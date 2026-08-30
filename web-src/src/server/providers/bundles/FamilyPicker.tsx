@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Search } from "lucide-react";
 
-import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -17,6 +16,7 @@ import { createDraftForProfile } from "@/server/providers/editor/providerDraft";
 import {
   familyAuthKind,
   familyIsExperimental,
+  familyLabel,
   familySupportedApps,
   filterFamilies,
   groupFamilies,
@@ -24,33 +24,21 @@ import {
   type FamilyAuthKind,
   type FamilyCategoryId,
 } from "./familyCatalog";
+import { APP_LABELS, AppLogo } from "./bundleApps";
 
-const APP_LABELS: Record<CoreProviderApp, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-};
-
-function AppLogo({
-  app,
-  muted = false,
+function FamilyLogo({
+  family,
+  label,
 }: {
-  app: CoreProviderApp;
-  muted?: boolean;
+  family: ProviderFamilySpec;
+  label: string;
 }) {
-  const className = muted ? "opacity-30 grayscale" : undefined;
-  if (app === "claude") return <ClaudeIcon size={14} className={className} />;
-  if (app === "codex") return <CodexIcon size={14} className={className} />;
-  return <GeminiIcon size={14} className={className} />;
-}
-
-function FamilyLogo({ family }: { family: ProviderFamilySpec }) {
   const profile = profileById(family.credentialProfileId);
   const preset = profile ? createDraftForProfile(profile) : undefined;
   return (
     <ProviderIcon
       icon={preset?.icon}
-      name={family.label}
+      name={label}
       color={preset?.iconColor}
       size={16}
       className="shrink-0"
@@ -70,7 +58,7 @@ function authKindLabel(
       return t("providerBundle.authKindAws", { defaultValue: "AWS" });
     case "custom":
       return t("providerBundle.authKindCustom", {
-        defaultValue: "Custom HTTP",
+        defaultValue: "Custom",
       });
     default:
       return t("providerBundle.authKindApiKey", { defaultValue: "API Key" });
@@ -82,6 +70,8 @@ function categoryLabel(
   t: (key: string, options?: { defaultValue: string }) => string,
 ): string {
   switch (categoryId) {
+    case "custom":
+      return t("providerBundle.categoryCustom", { defaultValue: "Custom" });
     case "subscription":
       return t("providerBundle.categorySubscription", {
         defaultValue: "Subscription accounts",
@@ -164,7 +154,7 @@ export function FamilyPicker({
                 t("providerBundle.appFilterAll", { defaultValue: "All Apps" })
               ) : (
                 <>
-                  <AppLogo app={app} />
+                  <AppLogo app={app} size={14} />
                   {APP_LABELS[app]}
                 </>
               )}
@@ -181,74 +171,97 @@ export function FamilyPicker({
         </p>
       ) : (
         <div className="space-y-5">
-          {groups.map((group) => (
-            <div key={group.groupId} className="space-y-2">
-              <h3 className="text-sm font-semibold text-foreground">
-                {categoryLabel(group.groupId, t)}
-              </h3>
-              <div
-                role="radiogroup"
-                className="grid grid-cols-1 gap-2 sm:grid-cols-2"
-              >
-                {group.families.map((family) => {
-                  const selected = family.familyId === selectedFamilyId;
-                  const supported = familySupportedApps(family);
-                  return (
-                    <button
-                      key={family.familyId}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      onClick={() => onSelect(family.familyId)}
-                      className={cn(
-                        "flex min-h-[4.5rem] w-full flex-col gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors",
-                        selected
-                          ? "border-primary bg-primary/5"
-                          : "border-border bg-card hover:border-border-active",
-                      )}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="flex min-w-0 items-center gap-2">
-                          <FamilyLogo family={family} />
-                          <span className="truncate text-sm font-medium">
-                            {family.label}
+          {groups.map((group) => {
+            const categoryName = categoryLabel(group.groupId, t);
+            // A single-card category whose one card already carries the category name
+            // does not need a heading: the two would print the same word twice in a
+            // row. The pinned Custom entry is the only group shaped like that, and
+            // dropping its heading leaves it reading as the default sitting on top.
+            const headingRepeatsCard =
+              group.families.length === 1 &&
+              familyLabel(group.families[0], t) === categoryName;
+            return (
+              <div key={group.groupId} className="space-y-2">
+                {headingRepeatsCard ? null : (
+                  <h3 className="text-sm font-semibold text-foreground">
+                    {categoryName}
+                  </h3>
+                )}
+                <div
+                  role="radiogroup"
+                  className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+                >
+                  {group.families.map((family) => {
+                    const selected = family.familyId === selectedFamilyId;
+                    const supported = familySupportedApps(family);
+                    const label = familyLabel(family, t);
+                    // Same rule one level down: the auth badge is there to say how you
+                    // sign in, which is worth nothing when it only echoes the name.
+                    const authLabel = authKindLabel(familyAuthKind(family), t);
+                    const experimental = familyIsExperimental(family);
+                    const showAuthBadge = authLabel !== label;
+                    return (
+                      <button
+                        key={family.familyId}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => onSelect(family.familyId)}
+                        className={cn(
+                          "flex min-h-[4.5rem] w-full flex-col gap-2 rounded-lg border px-3 py-2.5 text-left transition-colors",
+                          selected
+                            ? "border-primary bg-primary/5"
+                            : "border-border bg-card hover:border-border-active",
+                        )}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="flex min-w-0 items-center gap-2">
+                            <FamilyLogo family={family} label={label} />
+                            <span className="truncate text-sm font-medium">
+                              {label}
+                            </span>
                           </span>
-                        </span>
-                        <span className="flex shrink-0 items-center gap-1">
-                          {(["claude", "codex", "gemini"] as const).map(
-                            (app) => (
-                              <span key={app} title={APP_LABELS[app]}>
-                                <AppLogo
-                                  app={app}
-                                  muted={!supported.includes(app)}
-                                />
-                              </span>
-                            ),
-                          )}
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <Badge
-                          variant="outline"
-                          className="h-5 px-1.5 text-[10px]"
-                        >
-                          {authKindLabel(familyAuthKind(family), t)}
-                        </Badge>
-                        {familyIsExperimental(family) ? (
-                          <Badge
-                            variant="secondary"
-                            className="h-5 px-1.5 text-[10px]"
-                          >
-                            {t("serverProviderForm.identity.experimental")}
-                          </Badge>
+                          <span className="flex shrink-0 items-center gap-1">
+                            {(["claude", "codex", "gemini"] as const).map(
+                              (app) => (
+                                <span key={app} title={APP_LABELS[app]}>
+                                  <AppLogo
+                                    app={app}
+                                    size={14}
+                                    muted={!supported.includes(app)}
+                                  />
+                                </span>
+                              ),
+                            )}
+                          </span>
+                        </div>
+                        {showAuthBadge || experimental ? (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {showAuthBadge ? (
+                              <Badge
+                                variant="outline"
+                                className="h-5 px-1.5 text-[10px]"
+                              >
+                                {authLabel}
+                              </Badge>
+                            ) : null}
+                            {experimental ? (
+                              <Badge
+                                variant="secondary"
+                                className="h-5 px-1.5 text-[10px]"
+                              >
+                                {t("serverProviderForm.identity.experimental")}
+                              </Badge>
+                            ) : null}
+                          </div>
                         ) : null}
-                      </div>
-                    </button>
-                  );
-                })}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

@@ -307,7 +307,7 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::GitHubCopilot => "GitHub Copilot",
         ProviderType::DeepSeekAccount => "DeepSeek Account",
         ProviderType::KiroOAuth => "Kiro OAuth",
-        ProviderType::KimiCode => "Kimi Code",
+        ProviderType::KimiCode => "Kimi Code OAuth",
         ProviderType::QoderCosy => "Qoder COSY",
         ProviderType::CursorOAuth => "Cursor OAuth",
         ProviderType::CursorApiKey => "Cursor API Key",

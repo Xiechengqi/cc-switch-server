@@ -2871,7 +2871,7 @@ fn s1_provider_for_profile(
             ("GitHub Copilot", json!({}))
         }
         "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
-        "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code", json!({})),
+        "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code OAuth", json!({})),
         "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => ("Qoder COSY", json!({})),
         "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
         "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),

@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { familyById, providerRegistry } from "@/server/providerRegistry";
 import {
+  CUSTOM_FAMILY_IDS,
   FAMILY_GROUP_ORDER,
   SUBSCRIPTION_FAMILY_IDS,
   familyAuthKind,
   familyCategoryId,
   familyGroupId,
   familyIsExperimental,
+  familyLabel,
   familySearchText,
   familySupportedApps,
   filterFamilies,
@@ -18,17 +20,42 @@ import {
 } from "./familyCatalog";
 
 describe("familyCatalog", () => {
-  it("recommends Claude OAuth as the default Family", () => {
-    expect(recommendedFamilyId()).toBe("family.claude_oauth");
-    expect(recommendedFamily().familyId).toBe("family.claude_oauth");
+  it("recommends Custom as the default Family", () => {
+    expect(recommendedFamilyId()).toBe("family.custom_http");
+    expect(recommendedFamily().familyId).toBe("family.custom_http");
   });
 
-  it("places every visible Family into exactly one of the two categories", () => {
+  it("falls back to the subscription order when Custom is filtered out", () => {
+    const withoutCustom = providerRegistry.families.filter(
+      (family) => family.familyId !== "family.custom_http",
+    );
+    expect(recommendedFamilyId(withoutCustom)).toBe("family.claude_oauth");
+  });
+
+  it("translates the Custom label and finds it by its translated name", () => {
+    const custom = familyById("family.custom_http")!;
+    expect(custom.label).toBe("Custom");
+    expect(familyLabel(custom, () => "自定义")).toBe("自定义");
+    expect(familyLabel(familyById("family.openrouter")!, () => "自定义")).toBe(
+      familyById("family.openrouter")!.label,
+    );
+    expect(
+      filterFamilies(providerRegistry.families, "自定义").map(
+        (family) => family.familyId,
+      ),
+    ).toEqual(["family.custom_http"]);
+  });
+
+  it("places every visible Family into exactly one category", () => {
     const groups = groupFamilies(providerRegistry.families);
     const groupedIds = groups.flatMap((group) =>
       group.families.map((family) => family.familyId),
     );
-    expect(FAMILY_GROUP_ORDER).toEqual(["subscription", "api_key"]);
+    expect(FAMILY_GROUP_ORDER).toEqual(["custom", "subscription", "api_key"]);
+    expect(groups[0]?.groupId).toBe("custom");
+    expect(groups[0]?.families.map((family) => family.familyId)).toEqual([
+      ...CUSTOM_FAMILY_IDS,
+    ]);
     expect(new Set(groupedIds).size).toBe(groupedIds.length);
     expect([...groupedIds].sort()).toEqual(
       [...providerRegistry.families.map((family) => family.familyId)].sort(),
@@ -52,10 +79,9 @@ describe("familyCatalog", () => {
       "family.deepseek_api",
       "family.openai_api_key",
       "family.gemini_api_key",
-      "family.custom_http",
     ]);
-    expect(familyCategoryId("family.custom_http")).toBe("api_key");
-    expect(familyGroupId("family.custom_http")).toBe("api_key");
+    expect(familyCategoryId("family.custom_http")).toBe("custom");
+    expect(familyGroupId("family.custom_http")).toBe("custom");
     expect(familyCategoryId("family.future_provider")).toBe("api_key");
     const futureFamily = {
       ...providerRegistry.families[0]!,

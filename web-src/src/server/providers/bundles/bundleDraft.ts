@@ -596,7 +596,7 @@ export function applyCustomRecipeToBundleDraft(
 ): ProviderBundleEditorDraft {
   const targetProfile = profileById(recipe.profileId);
   if (!targetProfile || targetProfile.formComposition !== "custom") {
-    throw new Error(`Unknown Custom HTTP recipe profile ${recipe.profileId}`);
+    throw new Error(`Unknown Custom recipe profile ${recipe.profileId}`);
   }
   if (
     !draft.surfaces.some((surface) => surface.profileId === recipe.profileId)

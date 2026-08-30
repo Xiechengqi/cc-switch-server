@@ -804,7 +804,7 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
     },
   },
   {
-    name: "Xiaomi MiMo Token Plan (China)",
+    name: "Xiaomi MiMo (China)",
     websiteUrl: "https://platform.xiaomimimo.com/#/token-plan",
     apiKeyUrl: "https://platform.xiaomimimo.com/#/console/plan-manage",
     settingsConfig: {
@@ -844,10 +844,10 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
       model: { primary: "xiaomi-mimo-token-plan/mimo-v2.5-pro" },
       modelCatalog: {
         "xiaomi-mimo-token-plan/mimo-v2.5-pro": {
-          alias: "MiMo Token Plan (China)",
+          alias: "MiMo (China)",
         },
         "xiaomi-mimo-token-plan/mimo-v2.5": {
-          alias: "MiMo Token Plan (China) Multimodal",
+          alias: "MiMo (China) Multimodal",
         },
       },
     },

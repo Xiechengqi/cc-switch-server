@@ -4216,7 +4216,7 @@ fn normalize_provider_outbound_identity(
             .filter(|value| !value.is_empty());
         if existing_value != Some(incoming.as_str()) {
             return Err(ProviderCommandError::Invalid(
-                "customUserAgent is only supported by Custom HTTP Providers".to_string(),
+                "customUserAgent is only supported by Custom Providers".to_string(),
             ));
         }
     }
@@ -24724,7 +24724,7 @@ mod tests {
         let error =
             normalize_provider_outbound_identity(&mut new_value, None, profile).unwrap_err();
         assert!(
-            matches!(error, ProviderCommandError::Invalid(message) if message.contains("Custom HTTP"))
+            matches!(error, ProviderCommandError::Invalid(message) if message.contains("Custom Providers"))
         );
 
         let existing = stored_provider_with_user_agent("codex.openai_api_key", "legacy-agent/1");

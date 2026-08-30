@@ -57,14 +57,16 @@ const codexFeatureKeys = [
 ] as const;
 
 const providerBundleKeys = [
-  "advanced",
+  "cardConnection",
   "categoryApiKey",
+  "categoryCustom",
   "categorySubscription",
   "familySearchPlaceholder",
   "stepNavigation",
   "stepFamily",
   "stepSupply",
   "stepShare",
+  "gapCredential",
   "validation.accountRequired",
 ] as const;
 
@@ -92,6 +94,7 @@ describe("i18n resources", () => {
     expect(serverZh.providerBundle.stepShare).toBe("远程分享");
     expect(serverZh.providerBundle.categorySubscription).toBe("订阅账号");
     expect(serverZh.providerBundle.categoryApiKey).toBe("API Key");
+    expect(serverZh.providerBundle.categoryCustom).toBe("自定义");
   });
 
   it("provides every critical dialog string in all supported languages", () => {

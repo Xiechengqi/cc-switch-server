@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useEffect,
   useMemo,
   useRef,
@@ -8,24 +9,28 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import {
   ArrowLeft,
+  ArrowRight,
   ArrowRightLeft,
-  Check,
   ChevronDown,
   Copy,
   KeyRound,
+  Layers,
   LoaderCircle,
   Plus,
   RefreshCw,
   Save,
   Share2,
+  SlidersHorizontal,
+  Stethoscope,
   Target,
   Trash2,
+  Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
@@ -79,6 +84,7 @@ import {
   familyById,
   profileById,
   type CoreProviderApp,
+  type ProviderFamilySpec,
 } from "@/server/providerRegistry";
 import {
   CodexFeatureOptions,
@@ -133,8 +139,10 @@ import {
   updateBundleModel,
   updateSurfaceEndpoint,
   updateSurfaceModel,
+  type BundleHeaderDraft,
   type BundleSecretDraft,
   type BundleSurfaceEditorDraft,
+  type BundleValidationField,
   type BundleValidationIssue,
   type ProviderBundleEditorDraft,
 } from "./bundleDraft";
@@ -144,7 +152,11 @@ import {
   firstBundleValidationIssue,
   matchesBundleValidationIssue,
 } from "./bundleValidation";
-import { preferredManagedAccount, recommendedFamily } from "./familyCatalog";
+import {
+  familyLabel,
+  preferredManagedAccount,
+  recommendedFamily,
+} from "./familyCatalog";
 import { FamilyPicker } from "./FamilyPicker";
 import {
   canVisitCreateStep,
@@ -154,6 +166,16 @@ import {
   unlockCreateStep,
   type CreateStep,
 } from "./createStepNavigation";
+import { APP_LABELS, AppLogo } from "./bundleApps";
+import { ConfigCard } from "./ConfigCard";
+import {
+  BundleReadinessBar,
+  StatusDot,
+  readinessTone,
+  useGapLabel,
+} from "./BundleReadinessBar";
+import { bundleReadiness, type BundleGap } from "./bundleReadiness";
+import { runtimeSummaryRows, type RuntimeSummaryRowId } from "./runtimeSummary";
 
 interface ProviderBundleEditorProps {
   bundle?: ProviderBundleView;
@@ -168,16 +190,18 @@ function fieldErrorClass(invalid: boolean): string {
   return invalid ? "border-destructive focus-visible:ring-destructive" : "";
 }
 
-const APP_LABELS: Record<CoreProviderApp, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-};
-
-function AppLogo({ app, size = 16 }: { app: CoreProviderApp; size?: number }) {
-  if (app === "claude") return <ClaudeIcon size={size} />;
-  if (app === "codex") return <CodexIcon size={size} />;
-  return <GeminiIcon size={size} />;
+/**
+ * Two frames, not one: opening a card is a state change, and Radix only mounts the
+ * collapsed content on the commit after that, so a single rAF finds nothing.
+ */
+function scrollToWhenRendered(id: string, block: ScrollLogicalPosition) {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      document
+        .getElementById(id)
+        ?.scrollIntoView({ behavior: "smooth", block });
+    });
+  });
 }
 
 function Section({
@@ -282,18 +306,212 @@ function authSchemeLabel(scheme: string): string {
   }
 }
 
-function SurfaceEditor({
+type ConfigCardId =
+  | "connection"
+  | "model"
+  | "surfaces"
+  | "diagnostics"
+  | "features"
+  | "accountOps";
+
+/**
+ * Where a save-blocking issue actually lives now that the form is a card stack.
+ * Without this, "保存失败" scrolls to a field inside a collapsed card and nothing moves.
+ */
+function cardForValidationField(
+  field: BundleValidationField,
+  endpointScope: ProviderFamilySpec["endpointScope"],
+): ConfigCardId | null {
+  switch (field) {
+    case "account":
+    case "credential":
+    case "awsRegion":
+    case "timeoutSeconds":
+    case "streamFirstByteTimeoutSeconds":
+    case "streamIdleTimeoutSeconds":
+      return "connection";
+    case "endpoint":
+      return endpointScope === "bundle" ? "connection" : "surfaces";
+    case "modelScope":
+    case "modelPolicy":
+    case "upstreamModel":
+      return "model";
+    case "testApp":
+    case "testModel":
+    case "surfaceTestModel":
+      return "diagnostics";
+    case "surfaces":
+    case "customBinding":
+    case "authField":
+    case "surfaceSecret":
+    case "headers":
+      return "surfaces";
+    default:
+      return null;
+  }
+}
+
+function CardGapStatus({ gap }: { gap: BundleGap | null }) {
+  const gapLabel = useGapLabel();
+  if (!gap) return null;
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive">
+      <StatusDot tone="gap" />
+      {gapLabel(gap)}
+    </span>
+  );
+}
+
+/**
+ * One App's model decision on one line. Used both for the per-App scope and for the
+ * Profile-fixed Surfaces in global scope, so the two read as the same kind of thing.
+ */
+function SurfaceModelRow({
   surface,
-  modelPolicyScope,
   validation,
   onChange,
 }: {
   surface: BundleSurfaceEditorDraft;
-  modelPolicyScope: ProviderBundleEditorDraft["modelPolicyScope"];
   validation: BundleValidationIssue | null;
   onChange: (surface: BundleSurfaceEditorDraft) => void;
 }) {
   const { t } = useTranslation();
+  const profile = profileById(surface.profileId);
+  if (!profile) return null;
+  const allowedModelPolicies = modelPoliciesForSurface(surface);
+  const configurable = allowedModelPolicies.length > 1;
+  return (
+    <div className="grid items-center gap-2 border-t py-2.5 first:border-t-0 sm:grid-cols-[minmax(0,7rem)_minmax(0,1fr)]">
+      <div className="flex min-w-0 items-center gap-2">
+        <AppLogo app={surface.app} size={15} muted={!surface.enabled} />
+        <span
+          className={cn(
+            "truncate text-sm",
+            !surface.enabled && "text-muted-foreground",
+          )}
+        >
+          {APP_LABELS[surface.app]}
+        </span>
+      </div>
+      {configurable ? (
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <Tabs
+            value={surface.modelPolicy}
+            onValueChange={(value) => {
+              if (value !== "single" && value !== "passthrough") return;
+              if (!allowedModelPolicies.includes(value)) return;
+              onChange(
+                updateSurfaceModel(
+                  surface,
+                  value,
+                  value === "single" && !surface.upstreamModel.trim()
+                    ? (profile.defaultUpstreamModel ?? "")
+                    : surface.upstreamModel,
+                ),
+              );
+            }}
+          >
+            <TabsList className="h-9 gap-1 border bg-muted/40 p-1">
+              {allowedModelPolicies.map((policy) => (
+                <TabsTrigger
+                  key={policy}
+                  value={policy}
+                  className="h-7 min-w-0 gap-1.5 rounded-sm px-3 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground"
+                >
+                  {policy === "single" ? (
+                    <Target className="h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <ArrowRightLeft className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  {policy === "single"
+                    ? t("providerBundle.modelSingle")
+                    : t("providerBundle.modelPassthrough")}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          {surface.modelPolicy === "single" ? (
+            <Input
+              id={bundleValidationFieldId({
+                code: "surfaceUpstreamModelRequired",
+                field: "upstreamModel",
+                message: "",
+                surface: surface.app,
+              })}
+              aria-label={t("serverProviderForm.model.upstreamModel")}
+              placeholder={profile.defaultUpstreamModel ?? undefined}
+              className={cn(
+                "h-9 min-w-0 flex-1 basis-48",
+                fieldErrorClass(
+                  matchesBundleValidationIssue(
+                    validation,
+                    "upstreamModel",
+                    surface.app,
+                  ),
+                ),
+              )}
+              value={surface.upstreamModel}
+              onChange={(event) =>
+                onChange(
+                  updateSurfaceModel(
+                    surface,
+                    surface.modelPolicy,
+                    event.target.value,
+                  ),
+                )
+              }
+            />
+          ) : null}
+        </div>
+      ) : (
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <Badge variant="secondary">
+            {t("providerBundle.modelProfileFixed")}
+          </Badge>
+          <span className="min-w-0 truncate text-muted-foreground">
+            {surface.modelPolicy === "single"
+              ? surface.upstreamModel
+              : t("providerBundle.modelPassthrough")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+function runtimeRowLabel(id: RuntimeSummaryRowId, t: TFunction): string {
+  switch (id) {
+    case "endpoint":
+      return t("serverProviderForm.endpoint.url");
+    case "protocol":
+      return t("serverProviderForm.binding.upstreamProtocol");
+    case "driver":
+      return t("providerBundle.runtimeDriver", { defaultValue: "驱动" });
+    case "model":
+      return t("serverProviderForm.model.upstreamModel");
+    case "timeout":
+      return t("providerBundle.connectionTimeouts", {
+        defaultValue: "连接与超时",
+      });
+    case "headers":
+      return t("serverProviderForm.headers.title");
+    case "region":
+      return "AWS Region";
+    default:
+      return t("providerBundle.runtimeState", { defaultValue: "配置状态" });
+  }
+}
+
+function SurfaceEditor({
+  surface,
+  validation,
+  onChange,
+}: {
+  surface: BundleSurfaceEditorDraft;
+  validation: BundleValidationIssue | null;
+  onChange: (surface: BundleSurfaceEditorDraft) => void;
+}) {
+  const { t } = useTranslation();
+  const [showRuntimeJson, setShowRuntimeJson] = useState(false);
   const profile = profileById(surface.profileId);
   if (!profile) return null;
   const customPolicy = customPolicyForProfile(profile);
@@ -319,8 +537,7 @@ function SurfaceEditor({
         });
     }
   })();
-  const allowedModelPolicies = modelPoliciesForSurface(surface);
-  const modelPolicyConfigurable = allowedModelPolicies.length > 1;
+  const headers = surface.headers.filter((header) => !header.removed);
   const updateDriverOptions = (
     patch: Partial<BundleSurfaceEditorDraft["driverOptions"]>,
   ) =>
@@ -328,13 +545,18 @@ function SurfaceEditor({
       ...surface,
       driverOptions: { ...surface.driverOptions, ...patch },
     });
+  const updateHeader = (id: string, patch: Partial<BundleHeaderDraft>) =>
+    onChange({
+      ...surface,
+      headers: surface.headers.map((item) =>
+        item.id === id ? { ...item, ...patch } : item,
+      ),
+    });
 
   return (
-    <div className="space-y-6 pt-3">
+    <div className="space-y-5 pt-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Badge variant="outline">{profile.label}</Badge>
-        </div>
+        <Badge variant="outline">{profile.label}</Badge>
         <div className="flex items-center gap-2">
           <Label htmlFor={`surface-${surface.app}-enabled`}>
             {t("providerBundle.surfaceEnabled", { defaultValue: "启用 API" })}
@@ -347,111 +569,13 @@ function SurfaceEditor({
         </div>
       </div>
 
-      {modelPolicyScope === "per_app" ? (
-        <div className="space-y-4 border-b pb-6">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Label>{t("serverProviderForm.model.title")}</Label>
-            <Badge variant="secondary">
-              {modelPolicyConfigurable
-                ? t("providerBundle.modelScopePerApp")
-                : t("providerBundle.modelProfileFixed")}
-            </Badge>
-          </div>
-          {modelPolicyConfigurable ? (
-            <>
-              <Tabs
-                value={surface.modelPolicy}
-                onValueChange={(value) => {
-                  if (value !== "single" && value !== "passthrough") return;
-                  if (!allowedModelPolicies.includes(value)) return;
-                  onChange(
-                    updateSurfaceModel(
-                      surface,
-                      value,
-                      value === "single" && !surface.upstreamModel.trim()
-                        ? (profile.defaultUpstreamModel ?? "")
-                        : surface.upstreamModel,
-                    ),
-                  );
-                }}
-              >
-                <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
-                  {allowedModelPolicies.map((policy) => (
-                    <TabsTrigger
-                      key={policy}
-                      value={policy}
-                      className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
-                    >
-                      {policy === "single" ? (
-                        <Target className="hidden h-4 w-4 shrink-0 sm:block" />
-                      ) : (
-                        <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
-                      )}
-                      {policy === "single"
-                        ? t("providerBundle.modelSingle")
-                        : t("providerBundle.modelPassthrough")}
-                    </TabsTrigger>
-                  ))}
-                </TabsList>
-              </Tabs>
-              {surface.modelPolicy === "single" ? (
-                <div className="space-y-2">
-                  <Label htmlFor={`surface-${surface.app}-model`}>
-                    {t("serverProviderForm.model.upstreamModel")}
-                  </Label>
-                  <Input
-                    id={bundleValidationFieldId({
-                      code: "surfaceUpstreamModelRequired",
-                      field: "upstreamModel",
-                      message: "",
-                      surface: surface.app,
-                    })}
-                    className={fieldErrorClass(
-                      matchesBundleValidationIssue(
-                        validation,
-                        "upstreamModel",
-                        surface.app,
-                      ),
-                    )}
-                    value={surface.upstreamModel}
-                    onChange={(event) =>
-                      onChange(
-                        updateSurfaceModel(
-                          surface,
-                          surface.modelPolicy,
-                          event.target.value,
-                        ),
-                      )
-                    }
-                  />
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
-              {surface.modelPolicy === "single" ? (
-                <Target className="h-4 w-4" />
-              ) : (
-                <ArrowRightLeft className="h-4 w-4" />
-              )}
-              {surface.modelPolicy === "single"
-                ? t("providerBundle.modelSingle")
-                : t("providerBundle.modelPassthrough")}
-              {surface.modelPolicy === "single" && surface.upstreamModel ? (
-                <span className="text-muted-foreground">
-                  {surface.upstreamModel}
-                </span>
-              ) : null}
-            </div>
-          )}
-        </div>
-      ) : null}
-
       {profile.formComposition === "custom" && customPolicy ? (
-        <div className="space-y-5">
+        <div className="space-y-4">
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2 md:col-span-2">
-              <Label>{t("serverProviderForm.endpoint.url")}</Label>
+              <Label htmlFor={`surface-${surface.app}-endpoint`}>
+                {t("serverProviderForm.endpoint.url")}
+              </Label>
               <Input
                 id={bundleValidationFieldId({
                   code: "endpointInvalid",
@@ -460,6 +584,7 @@ function SurfaceEditor({
                   surface: surface.app,
                 })}
                 type="url"
+                placeholder="https://api.example.com/v1"
                 className={fieldErrorClass(
                   matchesBundleValidationIssue(
                     validation,
@@ -546,8 +671,8 @@ function SurfaceEditor({
             </div>
             {surface.customBinding?.authScheme === "custom_header" ||
             surface.customBinding?.authScheme === "query" ? (
-              <div className="space-y-2 md:col-span-2">
-                <Label>
+              <div className="space-y-2">
+                <Label htmlFor={`surface-${surface.app}-auth-field`}>
                   {surface.customBinding.authScheme === "query"
                     ? t("providerBundle.queryParameter", {
                         defaultValue: "API Key 查询参数名",
@@ -557,6 +682,7 @@ function SurfaceEditor({
                       })}
                 </Label>
                 <Input
+                  id={`surface-${surface.app}-auth-field`}
                   value={surface.driverOptions.apiKeyField ?? ""}
                   placeholder={
                     surface.customBinding.authScheme === "query"
@@ -569,46 +695,106 @@ function SurfaceEditor({
                 />
               </div>
             ) : null}
-          </div>
-
-          <div className="space-y-2">
-            <Label>{customCredentialLabel}</Label>
-            <SecretInput
-              id={bundleValidationFieldId({
-                code: "surfaceCredentialRequired",
-                field: "surfaceSecret",
-                message: "",
-                surface: surface.app,
-              })}
-              className={fieldErrorClass(
-                matchesBundleValidationIssue(
-                  validation,
-                  "surfaceSecret",
-                  surface.app,
-                ),
+            <div
+              className={cn(
+                "space-y-2",
+                surface.customBinding?.authScheme !== "custom_header" &&
+                  surface.customBinding?.authScheme !== "query" &&
+                  "md:col-span-2",
               )}
-              value={surface.secret.value}
-              placeholder={surface.secret.configured ? "••••••••" : undefined}
-              onChange={(event) =>
-                onChange({
-                  ...surface,
-                  secret: {
-                    ...surface.secret,
-                    value: event.target.value,
-                    clear: false,
-                  },
-                })
-              }
-            />
+            >
+              <Label htmlFor={`surface-${surface.app}-secret`}>
+                {customCredentialLabel}
+              </Label>
+              <SecretInput
+                id={bundleValidationFieldId({
+                  code: "surfaceCredentialRequired",
+                  field: "surfaceSecret",
+                  message: "",
+                  surface: surface.app,
+                })}
+                className={fieldErrorClass(
+                  matchesBundleValidationIssue(
+                    validation,
+                    "surfaceSecret",
+                    surface.app,
+                  ),
+                )}
+                value={surface.secret.value}
+                placeholder={surface.secret.configured ? "••••••••" : undefined}
+                onChange={(event) =>
+                  onChange({
+                    ...surface,
+                    secret: {
+                      ...surface.secret,
+                      value: event.target.value,
+                      clear: false,
+                    },
+                  })
+                }
+              />
+            </div>
           </div>
 
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <Label>{t("serverProviderForm.headers.title")}</Label>
-              <Button
+          {/* A table, not a stack of loose input pairs: header rows are two columns of
+              the same shape repeated, and a header row makes that readable at a glance. */}
+          <div className="space-y-2">
+            <Label>{t("serverProviderForm.headers.title")}</Label>
+            <div className="overflow-hidden rounded-md border">
+              {headers.length ? (
+                <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
+                  <span>
+                    {t("providerBundle.headerName", { defaultValue: "名称" })}
+                  </span>
+                  <span>
+                    {t("providerBundle.headerValue", { defaultValue: "值" })}
+                  </span>
+                  <span />
+                </div>
+              ) : null}
+              {headers.map((header) => (
+                <div
+                  key={header.id}
+                  className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b px-2 py-2"
+                >
+                  <Input
+                    className="h-9"
+                    value={header.name}
+                    placeholder="x-header-name"
+                    aria-label={t("providerBundle.headerName", {
+                      defaultValue: "名称",
+                    })}
+                    onChange={(event) =>
+                      updateHeader(header.id, { name: event.target.value })
+                    }
+                  />
+                  <SecretInput
+                    className="h-9"
+                    value={header.value}
+                    placeholder={header.configured ? "••••••••" : undefined}
+                    aria-label={t("providerBundle.headerValue", {
+                      defaultValue: "值",
+                    })}
+                    onChange={(event) =>
+                      updateHeader(header.id, { value: event.target.value })
+                    }
+                  />
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-9 w-9"
+                    title={t("common.delete")}
+                    aria-label={t("common.delete")}
+                    onClick={() => updateHeader(header.id, { removed: true })}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              <button
                 type="button"
-                size="sm"
-                variant="outline"
+                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                 onClick={() =>
                   onChange({
                     ...surface,
@@ -625,108 +811,112 @@ function SurfaceEditor({
                   })
                 }
               >
-                <Plus className="mr-2 h-4 w-4" />
-                {t("common.add")}
-              </Button>
+                <Plus className="h-3.5 w-3.5" />
+                {headers.length
+                  ? t("common.add")
+                  : t("providerBundle.headersEmpty", {
+                      defaultValue: "添加自定义请求头",
+                    })}
+              </button>
             </div>
-            {surface.headers
-              .filter((header) => !header.removed)
-              .map((header) => (
-                <div
-                  key={header.id}
-                  className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]"
-                >
-                  <Input
-                    value={header.name}
-                    placeholder="x-header-name"
-                    onChange={(event) =>
-                      onChange({
-                        ...surface,
-                        headers: surface.headers.map((item) =>
-                          item.id === header.id
-                            ? { ...item, name: event.target.value }
-                            : item,
-                        ),
-                      })
-                    }
-                  />
-                  <SecretInput
-                    value={header.value}
-                    placeholder={header.configured ? "••••••••" : undefined}
-                    onChange={(event) =>
-                      onChange({
-                        ...surface,
-                        headers: surface.headers.map((item) =>
-                          item.id === header.id
-                            ? { ...item, value: event.target.value }
-                            : item,
-                        ),
-                      })
-                    }
-                  />
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="outline"
-                    title={t("common.delete")}
-                    onClick={() =>
-                      onChange({
-                        ...surface,
-                        headers: surface.headers.map((item) =>
-                          item.id === header.id
-                            ? { ...item, removed: true }
-                            : item,
-                        ),
-                      })
-                    }
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
           </div>
 
-          <div className="space-y-2">
-            <Label>{t("serverProviderForm.usage.customUserAgent")}</Label>
-            <Input
-              value={surface.driverOptions.customUserAgent ?? ""}
-              onChange={(event) =>
-                updateDriverOptions({ customUserAgent: event.target.value })
-              }
-            />
-          </div>
+          <Collapsible>
+            <CollapsibleTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 px-2 text-xs"
+              >
+                <ChevronDown className="mr-1.5 h-3.5 w-3.5" />
+                {t("providerBundle.moreOptions", { defaultValue: "更多选项" })}
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-3">
+              <div className="space-y-2">
+                <Label htmlFor={`surface-${surface.app}-user-agent`}>
+                  {t("serverProviderForm.usage.customUserAgent")}
+                </Label>
+                <Input
+                  id={`surface-${surface.app}-user-agent`}
+                  value={surface.driverOptions.customUserAgent ?? ""}
+                  onChange={(event) =>
+                    updateDriverOptions({ customUserAgent: event.target.value })
+                  }
+                />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
         </div>
       ) : null}
 
       {surface.runtime ? (
-        <Collapsible className="pt-4">
-          <div className="flex items-center justify-between gap-2">
-            <CollapsibleTrigger asChild>
-              <Button type="button" variant="ghost" size="sm">
-                <ChevronDown className="mr-2 h-4 w-4" />
-                {t("providerBundle.effectiveConfig", {
-                  defaultValue: "有效运行配置",
-                })}
+        <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-medium">
+              {t("providerBundle.effectiveConfig", {
+                defaultValue: "有效运行配置",
+              })}
+            </span>
+            <div className="flex items-center gap-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-xs"
+                onClick={() => setShowRuntimeJson((current) => !current)}
+              >
+                {showRuntimeJson
+                  ? t("providerBundle.runtimeTable", { defaultValue: "摘要" })
+                  : "JSON"}
               </Button>
-            </CollapsibleTrigger>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              title={t("common.copy")}
-              onClick={() =>
-                void copyText(JSON.stringify(surface.runtime, null, 2))
-              }
-            >
-              <Copy className="h-4 w-4" />
-            </Button>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="h-7 w-7"
+                title={t("common.copy")}
+                aria-label={t("common.copy")}
+                onClick={() =>
+                  void copyText(JSON.stringify(surface.runtime, null, 2))
+                }
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+            </div>
           </div>
-          <CollapsibleContent className="pt-2">
-            <pre className="max-h-80 overflow-auto rounded-md border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
+          {showRuntimeJson ? (
+            <pre className="max-h-80 overflow-auto rounded-md border bg-background p-3 font-mono text-xs leading-relaxed">
               {JSON.stringify(surface.runtime, null, 2)}
             </pre>
-          </CollapsibleContent>
-        </Collapsible>
+          ) : (
+            <dl className="grid gap-x-4 gap-y-1.5 text-xs sm:grid-cols-[minmax(0,7rem)_minmax(0,1fr)]">
+              {runtimeSummaryRows(surface.runtime).map((row) => (
+                <Fragment key={row.id}>
+                  <dt className="text-muted-foreground">
+                    {runtimeRowLabel(row.id, t)}
+                  </dt>
+                  <dd className="min-w-0 break-all font-mono">
+                    {row.value == null ? (
+                      <span className="font-sans text-muted-foreground">
+                        {row.id === "model"
+                          ? t("providerBundle.modelPassthrough")
+                          : t("providerBundle.runtimeUnset", {
+                              defaultValue: "默认",
+                            })}
+                      </span>
+                    ) : row.id === "protocol" ? (
+                      protocolLabel(row.value)
+                    ) : (
+                      row.value
+                    )}
+                  </dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+        </div>
       ) : null}
     </div>
   );
@@ -1125,6 +1315,16 @@ export function ProviderBundleEditor({
   const [healthCheckConfig, setHealthCheckConfig] =
     useState<ProviderHealthCheckConfig | null>(null);
   const [modelScopeConfirmOpen, setModelScopeConfirmOpen] = useState(false);
+  // The three cards that always hold a decision start open; the rest are opt-in, so a
+  // fresh provider is a short page instead of six equally loud blocks of whitespace.
+  const [openCards, setOpenCards] = useState<Record<ConfigCardId, boolean>>({
+    connection: true,
+    model: true,
+    surfaces: true,
+    diagnostics: false,
+    features: false,
+    accountOps: false,
+  });
   const [revealedCredentialValues, setRevealedCredentialValues] = useState<
     Record<string, string>
   >({});
@@ -1393,16 +1593,29 @@ export function ProviderBundleEditor({
       app: issue.surface ? APP_LABELS[issue.surface] : undefined,
     });
 
+  const setCardOpen = (card: ConfigCardId, open: boolean) =>
+    setOpenCards((current) => ({ ...current, [card]: open }));
+
+  const revealCard = (card: ConfigCardId) => {
+    setCardOpen(card, true);
+    scrollToWhenRendered(`bundle-card-${card}`, "start");
+  };
+
+  const focusSurface = (app: CoreProviderApp) => {
+    setActiveApp(app);
+    revealCard("surfaces");
+  };
+
   const focusIssue = (issue: BundleValidationIssue) => {
     if (issue.surface) setActiveApp(issue.surface);
     if (!persisted) {
       setCreateStep(issue.field === "family" ? "family" : "supply");
     }
-    requestAnimationFrame(() => {
-      document
-        .getElementById(bundleValidationFieldId(issue))
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-    });
+    // A collapsed card keeps its content unmounted, so opening it has to happen before
+    // there is anything to scroll to.
+    const card = cardForValidationField(issue.field, family.endpointScope);
+    if (card) setCardOpen(card, true);
+    scrollToWhenRendered(bundleValidationFieldId(issue), "center");
   };
 
   const selectCreateStep = (step: CreateStep) => {
@@ -1574,6 +1787,73 @@ export function ProviderBundleEditor({
     draft.surfaces.find((surface) => surface.app === activeApp) ??
     draft.surfaces[0];
 
+  const readiness = bundleReadiness(draft);
+  const surfaceTone = (app: CoreProviderApp) => {
+    const item = readiness.surfaces.find((entry) => entry.app === app);
+    return item ? readinessTone(item) : "off";
+  };
+  // Each card only claims the gaps it can actually fix: a missing per-App model is the
+  // model card's problem even though it is a Surface-level value.
+  const modelGap = readiness.surfaces.some(
+    (surface) => surface.ownGap === "model",
+  );
+  const surfaceGapCount = readiness.surfaces.filter(
+    (surface) => surface.ownGap && surface.ownGap !== "model",
+  ).length;
+  const selectedAccount = accounts.find(
+    (account) => account.id === draft.accountId,
+  );
+  const connectionSummary =
+    [
+      credentialProfile?.credentialPolicy.mode === "managed_account"
+        ? (selectedAccount?.email ?? selectedAccount?.login ?? null)
+        : null,
+      commonEndpointEditable ? draft.endpoint.trim() || null : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || null;
+  const modelSummary =
+    draft.modelPolicyScope === "per_app"
+      ? t("providerBundle.modelScopePerApp")
+      : draft.modelPolicy === "single"
+        ? draft.upstreamModel.trim() || t("providerBundle.modelSingle")
+        : t("providerBundle.modelPassthrough");
+  const surfacesSummary =
+    draft.surfaces
+      .filter((surface) => surface.enabled)
+      .map((surface) => APP_LABELS[surface.app])
+      .join(" · ") || t("providerBundle.surfaceOff", { defaultValue: "关" });
+  const diagnosticsSummary = [
+    APP_LABELS[draft.testApp],
+    draft.testModel.trim() || healthCheckConfig?.testModels[draft.testApp],
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const surfaceTestModelOverrides = enabledTestApps.filter((app) =>
+    draft.surfaceTestModels[app]?.trim(),
+  ).length;
+  const enabledFeatureCount = [
+    "codexFastMode",
+    "codexImageGenerationEnabled",
+    "codexWebsocketEnabled",
+    "grokImageGenerationEnabled",
+    "grokImageEditEnabled",
+    "grokVideoGenerationEnabled",
+  ].filter((key) =>
+    draft.surfaces.some(
+      (surface) =>
+        surface.driverOptions[
+          key as keyof BundleSurfaceEditorDraft["driverOptions"]
+        ] === true,
+    ),
+  ).length;
+  const featuresSummary = enabledFeatureCount
+    ? t("providerBundle.featuresEnabledCount", {
+        defaultValue: "已开启 {{count}} 项",
+        count: enabledFeatureCount,
+      })
+    : t("providerBundle.featuresAllOff", { defaultValue: "全部关闭" });
+
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 pb-24">
       <div className="flex items-center gap-3">
@@ -1596,7 +1876,7 @@ export function ProviderBundleEditor({
             {family.surfaces.map((surface) => (
               <AppLogo key={surface.app} app={surface.app} />
             ))}
-            <span className="truncate">{family.label}</span>
+            <span className="truncate">{familyLabel(family, t)}</span>
             {dirty ? (
               <Badge variant="outline">
                 {t("providerBundle.unsaved", { defaultValue: "未保存" })}
@@ -1698,8 +1978,10 @@ export function ProviderBundleEditor({
             id="bundle-section-supply"
             role="tabpanel"
             aria-labelledby="bundle-tab-supply"
-            className="space-y-6"
+            className="space-y-4"
           >
+            <BundleReadinessBar readiness={readiness} onSelect={focusSurface} />
+
             <Section
               title={t("providerBundle.basic", { defaultValue: "基本信息" })}
             >
@@ -1721,7 +2003,7 @@ export function ProviderBundleEditor({
                   </div>
                   {persisted ? (
                     <p className="text-center text-sm text-muted-foreground">
-                      {family.label}
+                      {familyLabel(family, t)}
                     </p>
                   ) : null}
                   {duplicate ? (
@@ -1820,198 +2102,346 @@ export function ProviderBundleEditor({
               </div>
             </Section>
 
-            {credentialProfile?.credentialPolicy.mode === "managed_account" ? (
-              <Section
-                title={t("providerBundle.account", {
-                  defaultValue: "OAuth 账号",
-                })}
-                icon={<KeyRound className="h-4 w-4" />}
-              >
-                <div
-                  id={bundleValidationFieldId({
-                    code: "accountRequired",
-                    field: "account",
-                    message: "",
-                  })}
-                  className={cn(
-                    matchesBundleValidationIssue(validation, "account") &&
-                      "rounded-md border border-destructive p-3",
-                  )}
-                >
-                  <ManagedAccountSection
-                    providerType={
-                      credentialProfile.credentialPolicy.accountProviderType
-                    }
-                    selectedAccountId={draft.accountId || null}
-                    onAccountSelect={(accountId) => {
-                      const account = accounts.find(
-                        (item) => item.id === accountId,
-                      );
-                      setDraft((current) => ({
-                        ...current,
-                        accountId: accountId ?? "",
-                        accountGeneration: account?.authIdentityGeneration,
-                      }));
-                    }}
-                  />
-                  {matchesBundleValidationIssue(validation, "account") &&
-                  validation ? (
-                    <p className="mt-2 text-xs text-destructive">
-                      {validationMessage(validation)}
-                    </p>
-                  ) : null}
-                </div>
-              </Section>
-            ) : null}
+            <ConfigCard
+              id="bundle-card-connection"
+              title={t("providerBundle.cardConnection", {
+                defaultValue: "上游连接",
+              })}
+              icon={<KeyRound className="h-4 w-4 text-muted-foreground" />}
+              summary={connectionSummary}
+              status={<CardGapStatus gap={readiness.connection} />}
+              open={openCards.connection}
+              onOpenChange={(open) => setCardOpen("connection", open)}
+            >
+              <div className="space-y-5">
+                {credentialProfile?.credentialPolicy.mode ===
+                "managed_account" ? (
+                  <div
+                    id={bundleValidationFieldId({
+                      code: "accountRequired",
+                      field: "account",
+                      message: "",
+                    })}
+                    className={cn(
+                      matchesBundleValidationIssue(validation, "account") &&
+                        "rounded-md border border-destructive p-3",
+                    )}
+                  >
+                    <ManagedAccountSection
+                      providerType={
+                        credentialProfile.credentialPolicy.accountProviderType
+                      }
+                      selectedAccountId={draft.accountId || null}
+                      onAccountSelect={(accountId) => {
+                        const account = accounts.find(
+                          (item) => item.id === accountId,
+                        );
+                        setDraft((current) => ({
+                          ...current,
+                          accountId: accountId ?? "",
+                          accountGeneration: account?.authIdentityGeneration,
+                        }));
+                      }}
+                    />
+                    {matchesBundleValidationIssue(validation, "account") &&
+                    validation ? (
+                      <p className="mt-2 text-xs text-destructive">
+                        {validationMessage(validation)}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
 
-            {familyCredentialSlots(family).length ? (
-              <Section
-                title={t("providerBundle.credential", {
-                  defaultValue: "共享凭据",
-                })}
-                icon={<KeyRound className="h-4 w-4" />}
-              >
-                <div className="grid gap-4 md:grid-cols-2">
-                  {familyCredentialSlots(family).map(({ logical, pointer }) => {
-                    const actualPointer =
-                      Object.keys(draft.secrets).find(
-                        (slot) =>
-                          slot === pointer ||
-                          slot.endsWith(
-                            pointer.slice(pointer.lastIndexOf("/")),
-                          ),
-                      ) ?? pointer;
-                    const secret = draft.secrets[actualPointer] ?? {
-                      configured: false,
-                      value: "",
-                      clear: false,
-                    };
-                    const edit = credentialEditForBundleSecret(
-                      actualPointer,
-                      secret,
-                    );
-                    const revealedValue =
-                      revealedCredentialValues[actualPointer];
-                    const revealStatus =
-                      credentialRevealStatuses[actualPointer] ?? "idle";
-                    const value = credentialInputValue(edit, revealedValue);
-                    const loadingCurrent =
-                      edit.configured &&
-                      edit.action === "keep" &&
-                      revealStatus === "loading";
-                    const currentRevealFailed =
-                      edit.configured &&
-                      edit.action === "keep" &&
-                      revealStatus === "error";
-                    return (
-                      <div key={logical} className="space-y-2">
-                        <div className="flex min-h-6 items-center justify-between gap-2">
-                          <Label>{fieldLabel(logical)}</Label>
-                          {loadingCurrent ? (
-                            <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
-                          ) : currentRevealFailed ? (
-                            <Button
-                              type="button"
-                              size="icon"
-                              variant="ghost"
-                              className="h-6 w-6"
-                              title={t("common.retry")}
-                              aria-label={t("common.retry")}
-                              onClick={() =>
-                                void retryCredentialReveal(actualPointer)
+                {familyCredentialSlots(family).length ? (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    {familyCredentialSlots(family).map(
+                      ({ logical, pointer }) => {
+                        const actualPointer =
+                          Object.keys(draft.secrets).find(
+                            (slot) =>
+                              slot === pointer ||
+                              slot.endsWith(
+                                pointer.slice(pointer.lastIndexOf("/")),
+                              ),
+                          ) ?? pointer;
+                        const secret = draft.secrets[actualPointer] ?? {
+                          configured: false,
+                          value: "",
+                          clear: false,
+                        };
+                        const edit = credentialEditForBundleSecret(
+                          actualPointer,
+                          secret,
+                        );
+                        const revealedValue =
+                          revealedCredentialValues[actualPointer];
+                        const revealStatus =
+                          credentialRevealStatuses[actualPointer] ?? "idle";
+                        const value = credentialInputValue(edit, revealedValue);
+                        const loadingCurrent =
+                          edit.configured &&
+                          edit.action === "keep" &&
+                          revealStatus === "loading";
+                        const currentRevealFailed =
+                          edit.configured &&
+                          edit.action === "keep" &&
+                          revealStatus === "error";
+                        return (
+                          <div key={logical} className="space-y-2">
+                            <div className="flex min-h-6 items-center justify-between gap-2">
+                              <Label>{fieldLabel(logical)}</Label>
+                              {loadingCurrent ? (
+                                <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" />
+                              ) : currentRevealFailed ? (
+                                <Button
+                                  type="button"
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-6 w-6"
+                                  title={t("common.retry")}
+                                  aria-label={t("common.retry")}
+                                  onClick={() =>
+                                    void retryCredentialReveal(actualPointer)
+                                  }
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : null}
+                            </div>
+                            <SecretInput
+                              id={bundleValidationFieldId({
+                                code: "credentialRequired",
+                                field: "credential",
+                                message: "",
+                              })}
+                              className={fieldErrorClass(
+                                matchesBundleValidationIssue(
+                                  validation,
+                                  "credential",
+                                ),
+                              )}
+                              value={value}
+                              disabled={
+                                loadingCurrent || edit.action === "clear"
                               }
-                            >
-                              <RefreshCw className="h-3.5 w-3.5" />
-                            </Button>
-                          ) : null}
-                        </div>
-                        <SecretInput
+                              autoComplete="new-password"
+                              placeholder={
+                                loadingCurrent
+                                  ? t("serverProviderForm.credentials.loading")
+                                  : currentRevealFailed
+                                    ? t(
+                                        "serverProviderForm.credentials.loadFailedPlaceholder",
+                                      )
+                                    : t(
+                                        "serverProviderForm.credentials.placeholder",
+                                      )
+                              }
+                              onChange={(event) => {
+                                const next = updateCredentialInput(
+                                  edit,
+                                  event.target.value,
+                                  {
+                                    optional: logical === "session_token",
+                                    revealedValue,
+                                    revealStatus,
+                                  },
+                                );
+                                setDraft((current) => ({
+                                  ...current,
+                                  secrets: {
+                                    ...current.secrets,
+                                    [actualPointer]:
+                                      bundleSecretFromCredentialEdit(next),
+                                  },
+                                }));
+                              }}
+                            />
+                            {currentRevealFailed ? (
+                              <p className="text-xs text-destructive">
+                                {t("serverProviderForm.credentials.loadFailed")}
+                              </p>
+                            ) : null}
+                          </div>
+                        );
+                      },
+                    )}
+                    {credentialProfile?.formComposition === "aws" ? (
+                      <div className="space-y-2">
+                        <Label>AWS Region</Label>
+                        <Input
                           id={bundleValidationFieldId({
-                            code: "credentialRequired",
-                            field: "credential",
+                            code: "awsRegionRequired",
+                            field: "awsRegion",
                             message: "",
                           })}
                           className={fieldErrorClass(
                             matchesBundleValidationIssue(
                               validation,
-                              "credential",
+                              "awsRegion",
                             ),
                           )}
-                          value={value}
-                          disabled={loadingCurrent || edit.action === "clear"}
-                          autoComplete="new-password"
-                          placeholder={
-                            loadingCurrent
-                              ? t("serverProviderForm.credentials.loading")
-                              : currentRevealFailed
-                                ? t(
-                                    "serverProviderForm.credentials.loadFailedPlaceholder",
-                                  )
-                                : t(
-                                    "serverProviderForm.credentials.placeholder",
-                                  )
+                          value={draft.awsRegion}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              awsRegion: event.target.value,
+                            })
                           }
-                          onChange={(event) => {
-                            const next = updateCredentialInput(
-                              edit,
-                              event.target.value,
-                              {
-                                optional: logical === "session_token",
-                                revealedValue,
-                                revealStatus,
-                              },
-                            );
-                            setDraft((current) => ({
-                              ...current,
-                              secrets: {
-                                ...current.secrets,
-                                [actualPointer]:
-                                  bundleSecretFromCredentialEdit(next),
-                              },
-                            }));
-                          }}
                         />
-                        {currentRevealFailed ? (
-                          <p className="text-xs text-destructive">
-                            {t("serverProviderForm.credentials.loadFailed")}
-                          </p>
-                        ) : null}
                       </div>
-                    );
-                  })}
-                  {credentialProfile?.formComposition === "aws" ? (
-                    <div className="space-y-2">
-                      <Label>AWS Region</Label>
-                      <Input
-                        id={bundleValidationFieldId({
-                          code: "awsRegionRequired",
-                          field: "awsRegion",
-                          message: "",
-                        })}
-                        className={fieldErrorClass(
-                          matchesBundleValidationIssue(validation, "awsRegion"),
-                        )}
-                        value={draft.awsRegion}
-                        onChange={(event) =>
-                          setDraft({ ...draft, awsRegion: event.target.value })
-                        }
-                      />
-                    </div>
-                  ) : null}
-                </div>
-              </Section>
-            ) : null}
+                    ) : null}
+                  </div>
+                ) : null}
 
-            <Section title={t("serverProviderForm.model.title")}>
-              <div className="max-w-xl space-y-4">
-                <p className="text-sm text-muted-foreground">
-                  {t("providerBundle.modelScopeHint", {
-                    defaultValue:
-                      "Global uses one upstream model for every configurable App. Per App lets each Surface keep its own model.",
-                  })}
-                </p>
-                <div className="space-y-2">
-                  <Label>{t("providerBundle.modelScope")}</Label>
+                {commonEndpointEditable ? (
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-bundle-endpoint">
+                      {t("serverProviderForm.endpoint.url")}
+                    </Label>
+                    <Input
+                      id={bundleValidationFieldId({
+                        code: "endpointInvalid",
+                        field: "endpoint",
+                        message: "",
+                      })}
+                      type="url"
+                      placeholder="https://api.example.com/v1"
+                      className={fieldErrorClass(
+                        matchesBundleValidationIssue(validation, "endpoint"),
+                      )}
+                      value={draft.endpoint}
+                      onChange={(event) =>
+                        setDraft({ ...draft, endpoint: event.target.value })
+                      }
+                    />
+                  </div>
+                ) : null}
+
+                {/* The address lives on each Surface for this family. Say so and point at
+                    it, rather than leaving a connection card that looks half-empty. */}
+                {family.endpointScope === "surface" ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-dashed px-3 py-2.5">
+                    <span className="text-xs text-muted-foreground">
+                      {t("providerBundle.endpointPerSurfaceHint", {
+                        defaultValue:
+                          "该供应商的 API 地址与凭据在每个应用接口里单独配置。",
+                      })}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      onClick={() => revealCard("surfaces")}
+                    >
+                      {t("providerBundle.goToSurfaces", {
+                        defaultValue: "前往应用接口",
+                      })}
+                      <ArrowRight className="ml-1 h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ) : null}
+
+                <div className="space-y-2 border-t pt-4">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <Label>
+                      {t("providerBundle.connectionTimeouts", {
+                        defaultValue: "连接与超时",
+                      })}
+                    </Label>
+                    <span className="text-xs text-muted-foreground">
+                      {t("providerBundle.timeoutHint", {
+                        defaultValue: "留空即使用全局默认值",
+                      })}
+                    </span>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    {[
+                      {
+                        key: "timeoutSeconds" as const,
+                        defaultKey: "requestTimeoutSeconds" as const,
+                        label: t("providerBundle.requestTimeoutShort", {
+                          defaultValue: "请求超时",
+                        }),
+                        max: 3_600,
+                      },
+                      {
+                        key: "streamFirstByteTimeoutSeconds" as const,
+                        defaultKey: "streamFirstByteTimeoutSeconds" as const,
+                        label: t("providerBundle.firstByteTimeoutShort", {
+                          defaultValue: "首字节超时",
+                        }),
+                        max: 600,
+                      },
+                      {
+                        key: "streamIdleTimeoutSeconds" as const,
+                        defaultKey: "streamIdleTimeoutSeconds" as const,
+                        label: t("providerBundle.streamIdleTimeoutShort", {
+                          defaultValue: "流空闲超时",
+                        }),
+                        max: 3_600,
+                      },
+                    ].map(({ key, defaultKey, label, max }) => (
+                      <div key={key} className="space-y-1.5">
+                        <Label
+                          htmlFor={`provider-bundle-${key}`}
+                          className="text-xs font-normal text-muted-foreground"
+                        >
+                          {label}
+                        </Label>
+                        {/* The unit belongs in the field, not in the label: three labels
+                            each ending in "（秒）" made the row read as boilerplate. */}
+                        <div className="relative">
+                          <Input
+                            id={`provider-bundle-${key}`}
+                            type="number"
+                            min={1}
+                            max={max}
+                            step={1}
+                            value={draft.transport[key]}
+                            placeholder={
+                              requestDefaults
+                                ? String(requestDefaults[defaultKey])
+                                : undefined
+                            }
+                            className="pr-9 focus:placeholder:text-transparent [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                transport: {
+                                  ...current.transport,
+                                  [key]: event.target.value,
+                                },
+                              }))
+                            }
+                          />
+                          <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">
+                            {t("providerBundle.secondsUnit", {
+                              defaultValue: "秒",
+                            })}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </ConfigCard>
+
+            <ConfigCard
+              id="bundle-card-model"
+              title={t("serverProviderForm.model.title")}
+              icon={<Target className="h-4 w-4 text-muted-foreground" />}
+              summary={modelSummary}
+              status={<CardGapStatus gap={modelGap ? "model" : null} />}
+              open={openCards.model}
+              onOpenChange={(open) => setCardOpen("model", open)}
+            >
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <Label className="shrink-0">
+                    {t("providerBundle.modelScope")}
+                  </Label>
                   {perAppModelPolicyRequired ? (
                     <Badge variant="secondary">
                       {t("providerBundle.modelScopePerApp")}
@@ -2034,11 +2464,17 @@ export function ProviderBundleEditor({
                         );
                       }}
                     >
-                      <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
-                        <TabsTrigger value="global" className="rounded-sm">
+                      <TabsList className="h-9 gap-1 border bg-muted/40 p-1">
+                        <TabsTrigger
+                          value="global"
+                          className="h-7 rounded-sm px-3 text-xs"
+                        >
                           {t("providerBundle.modelScopeGlobal")}
                         </TabsTrigger>
-                        <TabsTrigger value="per_app" className="rounded-sm">
+                        <TabsTrigger
+                          value="per_app"
+                          className="h-7 rounded-sm px-3 text-xs"
+                        >
                           {t("providerBundle.modelScopePerApp")}
                         </TabsTrigger>
                       </TabsList>
@@ -2049,10 +2485,22 @@ export function ProviderBundleEditor({
                     </Badge>
                   )}
                 </div>
+                {/* One sentence about the mode you are actually in beats a paragraph
+                    describing both of them. */}
+                <p className="text-xs text-muted-foreground">
+                  {draft.modelPolicyScope === "per_app"
+                    ? t("providerBundle.modelScopePerAppHint", {
+                        defaultValue: "每个应用接口各自决定使用哪个上游模型。",
+                      })
+                    : t("providerBundle.modelScopeGlobalHint", {
+                        defaultValue:
+                          "所有可配置的应用接口共用同一个上游模型。",
+                      })}
+                </p>
 
                 {draft.modelPolicyScope === "global" ? (
                   <>
-                    <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       {allowedModelPolicies.length > 1 ? (
                         <Tabs
                           value={draft.modelPolicy}
@@ -2072,17 +2520,17 @@ export function ProviderBundleEditor({
                             );
                           }}
                         >
-                          <TabsList className="grid h-10 w-full grid-cols-2 gap-1 border bg-muted/40 p-1">
+                          <TabsList className="h-9 gap-1 border bg-muted/40 p-1">
                             {allowedModelPolicies.map((policy) => (
                               <TabsTrigger
                                 key={policy}
                                 value={policy}
-                                className="min-w-0 gap-2 rounded-sm px-3 data-[state=active]:bg-background data-[state=active]:text-foreground"
+                                className="h-7 min-w-0 gap-1.5 rounded-sm px-3 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground"
                               >
                                 {policy === "single" ? (
-                                  <Target className="hidden h-4 w-4 shrink-0 sm:block" />
+                                  <Target className="h-3.5 w-3.5 shrink-0" />
                                 ) : (
-                                  <ArrowRightLeft className="hidden h-4 w-4 shrink-0 sm:block" />
+                                  <ArrowRightLeft className="h-3.5 w-3.5 shrink-0" />
                                 )}
                                 {policy === "single"
                                   ? t("providerBundle.modelSingle")
@@ -2092,33 +2540,38 @@ export function ProviderBundleEditor({
                           </TabsList>
                         </Tabs>
                       ) : (
-                        <div className="inline-flex h-10 items-center gap-2 rounded-md border bg-muted/40 px-3 text-sm font-medium">
+                        <div className="inline-flex h-9 items-center gap-2 rounded-md border bg-muted/40 px-3 text-xs font-medium">
                           {draft.modelPolicy === "single" ? (
-                            <Target className="h-4 w-4" />
+                            <Target className="h-3.5 w-3.5" />
                           ) : (
-                            <ArrowRightLeft className="h-4 w-4" />
+                            <ArrowRightLeft className="h-3.5 w-3.5" />
                           )}
                           {draft.modelPolicy === "single"
                             ? t("providerBundle.modelSingle")
                             : t("providerBundle.modelPassthrough")}
                         </div>
                       )}
-                    </div>
-                    {draft.modelPolicy === "single" ? (
-                      <div className="space-y-2">
-                        <Label htmlFor="provider-bundle-model">
-                          {t("serverProviderForm.model.upstreamModel")}
-                        </Label>
+                      {draft.modelPolicy === "single" ? (
                         <Input
                           id={bundleValidationFieldId({
                             code: "upstreamModelRequired",
                             field: "upstreamModel",
                             message: "",
                           })}
-                          className={fieldErrorClass(
-                            matchesBundleValidationIssue(
-                              validation,
-                              "upstreamModel",
+                          aria-label={t(
+                            "serverProviderForm.model.upstreamModel",
+                          )}
+                          placeholder={
+                            defaultSharedModel ||
+                            t("serverProviderForm.model.upstreamModel")
+                          }
+                          className={cn(
+                            "h-9 min-w-0 flex-1 basis-56",
+                            fieldErrorClass(
+                              matchesBundleValidationIssue(
+                                validation,
+                                "upstreamModel",
+                              ),
                             ),
                           )}
                           value={draft.upstreamModel}
@@ -2132,303 +2585,59 @@ export function ProviderBundleEditor({
                             )
                           }
                         />
-                      </div>
-                    ) : null}
+                      ) : null}
+                    </div>
                     {fixedModelSurfaces.length ? (
-                      <div className="grid gap-2 border-t pt-3 text-sm">
+                      <div className="rounded-md border px-3">
                         {fixedModelSurfaces.map((surface) => (
-                          <div
+                          <SurfaceModelRow
                             key={surface.app}
-                            className="flex min-w-0 items-center gap-2"
-                          >
-                            <span className="shrink-0 font-medium">
-                              {APP_LABELS[surface.app]}
-                            </span>
-                            <Badge variant="secondary">
-                              {t("providerBundle.modelProfileFixed")}
-                            </Badge>
-                            <span
-                              className="min-w-0 truncate text-muted-foreground"
-                              title={
-                                surface.modelPolicy === "single"
-                                  ? surface.upstreamModel
-                                  : t("providerBundle.modelPassthrough")
-                              }
-                            >
-                              {surface.modelPolicy === "single"
-                                ? surface.upstreamModel
-                                : t("providerBundle.modelPassthrough")}
-                            </span>
-                          </div>
+                            surface={surface}
+                            validation={validation}
+                            onChange={updateSurface}
+                          />
                         ))}
                       </div>
                     ) : null}
                   </>
-                ) : null}
-              </div>
-            </Section>
-
-            <Collapsible>
-              <CollapsibleTrigger asChild>
-                <Button type="button" variant="ghost" size="sm">
-                  <ChevronDown className="mr-2 h-4 w-4" />
-                  {t("providerBundle.advanced", { defaultValue: "高级设置" })}
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="space-y-6 pt-4">
-                <Section
-                  title={t("providerBundle.testModel", {
-                    defaultValue: "测试模型",
-                  })}
-                >
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="space-y-2">
-                      <Label>{t("providerBundle.testApp")}</Label>
-                      <Select
-                        value={draft.testApp}
-                        onValueChange={(value) =>
-                          setDraft((current) => ({
-                            ...current,
-                            testApp: value as CoreProviderApp,
-                          }))
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {enabledTestApps.map((app) => (
-                            <SelectItem key={app} value={app}>
-                              <span className="flex items-center gap-2">
-                                <AppLogo app={app} />
-                                {APP_LABELS[app]}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="provider-bundle-test-model">
-                        {t("providerBundle.providerTestModel", {
-                          defaultValue: "供应商默认测试模型",
-                        })}
-                      </Label>
-                      <Input
-                        id="provider-bundle-test-model"
-                        value={draft.testModel}
-                        placeholder={
-                          healthCheckConfig?.testModels[draft.testApp]
-                        }
-                        className="focus:placeholder:text-transparent"
-                        onChange={(event) =>
-                          setDraft((current) => ({
-                            ...current,
-                            testModel: event.target.value,
-                          }))
-                        }
+                ) : (
+                  /* Per App means every Surface gets a line here — one place to compare
+                     them, instead of one model field buried in each Surface tab. */
+                  <div className="rounded-md border px-3">
+                    {draft.surfaces.map((surface) => (
+                      <SurfaceModelRow
+                        key={surface.app}
+                        surface={surface}
+                        validation={validation}
+                        onChange={updateSurface}
                       />
-                    </div>
-                    <div className="space-y-3 md:col-span-2">
-                      <Label>
-                        {t("providerBundle.surfaceTestModelOverrides", {
-                          defaultValue: "App 特例",
-                        })}
-                      </Label>
-                      <div className="grid gap-4 md:grid-cols-3">
-                        {enabledTestApps.map((app) => (
-                          <div key={app} className="space-y-2">
-                            <Label
-                              htmlFor={`provider-bundle-${app}-test-model`}
-                              className="flex items-center gap-2 text-xs text-muted-foreground"
-                            >
-                              <AppLogo app={app} />
-                              {APP_LABELS[app]}
-                            </Label>
-                            <Input
-                              id={`provider-bundle-${app}-test-model`}
-                              value={draft.surfaceTestModels[app]}
-                              placeholder={
-                                draft.testModel.trim() ||
-                                healthCheckConfig?.testModels[app]
-                              }
-                              className="focus:placeholder:text-transparent"
-                              onChange={(event) =>
-                                setDraft((current) => ({
-                                  ...current,
-                                  surfaceTestModels: {
-                                    ...current.surfaceTestModels,
-                                    [app]: event.target.value,
-                                  },
-                                }))
-                              }
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                </Section>
-
-                {commonEndpointEditable ? (
-                  <Section title={t("serverProviderForm.endpoint.title")}>
-                    <Input
-                      id={bundleValidationFieldId({
-                        code: "endpointInvalid",
-                        field: "endpoint",
-                        message: "",
-                      })}
-                      type="url"
-                      className={fieldErrorClass(
-                        matchesBundleValidationIssue(validation, "endpoint"),
-                      )}
-                      value={draft.endpoint}
-                      onChange={(event) =>
-                        setDraft({ ...draft, endpoint: event.target.value })
-                      }
-                    />
-                  </Section>
-                ) : null}
-
-                <Section
-                  title={t("providerBundle.connectionTimeouts", {
-                    defaultValue: "连接与超时",
-                  })}
-                >
-                  <div className="grid gap-4 md:grid-cols-3">
-                    {[
-                      {
-                        key: "timeoutSeconds" as const,
-                        defaultKey: "requestTimeoutSeconds" as const,
-                        label: t("providerBundle.requestTimeout", {
-                          defaultValue: "请求超时（秒）",
-                        }),
-                        max: 3_600,
-                      },
-                      {
-                        key: "streamFirstByteTimeoutSeconds" as const,
-                        defaultKey: "streamFirstByteTimeoutSeconds" as const,
-                        label: t("providerBundle.firstByteTimeout", {
-                          defaultValue: "首字节超时（秒）",
-                        }),
-                        max: 600,
-                      },
-                      {
-                        key: "streamIdleTimeoutSeconds" as const,
-                        defaultKey: "streamIdleTimeoutSeconds" as const,
-                        label: t("providerBundle.streamIdleTimeout", {
-                          defaultValue: "流空闲超时（秒）",
-                        }),
-                        max: 3_600,
-                      },
-                    ].map(({ key, defaultKey, label, max }) => (
-                      <div key={key} className="space-y-2">
-                        <Label>{label}</Label>
-                        <Input
-                          type="number"
-                          min={1}
-                          max={max}
-                          step={1}
-                          value={draft.transport[key]}
-                          placeholder={
-                            requestDefaults
-                              ? String(requestDefaults[defaultKey])
-                              : undefined
-                          }
-                          className="focus:placeholder:text-transparent"
-                          onChange={(event) =>
-                            setDraft((current) => ({
-                              ...current,
-                              transport: {
-                                ...current.transport,
-                                [key]: event.target.value,
-                              },
-                            }))
-                          }
-                        />
-                      </div>
                     ))}
                   </div>
-                </Section>
-
-                {codexDriverOptions ? (
-                  <Section title={t("codexOauth.featureOptionsTitle")}>
-                    <CodexFeatureOptions
-                      values={{
-                        codexFastMode: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.codexFastMode === true,
-                        ),
-                        codexImageGenerationEnabled: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions
-                              .codexImageGenerationEnabled === true,
-                        ),
-                        codexWebsocketEnabled: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.codexWebsocketEnabled ===
-                            true,
-                        ),
-                      }}
-                      onChange={setDriverOption}
-                    />
-                  </Section>
-                ) : null}
-
-                {grokDriverOptions ? (
-                  <Section
-                    title={t("grokOauth.featureOptionsTitle", {
-                      defaultValue: "Grok OAuth 媒体能力",
-                    })}
-                  >
-                    <GrokFeatureOptions
-                      providerId={bundle?.surfaces.codex?.provider.id}
-                      values={{
-                        grokImageGenerationEnabled: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.grokImageGenerationEnabled ===
-                            true,
-                        ),
-                        grokImageEditEnabled: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.grokImageEditEnabled === true,
-                        ),
-                        grokVideoGenerationEnabled: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.grokVideoGenerationEnabled ===
-                            true,
-                        ),
-                      }}
-                      onChange={setGrokDriverOption}
-                    />
-                  </Section>
-                ) : null}
-
-                {codexControlTarget ? (
-                  <CodexBankedResetPanel
-                    accountId={codexControlTarget.accountId}
-                    providerId={codexControlTarget.providerId}
-                    expectedRevision={codexControlTarget.expectedRevision}
-                    workspaceId={codexControlWorkspaceId}
-                  />
-                ) : null}
-
-                {codexControlTarget ? (
-                  <Section title={t("codexReferrals.sectionTitle")}>
-                    <CodexReferralPanel
-                      providerId={codexControlTarget.providerId}
-                      expectedRevision={codexControlTarget.expectedRevision}
-                    />
-                  </Section>
-                ) : null}
-              </CollapsibleContent>
-            </Collapsible>
+                )}
+              </div>
+            </ConfigCard>
 
             {showSurfaceTabs || family.endpointScope === "surface" ? (
-              <Section
+              <ConfigCard
+                id="bundle-card-surfaces"
                 title={t("providerBundle.surfaces", {
                   defaultValue: "应用接口",
                 })}
+                icon={<Layers className="h-4 w-4 text-muted-foreground" />}
+                summary={surfacesSummary}
+                status={
+                  surfaceGapCount ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive">
+                      <StatusDot tone="gap" />
+                      {t("providerBundle.cardPending", {
+                        defaultValue: "待完善",
+                      })}
+                      <span className="tabular-nums">{surfaceGapCount}</span>
+                    </span>
+                  ) : null
+                }
+                open={openCards.surfaces}
+                onOpenChange={(open) => setCardOpen("surfaces", open)}
               >
                 {showSurfaceTabs ? (
                   <Tabs
@@ -2449,19 +2658,11 @@ export function ProviderBundleEditor({
                           value={surface.app}
                           className="min-w-0 gap-2"
                         >
-                          <AppLogo app={surface.app} />
+                          <AppLogo app={surface.app} muted={!surface.enabled} />
                           <span className="truncate">
                             {APP_LABELS[surface.app]}
                           </span>
-                          {surface.enabled ? (
-                            <Check className="h-3.5 w-3.5" />
-                          ) : (
-                            <span className="text-[10px] text-muted-foreground">
-                              {t("providerBundle.surfaceOff", {
-                                defaultValue: "关",
-                              })}
-                            </span>
-                          )}
+                          <StatusDot tone={surfaceTone(surface.app)} />
                         </TabsTrigger>
                       ))}
                     </TabsList>
@@ -2469,7 +2670,6 @@ export function ProviderBundleEditor({
                       <TabsContent key={surface.app} value={surface.app}>
                         <SurfaceEditor
                           surface={surface}
-                          modelPolicyScope={draft.modelPolicyScope}
                           validation={validation}
                           onChange={updateSurface}
                         />
@@ -2479,12 +2679,248 @@ export function ProviderBundleEditor({
                 ) : activeSurface ? (
                   <SurfaceEditor
                     surface={activeSurface}
-                    modelPolicyScope={draft.modelPolicyScope}
                     validation={validation}
                     onChange={updateSurface}
                   />
                 ) : null}
-              </Section>
+              </ConfigCard>
+            ) : null}
+
+            <ConfigCard
+              id="bundle-card-diagnostics"
+              title={t("providerBundle.cardDiagnostics", {
+                defaultValue: "连通性测试",
+              })}
+              icon={<Stethoscope className="h-4 w-4 text-muted-foreground" />}
+              summary={diagnosticsSummary}
+              open={openCards.diagnostics}
+              onOpenChange={(open) => setCardOpen("diagnostics", open)}
+            >
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <Label className="shrink-0">
+                    {t("providerBundle.testApp")}
+                  </Label>
+                  {enabledTestApps.length > 1 ? (
+                    <Tabs
+                      value={draft.testApp}
+                      onValueChange={(value) =>
+                        setDraft((current) => ({
+                          ...current,
+                          testApp: value as CoreProviderApp,
+                        }))
+                      }
+                    >
+                      <TabsList className="h-9 gap-1 border bg-muted/40 p-1">
+                        {enabledTestApps.map((app) => (
+                          <TabsTrigger
+                            key={app}
+                            value={app}
+                            className="h-7 gap-1.5 rounded-sm px-3 text-xs"
+                          >
+                            <AppLogo app={app} size={14} />
+                            {APP_LABELS[app]}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                    </Tabs>
+                  ) : (
+                    <span className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-muted/40 px-3 text-xs font-medium">
+                      <AppLogo app={draft.testApp} size={14} />
+                      {APP_LABELS[draft.testApp]}
+                    </span>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="provider-bundle-test-model">
+                    {t("providerBundle.providerTestModel", {
+                      defaultValue: "供应商默认测试模型",
+                    })}
+                  </Label>
+                  <Input
+                    id="provider-bundle-test-model"
+                    value={draft.testModel}
+                    placeholder={healthCheckConfig?.testModels[draft.testApp]}
+                    className="focus:placeholder:text-transparent"
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        testModel: event.target.value,
+                      }))
+                    }
+                  />
+                  {/* An empty field with a grey placeholder is ambiguous — it could be a
+                      default or it could be nothing. Spell the fallback out. */}
+                  {!draft.testModel.trim() &&
+                  healthCheckConfig?.testModels[draft.testApp] ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("providerBundle.testModelDefaultHint", {
+                        defaultValue: "留空则使用 {{model}}",
+                        model: healthCheckConfig.testModels[draft.testApp],
+                      })}
+                    </p>
+                  ) : null}
+                </div>
+
+                <Collapsible>
+                  <CollapsibleTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 px-2 text-xs"
+                    >
+                      <ChevronDown className="mr-1.5 h-3.5 w-3.5" />
+                      {t("providerBundle.surfaceTestModelOverrides", {
+                        defaultValue: "App 特例",
+                      })}
+                      {surfaceTestModelOverrides ? (
+                        <Badge variant="secondary" className="ml-1.5">
+                          {surfaceTestModelOverrides}
+                        </Badge>
+                      ) : null}
+                    </Button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-3">
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {enabledTestApps.map((app) => (
+                        <div key={app} className="space-y-1.5">
+                          <Label
+                            htmlFor={`provider-bundle-${app}-test-model`}
+                            className="flex items-center gap-2 text-xs font-normal text-muted-foreground"
+                          >
+                            <AppLogo app={app} size={14} />
+                            {APP_LABELS[app]}
+                          </Label>
+                          <Input
+                            id={`provider-bundle-${app}-test-model`}
+                            value={draft.surfaceTestModels[app]}
+                            placeholder={
+                              draft.testModel.trim() ||
+                              healthCheckConfig?.testModels[app]
+                            }
+                            className="focus:placeholder:text-transparent"
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                surfaceTestModels: {
+                                  ...current.surfaceTestModels,
+                                  [app]: event.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              </div>
+            </ConfigCard>
+
+            {codexDriverOptions || grokDriverOptions ? (
+              <ConfigCard
+                id="bundle-card-features"
+                title={t("providerBundle.cardFeatures", {
+                  defaultValue: "功能开关",
+                })}
+                icon={
+                  <SlidersHorizontal className="h-4 w-4 text-muted-foreground" />
+                }
+                summary={featuresSummary}
+                open={openCards.features}
+                onOpenChange={(open) => setCardOpen("features", open)}
+              >
+                <div className="space-y-5">
+                  {codexDriverOptions ? (
+                    <CodexFeatureOptions
+                      values={{
+                        codexFastMode: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions.codexFastMode === true,
+                        ),
+                        codexImageGenerationEnabled: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions
+                              .codexImageGenerationEnabled === true,
+                        ),
+                        codexWebsocketEnabled: draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions.codexWebsocketEnabled ===
+                            true,
+                        ),
+                      }}
+                      onChange={setDriverOption}
+                    />
+                  ) : null}
+                  {grokDriverOptions ? (
+                    <div className="space-y-2">
+                      {codexDriverOptions ? (
+                        <Label>
+                          {t("grokOauth.featureOptionsTitle", {
+                            defaultValue: "Grok OAuth 媒体能力",
+                          })}
+                        </Label>
+                      ) : null}
+                      <GrokFeatureOptions
+                        providerId={bundle?.surfaces.codex?.provider.id}
+                        values={{
+                          grokImageGenerationEnabled: draft.surfaces.some(
+                            (surface) =>
+                              surface.driverOptions
+                                .grokImageGenerationEnabled === true,
+                          ),
+                          grokImageEditEnabled: draft.surfaces.some(
+                            (surface) =>
+                              surface.driverOptions.grokImageEditEnabled ===
+                              true,
+                          ),
+                          grokVideoGenerationEnabled: draft.surfaces.some(
+                            (surface) =>
+                              surface.driverOptions
+                                .grokVideoGenerationEnabled === true,
+                          ),
+                        }}
+                        onChange={setGrokDriverOption}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              </ConfigCard>
+            ) : null}
+
+            {codexControlTarget ? (
+              <ConfigCard
+                id="bundle-card-account-ops"
+                title={t("providerBundle.cardAccountOps", {
+                  defaultValue: "账号运维",
+                })}
+                icon={<Wrench className="h-4 w-4 text-muted-foreground" />}
+                summary={t("providerBundle.cardAccountOpsSummary", {
+                  defaultValue: "额度重置 · 邀请码",
+                })}
+                open={openCards.accountOps}
+                onOpenChange={(open) => setCardOpen("accountOps", open)}
+              >
+                <div className="space-y-6">
+                  <CodexBankedResetPanel
+                    accountId={codexControlTarget.accountId}
+                    providerId={codexControlTarget.providerId}
+                    expectedRevision={codexControlTarget.expectedRevision}
+                    workspaceId={codexControlWorkspaceId}
+                  />
+                  <div className="space-y-3 border-t pt-5">
+                    <h3 className="text-sm font-semibold">
+                      {t("codexReferrals.sectionTitle")}
+                    </h3>
+                    <CodexReferralPanel
+                      providerId={codexControlTarget.providerId}
+                      expectedRevision={codexControlTarget.expectedRevision}
+                    />
+                  </div>
+                </div>
+              </ConfigCard>
             ) : null}
           </div>
         ) : null}

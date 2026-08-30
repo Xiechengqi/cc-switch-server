@@ -501,8 +501,8 @@ export function AuthCenterPanel({
         {canShowAccountProvider("kimi_code") ? (
           <AuthProviderAccordionItem
             value="kimi-code"
-            icon={<ProviderIcon icon="kimi" name="Kimi Code" size={24} />}
-            title="Kimi Code"
+            icon={<ProviderIcon icon="kimi" name="Kimi Code OAuth" size={24} />}
+            title="Kimi Code OAuth"
             description={t("kimiOauth.description")}
           >
             <KimiOAuthSection showLoggedInAccounts />

@@ -131,7 +131,7 @@ export const googleGeminiApiKeyPreset: GeminiProviderPreset = {
 };
 
 export const kimiCodeClaudePreset: ProviderPreset = {
-  name: "Kimi Code",
+  name: "Kimi Code OAuth",
   websiteUrl: "https://kimi.com",
   settingsConfig: {
     env: {
@@ -148,7 +148,7 @@ export const kimiCodeClaudePreset: ProviderPreset = {
 };
 
 export const kimiCodeCodexPreset: CodexProviderPreset = {
-  name: "Kimi Code",
+  name: "Kimi Code OAuth",
   websiteUrl: "https://kimi.com",
   auth: {},
   config: `model_provider = "kimi_code"
@@ -169,7 +169,7 @@ requires_openai_auth = true`,
 };
 
 export const kimiCodeGeminiPreset: GeminiProviderPreset = {
-  name: "Kimi Code",
+  name: "Kimi Code OAuth",
   websiteUrl: "https://kimi.com",
   settingsConfig: {
     env: {
@@ -238,61 +238,61 @@ const directProfileVisuals: Record<string, DirectProfileVisual> = {
     icon: "cursor",
   },
   kimi_coding_api_key: {
-    name: "Kimi For Coding API Key",
+    name: "Kimi Code API Key",
     websiteUrl: "https://kimi.com",
     icon: "kimi",
     iconColor: "#6366F1",
   },
   zhipu_glm_cn: {
-    name: "Zhipu GLM Coding Plan (China)",
+    name: "Zhipu (China)",
     websiteUrl: "https://bigmodel.cn",
     icon: "zhipu",
     iconColor: "#0F62FE",
   },
   zhipu_glm_global: {
-    name: "Zhipu GLM Coding Plan (Global)",
+    name: "Zhipu (Global)",
     websiteUrl: "https://z.ai",
     icon: "zhipu",
     iconColor: "#0F62FE",
   },
   bailian_coding_plan_cn: {
-    name: "Alibaba Coding Plan (China)",
+    name: "Alibaba (China)",
     websiteUrl: "https://bailian.console.aliyun.com",
     icon: "bailian",
     iconColor: "#FF6A00",
   },
   bailian_coding_plan_global: {
-    name: "Alibaba Coding Plan (Global/Singapore)",
+    name: "Alibaba (Global/Singapore)",
     websiteUrl: "https://www.alibabacloud.com/product/coding",
     icon: "bailian",
     iconColor: "#FF6A00",
   },
   minimax_cn: {
-    name: "MiniMax Coding Plan (China)",
+    name: "MiniMax (China)",
     websiteUrl: "https://platform.minimaxi.com",
     icon: "minimax",
     iconColor: "#FF6B6B",
   },
   minimax_global: {
-    name: "MiniMax Coding Plan (Global)",
+    name: "MiniMax (Global)",
     websiteUrl: "https://platform.minimax.io",
     icon: "minimax",
     iconColor: "#FF6B6B",
   },
   volcengine_coding_plan: {
-    name: "Volcengine Agent/Coding Plan",
+    name: "Volcengine",
     websiteUrl: "https://www.volcengine.com",
     icon: "doubao",
     iconColor: "#1E37FC",
   },
   xiaomi_mimo_token_plan: {
-    name: "Xiaomi MiMo Token Plan (China)",
+    name: "Xiaomi MiMo (China)",
     websiteUrl: "https://platform.xiaomimimo.com",
     icon: "xiaomimimo",
     iconColor: "#FF6900",
   },
   xiaomi_mimo_token_plan_sgp: {
-    name: "Xiaomi MiMo Token Plan (Singapore)",
+    name: "Xiaomi MiMo (Singapore)",
     websiteUrl: "https://platform.xiaomimimo.com",
     icon: "xiaomimimo",
     iconColor: "#FF6900",

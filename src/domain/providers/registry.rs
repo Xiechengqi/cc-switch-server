@@ -828,7 +828,7 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             || profile.creation_policy != CreationPolicy::CreateAllowed
         {
             bail!(
-                "custom recipe {} must reference a creatable Custom HTTP profile",
+                "custom recipe {} must reference a creatable Custom profile",
                 recipe.recipe_id
             );
         }
@@ -1633,7 +1633,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(
                 !profiles.is_empty() || !recipes.is_empty(),
-                "missing visible create_allowed Profile or Custom HTTP recipe for {}:{}",
+                "missing visible create_allowed Profile or Custom recipe for {}:{}",
                 app.as_str(),
                 provider_type.as_str()
             );

@@ -923,12 +923,12 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
   {
-    name: "Xiaomi MiMo Token Plan (China)",
+    name: "Xiaomi MiMo (China)",
     websiteUrl: "https://platform.xiaomimimo.com/#/token-plan",
     apiKeyUrl: "https://platform.xiaomimimo.com/#/console/plan-manage",
     settingsConfig: {
       npm: "@ai-sdk/openai-compatible",
-      name: "Xiaomi MiMo Token Plan (China)",
+      name: "Xiaomi MiMo (China)",
       options: {
         baseURL: "https://token-plan-cn.xiaomimimo.com/v1",
         apiKey: "",

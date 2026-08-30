@@ -15,7 +15,6 @@ import type {
 } from "@dnd-kit/core";
 
 import AntigravityOauthQuotaFooter from "@/components/AntigravityOauthQuotaFooter";
-import { ClaudeIcon, CodexIcon, GeminiIcon } from "@/components/BrandIcons";
 import ClaudeOauthQuotaFooter from "@/components/ClaudeOauthQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
@@ -41,7 +40,6 @@ import { cn } from "@/lib/utils";
 import {
   modelPoliciesForProfile,
   profileById,
-  type CoreProviderApp,
 } from "@/server/providerRegistry";
 import { providerResourceSupportsOperation } from "@/server/providerOperations";
 import {
@@ -55,18 +53,7 @@ import {
   providerBundlePrimaryResource,
   providerBundleTestResource,
 } from "./bundleCard";
-
-const APP_LABELS: Record<CoreProviderApp, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-};
-
-function AppLogo({ app }: { app: CoreProviderApp }) {
-  if (app === "claude") return <ClaudeIcon size={17} />;
-  if (app === "codex") return <CodexIcon size={17} />;
-  return <GeminiIcon size={17} />;
-}
+import { APP_LABELS, AppLogo } from "./bundleApps";
 
 function BundleQuotaSummary({
   resource,
@@ -362,7 +349,7 @@ export function ProviderBundleCard({
                     )}
                     title={`${APP_LABELS[app]}${bundle.enabledApps.includes(app) ? "" : " (disabled)"}`}
                   >
-                    <AppLogo app={app} />
+                    <AppLogo app={app} size={17} />
                   </span>
                 ))}
               </div>

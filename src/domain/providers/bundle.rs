@@ -588,7 +588,7 @@ impl ProviderBundleWriteDraft {
         }
         if !surface.extra_headers.is_empty() && profile.form_composition != FormComposition::Custom
         {
-            bail!("extra headers are only valid for Custom HTTP Providers");
+            bail!("extra headers are only valid for Custom Providers");
         }
 
         let resolved_driver_id = match &profile.driver_binding {
@@ -632,12 +632,12 @@ impl ProviderBundleWriteDraft {
                 )?;
             }
         } else if api_key_field.is_some() {
-            bail!("apiKeyField is only valid for Custom HTTP Providers");
+            bail!("apiKeyField is only valid for Custom Providers");
         }
         if surface.driver_options.custom_user_agent.is_some()
             && profile.form_composition != FormComposition::Custom
         {
-            bail!("customUserAgent is only valid for Custom HTTP Providers");
+            bail!("customUserAgent is only valid for Custom Providers");
         }
         Ok(())
     }

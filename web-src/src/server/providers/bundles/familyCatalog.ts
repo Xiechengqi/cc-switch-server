@@ -8,18 +8,29 @@ import {
 import { createDraftForProfile } from "@/server/providers/editor/providerDraft";
 import { BUNDLE_TEST_APP_ORDER } from "./bundleDraft";
 
-export type FamilyCategoryId = "subscription" | "api_key";
+export type FamilyCategoryId = "custom" | "subscription" | "api_key";
 
 // Keep the historical Group name as an alias so existing callers do not need
-// to change just because the picker now has two product-facing categories.
+// to change just because the picker gained product-facing categories.
 export type FamilyGroupId = FamilyCategoryId;
 
 export type FamilyAuthKind = "oauth" | "api_key" | "aws" | "custom";
 
 export const FAMILY_GROUP_ORDER: FamilyCategoryId[] = [
+  "custom",
   "subscription",
   "api_key",
 ];
+
+/**
+ * Pinned above everything else and pre-selected. Bringing your own endpoint is
+ * the one path that works no matter which vendor someone is on, so it is the
+ * safest thing to land on; the subscription accounts sit right underneath and
+ * cost one click for anyone who wanted those instead.
+ */
+export const CUSTOM_FAMILY_IDS = ["family.custom_http"] as const;
+
+const CUSTOM_FAMILY_ID_SET = new Set<string>(CUSTOM_FAMILY_IDS);
 
 /**
  * Product-facing order and membership. This is intentionally explicit: a
@@ -60,10 +71,11 @@ const SUBSCRIPTION_FAMILY_ORDER = new Map<string, number>(
 export function recommendedFamilyId(
   families: readonly ProviderFamilySpec[] = providerRegistry.families,
 ): string {
+  const exists = (familyId: string) =>
+    families.some((family) => family.familyId === familyId);
   return (
-    SUBSCRIPTION_FAMILY_IDS.find((familyId) =>
-      families.some((family) => family.familyId === familyId),
-    ) ??
+    CUSTOM_FAMILY_IDS.find(exists) ??
+    SUBSCRIPTION_FAMILY_IDS.find(exists) ??
     families[0]?.familyId ??
     "family.claude_oauth"
   );
@@ -80,12 +92,38 @@ export function recommendedFamily(
 }
 
 export function familyCategoryId(familyId: string): FamilyCategoryId {
+  if (CUSTOM_FAMILY_ID_SET.has(familyId)) return "custom";
   return SUBSCRIPTION_FAMILY_ID_SET.has(familyId) ? "subscription" : "api_key";
 }
 
 export function familyGroupId(familyId: string): FamilyGroupId {
   return familyCategoryId(familyId);
 }
+
+/**
+ * Registry labels are contract strings, so they stay English. "Custom" is the one
+ * Family named after what it does rather than after a vendor, which makes it the
+ * one label worth translating; everything else is a brand name and should not be.
+ */
+const FAMILY_LABEL_KEYS: Record<string, string> = {
+  "family.custom_http": "providerBundle.familyCustom",
+};
+
+export function familyLabel(
+  family: ProviderFamilySpec,
+  t: (key: string, options?: { defaultValue: string }) => string,
+): string {
+  const labelKey = FAMILY_LABEL_KEYS[family.familyId];
+  return labelKey ? t(labelKey, { defaultValue: family.label }) : family.label;
+}
+
+/**
+ * Search runs over the untranslated label, so a reader who only ever sees 自定义
+ * would otherwise find nothing by typing it.
+ */
+const FAMILY_SEARCH_ALIASES: Record<string, string[]> = {
+  "family.custom_http": ["custom http", "自定义", "自訂", "カスタム"],
+};
 
 export function familyAuthKind(family: ProviderFamilySpec): FamilyAuthKind {
   const profile = profileById(family.credentialProfileId);
@@ -122,6 +160,7 @@ export function familySearchText(family: ProviderFamilySpec): string {
     preset?.websiteUrl,
     ...familySupportedApps(family),
     ...family.surfaces.map((surface) => surface.profileId),
+    ...(FAMILY_SEARCH_ALIASES[family.familyId] ?? []),
   ]
     .filter(Boolean)
     .join(" ")

@@ -993,7 +993,7 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
     iconColor: "#000000",
   },
   {
-    name: "Xiaomi MiMo Token Plan (China)",
+    name: "Xiaomi MiMo (China)",
     websiteUrl: "https://platform.xiaomimimo.com/#/token-plan",
     apiKeyUrl: "https://platform.xiaomimimo.com/#/console/plan-manage",
     category: "cn_official",

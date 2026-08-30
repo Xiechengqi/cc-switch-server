@@ -134,7 +134,6 @@ import { resolveManagedAccountId } from "@/lib/authBinding";
 import { stableStringify } from "@/lib/stableStringify";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { PROVIDER_TYPES } from "@/config/constants";
-import { detectCodingPlanProvider } from "@/config/codingPlanProviders";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 import {
   customProfileId,
