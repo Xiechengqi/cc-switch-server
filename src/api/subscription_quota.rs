@@ -170,6 +170,7 @@ pub(in crate::api) fn subscription_tool_label(provider_type: ProviderType) -> &'
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::CursorApiKey => "cursor_apikey",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::AmazonQOAuth => "amazon_q_oauth",
         ProviderType::GrokOAuth => "grok_oauth",
         _ => "unknown",
     }
@@ -338,6 +339,11 @@ fn subscription_tier_from_account_tier(tier: &AccountQuotaTier) -> Value {
         "used": tier.used,
         "limit": tier.limit,
         "unit": tier.unit,
+        "scope": tier.scope,
+        "capacityPool": tier.capacity_pool,
+        "modelFamily": tier.model_family,
+        "relativeWeeklyCapacity": tier.relative_weekly_capacity,
+        "source": tier.source,
     })
 }
 
@@ -489,6 +495,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }
@@ -680,6 +687,7 @@ mod tests {
                 limit: Some(100.0),
                 unit: Some("credits".to_string()),
                 resets_at: None,
+                ..Default::default()
             }],
             extra_usage: Some(json!({
                 "queriedAt": 1_700_000_000_000i64,

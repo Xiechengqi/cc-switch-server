@@ -13,6 +13,38 @@ const MAX_MODEL_KEY_BYTES: usize = 256;
 const SESSION_EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
 pub const QODER_MODEL_CATALOG_TTL_MS: i64 = 60 * 60 * 1000;
 
+const QODER_GLOBAL_MODEL_ALIASES: &[(&str, &str)] = &[
+    ("claude-opus-4-6", "ultimate"),
+    ("auto", "auto"),
+    ("performance", "performance"),
+    ("efficient", "efficient"),
+    ("lite", "lite"),
+    ("qwen3.8-max", "qmodel_38max"),
+    ("qwen3.7-max", "qmodel_latest"),
+    ("qwen3.7-plus", "qmodel"),
+    ("kimi-k3", "kmodel_latest"),
+    ("kimi-k2.7-code", "kmodel"),
+    ("glm-5.3", "gmodel"),
+    ("glm-5.2", "gm51model"),
+    ("deepseek-v4-pro", "dmodel"),
+    ("deepseek-v4-flash", "dfmodel"),
+    ("minimax-m3", "mmodel"),
+];
+
+const QODER_CN_MODEL_ALIASES: &[(&str, &str)] = &[
+    ("auto", "auto"),
+    ("qwen3.8-max", "qmodel_38max"),
+    ("qwen3.7-max", "qmodel_latest"),
+    ("qwen3.7-plus", "qmodel"),
+    ("qwen3.6-flash", "q36fmodel"),
+    ("deepseek-v4-pro", "dmodel"),
+    ("deepseek-v4-flash", "dfmodel"),
+    ("glm-5.3", "gmodel"),
+    ("glm-5.2", "gm51model"),
+    ("kimi-k2.7-code", "kmodel"),
+    ("minimax-m2.7", "mmodel"),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QoderRuntimeScope(String);
 
@@ -120,8 +152,26 @@ impl std::fmt::Debug for QoderCachedSession {
 pub struct QoderModelCatalog {
     pub enabled_models: Vec<String>,
     pub raw_configs: BTreeMap<String, Value>,
+    pub capabilities: BTreeMap<String, QoderModelCapability>,
     pub fetched_at_ms: i64,
     expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QoderModelCapability {
+    pub model_key: String,
+    pub display_name: Option<String>,
+    pub reasoning_efforts: Vec<String>,
+    pub max_input_tokens: Option<u64>,
+    pub runtime_context_selectable: bool,
+    pub input_modalities: Vec<String>,
+    pub supports_tools: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QoderPublicModelCapability {
+    pub id: String,
+    pub route: QoderModelCapability,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +196,34 @@ impl QoderModelCatalog {
         self.raw_configs.get(model_key.trim())
     }
 
+    pub fn public_models(&self, site: QoderSite) -> Vec<QoderPublicModelCapability> {
+        let aliases = qoder_model_aliases(site);
+        let mut output = Vec::new();
+        for model_key in &self.enabled_models {
+            let Some(capability) = self.capabilities.get(model_key) else {
+                continue;
+            };
+            let public_ids = aliases
+                .iter()
+                .filter_map(|(alias, route)| (*route == model_key).then_some(*alias))
+                .collect::<Vec<_>>();
+            if public_ids.is_empty() {
+                output.push(QoderPublicModelCapability {
+                    id: model_key.clone(),
+                    route: capability.clone(),
+                });
+            } else {
+                output.extend(public_ids.into_iter().map(|id| QoderPublicModelCapability {
+                    id: id.to_string(),
+                    route: capability.clone(),
+                }));
+            }
+        }
+        output.sort_by(|left, right| left.id.cmp(&right.id));
+        output.dedup_by(|left, right| left.id == right.id);
+        output
+    }
+
     fn is_fresh(&self, now_ms: i64) -> bool {
         self.expires_at_ms > now_ms
     }
@@ -155,6 +233,7 @@ impl QoderModelCatalog {
 pub struct FetchedQoderModelCatalog {
     pub enabled_models: Vec<String>,
     pub raw_configs: BTreeMap<String, Value>,
+    pub capabilities: BTreeMap<String, QoderModelCapability>,
 }
 
 #[derive(Default)]
@@ -232,6 +311,7 @@ impl QoderRuntimeCache {
         let catalog = QoderModelCatalog {
             enabled_models: fetched.enabled_models,
             raw_configs: fetched.raw_configs,
+            capabilities: fetched.capabilities,
             fetched_at_ms,
             expires_at_ms: fetched_at_ms.saturating_add(QODER_MODEL_CATALOG_TTL_MS),
         };
@@ -279,7 +359,10 @@ async fn flight_lock(
     flight.lock_owned().await
 }
 
-pub fn parse_qoder_model_catalog(value: &Value) -> Result<FetchedQoderModelCatalog, String> {
+pub fn parse_qoder_model_catalog(
+    value: &Value,
+    site: QoderSite,
+) -> Result<FetchedQoderModelCatalog, String> {
     let entries = value
         .get("chat")
         .and_then(Value::as_array)
@@ -292,18 +375,17 @@ pub fn parse_qoder_model_catalog(value: &Value) -> Result<FetchedQoderModelCatal
 
     let mut raw_configs = BTreeMap::new();
     let mut enabled_models = Vec::new();
-    for entry in entries {
-        let Some(object) = entry.as_object() else {
-            continue;
-        };
-        let Some(key) = object
+    let mut capabilities = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("Qoder model catalog entry {index} must be an object"))?;
+        let key = object
             .get("key")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|key| !key.is_empty())
-        else {
-            continue;
-        };
+            .ok_or_else(|| format!("Qoder model catalog entry {index} is missing a key"))?;
         if key.len() > MAX_MODEL_KEY_BYTES {
             return Err("Qoder model key exceeds the size limit".to_string());
         }
@@ -313,8 +395,18 @@ pub fn parse_qoder_model_catalog(value: &Value) -> Result<FetchedQoderModelCatal
             ));
         }
         raw_configs.insert(key.to_string(), entry.clone());
-        if object.get("enable").and_then(Value::as_bool) != Some(false) {
+        let enabled = match object.get("enable") {
+            None => true,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => {
+                return Err(format!(
+                    "Qoder model catalog enable flag for {key:?} must be boolean"
+                ))
+            }
+        };
+        if enabled {
             enabled_models.push(key.to_string());
+            capabilities.insert(key.to_string(), qoder_model_capability(site, key, object));
         }
     }
     enabled_models.sort();
@@ -322,6 +414,7 @@ pub fn parse_qoder_model_catalog(value: &Value) -> Result<FetchedQoderModelCatal
     Ok(FetchedQoderModelCatalog {
         enabled_models,
         raw_configs,
+        capabilities,
     })
 }
 
@@ -335,45 +428,42 @@ pub fn resolve_qoder_model_key(site: QoderSite, requested: &str) -> Result<Strin
     if requested.is_empty() {
         return Err("Qoder request model is empty".to_string());
     }
-    let global = [
-        ("claude-opus-4-6", "ultimate"),
-        ("auto", "auto"),
-        ("performance", "performance"),
-        ("efficient", "efficient"),
-        ("lite", "lite"),
-        ("qwen3.8-max", "qmodel_38max"),
-        ("qwen3.7-max", "qmodel_latest"),
-        ("qwen3.7-plus", "qmodel"),
-        ("kimi-k3", "kmodel_latest"),
-        ("kimi-k2.7-code", "kmodel"),
-        ("glm-5.3", "gmodel"),
-        ("glm-5.2", "gm51model"),
-        ("deepseek-v4-pro", "dmodel"),
-        ("deepseek-v4-flash", "dfmodel"),
-        ("minimax-m3", "mmodel"),
-    ];
-    let cn = [
-        ("auto", "auto"),
-        ("qwen3.8-max", "qmodel_38max"),
-        ("qwen3.7-max", "qmodel_latest"),
-        ("qwen3.7-plus", "qmodel"),
-        ("qwen3.6-flash", "q36fmodel"),
-        ("deepseek-v4-pro", "dmodel"),
-        ("deepseek-v4-flash", "dfmodel"),
-        ("glm-5.3", "gmodel"),
-        ("glm-5.2", "gm51model"),
-        ("kimi-k2.7-code", "kmodel"),
-        ("minimax-m2.7", "mmodel"),
-    ];
-    let aliases = match site {
-        QoderSite::Global => global.as_slice(),
-        QoderSite::Cn => cn.as_slice(),
-    };
+    let aliases = qoder_model_aliases(site);
     Ok(aliases
         .iter()
         .find_map(|(alias, key)| (*alias == requested).then_some(*key))
         .unwrap_or(requested.as_str())
         .to_string())
+}
+
+fn qoder_model_aliases(site: QoderSite) -> &'static [(&'static str, &'static str)] {
+    match site {
+        QoderSite::Global => QODER_GLOBAL_MODEL_ALIASES,
+        QoderSite::Cn => QODER_CN_MODEL_ALIASES,
+    }
+}
+
+fn qoder_model_capability(
+    site: QoderSite,
+    model_key: &str,
+    config: &Map<String, Value>,
+) -> QoderModelCapability {
+    let context = qoder_context_capability(site, model_key);
+    QoderModelCapability {
+        model_key: model_key.to_string(),
+        display_name: config
+            .get("display_name")
+            .or_else(|| config.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= MAX_MODEL_KEY_BYTES)
+            .map(str::to_string),
+        reasoning_efforts: qoder_reasoning_efforts(site, model_key),
+        max_input_tokens: context.map(|context| context.max_input_tokens),
+        runtime_context_selectable: context.is_some_and(|context| context.runtime_selectable),
+        input_modalities: vec!["text".to_string()],
+        supports_tools: true,
+    }
 }
 
 pub fn derive_qoder_conversation_session_id(
@@ -457,12 +547,25 @@ pub fn build_qoder_payload(
     let max_tokens = qoder_max_tokens(request, &model_config);
     let reasoning = qoder_reasoning_directive(request);
     apply_reasoning_directive(site, model_key, reasoning, &mut model_config);
+    let context_capability = qoder_context_capability(site, model_key);
+    if let Some(context) = context_capability {
+        model_config.insert(
+            "max_input_tokens".to_string(),
+            Value::Number(context.max_input_tokens.into()),
+        );
+    }
 
     let request_id = crate::domain::qoder::random_qoder_uuid();
     let request_set_id = crate::domain::qoder::random_qoder_uuid();
     let business_id = crate::domain::qoder::random_qoder_uuid();
     let mut compact_model_config = Map::new();
-    for field in ["key", "source", "is_reasoning", "reasoning_effort"] {
+    for field in [
+        "key",
+        "source",
+        "is_reasoning",
+        "reasoning_effort",
+        "max_input_tokens",
+    ] {
         if let Some(value) = model_config.get(field) {
             compact_model_config.insert(field.to_string(), value.clone());
         }
@@ -477,7 +580,7 @@ pub fn build_qoder_payload(
     } else {
         user_type.trim()
     };
-    let body = json!({
+    let mut body = json!({
         "request_id": request_id,
         "request_set_id": request_set_id,
         "chat_record_id": request_id,
@@ -520,6 +623,15 @@ pub fn build_qoder_payload(
             "begin_at": now_ms
         }
     });
+    if context_capability.is_some_and(|context| context.runtime_selectable) {
+        let max_input_tokens = context_capability
+            .expect("runtime-selectable context is present")
+            .max_input_tokens;
+        body["parameters"]["context_length"] = Value::Number(max_input_tokens.into());
+        body["chat_context"]["extra"]["ideModelConfigOverride"] = json!({
+            "max_input_tokens": max_input_tokens
+        });
+    }
     Ok(PreparedQoderPayload {
         body,
         request_id,
@@ -839,6 +951,12 @@ enum ThinkingCapability {
     LowHighMax,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QoderContextCapability {
+    max_input_tokens: u64,
+    runtime_selectable: bool,
+}
+
 fn thinking_capability(site: QoderSite, model_key: &str) -> ThinkingCapability {
     match model_key {
         "qmodel_38max" | "qmodel_latest" | "qmodel" => ThinkingCapability::ToggleOnly,
@@ -847,6 +965,50 @@ fn thinking_capability(site: QoderSite, model_key: &str) -> ThinkingCapability {
         "q36fmodel" if site == QoderSite::Cn => ThinkingCapability::Unsupported,
         _ => ThinkingCapability::Unsupported,
     }
+}
+
+fn qoder_reasoning_efforts(site: QoderSite, model_key: &str) -> Vec<String> {
+    let efforts: &[&str] = match thinking_capability(site, model_key) {
+        ThinkingCapability::Unsupported => &[],
+        ThinkingCapability::ToggleOnly => &["none", "high"],
+        ThinkingCapability::HighMax => &["none", "high", "max"],
+        ThinkingCapability::LowHighMax => &["none", "low", "high", "max"],
+    };
+    efforts.iter().map(|effort| (*effort).to_string()).collect()
+}
+
+fn qoder_context_capability(site: QoderSite, model_key: &str) -> Option<QoderContextCapability> {
+    let capability = match (site, model_key) {
+        (QoderSite::Global, "auto" | "efficient" | "lite") | (QoderSite::Cn, "auto") => {
+            QoderContextCapability {
+                max_input_tokens: 180_000,
+                runtime_selectable: false,
+            }
+        }
+        (QoderSite::Global, "kmodel") | (QoderSite::Cn, "kmodel") => QoderContextCapability {
+            max_input_tokens: 256_000,
+            runtime_selectable: true,
+        },
+        (QoderSite::Cn, "mmodel") => QoderContextCapability {
+            max_input_tokens: 200_000,
+            runtime_selectable: true,
+        },
+        (
+            QoderSite::Global,
+            "ultimate" | "performance" | "qmodel_38max" | "qmodel_latest" | "qmodel"
+            | "kmodel_latest" | "gmodel" | "gm51model" | "dmodel" | "dfmodel" | "mmodel",
+        )
+        | (
+            QoderSite::Cn,
+            "qmodel_38max" | "qmodel_latest" | "qmodel" | "q36fmodel" | "dmodel" | "dfmodel"
+            | "gmodel" | "gm51model",
+        ) => QoderContextCapability {
+            max_input_tokens: 1_000_000,
+            runtime_selectable: true,
+        },
+        _ => return None,
+    };
+    Some(capability)
 }
 
 fn apply_reasoning_directive(
@@ -1013,6 +1175,7 @@ mod tests {
                 FetchedQoderModelCatalog {
                     enabled_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
+                    capabilities: BTreeMap::new(),
                 },
                 1_000,
             )
@@ -1024,23 +1187,40 @@ mod tests {
 
     #[test]
     fn catalog_keeps_hidden_raw_config_but_only_exposes_enabled_models() {
-        let catalog = parse_qoder_model_catalog(&json!({
-            "chat": [
-                {"key": "auto", "display_name": "Auto", "enable": true},
-                {"key": "hidden", "display_name": "Hidden", "enable": false}
-            ]
-        }))
+        let catalog = parse_qoder_model_catalog(
+            &json!({
+                "chat": [
+                    {"key": "auto", "display_name": "Auto", "enable": true},
+                    {"key": "hidden", "display_name": "Hidden", "enable": false}
+                ]
+            }),
+            QoderSite::Global,
+        )
         .unwrap();
         assert_eq!(catalog.enabled_models, vec!["auto"]);
         assert!(catalog.raw_configs.contains_key("hidden"));
         assert_eq!(
-            parse_qoder_model_catalog(&json!({"chat": []})).unwrap(),
+            catalog.capabilities["auto"].display_name.as_deref(),
+            Some("Auto")
+        );
+        assert_eq!(catalog.capabilities["auto"].max_input_tokens, Some(180_000));
+        assert_eq!(catalog.capabilities["auto"].input_modalities, ["text"]);
+        assert!(catalog.capabilities["auto"].supports_tools);
+        assert_eq!(
+            parse_qoder_model_catalog(&json!({"chat": []}), QoderSite::Global).unwrap(),
             FetchedQoderModelCatalog {
                 enabled_models: Vec::new(),
-                raw_configs: BTreeMap::new()
+                raw_configs: BTreeMap::new(),
+                capabilities: BTreeMap::new()
             }
         );
-        assert!(parse_qoder_model_catalog(&json!({"models": []})).is_err());
+        assert!(parse_qoder_model_catalog(&json!({"models": []}), QoderSite::Global).is_err());
+        assert!(parse_qoder_model_catalog(&json!({"chat": [null]}), QoderSite::Global).is_err());
+        assert!(parse_qoder_model_catalog(
+            &json!({"chat": [{"key": "auto", "enable": "yes"}]}),
+            QoderSite::Global
+        )
+        .is_err());
     }
 
     #[test]
@@ -1112,6 +1292,12 @@ mod tests {
         assert_eq!(prepared.body["model_config"]["vendor"], "preserved");
         assert_eq!(prepared.body["model_config"]["is_reasoning"], true);
         assert_eq!(prepared.body["model_config"]["reasoning_effort"], "max");
+        assert_eq!(prepared.body["model_config"]["max_input_tokens"], 1_000_000);
+        assert_eq!(prepared.body["parameters"]["context_length"], 1_000_000);
+        assert_eq!(
+            prepared.body["chat_context"]["extra"]["ideModelConfigOverride"]["max_input_tokens"],
+            1_000_000
+        );
         assert_eq!(prepared.body["stream"], true);
     }
 
@@ -1154,6 +1340,81 @@ mod tests {
                 "requested={requested}"
             );
         }
+    }
+
+    #[test]
+    fn site_model_capability_matrix_controls_effort_context_and_public_ids() {
+        let global = parse_qoder_model_catalog(
+            &json!({"chat": [
+                {"key":"gmodel","display_name":"GLM-5.3","enable":true},
+                {"key":"mmodel","display_name":"MiniMax-M3","enable":true},
+                {"key":"future-route","display_name":"Future","enable":true}
+            ]}),
+            QoderSite::Global,
+        )
+        .unwrap();
+        assert_eq!(
+            global.capabilities["gmodel"].reasoning_efforts,
+            ["none", "low", "high", "max"]
+        );
+        assert_eq!(
+            global.capabilities["gmodel"].max_input_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            global.capabilities["future-route"].reasoning_efforts,
+            Vec::<String>::new()
+        );
+        assert_eq!(global.capabilities["future-route"].max_input_tokens, None);
+        let cached = QoderModelCatalog {
+            enabled_models: global.enabled_models,
+            raw_configs: global.raw_configs,
+            capabilities: global.capabilities,
+            fetched_at_ms: 1,
+            expires_at_ms: 2,
+        };
+        let public = cached.public_models(QoderSite::Global);
+        assert!(public
+            .iter()
+            .any(|model| model.id == "glm-5.3" && model.route.model_key == "gmodel"));
+        assert!(public
+            .iter()
+            .any(|model| model.id == "minimax-m3" && model.route.model_key == "mmodel"));
+        assert!(public
+            .iter()
+            .any(|model| model.id == "future-route" && model.route.max_input_tokens.is_none()));
+
+        let cn = qoder_context_capability(QoderSite::Cn, "mmodel").unwrap();
+        let global = qoder_context_capability(QoderSite::Global, "mmodel").unwrap();
+        assert_eq!(cn.max_input_tokens, 200_000);
+        assert_eq!(global.max_input_tokens, 1_000_000);
+        assert!(cn.runtime_selectable && global.runtime_selectable);
+    }
+
+    #[test]
+    fn fixed_context_routes_do_not_emit_runtime_context_override() {
+        let prepared = build_qoder_payload(
+            &json!({
+                "model":"auto",
+                "messages":[{"role":"user","content":"run"}],
+                "reasoning_effort":"future-effort"
+            }),
+            &json!({"key":"auto","enable":true}),
+            QoderSite::Cn,
+            "auto",
+            "session-a",
+            "personal_standard",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(prepared.body["model_config"]["max_input_tokens"], 180_000);
+        assert!(prepared.body["parameters"].get("context_length").is_none());
+        assert!(prepared.body["chat_context"]["extra"]
+            .get("ideModelConfigOverride")
+            .is_none());
+        assert!(prepared.body["model_config"]
+            .get("reasoning_effort")
+            .is_none());
     }
 
     #[test]

@@ -1072,6 +1072,7 @@ pub(crate) fn quota_from_usage_limits(
             limit: Some(resource.limit),
             unit: Some("credits".to_string()),
             resets_at: resource.resets_at,
+            ..Default::default()
         });
         resources.push(json!({
             "resourceType": resource.resource_type,

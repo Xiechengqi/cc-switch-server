@@ -5125,7 +5125,11 @@ mod tests {
 
     #[test]
     fn usage_rebase_sets_target_and_accumulates_only_new_history() {
-        let now = test_timestamp_ms(2026, 7, 28, 12, 0);
+        // Keep the synthetic records inside the detail-retention window. A
+        // fixed historical date eventually ages out and makes the edge
+        // bucket unavailable to this test even though production rollups are
+        // correct for completed buckets.
+        let now = i64::try_from(crate::infra::time::now_ms()).unwrap();
         let mut input = codex_share_input("usage-rebase");
         add_manual_shareto(&mut input, "user@example.com");
         let mut store = ShareStore::default();

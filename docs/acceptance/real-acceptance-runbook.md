@@ -186,10 +186,28 @@ credential.
 | `GITHUB_COPILOT_TEST_ACCOUNT` | GitHub Copilot device flow 测试账号 | 记录脱敏 email/账号名 |
 | `GITHUB_COPILOT_GITHUB_DOMAIN` | GitHub 或 GHES 域名，默认 `github.com` | 可完整记录 |
 | `GITHUB_COPILOT_TOKEN_FIXTURE` | Copilot/GitHub 已导入 token fixture | 不记录明文 |
+| `CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID` | 显式绑定待测 Copilot Account 的 Claude Provider ID | 只记录是否存在 |
+| `CC_SWITCH_COPILOT_CODEX_PROVIDER_ID` | 显式绑定同一 Copilot Account 的 Codex Provider ID | 只记录是否存在 |
+| `CC_SWITCH_COPILOT_GEMINI_PROVIDER_ID` | 显式绑定同一 Copilot Account 的 Gemini Provider ID | 只记录是否存在 |
+| `CC_SWITCH_COPILOT_MODEL` | 可选的三 Surface 共同 entitlement model；缺省时从三份动态目录交集选择 | 可完整记录 |
+| `DEEPSEEK_WEB_ACCESS_TOKEN_FIXTURE` | DeepSeek Web import-only bearer fixture；只可用于授权的真实验收环境 | 不记录明文、长度、prefix 或 digest |
+| `CC_SWITCH_DEEPSEEK_PROVIDER_ID` | 显式绑定待测 `deepseek_account` Account 的 Claude Provider ID | 只记录是否存在 |
+| `CC_SWITCH_DEEPSEEK_MODEL` | DeepSeek Web reviewed 低成本验收模型，默认 `deepseek-v4-flash` | 可完整记录 |
+| `CC_SWITCH_CODING_PLAN_PROFILE_ID` | 本轮 region × Surface typed Coding Plan Profile id | 可完整记录 |
+| `CC_SWITCH_CODING_PLAN_API_KEY_FIXTURE` | 当前 Profile 对应套餐发放的静态 Key | 不记录明文、prefix、长度或 digest |
+| `CC_SWITCH_CODING_PLAN_MODEL` | 当前 Profile reviewed catalog 中的低成本模型 | 可完整记录 |
+| `OLLAMA_API_KEY` | Ollama Cloud 推理及官方 `/api/me`、`/api/usage` 真实 fixture | 不记录明文、prefix、长度或 digest |
 | `KIRO_TEST_ACCOUNT` | Kiro/AWS Builder ID 测试账号 | 记录脱敏 email |
 | `KIRO_REGION` | Kiro device flow region，默认 `us-east-1` | 可完整记录 |
 | `KIRO_START_URL` | Kiro/AWS SSO start URL | 可完整记录 |
 | `KIRO_REFRESH_TOKEN_FIXTURE` | Kiro 已导入 refresh token fixture | 不记录明文 |
+| `AMAZON_Q_TEST_ACCOUNT` | Amazon Q Developer Builder ID/IdC 测试账号；不能填写 Kiro Account | 记录脱敏 email/账号名 |
+| `AMAZON_Q_REFRESH_TOKEN_FIXTURE` | Amazon Q SSO OIDC refresh token fixture；不能复用 Kiro token | 不记录明文、prefix、长度或 digest |
+| `CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID` | 显式绑定待测 Amazon Q Account 的 Claude Provider ID | 只记录是否存在 |
+| `CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID` | 显式绑定同一 Amazon Q Account generation 的 Codex Provider ID | 只记录是否存在 |
+| `CC_SWITCH_AMAZON_Q_MODEL` | 可选的两个 Surface 共同动态 entitlement model；缺省时使用 `defaultModel` | 可完整记录 |
+| `CC_SWITCH_AMAZON_Q_RUNTIME_REGION` | Amazon Q runtime region，只允许 `us-east-1` 或 `eu-central-1` | 可完整记录 |
+| `CC_SWITCH_AMAZON_Q_PROFILE_ARN` | IAM Identity Center 场景可选的 Amazon Q profile ARN | 只记录是否存在，不记录完整 ARN |
 | `AWS_REGION` | Bedrock region | 可完整记录 |
 | `AWS_ACCESS_KEY_ID` | Bedrock AKSK access key | 只记录是否存在 |
 | `AWS_SECRET_ACCESS_KEY` | Bedrock AKSK secret key | 不记录明文，只记录是否存在 |
@@ -218,6 +236,7 @@ Codex OAuth 专项补充：
 6c. 分别在 HTTP、首次 401 replay、原生 WS response.create、WS→HTTP fallback 和 Dedicated Images 携带同一份含 Unix/Windows/Unicode path、remote URL、commit hash 的 turn/client metadata；确认所有出站均使用同 scope 稳定占位符、remote 被删除、commit 为 40 hex，第二次清洗不变化，且客户端未携带的字段不被新增。malformed/超过 32 KiB 的可选 header 应被丢弃，日志和错误中不得出现原文。
 6d. 保持 `CC_SWITCH_CODEX_ROUTING_HINT_ENABLED=0`，确认客户端和 Account extra header 都不能把 `x-codex-routing-hint` 发往上游。仅在专用测试账号确认后临时设为 `1`：model-only 与 priority HTTP 请求分别应发送 `<final-model>` 和 `<final-model>;tier=priority`，未知 tier 只发模型，Images 使用内部 Responses 最终模型；WebSocket handshake 始终无 hint。若任一真实请求被拒，立即关闭并保持 `live_pending`。
 6e. 用会在首个业务事件之后至少静默 60 秒的 reasoning 流验证普通文本 SSE：首业务事件前绝无 comment，之后约每 15 秒收到 `: keepalive`，最终仍收到真实 terminal；缩短 `STREAM_IDLE_TIMEOUT_MS` 后确认心跳不能阻止上游 idle timeout。再设 `CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS=0` 验证禁用，并通过 Nginx/Cloudflare 确认中间层不缓冲小 chunk。
+6f. 保持 Responses normalizer 默认开启，分别注入任意 byte split、CRLF、多行 data、comment、无 data 控制帧、文本/JSON ping、HTML 200、普通文本 200、JSON scalar/array、坏 UTF-8/JSON、超限 partial event、`[DONE]`/`response.done` 无真实终态，以及 completed/failed/incomplete。只允许白名单 liveness 被丢弃；每个下游 `data:` 必须是单行合法 JSON object（可选终态后的 `[DONE]` 除外），HTML/文本/坏载荷须在 commit 前返回 502，commit 后须收到不带 `[DONE]` 的 `response.failed/upstream_stream_protocol_error`，usage 为 `protocol_error`。检查 `Content-Type`、`Cache-Control/no-transform`、`X-Accel-Buffering`、`nosniff`，并确认 headers/liveness/lifecycle 不满足首事件预算。临时启用 HTTP/2 PING 做同一长流对照，确认它不改变业务 timeout；HTTP/1.1 对照不应被误判为已启用。
 7. SSE 与 WebSocket 分别模拟空 `response.completed.response.output`，确认按 `output_index` 重建；已有非空 output 不覆盖，第二个 response 不得串入前一轮状态。
 8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
 9. 推理等级由客户端选择并透传：`low`、`medium`、`high`、`xhigh`、`max` 保持不变，仅把非 wire 别名 `ultra` 规范为 `max`；日志分别显示 requested/effective effort。Claude `output_config.effort`/`thinking.effort` 与 Gemini `generationConfig.thinkingConfig.thinkingLevel` 必须经过转换保留；`/v1/models` 应返回 Sol/Terra/Luna。
@@ -237,6 +256,22 @@ Codex OAuth 专项补充：
 23. 对同一账号建立两个 Share 和两个模型。普通 model-capacity/未知 Codex 429 只让当前 `(Share,runtime,model)` 冷却五分钟，另一个 Share/模型仍可用；`usage_limit_reached` 或明确耗尽 window 只冷却固定账号，不切换账号、Provider 或模型。随后开启 previous-response cache：HTTP JSON 聚合、任意 chunk 切分 SSE、text/binary WS 和 WS→HTTP fallback 的 completed 均可续接 function/custom/shell/MCP call/output；message、reasoning/encrypted content、image/web-search 不得进入缓存，server item id 必须删除，重复 `(type,call_id)` 不注入。更换 Share、签名用户、runtime、workspace、账号代际或 response id 均 miss；缺 principal、TTL 到期、failed/incomplete/error、超 8 MiB、超 200 items 均不写入。普通 continuation miss 保持既有上游清洗行为；只有 `previous_response_id` 加当前未配对 tool output 的必需上下文 miss 返回精确 409，body 必须含 `type=invalid_request_error`、`code=response_context_unavailable`、`param=previous_response_id`，当前已有完整 call/output pairing 时不得误报。
 24. 上述 Share 策略保存、Bundle Share 保存和 Router descriptor 同步均检查 camelCase/snake_case 兼容、默认值、10..10080 reset lead 校验、revision/fingerprint 变化和重启持久化。账号中心 active account 改变不得影响 Referral 的 Provider 身份或任一 Share 的 credits/reset/cooldown/cache namespace。
 
+Gemini Code Assist 单账号专项补充：
+
+1. 为 `gemini.google_oauth` 或 `claude.google_oauth` Provider 显式绑定一个 `gemini_cli` Account，另建一个未绑定账号作为负向候选。调用 `POST /api/providers/:id/fetch-models`，抓包确认只有绑定账号的 Bearer、Gemini CLI identity、`loadCodeAssist` 与 `retrieveUserQuota` 被使用，负向账号请求数为零。
+2. `retrieveUserQuota.buckets` 同时返回重复 Gemini id、`models/` 前缀、0% remaining、非 Gemini model 和非法 id。目录应去重、去前缀、保留 0% 元数据并排除非 Gemini/非法 id；响应必须包含 `source=authenticated_retrieve_user_quota`、`stale=false` 和 `fetchedAtMs`。
+3. 成功的空 buckets 是当前绑定的权威空目录，不得合入静态或其他账号模型。模拟 408、429、可重试 5xx 时，只可返回相同 `authIdentityGeneration` 的旧目录并标记 `source=same_account_cached_retrieve_user_quota`、`stale=true`。
+4. 模拟 401/403、删除/换绑、Account generation 变化、credential persistence degraded 和旧代际缓存。以上情况即使存在旧目录也必须失败关闭，且第二账号、静态目录和 models upstream 请求数均为零。首个 401 只有存在 refresh token 时可刷新并重放同账号一次；第二个 401 终止。
+5. 用目录返回的一个低成本模型完成 Gemini non-stream、stream、tool、image 和 quota；保存脱敏 receipt 的 model id、project/tier 摘要、source/stale/fetchedAt、终态与 usage，不保存 project id、raw quota body 或 token。未完成本项时保持 `live_pending`。
+
+Antigravity / Agy 单账号模型目录专项补充：
+
+1. 分别为 `special.antigravity` 与 `special.agy` Provider 显式绑定一个对应类型 Account；另建未绑定账号。调用 `POST /api/providers/:id/fetch-models`，抓包确认 `loadCodeAssist` 与 `fetchAvailableModels` 只使用各自绑定账号的 Bearer、project 和 Antigravity identity，未绑定账号请求数为零，Agy 不借 Antigravity 的 credential 或 cache。
+2. `fetchAvailableModels.models` 同时返回 Gemini、Claude、GPT、未知安全 model id、0% remaining、reset time、thinking/image、thinking budget、max token、MIME 与 `deprecatedModelIds`。响应应逐模型保留明确字段并标记 family；未知字段不得自动扩大能力，非法 model id 应丢弃。
+3. 成功空 `models` 是权威空目录。网络、408、429、5xx 只能返回同 Provider type、Account id 与 `authIdentityGeneration` 的旧目录，且 `source=same_identity_cached_fetch_available_models`、`stale=true`；Agy、其他账号和旧代际缓存均不得命中。
+4. 模拟首次 401 后原账号 refresh/replay 成功，再模拟第二次 401、403、坏 JSON、缺 `models`、Provider revision/runtime/binding 变化和 Account generation 变化；以上终态必须失败关闭，不得合并静态目录或切换账号。成功 fresh 目录应写入当前代际的 model-catalog、Gemini/Claude/GPT family 与 capacity capability evidence；stale 结果不得刷新证据时间。
+5. 用目录中的低成本 Gemini 与 Claude 模型分别完成 non-stream、stream、mixed Google Search + function tool、thought signature、图片输入、429 retry-delay、畸形 stream 与 terminal reason 验收。receipt 只保存 rail、脱敏账号、model family、source/stale/fetchedAt、能力摘要、终态与 usage，不保存 project、token 或 raw body。没有独立可复现的 weekly quota endpoint 时必须记录 `unavailable`，不得从 5h/reset time 猜测周额度；完成真实账号验收前保持 `live_pending`。
+
 Grok OAuth 单账号专项补充：
 
 1. 待测 `grok_oauth` Provider 必须显式绑定一个账号。另建一个绑定不同账号的 Grok Provider 作为负向候选；无论 HTTP、SSE、媒体、WebSocket、429、5xx 或 refresh 失败，负向 Provider/账号的请求数都必须保持为零。
@@ -247,13 +282,53 @@ Grok OAuth 单账号专项补充：
 6. 对 Responses JSON 和 SSE 发送固定 `x-session-id` 与合法十进制 `x-grok-turn-idx`，确认上游值完全一致。缺失、负数、带符号、空白、非数字、超过 20 位和 `u64` 溢出都应在上游完全省略；Server 不生成、不缓存、不递增 turn，也不因非法值返回 4xx。
 7. HTTP non-stream 和 SSE 分别模拟首次 401，确认只强刷绑定账号一次，重放使用新 Authorization，同时 conversation id、turn、Provider id 和 model 不变。第二次 401 直接返回并只冷却原账号，不进入通用 Provider failover。
 8. `websocket` 未验证时 GET Responses WS 必须在零上游请求下返回 503。显式 bootstrap 后模拟握手首次 401，再模拟首事件前 close 1009 或 connect/5xx，确认强刷及 HTTP/SSE fallback 始终复用原 Provider、账号、conversation id、turn、single-model policy 和 in-flight lease；握手 400/401/403/429 与首业务事件后的错误不得 fallback。分别发送裸 body、nested 和 flat `response.create`，确认三者统一删除 stream/background、强制 `store=true`，且 continuation 不重复发送 instructions；握手 403/5xx 必须更新绑定账号 cooldown，entitlement headers 必须持久化。
-9. `image_generation`、`image_edit`、`video_generation` 未验证时必须各自 fail closed。仅在 `CC_SWITCH_GROK_OAUTH_CAPABILITIES` 明确 bootstrap 对应能力后执行短请求；成功证据持久化后移除开关重启，能力应继续开放。媒体首次 401 只强刷原账号一次，视频状态查询保持创建时的 Provider/账号 sticky identity。验证大于 2 MiB 且不超过 32 MiB 的图片编辑可进入 handler，wire body、gzip/deflate 任一解码层或最终 decoded body 超过 32 MiB 都返回 413；视频 request id 中的 `/`、`?`、`#`、percent escape、空值、超长值必须在零上游请求下返回 400。
+9. `image_generation`、`image_edit`、`video_generation` 未验证时必须各自 fail closed。仅在 `CC_SWITCH_GROK_OAUTH_CAPABILITIES` 明确 bootstrap 对应能力后执行短请求；成功证据持久化后移除开关重启，能力应继续开放。媒体首次 401 只强刷原账号一次，视频状态查询保持创建时的 Provider/账号 sticky identity。检查 `grok-media-tasks.json` schema v4：owner key 必须覆盖 Share、用户 namespace、`video_generation` kind、task id、Provider、Account、auth generation、runtime fingerprint 与 upstream plane；v1-v3 fixture 迁移后仍应指向原 xAI/video identity，任一维度漂移都返回 conflict。验证大于 2 MiB 且不超过 32 MiB 的图片编辑可进入 handler，wire body、gzip/deflate 任一解码层或最终 decoded body 超过 32 MiB 都返回 413；视频 request id 中的 `/`、`?`、`#`、percent escape、空值、超长值必须在零上游请求下返回 400。
 10. 对 HTTP、SSE、媒体和 WS 分别注入 429 与 reset/retry hints，确认只更新绑定账号的 cooldown/rate-limit outcome，保留下游审计允许的限流头且不跨 Provider。403/5xx/network failure 同样不能授权账号切换。
-11. `/v1/models?app=codex&providerId=<id>` 必须返回选定模型及 `source`、`stale`、`fetchedAtMs`。依次验收 upstream、TTL fresh cache、ETag 304、过期后的 last-known-good 和无缓存 static fallback；所有目录请求只使用已提交 RuntimePlan 中 revision/类型/身份代际一致的 managed binding。未绑定、stale generation、stale plan 或 degraded persistence 时 token 和 models 上游请求数都必须为零。
+11. `/v1/models?app=codex&providerId=<id>` 必须返回当前账号的模型及 `source`、`stale`、`fetchedAtMs`，Provider 控制面 raw 还应包含保守的 model family 与 account capability manifest。依次验收 upstream、权威成功空目录、TTL fresh cache、ETag 304、network/408/429/5xx 后的同 scope last-known-good；无缓存时必须失败，禁止 static fallback。缓存 scope 必须同时匹配 app、Provider revision/runtime fingerprint、Account、`authIdentityGeneration` 与 `tokenRefreshGeneration`。首次 models 401 只强刷并重放原账号一次；第二个 401、403、坏 JSON、超大 body、未绑定、stale generation/plan 或 degraded persistence 均失败关闭，其他账号和静态 models 请求数为零。
 12. 将 Grok CLI version 降到已知不受支持值并触发上游 version gate，确认下游错误改写为面向管理员的 `CC_SWITCH_GROK_CLI_VERSION` / `CC_SWITCH_GROK_CLI_USER_AGENT` 指引，raw token/账号不泄漏，`cc_switch_grok_cli_version_gate_total` 增加；恢复默认 `0.2.111` 后重测。
 13. Quota 抓包同时覆盖 user、weekly、monthly、task usage 和 subscriptions。`currentPeriod.end`、`billingPeriodEnd`、token expiry 及 inactive subscription 不能成为订阅到期日；仅 active subscription 的明确 expiry 或账号手工 next-payment 值可进入 UI，且不影响凭据有效性和路由。
 14. 运行 `node scripts/smoke/grok-oauth-real.mjs`，通过同一个 `CC_SWITCH_SHARE_URL` 验收 models metadata、Responses JSON 和完整 SSE terminal。只有显式设置 `CC_SWITCH_GROK_MEDIA_SMOKE=1` 才运行图片；缺少 Share URL/Router token 或仍为占位符时的 `SKIP` 只能记录为 blocked-inputs，不能记录为真实通过。
 15. 检查 `/metrics` 中 Provider outcome、forward retry、WS fallback、CLI version gate、model catalog、账号 in-flight/max、warm refresh 和 persistence degraded 指标；labels 和 evidence 只含有界分类、Provider id、模型和脱敏账号，不得包含 access/refresh/ID token 或 raw OAuth/upstream body。
+
+GitHub Copilot 单账号三 Surface 专项补充：
+
+1. 建立 Claude、Codex、Gemini 三个 `github_copilot` Provider，分别填入三个 `CC_SWITCH_COPILOT_*_PROVIDER_ID`；三者必须显式绑定 `GITHUB_COPILOT_TEST_ACCOUNT` 选中的同一个 Account 和相同 `authIdentityGeneration`，runtime 均为 `special.copilot` / `ready`。不得从 active account、模型名或 quota 选择另一个账号。
+2. 运行 `node scripts/smoke/copilot-real.mjs`。脚本通过管理 API 对每个 Provider 分别执行 `fetch-models`，要求 fresh、非空且来自 `copilot_models_api` 或同身份 fresh account cache；每个模型 raw metadata 必须携带 GitHub domain、受信 HTTPS API origin、picker/policy、endpoint、limits，以及 tools/vision/reasoning capability。成功空目录仍是权威 entitlement，只是本项真实验收会因无法选出共同模型而失败，不能静态补模型。
+3. 三份目录必须存在共同 entitled model；显式 `CC_SWITCH_COPILOT_MODEL` 时三者都必须包含它。随后只刷新原绑定 Account 的 premium quota，并分别在同一 Share URL 完成 Claude Messages、Codex Responses、Gemini generateContent 的非流/流、强制 function tool、usage 和唯一终态。任一 Surface 失败都不得用另一 Provider、Account 或模型静默代偿。
+4. 对 github.com 与每个支持的 GHES 域分别保存脱敏 receipt：Account 只保存脱敏 selector/稳定摘要，Provider ID 只记录存在性；保存 domain、API origin、model、catalog source/fetchedAt、quota tier 和六个推理检查状态，不保存 GitHub/Copilot token、raw catalog/quota/body。缺任一真实输入时脚本只输出 `[SKIP]` 并写 `blocked_inputs`，不得标记 `live_verified`。
+5. 本地回归运行 `node --test scripts/audit/copilot-real.test.mjs`；mock PASS 只证明 harness 合同，不是 Copilot 真实通过。401 验收仍只能在下游提交前强刷原 Account 一次并重放一次；第二次 401、403、domain/origin/binding/generation 漂移必须失败关闭。
+
+Amazon Q Developer 单账号双 Surface 专项补充：
+
+1. 只使用独立 `amazon_q_oauth` device register/start/poll 或管理员显式导入 `AMAZON_Q_REFRESH_TOKEN_FIXTURE`。抓包确认 Builder ID 固定 start URL 为 `https://view.awsapps.com/start`、OIDC region 为 `us-east-1`、client name 为 `Amazon Q Developer for command line`，scope 恰为 `codewhisperer:completions`、`codewhisperer:analysis`、`codewhisperer:conversations`。Kiro device code、client registration、Account、token 和 Profile 均不得参与。
+2. 建立 `claude.amazon_q_oauth` 与 `codex.amazon_q_oauth` 两个 Provider，分别填写 `CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID` / `CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID`；两者必须显式绑定 `AMAZON_Q_TEST_ACCOUNT` 对应的同一 Account ID 和当前 `authIdentityGeneration`，runtime 必须是 `special.amazon_q`。另建 Kiro Account 与第二个 Amazon Q Account 作为 decoy，所有控制面和数据面请求计数必须始终为零。
+3. 对两个 Provider 分别执行 `fetch-models`。要求 `ListAvailableModels` 从第一页遍历到无 `nextToken`，每页 body 都含 `origin=CLI`，`defaultModel` 必须真实存在于合并后的目录；目录 scope 同时匹配 App、Provider revision/runtime fingerprint、Account ID、auth identity/token refresh generation、runtime region 与 profile ARN。成功空目录、重复 nextToken、坏/超大 JSON、未知 region、第二次 401 和 generation 漂移均失败关闭，不能合并 Kiro 静态目录。
+4. 刷新 quota 并抓包确认调用 `AmazonCodeWhispererService.GetUsageLimits`、官方 CLI UA、`origin=CLI` 和原绑定身份。usage/limit/subscription 投影不得制造未观察到的 plan、到期日或跨账号余额；缺失字段诚实标 unavailable。额度只用于展示，不能用于账号选择或 fallback。
+5. 使用动态目录中的 `CC_SWITCH_AMAZON_Q_MODEL` 或真实 `defaultModel`，分别完成 Claude Messages 与 Codex Responses 的 non-stream、stream、声明 function tool/tool result 续轮和允许的 image input。每条 EventStream 必须校验 prelude、headers、message CRC、frame CRC、唯一终态、tool JSON 与图片边界；畸形、截断、重复 terminal、terminal 后 frame、首帧/idle timeout 和客户端取消都只终止原请求，不得重放到 Kiro、另一 Amazon Q Account 或另一个 Provider。
+6. 对 inference、catalog 和 quota 分别注入首次 eligible 401。只有在下游尚未提交且 Provider/runtime/Account/auth generation 未漂移时，才允许强刷原 Amazon Q Account 并重放一次；第二个 401、403、429、5xx、network/reset 或取消均终止。验证 refresh grant 为 `refresh_token`，重物化后的 Authorization 只来自同一 Account，decoy 请求数为零。
+7. 轮换 refresh/access token、runtime region、profile ARN、Provider credential binding 或 Account identity generation，确认旧 catalog/session/cache/in-flight 结果无法提交；撤销或 relogin 后两个 Provider 都应明确失败，不能落入 `special.kiro`、generic HTTP、Bedrock 或静态模型。`us-east-1` 与 `eu-central-1` 分别验收；其他 region 必须在零上游请求下拒绝。
+8. receipt 只保存时间、两个 Provider ID 是否存在、脱敏 Account 稳定标识、region、model、catalog source/default、quota 摘要、各 Surface/终态/401/撤销状态与 decoy 请求计数；不保存 device code、client secret、access/refresh token、profile ARN、prompt、图片、raw EventStream 或上游错误 body。环境检查显示 `inputs-ready` 只代表可开始；上述真实链全部通过前继续保持 `fixture_verified` / `live_pending`。
+
+DeepSeek Web Account 单账号专项补充：
+
+1. 只通过管理员 import 接口提交 `DEEPSEEK_WEB_ACCESS_TOKEN_FIXTURE`；输入必须是 token-only bearer，不能带 `Bearer `、Cookie、refresh/ID token、API key、scope、extra header、password 或 session credential。控制面响应、日志、错误、evidence 与 `accounts.json` 检查不得出现 token 明文、prefix、长度或可关联 digest。
+2. `CC_SWITCH_DEEPSEEK_PROVIDER_ID` 必须指向 Claude Surface 的 `claude.deepseek_account`，且显式绑定刚导入 Account 的当前 `authIdentityGeneration`。另建一个 DeepSeek Account 作为负向候选；provider test、models、non-stream、stream、session recovery 和错误路径中该候选请求数必须始终为零。
+3. 先执行 Provider dry-run，确认 `driverId=special.deepseek_account`、固定 `chat.deepseek.com` origin、reviewed model 和 `networkChecked=false`；再显式执行 network test，要求同一绑定依次完成 create-session、PoW、completion、严格 terminal，并且结构化 outcome 为 success。SKIP 或缺输入只能记录 `blocked_inputs`。
+4. models discovery 必须只返回 `reviewed_deepseek_web_catalog`，`stale=false`、`entitlement=live_pending`，并逐模型携带 text/tools/thinking/search capability；成功结果不能声称动态 subscription entitlement，也不能合并 `deepseek_api`、静态或其他 Account 模型。更改 Account generation 后旧 Provider discovery 必须冲突并要求重绑。
+5. 用 `CC_SWITCH_DEEPSEEK_MODEL` 分别验收 Claude non-stream 与 stream；随后覆盖 thinking、search citation 和声明 tool call/result。每条流必须恰有一个合法终态，坏 JSON、截断 EOF、重复 terminal 和 terminal 后业务数据均失败关闭且不得在已提交后重放。
+6. 复用同一 Share/user/client session 发起两轮以确认 session cache；让已复用 session 分别返回 400、404、409，确认每种状态只用原 Account 新建一次并在提交前重放。401、403、429、5xx、新 session 失败、第二次失败和中途断流均不得重建或切换 credential rail。
+7. 分别注入过期、未来超过 15 分钟、错误 target/algorithm、超限 difficulty、坏 challenge/signature 的 PoW，确认 completion 请求数为零。轮换 bearer 或 Account identity generation 后，旧 session/PoW/replay state 必须不可命中。
+8. receipt 只保存时间、Provider/Account 的脱敏稳定标识、reviewed model、operation、HTTP/outcome、terminal/usage 摘要与负向账号请求计数；不保存 bearer、session id、PoW challenge/signature、prompt、raw SSE 或上游错误 body。上述真实链全部通过前保持 `fixture_verified` / `live_pending`。
+
+API Key Coding Plans / Ollama Cloud 专项补充：
+
+1. 先运行 `node scripts/audit/audit-coding-plan-registry.mjs --check --check-sources`，保存三份外部仓库 commit 匹配和 manifest current 的非敏感结果。任一 evidence file hash 漂移都必须先人工 review origin、route、catalog、quota 与 terminal，不能只刷新 hash。
+2. 按 `assets/contract/coding-plan-registry-manifest.json` 的 20 个 Profile 逐项设置 `CC_SWITCH_CODING_PLAN_PROFILE_ID`、对应 Key 和 reviewed model。receipt 必须明确 family、region 与 Claude/Codex Surface；一个 Surface/region 的成功不能替代另一个，也不能把通用 compatible Provider 当成该套餐。
+3. 每项执行 non-stream、stream、tool（仅 manifest/独立证据明确时）、usage 与错误 Key/429/5xx/坏终态；抓包确认 fixed origin、exact route、auth scheme 和 credential generation。另建不同 region/Surface/Provider 的干扰 Key，所有恢复路径中其请求数必须为零。
+4. quota adapter 为 supported 时验收固定 endpoint、credential role、fresh/source/reset 与同 generation transient stale；认证、坏 JSON、Provider revision/credential rotation 后旧 cache 必须失败关闭。adapter 为 `unavailable` 时只接受诚实 unavailable，禁止临时抓 Cookie/HTML、PAYG 余额或另一个 plan endpoint。
+5. 轮换当前 Provider Key 后，旧 generation 的 quota/cache/in-flight result 必须不可提交；Provider-owned Key 不能生成 Account 行，Account 列表与推理 binding selector 中都不得出现可选账号。terminal 后、body write 后或任何有歧义的请求都不得重放或切 rail。
+6. Ollama 使用一个 `OLLAMA_API_KEY` 创建同 Bundle 的 Claude/Codex Profiles。分别验收推理与目录，再验收并发 `POST /api/me` 和 `GET /api/usage` 的 complete、account-only、usage-only、0%、429→同 generation stale、401 清 cache、redirect、超 512 KiB、坏 JSON与 credential rotation。账号/usage 投影不得阻断推理或影响调度，也不得创建 Account、保存 Cookie/HTML。
+7. 本地 `cargo test coding_plan --lib`、`cargo test ollama --lib` 和 `node --test scripts/audit/coding-plan-registry.test.mjs` 通过只算 fixture。每个 Profile 与 Ollama 的 receipt 齐备前继续标记 `fixture_verified` / `live_pending`。
 
 Claude OAuth 专项补充：
 
@@ -285,7 +360,7 @@ Claude OAuth 专项补充：
 26. 20x 已有本地 `default_claude_max_20x` fixture 证据，但仍需真实账号确认当前 Anthropic 响应。5x 当前只有同形 `..._5x` 解析规则，没有 checked-in 真实 fixture；在 5x 账号和脱敏响应证据齐备前，release evidence 必须写 `blocked-inputs` 或 `SKIP`，不得写 live passed。
 27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x 三个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入。
 
-Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
+Grok 与 Amazon Q 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
 
 ## 脱敏 Evidence
 
@@ -296,6 +371,7 @@ Grok 的真实输入作为独立 external gate 接入环境检查：缺失时不
 - `scripts/smoke/code-agent-regression.sh`
 - `scripts/smoke/oauth-readiness-check.sh`
 - `scripts/smoke/grok-oauth-real.mjs`
+- `scripts/smoke/copilot-real.mjs`
 - `scripts/release-readiness.sh`
 
 检查 evidence 是否包含密钥形态：

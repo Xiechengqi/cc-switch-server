@@ -58,6 +58,7 @@ pub(super) fn supports_unauthorized_recovery(provider_type: ProviderType) -> boo
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
             | ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
             | ProviderType::GitHubCopilot
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
@@ -79,6 +80,7 @@ mod tests {
             ProviderType::AntigravityOAuth,
             ProviderType::AgyOAuth,
             ProviderType::KiroOAuth,
+            ProviderType::AmazonQOAuth,
             ProviderType::GitHubCopilot,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,

@@ -3360,16 +3360,25 @@
     "grokVideoGenerationEnabledDescription": "允许该 Grok OAuth Provider 或 Share 创建并查询视频任务。"
   },
   "kimiOauth": {
-    "description": "管理 Kimi Code 订阅账号",
-    "authStatus": "Kimi Code OAuth 认证",
-    "loginWithKimi": "使用 Kimi Code 登录",
-    "userCodeHint": "Kimi Code 设备验证码：",
-    "loginRequired": "请先登录 Kimi Code 账号",
-    "selectAccountRequired": "Kimi Code 必须绑定一个 Kimi Code 账号"
+    "description": "管理 Kimi 订阅账号",
+    "authStatus": "Kimi OAuth 认证",
+    "loginWithKimi": "使用 Kimi 登录",
+    "userCodeHint": "Kimi 设备验证码：",
+    "loginRequired": "请先登录 Kimi 账号",
+    "selectAccountRequired": "Kimi OAuth 必须绑定一个 Kimi 账号"
+  },
+  "amazonQOauth": {
+    "title": "Amazon Q Developer",
+    "description": "管理 Amazon Q Developer 订阅账号",
+    "authStatus": "Amazon Q Developer 认证",
+    "loginWithAmazonQ": "使用 Amazon Q Developer 登录",
+    "userCodeHint": "Amazon Q Developer 设备验证码：",
+    "loginRequired": "请先登录 Amazon Q Developer 账号",
+    "selectAccountRequired": "Amazon Q Developer 必须绑定一个 Amazon Q 账号"
   },
   "qoderOauth": {
-    "description": "管理 Qoder COSY 账号",
-    "authStatus": "Qoder COSY 认证",
+    "description": "管理 Qoder OAuth 账号",
+    "authStatus": "Qoder OAuth 认证",
     "deviceLogin": "设备登录",
     "patImport": "PAT 导入",
     "globalSite": "国际站",
@@ -3559,6 +3568,8 @@
     "thirtyDay": "30天",
     "sevenDayOpus": "7天 Opus 限额",
     "sevenDaySonnet": "7天 Sonnet 限额",
+    "sevenDayFable": "Fable 7天",
+    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的独立周容量池，上限为普通周额度的 50%。百分比直接来自 Anthropic 7d_oi/seven_day_overage_included，不由普通周用量推算。",
     "geminiPro": "Pro",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",
@@ -3566,6 +3577,7 @@
     "monthly": "每月",
     "copilotPremium": "高级请求",
     "cursorCredits": "用量",
+    "cursorSubscriptionUnavailable": "订阅信息暂不可用",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "预计用量",
     "kiroResetsOn": "{{date}} 重置",

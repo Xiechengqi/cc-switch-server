@@ -1999,7 +1999,7 @@ export function ServerProviderForm({
         <Section title={t("serverProviderForm.aws.title")}>
           <div className="grid gap-4 md:grid-cols-2">
             <CredentialControl
-              label="Access Key ID"
+              label={t("settings.s3Sync.accessKeyId")}
               edit={state.credentials.accessKeyId}
               revealedValue={
                 revealedCredentialValues[state.credentials.accessKeyId.slot]
@@ -2013,7 +2013,7 @@ export function ServerProviderForm({
               onChange={(next) => updateCredential("accessKeyId", next)}
             />
             <CredentialControl
-              label="Secret Access Key"
+              label={t("settings.s3Sync.secretAccessKey")}
               edit={state.credentials.secretAccessKey}
               revealedValue={
                 revealedCredentialValues[state.credentials.secretAccessKey.slot]
@@ -2045,7 +2045,9 @@ export function ServerProviderForm({
             onChange={(next) => updateCredential("sessionToken", next)}
           />
           <div className="space-y-2">
-            <Label htmlFor="server-provider-aws-region">Region</Label>
+            <Label htmlFor="server-provider-aws-region">
+              {t("settings.s3Sync.region")}
+            </Label>
             <Input
               id="server-provider-aws-region"
               value={state.awsRegion}
@@ -2316,7 +2318,9 @@ export function ServerProviderForm({
             </Tabs>
           ) : (
             <Badge variant="secondary">
-              {t("serverProviderForm.model.passthrough")}
+              {state.modelPolicy === "single"
+                ? t("serverProviderForm.model.single")
+                : t("serverProviderForm.model.passthrough")}
             </Badge>
           )}
 

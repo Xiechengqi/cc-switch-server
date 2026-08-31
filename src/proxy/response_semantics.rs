@@ -1,5 +1,11 @@
+use bytes::Bytes;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use super::responses_transport::{
+    encode_canonical_done_sse, encode_canonical_json_sse, ResponsesLivenessKind,
+    ResponsesTransportDecoder, ResponsesTransportItem,
+};
 
 const MAX_SEMANTIC_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEMANTIC_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -160,16 +166,51 @@ impl SemanticTerminal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticProtocolErrorKind {
+    Protocol,
+    Capacity,
+    MissingTerminal,
+}
+
 #[derive(Debug)]
 pub(super) struct SemanticProtocolError {
+    kind: SemanticProtocolErrorKind,
     message: String,
 }
 
 impl SemanticProtocolError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: SemanticProtocolErrorKind::Protocol,
             message: message.into(),
         }
+    }
+
+    fn from_transport(error: super::responses_transport::ResponsesTransportError) -> Self {
+        Self {
+            kind: if error.is_capacity() {
+                SemanticProtocolErrorKind::Capacity
+            } else {
+                SemanticProtocolErrorKind::Protocol
+            },
+            message: error.to_string(),
+        }
+    }
+
+    fn missing_terminal(message: impl Into<String>) -> Self {
+        Self {
+            kind: SemanticProtocolErrorKind::MissingTerminal,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn is_capacity(&self) -> bool {
+        self.kind == SemanticProtocolErrorKind::Capacity
+    }
+
+    pub(super) fn is_missing_terminal(&self) -> bool {
+        self.kind == SemanticProtocolErrorKind::MissingTerminal
     }
 }
 
@@ -192,12 +233,28 @@ pub(super) fn semantic_guard_enabled() -> bool {
         .unwrap_or(true)
 }
 
+pub(super) fn responses_sse_normalizer_enabled() -> bool {
+    std::env::var("CC_SWITCH_CODEX_RESPONSES_SSE_NORMALIZER_ENABLED")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            )
+        })
+        .unwrap_or(true)
+}
+
 pub(super) fn classify_json_document(
     body: &[u8],
 ) -> Result<SemanticObservation, SemanticProtocolError> {
     let value = serde_json::from_slice::<Value>(body).map_err(|error| {
         SemanticProtocolError::new(format!("Responses body is not valid JSON: {error}"))
     })?;
+    if !value.is_object() {
+        return Err(SemanticProtocolError::new(
+            "Responses body must be a JSON object",
+        ));
+    }
     Ok(classify_value(&value))
 }
 
@@ -221,16 +278,19 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         return SemanticObservation::Failure(failure_from_value(value, response, status));
     }
 
-    if event_type == "response.incomplete" || status == Some("incomplete") {
+    if event_type == "response.incomplete"
+        || (event_type.is_empty() && status == Some("incomplete"))
+    {
         return SemanticObservation::IncompleteTerminal;
     }
-    if event_type == "response.completed" || status == Some("completed") {
+    if event_type == "response.completed" || (event_type.is_empty() && status == Some("completed"))
+    {
         return SemanticObservation::SuccessTerminal;
     }
     if matches!(
         event_type,
         "response.created" | "response.in_progress" | "response.queued"
-    ) || matches!(status, Some("queued" | "in_progress"))
+    ) || (event_type.is_empty() && matches!(status, Some("queued" | "in_progress")))
     {
         return SemanticObservation::Lifecycle;
     }
@@ -351,17 +411,9 @@ fn normalize_failure_token(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['-', '.'], "_")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamEncoding {
-    Unknown,
-    Sse,
-    Json,
-}
-
 #[derive(Debug)]
 pub(super) struct ResponsesSseInspector {
-    encoding: StreamEncoding,
-    buffer: Vec<u8>,
+    transport: ResponsesTransportDecoder,
     saw_business: bool,
     terminal: Option<SemanticTerminal>,
     pending_error: Option<SemanticFailure>,
@@ -369,13 +421,34 @@ pub(super) struct ResponsesSseInspector {
     done_seen: bool,
     repeats: ResponsesRepeatTracker,
     repeat_guard_enabled: bool,
+    started: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ResponsesInspectionBatch {
+    pub(super) observations: Vec<SemanticObservation>,
+    pub(super) normalized: Bytes,
+    pub(super) liveness: Vec<ResponsesLivenessKind>,
+}
+
+impl ResponsesInspectionBatch {
+    pub(super) fn record_transport_metrics(&self, surface: &'static str) {
+        for kind in &self.liveness {
+            crate::metrics::record_responses_sse_transport(surface, kind.metric_kind());
+        }
+        if !self.normalized.is_empty() {
+            crate::metrics::record_responses_sse_transport(surface, "normalized_event");
+        }
+    }
 }
 
 impl Default for ResponsesSseInspector {
     fn default() -> Self {
         Self {
-            encoding: StreamEncoding::Unknown,
-            buffer: Vec::new(),
+            transport: ResponsesTransportDecoder::new(
+                MAX_SEMANTIC_PENDING_BYTES,
+                MAX_SEMANTIC_EVENT_BYTES,
+            ),
             saw_business: false,
             terminal: None,
             pending_error: None,
@@ -383,6 +456,7 @@ impl Default for ResponsesSseInspector {
             done_seen: false,
             repeats: ResponsesRepeatTracker::default(),
             repeat_guard_enabled: false,
+            started: false,
         }
     }
 }
@@ -406,7 +480,19 @@ impl ResponsesSseInspector {
         &mut self,
         chunk: &[u8],
     ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
-        self.push_with_limits(chunk, MAX_SEMANTIC_PENDING_BYTES, MAX_SEMANTIC_EVENT_BYTES)
+        self.push_normalized(chunk).map(|batch| batch.observations)
+    }
+
+    pub(super) fn push_normalized(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
+        self.started = true;
+        let items = self
+            .transport
+            .push(chunk)
+            .map_err(SemanticProtocolError::from_transport)?;
+        self.process_transport_items(items)
     }
 
     fn push_with_limits(
@@ -415,54 +501,46 @@ impl ResponsesSseInspector {
         max_pending_bytes: usize,
         max_event_bytes: usize,
     ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
-        if chunk.is_empty() {
-            return Ok(Vec::new());
+        if self.started {
+            return Err(SemanticProtocolError::new(
+                "Responses inspector limits cannot change after decoding starts",
+            ));
         }
-        self.buffer.extend_from_slice(chunk);
-        self.detect_encoding();
-        match self.encoding {
-            StreamEncoding::Unknown => self.ensure_bounded(max_pending_bytes).map(|()| Vec::new()),
-            StreamEncoding::Json => self.drain_json(false, max_pending_bytes, max_event_bytes),
-            StreamEncoding::Sse => self.drain_sse(false, max_pending_bytes, max_event_bytes),
-        }
+        self.transport = ResponsesTransportDecoder::new(max_pending_bytes, max_event_bytes);
+        self.push(chunk)
     }
 
     pub(super) fn finish(&mut self) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
-        self.finish_with_limits(MAX_SEMANTIC_PENDING_BYTES, MAX_SEMANTIC_EVENT_BYTES)
+        self.finish_normalized().map(|batch| batch.observations)
     }
 
-    fn finish_with_limits(
+    pub(super) fn finish_normalized(
         &mut self,
-        max_pending_bytes: usize,
-        max_event_bytes: usize,
-    ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
-        self.detect_encoding();
-        let mut observations = match self.encoding {
-            StreamEncoding::Unknown if self.buffer.iter().all(u8::is_ascii_whitespace) => {
-                self.buffer.clear();
-                Vec::new()
-            }
-            StreamEncoding::Unknown => {
-                return Err(SemanticProtocolError::new(
-                    "Responses stream ended with an unrecognized payload",
-                ))
-            }
-            StreamEncoding::Json if self.buffer.is_empty() && self.terminal.is_some() => Vec::new(),
-            StreamEncoding::Json => self.drain_json(true, max_pending_bytes, max_event_bytes)?,
-            StreamEncoding::Sse => self.drain_sse(true, max_pending_bytes, max_event_bytes)?,
-        };
+    ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
+        self.started = true;
+        let items = self
+            .transport
+            .finish()
+            .map_err(SemanticProtocolError::from_transport)?;
+        let mut batch = self.process_transport_items(items)?;
         if self.terminal.is_none() {
             if let Some(failure) = self.promote_pending_error() {
-                observations.push(SemanticObservation::Failure(failure));
+                batch
+                    .observations
+                    .push(SemanticObservation::Failure(failure));
             } else {
-                return Err(SemanticProtocolError::new(if self.done_seen {
-                    "Responses stream emitted [DONE] before a terminal response event"
+                return Err(if self.done_seen {
+                    SemanticProtocolError::new(
+                        "Responses stream emitted [DONE] before a terminal response event",
+                    )
                 } else {
-                    "Responses stream ended before a terminal response event"
-                }));
+                    SemanticProtocolError::missing_terminal(
+                        "Responses stream ended before a terminal response event",
+                    )
+                });
             }
         }
-        Ok(observations)
+        Ok(batch)
     }
 
     pub(super) fn saw_business(&self) -> bool {
@@ -483,206 +561,61 @@ impl ResponsesSseInspector {
         }
     }
 
-    fn detect_encoding(&mut self) {
-        if self.encoding != StreamEncoding::Unknown {
-            return;
-        }
-        let first = self
-            .buffer
-            .iter()
-            .copied()
-            .find(|byte| !byte.is_ascii_whitespace());
-        self.encoding = match first {
-            Some(b'{' | b'[') => StreamEncoding::Json,
-            Some(_) if self.buffer.contains(&b'\n') => StreamEncoding::Sse,
-            _ => StreamEncoding::Unknown,
-        };
-    }
-
-    fn drain_json(
+    fn process_transport_items(
         &mut self,
-        finish: bool,
-        max_pending_bytes: usize,
-        max_event_bytes: usize,
-    ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
-        if trim_ascii_whitespace(&self.buffer) == b"[DONE]" {
-            self.buffer.clear();
-            self.observe_done()?;
-            return Ok(Vec::new());
-        }
-        match serde_json::from_slice::<Value>(&self.buffer) {
-            Ok(value) => {
-                ensure_event_bounded(self.buffer.len(), max_event_bytes)?;
-                self.buffer.clear();
-                if self.terminal.is_some() {
-                    return Ok(Vec::new());
-                }
-                self.observe_repeat(&value)?;
-                let observation = classify_value(&value);
-                self.record(&observation);
-                Ok(vec![observation])
-            }
-            Err(_) => {
-                let mut observations = Vec::new();
-                let mut consumed = 0;
-                while let Some(relative_end) = self.buffer[consumed..]
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                {
-                    let line_end = consumed + relative_end;
-                    let line = self.buffer[consumed..line_end]
-                        .strip_suffix(b"\r")
-                        .unwrap_or(&self.buffer[consumed..line_end]);
-                    let line = trim_ascii_whitespace(line);
-                    if line.is_empty() {
-                        consumed = line_end + 1;
-                        continue;
-                    }
-                    if line == b"[DONE]" {
-                        self.observe_done()?;
-                        consumed = line_end + 1;
-                        continue;
-                    }
-                    if self.terminal.is_some() {
-                        consumed = line_end + 1;
-                        continue;
-                    }
-                    match serde_json::from_slice::<Value>(line) {
-                        Ok(value) => {
-                            ensure_event_bounded(line.len(), max_event_bytes)?;
-                            self.observe_repeat(&value)?;
-                            let observation = classify_value(&value);
-                            self.record(&observation);
-                            observations.push(observation);
-                            consumed = line_end + 1;
-                        }
-                        Err(error) if error.is_eof() => break,
-                        Err(error) => {
-                            ensure_event_bounded(line.len(), max_pending_bytes)?;
-                            return Err(SemanticProtocolError::new(format!(
-                                "Responses JSON line is invalid: {error}"
-                            )));
-                        }
-                    }
-                }
-                if consumed > 0 {
-                    self.buffer.drain(..consumed);
-                }
-                if !finish {
-                    self.ensure_bounded(max_pending_bytes)?;
-                    return Ok(observations);
-                }
-                let remaining = trim_ascii_whitespace(&self.buffer);
-                if remaining.is_empty() {
-                    self.buffer.clear();
-                    return Ok(observations);
-                }
-                if remaining == b"[DONE]" {
-                    self.buffer.clear();
-                    self.observe_done()?;
-                    return Ok(observations);
-                }
-                if self.terminal.is_some() {
-                    self.buffer.clear();
-                    return Ok(observations);
-                }
-                let value = match serde_json::from_slice::<Value>(remaining) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        ensure_event_bounded(remaining.len(), max_pending_bytes)?;
-                        return Err(SemanticProtocolError::new(format!(
-                            "Responses JSON stream is invalid: {error}"
-                        )));
-                    }
-                };
-                ensure_event_bounded(remaining.len(), max_event_bytes)?;
-                self.observe_repeat(&value)?;
-                let observation = classify_value(&value);
-                self.record(&observation);
-                observations.push(observation);
-                self.buffer.clear();
-                Ok(observations)
-            }
-        }
-    }
-
-    fn drain_sse(
-        &mut self,
-        finish: bool,
-        max_pending_bytes: usize,
-        max_event_bytes: usize,
-    ) -> Result<Vec<SemanticObservation>, SemanticProtocolError> {
+        items: Vec<ResponsesTransportItem>,
+    ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
         let mut observations = Vec::new();
-        while let Some((event_end, delimiter_len)) = next_event_boundary(&self.buffer) {
-            ensure_event_bounded(event_end, max_event_bytes)?;
-            let event = self.buffer[..event_end].to_vec();
-            self.buffer.drain(..event_end + delimiter_len);
-            if let Some(observation) = self.parse_sse_event(&event)? {
-                observations.push(observation);
+        let mut normalized = Vec::new();
+        let mut liveness = Vec::new();
+        for item in items {
+            match item {
+                ResponsesTransportItem::Liveness(kind) => liveness.push(kind),
+                ResponsesTransportItem::Done => {
+                    let had_terminal = self.terminal.is_some();
+                    if let Some(failure) = self.observe_done()? {
+                        observations.push(SemanticObservation::Failure(failure));
+                    }
+                    if had_terminal && !self.terminal_from_error_frame {
+                        normalized.extend_from_slice(&encode_canonical_done_sse());
+                    }
+                }
+                ResponsesTransportItem::Json {
+                    declared_event,
+                    value,
+                } => {
+                    if self.terminal.is_some() {
+                        continue;
+                    }
+                    self.observe_repeat(&value)?;
+                    let observation = classify_value(&value);
+                    self.record(&observation);
+                    normalized.extend_from_slice(&encode_canonical_json_sse(
+                        declared_event.as_deref(),
+                        &value,
+                    ));
+                    observations.push(observation);
+                }
             }
         }
-        if finish && !self.buffer.is_empty() {
-            ensure_event_bounded(self.buffer.len(), max_event_bytes)?;
-            let event = std::mem::take(&mut self.buffer);
-            if let Some(observation) = self.parse_sse_event(&event)? {
-                observations.push(observation);
-            }
-        }
-        self.ensure_bounded(max_pending_bytes)?;
-        Ok(observations)
+        Ok(ResponsesInspectionBatch {
+            observations,
+            normalized: Bytes::from(normalized),
+            liveness,
+        })
     }
 
-    fn parse_sse_event(
-        &mut self,
-        event: &[u8],
-    ) -> Result<Option<SemanticObservation>, SemanticProtocolError> {
-        let event = std::str::from_utf8(event).map_err(|error| {
-            SemanticProtocolError::new(format!("Responses SSE event is not UTF-8: {error}"))
-        })?;
-        let data = event
-            .lines()
-            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect::<Vec<_>>();
-        let payload = if data.is_empty() {
-            let event = event.trim();
-            if event.is_empty() || event.starts_with(':') || event.starts_with("event:") {
-                return Ok(None);
-            }
-            event.to_string()
-        } else {
-            data.join("\n").trim().to_string()
-        };
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        if payload == "[DONE]" {
-            self.observe_done()?;
-            return Ok(None);
-        }
-        if self.terminal.is_some() {
-            return Ok(None);
-        }
-        let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
-            SemanticProtocolError::new(format!("Responses SSE data is not valid JSON: {error}"))
-        })?;
-        self.observe_repeat(&value)?;
-        let observation = classify_value(&value);
-        self.record(&observation);
-        Ok(Some(observation))
-    }
-
-    fn observe_done(&mut self) -> Result<(), SemanticProtocolError> {
+    fn observe_done(&mut self) -> Result<Option<SemanticFailure>, SemanticProtocolError> {
         self.done_seen = true;
         if self.terminal.is_none() {
-            if self.promote_pending_error().is_some() {
-                return Ok(());
+            if let Some(failure) = self.promote_pending_error() {
+                return Ok(Some(failure));
             }
             return Err(SemanticProtocolError::new(
                 "Responses stream emitted [DONE] before a terminal response event",
             ));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn record(&mut self, observation: &SemanticObservation) {
@@ -713,44 +646,6 @@ impl ResponsesSseInspector {
         }
         Some(failure)
     }
-
-    fn ensure_bounded(&self, max_event_bytes: usize) -> Result<(), SemanticProtocolError> {
-        ensure_event_bounded(self.buffer.len(), max_event_bytes)
-    }
-}
-
-fn ensure_event_bounded(
-    event_bytes: usize,
-    max_event_bytes: usize,
-) -> Result<(), SemanticProtocolError> {
-    if event_bytes <= max_event_bytes {
-        return Ok(());
-    }
-    Err(SemanticProtocolError::new(format!(
-        "Responses semantic event exceeded {max_event_bytes} bytes"
-    )))
-}
-
-fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
-        if buffer.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, 2));
-        }
-        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-    }
-    None
-}
-
-fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[1..];
-    }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 #[cfg(test)]
@@ -778,6 +673,30 @@ mod tests {
             classify_value(&json!({"status": "incomplete", "output": []})),
             SemanticObservation::IncompleteTerminal
         );
+        assert_eq!(
+            classify_value(&json!({
+                "type": "response.created",
+                "response": {"status": "completed"}
+            })),
+            SemanticObservation::Lifecycle
+        );
+        assert_eq!(
+            classify_value(&json!({
+                "type": "response.done",
+                "response": {"status": "completed"}
+            })),
+            SemanticObservation::Business
+        );
+    }
+
+    #[test]
+    fn json_document_rejects_scalar_and_array_payloads() {
+        for body in [b"[]".as_slice(), b"\"not a response object\"".as_slice()] {
+            assert!(classify_json_document(body)
+                .unwrap_err()
+                .to_string()
+                .contains("JSON object"));
+        }
     }
 
     #[test]
@@ -1026,11 +945,18 @@ mod tests {
             .unwrap();
         assert!(matches!(
             observations.as_slice(),
-            [SemanticObservation::ErrorFrame(SemanticFailure {
-                origin: FailureOrigin::Provider,
-                code,
-                ..
-            })] if code == "rate_limit_exceeded"
+            [
+                SemanticObservation::ErrorFrame(SemanticFailure {
+                    origin: FailureOrigin::Provider,
+                    code: error_code,
+                    ..
+                }),
+                SemanticObservation::Failure(SemanticFailure {
+                    origin: FailureOrigin::Provider,
+                    code: failure_code,
+                    ..
+                })
+            ] if error_code == "rate_limit_exceeded" && failure_code == error_code
         ));
         assert!(matches!(
             inspector.terminal(),
@@ -1117,11 +1043,14 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
-        assert_eq!(observations, vec![SemanticObservation::Lifecycle]);
         assert_eq!(
-            inspector.finish().unwrap(),
-            vec![SemanticObservation::SuccessTerminal]
+            observations,
+            vec![
+                SemanticObservation::Lifecycle,
+                SemanticObservation::SuccessTerminal
+            ]
         );
+        assert!(inspector.finish().unwrap().is_empty());
     }
 
     #[test]

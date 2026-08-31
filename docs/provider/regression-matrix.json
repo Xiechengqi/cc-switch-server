@@ -13,7 +13,7 @@
   },
   "cursorImplementation": {
     "scope": "single explicitly bound subscription account per Provider; no account pool or cross-binding fallback",
-    "contractState": "statically-tested",
+    "contractState": "fixture_verified_live_pending",
     "apiKeyLiveVerified": false,
     "oauthLiveVerified": false,
     "implementedContracts": [
@@ -29,7 +29,11 @@
       "responses_tool_context_cold_resume",
       "store_false_ephemeral_continuation",
       "strict_client_mcp_wrapper_routing",
-      "unsupported_parameter_rejection"
+      "unsupported_parameter_rejection",
+      "fresh_exact_scope_live_catalog_model_passthrough",
+      "bounded_one_hour_catalog_stale",
+      "server_config_duplicate_fields_fail_closed",
+      "oauth_apikey_rail_isolation"
     ],
     "transientPrecommitRetry": "disabled_pending_separate_live_idempotency_evidence"
   },
@@ -40,6 +44,10 @@
     "implementedContracts": [
       "single_model_resolver_and_catalog_authorization",
       "profile_aware_bounded_model_discovery",
+      "provider_runtime_account_generation_scoped_catalog",
+      "authoritative_empty_and_no_static_entitlement_fallback",
+      "same_account_model_discovery_401_replay_once",
+      "malformed_or_oversized_catalog_fail_closed",
       "dynamic_context_window_usage",
       "request_scoped_session_and_cache_identity",
       "strict_tool_bridge_and_eventstream",
@@ -48,6 +56,154 @@
       "supplemental_credit_metering"
     ],
     "geminiSurface": "unsupported",
+    "amazonQBoundary": "independent_amazon_q_oauth_typed_family; Kiro credentials, entitlement, endpoint identity, and quota are never accepted",
+    "realAccountAcceptance": "live_pending"
+  },
+  "amazonQImplementation": {
+    "scope": "one explicitly bound amazon_q_oauth account per Provider; no Kiro credential reuse, account pool, catalog union, rotation, or cross-Provider fallback",
+    "contractState": "fixture_verified_live_pending",
+    "officialSourceCommit": "15cc8f3cd18c",
+    "surfaces": ["claude_messages", "codex_responses", "codex_chat_completions"],
+    "runtimeRegions": ["us-east-1", "eu-central-1"],
+    "implementedContracts": [
+      "independent_sso_oidc_device_registration_authorization_poll_refresh",
+      "server_native_claude_and_codex_profile_creation",
+      "official_cli_root_endpoint_target_user_agent_and_origin",
+      "strict_eventstream_tool_and_image_bridge",
+      "paginated_list_available_models_with_default_model",
+      "provider_runtime_account_generation_scoped_catalog",
+      "authoritative_empty_and_transient_only_exact_scope_stale",
+      "get_usage_limits_on_same_identity",
+      "same_account_precommit_401_refresh_and_replay_once",
+      "kiro_account_and_identity_rejection"
+    ],
+    "geminiSurface": "unsupported",
+    "realAccountAcceptance": "live_pending"
+  },
+  "webSessionImplementation": {
+    "scope": "one Provider-owned reviewed Cookie generation per hidden typed Profile; no Account binding, pool, rotation, automatic refresh, credential-rail fallback, or cross-Provider fallback",
+    "contractState": "fixture_verified_live_pending",
+    "visibility": "hidden",
+    "maturity": "experimental",
+    "risk": "high",
+    "profiles": ["grok_web_session", "perplexity_web_session"],
+    "surfaces": ["claude_messages", "claude_count_tokens_local", "codex_responses", "codex_chat_completions"],
+    "implementedContracts": [
+      "fixed_method_path_origin_referer_cookie_and_browser_identity",
+      "provider_owned_allowlisted_cookie_canonicalization",
+      "redirect_cookie_jar_cross_origin_set_cookie_and_client_header_isolation",
+      "provider_revision_runtime_and_credential_generation_scoped_auth_state",
+      "explicit_reimport_only_after_401_or_403",
+      "text_only_route_and_local_capability_rejection",
+      "bounded_arbitrary_chunk_ndjson_and_sse_strict_terminal_parsing",
+      "client_cancellation_is_terminal_without_retry_or_fallback",
+      "reviewed_static_catalog_without_live_entitlement_claim",
+      "estimated_usage_and_share_invocation_accounting_without_account_pool"
+    ],
+    "geminiSurface": "unsupported",
+    "realAccountAcceptance": "live_pending"
+  },
+  "geminiCodeAssistImplementation": {
+    "scope": "one explicitly bound gemini_cli account per Provider; no account pool, static catalog merge, or cross-Provider fallback",
+    "contractState": "fixture_verified_live_pending",
+    "surfaces": ["claude_messages", "gemini_generate_content"],
+    "modelDiscovery": {
+      "source": "authenticated_retrieve_user_quota_model_buckets",
+      "sameAccount401Replay": 1,
+      "sameGenerationTransientStaleAllowed": true,
+      "authenticationOrGenerationFailure": "fail_closed",
+      "staticOrCrossAccountMerge": false
+    },
+    "implementedContracts": [
+      "project_and_tier_bootstrap",
+      "generation_scoped_quota_refresh",
+      "quota_backed_entitlement_catalog",
+      "gemini_only_model_filter",
+      "authoritative_successful_empty_catalog",
+      "transient_only_same_generation_stale_catalog",
+      "schema_thought_signature_and_terminal_bridges"
+    ],
+    "realAccountAcceptance": "live_pending"
+  },
+  "antigravityCodePlanImplementation": {
+    "scope": "one explicitly bound antigravity_oauth or agy_oauth account per Provider; the two rails never share catalog cache or credentials",
+    "contractState": "fixture_verified_live_pending",
+    "surfaces": ["claude_messages", "gemini_generate_content"],
+    "modelDiscovery": {
+      "source": "authenticated_fetch_available_models",
+      "request": "POST /v1internal:fetchAvailableModels with the bound account project",
+      "families": ["gemini", "claude", "gpt", "other"],
+      "sameAccount401Replay": 1,
+      "sameIdentityTransientStaleAllowed": true,
+      "authenticationOrBindingFailure": "fail_closed",
+      "crossRailOrCrossAccountCache": false
+    },
+    "implementedContracts": [
+      "generation_scoped_authenticated_catalog",
+      "authoritative_successful_empty_catalog",
+      "model_quota_and_reset_metadata",
+      "thinking_image_token_and_mime_capabilities",
+      "deprecated_model_alias_evidence",
+      "gemini_claude_gpt_family_evidence",
+      "transient_only_same_identity_stale_catalog",
+      "mixed_search_function_thought_signature_and_terminal_bridges"
+    ],
+    "weeklyQuotaSummary": "not_implemented_no_reproducible_reference_endpoint",
+    "realAccountAcceptance": "live_pending"
+  },
+  "grokCodePlanImplementation": {
+    "scope": "one explicitly bound grok_oauth account per Provider; no pool, account rotation, cross-account cache, credential-rail fallback, or cross-Provider failover",
+    "contractState": "fixture_verified_live_pending",
+    "surfaces": ["claude_messages", "codex_responses", "codex_chat_completions", "gemini_generate_content"],
+    "modelDiscovery": {
+      "source": "authenticated_grok_cli_models",
+      "sameAccount401Replay": 1,
+      "scopeFields": ["app", "provider_revision", "runtime_fingerprint", "account_id", "auth_identity_generation", "token_refresh_generation"],
+      "sameIdentityTransientStaleAllowed": true,
+      "authenticationMalformedOrBindingFailure": "fail_closed",
+      "authoritativeSuccessfulEmptyCatalog": true,
+      "staticOrCrossAccountMerge": false
+    },
+    "mediaTaskOwnership": {
+      "schemaVersion": 4,
+      "taskKind": "video_generation",
+      "ownerKeyFields": ["share", "user_namespace", "task_kind", "task_id", "provider_id", "account_id", "auth_identity_generation", "runtime_fingerprint", "upstream_plane"]
+    },
+    "implementedContracts": [
+      "responses_http_sse_and_websocket",
+      "hosted_search_translation_and_usage",
+      "image_edit_video_capability_gates",
+      "conservative_account_capability_manifest",
+      "generation_scoped_dynamic_model_catalog",
+      "transient_only_same_identity_stale_catalog",
+      "durable_video_task_sticky_ownership",
+      "media_task_schema_v1_v3_migration"
+    ],
+    "realAccountAcceptance": "live_pending"
+  },
+  "githubCopilotCodePlanImplementation": {
+    "scope": "three explicit Claude, Codex, and Gemini Providers bind one selected github_copilot Account and auth identity generation; no pool, account rotation, model-driven rebinding, or cross-Provider fallback",
+    "contractState": "fixture_verified_live_pending",
+    "surfaces": ["claude_messages", "codex_responses", "gemini_generate_content"],
+    "modelDiscovery": {
+      "controlPlane": "POST /api/providers/:id/fetch-models for each explicit Provider ID",
+      "authoritativeSources": ["copilot_models_api", "copilot_account_cache"],
+      "requiredMetadata": ["github_domain", "api_origin", "picker_policy", "supported_endpoints", "token_limits", "tools_vision_reasoning"],
+      "sameAccount401Replay": 1,
+      "sameIdentityTransientStaleAllowed": true,
+      "authenticationMalformedOriginOrGenerationFailure": "fail_closed",
+      "authoritativeSuccessfulEmptyCatalog": true,
+      "staticOrCrossAccountMerge": false
+    },
+    "acceptanceHarness": {
+      "script": "scripts/smoke/copilot-real.mjs",
+      "offlineContractTest": "scripts/audit/copilot-real.test.mjs",
+      "requiredProviderIdEnvs": ["CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID", "CC_SWITCH_COPILOT_CODEX_PROVIDER_ID", "CC_SWITCH_COPILOT_GEMINI_PROVIDER_ID"],
+      "checks": ["same_account_generation_binding", "fresh_common_entitlement_model", "premium_quota", "three_surface_non_stream", "three_surface_stream", "forced_tool", "usage", "single_terminal"],
+      "mockContractVerified": true,
+      "githubComLiveVerified": false,
+      "ghesLiveVerified": false
+    },
     "realAccountAcceptance": "live_pending"
   },
   "requiredFixtureFields": [
@@ -90,7 +246,9 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
-        "deepseek_account"
+        "deepseek_account",
+        "grok_web_session",
+        "perplexity_web_session"
       ],
       "staticCoverage": {
         "nativeFamilies": [
@@ -110,12 +268,13 @@
           "nvidia",
           "deepseek_api",
           "kiro_oauth",
-          "github_copilot"
+          "github_copilot",
+          "deepseek_account"
         ],
-        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
         "plannedFamilies": ["aws_bedrock"],
-        "remainingFallbackFamilies": ["deepseek_account"],
-        "notes": "Local static adapter contracts are native for listed families. Kimi Claude uses exact native Messages/count_tokens endpoints with authoritative model discovery, bounded signed-thinking replay, generation fencing, and same-account 401 fixtures; real Kimi acceptance remains live pending. Qoder COSY Claude canonicalization, fixed-site signing, model/session/quota scoping, strict SSE terminal handling, and same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro Claude->CodeWhisperer non-stream/stream, absolute first-frame and terminal EventStream rules, tool gate, cross-region identity, fail-closed discovery, local count_tokens, and same-account 401 contracts are fixture-verified; real Kiro acceptance remains live pending. GitHub Copilot Claude->Chat non-stream/stream tool lifecycle, short-lived token-only forwarding, discovery, quota, and same-account 401 replay are fixture-verified Native; real github.com/GHES acceptance remains live pending. Cursor AgentService Claude text/image/tool emission, exact Provider/Account/Share/user session scope, initial and resumed absolute business-output deadlines, protocol-level builtin rejection, exact-scope credential/catalog caches, and same-binding 401/429 behavior are fixture-verified; Cursor remains Experimental/live-unverified until real validation."
+        "remainingFallbackFamilies": [],
+        "notes": "Local static adapter contracts are native for listed families. Kimi Claude uses exact native Messages/count_tokens endpoints with authoritative model discovery, bounded signed-thinking replay, generation fencing, and same-account 401 fixtures; real Kimi acceptance remains live pending. Qoder COSY Claude canonicalization, dynamic site-by-route effort/context capability, bounded signing clock and UUID nonce, exact account-generation model/session/quota scope, strict SSE terminal handling, and one same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro Claude->CodeWhisperer non-stream/stream, absolute first-frame and terminal EventStream rules, tool gate, cross-region identity, fail-closed discovery, local count_tokens, and same-account 401 contracts are fixture-verified; real Kiro acceptance remains live pending. GitHub Copilot Claude->Chat non-stream/stream tool lifecycle, short-lived token-only forwarding, discovery, quota, and same-account 401 replay are fixture-verified Native; real github.com/GHES acceptance remains live pending. Cursor AgentService Claude text/image/tool emission, exact Provider/Account/Share/user session scope, initial and resumed absolute business-output deadlines, protocol-level builtin rejection, exact-scope credential/catalog caches, and same-binding 401/429 behavior are fixture-verified; Cursor remains Experimental/live-unverified until real validation. DeepSeek Web Claude uses the fixed chat.deepseek.com session/PoW bridge, exact Provider/runtime/Account generation scope, strict terminal parsing, and only same-account pre-commit cached-session rebuild; import, provider test, discovery, and forwarding are fixture-verified while real imported-token acceptance remains live pending. Hidden Experimental Grok and Perplexity Web Session Profiles support text-only Messages and local count_tokens with fixed Cookie rails, strict terminals, cancellation without retry/fallback, and reviewed non-entitlement discovery; fixtures are verified and live Cookie acceptance remains pending."
       },
       "urlEnv": "CC_SWITCH_SHARE_URL",
       "requiresRouterToken": true,
@@ -148,7 +307,8 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
-        "deepseek_account"
+        "grok_web_session",
+        "perplexity_web_session"
       ],
       "staticCoverage": {
         "nativeFamilies": [
@@ -170,10 +330,10 @@
           "kiro_oauth",
           "github_copilot"
         ],
-        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
         "plannedFamilies": ["aws_bedrock"],
-        "remainingFallbackFamilies": ["deepseek_account"],
-        "notes": "Responses and Chat share the same provider family support. Kimi Responses uses the exact Chat bridge with authoritative model discovery, K3 effort normalization, bounded signed-thinking replay, generation fencing, and same-account 401 fixtures; real Kimi acceptance remains live pending. Qoder COSY Responses canonicalization, fixed-site signing, model/session/quota scoping, strict SSE terminal handling, and same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro uses the native Codex->Anthropic->CodeWhisperer bridge with fixture-verified non-stream/stream envelopes, absolute first-frame and terminal EventStream rules, cross-region identity, and fail-closed discovery; live acceptance remains pending. GitHub Copilot Responses->Chat non-stream/stream tool lifecycle, short-lived token-only forwarding, discovery, quota, and same-account 401 replay are fixture-verified Native; real github.com/GHES acceptance remains live pending. Cursor AgentService Responses lifecycle, exact scoped continuation/tool indexes, initial and post-tool absolute business-output deadlines, protocol-level builtin rejection, and same-binding credential/catalog/401/429 behavior are fixture-verified; Cursor remains Experimental/live-unverified."
+        "remainingFallbackFamilies": [],
+        "notes": "Responses and Chat share the same provider family support. Kimi Responses uses the exact Chat bridge with authoritative empty/error-separated discovery, transient-only exact-generation stale, no static entitlement fallback, K3 effort normalization, auth/token-generation-fenced signed-thinking replay, and one same-account 401 fixture; real Kimi acceptance remains live pending. Qoder COSY Responses canonicalization, dynamic site-by-route effort/context capability, bounded signing clock and UUID nonce, exact account-generation model/session/quota scope, strict SSE terminal handling, and one same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro uses the native Codex->Anthropic->CodeWhisperer bridge with fixture-verified non-stream/stream envelopes, absolute first-frame and terminal EventStream rules, cross-region identity, and fail-closed discovery; live acceptance remains pending. GitHub Copilot Responses->Chat non-stream/stream tool lifecycle, short-lived-token boundary, discovery, quota, and same-account 401 replay are fixture-verified Native; real github.com/GHES acceptance remains live pending. Cursor AgentService Responses lifecycle, exact scoped continuation/tool indexes, initial and post-tool absolute business-output deadlines, protocol-level builtin rejection, and same-binding credential/catalog/401/429 behavior are fixture-verified; Cursor remains Experimental/live-unverified. DeepSeek Web is intentionally unsupported on Codex and cannot fall through generic HTTP or deepseek_api. Hidden Experimental Grok and Perplexity Web Session Profiles provide fixture-verified text-only Responses lifecycles, fixed Provider-owned Cookie rails, strict terminal/cancellation semantics, and reviewed non-entitlement discovery; real Cookie acceptance remains pending."
       },
       "urlEnv": "CC_SWITCH_SHARE_URL",
       "requiresRouterToken": true,
@@ -206,7 +366,8 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
-        "deepseek_account"
+        "grok_web_session",
+        "perplexity_web_session"
       ],
       "staticCoverage": {
         "nativeFamilies": [
@@ -228,10 +389,10 @@
           "kiro_oauth",
           "github_copilot"
         ],
-        "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
+        "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
         "plannedFamilies": ["aws_bedrock"],
-        "remainingFallbackFamilies": ["deepseek_account"],
-        "notes": "Chat endpoint must stay in the matrix because Codex OAuth Chat->Responses routing is a production regression target. Kimi Chat uses the exact Coding Chat endpoint with authoritative model discovery, K3 effort normalization, bounded signed-thinking replay, generation fencing, and same-account 401 fixtures; real Kimi acceptance remains live pending. Qoder COSY Chat canonicalization, fixed-site signing, model/session/quota scoping, strict SSE terminal handling, and same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro Chat uses the native Codex->Anthropic->CodeWhisperer bridge with fixture-verified stream/non-stream envelopes, absolute first-frame and terminal EventStream rules, cross-region identity, and fail-closed discovery; real Kiro acceptance remains live pending. GitHub Copilot Chat forwarding shares the fixture-verified native Codex surface, short-lived token boundary, discovery, quota, and same-account 401 replay; real github.com/GHES acceptance remains live pending. Cursor AgentService Chat text/tool/finish/usage emission shares the exact scoped session, deadline, builtin-rejection, credential/catalog, and same-binding retry fixtures; Cursor remains Experimental/live-unverified."
+        "remainingFallbackFamilies": [],
+        "notes": "Chat endpoint must stay in the matrix because Codex OAuth Chat->Responses routing is a production regression target. Kimi Chat uses the exact Coding Chat endpoint with authoritative empty/error-separated discovery, transient-only exact-generation stale, no static entitlement fallback, K3 effort normalization, auth/token-generation-fenced signed-thinking replay, and one same-account 401 fixture; real Kimi acceptance remains live pending. Qoder COSY Chat canonicalization, dynamic site-by-route effort/context capability, bounded signing clock and UUID nonce, exact account-generation model/session/quota scope, strict SSE terminal handling, and one same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kimi/GLM/Alibaba/MiniMax/Volcengine/MiMo API-key coding-plan Profiles have fixed route/model/quota contracts; real subscription inference and quota remain live pending. Kiro Chat uses the native Codex->Anthropic->CodeWhisperer bridge with fixture-verified stream/non-stream envelopes, absolute first-frame and terminal EventStream rules, cross-region identity, and fail-closed discovery; real Kiro acceptance remains live pending. GitHub Copilot Chat forwarding shares the fixture-verified native Codex surface, short-lived token boundary, discovery, quota, and same-account 401 replay; real github.com/GHES acceptance remains live pending. Cursor AgentService Chat text/tool/finish/usage emission shares the exact scoped session, deadline, builtin-rejection, credential/catalog, and same-binding retry fixtures; Cursor remains Experimental/live-unverified. DeepSeek Web is intentionally unsupported on Codex Chat and cannot fall through generic HTTP or deepseek_api. Hidden Experimental Grok and Perplexity Web Session Profiles provide fixture-verified text-only Chat lifecycles, fixed Provider-owned Cookie rails, strict terminal/cancellation semantics, and reviewed non-entitlement discovery; real Cookie acceptance remains pending."
       },
       "urlEnv": "CC_SWITCH_SHARE_URL",
       "requiresRouterToken": true,
@@ -263,8 +424,7 @@
         "nvidia",
         "deepseek_api",
         "github_copilot",
-        "kiro_oauth",
-        "deepseek_account"
+        "kiro_oauth"
       ],
       "staticCoverage": {
         "nativeFamilies": [
@@ -287,11 +447,8 @@
         ],
         "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
         "plannedFamilies": ["aws_bedrock"],
-        "remainingFallbackFamilies": [
-          "kiro_oauth",
-          "deepseek_account"
-        ],
-        "notes": "streamGenerateContent bridge is covered statically for native OpenAI-compatible upstreams. GitHub Copilot Gemini->Chat non-stream/stream tool lifecycle, usage, single terminal, short-lived-token boundary, and same-account 401 contract are fixture-verified Native; real github.com/GHES acceptance remains live pending. Kimi Gemini uses the exact Coding Chat bridge with authoritative model discovery, K3 effort normalization, bounded signed-thinking replay, generation fencing, and same-account 401 fixtures; real Kimi acceptance remains live pending. Qoder COSY Gemini canonicalization, fixed-site signing, model/session/quota scoping, strict SSE terminal handling, and same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kiro is deliberately not exposed on Gemini and remains unsupported. Cursor AgentService Gemini response emission plus signed Share `/v1beta/models` exact S2 Provider scope, cross-scope isolation, and authoritative empty catalogs are fixture-verified; Cursor remains Experimental/live-unverified and still requires real stream/tool/image evidence."
+        "remainingFallbackFamilies": [],
+        "notes": "streamGenerateContent bridge is covered statically for native OpenAI-compatible upstreams. GitHub Copilot Gemini->Chat non-stream/stream tool lifecycle, usage, single terminal, short-lived-token boundary, and same-account 401 contract are fixture-verified Native; real github.com/GHES acceptance remains live pending. Kimi Gemini uses the exact Coding Chat bridge with authoritative empty/error-separated discovery, transient-only exact-generation stale, no static entitlement fallback, K3 effort normalization, auth/token-generation-fenced signed-thinking replay, and one same-account 401 fixture; real Kimi acceptance remains live pending. Qoder COSY Gemini canonicalization, dynamic site-by-route effort/context capability, bounded signing clock and UUID nonce, exact account-generation model/session/quota scope, strict SSE terminal handling, and one same-account pre-commit auth replay are fixture-verified; real Qoder acceptance remains live pending. Kiro is deliberately not exposed on Gemini and remains unsupported. Cursor AgentService Gemini response emission plus signed Share `/v1beta/models` exact S2 Provider scope, cross-scope isolation, and authoritative empty catalogs are fixture-verified; Cursor remains Experimental/live-unverified and still requires real stream/tool/image evidence. DeepSeek Web is intentionally unsupported on Gemini and cannot fall through generic HTTP or deepseek_api. Grok and Perplexity Web Session Profiles are also deliberately absent from Gemini and fail closed as unsupported."
       },
       "urlEnv": "CC_SWITCH_SHARE_URL",
       "requiresRouterToken": true,

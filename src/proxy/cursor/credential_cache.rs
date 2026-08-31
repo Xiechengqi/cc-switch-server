@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 const MAX_CREDENTIAL_CACHE_ENTRIES: usize = 16;
+pub const CURSOR_MODEL_STALE_TTL_MS: i64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct CachedToken {
@@ -113,8 +114,20 @@ impl CursorModelCatalogCache {
     pub async fn last_known_good(
         &self,
         scope: &CursorModelCatalogScope,
+        now_ms: i64,
     ) -> Option<CursorModelCatalog> {
-        self.catalogs.read().await.get(scope).cloned()
+        let mut catalogs = self.catalogs.write().await;
+        let usable = catalogs.get(scope).is_some_and(|catalog| {
+            catalog
+                .fetched_at_ms
+                .saturating_add(CURSOR_MODEL_STALE_TTL_MS)
+                > now_ms
+        });
+        if usable {
+            return catalogs.get(scope).cloned();
+        }
+        catalogs.remove(scope);
+        None
     }
 
     pub async fn insert(
@@ -389,7 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_catalog_keeps_stale_last_known_good() {
+    async fn model_catalog_keeps_only_bounded_stale_last_known_good() {
         let cache = CursorModelCatalogCache::default();
         let scope = catalog_scope(1);
         cache
@@ -398,9 +411,13 @@ mod tests {
         assert!(cache.fresh(&scope, 1_050).await.is_some());
         assert!(cache.fresh(&scope, 1_101).await.is_none());
         assert_eq!(
-            cache.last_known_good(&scope).await.unwrap().models,
+            cache.last_known_good(&scope, 2_000).await.unwrap().models,
             vec!["composer"]
         );
+        assert!(cache
+            .last_known_good(&scope, 1_000 + CURSOR_MODEL_STALE_TTL_MS)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -418,10 +435,16 @@ mod tests {
             .insert(original.clone(), vec!["composer".to_string()], 1_000, 100)
             .await;
 
-        assert!(cache.last_known_good(&original).await.is_some());
-        assert!(cache.last_known_good(&changed_runtime).await.is_none());
-        assert!(cache.last_known_good(&changed_generation).await.is_none());
-        assert!(cache.last_known_good(&changed_key).await.is_none());
+        assert!(cache.last_known_good(&original, 2_000).await.is_some());
+        assert!(cache
+            .last_known_good(&changed_runtime, 2_000)
+            .await
+            .is_none());
+        assert!(cache
+            .last_known_good(&changed_generation, 2_000)
+            .await
+            .is_none());
+        assert!(cache.last_known_good(&changed_key, 2_000).await.is_none());
     }
 
     #[tokio::test]
@@ -433,11 +456,11 @@ mod tests {
             .await;
         cache.insert(scope.clone(), Vec::new(), 2_000, 100).await;
         assert!(cache
-            .last_known_good(&scope)
+            .last_known_good(&scope, 2_050)
             .await
             .is_some_and(|catalog| catalog.models.is_empty()));
 
         cache.invalidate(&scope).await;
-        assert!(cache.last_known_good(&scope).await.is_none());
+        assert!(cache.last_known_good(&scope, 2_050).await.is_none());
     }
 }

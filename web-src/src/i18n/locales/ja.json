@@ -3285,16 +3285,25 @@
     "grokVideoGenerationEnabledDescription": "この Grok OAuth Provider または Share に動画タスクの作成と照会を許可します。"
   },
   "kimiOauth": {
-    "description": "Kimi Code サブスクリプションアカウントを管理",
-    "authStatus": "Kimi Code OAuth 認証",
-    "loginWithKimi": "Kimi Code でログイン",
-    "userCodeHint": "Kimi Code デバイス確認コード：",
-    "loginRequired": "先に Kimi Code アカウントへログインしてください",
-    "selectAccountRequired": "Kimi Code を Kimi Code アカウントに関連付けてください"
+    "description": "Kimi サブスクリプションアカウントを管理",
+    "authStatus": "Kimi OAuth 認証",
+    "loginWithKimi": "Kimi でログイン",
+    "userCodeHint": "Kimi デバイス確認コード：",
+    "loginRequired": "先に Kimi アカウントへログインしてください",
+    "selectAccountRequired": "Kimi OAuth を Kimi アカウントに関連付けてください"
+  },
+  "amazonQOauth": {
+    "title": "Amazon Q Developer",
+    "description": "Amazon Q Developer サブスクリプションアカウントを管理",
+    "authStatus": "Amazon Q Developer 認証",
+    "loginWithAmazonQ": "Amazon Q Developer でログイン",
+    "userCodeHint": "Amazon Q Developer デバイス確認コード：",
+    "loginRequired": "先に Amazon Q Developer アカウントへログインしてください",
+    "selectAccountRequired": "Amazon Q Developer を Amazon Q アカウントに関連付けてください"
   },
   "qoderOauth": {
-    "description": "Qoder COSY アカウントを管理",
-    "authStatus": "Qoder COSY 認証",
+    "description": "Qoder OAuth アカウントを管理",
+    "authStatus": "Qoder OAuth 認証",
     "deviceLogin": "デバイスログイン",
     "patImport": "PAT インポート",
     "globalSite": "グローバル",
@@ -3484,6 +3493,8 @@
     "thirtyDay": "30日間",
     "sevenDayOpus": "7日間 Opus 制限",
     "sevenDaySonnet": "7日間 Sonnet 制限",
+    "sevenDayFable": "Fable 7日間",
+    "fablePoolHelp": "Fable は Claude Max 5x/20x 専用の週次容量プールで、通常の週次上限の 50% が上限です。この割合は Anthropic の 7d_oi/seven_day_overage_included から直接取得し、通常の週次使用量から推定しません。",
     "geminiPro": "Pro",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",
@@ -3491,6 +3502,7 @@
     "monthly": "月間",
     "copilotPremium": "プレミアム",
     "cursorCredits": "使用量",
+    "cursorSubscriptionUnavailable": "サブスクリプション情報を一時的に取得できません",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "推定使用量",
     "kiroResetsOn": "{{date}}にリセット",

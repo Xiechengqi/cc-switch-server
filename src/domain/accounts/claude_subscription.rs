@@ -9,7 +9,33 @@ pub enum ClaudeSubscriptionPlan {
     Enterprise,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeFableEligibility {
+    Eligible,
+    Ineligible,
+    Unknown,
+}
+
+pub const CLAUDE_FABLE_MODEL_FAMILY: &str = "claude-fable-5";
+
+pub fn is_claude_fable_5_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized == CLAUDE_FABLE_MODEL_FAMILY
+        || normalized
+            .strip_prefix(CLAUDE_FABLE_MODEL_FAMILY)
+            .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with(':'))
+}
+
 impl ClaudeSubscriptionPlan {
+    pub const fn fable_eligibility(self) -> ClaudeFableEligibility {
+        match self {
+            Self::Max5x | Self::Max20x => ClaudeFableEligibility::Eligible,
+            Self::Free | Self::Pro | Self::Team | Self::Enterprise => {
+                ClaudeFableEligibility::Ineligible
+            }
+            Self::Max => ClaudeFableEligibility::Unknown,
+        }
+    }
     pub const fn plan_type(self) -> &'static str {
         match self {
             Self::Free => "claude_free",
@@ -48,6 +74,16 @@ impl ClaudeSubscriptionPlan {
         match self {
             Self::Max5x | Self::Max20x => 2,
             _ => 1,
+        }
+    }
+}
+
+impl ClaudeSubscriptionResolution {
+    pub const fn fable_eligibility(&self) -> ClaudeFableEligibility {
+        if self.conflict || self.stale {
+            ClaudeFableEligibility::Unknown
+        } else {
+            self.plan.fable_eligibility()
         }
     }
 }
@@ -418,5 +454,32 @@ mod tests {
             ClaudeSubscriptionSource::CachedSubscriptionLevel
         );
         assert!(resolution.stale);
+    }
+
+    #[test]
+    fn fable_eligibility_requires_a_fresh_specific_max_multiplier() {
+        assert_eq!(
+            ClaudeSubscriptionPlan::Max5x.fable_eligibility(),
+            ClaudeFableEligibility::Eligible
+        );
+        assert_eq!(
+            ClaudeSubscriptionPlan::Max20x.fable_eligibility(),
+            ClaudeFableEligibility::Eligible
+        );
+        assert_eq!(
+            ClaudeSubscriptionPlan::Pro.fable_eligibility(),
+            ClaudeFableEligibility::Ineligible
+        );
+        assert_eq!(
+            ClaudeSubscriptionPlan::Max.fable_eligibility(),
+            ClaudeFableEligibility::Unknown
+        );
+
+        let stale = resolve_claude_subscription([candidate(
+            ClaudeSubscriptionSource::CachedSubscriptionLevel,
+            "Claude Max 20x",
+        )])
+        .unwrap();
+        assert_eq!(stale.fable_eligibility(), ClaudeFableEligibility::Unknown);
     }
 }

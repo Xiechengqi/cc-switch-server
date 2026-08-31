@@ -5,6 +5,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGE
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::clients::oauth::claude_models::CLAUDE_FABLE_MODEL_FAMILY;
 use crate::clients::oauth::codex_reset_credits::{
     codex_authenticated_get, fetch_reset_credit_details, merge_reset_credit_snapshot,
     normalize_imported_snapshot, parse_usage_available_count,
@@ -21,12 +22,13 @@ use crate::domain::accounts::capability_evidence::{
     PROJECT_BOOTSTRAP_DIMENSION, TIER_ENTITLEMENT_DIMENSION,
 };
 use crate::domain::accounts::claude_subscription::{
-    parse_claude_subscription_plan, resolve_claude_subscription, ClaudeSubscriptionCandidate,
-    ClaudeSubscriptionResolution, ClaudeSubscriptionSource,
+    parse_claude_subscription_plan, resolve_claude_subscription, ClaudeFableEligibility,
+    ClaudeSubscriptionCandidate, ClaudeSubscriptionResolution, ClaudeSubscriptionSource,
 };
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     gemini_v1internal_project_id, Account, AccountQuota, AccountQuotaTier, AccountRefreshUpdate,
+    CLAUDE_FABLE_CAPACITY_POOL, CLAUDE_FABLE_QUOTA_TIER, CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY,
 };
 use crate::domain::claude_cli::{
     claude_axios_user_agent, claude_cli_user_agent, claude_code_user_agent,
@@ -250,6 +252,10 @@ pub async fn refresh_account_quota(
         ProviderType::KiroOAuth => {
             refresh_kiro_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
+        ProviderType::AmazonQOAuth => {
+            refresh_amazon_q_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
+        }
         ProviderType::GrokOAuth => {
             refresh_grok_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
@@ -357,6 +363,7 @@ impl QoderQuotaBucket {
             limit: self.total,
             unit: self.unit.clone().or_else(|| Some("credits".to_string())),
             resets_at,
+            ..Default::default()
         }
     }
 
@@ -839,6 +846,7 @@ fn push_kimi_count_tier(tiers: &mut Vec<AccountQuotaTier>, name: &str, label: &s
         limit: Some(limit),
         unit: Some("requests".to_string()),
         resets_at: kimi_reset_at(value),
+        ..Default::default()
     });
 }
 
@@ -864,6 +872,7 @@ fn push_kimi_utilization_tier(
         limit: None,
         unit: Some("percent".to_string()),
         resets_at: kimi_reset_at(value),
+        ..Default::default()
     });
 }
 
@@ -2745,6 +2754,7 @@ fn grok_monthly_billing_tiers(body: &Value) -> Vec<AccountQuotaTier> {
         limit: Some(limit),
         unit: Some("USD".to_string()),
         resets_at: grok_billing_reset_at(body),
+        ..Default::default()
     }]
 }
 
@@ -3181,6 +3191,7 @@ fn grok_legacy_billing_tier(body: &Value) -> Option<AccountQuotaTier> {
             limit,
             unit: Some("credits".to_string()),
             resets_at,
+            ..Default::default()
         }
     })
 }
@@ -3194,6 +3205,7 @@ fn grok_credit_tier(name: &str, used: f64, limit: f64, resets_at: Option<i64>) -
         limit: Some(limit),
         unit: Some("credits".to_string()),
         resets_at,
+        ..Default::default()
     }
 }
 
@@ -3633,6 +3645,62 @@ async fn refresh_kiro_quota(
     Ok(update)
 }
 
+async fn refresh_amazon_q_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    #[cfg(test)]
+    let endpoint_override = account
+        .raw
+        .as_ref()
+        .and_then(|value| string_at(value, &["/testAmazonQRuntimeUrl"]));
+    #[cfg(not(test))]
+    let endpoint_override: Option<String> = None;
+    let usage = crate::clients::oauth::amazon_q_runtime::usage_snapshot(
+        http,
+        account,
+        endpoint_override.as_deref(),
+        request_timeout,
+    )
+    .await
+    .map_err(|message| QuotaRefreshFailure {
+        status_code: 502,
+        upstream_status: None,
+        message: format!("amazon_q_oauth quota request failed: {message}"),
+        retryable: true,
+        next_refresh_at: Some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        partial_update: None,
+    })?;
+    let subscription_level = string_at(
+        &usage,
+        &[
+            "/subscriptionInfo/subscriptionTitle",
+            "/subscription_info/subscription_title",
+        ],
+    )
+    .or_else(|| account.subscription_level.clone())
+    .or_else(|| Some("Amazon Q Developer".to_string()));
+    let quota = quota_from_usage_limits(usage.clone(), subscription_level.clone(), now_ms);
+    let mut raw = account
+        .raw
+        .clone()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("amazonQUsageLimits".to_string(), usage);
+        object.insert("quotaRefreshedAtMs".to_string(), Value::from(now_ms));
+    }
+    let quota_percent = agentic_quota_percent(&quota);
+    let mut update =
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms)
+            .with_raw(raw);
+    update.quota_percent = quota_percent;
+    Ok(update)
+}
+
 fn kiro_quota_runtime_identity(
     account: &Account,
 ) -> Result<crate::domain::providers::kiro::KiroRuntimeIdentity, QuotaRefreshFailure> {
@@ -3805,6 +3873,7 @@ fn codex_tiers_from_rate_limit(rate_limit: Option<CodexRateLimit>) -> Vec<Accoun
                 limit: None,
                 unit: Some("percent".to_string()),
                 resets_at: window.reset_at.and_then(codex_reset_at_ms),
+                ..Default::default()
             });
         }
     }
@@ -3836,6 +3905,7 @@ fn codex_review_tiers_from_usage(body: &Value) -> Vec<AccountQuotaTier> {
                 limit: None,
                 unit: Some("percent".to_string()),
                 resets_at: window.reset_at.and_then(codex_reset_at_ms),
+                ..Default::default()
             })
         })
         .collect()
@@ -4228,6 +4298,7 @@ fn parse_claude_quota(
     const KNOWN_TIERS: &[&str] = &[
         "five_hour",
         "seven_day",
+        "seven_day_overage_included",
         "seven_day_opus",
         "seven_day_omelette",
         "seven_day_sonnet",
@@ -4243,6 +4314,11 @@ fn parse_claude_quota(
             }
             push_claude_tier(&mut tiers, name, Some(value));
         }
+    }
+    if subscription.map(|value| value.resolution.fable_eligibility())
+        != Some(ClaudeFableEligibility::Eligible)
+    {
+        tiers.retain(|tier| tier.name != CLAUDE_FABLE_QUOTA_TIER);
     }
     let plan_label =
         subscription.map(|subscription| subscription.resolution.plan.label().to_string());
@@ -4311,14 +4387,21 @@ fn push_claude_tier(tiers: &mut Vec<AccountQuotaTier>, name: &str, value: Option
     let Some(utilization) = window.utilization else {
         return;
     };
+    let normalized_name = normalize_claude_tier_name(name);
+    let is_fable = normalized_name == CLAUDE_FABLE_QUOTA_TIER;
     tiers.push(AccountQuotaTier {
-        name: normalize_claude_tier_name(name).to_string(),
+        name: normalized_name.to_string(),
         label: None,
         utilization: Some(percent_to_fraction(utilization)),
         used: None,
         limit: None,
         unit: Some("percent".to_string()),
         resets_at: window.resets_at.as_deref().and_then(rfc3339_to_unix_ms),
+        scope: is_fable.then(|| "model_family".to_string()),
+        capacity_pool: is_fable.then(|| CLAUDE_FABLE_CAPACITY_POOL.to_string()),
+        model_family: is_fable.then(|| CLAUDE_FABLE_MODEL_FAMILY.to_string()),
+        relative_weekly_capacity: is_fable.then_some(CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY),
+        source: is_fable.then(|| "anthropic_usage_7d_oi".to_string()),
     });
 }
 
@@ -4356,6 +4439,7 @@ fn parse_gemini_quota(
             limit: None,
             unit: Some("percent".to_string()),
             resets_at: reset_time.as_deref().and_then(rfc3339_to_unix_ms),
+            ..Default::default()
         })
         .collect();
     AccountQuota {
@@ -4615,6 +4699,7 @@ fn parse_copilot_usage_quota(
                 limit: Some(total),
                 unit: Some("premium_interactions".to_string()),
                 resets_at: limited_reset.as_deref().and_then(dateish_to_unix_ms),
+                ..Default::default()
             },
             limited_reset,
             "monthly_quotas",
@@ -4682,6 +4767,7 @@ fn copilot_tier_from_detail(premium: &CopilotQuotaDetail, reset: Option<&str>) -
         limit: if unlimited { None } else { limit },
         unit: Some("premium_interactions".to_string()),
         resets_at: reset.and_then(dateish_to_unix_ms),
+        ..Default::default()
     }
 }
 
@@ -4859,6 +4945,7 @@ fn parse_cursor_imported_quota(
             limit,
             unit,
             resets_at,
+            ..Default::default()
         }],
         extra_usage: Some(json!({
             "raw": snapshot,
@@ -6046,6 +6133,7 @@ struct CopilotQuotaDetail {
 fn normalize_claude_tier_name(name: &str) -> &str {
     match name {
         "seven_day_omelette" => "seven_day_opus",
+        "seven_day_overage_included" | "seven_day_oi" | "7d_oi" => CLAUDE_FABLE_QUOTA_TIER,
         _ => name,
     }
 }
@@ -7554,6 +7642,7 @@ mod tests {
                 limit: None,
                 unit: Some("percent".to_string()),
                 resets_at: None,
+                ..Default::default()
             },
             AccountQuotaTier {
                 name: "review_weekly".to_string(),
@@ -7563,6 +7652,7 @@ mod tests {
                 limit: None,
                 unit: Some("percent".to_string()),
                 resets_at: None,
+                ..Default::default()
             },
         ];
         assert_eq!(quota_percent_from_tiers(&tiers), Some(20.0));
@@ -8113,6 +8203,58 @@ mod tests {
             assert_eq!(extra["subscriptionEvidence"]["stale"], false);
             assert_eq!(extra["warningCodes"], json!([]));
         }
+    }
+
+    #[test]
+    fn claude_fable_pool_is_canonical_and_only_exposed_for_eligible_max_plans() {
+        let usage = json!({
+            "plan": "claude_max",
+            "seven_day": {"utilization": 72.0},
+            "seven_day_overage_included": {
+                "utilization": 100.0,
+                "resets_at": "2026-09-07T00:00:00Z"
+            }
+        });
+        let account = imported_account(ProviderType::ClaudeOAuth, json!({}));
+        let bootstrap = json!({
+            "organizationType": "claude_max",
+            "organizationRateLimitTier": "default_claude_max_20x",
+        });
+        let subscription =
+            resolve_claude_quota_subscription(&account, &usage, None, Some(&bootstrap), 1_000)
+                .unwrap();
+        let quota = parse_claude_quota(&usage, Some(&subscription), 1_000);
+        let fable = quota
+            .tiers
+            .iter()
+            .find(|tier| tier.name == CLAUDE_FABLE_QUOTA_TIER)
+            .unwrap();
+        assert_eq!(fable.utilization, Some(1.0));
+        assert_eq!(fable.scope.as_deref(), Some("model_family"));
+        assert_eq!(
+            fable.capacity_pool.as_deref(),
+            Some(CLAUDE_FABLE_CAPACITY_POOL)
+        );
+        assert_eq!(
+            fable.model_family.as_deref(),
+            Some(CLAUDE_FABLE_MODEL_FAMILY)
+        );
+        assert_eq!(
+            fable.relative_weekly_capacity,
+            Some(CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY)
+        );
+
+        let pro_usage = json!({
+            "plan": "claude_pro",
+            "seven_day_overage_included": {"utilization": 100.0}
+        });
+        let pro_subscription =
+            resolve_claude_quota_subscription(&account, &pro_usage, None, None, 1_000).unwrap();
+        let pro_quota = parse_claude_quota(&pro_usage, Some(&pro_subscription), 1_000);
+        assert!(pro_quota
+            .tiers
+            .iter()
+            .all(|tier| tier.name != CLAUDE_FABLE_QUOTA_TIER));
     }
 
     #[test]
@@ -9349,6 +9491,7 @@ mod tests {
             limit: Some(100.0),
             unit: Some("credits".to_string()),
             resets_at: None,
+            ..Default::default()
         };
         let failed = grok_test_failed_probe("weekly_billing", "billing temporarily unavailable");
         let skipped = GrokProbe::skipped("not needed");
@@ -9562,6 +9705,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn amazon_q_quota_uses_official_cli_operation_and_preserves_account_scope() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    observations.lock().unwrap().push(json!({
+                        "target": headers.get("x-amz-target").and_then(|value| value.to_str().ok()),
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        "userAgent": headers.get("user-agent").and_then(|value| value.to_str().ok()),
+                        "body": serde_json::from_slice::<Value>(&body).unwrap(),
+                    }));
+                    axum::Json(json!({
+                        "subscriptionInfo": {"subscriptionTitle": "Amazon Q Developer Pro"},
+                        "usageBreakdownList": [{
+                            "resourceType": "CREDITS",
+                            "displayName": "Monthly requests",
+                            "currentValue": 25,
+                            "limitValue": 100,
+                            "nextResetDate": 4_102_444_800_000_i64
+                        }],
+                        "overageConfiguration": {"overageEnabled": false}
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/");
+        let account: Account = serde_json::from_value(json!({
+            "id": "amazon-q-quota-account",
+            "providerType": "amazon_q_oauth",
+            "accessToken": "amazon-q-quota-access",
+            "refreshToken": "amazon-q-quota-refresh",
+            "authIdentityGeneration": 7,
+            "tokenRefreshGeneration": 3,
+            "profile": {
+                "accountId": "amazon-q-quota-subject",
+                "runtimeRegion": "us-east-1",
+                "authRegion": "us-east-1"
+            },
+            "raw": {"testAmazonQRuntimeUrl": endpoint}
+        }))
+        .unwrap();
+        let update = refresh_amazon_q_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_700_000_000_000,
+            300_000,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            update.subscription_level.as_deref(),
+            Some("Amazon Q Developer Pro")
+        );
+        assert!(update.quota.as_ref().is_some_and(|quota| quota.success));
+        assert_eq!(
+            update
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.get("amazonQUsageLimits"))
+                .and_then(|usage| usage.pointer("/subscriptionInfo/subscriptionTitle")),
+            Some(&json!("Amazon Q Developer Pro"))
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["target"],
+            crate::clients::oauth::amazon_q_runtime::AMAZON_Q_USAGE_TARGET
+        );
+        assert_eq!(
+            observations[0]["authorization"],
+            "Bearer amazon-q-quota-access"
+        );
+        assert_eq!(observations[0]["body"]["origin"], "CLI");
+        assert!(observations[0]["userAgent"]
+            .as_str()
+            .is_some_and(|value| value.contains("AmazonQ-For-CLI")));
+        drop(observations);
+        server.abort();
+    }
+
     fn imported_account(provider_type: ProviderType, raw: Value) -> Account {
         Account {
             id: "acct-imported".to_string(),
@@ -9592,6 +9825,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }

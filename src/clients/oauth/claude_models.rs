@@ -1,3 +1,6 @@
+pub use crate::domain::accounts::claude_subscription::{
+    is_claude_fable_5_model, CLAUDE_FABLE_MODEL_FAMILY,
+};
 use crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
 
 pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_787_702_400_000;
@@ -107,5 +110,14 @@ mod tests {
         );
         assert_eq!(profile["modelCatalog"]["stale"], false);
         assert_eq!(captured_at_ms, CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS);
+    }
+
+    #[test]
+    fn fable_family_matching_is_strict() {
+        assert!(is_claude_fable_5_model("claude-fable-5"));
+        assert!(is_claude_fable_5_model("claude-fable-5-thinking"));
+        assert!(!is_claude_fable_5_model("claude-fable-50"));
+        assert!(!is_claude_fable_5_model("vendor/claude-fable-5"));
+        assert!(!is_claude_fable_5_model("claude-opus-5"));
     }
 }

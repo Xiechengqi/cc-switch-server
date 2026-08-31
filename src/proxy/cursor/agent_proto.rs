@@ -16,9 +16,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rand::RngCore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
 use super::model::resolve_cursor_model;
+use super::model::resolve_cursor_model_with_catalog;
 use super::profile::CursorProtocolRail;
 
 pub const CURSOR_AGENT_PROTOCOL_REVISION: &str = "cursor-agent/2026.06.02-8c11d9f";
@@ -1246,6 +1248,7 @@ pub struct EncodedImage {
 pub struct AgentRunInput<'a> {
     pub rail: CursorProtocolRail,
     pub model_id: &'a str,
+    pub live_catalog_ids: Option<&'a HashSet<String>>,
     pub user_text: &'a str,
     pub conversation_id: Option<&'a str>,
     pub message_id: Option<&'a str>,
@@ -1295,7 +1298,7 @@ pub fn encode_agent_run_request(input: &mut AgentRunInput<'_>) -> Result<Bytes, 
             CursorProtocolRail::ApiKeySdk => format!("run-{}", random_uuid_like()),
         });
 
-    let resolved = resolve_cursor_model(input.model_id)?;
+    let resolved = resolve_cursor_model_with_catalog(input.model_id, input.live_catalog_ids)?;
 
     // UserMessage { text, message_id, selected_context, mode=1 }
     let mut selected_context_parts: Vec<Bytes> = Vec::new();
@@ -2545,6 +2548,7 @@ mod tests {
                 let mut input = AgentRunInput {
                     rail,
                     model_id: &plan.model_id,
+                    live_catalog_ids: None,
                     user_text: &plan.user_text,
                     conversation_id: Some("tool-wire-fixture"),
                     message_id: Some("tool-wire-message"),
@@ -2578,6 +2582,7 @@ mod tests {
         let mut input = AgentRunInput {
             rail: CursorProtocolRail::OAuthCli,
             model_id: "claude-4.6-sonnet-medium",
+            live_catalog_ids: None,
             user_text: "hi there",
             conversation_id: Some("conv-123"),
             message_id: Some("msg-456"),
@@ -2601,6 +2606,7 @@ mod tests {
         let mut input = AgentRunInput {
             rail: CursorProtocolRail::OAuthCli,
             model_id: "cursor-plan:gpt-5.5-fast",
+            live_catalog_ids: None,
             user_text: "hi there",
             conversation_id: Some("conv-plan"),
             message_id: Some("msg-plan"),
@@ -2625,10 +2631,41 @@ mod tests {
     }
 
     #[test]
+    fn agent_run_request_preserves_exact_fresh_catalog_fast_id() {
+        let live_catalog_ids = HashSet::from(["composer-2.5-fast".to_string()]);
+        let mut input = AgentRunInput {
+            rail: CursorProtocolRail::ApiKeySdk,
+            model_id: "cursor-plan:composer-2.5-fast",
+            live_catalog_ids: Some(&live_catalog_ids),
+            user_text: "hi there",
+            conversation_id: Some("agent-live-model"),
+            message_id: Some("run-live-model"),
+            tools: Vec::new(),
+            system_prompt: None,
+            blob_store: None,
+            images: Vec::new(),
+        };
+        let body = encode_agent_run_request(&mut input).unwrap();
+        let run_request = field_bytes(&body, ACM_RUN_REQUEST);
+        let requested_model = field_bytes(run_request, ARR_REQUESTED_MODEL);
+        assert_eq!(
+            field_string(requested_model, RM_MODEL_ID),
+            "composer-2.5-fast"
+        );
+        assert!(find_bytes_field(requested_model, RM_PARAMETERS).is_none());
+
+        let action = field_bytes(run_request, ARR_ACTION);
+        let user_message_action = field_bytes(action, CA_USER_MESSAGE_ACTION);
+        let user_message = field_bytes(user_message_action, UMA_USER_MESSAGE);
+        assert_eq!(field_varint(user_message, UM_MODE), 3);
+    }
+
+    #[test]
     fn api_key_sdk_run_request_uses_sdk_envelope_only() {
         let mut input = AgentRunInput {
             rail: CursorProtocolRail::ApiKeySdk,
             model_id: "composer-2.5",
+            live_catalog_ids: None,
             user_text: "hello",
             conversation_id: Some("agent-sdk"),
             message_id: Some("message-sdk"),
@@ -2650,6 +2687,7 @@ mod tests {
         let mut input = AgentRunInput {
             rail: CursorProtocolRail::ApiKeySdk,
             model_id: "composer-2.5",
+            live_catalog_ids: None,
             user_text: "hello",
             conversation_id: None,
             message_id: None,

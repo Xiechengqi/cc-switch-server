@@ -34,6 +34,7 @@ import {
 } from "@/components/BrandIcons";
 import { CopilotAuthSection } from "@/components/providers/forms/CopilotAuthSection";
 import { AntigravityOAuthSection } from "@/components/providers/forms/AntigravityOAuthSection";
+import { AmazonQOAuthSection } from "@/components/providers/forms/AmazonQOAuthSection";
 import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSection";
 import { ClaudeOAuthSection } from "@/components/providers/forms/ClaudeOAuthSection";
 import { CursorOAuthSection } from "@/components/providers/forms/CursorOAuthSection";
@@ -228,6 +229,7 @@ export function AuthCenterPanel({
           "grok_oauth",
           "google_gemini_oauth",
           "kiro_oauth",
+          "amazon_q_oauth",
           "antigravity_oauth",
           "agy_oauth",
           "ollama",
@@ -498,11 +500,22 @@ export function AuthCenterPanel({
           </AuthProviderAccordionItem>
         ) : null}
 
+        {canShowAccountProvider("amazon_q_oauth") ? (
+          <AuthProviderAccordionItem
+            value="amazon-q"
+            icon={<ProviderIcon icon="aws" name="Amazon Q" size={24} />}
+            title={t("amazonQOauth.title")}
+            description={t("amazonQOauth.description")}
+          >
+            <AmazonQOAuthSection showLoggedInAccounts />
+          </AuthProviderAccordionItem>
+        ) : null}
+
         {canShowAccountProvider("kimi_code") ? (
           <AuthProviderAccordionItem
             value="kimi-code"
-            icon={<ProviderIcon icon="kimi" name="Kimi Code OAuth" size={24} />}
-            title="Kimi Code OAuth"
+            icon={<ProviderIcon icon="kimi" name="Kimi OAuth" size={24} />}
+            title="Kimi OAuth"
             description={t("kimiOauth.description")}
           >
             <KimiOAuthSection showLoggedInAccounts />
@@ -512,8 +525,8 @@ export function AuthCenterPanel({
         {canShowAccountProvider("qoder_cosy") ? (
           <AuthProviderAccordionItem
             value="qoder-cosy"
-            icon={<ProviderIcon icon="qoder" name="Qoder" size={24} />}
-            title="Qoder COSY"
+            icon={<ProviderIcon icon="qoder" name="Qoder OAuth" size={24} />}
+            title="Qoder OAuth"
             description={t("qoderOauth.description")}
           >
             <QoderOAuthSection showLoggedInAccounts />

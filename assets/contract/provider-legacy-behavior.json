@@ -599,8 +599,8 @@
       },
       "production": {
         "branch": "special_forwarder",
-        "adapter": "claude_deepseek_account_planned",
-        "adapterSupport": "planned"
+        "adapter": "claude_deepseek_web",
+        "adapterSupport": "native"
       },
       "endpoint": {
         "origin": "https://chat.deepseek.com",
@@ -624,18 +624,20 @@
       "capabilities": {
         "stream": "native_or_translated_stream",
         "tools": "special_tool_bridge",
-        "images": "request_content_only_when_protocol_supports_it"
+        "images": "unsupported"
       },
       "specialSideEffects": [
-        "DeepSeek account token refresh"
+        "DeepSeek session creation",
+        "PoW solve",
+        "same-scope stale-session rebuild"
       ],
       "operationParity": {
-        "manualTestUsesProductionBranch": false,
-        "discoveryUsesProductionBranch": false
+        "manualTestUsesProductionBranch": true,
+        "discoveryUsesProductionBranch": true
       },
       "knownStatus": {
-        "status": "partial",
-        "reason": "production has a special forward branch while manual test/discovery still use the generic adapter"
+        "status": "supported",
+        "reason": null
       }
     },
     {

@@ -131,7 +131,7 @@ export const googleGeminiApiKeyPreset: GeminiProviderPreset = {
 };
 
 export const kimiCodeClaudePreset: ProviderPreset = {
-  name: "Kimi Code OAuth",
+  name: "Kimi OAuth",
   websiteUrl: "https://kimi.com",
   settingsConfig: {
     env: {
@@ -148,7 +148,7 @@ export const kimiCodeClaudePreset: ProviderPreset = {
 };
 
 export const kimiCodeCodexPreset: CodexProviderPreset = {
-  name: "Kimi Code OAuth",
+  name: "Kimi OAuth",
   websiteUrl: "https://kimi.com",
   auth: {},
   config: `model_provider = "kimi_code"
@@ -169,7 +169,7 @@ requires_openai_auth = true`,
 };
 
 export const kimiCodeGeminiPreset: GeminiProviderPreset = {
-  name: "Kimi Code OAuth",
+  name: "Kimi OAuth",
   websiteUrl: "https://kimi.com",
   settingsConfig: {
     env: {
@@ -179,14 +179,14 @@ export const kimiCodeGeminiPreset: GeminiProviderPreset = {
   },
   baseURL: KIMI_CODE_BASE_URL,
   model: KIMI_CODE_MODEL,
-  description: "Kimi Code OAuth",
+  description: "Kimi OAuth",
   category: "official",
   icon: "kimi",
   iconColor: "#111827",
 };
 
 export const qoderClaudePreset: ProviderPreset = {
-  name: "Qoder COSY",
+  name: "Qoder OAuth",
   websiteUrl: "https://qoder.com",
   settingsConfig: {
     env: {},
@@ -198,7 +198,7 @@ export const qoderClaudePreset: ProviderPreset = {
 };
 
 export const qoderCodexPreset: CodexProviderPreset = {
-  name: "Qoder COSY",
+  name: "Qoder OAuth",
   websiteUrl: "https://qoder.com",
   auth: {},
   config: "",
@@ -209,18 +209,36 @@ export const qoderCodexPreset: CodexProviderPreset = {
 };
 
 export const qoderGeminiPreset: GeminiProviderPreset = {
-  name: "Qoder COSY",
+  name: "Qoder OAuth",
   websiteUrl: "https://qoder.com",
   settingsConfig: {
     env: {},
   },
   model: QODER_MODEL,
-  description: "Qoder COSY",
+  description: "Qoder OAuth",
   category: "official",
   icon: "qoder",
 };
 
 const directProfileVisuals: Record<string, DirectProfileVisual> = {
+  amazon_q_oauth: {
+    name: "Amazon Q Developer",
+    websiteUrl: "https://aws.amazon.com/q/developer/",
+    icon: "aws",
+    iconColor: "#FF9900",
+  },
+  grok_web_session: {
+    name: "Grok Web Session",
+    websiteUrl: "https://grok.com/",
+    icon: "grok",
+    iconColor: "#111827",
+  },
+  perplexity_web_session: {
+    name: "Perplexity Web Session",
+    websiteUrl: "https://www.perplexity.ai/",
+    icon: "perplexity",
+    iconColor: "#20808D",
+  },
   "gemini.github_copilot": {
     name: "GitHub Copilot",
     websiteUrl: "https://github.com/features/copilot",
@@ -238,7 +256,7 @@ const directProfileVisuals: Record<string, DirectProfileVisual> = {
     icon: "cursor",
   },
   kimi_coding_api_key: {
-    name: "Kimi Code API Key",
+    name: "Kimi API Key",
     websiteUrl: "https://kimi.com",
     icon: "kimi",
     iconColor: "#6366F1",
@@ -256,16 +274,14 @@ const directProfileVisuals: Record<string, DirectProfileVisual> = {
     iconColor: "#0F62FE",
   },
   bailian_coding_plan_cn: {
-    name: "Alibaba (China)",
+    name: "Bailian",
     websiteUrl: "https://bailian.console.aliyun.com",
     icon: "bailian",
-    iconColor: "#FF6A00",
   },
   bailian_coding_plan_global: {
-    name: "Alibaba (Global/Singapore)",
+    name: "Bailian",
     websiteUrl: "https://www.alibabacloud.com/product/coding",
     icon: "bailian",
-    iconColor: "#FF6A00",
   },
   minimax_cn: {
     name: "MiniMax (China)",

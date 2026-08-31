@@ -627,7 +627,10 @@ pub fn compile_runtime_plan_with_defaults(
         .map(|contract| compile_profile_contract(stored.app, contract))
         .transpose()?;
     let configured_endpoint = configured_base_url(&stored.provider, stored.app);
-    let default_endpoint = default_base_url(stored.provider_type).map(str::to_string);
+    let default_endpoint = super::web_session::web_session_profile_for_driver(driver_id.as_str())
+        .map(|profile| profile.endpoint().map(|endpoint| endpoint.to_string()))
+        .transpose()?
+        .or_else(|| default_base_url(stored.provider_type).map(str::to_string));
     let endpoint_policy = profile_policy
         .map(|profile| profile.endpoint_policy)
         .unwrap_or_else(|| {
@@ -1431,6 +1434,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::GitHubCopilot => Some("https://api.githubcopilot.com"),
         ProviderType::DeepSeekAccount => Some("https://chat.deepseek.com"),
         ProviderType::KiroOAuth => Some("https://q.us-east-1.amazonaws.com"),
+        ProviderType::AmazonQOAuth => Some("https://q.us-east-1.amazonaws.com"),
         ProviderType::KimiCode => Some("https://api.kimi.com/coding/v1"),
         ProviderType::QoderCosy => Some("https://api1.qoder.sh"),
         ProviderType::CursorOAuth => Some("https://api2.cursor.sh"),
@@ -1614,6 +1618,7 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::GitHubCopilot => "special.copilot",
         ProviderType::DeepSeekAccount => "special.deepseek_account",
         ProviderType::KiroOAuth => "special.kiro",
+        ProviderType::AmazonQOAuth => "special.amazon_q",
         ProviderType::KimiCode => "oauth.kimi_code",
         ProviderType::QoderCosy => "special.qoder_cosy",
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => "special.cursor",

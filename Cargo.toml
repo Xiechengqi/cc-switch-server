@@ -44,7 +44,7 @@ md5 = "0.7"
 multer = "3"
 rand = "0.8"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls-webpki-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "http2", "json", "rustls-tls-webpki-roots", "stream"] }
 rsa = "0.9"
 rusqlite = { version = "0.32", features = ["bundled"] }
 russh = { version = "0.46", default-features = false, features = ["flate2"] }

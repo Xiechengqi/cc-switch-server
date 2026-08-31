@@ -84,6 +84,7 @@ impl KimiThinkingReplayScope {
         runtime_fingerprint: &str,
         account_id: &str,
         auth_identity_generation: u64,
+        token_refresh_generation: u64,
         share_id: &str,
         user_namespace: &str,
         session_id: &str,
@@ -109,7 +110,7 @@ impl KimiThinkingReplayScope {
             return None;
         }
         Some(Self(scoped_digest(
-            b"cc-switch-server:kimi-thinking-replay:v1\0",
+            b"cc-switch-server:kimi-thinking-replay:v2\0",
             [
                 app,
                 provider_id,
@@ -117,12 +118,13 @@ impl KimiThinkingReplayScope {
                 runtime_fingerprint,
                 account_id,
                 &auth_identity_generation.to_string(),
+                &token_refresh_generation.to_string(),
                 share_id,
                 user_namespace,
                 session_id,
                 model_family,
             ],
-            "kimi-thinking-replay-v1",
+            "kimi-thinking-replay-v2",
         )))
     }
 }
@@ -250,7 +252,9 @@ impl KimiModelFetchError {
     pub fn retryable(&self) -> bool {
         self.status.is_none()
             || self.status.is_some_and(|status| {
-                status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                status == StatusCode::REQUEST_TIMEOUT
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
             })
     }
 }
@@ -343,23 +347,16 @@ pub fn parse_kimi_models(value: &Value) -> Result<FetchedKimiModelCatalog, Strin
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
+    if upstream_non_empty && models.is_empty() {
+        return Err(
+            "Kimi model response contains no reviewed model identifiers; catalog contract may have drifted"
+                .to_string(),
+        );
+    }
     Ok(FetchedKimiModelCatalog {
         models,
         upstream_non_empty,
     })
-}
-
-pub fn reviewed_fallback_catalog() -> KimiModelCatalog {
-    KimiModelCatalog {
-        models: crate::domain::kimi_cli::KIMI_REVIEWED_WIRE_MODELS
-            .iter()
-            .map(|model| (*model).to_string())
-            .collect(),
-        source: "kimi_reviewed_fallback",
-        fetched_at_ms: 0,
-        stale: true,
-        expires_at_ms: 0,
-    }
 }
 
 pub fn unavailable_catalog() -> KimiModelCatalog {
@@ -404,7 +401,10 @@ impl KimiThinkingReplayCache {
         now_ms: i64,
     ) -> (Option<Bytes>, KimiThinkingReplaySnapshot) {
         let mut store = self.store.lock().await;
-        prune_replay_store(&mut store, now_ms);
+        let expired = prune_replay_store(&mut store, now_ms);
+        if expired > 0 {
+            crate::metrics::record_kimi_thinking_replay("expired", expired as u64);
+        }
         let entry = store.entries.get(scope);
         (
             entry.map(|entry| entry.content.clone()),
@@ -425,7 +425,10 @@ impl KimiThinkingReplayCache {
             return false;
         }
         let mut store = self.store.lock().await;
-        prune_replay_store(&mut store, now_ms);
+        let expired = prune_replay_store(&mut store, now_ms);
+        if expired > 0 {
+            crate::metrics::record_kimi_thinking_replay("expired", expired as u64);
+        }
         if store.entries.get(&scope).map(|entry| entry.generation) != snapshot.generation {
             return false;
         }
@@ -464,18 +467,20 @@ impl KimiThinkingReplayCache {
     }
 }
 
-fn prune_replay_store(store: &mut ThinkingReplayStore, now_ms: i64) {
+fn prune_replay_store(store: &mut ThinkingReplayStore, now_ms: i64) -> usize {
     let expired = store
         .entries
         .iter()
         .filter(|(_, entry)| entry.expires_at_ms <= now_ms)
         .map(|(scope, _)| scope.clone())
         .collect::<Vec<_>>();
+    let expired_count = expired.len();
     for scope in expired {
         if let Some(entry) = store.entries.remove(&scope) {
             store.total_bytes = store.total_bytes.saturating_sub(entry.content.len());
         }
     }
+    expired_count
 }
 
 fn enforce_replay_limits(store: &mut ThinkingReplayStore) {
@@ -923,7 +928,7 @@ mod tests {
 
     fn replay_scope(suffix: &str) -> KimiThinkingReplayScope {
         KimiThinkingReplayScope::derive(
-            "claude", "provider", 1, "runtime", "account", 2, "share", "user", suffix, "k3",
+            "claude", "provider", 1, "runtime", "account", 2, 3, "share", "user", suffix, "k3",
         )
         .unwrap()
     }
@@ -957,15 +962,15 @@ mod tests {
     #[test]
     fn replay_scope_requires_every_tenant_component_and_normalizes_families() {
         assert!(KimiThinkingReplayScope::derive(
-            "claude", "provider", 1, "runtime", "account", 2, "", "user", "session", "k3"
+            "claude", "provider", 1, "runtime", "account", 2, 3, "", "user", "session", "k3"
         )
         .is_none());
         assert!(KimiThinkingReplayScope::derive(
-            "claude", "provider", 1, "runtime", "account", 2, "share", "", "session", "k3"
+            "claude", "provider", 1, "runtime", "account", 2, 3, "share", "", "session", "k3"
         )
         .is_none());
         assert!(KimiThinkingReplayScope::derive(
-            "claude", "provider", 1, "runtime", "account", 2, "share", "user", "", "k3"
+            "claude", "provider", 1, "runtime", "account", 2, 3, "share", "user", "", "k3"
         )
         .is_none());
         assert_eq!(kimi_thinking_replay_model_family("kimi-k3"), Some("k3"));
@@ -980,6 +985,16 @@ mod tests {
             kimi_thinking_replay_user_namespace("user@example.com")
         );
         assert!(kimi_thinking_replay_user_namespace(" ").is_none());
+
+        let token_generation_three = KimiThinkingReplayScope::derive(
+            "claude", "provider", 1, "runtime", "account", 2, 3, "share", "user", "session", "k3",
+        )
+        .unwrap();
+        let token_generation_four = KimiThinkingReplayScope::derive(
+            "claude", "provider", 1, "runtime", "account", 2, 4, "share", "user", "session", "k3",
+        )
+        .unwrap();
+        assert_ne!(token_generation_three, token_generation_four);
     }
 
     #[test]
@@ -1070,6 +1085,58 @@ mod tests {
     }
 
     #[test]
+    fn replay_preserves_parallel_tools_and_matches_canonical_turns_across_history() {
+        let cached = br#"[
+            {"type":"thinking","thinking":"signed parallel plan","signature":"parallel-sig"},
+            {"type":"text","text":"inspect both"},
+            {"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"a.rs"}},
+            {"type":"tool_use","id":"tool-2","name":"Read","input":{"path":"b.rs"}}
+        ]"#;
+        let unsigned = serde_json::json!([
+            {"type":"text","text":"inspect both"},
+            {"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"a.rs"}},
+            {"type":"tool_use","id":"tool-2","name":"Read","input":{"path":"b.rs"}}
+        ]);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [
+                {"role":"assistant","content":unsigned.clone()},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"tool-1","content":"a"},
+                    {"type":"tool_result","tool_use_id":"tool-2","content":"b"}
+                ]},
+                {"role":"assistant","content":unsigned},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+
+        let restored = restore_kimi_thinking_replay_content(&body, cached).unwrap();
+        let restored = serde_json::from_slice::<Value>(&restored).unwrap();
+        assert_eq!(
+            restored.pointer("/messages/0/content/0/type"),
+            Some(&Value::String("text".to_string()))
+        );
+        assert_eq!(
+            restored.pointer("/messages/2/content"),
+            Some(&serde_json::from_slice::<Value>(cached).unwrap())
+        );
+
+        let mut reordered = serde_json::from_slice::<Value>(&body).unwrap();
+        reordered["messages"][2]["content"]
+            .as_array_mut()
+            .unwrap()
+            .swap(1, 2);
+        let reordered_content = reordered["messages"][2]["content"].clone();
+        let reordered = serde_json::to_vec(&reordered).unwrap();
+        assert!(restore_kimi_thinking_replay_content(&reordered, cached).is_some());
+        let only_reordered = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role":"assistant","content":reordered_content}]
+        }))
+        .unwrap();
+        assert!(restore_kimi_thinking_replay_content(&only_reordered, cached).is_none());
+    }
+
+    #[test]
     fn stream_accumulator_reconstructs_signed_thinking_and_tool_use() {
         let stream = concat!(
             "event: message_start\n",
@@ -1145,13 +1212,17 @@ mod tests {
     async fn authoritative_empty_catalog_is_cached_and_scopes_fence_generations() {
         let cache = KimiModelCatalogCache::default();
         let first = KimiModelCatalogScope::derive("claude", "p", 1, "r", "a", 2, 3);
-        let changed = KimiModelCatalogScope::derive("claude", "p", 1, "r", "a", 3, 3);
+        let changed_auth = KimiModelCatalogScope::derive("claude", "p", 1, "r", "a", 3, 3);
+        let changed_token = KimiModelCatalogScope::derive("claude", "p", 1, "r", "a", 2, 4);
+        let changed_runtime = KimiModelCatalogScope::derive("claude", "p", 1, "r2", "a", 2, 3);
         cache.insert(first.clone(), Vec::new(), 1_000).await;
         assert_eq!(
             cache.fresh(&first, 1_001).await.unwrap().models,
             Vec::<String>::new()
         );
-        assert!(cache.fresh(&changed, 1_001).await.is_none());
+        assert!(cache.fresh(&changed_auth, 1_001).await.is_none());
+        assert!(cache.fresh(&changed_token, 1_001).await.is_none());
+        assert!(cache.fresh(&changed_runtime, 1_001).await.is_none());
     }
 
     #[test]
@@ -1189,6 +1260,11 @@ mod tests {
                 upstream_non_empty: false,
             }
         );
+        assert!(parse_kimi_models(&serde_json::json!({
+            "data": [{"id": "future-unreviewed-model"}]
+        }))
+        .unwrap_err()
+        .contains("contract may have drifted"));
         assert!(parse_kimi_models(&serde_json::json!({"data": {}})).is_err());
     }
 
@@ -1228,6 +1304,10 @@ mod tests {
                 get(|| async { (axum::http::StatusCode::TOO_MANY_REQUESTS, "limited") }),
             )
             .route(
+                "/timeout",
+                get(|| async { (axum::http::StatusCode::REQUEST_TIMEOUT, "timeout") }),
+            )
+            .route(
                 "/denied",
                 get(|| async { (axum::http::StatusCode::FORBIDDEN, "denied") }),
             );
@@ -1261,6 +1341,16 @@ mod tests {
         .await
         .unwrap_err();
         assert!(limited.retryable());
+        let timeout = fetch_kimi_models(
+            &reqwest::Client::new(),
+            &format!("http://{address}/timeout"),
+            "bound-token",
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(timeout.retryable());
         let denied = fetch_kimi_models(
             &reqwest::Client::new(),
             &format!("http://{address}/denied"),

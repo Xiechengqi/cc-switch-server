@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub const CURSOR_MODEL_ALIASES: &[&str] = &[
     "cursor",
@@ -58,6 +58,13 @@ pub fn is_explicit_cursor_selector(model: &str) -> bool {
 }
 
 pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String> {
+    resolve_cursor_model_with_catalog(model, None)
+}
+
+pub fn resolve_cursor_model_with_catalog(
+    model: &str,
+    live_catalog_ids: Option<&HashSet<String>>,
+) -> Result<CursorModelResolution, String> {
     let model = model.trim();
     if model.is_empty() {
         return Err("Cursor model selector must not be empty".to_string());
@@ -77,7 +84,7 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
                     "Cursor model selector `{prefix}` requires a model id"
                 ));
             }
-            return resolve_wire_model(raw, mode);
+            return resolve_wire_model(raw, mode, live_catalog_ids);
         }
     }
 
@@ -107,7 +114,7 @@ pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String
             mode: CursorAgentMode::Agent,
             fast: true,
         },
-        _ => return resolve_wire_model(model, CursorAgentMode::Agent),
+        _ => return resolve_wire_model(model, CursorAgentMode::Agent, live_catalog_ids),
     };
     Ok(resolution)
 }
@@ -133,7 +140,22 @@ pub fn cursor_namespaced_model_ids(model: &str) -> Vec<String> {
     ids.into_iter().collect()
 }
 
-fn resolve_wire_model(raw: &str, mode: CursorAgentMode) -> Result<CursorModelResolution, String> {
+fn resolve_wire_model(
+    raw: &str,
+    mode: CursorAgentMode,
+    live_catalog_ids: Option<&HashSet<String>>,
+) -> Result<CursorModelResolution, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Cursor wire model id must not be empty".to_string());
+    }
+    if live_catalog_ids.is_some_and(|catalog| catalog.contains(raw)) {
+        return Ok(CursorModelResolution {
+            model_id: raw.to_string(),
+            mode,
+            fast: false,
+        });
+    }
     let normalized = normalize_cursor_model_id(raw);
     let fast = normalized.to_ascii_lowercase().ends_with("-fast");
     let model_id = if fast {
@@ -204,6 +226,33 @@ mod tests {
         assert_eq!(resolution.model_id, "gpt-5.5");
         assert_eq!(resolution.mode, CursorAgentMode::Agent);
         assert!(resolution.fast);
+    }
+
+    #[test]
+    fn fresh_live_catalog_preserves_an_exact_fast_model_id() {
+        let live = HashSet::from(["composer-2.5-fast".to_string()]);
+        assert_eq!(
+            resolve_cursor_model_with_catalog("composer-2.5-fast", Some(&live)).unwrap(),
+            CursorModelResolution {
+                model_id: "composer-2.5-fast".to_string(),
+                mode: CursorAgentMode::Agent,
+                fast: false,
+            }
+        );
+        assert_eq!(
+            resolve_cursor_model_with_catalog("cursor-plan:composer-2.5-fast", Some(&live))
+                .unwrap(),
+            CursorModelResolution {
+                model_id: "composer-2.5-fast".to_string(),
+                mode: CursorAgentMode::Plan,
+                fast: false,
+            }
+        );
+        assert!(
+            resolve_cursor_model_with_catalog("composer-2.5-fast", None)
+                .unwrap()
+                .fast
+        );
     }
 
     #[test]

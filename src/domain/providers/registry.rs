@@ -323,6 +323,7 @@ pub enum ManagedIdentityFamily {
     KimiCli,
     Qoder,
     Kiro,
+    AmazonQCli,
     Cursor,
     Copilot,
     Deepseek,
@@ -974,8 +975,8 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 30usize),
-        (AppKind::Codex, 23usize),
+        (AppKind::Claude, 33usize),
+        (AppKind::Codex, 26usize),
         (AppKind::Gemini, 11usize),
     ]);
     for (app, expected) in expected_counts {
@@ -997,9 +998,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 70 {
+    if registry.profiles.len() != 76 {
         bail!(
-            "Provider registry contains {} profiles, expected 70",
+            "Provider registry contains {} profiles, expected 76",
             registry.profiles.len()
         );
     }
@@ -1009,9 +1010,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             registry.custom_recipes.len()
         );
     }
-    if registry.legacy_preset_mappings.len() != 29 {
+    if registry.legacy_preset_mappings.len() != 31 {
         bail!(
-            "Provider registry contains {} legacy preset mappings, expected 29",
+            "Provider registry contains {} legacy preset mappings, expected 31",
             registry.legacy_preset_mappings.len()
         );
     }
@@ -1167,24 +1168,21 @@ fn validate_profile_contract(
             profile.profile_id
         );
     }
-    match profile.model_policy {
-        ModelPolicyKind::Single => {
-            if default_upstream_model.is_none()
-                && profile.creation_policy == CreationPolicy::CreateAllowed
-            {
-                bail!(
-                    "single-model profile {} has no default upstream model",
-                    profile.profile_id
-                );
-            }
-        }
-        ModelPolicyKind::Passthrough if profile.default_upstream_model.is_some() => {
+    let allows_single = allowed_model_policies.contains(&ModelPolicyKind::Single);
+    if allows_single {
+        if default_upstream_model.is_none()
+            && profile.creation_policy == CreationPolicy::CreateAllowed
+        {
             bail!(
-                "passthrough profile {} cannot declare a default upstream model",
+                "profile {} that allows single-model policy has no default upstream model",
                 profile.profile_id
             );
         }
-        ModelPolicyKind::Passthrough => {}
+    } else if profile.default_upstream_model.is_some() {
+        bail!(
+            "passthrough-only profile {} cannot declare a default upstream model",
+            profile.profile_id
+        );
     }
 
     match (&profile.form_composition, &profile.credential_policy) {
@@ -1402,7 +1400,7 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 35] = [
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 39] = [
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
@@ -1438,6 +1436,10 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 35] = [
     "codex.xiaomi_mimo_token_plan",
     "claude.xiaomi_mimo_token_plan_sgp",
     "codex.xiaomi_mimo_token_plan_sgp",
+    "claude.grok_web_session",
+    "codex.grok_web_session",
+    "claude.perplexity_web_session",
+    "codex.perplexity_web_session",
 ];
 
 #[cfg(test)]
@@ -1449,9 +1451,9 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.families.len(), 33);
-        assert_eq!(registry.profiles.len(), 70);
-        assert_eq!(registry.legacy_preset_mappings.len(), 29);
+        assert_eq!(registry.families.len(), 34);
+        assert_eq!(registry.profiles.len(), 76);
+        assert_eq!(registry.legacy_preset_mappings.len(), 31);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
             registry
@@ -1681,7 +1683,8 @@ mod tests {
     }
 
     #[test]
-    fn model_policy_capabilities_lock_native_profiles_and_configure_others() {
+    fn model_policy_capabilities_lock_native_and_web_session_profiles_and_configure_others() {
+        let mut single_only_profiles = Vec::new();
         for profile in &provider_registry().profiles {
             if profile.form_composition == FormComposition::Legacy {
                 assert!(profile.allowed_model_policies.is_empty());
@@ -1691,12 +1694,33 @@ mod tests {
             match profile.model_policy {
                 ModelPolicyKind::Passthrough => {
                     assert!(profile.allows_model_policy(ModelPolicyKind::Passthrough));
-                    assert!(!profile.allows_model_policy(ModelPolicyKind::Single));
-                    assert!(profile.default_upstream_model.is_none());
+                    if profile.allows_model_policy(ModelPolicyKind::Single) {
+                        assert_ne!(
+                            profile.visibility,
+                            ProfileVisibility::Hidden,
+                            "hidden passthrough Profile unexpectedly permits single: {}",
+                            profile.profile_id
+                        );
+                        assert!(profile
+                            .default_upstream_model
+                            .as_deref()
+                            .is_some_and(|model| !model.trim().is_empty()));
+                    } else {
+                        assert!(profile.default_upstream_model.is_none());
+                    }
                 }
                 ModelPolicyKind::Single => {
                     assert!(profile.allows_model_policy(ModelPolicyKind::Single));
-                    assert!(profile.allows_model_policy(ModelPolicyKind::Passthrough));
+                    if profile.allows_model_policy(ModelPolicyKind::Passthrough) {
+                        assert_ne!(
+                            profile.visibility,
+                            ProfileVisibility::Hidden,
+                            "hidden single-model Profile unexpectedly permits passthrough: {}",
+                            profile.profile_id
+                        );
+                    } else {
+                        single_only_profiles.push(profile.profile_id.as_str());
+                    }
                     assert!(profile
                         .default_upstream_model
                         .as_deref()
@@ -1704,6 +1728,16 @@ mod tests {
                 }
             }
         }
+        single_only_profiles.sort_unstable();
+        assert_eq!(
+            single_only_profiles,
+            [
+                "claude.grok_web_session",
+                "claude.perplexity_web_session",
+                "codex.grok_web_session",
+                "codex.perplexity_web_session",
+            ]
+        );
     }
 
     #[test]

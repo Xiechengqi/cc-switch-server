@@ -3356,16 +3356,25 @@
     "grokVideoGenerationEnabledDescription": "Allow this Grok OAuth Provider or Share to create and query video tasks."
   },
   "kimiOauth": {
-    "description": "Manage Kimi Code subscription accounts",
-    "authStatus": "Kimi Code OAuth authentication",
-    "loginWithKimi": "Sign in with Kimi Code",
-    "userCodeHint": "Kimi Code device verification code:",
-    "loginRequired": "Sign in to a Kimi Code account first",
-    "selectAccountRequired": "Kimi Code must be bound to a Kimi Code account"
+    "description": "Manage Kimi subscription accounts",
+    "authStatus": "Kimi OAuth authentication",
+    "loginWithKimi": "Sign in with Kimi",
+    "userCodeHint": "Kimi device verification code:",
+    "loginRequired": "Sign in to a Kimi account first",
+    "selectAccountRequired": "Kimi OAuth must be bound to a Kimi account"
+  },
+  "amazonQOauth": {
+    "title": "Amazon Q Developer",
+    "description": "Manage Amazon Q Developer subscription accounts",
+    "authStatus": "Amazon Q Developer authentication",
+    "loginWithAmazonQ": "Sign in with Amazon Q Developer",
+    "userCodeHint": "Amazon Q Developer device verification code:",
+    "loginRequired": "Sign in to an Amazon Q Developer account first",
+    "selectAccountRequired": "Amazon Q Developer must be bound to an Amazon Q account"
   },
   "qoderOauth": {
-    "description": "Manage Qoder COSY accounts",
-    "authStatus": "Qoder COSY authentication",
+    "description": "Manage Qoder OAuth accounts",
+    "authStatus": "Qoder OAuth authentication",
     "deviceLogin": "Device sign-in",
     "patImport": "PAT import",
     "globalSite": "Global",
@@ -3555,6 +3564,8 @@
     "thirtyDay": "30-Day",
     "sevenDayOpus": "7-Day Opus Limit",
     "sevenDaySonnet": "7-Day Sonnet Limit",
+    "sevenDayFable": "Fable 7-Day",
+    "fablePoolHelp": "Fable has a separate weekly capacity pool for Claude Max 5x/20x, capped at 50% of the regular weekly allowance. This percentage comes directly from Anthropic 7d_oi/seven_day_overage_included and is not inferred from regular weekly usage.",
     "geminiPro": "Pro",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",
@@ -3562,6 +3573,7 @@
     "monthly": "Monthly",
     "copilotPremium": "Premium",
     "cursorCredits": "Usage",
+    "cursorSubscriptionUnavailable": "Subscription information is temporarily unavailable",
     "kiroAgenticRequests": "Kiro Agentic Requests",
     "kiroEstimatedUsage": "Estimated Usage",
     "kiroResetsOn": "resets on {{date}}",

@@ -407,7 +407,7 @@ const adapterByAppType = Object.freeze({
   "claude:antigravity_oauth": ["claude_antigravity_gemini_native", "native"],
   "claude:agy_oauth": ["claude_antigravity_gemini_native", "native"],
   "claude:github_copilot": ["claude_to_copilot_chat", "native"],
-  "claude:deepseek_account": ["claude_deepseek_account_planned", "planned"],
+  "claude:deepseek_account": ["claude_deepseek_web", "native"],
   "claude:aws_bedrock": ["claude_bedrock_signature_planned", "planned"],
   "claude:openrouter": ["claude_openrouter_compatible", "native"],
   "claude:nvidia": ["claude_nvidia_openai_chat", "native"],
@@ -538,7 +538,7 @@ function knownStatus(app, providerType, presetName) {
   if (presetName === "AWS Bedrock (AKSK)") {
     return { status: "known_broken", reason: "SigV4 request planner exists but adapter capability intentionally remains planned" };
   }
-  if (["kiro_oauth", "deepseek_account"].includes(providerType)) {
+  if (providerType === "kiro_oauth") {
     return { status: "partial", reason: "production has a special forward branch while manual test/discovery still use the generic adapter" };
   }
   if (["cursor_oauth", "cursor_apikey"].includes(providerType)) {
@@ -614,7 +614,9 @@ function buildLegacyBehavior(inventory, coverage) {
           stream: cursor ? "special_stream_translation" : "native_or_translated_stream",
           tools: cursor || ["kiro_oauth", "deepseek_account"].includes(providerType) ? "special_tool_bridge" : "native_or_protocol_transform",
           images:
-            ["codex_oauth", "grok_oauth"].includes(providerType)
+            providerType === "deepseek_account"
+              ? "unsupported"
+              : ["codex_oauth", "grok_oauth"].includes(providerType)
               ? "generation_route_and_request_content"
               : "request_content_only_when_protocol_supports_it",
         },
@@ -624,11 +626,12 @@ function buildLegacyBehavior(inventory, coverage) {
           ...(providerType === "github_copilot" ? ["Copilot token exchange", "request optimizer"] : []),
           ...(cursor ? ["Cursor session/tool bridge"] : []),
           ...(providerType === "kiro_oauth" ? ["Kiro token refresh", "tool name bridge"] : []),
-          ...(providerType === "deepseek_account" ? ["DeepSeek account token refresh"] : []),
+          ...(providerType === "deepseek_account" ? ["DeepSeek session creation", "PoW solve", "same-scope stale-session rebuild"] : []),
         ],
         operationParity: {
-          manualTestUsesProductionBranch: !special && providerType !== "github_copilot",
-          discoveryUsesProductionBranch: false,
+          manualTestUsesProductionBranch:
+            providerType === "deepseek_account" || (!special && providerType !== "github_copilot"),
+          discoveryUsesProductionBranch: providerType === "deepseek_account",
         },
         knownStatus: knownStatus(app, providerType, preset.name),
       });

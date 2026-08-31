@@ -56,20 +56,21 @@ Kimi refresh 使用固定 token endpoint、client ID、Kimi CLI User-Agent 和�
 - `kimi-for-coding`、`kimi`、`kimi-code` 以及登记的 Claude 风格 aliases 映射为 wire model `kimi-for-coding`。
 - `kimi-k3` 和 `k3` 映射为 wire model `k3`。
 - single-model policy 先选择配置模型；passthrough 只允许上述登记 alias。未知模型直接返回 400，不透传到 Kimi。
-- 模型目录按 App、Provider revision/runtime、Account、identity/token generation 隔离并 single-flight 获取。成功空目录是权威结果；只有完全相同作用域的可重试失败才可读取有界 stale cache。
+- 模型目录按 App、Provider revision/runtime、Account、identity/token generation 隔离并 single-flight 获取。成功空目录是权威结果；只有 network/408/429/5xx 才可读取完全相同作用域内、24 小时硬上限内的 stale cache。认证错误、超限响应、坏 JSON、未知成功结构和“上游非空但全部模型均不在 reviewed allowlist”均失败关闭并清理当前 scope；运行时不存在静态 entitlement fallback。
 - `/v1/models` 只在当前 Share 选中的 Kimi Provider 范围内公开上游目录与 reviewed allowlist 的交集 aliases，不参与 Provider 或账号选择。
 
 ## Thinking 与工具续接
 
 - K3 reasoning effort 只允许规范化后的 `low`、`high`、`max`，缺省为 `max`；启用 thinking 时固定 `thinking.keep=all`。
 - Claude Messages 使用 Kimi 所有的 `clear_thinking_20251015` edit；Chat bridge 只在 Kimi thinking 合同下回填 reasoning history。
-- signed thinking replay 必须同时匹配 App、Provider revision/runtime、Account identity generation、Share、签名用户哈希、session 和 model family。缓存只接受带签名 thinking 与 tool-use 的完整 assistant turn，单条/总容量、block 数量和 TTL 都有上限。
-- 非流与流式写入都在提交前重新验证 Provider 与 Account binding；流式只在 `message_stop` 提交，因此即使上游连接暂不 EOF，也能保存完整合法 turn。错误、未知 delta、截断或代际漂移不写入。
+- signed thinking replay 必须同时匹配 App、Provider revision/runtime、Account identity generation、token refresh generation、Share、签名用户哈希、session 和 model family。缓存只接受带签名 thinking 与 tool-use 的完整 assistant turn，单条/总容量、block 数量和 TTL 都有上限。
+- 非流与流式写入都在提交前重新验证 Provider、Account binding 与两个 credential generations；流式只在 `message_stop` 提交，因此即使上游连接暂不 EOF，也能保存完整合法 turn。错误、未知 delta、截断或代际漂移不写入。
 - 仅当本次确实应用 replay 且上游返回 400/422 时 CAS 删除对应旧值，避免一个失败请求清理另一会话或更新后的内容。
+- replay 的 hit、miss、content mismatch、上游拒绝、过期与 CAS 冲突使用固定枚举 metric；不携带 Provider、Account、Share、用户或 session 标签。
 
 ## 验收边界
 
-32 项离线 Kimi 测试覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威模型目录、模型 allowlist、K3 effort、thinking replay、同账号 401 和代际漂移。真实 Kimi Code 账号仍需分别验证：
+37 项离线 Kimi 测试覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威/空/stale/协议漂移模型目录、模型 allowlist、K3 effort、signature-only/placeholder/parallel-tool thinking replay、同账号单次 401 和 Provider/Account/token 代际漂移。真实 Kimi Code 账号仍需分别验证：
 
 - device 登录与 refresh-token 轮换；
 - Claude/Codex/Gemini 三个 Surface 的非流和流式文本；

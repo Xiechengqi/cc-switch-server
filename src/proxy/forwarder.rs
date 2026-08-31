@@ -27,9 +27,12 @@ use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::domain::accounts::claude_subscription::{
+    is_claude_fable_5_model, parse_claude_subscription_plan, ClaudeFableEligibility,
+};
 use crate::domain::accounts::store::{
     effective_codex_workspace_id, grok_account_capability_enabled, AccountStore,
-    GrokAccountCapability,
+    GrokAccountCapability, CLAUDE_FABLE_CAPACITY_POOL,
 };
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::bundle::surface_enabled;
@@ -50,8 +53,8 @@ use crate::logging::{
 };
 use crate::state::{
     AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    GrokMediaTaskBinding, GrokMediaTaskCommitError, GrokVideoPlane, ManagedAccountRefreshError,
-    QoderRuntimeError, ServerState, ShareInFlightGuard,
+    GrokMediaTaskBinding, GrokMediaTaskCommitError, GrokMediaTaskKind, GrokVideoPlane,
+    ManagedAccountRefreshError, QoderRuntimeError, ServerState, ShareInFlightGuard,
 };
 
 #[cfg(test)]
@@ -86,8 +89,9 @@ use super::request_governance::{
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
-    SemanticObservation, SemanticTerminal,
+    SemanticObservation, SemanticProtocolError, SemanticTerminal,
 };
+use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
 use super::retry_policy::{self, AuthRecoveryDecision};
 #[cfg(test)]
 use super::router::select_test_provider;
@@ -653,6 +657,7 @@ pub(crate) async fn forward_provider_test(
     }
     if route == ProxyRoute::ClaudeCountTokens
         && !provider_supports_claude_count_tokens(&execution.stored)
+        && !super::web_session::is_web_session_driver(execution.plan.driver_id.as_str())
     {
         return Err(ProxyError::bad_request(
             "Claude count_tokens requires a native Anthropic provider",
@@ -972,7 +977,8 @@ pub async fn forward_codex_alpha_search(
         &execution,
         request_context.share_id.as_deref(),
         final_model.as_deref(),
-    )?;
+    )
+    .await?;
     let accounts = state.accounts_snapshot().await;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
@@ -1434,6 +1440,7 @@ async fn forward_with_attempt(
                 )?;
                 if route == ProxyRoute::ClaudeCountTokens
                     && !provider_supports_claude_count_tokens(&execution.stored)
+                    && !super::web_session::is_web_session_driver(execution.plan.driver_id.as_str())
                 {
                     return Err(ProxyError::bad_request(
                         "Claude count_tokens requires a native Anthropic provider",
@@ -1490,7 +1497,8 @@ async fn forward_with_attempt(
                 &execution,
                 request_context.share_id.as_deref(),
                 Some(&cursor_model.model_id),
-            )?;
+            )
+            .await?;
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
             let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
             execution.materialize_auth(&accounts)?;
@@ -1514,7 +1522,9 @@ async fn forward_with_attempt(
         if execution.driver_is("special.cursor") {
             return Err(cursor::agentservice_not_ready_error(route, &stored, &body));
         }
-        if matches!(app, AppKind::Claude | AppKind::Codex) && execution.driver_is("special.kiro") {
+        if matches!(app, AppKind::Claude | AppKind::Codex)
+            && (execution.driver_is("special.kiro") || execution.driver_is("special.amazon_q"))
+        {
             return forward_claude_kiro(ClaudeKiroForwardOptions {
                 state,
                 execution,
@@ -1535,6 +1545,20 @@ async fn forward_with_attempt(
                 state,
                 execution,
                 stored,
+                body,
+                request_context,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            })
+            .await;
+        }
+        if super::web_session::is_web_session_driver(execution.plan.driver_id.as_str()) {
+            return forward_web_session(WebSessionForwardOptions {
+                state,
+                execution,
+                stored,
+                route,
                 body,
                 request_context,
                 account_in_flight_guard,
@@ -1861,7 +1885,8 @@ async fn forward_with_attempt(
             &execution,
             request_context.share_id.as_deref(),
             final_model.as_deref(),
-        )?;
+        )
+        .await?;
 
         let http_client = forward_http_client(&state, &stored).await?;
         let request = build_upstream_post_request(
@@ -1874,9 +1899,23 @@ async fn forward_with_attempt(
             adapter_request.upstream_stream_requested,
         )?;
 
+        // One absolute budget covers request send, response headers, and the
+        // first committable Responses event. Receiving HTTP 200 headers or an
+        // upstream liveness frame must not restart this clock.
+        let stream_first_event_deadline = adapter_request
+            .upstream_stream_requested
+            .then(|| execution.stream_first_byte_timeout())
+            .flatten()
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+
         let upstream_result = if adapter_request.upstream_stream_requested {
             match execution.stream_first_byte_timeout() {
-                Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
+                Some(timeout) => match tokio::time::timeout_at(
+                    stream_first_event_deadline.expect("stream timeout has an absolute deadline"),
+                    request.send(),
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(_) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
@@ -2408,6 +2447,8 @@ async fn forward_with_attempt(
                     status_code,
                     response_headers,
                     timeout: execution.request_timeout(),
+                    first_event_deadline: stream_first_event_deadline,
+                    first_event_timeout: execution.stream_first_byte_timeout(),
                     keepalive_interval: image_keepalive_interval(&execution),
                     account_in_flight_guard,
                     share_invocation_guard,
@@ -2424,6 +2465,8 @@ async fn forward_with_attempt(
             let aggregation = match aggregate_openai_responses_upstream(
                 &mut upstream,
                 execution.request_timeout(),
+                stream_first_event_deadline,
+                execution.stream_first_byte_timeout(),
             )
             .await
             {
@@ -2632,9 +2675,6 @@ async fn forward_with_attempt(
                 first_byte: execution.stream_first_byte_timeout(),
                 idle: execution.stream_idle_timeout(),
             };
-            let stream_first_event_deadline = timeouts
-                .first_byte
-                .map(|timeout| tokio::time::Instant::now() + timeout);
             let mut inner = if stored.provider_type == ProviderType::ClaudeOAuth
                 && route == ProxyRoute::ClaudeMessages
             {
@@ -2728,14 +2768,19 @@ async fn forward_with_attempt(
                     stored.provider_type,
                     ProviderType::KimiCode | ProviderType::GrokOAuth
                 );
+            let normalize_responses_transport = status.is_success()
+                && execution.driver_is("oauth.openai_codex")
+                && upstream_format == UpstreamFormat::OpenAiResponses
+                && response_semantics::responses_sse_normalizer_enabled();
             let inspect_responses_semantics = status.is_success()
                 && upstream_format == UpstreamFormat::OpenAiResponses
-                && responses_semantic_inspection_required(
-                    response_semantics::semantic_guard_enabled(),
-                    codex_overflow_compact_eligible(route, &execution, &attempt_context),
-                    responses_image_transport,
-                    mandatory_semantic_contract,
-                );
+                && (normalize_responses_transport
+                    || responses_semantic_inspection_required(
+                        response_semantics::semantic_guard_enabled(),
+                        codex_overflow_compact_eligible(route, &execution, &attempt_context),
+                        responses_image_transport,
+                        mandatory_semantic_contract,
+                    ));
             let inspect_anthropic_semantics = status.is_success()
                 && (response_semantics::semantic_guard_enabled() || mandatory_semantic_contract)
                 && route == ProxyRoute::ClaudeMessages
@@ -2799,20 +2844,30 @@ async fn forward_with_attempt(
                         }
                     };
                     match next {
-                        Ok(Some(chunk)) => {
-                            prelude.extend_from_slice(&chunk);
-                            if terminal_detector.push(&chunk).is_err() {
-                                semantic_protocol_error = Some(format!(
-                                    "Upstream terminal event exceeded the {} byte limit",
-                                    terminal_detector.max_event_bytes()
-                                ));
-                            }
+                        Ok(Some(upstream_chunk)) => {
                             detected_error = sse_error_detector
                                 .as_mut()
-                                .and_then(|detector| detector.push(&chunk));
+                                .and_then(|detector| detector.push(&upstream_chunk));
+                            let mut downstream_chunk = upstream_chunk.clone();
                             if let Some(inspector) = responses_semantics.as_mut() {
-                                match inspector.push(&chunk) {
-                                    Ok(observations) => {
+                                let inspected = if normalize_responses_transport {
+                                    inspector.push_normalized(&upstream_chunk)
+                                } else {
+                                    inspector.push(&upstream_chunk).map(|observations| {
+                                        response_semantics::ResponsesInspectionBatch {
+                                            observations,
+                                            normalized: upstream_chunk.clone(),
+                                            ..Default::default()
+                                        }
+                                    })
+                                };
+                                match inspected {
+                                    Ok(batch) => {
+                                        if normalize_responses_transport {
+                                            batch.record_transport_metrics("http_stream_prime");
+                                            downstream_chunk = batch.normalized.clone();
+                                        }
+                                        let observations = batch.observations;
                                         for observation in &observations {
                                             crate::metrics::record_proxy_semantic_guard(
                                                 "http_stream_prime",
@@ -2837,13 +2892,26 @@ async fn forward_with_attempt(
                                     }
                                 }
                             }
+                            prelude.extend_from_slice(&downstream_chunk);
+                            if semantic_protocol_error.is_none() {
+                                if let Err(error) = terminal_detector.push(&downstream_chunk) {
+                                    semantic_protocol_error = Some(
+                                        error.proxy_message(terminal_detector.max_event_bytes()),
+                                    );
+                                }
+                            }
                             if terminal_detector.terminal().is_some()
                                 && semantic_decision.is_none()
                                 && semantic_protocol_error.is_none()
                             {
                                 if let Some(inspector) = responses_semantics.as_mut() {
-                                    match inspector.finish() {
-                                        Ok(observations) => {
+                                    match inspector.finish_normalized() {
+                                        Ok(batch) => {
+                                            if normalize_responses_transport {
+                                                batch.record_transport_metrics("http_stream_prime");
+                                                prelude.extend_from_slice(&batch.normalized);
+                                            }
+                                            let observations = batch.observations;
                                             for observation in &observations {
                                                 crate::metrics::record_proxy_semantic_guard(
                                                     "http_stream_prime",
@@ -2864,7 +2932,7 @@ async fn forward_with_attempt(
                                 }
                             }
                             if let Some(inspector) = anthropic_semantics.as_mut() {
-                                match inspector.push(&chunk) {
+                                match inspector.push(&upstream_chunk) {
                                     Ok(observations) => {
                                         for observation in &observations {
                                             crate::metrics::record_proxy_semantic_guard(
@@ -2929,8 +2997,23 @@ async fn forward_with_attempt(
                         Ok(None) => {
                             if semantic_decision.is_none() {
                                 if let Some(inspector) = responses_semantics.as_mut() {
-                                    match inspector.finish() {
-                                        Ok(observations) => {
+                                    match inspector.finish_normalized() {
+                                        Ok(batch) => {
+                                            if normalize_responses_transport {
+                                                batch.record_transport_metrics("http_stream_prime");
+                                                prelude.extend_from_slice(&batch.normalized);
+                                                if semantic_protocol_error.is_none() {
+                                                    if let Err(error) =
+                                                        terminal_detector.push(&batch.normalized)
+                                                    {
+                                                        semantic_protocol_error =
+                                                            Some(error.proxy_message(
+                                                                terminal_detector.max_event_bytes(),
+                                                            ));
+                                                    }
+                                                }
+                                            }
+                                            let observations = batch.observations;
                                             for observation in &observations {
                                                 crate::metrics::record_proxy_semantic_guard(
                                                     "http_stream_prime",
@@ -3318,6 +3401,7 @@ async fn forward_with_attempt(
                 sse_error_detector,
                 sse_error_outcome_recorded,
                 responses_semantics,
+                normalize_responses_transport,
                 anthropic_semantics,
                 semantic_provider_outcome_recorded,
                 terminal_frame_sent: false,
@@ -3326,20 +3410,20 @@ async fn forward_with_attempt(
                 pending_image_transport_chunk: responses_image_transport
                     .then(|| Bytes::from_static(b": connected\n\n")),
                 image_upstream_deadline: responses_image_transport
-                    .then(|| {
-                        timeouts
-                            .first_byte
-                            .map(|timeout| tokio::time::Instant::now() + timeout)
-                    })
+                    .then_some(stream_first_event_deadline)
                     .flatten(),
                 image_transport: responses_image_transport
                     .then(|| ImageTransportMetrics::new("responses", "sse", started)),
                 image_keepalive_interval: image_keepalive_interval(&execution),
                 text_upstream_deadline: (!responses_image_transport)
                     .then(|| {
-                        timeouts
-                            .first_byte
-                            .map(|timeout| tokio::time::Instant::now() + timeout)
+                        if pending_chunk_committed_output {
+                            timeouts
+                                .idle
+                                .map(|timeout| tokio::time::Instant::now() + timeout)
+                        } else {
+                            stream_first_event_deadline
+                        }
                     })
                     .flatten(),
                 downstream_keepalive: (execution.driver_is("oauth.openai_codex")
@@ -3487,16 +3571,58 @@ async fn forward_with_attempt(
                 }
 
                 match next_chunk {
-                    Ok(Some(chunk)) => {
-                        if !chunk_already_inspected
-                            && stream_state.terminal_detector.push(&chunk).is_err()
-                        {
+                    Ok(Some(upstream_chunk)) => {
+                        let mut chunk = upstream_chunk;
+                        let mut normalized_semantics = None;
+                        if !chunk_already_inspected && stream_state.normalize_responses_transport {
+                            let batch = match stream_state
+                                .responses_semantics
+                                .as_mut()
+                                .expect("Responses normalization requires semantic state")
+                                .push_normalized(&chunk)
+                            {
+                                Ok(batch) => batch,
+                                Err(error) => {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    crate::metrics::record_responses_sse_transport(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .await;
+                                }
+                            };
+                            batch.record_transport_metrics("http_stream");
+                            for observation in &batch.observations {
+                                crate::metrics::record_proxy_semantic_guard(
+                                    "http_stream",
+                                    observation.metric_kind(),
+                                );
+                            }
+                            normalized_semantics = Some((
+                                batch
+                                    .observations
+                                    .iter()
+                                    .any(SemanticObservation::counts_as_business_output),
+                                batch
+                                    .observations
+                                    .iter()
+                                    .any(SemanticObservation::commits_downstream),
+                            ));
+                            chunk = batch.normalized;
+                        }
+                        if !chunk_already_inspected {
                             let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
-                            return stream_state
-                                .terminate_transform_error(ProxyError::bad_gateway(format!(
-                                    "Upstream terminal event exceeded the {max_event_bytes} byte limit"
-                                )))
-                                .await;
+                            if let Err(error) = stream_state.terminal_detector.push(&chunk) {
+                                let message = error.proxy_message(max_event_bytes);
+                                return stream_state
+                                    .terminate_transform_error(ProxyError::bad_gateway(message))
+                                    .await;
+                            }
                         }
                         stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
@@ -3509,6 +3635,8 @@ async fn forward_with_attempt(
                                 stream_state.pending_chunk_saw_business_output = false;
                                 stream_state.pending_chunk_committed_output = false;
                                 (saw_business, committed)
+                            } else if let Some(observed) = normalized_semantics {
+                                observed
                             } else if let Some(inspector) =
                                 stream_state.responses_semantics.as_mut()
                             {
@@ -3657,7 +3785,66 @@ async fn forward_with_attempt(
                         Ok(Some((transformed, stream_state)))
                     }
                     Ok(None) => {
-                        let chunk = stream_state.codex_completed_output_patcher.finish();
+                        let mut responses_transport_finished = false;
+                        let mut normalized_finish_semantics = None;
+                        let transport_tail = if stream_state.normalize_responses_transport {
+                            responses_transport_finished = true;
+                            let batch = match stream_state
+                                .responses_semantics
+                                .as_mut()
+                                .expect("Responses normalization requires semantic state")
+                                .finish_normalized()
+                            {
+                                Ok(batch) => batch,
+                                Err(error) => {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    crate::metrics::record_responses_sse_transport(
+                                        "http_stream",
+                                        "protocol_error",
+                                    );
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .await;
+                                }
+                            };
+                            batch.record_transport_metrics("http_stream");
+                            for observation in &batch.observations {
+                                crate::metrics::record_proxy_semantic_guard(
+                                    "http_stream",
+                                    observation.metric_kind(),
+                                );
+                            }
+                            normalized_finish_semantics = Some((
+                                batch
+                                    .observations
+                                    .iter()
+                                    .any(SemanticObservation::counts_as_business_output),
+                                batch
+                                    .observations
+                                    .iter()
+                                    .any(SemanticObservation::commits_downstream),
+                            ));
+                            let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
+                            if let Err(error) =
+                                stream_state.terminal_detector.push(&batch.normalized)
+                            {
+                                let message = error.proxy_message(max_event_bytes);
+                                return stream_state
+                                    .terminate_transform_error(ProxyError::bad_gateway(message))
+                                    .await;
+                            }
+                            batch.normalized
+                        } else {
+                            Bytes::new()
+                        };
+                        let chunk = stream_state
+                            .codex_completed_output_patcher
+                            .push(transport_tail);
+                        let chunk =
+                            join_bytes(chunk, stream_state.codex_completed_output_patcher.finish());
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
                         let tail = stream_state.codex_pending_function_call_patcher.finish();
                         let chunk = if tail.is_empty() {
@@ -3671,40 +3858,43 @@ async fn forward_with_attempt(
                         };
                         if !chunk.is_empty() {
                             stream_state.usage.push(&chunk);
-                            let (saw_business_output, committed_output) = if let Some(inspector) =
-                                stream_state.responses_semantics.as_mut()
-                            {
-                                let observations = match inspector.push(&chunk) {
-                                    Ok(observations) => observations,
-                                    Err(error) => {
+                            let (saw_business_output, committed_output) =
+                                if let Some(observed) = normalized_finish_semantics {
+                                    observed
+                                } else if let Some(inspector) =
+                                    stream_state.responses_semantics.as_mut()
+                                {
+                                    let observations = match inspector.push(&chunk) {
+                                        Ok(observations) => observations,
+                                        Err(error) => {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream",
+                                                "protocol_error",
+                                            );
+                                            return stream_state
+                                                .terminate_transform_error(ProxyError::bad_gateway(
+                                                    error,
+                                                ))
+                                                .await;
+                                        }
+                                    };
+                                    for observation in &observations {
                                         crate::metrics::record_proxy_semantic_guard(
                                             "http_stream",
-                                            "protocol_error",
+                                            observation.metric_kind(),
                                         );
-                                        return stream_state
-                                            .terminate_transform_error(ProxyError::bad_gateway(
-                                                error,
-                                            ))
-                                            .await;
                                     }
+                                    (
+                                        observations
+                                            .iter()
+                                            .any(SemanticObservation::counts_as_business_output),
+                                        observations
+                                            .iter()
+                                            .any(SemanticObservation::commits_downstream),
+                                    )
+                                } else {
+                                    (true, true)
                                 };
-                                for observation in &observations {
-                                    crate::metrics::record_proxy_semantic_guard(
-                                        "http_stream",
-                                        observation.metric_kind(),
-                                    );
-                                }
-                                (
-                                    observations
-                                        .iter()
-                                        .any(SemanticObservation::counts_as_business_output),
-                                    observations
-                                        .iter()
-                                        .any(SemanticObservation::commits_downstream),
-                                )
-                            } else {
-                                (true, true)
-                            };
                             stream_state.received_any_chunk |= committed_output;
                             if stream_state.first_token_ms.is_none() && saw_business_output {
                                 let first_token_ms = stream_state.started.elapsed().as_millis();
@@ -3761,24 +3951,28 @@ async fn forward_with_attempt(
                             stream_state.finalize_terminal_usage(true).await;
                             return Ok(Some((transformed, stream_state)));
                         }
-                        if let Some(inspector) = stream_state.responses_semantics.as_mut() {
-                            let observations = match inspector.finish() {
-                                Ok(observations) => observations,
-                                Err(error) => {
+                        if !responses_transport_finished {
+                            if let Some(inspector) = stream_state.responses_semantics.as_mut() {
+                                let observations = match inspector.finish() {
+                                    Ok(observations) => observations,
+                                    Err(error) => {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            "protocol_error",
+                                        );
+                                        return stream_state
+                                            .terminate_transform_error(ProxyError::bad_gateway(
+                                                error,
+                                            ))
+                                            .await;
+                                    }
+                                };
+                                for observation in &observations {
                                     crate::metrics::record_proxy_semantic_guard(
                                         "http_stream",
-                                        "protocol_error",
+                                        observation.metric_kind(),
                                     );
-                                    return stream_state
-                                        .terminate_transform_error(ProxyError::bad_gateway(error))
-                                        .await;
                                 }
-                            };
-                            for observation in &observations {
-                                crate::metrics::record_proxy_semantic_guard(
-                                    "http_stream",
-                                    observation.metric_kind(),
-                                );
                             }
                         }
                         if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
@@ -3906,6 +4100,14 @@ async fn forward_with_attempt(
                 }
             }
             copy_safe_upstream_response_headers(&response_headers, &mut response);
+            if upstream_format == UpstreamFormat::OpenAiResponses
+                && matches!(
+                    route,
+                    ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact
+                )
+            {
+                apply_openai_responses_streaming_headers(&mut response);
+            }
             if responses_image_transport {
                 apply_codex_images_streaming_headers(&mut response);
             }
@@ -4872,15 +5074,60 @@ fn codex_tool_call_output_type(item_type: &str) -> bool {
     )
 }
 
-fn ensure_share_model_available(
+async fn ensure_share_model_available(
     state: &ServerState,
     execution: &ProviderExecution,
     share_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), ProxyError> {
+    if execution.stored.provider_type == ProviderType::ClaudeOAuth
+        && model.is_some_and(is_claude_fable_5_model)
+    {
+        if let Some((provider_type, account_id, auth_identity_generation)) =
+            execution.managed_account_identity_target()
+        {
+            if let Some(account) = state.find_account_by_id(account_id).await {
+                let eligibility = account
+                    .subscription_level
+                    .as_deref()
+                    .and_then(parse_claude_subscription_plan)
+                    .map(|plan| plan.fable_eligibility())
+                    .unwrap_or(ClaudeFableEligibility::Unknown);
+                if eligibility == ClaudeFableEligibility::Ineligible {
+                    return Err(ProxyError {
+                        status: StatusCode::FORBIDDEN,
+                        message: "claude-fable-5 requires a Claude Max 5x or Max 20x subscription"
+                            .to_string(),
+                    });
+                }
+            }
+            let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(limit) = state
+                .active_account_capacity_pool_limit_if_current(
+                    account_id,
+                    provider_type,
+                    auth_identity_generation,
+                    CLAUDE_FABLE_CAPACITY_POOL,
+                    now,
+                )
+                .await
+            {
+                return Err(ProxyError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: format!(
+                        "Claude Fable weekly capacity pool is cooling down until {} ({})",
+                        limit.until_ms, limit.reason
+                    ),
+                });
+            }
+        }
+    }
     if !matches!(
         execution.stored.provider_type,
-        ProviderType::CodexOAuth | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ProviderType::ClaudeOAuth
+            | ProviderType::CodexOAuth
+            | ProviderType::AntigravityOAuth
+            | ProviderType::AgyOAuth
     ) {
         return Ok(());
     }
@@ -4950,6 +5197,7 @@ async fn forward_grok_media_for_test_surface(
                     .grok_media_task_binding(
                         &test_share_id,
                         request_context.user_email.as_deref(),
+                        GrokMediaTaskKind::VideoGeneration,
                         &task_id,
                     )
                     .await
@@ -5063,19 +5311,23 @@ pub async fn forward_grok_media(
     let share_id = request_context.share_id.as_deref().ok_or_else(|| {
         ProxyError::bad_request("Grok media requests require a Router Share binding")
     })?;
-    let sticky_media_binding = if let Some(task_id) =
-        super::grok::video_task_id_from_request(&upstream_path, &body)
-    {
-        Some(
-            state
-                .grok_media_task_binding(share_id, request_context.user_email.as_deref(), &task_id)
-                .await
-                .map_err(grok_media_task_store_error)?
-                .ok_or_else(|| grok_media_task_not_found(&task_id))?,
-        )
-    } else {
-        None
-    };
+    let sticky_media_binding =
+        if let Some(task_id) = super::grok::video_task_id_from_request(&upstream_path, &body) {
+            Some(
+                state
+                    .grok_media_task_binding(
+                        share_id,
+                        request_context.user_email.as_deref(),
+                        GrokMediaTaskKind::VideoGeneration,
+                        &task_id,
+                    )
+                    .await
+                    .map_err(grok_media_task_store_error)?
+                    .ok_or_else(|| grok_media_task_not_found(&task_id))?,
+            )
+        } else {
+            None
+        };
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
@@ -5724,6 +5976,7 @@ async fn forward_grok_media_with_execution(
                 account_id.to_string(),
                 auth_identity_generation,
                 task_id,
+                GrokMediaTaskKind::VideoGeneration,
                 request_context.request_id.clone(),
                 owner_share_id,
                 user_email.as_deref(),
@@ -6157,6 +6410,7 @@ fn ensure_grok_media_task_binding(
         },
     );
     if binding.provider_id == execution.stored.provider.id
+        && binding.task_kind == GrokMediaTaskKind::VideoGeneration
         && account_matches
         && binding.runtime_fingerprint == execution.plan.runtime_fingerprint
         && binding.upstream_plane == GrokVideoPlane::Xai
@@ -6248,7 +6502,8 @@ async fn forward_codex_images_request(
         &execution,
         request_context.share_id.as_deref(),
         final_model.as_deref(),
-    )?;
+    )
+    .await?;
     let (body, metadata) = super::codex_request_policy::apply_to_bytes(
         &adapter_request.body,
         &stored,
@@ -6264,8 +6519,9 @@ async fn forward_codex_images_request(
     } else {
         None
     };
-    let session_id = codex_oauth_session_id_from_request(&headers, &prepared.body);
     let started = Instant::now();
+    let first_event_timeout = execution.stream_first_byte_timeout();
+    let session_id = codex_oauth_session_id_from_request(&headers, &prepared.body);
     if let Err(error) = refresh_execution_managed_account_if_needed(&state, &execution).await {
         let timeout = error.status == StatusCode::GATEWAY_TIMEOUT;
         record_codex_images_prebody_failure(
@@ -6287,11 +6543,16 @@ async fn forward_codex_images_request(
         .await;
         return Err(error);
     }
-    let first_event_timeout = execution.stream_first_byte_timeout();
+    // OAuth refresh has its own bounded singleflight deadline and is request
+    // preparation, not part of the upstream Responses first-event budget.
+    // This matches the normal Responses path and prevents a successful slow
+    // refresh from leaving an already-expired image transport deadline.
+    let mut first_event_deadline =
+        first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let mut auth_refresh_attempted = false;
     let (mut upstream, rejected_access_token) = loop {
-        let header_timeout = first_event_timeout
-            .map(|timeout| timeout.saturating_sub(started.elapsed()))
+        let header_timeout = first_event_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
             .unwrap_or_else(|| execution.request_timeout());
         let attempt = match send_codex_images_attempt(
             &state,
@@ -6370,6 +6631,8 @@ async fn forward_codex_images_request(
                     .await;
                     return Err(error);
                 }
+                first_event_deadline =
+                    first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
                 auth_refresh_attempted = true;
                 advance_audited_attempt(
                     &state,
@@ -6638,8 +6901,8 @@ async fn forward_codex_images_request(
         started,
         request_id,
         status_code,
-        first_event_timeout: first_event_timeout
-            .map(|timeout| timeout.saturating_sub(started.elapsed())),
+        first_event_deadline,
+        first_event_timeout,
         idle_timeout: execution.stream_idle_timeout(),
         keepalive_interval: CODEX_IMAGES_KEEPALIVE_INTERVAL,
         public_origin,
@@ -7337,6 +7600,7 @@ struct CodexImagesStreamArgs {
     started: Instant,
     request_id: String,
     status_code: u16,
+    first_event_deadline: Option<tokio::time::Instant>,
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     keepalive_interval: Duration,
@@ -7357,6 +7621,7 @@ fn codex_images_response_stream(
         started,
         request_id,
         status_code,
+        first_event_deadline,
         first_event_timeout,
         idle_timeout,
         keepalive_interval,
@@ -7403,9 +7668,8 @@ fn codex_images_response_stream(
             keepalive_interval,
         );
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut saw_valid_event = false;
-        let mut read_deadline = first_event_timeout
-            .map(|timeout| tokio::time::Instant::now() + timeout);
+        let mut saw_semantic_event = false;
+        let mut read_deadline = first_event_deadline;
 
         loop {
             let step = if let Some(deadline) = read_deadline {
@@ -7435,13 +7699,13 @@ fn codex_images_response_stream(
                     continue;
                 }
                 CodexImagesReadStep::Timeout => {
-                    let timeout = if saw_valid_event {
+                    let timeout = if saw_semantic_event {
                         idle_timeout
                     } else {
                         first_event_timeout
                     }
                     .unwrap_or_default();
-                    Err(CodexImagesFailure::timeout(saw_valid_event, timeout))
+                    Err(CodexImagesFailure::timeout(saw_semantic_event, timeout))
                 }
                 CodexImagesReadStep::Upstream(Err(error)) => {
                     Err(CodexImagesFailure::network(error.to_string()))
@@ -7449,11 +7713,11 @@ fn codex_images_response_stream(
                 CodexImagesReadStep::Upstream(Ok(Some(chunk))) => {
                     lifecycle.usage_snapshot = lifecycle.usage.push(&chunk);
                     let parsed = parser.push(&chunk);
-                    if parsed.as_ref().is_ok_and(|parsed| parsed.saw_valid_event) {
-                        saw_valid_event = true;
-                        read_deadline = idle_timeout
-                            .map(|timeout| tokio::time::Instant::now() + timeout);
-                    } else if saw_valid_event {
+                    if parsed
+                        .as_ref()
+                        .is_ok_and(|parsed| parsed.saw_semantic_event)
+                    {
+                        saw_semantic_event = true;
                         read_deadline = idle_timeout
                             .map(|timeout| tokio::time::Instant::now() + timeout);
                     }
@@ -7728,7 +7992,7 @@ impl Drop for CodexImagesLifecycleGuard {
 
 struct CodexImagesParsedChunk {
     events: Vec<CodexImagesProtocolEvent>,
-    saw_valid_event: bool,
+    saw_semantic_event: bool,
 }
 
 enum CodexImagesProtocolEvent {
@@ -7751,8 +8015,9 @@ struct CodexImagesCompletion {
 }
 
 struct CodexImagesResponseParser {
-    buffer: Vec<u8>,
+    decoder: ResponsesTransportDecoder,
     total_bytes: usize,
+    terminal_seen: bool,
     pending_results: Vec<CodexImageResult>,
     pending_refusal: Option<String>,
     stream_meta: CodexImageResult,
@@ -7762,8 +8027,12 @@ struct CodexImagesResponseParser {
 impl CodexImagesResponseParser {
     fn new() -> Self {
         Self {
-            buffer: Vec::new(),
+            decoder: ResponsesTransportDecoder::new(
+                CODEX_IMAGES_MAX_UPSTREAM_BYTES,
+                CODEX_IMAGES_MAX_UPSTREAM_BYTES,
+            ),
             total_bytes: 0,
+            terminal_seen: false,
             pending_results: Vec::new(),
             pending_refusal: None,
             stream_meta: CodexImageResult::default(),
@@ -7779,92 +8048,87 @@ impl CodexImagesResponseParser {
                 CODEX_IMAGES_MAX_UPSTREAM_BYTES
             )));
         }
-        self.buffer.extend_from_slice(chunk);
+        let items = self.decoder.push(chunk).map_err(|error| {
+            CodexImagesFailure::protocol(format!("invalid Codex Images SSE: {error}"))
+        })?;
+        if !items.is_empty() && !self.decoder.is_sse() {
+            return Err(CodexImagesFailure::protocol(
+                "Codex Images upstream did not use the expected SSE data framing",
+            ));
+        }
+        self.process_transport_items(items)
+    }
+
+    fn finish(&mut self) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
+        let items = self.decoder.finish().map_err(|error| {
+            CodexImagesFailure::protocol(format!("invalid Codex Images SSE tail: {error}"))
+        })?;
+        if !items.is_empty() && !self.decoder.is_sse() {
+            return Err(CodexImagesFailure::protocol(
+                "Codex Images upstream did not use the expected SSE data framing",
+            ));
+        }
+        let parsed = self.process_transport_items(items)?;
+        if !self.terminal_seen {
+            return Err(CodexImagesFailure::protocol(
+                "Codex image stream ended before a terminal event",
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn process_transport_items(
+        &mut self,
+        items: Vec<ResponsesTransportItem>,
+    ) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
         let mut events = Vec::new();
-        let mut saw_valid_event = false;
-        while let Some((event_end, delimiter_len)) = next_sse_event_boundary_bytes(&self.buffer) {
-            let event = self.buffer[..event_end].to_vec();
-            self.buffer.drain(..event_end + delimiter_len);
-            if let Some(parsed) = self.parse_sse_event(&event, &mut saw_valid_event)? {
-                let terminal = matches!(
-                    parsed,
-                    CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
-                );
-                events.push(parsed);
-                if terminal {
-                    break;
+        let mut saw_semantic_event = false;
+        for item in items {
+            match item {
+                ResponsesTransportItem::Liveness(kind) => {
+                    crate::metrics::record_responses_sse_transport(
+                        "codex_images",
+                        kind.metric_kind(),
+                    );
+                }
+                ResponsesTransportItem::Done => {
+                    crate::metrics::record_responses_sse_transport("codex_images", "done");
+                    return Err(CodexImagesFailure::protocol(
+                        "Codex image stream emitted [DONE] before a terminal response event",
+                    ));
+                }
+                ResponsesTransportItem::Json {
+                    declared_event,
+                    value,
+                } => {
+                    let observation = response_semantics::classify_value(&value);
+                    saw_semantic_event |=
+                        observation.counts_as_business_output() || observation.commits_downstream();
+                    crate::metrics::record_responses_sse_transport(
+                        "codex_images",
+                        "normalized_event",
+                    );
+                    if let Some(parsed) =
+                        self.protocol_event_from_value(&value, declared_event.as_deref())?
+                    {
+                        let terminal = matches!(
+                            parsed,
+                            CodexImagesProtocolEvent::Completed(_)
+                                | CodexImagesProtocolEvent::Failed(_)
+                        );
+                        self.terminal_seen |= terminal;
+                        events.push(parsed);
+                        if terminal {
+                            break;
+                        }
+                    }
                 }
             }
         }
         Ok(CodexImagesParsedChunk {
             events,
-            saw_valid_event,
+            saw_semantic_event,
         })
-    }
-
-    fn finish(&mut self) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
-        let mut events = Vec::new();
-        let mut saw_valid_event = false;
-        if !self.buffer.iter().all(u8::is_ascii_whitespace) {
-            let tail = std::mem::take(&mut self.buffer);
-            if let Some(event) = self.parse_sse_event(&tail, &mut saw_valid_event)? {
-                events.push(event);
-            }
-        }
-        if !events.iter().any(|event| {
-            matches!(
-                event,
-                CodexImagesProtocolEvent::Completed(_) | CodexImagesProtocolEvent::Failed(_)
-            )
-        }) {
-            return Err(CodexImagesFailure::protocol(
-                "Codex image stream ended before a terminal event",
-            ));
-        }
-        Ok(CodexImagesParsedChunk {
-            events,
-            saw_valid_event,
-        })
-    }
-
-    fn parse_sse_event(
-        &mut self,
-        event: &[u8],
-        saw_valid_event: &mut bool,
-    ) -> Result<Option<CodexImagesProtocolEvent>, CodexImagesFailure> {
-        let event = std::str::from_utf8(event).map_err(|error| {
-            CodexImagesFailure::protocol(format!("Codex Images SSE is not UTF-8: {error}"))
-        })?;
-        let mut event_name = None;
-        let mut data = Vec::new();
-        for line in event.lines() {
-            let line = line.trim_end_matches('\r');
-            if let Some(value) = line.strip_prefix("event:") {
-                event_name = Some(value.trim().to_string());
-            } else if let Some(value) = line.strip_prefix("data:") {
-                data.push(value.trim_start().to_string());
-            }
-        }
-        if data.is_empty() {
-            if event.lines().any(|line| {
-                let line = line.trim();
-                line.starts_with('{') || line.starts_with('[')
-            }) {
-                return Err(CodexImagesFailure::protocol(
-                    "Codex Images upstream did not use the expected SSE data framing",
-                ));
-            }
-            return Ok(None);
-        }
-        let payload = data.join("\n");
-        *saw_valid_event = true;
-        if payload.trim() == "[DONE]" {
-            return self.completion_from_pending().map(Some);
-        }
-        let value = serde_json::from_str::<Value>(&payload).map_err(|error| {
-            CodexImagesFailure::protocol(format!("invalid Codex Images SSE JSON: {error}"))
-        })?;
-        self.protocol_event_from_value(&value, event_name.as_deref())
     }
 
     fn protocol_event_from_value(
@@ -7943,7 +8207,7 @@ impl CodexImagesResponseParser {
                 }
                 Ok(None)
             }
-            "response.completed" | "response.done" => self.completion_from_value(value).map(Some),
+            "response.completed" => self.completion_from_value(value).map(Some),
             _ => Ok(None),
         }
     }
@@ -8001,20 +8265,6 @@ impl CodexImagesResponseParser {
             results,
             created_at,
             usage,
-        }))
-    }
-
-    fn completion_from_pending(&mut self) -> Result<CodexImagesProtocolEvent, CodexImagesFailure> {
-        let results = std::mem::take(&mut self.pending_results);
-        if results.is_empty() {
-            return Err(CodexImagesFailure::protocol(
-                "Codex image stream ended before image generation completed",
-            ));
-        }
-        Ok(CodexImagesProtocolEvent::Completed(CodexImagesCompletion {
-            results,
-            created_at: self.created_at,
-            usage: None,
         }))
     }
 
@@ -8536,6 +8786,27 @@ fn codex_images_model_metadata(prepared: &CodexImagesPreparedRequest) -> UsageMo
 }
 
 fn apply_codex_images_streaming_headers(response: &mut Response) {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, no-transform"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+}
+
+fn apply_openai_responses_streaming_headers(response: &mut Response) {
+    response.headers_mut().remove(CONTENT_LENGTH);
+    response.headers_mut().remove(CONTENT_ENCODING);
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
     response.headers_mut().insert(
         CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate, no-transform"),
@@ -9504,7 +9775,8 @@ async fn bridge_responses_websocket(
                             &execution,
                             request_context.share_id.as_deref(),
                             codex_session_model.as_deref(),
-                        )?;
+                        )
+                        .await?;
                     }
                     let grok_tool_context = matches!(mode, ResponsesWebsocketMode::Grok)
                         .then(|| transforms::responses_tool_context(requested_response_body))
@@ -11271,7 +11543,18 @@ async fn run_codex_websocket_http_fallback(
                     crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
                     return Ok(CodexHttpFallbackOutcome::Completed);
                 }
-                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                let protocol_error = stream_error_code_and_message(error.client_message()).0
+                    == "upstream_stream_protocol_error";
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    if protocol_error {
+                        ProviderOutcome::Failure { status_code: 502 }
+                    } else {
+                        ProviderOutcome::NetworkFailure
+                    },
+                )
+                .await;
                 let error_code = if error.status == StatusCode::GATEWAY_TIMEOUT {
                     "upstream_stream_timeout"
                 } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
@@ -11281,6 +11564,8 @@ async fn run_codex_websocket_http_fallback(
                     .contains("ended before a terminal response event")
                 {
                     "upstream_closed_before_terminal"
+                } else if protocol_error {
+                    "upstream_stream_protocol_error"
                 } else {
                     "upstream_stream_error"
                 };
@@ -11293,10 +11578,11 @@ async fn run_codex_websocket_http_fallback(
                     replay_payloads,
                     error,
                     error_code,
-                    Some(if error_code == "upstream_closed_before_terminal" {
-                        "missing_terminal"
-                    } else {
-                        "transport_error"
+                    Some(match error_code {
+                        "upstream_closed_before_terminal" => "missing_terminal",
+                        "upstream_stream_too_large" => "capacity",
+                        "upstream_stream_protocol_error" => "protocol_error",
+                        _ => "transport_error",
                     }),
                     active_usage_turn,
                 )
@@ -11338,10 +11624,15 @@ async fn terminate_codex_http_fallback_with_error(
     if let Some(metric_kind) = metric_kind {
         crate::metrics::record_proxy_semantic_guard("websocket_http_fallback", metric_kind);
     }
-    let usage_status = if error.status.is_client_error() {
+    let usage_status = if error.status.is_client_error() && metric_kind != Some("capacity") {
         "client_error"
     } else {
-        "interrupted"
+        match metric_kind {
+            Some("missing_terminal") => "missing_terminal",
+            Some("protocol_error") => "protocol_error",
+            Some("capacity") => "aggregate_too_large",
+            _ => "interrupted",
+        }
     };
     finish_active_websocket_usage(
         active_usage_turn,
@@ -11858,45 +12149,51 @@ async fn relay_codex_http_fallback_stream(
 
             match next_chunk {
                 Some(chunk) => {
-                    let payloads = decoder
+                    let items = decoder
                         .push(&chunk)
                         .map_err(CodexHttpRelayFailure::Upstream)?;
-                    remember_codex_http_fallback_error_frames(&payloads, &mut last_error);
-                    if let Some(outcome) = relay_codex_http_fallback_payloads(
+                    remember_codex_http_fallback_transport_error_frames(
+                        &items,
+                        &mut last_error,
+                    );
+                    let (outcome, semantic_activity) = relay_codex_http_fallback_transport_items(
                         downstream,
                         output_patcher,
-                        payloads,
+                        items,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
                         response_repeat_tracker.as_mut(),
                         active_usage_turn,
                     )
-                    .await?
-                    {
+                    .await?;
+                    if let Some(outcome) = outcome {
                         return Ok(outcome);
                     }
-                    if committed_business_event {
+                    if semantic_activity {
                         deadline = policy
                             .idle_timeout
                             .map(|timeout| tokio::time::Instant::now() + timeout);
                     }
                 }
                 None => {
-                    let payloads = decoder
+                    let items = decoder
                         .finish()
                         .map_err(CodexHttpRelayFailure::Upstream)?;
-                    remember_codex_http_fallback_error_frames(&payloads, &mut last_error);
-                    if let Some(outcome) = relay_codex_http_fallback_payloads(
+                    remember_codex_http_fallback_transport_error_frames(
+                        &items,
+                        &mut last_error,
+                    );
+                    let (outcome, _) = relay_codex_http_fallback_transport_items(
                         downstream,
                         output_patcher,
-                        payloads,
+                        items,
                         &mut pending_lifecycle_payloads,
                         &mut committed_business_event,
                         response_repeat_tracker.as_mut(),
                         active_usage_turn,
                     )
-                    .await?
-                    {
+                    .await?;
+                    if let Some(outcome) = outcome {
                         return Ok(outcome);
                     }
                     return Err(CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(
@@ -11921,6 +12218,55 @@ async fn relay_codex_http_fallback_stream(
     }
 }
 
+async fn relay_codex_http_fallback_transport_items(
+    downstream: &mut WebSocket,
+    output_patcher: &mut CodexWebsocketOutputPatcher,
+    items: Vec<CodexHttpFallbackTransportItem>,
+    pending_lifecycle_payloads: &mut Vec<String>,
+    committed_business_event: &mut bool,
+    mut response_repeat_tracker: Option<&mut ResponsesRepeatTracker>,
+    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+) -> Result<(Option<CodexHttpRelayOutcome>, bool), CodexHttpRelayFailure> {
+    let mut payloads = Vec::new();
+    let mut semantic_activity = false;
+    for item in items {
+        match item {
+            CodexHttpFallbackTransportItem::Payload(payload) => payloads.push(payload),
+            CodexHttpFallbackTransportItem::Done => {
+                let (outcome, activity) = relay_codex_http_fallback_payloads(
+                    downstream,
+                    output_patcher,
+                    std::mem::take(&mut payloads),
+                    pending_lifecycle_payloads,
+                    committed_business_event,
+                    response_repeat_tracker.as_deref_mut(),
+                    active_usage_turn,
+                )
+                .await?;
+                semantic_activity |= activity;
+                if let Some(outcome) = outcome {
+                    return Ok((Some(outcome), semantic_activity));
+                }
+                return Err(CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(
+                    "Responses stream emitted [DONE] before a terminal response event",
+                )));
+            }
+        }
+    }
+    let (outcome, activity) = relay_codex_http_fallback_payloads(
+        downstream,
+        output_patcher,
+        payloads,
+        pending_lifecycle_payloads,
+        committed_business_event,
+        response_repeat_tracker,
+        active_usage_turn,
+    )
+    .await?;
+    semantic_activity |= activity;
+    Ok((outcome, semantic_activity))
+}
+
 async fn relay_codex_http_fallback_payloads(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
@@ -11929,7 +12275,8 @@ async fn relay_codex_http_fallback_payloads(
     committed_business_event: &mut bool,
     mut response_repeat_tracker: Option<&mut ResponsesRepeatTracker>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
-) -> Result<Option<CodexHttpRelayOutcome>, CodexHttpRelayFailure> {
+) -> Result<(Option<CodexHttpRelayOutcome>, bool), CodexHttpRelayFailure> {
+    let mut semantic_activity = false;
     if !*committed_business_event {
         if let Some((failure_index, failure)) =
             codex_http_fallback_batch_provider_failure(&payloads)
@@ -11943,10 +12290,13 @@ async fn relay_codex_http_fallback_payloads(
                 buffer_codex_http_fallback_semantic_prelude(pending_lifecycle_payloads, payload)
                     .map_err(CodexHttpRelayFailure::Upstream)?;
             }
-            return Ok(Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
-                failure,
-                replay_payloads: std::mem::take(pending_lifecycle_payloads),
-            }));
+            return Ok((
+                Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                    failure,
+                    replay_payloads: std::mem::take(pending_lifecycle_payloads),
+                }),
+                semantic_activity,
+            ));
         }
     }
 
@@ -11961,8 +12311,14 @@ async fn relay_codex_http_fallback_payloads(
                 .observe_value(&value)
                 .map_err(|error| CodexHttpRelayFailure::Upstream(ProxyError::bad_gateway(error)))?;
         }
+        let observation = response_semantics::classify_value(&value);
+        semantic_activity |= if response_semantics::semantic_guard_enabled() {
+            observation.commits_downstream()
+        } else {
+            true
+        };
         if let Some(turn) = active_usage_turn.as_mut() {
-            let business = response_semantics::classify_value(&value).counts_as_business_output();
+            let business = observation.counts_as_business_output();
             turn.observe_payload(payload.as_bytes(), business);
         }
         match relay_codex_http_fallback_semantic_event(
@@ -11976,17 +12332,23 @@ async fn relay_codex_http_fallback_payloads(
         {
             CodexHttpRelayEventOutcome::Continue => {}
             CodexHttpRelayEventOutcome::Terminal(terminal) => {
-                return Ok(Some(CodexHttpRelayOutcome::Completed(terminal)));
+                return Ok((
+                    Some(CodexHttpRelayOutcome::Completed(terminal)),
+                    semantic_activity,
+                ));
             }
             CodexHttpRelayEventOutcome::ProviderFailureBeforeCommit(failure) => {
-                return Ok(Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
-                    failure,
-                    replay_payloads: std::mem::take(pending_lifecycle_payloads),
-                }));
+                return Ok((
+                    Some(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                        failure,
+                        replay_payloads: std::mem::take(pending_lifecycle_payloads),
+                    }),
+                    semantic_activity,
+                ));
             }
         }
     }
-    Ok(None)
+    Ok((None, semantic_activity))
 }
 
 fn codex_http_fallback_batch_provider_failure(
@@ -12133,22 +12495,30 @@ fn responses_payload_terminal(payload: &str) -> Option<SemanticTerminal> {
 }
 
 fn last_responses_error_from_payloads(payloads: &[String]) -> Option<SemanticFailure> {
-    payloads.iter().rev().find_map(|payload| {
-        let value = serde_json::from_str::<Value>(payload).ok()?;
-        match response_semantics::classify_value(&value) {
-            SemanticObservation::ErrorFrame(failure) | SemanticObservation::Failure(failure) => {
-                Some(failure)
-            }
-            _ => None,
-        }
-    })
+    payloads
+        .iter()
+        .rev()
+        .find_map(|payload| responses_error_from_payload(payload))
 }
 
-fn remember_codex_http_fallback_error_frames(
-    payloads: &[String],
+fn responses_error_from_payload(payload: &str) -> Option<SemanticFailure> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    match response_semantics::classify_value(&value) {
+        SemanticObservation::ErrorFrame(failure) | SemanticObservation::Failure(failure) => {
+            Some(failure)
+        }
+        _ => None,
+    }
+}
+
+fn remember_codex_http_fallback_transport_error_frames(
+    items: &[CodexHttpFallbackTransportItem],
     last_error: &mut Option<SemanticFailure>,
 ) {
-    if let Some(failure) = last_responses_error_from_payloads(payloads) {
+    if let Some(failure) = items.iter().rev().find_map(|item| match item {
+        CodexHttpFallbackTransportItem::Payload(payload) => responses_error_from_payload(payload),
+        CodexHttpFallbackTransportItem::Done => None,
+    }) {
         *last_error = Some(failure);
     }
 }
@@ -12173,111 +12543,91 @@ async fn relay_codex_http_fallback_event(
     Ok(terminal)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CodexHttpFallbackSseDecoder {
-    buffer: Vec<u8>,
+    decoder: ResponsesTransportDecoder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexHttpFallbackTransportItem {
+    Payload(String),
+    Done,
+}
+
+impl Default for CodexHttpFallbackSseDecoder {
+    fn default() -> Self {
+        Self::with_limit(MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES)
+    }
 }
 
 impl CodexHttpFallbackSseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ProxyError> {
-        self.buffer.extend_from_slice(chunk);
-        self.drain(false)
+    fn with_limit(max_event_bytes: usize) -> Self {
+        Self {
+            decoder: ResponsesTransportDecoder::new(
+                max_event_bytes.min(MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES),
+                max_event_bytes,
+            ),
+        }
     }
 
-    fn finish(&mut self) -> Result<Vec<String>, ProxyError> {
-        self.drain(true)
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<CodexHttpFallbackTransportItem>, ProxyError> {
+        let items = self
+            .decoder
+            .push(chunk)
+            .map_err(codex_http_fallback_transport_error)?;
+        codex_http_fallback_transport_items(items)
     }
 
-    fn drain(&mut self, finish: bool) -> Result<Vec<String>, ProxyError> {
-        self.drain_with_limit(finish, MAX_CODEX_HTTP_FALLBACK_SSE_EVENT_BYTES)
-    }
-
-    fn drain_with_limit(
-        &mut self,
-        finish: bool,
-        max_event_bytes: usize,
-    ) -> Result<Vec<String>, ProxyError> {
-        let mut payloads = Vec::new();
-        while let Some((event_end, delimiter_len)) = codex_sse_event_boundary(&self.buffer) {
-            if event_end > max_event_bytes {
-                return Err(codex_http_fallback_sse_event_too_large());
-            }
-            let event = self.buffer[..event_end].to_vec();
-            self.buffer.drain(..event_end + delimiter_len);
-            if let Some(payload) = codex_sse_json_payload(&event)? {
-                payloads.push(payload);
-            }
-        }
-        let pending_event_bytes = if finish {
-            self.buffer.len()
-        } else {
-            self.buffer
-                .len()
-                .saturating_sub(codex_sse_delimiter_prefix_len(&self.buffer))
-        };
-        if pending_event_bytes > max_event_bytes {
-            return Err(codex_http_fallback_sse_event_too_large());
-        }
-        if finish && !self.buffer.is_empty() {
-            let event = std::mem::take(&mut self.buffer);
-            if let Some(payload) = codex_sse_json_payload(&event)? {
-                payloads.push(payload);
-            }
-        }
-        Ok(payloads)
+    fn finish(&mut self) -> Result<Vec<CodexHttpFallbackTransportItem>, ProxyError> {
+        let items = self
+            .decoder
+            .finish()
+            .map_err(codex_http_fallback_transport_error)?;
+        codex_http_fallback_transport_items(items)
     }
 }
 
-fn codex_http_fallback_sse_event_too_large() -> ProxyError {
-    ProxyError {
-        status: StatusCode::PAYLOAD_TOO_LARGE,
-        message: "Responses HTTP fallback SSE event exceeded 128 MiB".to_string(),
-    }
-}
-
-fn codex_sse_delimiter_prefix_len(buffer: &[u8]) -> usize {
-    [b"\r\n\r".as_slice(), b"\r\n", b"\r", b"\n"]
-        .into_iter()
-        .find(|prefix| buffer.ends_with(prefix))
-        .map_or(0, <[u8]>::len)
-}
-
-fn codex_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
-        if buffer.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, 2));
+fn codex_http_fallback_transport_error(
+    error: super::responses_transport::ResponsesTransportError,
+) -> ProxyError {
+    if error.is_capacity() {
+        ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: error.to_string(),
         }
-        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-    }
-    None
-}
-
-fn codex_sse_json_payload(event: &[u8]) -> Result<Option<String>, ProxyError> {
-    let event = std::str::from_utf8(event)
-        .map_err(|error| ProxyError::bad_gateway(format!("Codex SSE is not UTF-8: {error}")))?;
-    let data = event
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    let payload = if data.is_empty() {
-        let event = event.trim();
-        if !event.starts_with('{') {
-            return Ok(None);
-        }
-        event.to_string()
     } else {
-        data.join("\n").trim().to_string()
-    };
-    if payload.is_empty() || payload == "[DONE]" {
-        return Ok(None);
+        ProxyError::bad_gateway(error)
     }
-    serde_json::from_str::<Value>(&payload).map_err(|error| {
-        ProxyError::bad_gateway(format!("Codex SSE data is not valid JSON: {error}"))
-    })?;
-    Ok(Some(payload))
+}
+
+fn codex_http_fallback_transport_items(
+    items: Vec<ResponsesTransportItem>,
+) -> Result<Vec<CodexHttpFallbackTransportItem>, ProxyError> {
+    let mut output = Vec::new();
+    for item in items {
+        match item {
+            ResponsesTransportItem::Json { value, .. } => {
+                output.push(CodexHttpFallbackTransportItem::Payload(
+                    serde_json::to_string(&value).map_err(ProxyError::bad_gateway)?,
+                ));
+                crate::metrics::record_responses_sse_transport(
+                    "websocket_http_fallback",
+                    "normalized_event",
+                );
+            }
+            ResponsesTransportItem::Liveness(kind) => {
+                crate::metrics::record_responses_sse_transport(
+                    "websocket_http_fallback",
+                    kind.metric_kind(),
+                );
+            }
+            ResponsesTransportItem::Done => {
+                crate::metrics::record_responses_sse_transport("websocket_http_fallback", "done");
+                output.push(CodexHttpFallbackTransportItem::Done);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn responses_websocket_request_starts_response(message: &TungsteniteMessage) -> bool {
@@ -12326,9 +12676,6 @@ fn classify_responses_websocket_message(
     message: &TungsteniteMessage,
     repeats: Option<&mut ResponsesRepeatTracker>,
 ) -> Result<Option<SemanticObservation>, ProxyError> {
-    if !response_semantics::semantic_guard_enabled() {
-        return Ok(None);
-    }
     let bytes = match message {
         TungsteniteMessage::Text(text) => text.as_bytes(),
         TungsteniteMessage::Binary(bytes) => bytes.as_slice(),
@@ -12337,6 +12684,14 @@ fn classify_responses_websocket_message(
     let value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
         ProxyError::bad_gateway(format!("Responses body is not valid JSON: {error}"))
     })?;
+    if !value.is_object() {
+        return Err(ProxyError::bad_gateway(
+            "Responses WebSocket payload must be a JSON object",
+        ));
+    }
+    if !response_semantics::semantic_guard_enabled() {
+        return Ok(None);
+    }
     if let Some(repeats) = repeats {
         repeats
             .observe_value(&value)
@@ -12960,7 +13315,10 @@ async fn maybe_mark_upstream_rate_limited(
     share_id: Option<&str>,
     model: Option<&str>,
 ) {
-    if execution.stored.provider_type == ProviderType::KiroOAuth {
+    if matches!(
+        execution.stored.provider_type,
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
+    ) {
         if let Some(class) = kiro::classify_throttle(status, body) {
             if class != kiro::KiroThrottleClass::OrdinaryOverload {
                 let Some((provider_type, account_id, auth_identity_generation)) =
@@ -12982,7 +13340,7 @@ async fn maybe_mark_upstream_rate_limited(
                         auth_identity_generation,
                         until,
                         Some(format!(
-                            "Kiro subscription throttle classified as {class:?}"
+                            "CodeWhisperer subscription throttle classified as {class:?}"
                         )),
                     )
                     .await;
@@ -12995,35 +13353,51 @@ async fn maybe_mark_upstream_rate_limited(
     }
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     if execution.stored.provider_type == ProviderType::ClaudeOAuth {
-        match classify_claude_rate_limit(headers, body, now) {
-            ClaudeRateLimitScope::RequestEntitlement => {
-                crate::metrics::record_claude_rate_limit_scope("request_entitlement");
-                return;
-            }
-            ClaudeRateLimitScope::ShareModel { until, reason } => {
-                crate::metrics::record_claude_rate_limit_scope("share_model");
-                if let (Some(share_id), Some(model)) = (
-                    share_id.map(str::trim).filter(|value| !value.is_empty()),
-                    model.map(str::trim).filter(|value| !value.is_empty()),
-                ) {
-                    state.mark_share_model_cooldown(
-                        share_id,
-                        &execution.plan.runtime_fingerprint,
-                        model,
+        let effects = classify_claude_rate_limit(
+            headers,
+            body,
+            model.is_some_and(is_claude_fable_5_model),
+            now,
+        );
+        if effects.request_entitlement {
+            crate::metrics::record_claude_rate_limit_scope("request_entitlement");
+            return;
+        }
+        let identity = execution.managed_account_identity_target();
+        if let Some(until) = effects.fable_pool_until {
+            crate::metrics::record_claude_rate_limit_scope("fable_pool");
+            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
+                state
+                    .mark_account_capacity_pool_limit_if_current(
+                        account_id,
+                        provider_type,
+                        auth_identity_generation,
+                        CLAUDE_FABLE_CAPACITY_POOL,
                         until,
-                        reason,
                         now,
-                    );
-                }
-                return;
+                        "Anthropic Fable 7d_oi capacity pool is exhausted",
+                        Some(1.0),
+                        "anthropic_ratelimit_7d_oi",
+                    )
+                    .await;
             }
-            ClaudeRateLimitScope::AccountUnified { until } => {
-                crate::metrics::record_claude_rate_limit_scope("account_unified");
-                let Some((provider_type, account_id, auth_identity_generation)) =
-                    execution.managed_account_identity_target()
-                else {
-                    return;
-                };
+            if let (Some(share_id), Some(model)) = (
+                share_id.map(str::trim).filter(|value| !value.is_empty()),
+                model.map(str::trim).filter(|value| !value.is_empty()),
+            ) {
+                state.mark_share_model_cooldown(
+                    share_id,
+                    &execution.plan.runtime_fingerprint,
+                    model,
+                    until,
+                    "anthropic_fable_7d_oi",
+                    now,
+                );
+            }
+        }
+        if let Some(until) = effects.account_unified_until {
+            crate::metrics::record_claude_rate_limit_scope("account_unified");
+            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
                 state
                     .mark_account_rate_limited_until_if_current(
                         account_id,
@@ -13035,9 +13409,25 @@ async fn maybe_mark_upstream_rate_limited(
                         )),
                     )
                     .await;
-                return;
             }
         }
+        if let Some((until, reason)) = effects.exact_model_until {
+            crate::metrics::record_claude_rate_limit_scope("share_model");
+            if let (Some(share_id), Some(model)) = (
+                share_id.map(str::trim).filter(|value| !value.is_empty()),
+                model.map(str::trim).filter(|value| !value.is_empty()),
+            ) {
+                state.mark_share_model_cooldown(
+                    share_id,
+                    &execution.plan.runtime_fingerprint,
+                    model,
+                    until,
+                    reason,
+                    now,
+                );
+            }
+        }
+        return;
     }
     if execution.stored.provider_type == ProviderType::CodexOAuth
         && !codex_account_rate_limit_evidence(headers, body)
@@ -13082,16 +13472,25 @@ async fn maybe_mark_upstream_rate_limited(
         .await;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeRateLimitScope {
-    AccountUnified { until: i64 },
-    ShareModel { until: i64, reason: &'static str },
-    RequestEntitlement,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeRateLimitEffects {
+    account_unified_until: Option<i64>,
+    fable_pool_until: Option<i64>,
+    exact_model_until: Option<(i64, &'static str)>,
+    request_entitlement: bool,
 }
 
-fn classify_claude_rate_limit(headers: &HeaderMap, body: &[u8], now: i64) -> ClaudeRateLimitScope {
+fn classify_claude_rate_limit(
+    headers: &HeaderMap,
+    body: &[u8],
+    fable_request: bool,
+    now: i64,
+) -> ClaudeRateLimitEffects {
     if claude_fast_credit_refusal(body) {
-        return ClaudeRateLimitScope::RequestEntitlement;
+        return ClaudeRateLimitEffects {
+            request_entitlement: true,
+            ..Default::default()
+        };
     }
     let unified = header_lower(headers, "anthropic-ratelimit-unified-status");
     let status_5h = header_lower(headers, "anthropic-ratelimit-unified-5h-status");
@@ -13099,6 +13498,7 @@ fn classify_claude_rate_limit(headers: &HeaderMap, body: &[u8], now: i64) -> Cla
     let status_7d_oi = header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status");
     let account_window_rejected =
         status_5h.as_deref() == Some("rejected") || status_7d.as_deref() == Some("rejected");
+    let mut effects = ClaudeRateLimitEffects::default();
     if account_window_rejected {
         let until = [
             "anthropic-ratelimit-unified-reset",
@@ -13110,44 +13510,44 @@ fn classify_claude_rate_limit(headers: &HeaderMap, body: &[u8], now: i64) -> Cla
         .chain(super::grok::retry_after_until_ms(headers, now))
         .max()
         .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
-        return ClaudeRateLimitScope::AccountUnified {
-            until: super::bounded_upstream_rate_limit_until(now, until),
-        };
+        effects.account_unified_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
-    if status_7d_oi.as_deref() == Some("rejected") {
+    if fable_request && status_7d_oi.as_deref() == Some("rejected") {
         let until =
             parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-7d_oi-reset", now)
                 .or_else(|| super::grok::retry_after_until_ms(headers, now))
                 .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
-        return ClaudeRateLimitScope::ShareModel {
-            until: super::bounded_upstream_rate_limit_until(now, until),
-            reason: "anthropic_fable_7d_oi",
-        };
+        effects.fable_pool_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
-    if unified.as_deref() == Some("rejected") {
+    if effects.account_unified_until.is_none()
+        && effects.fable_pool_until.is_none()
+        && status_7d_oi.as_deref() != Some("rejected")
+        && unified.as_deref() == Some("rejected")
+    {
         let until = parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-reset", now)
             .or_else(|| super::grok::retry_after_until_ms(headers, now))
             .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
-        return ClaudeRateLimitScope::AccountUnified {
-            until: super::bounded_upstream_rate_limit_until(now, until),
-        };
+        effects.account_unified_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
-    let retry_after = super::grok::retry_after_until_ms(headers, now);
-    ClaudeRateLimitScope::ShareModel {
-        until: super::bounded_upstream_rate_limit_until(
-            now,
-            retry_after
-                .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
-        ),
-        reason: if retry_after.is_some() {
-            "anthropic_model_rate_limit"
-        } else {
-            "anthropic_unknown_429"
-        },
+    if effects.account_unified_until.is_none() && effects.fable_pool_until.is_none() {
+        let retry_after = super::grok::retry_after_until_ms(headers, now);
+        effects.exact_model_until = Some((
+            super::bounded_upstream_rate_limit_until(
+                now,
+                retry_after
+                    .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
+            ),
+            if retry_after.is_some() {
+                "anthropic_model_rate_limit"
+            } else {
+                "anthropic_unknown_429"
+            },
+        ));
     }
+    effects
 }
 
 fn header_lower(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -13712,6 +14112,262 @@ fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
     None
 }
 
+struct WebSessionForwardOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    route: ProxyRoute,
+    body: Bytes,
+    request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+fn web_session_requested_model(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .filter(|model| !model.is_empty())
+}
+
+#[allow(clippy::too_many_arguments)] // Failure accounting carries the fixed request/model context.
+async fn finish_web_session_failure(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request_context: &UsageLogContext,
+    started: Instant,
+    requested_model: Option<String>,
+    actual_model: Option<String>,
+    upstream_attempted: bool,
+    error: ProxyError,
+) -> Result<Response, ProxyError> {
+    let provider_failure = upstream_attempted
+        && matches!(
+            error.status,
+            StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::GATEWAY_TIMEOUT
+        );
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        UsageModelMetadata {
+            model: actual_model.clone().or_else(|| requested_model.clone()),
+            requested_model,
+            actual_model,
+            actual_model_source: Some("reviewed_web_session_catalog".to_string()),
+        },
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: request_context.is_streaming,
+            stream_status: request_context.is_streaming.then(|| {
+                if upstream_attempted {
+                    "upstream_error"
+                } else {
+                    "rejected"
+                }
+                .to_string()
+            }),
+            usage_state: Some(if upstream_attempted {
+                UsageState::Missing
+            } else {
+                UsageState::NotApplicable
+            }),
+            outcome: Some(if upstream_attempted {
+                UsageOutcome::from_status(error.status.as_u16())
+            } else {
+                UsageOutcome::ClientError
+            }),
+            failure_kind: Some(error.error_code().to_string()),
+            error_message: Some(error.client_message().to_string()),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        TokenUsage::default(),
+    )
+    .await;
+    if provider_failure {
+        record_provider_outcome(
+            state,
+            stored,
+            provider_outcome_from_status(error.status.as_u16()),
+        )
+        .await;
+    }
+    Err(error)
+}
+
+async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Response, ProxyError> {
+    let WebSessionForwardOptions {
+        state,
+        execution,
+        stored,
+        route,
+        body,
+        mut request_context,
+        account_in_flight_guard: _account_in_flight_guard,
+        share_invocation_guard: _share_invocation_guard,
+        started,
+    } = options;
+    if !matches!(
+        route,
+        ProxyRoute::ClaudeMessages
+            | ProxyRoute::ClaudeCountTokens
+            | ProxyRoute::CodexChatCompletions
+            | ProxyRoute::CodexResponses
+    ) {
+        return finish_web_session_failure(
+            &state,
+            &stored,
+            &request_context,
+            started,
+            web_session_requested_model(&body),
+            None,
+            false,
+            ProxyError::bad_request(
+                "Web Session Drivers support only Messages/count_tokens, Chat Completions, and Responses text routes",
+            ),
+        )
+        .await;
+    }
+
+    let requested_model = web_session_requested_model(&body);
+    request_context.is_streaming = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let actual_model = match super::web_session::preflight_actual_model(&execution, route, &body) {
+        Ok(model) => model,
+        Err(error) => {
+            return finish_web_session_failure(
+                &state,
+                &stored,
+                &request_context,
+                started,
+                requested_model,
+                None,
+                false,
+                error,
+            )
+            .await
+        }
+    };
+    if let Err(error) = ensure_share_model_available(
+        &state,
+        &execution,
+        request_context.share_id.as_deref(),
+        Some(&actual_model),
+    )
+    .await
+    {
+        return finish_web_session_failure(
+            &state,
+            &stored,
+            &request_context,
+            started,
+            requested_model,
+            Some(actual_model),
+            false,
+            error,
+        )
+        .await;
+    }
+
+    let result = match super::web_session::execute(&state, &execution, route, body).await {
+        Ok(result) => result,
+        Err(error) => {
+            return finish_web_session_failure(
+                &state,
+                &stored,
+                &request_context,
+                started,
+                requested_model,
+                Some(actual_model),
+                true,
+                error,
+            )
+            .await
+        }
+    };
+    let usage = TokenUsage {
+        raw_input_tokens: Some(result.input_tokens),
+        input_tokens: Some(result.input_tokens),
+        output_tokens: Some(result.output_tokens),
+        total_tokens: Some(result.input_tokens.saturating_add(result.output_tokens)),
+        ..TokenUsage::default()
+    };
+    log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        UsageModelMetadata {
+            model: Some(result.actual_model.clone()),
+            requested_model: Some(result.requested_model.clone()),
+            actual_model: Some(result.actual_model.clone()),
+            actual_model_source: result
+                .actual_model_source
+                .clone()
+                .or_else(|| Some("reviewed_web_session_catalog".to_string())),
+        },
+        usage,
+        UsageLogContext {
+            is_streaming: result.stream_requested,
+            stream_status: result.stream_requested.then(|| "completed".to_string()),
+            usage_state: Some(UsageState::Observed),
+            usage_estimated: true,
+            outcome: Some(UsageOutcome::Success),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    if !result.local_only {
+        record_provider_outcome(
+            &state,
+            &stored,
+            provider_outcome_from_status(result.upstream_status),
+        )
+        .await;
+    }
+
+    let mut response = Response::new(Body::from(result.downstream_body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(result.downstream_content_type),
+    );
+    if result.stream_requested {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-transform"),
+        );
+    }
+    Ok(response)
+}
+
 struct QoderForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -14022,7 +14678,9 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         &execution,
         request_context.share_id.as_deref(),
         Some(&model_key),
-    ) {
+    )
+    .await
+    {
         return qoder_fail_before_commit(
             &state,
             &stored,
@@ -15027,9 +15685,9 @@ async fn forward_claude_deepseek(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let prompt = deepseek::build_prompt(&request_body)?;
     let input_tokens = deepseek::estimate_billable_user_input_tokens(&request_body);
-    let deepseek_model = deepseek::map_model(&routed_model);
+    let deepseek_model = deepseek::resolve_model(&routed_model)?;
+    let prepared = deepseek::prepare_request(&request_body, &deepseek_model)?;
     let model_metadata = routed_model_metadata(
         &response_model,
         &deepseek_model,
@@ -15049,8 +15707,35 @@ async fn forward_claude_deepseek(
             )
         })?;
     debug_assert_eq!(provider_type, ProviderType::DeepSeekAccount);
+    let share_id = request_context
+        .share_id
+        .as_deref()
+        .ok_or_else(|| ProxyError::unauthorized("DeepSeek Web requires signed Share ingress"))?;
+    let user_identity = request_context
+        .user_email
+        .as_deref()
+        .unwrap_or("share-owner");
+    let client_session_id = request_context
+        .session_id
+        .clone()
+        .or_else(|| request_context.request_id.clone())
+        .unwrap_or_else(deepseek::request_scoped_session_id);
     let upstream = state
-        .start_deepseek_chat_completion(account_id, expected_generation, &deepseek_model, &prompt)
+        .start_deepseek_chat_completion(
+            stored.app,
+            &stored.provider.id,
+            stored.resource.revision,
+            &execution.plan.runtime_fingerprint,
+            account_id,
+            expected_generation,
+            share_id,
+            user_identity,
+            &client_session_id,
+            &deepseek_model,
+            &prepared.prompt,
+            prepared.thinking_enabled,
+            prepared.search_enabled,
+        )
         .await
         .map_err(deepseek_upstream_error_to_proxy_error)?;
     let status = upstream.status();
@@ -15096,11 +15781,33 @@ async fn forward_claude_deepseek(
         .await;
         let share_id = request_context.share_id.clone();
         let user_email = request_context.user_email.clone();
-        let sse_stream = deepseek::deepseek_bytes_stream_to_claude_sse(
-            upstream.bytes_stream(),
-            response_model,
-            input_tokens,
-        );
+        let sse_stream: BoxStream<'static, Result<Bytes, std::io::Error>> = if prepared.has_tools()
+        {
+            let collected = deepseek::collect_deepseek_response(
+                upstream.bytes_stream(),
+                prepared.thinking_enabled,
+            )
+            .await?;
+            let collected = deepseek::finalize_collected_response(collected, &prepared)?;
+            stream::iter(
+                deepseek::collected_response_to_claude_sse(
+                    &collected,
+                    &response_model,
+                    input_tokens,
+                )
+                .into_iter()
+                .map(Ok),
+            )
+            .boxed()
+        } else {
+            deepseek::deepseek_bytes_stream_to_claude_sse(
+                upstream.bytes_stream(),
+                response_model,
+                input_tokens,
+                prepared.thinking_enabled,
+            )
+            .boxed()
+        };
         let stream = async_stream::stream! {
             let _account_in_flight_guard = account_in_flight_guard;
             let _share_invocation_guard = share_invocation_guard;
@@ -15186,11 +15893,13 @@ async fn forward_claude_deepseek(
         return Ok(response);
     }
 
-    let body_text = upstream.text().await.unwrap_or_default();
-    let text = deepseek::collect_text_from_sse_body(&body_text);
-    let output_tokens = deepseek::estimate_tokens(&text);
-    let message =
-        deepseek::claude_message_json(&text, &response_model, input_tokens, output_tokens);
+    let collected =
+        deepseek::collect_deepseek_response(upstream.bytes_stream(), prepared.thinking_enabled)
+            .await?;
+    let collected = deepseek::finalize_collected_response(collected, &prepared)?;
+    let message = deepseek::claude_message_json(&collected, &response_model, input_tokens);
+    let output_tokens =
+        deepseek::estimate_tokens(&format!("{}{}", collected.thinking, collected.content));
     let bytes =
         serde_json::to_vec(&message).map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
     let usage = TokenUsage {
@@ -15242,7 +15951,20 @@ fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> Proxy
             status: StatusCode::UNAUTHORIZED,
             message: "deepseek account access token is missing".to_string(),
         },
-        DeepSeekUpstreamError::Client(message) => ProxyError::bad_gateway(message),
+        DeepSeekUpstreamError::Network { operation, message } => {
+            ProxyError::bad_gateway(format!("DeepSeek {operation} network error: {message}"))
+        }
+        DeepSeekUpstreamError::Upstream {
+            operation,
+            status_code,
+            message,
+        } => ProxyError {
+            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: format!("DeepSeek {operation} returned HTTP {status_code}: {message}"),
+        },
+        DeepSeekUpstreamError::Protocol { operation, message } => {
+            ProxyError::bad_gateway(format!("DeepSeek {operation} protocol error: {message}"))
+        }
     }
 }
 
@@ -15260,6 +15982,20 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         share_invocation_guard,
         started,
     } = options;
+    let expected_provider_type = stored.provider_type;
+    if !matches!(
+        expected_provider_type,
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
+    ) {
+        return Err(ProxyError::bad_request(
+            "CodeWhisperer driver requires kiro_oauth or amazon_q_oauth Provider",
+        ));
+    }
+    let product_label = if expected_provider_type == ProviderType::AmazonQOAuth {
+        "Amazon Q"
+    } else {
+        "Kiro"
+    };
     let mut audit_attempt = ForwardAttemptContext::default();
     let adapter = adapters::adapter_for(route.app(), stored.provider_type);
     let copilot_metadata = adapters::CopilotRequestMetadata {
@@ -15275,7 +16011,9 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     )?;
     execution.enforce_model_policy(&mut runtime_request)?;
     let request_body: Value = serde_json::from_slice(&runtime_request.body).map_err(|error| {
-        ProxyError::bad_request(format!("invalid Kiro canonical request body: {error}"))
+        ProxyError::bad_request(format!(
+            "invalid {product_label} canonical request body: {error}"
+        ))
     })?;
     let mut request_context = request_context;
     if request_context.session_id.is_none() {
@@ -15293,7 +16031,9 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .clone()
         .unwrap_or_else(|| routed_model.clone());
     let actual_model = kiro::resolve_model(&routed_model).ok_or_else(|| {
-        ProxyError::bad_request(format!("Kiro model identifier is invalid: {routed_model}"))
+        ProxyError::bad_request(format!(
+            "{product_label} model identifier is invalid: {routed_model}"
+        ))
     })?;
     let stream_requested = runtime_request.stream_requested;
 
@@ -15312,7 +16052,11 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
 
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
     let http_client = forward_http_client(&state, &stored).await?;
-    let ide_version = state.kiro_ide_version().await;
+    let ide_version = if expected_provider_type == ProviderType::KiroOAuth {
+        state.kiro_ide_version().await
+    } else {
+        "amazon-q-cli".to_string()
+    };
     let claude_code_tools = route == ProxyRoute::ClaudeMessages
         && (headers
             .get("x-app")
@@ -15329,15 +16073,39 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         execution.materialize_auth(&accounts)?;
         let account_id = execution
             .managed_account_target()
-            .filter(|(provider_type, _)| *provider_type == ProviderType::KiroOAuth)
+            .filter(|(provider_type, _)| *provider_type == expected_provider_type)
             .map(|(_, account_id)| account_id)
             .ok_or_else(|| {
-                ProxyError::bad_request("kiro_oauth managed account binding is required")
+                ProxyError::bad_request(format!(
+                    "{} managed account binding is required",
+                    expected_provider_type.as_str()
+                ))
             })?;
+        let expected_auth_identity_generation = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id: bound_account_id,
+                expected_provider_type: bound_provider_type,
+                auth_identity_generation,
+            } if bound_account_id == account_id
+                && *bound_provider_type == expected_provider_type =>
+            {
+                *auth_identity_generation
+            }
+            _ => {
+                return Err(ProxyError::conflict(format!(
+                    "{product_label} runtime account binding changed before model discovery"
+                )))
+            }
+        };
         let account = accounts
-            .find_for_provider(ProviderType::KiroOAuth, Some(account_id))
+            .find_for_provider(expected_provider_type, Some(account_id))
             .cloned()
-            .ok_or_else(|| ProxyError::not_found("kiro_oauth managed account not found"))?;
+            .ok_or_else(|| {
+                ProxyError::not_found(format!(
+                    "{} managed account not found",
+                    expected_provider_type.as_str()
+                ))
+            })?;
         let replay_allowed = account
             .refresh_token
             .as_deref()
@@ -15346,17 +16114,40 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         let models_endpoint_override = execution
             .plan
             .driver_options
-            .get("testKiroModelsUrl")
+            .get(if expected_provider_type == ProviderType::AmazonQOAuth {
+                "testAmazonQModelsUrl"
+            } else {
+                "testKiroModelsUrl"
+            })
             .and_then(Value::as_str);
         #[cfg(not(test))]
         let models_endpoint_override: Option<&str> = None;
         #[cfg(test)]
         let catalog_model = if models_endpoint_override.is_none() {
             Some((actual_model.clone(), None))
+        } else if expected_provider_type == ProviderType::AmazonQOAuth {
+            state
+                .amazon_q_catalog_model(
+                    stored.app,
+                    &stored.provider.id,
+                    execution.plan.provider_revision,
+                    &execution.plan.runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                    &actual_model,
+                    models_endpoint_override,
+                    execution.request_timeout(),
+                )
+                .await
         } else {
             state
                 .kiro_catalog_model(
-                    &account,
+                    stored.app,
+                    &stored.provider.id,
+                    execution.plan.provider_revision,
+                    &execution.plan.runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
                     &actual_model,
                     models_endpoint_override,
                     execution.request_timeout(),
@@ -15364,28 +16155,38 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 .await
         };
         #[cfg(not(test))]
-        let catalog_model = match state
-            .kiro_cached_catalog_model(&account, &actual_model)
-            .await
-        {
-            Some(authoritative) => authoritative,
-            None if kiro::static_model_context_window(&actual_model).is_some() => {
-                Some((actual_model.clone(), None))
-            }
-            None => {
-                state
-                    .kiro_catalog_model(
-                        &account,
-                        &actual_model,
-                        models_endpoint_override,
-                        execution.request_timeout(),
-                    )
-                    .await
-            }
+        let catalog_model = if expected_provider_type == ProviderType::AmazonQOAuth {
+            state
+                .amazon_q_catalog_model(
+                    stored.app,
+                    &stored.provider.id,
+                    execution.plan.provider_revision,
+                    &execution.plan.runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                    &actual_model,
+                    models_endpoint_override,
+                    execution.request_timeout(),
+                )
+                .await
+        } else {
+            state
+                .kiro_catalog_model(
+                    stored.app,
+                    &stored.provider.id,
+                    execution.plan.provider_revision,
+                    &execution.plan.runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                    &actual_model,
+                    models_endpoint_override,
+                    execution.request_timeout(),
+                )
+                .await
         };
         let (catalog_model_id, catalog_max_input_tokens) = catalog_model.ok_or_else(|| {
             ProxyError::bad_request(format!(
-                "Kiro model is not available to the bound account: {actual_model}"
+                "{product_label} model is not available to the bound account: {actual_model}"
             ))
         })?;
         let cache_session = request_context
@@ -15471,9 +16272,10 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 let Some((provider_type, account_id, expected_generation)) =
                     execution.managed_account_identity_target()
                 else {
-                    return Err(ProxyError::bad_request(
-                        "kiro_oauth provider is missing a managed account binding",
-                    ));
+                    return Err(ProxyError::bad_request(format!(
+                        "{} provider is missing a managed account binding",
+                        expected_provider_type.as_str()
+                    )));
                 };
                 if let Err(error) = state
                     .refresh_managed_account_now_for_generation(
@@ -16090,14 +16892,21 @@ fn routed_model_metadata(
 fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
     #[cfg(test)]
     {
-        setting(
-            &stored.provider,
-            &[
-                "KIRO_API_BASE_URL",
-                "KIRO_BASE_URL",
-                "CODEWHISPERER_BASE_URL",
-            ],
-        )
+        if stored.provider_type == ProviderType::AmazonQOAuth {
+            setting(
+                &stored.provider,
+                &["AMAZON_Q_API_BASE_URL", "AMAZON_Q_BASE_URL"],
+            )
+        } else {
+            setting(
+                &stored.provider,
+                &[
+                    "KIRO_API_BASE_URL",
+                    "KIRO_BASE_URL",
+                    "CODEWHISPERER_BASE_URL",
+                ],
+            )
+        }
     }
     #[cfg(not(test))]
     {
@@ -17563,9 +18372,10 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
                 app
             }
         }
-        ProviderType::GitHubCopilot | ProviderType::DeepSeekAccount | ProviderType::KiroOAuth => {
-            app
-        }
+        ProviderType::GitHubCopilot
+        | ProviderType::DeepSeekAccount
+        | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth => app,
         ProviderType::AwsBedrock => AppKind::Claude,
         ProviderType::Nvidia | ProviderType::DeepSeekApi => {
             if app == AppKind::Gemini {
@@ -17746,6 +18556,8 @@ struct ResponsesImageJsonHeartbeatArgs {
     status_code: u16,
     response_headers: HeaderMap,
     timeout: Duration,
+    first_event_deadline: Option<tokio::time::Instant>,
+    first_event_timeout: Option<Duration>,
     keepalive_interval: Duration,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
@@ -17764,6 +18576,8 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
         status_code,
         response_headers,
         timeout,
+        first_event_deadline,
+        first_event_timeout,
         keepalive_interval,
         account_in_flight_guard,
         share_invocation_guard,
@@ -17784,7 +18598,12 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
         transport.emit(false);
         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"\n"));
 
-        let aggregation = aggregate_openai_responses_upstream(&mut upstream, timeout);
+        let aggregation = aggregate_openai_responses_upstream(
+            &mut upstream,
+            timeout,
+            first_event_deadline,
+            first_event_timeout,
+        );
         tokio::pin!(aggregation);
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + keepalive_interval,
@@ -18037,6 +18856,37 @@ struct OpenAiResponsesAggregationFailure {
 }
 
 impl OpenAiResponsesAggregationFailure {
+    fn from_synthesized_error_frame(
+        failure: SemanticFailure,
+        usage: TokenUsage,
+        saw_business_output: bool,
+    ) -> Self {
+        let (status, stream_status, provider_outcome) = match failure.origin {
+            FailureOrigin::Client => (StatusCode::BAD_REQUEST, "client_error", None),
+            FailureOrigin::Provider => (
+                StatusCode::BAD_GATEWAY,
+                "provider_failed",
+                Some(if is_openai_capacity_shed_failure(&failure) {
+                    capacity_shed_provider_outcome()
+                } else {
+                    ProviderOutcome::Failure { status_code: 502 }
+                }),
+            ),
+        };
+        Self {
+            error: ProxyError {
+                status,
+                message: failure.display_message(),
+            },
+            usage,
+            usage_state: observed_or_missing_usage_state(usage),
+            stream_status,
+            provider_outcome,
+            semantic_failure: Some(failure),
+            saw_business_output,
+        }
+    }
+
     fn from_aggregation_error(
         error: ResponsesSseAggregationError,
         usage: TokenUsage,
@@ -18102,6 +18952,50 @@ impl OpenAiResponsesAggregationFailure {
             saw_business_output: false,
         }
     }
+
+    fn from_semantic_protocol_error(
+        error: SemanticProtocolError,
+        usage: TokenUsage,
+        semantic_terminal: Option<SemanticTerminal>,
+        saw_business_output: bool,
+    ) -> Self {
+        let (status, usage_state, stream_status) = if error.is_capacity() {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                observed_or_missing_usage_state(usage),
+                "aggregate_too_large",
+            )
+        } else if error.is_missing_terminal() {
+            (
+                StatusCode::BAD_GATEWAY,
+                observed_or_missing_usage_state(usage),
+                "missing_terminal",
+            )
+        } else {
+            (
+                StatusCode::BAD_GATEWAY,
+                UsageState::ParseError,
+                "protocol_error",
+            )
+        };
+        Self {
+            error: ProxyError {
+                status,
+                message: error.to_string(),
+            },
+            usage,
+            usage_state,
+            stream_status,
+            provider_outcome: Some(ProviderOutcome::Failure {
+                status_code: status.as_u16(),
+            }),
+            semantic_failure: match semantic_terminal {
+                Some(SemanticTerminal::Failure(failure)) => Some(failure),
+                _ => None,
+            },
+            saw_business_output,
+        }
+    }
 }
 
 fn observed_or_missing_usage_state(usage: TokenUsage) -> UsageState {
@@ -18151,12 +19045,18 @@ async fn record_openai_responses_aggregation_failure(
 async fn aggregate_openai_responses_upstream(
     response: &mut reqwest::Response,
     timeout: Duration,
+    mut first_event_deadline: Option<tokio::time::Instant>,
+    first_event_timeout: Option<Duration>,
 ) -> Result<super::streaming::ResponsesSseAggregation, OpenAiResponsesAggregationFailure> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let overall_deadline = tokio::time::Instant::now() + timeout;
     let mut aggregator = ResponsesSseAggregator::new();
     let mut semantics = ResponsesSseInspector::default();
     let mut usage = StreamUsageAccumulator::new(InputTokenSemantics::Inclusive);
     loop {
+        let deadline = first_event_deadline
+            .map(|first| first.min(overall_deadline))
+            .unwrap_or(overall_deadline);
+        let awaiting_first_event = first_event_deadline.is_some();
         let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
             Ok(Ok(chunk)) => chunk,
             Ok(Err(error)) => {
@@ -18170,22 +19070,73 @@ async fn aggregate_openai_responses_upstream(
                 return Err(OpenAiResponsesAggregationFailure::interrupted(
                     ProxyError {
                         status: StatusCode::GATEWAY_TIMEOUT,
-                        message: format!(
-                            "OpenAI Responses aggregation timed out after {}ms",
-                            timeout.as_millis()
-                        ),
+                        message: if awaiting_first_event {
+                            format!(
+                                "OpenAI Responses first event timeout after {}ms",
+                                first_event_timeout.unwrap_or(timeout).as_millis()
+                            )
+                        } else {
+                            format!(
+                                "OpenAI Responses aggregation timed out after {}ms",
+                                timeout.as_millis()
+                            )
+                        },
                     },
                     usage.finish(),
-                    "timeout",
+                    if awaiting_first_event {
+                        "first_event_timeout"
+                    } else {
+                        "timeout"
+                    },
                 ));
             }
         };
         let Some(chunk) = chunk else {
             break;
         };
-        usage.push(&chunk);
-        let _ = semantics.push(&chunk);
-        if let Err(error) = aggregator.push(&chunk) {
+        let batch = match semantics.push_normalized(&chunk) {
+            Ok(batch) => batch,
+            Err(error) => {
+                crate::metrics::record_responses_sse_transport(
+                    "responses_aggregation",
+                    "protocol_error",
+                );
+                return Err(
+                    OpenAiResponsesAggregationFailure::from_semantic_protocol_error(
+                        error,
+                        usage.finish(),
+                        semantics.terminal().cloned(),
+                        semantics.saw_business(),
+                    ),
+                );
+            }
+        };
+        batch.record_transport_metrics("responses_aggregation");
+        if batch
+            .observations
+            .iter()
+            .any(SemanticObservation::commits_downstream)
+        {
+            first_event_deadline = None;
+        }
+        usage.push(&batch.normalized);
+        if let Some(failure) = semantics
+            .terminal()
+            .and_then(|terminal| match terminal {
+                SemanticTerminal::Failure(_) => semantics.synthesized_failure_from_error_frame(),
+                SemanticTerminal::Success | SemanticTerminal::Incomplete => None,
+            })
+            .cloned()
+        {
+            return Err(
+                OpenAiResponsesAggregationFailure::from_synthesized_error_frame(
+                    failure,
+                    usage.finish(),
+                    semantics.saw_business(),
+                ),
+            );
+        }
+        if let Err(error) = aggregator.push(&batch.normalized) {
             return Err(OpenAiResponsesAggregationFailure::from_aggregation_error(
                 error,
                 usage.finish(),
@@ -18197,7 +19148,33 @@ async fn aggregate_openai_responses_upstream(
             break;
         }
     }
-    let _ = semantics.finish();
+    let tail = match semantics.finish_normalized() {
+        Ok(batch) => batch,
+        Err(error) => {
+            crate::metrics::record_responses_sse_transport(
+                "responses_aggregation",
+                "protocol_error",
+            );
+            return Err(
+                OpenAiResponsesAggregationFailure::from_semantic_protocol_error(
+                    error,
+                    usage.finish(),
+                    semantics.terminal().cloned(),
+                    semantics.saw_business(),
+                ),
+            );
+        }
+    };
+    tail.record_transport_metrics("responses_aggregation");
+    usage.push(&tail.normalized);
+    if let Err(error) = aggregator.push(&tail.normalized) {
+        return Err(OpenAiResponsesAggregationFailure::from_aggregation_error(
+            error,
+            usage.finish(),
+            semantics.terminal().cloned(),
+            semantics.saw_business(),
+        ));
+    }
     aggregator.finish().map_err(|error| {
         OpenAiResponsesAggregationFailure::from_aggregation_error(
             error,
@@ -19043,6 +20020,11 @@ async fn prepare_kimi_thinking_replay(
     if provider_type != ProviderType::KimiCode {
         return None;
     }
+    let account = state
+        .find_account_for_provider(ProviderType::KimiCode, account_id)
+        .await
+        .filter(|account| account.auth_identity_generation == auth_identity_generation)?;
+    let token_refresh_generation = account.token_refresh_generation;
     let scope = KimiThinkingReplayScope::derive(
         execution.plan.provider_key.app.as_str(),
         &execution.stored.provider.id,
@@ -19050,6 +20032,7 @@ async fn prepare_kimi_thinking_replay(
         &execution.plan.runtime_fingerprint,
         account_id,
         auth_identity_generation,
+        token_refresh_generation,
         share_id,
         &user_namespace,
         session_id,
@@ -19064,7 +20047,12 @@ async fn prepare_kimi_thinking_replay(
         if let Some(restored) = restore_kimi_thinking_replay_content(body, &cached) {
             *body = restored;
             replay_applied = true;
+            crate::metrics::record_kimi_thinking_replay("hit", 1);
+        } else {
+            crate::metrics::record_kimi_thinking_replay("content_mismatch", 1);
         }
+    } else {
+        crate::metrics::record_kimi_thinking_replay("miss", 1);
     }
     Some(KimiThinkingReplayWriteContext {
         scope,
@@ -19076,6 +20064,7 @@ async fn prepare_kimi_thinking_replay(
         runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
         account_id: account_id.to_string(),
         auth_identity_generation,
+        token_refresh_generation,
         share_id: share_id.to_string(),
     })
 }
@@ -19087,6 +20076,7 @@ async fn clear_rejected_kimi_thinking_replay(
     let Some(context) = context.filter(|context| context.replay_applied) else {
         return;
     };
+    crate::metrics::record_kimi_thinking_replay("upstream_rejected", 1);
     state
         .kimi_thinking_replays
         .delete_if_unchanged(&context.scope, context.snapshot)
@@ -19112,7 +20102,7 @@ async fn commit_kimi_thinking_replay(
     }
     match content {
         Some(content) if super::kimi_runtime::valid_replay_content(&content) => {
-            state
+            let stored = state
                 .kimi_thinking_replays
                 .replace_if_unchanged(
                     context.scope.clone(),
@@ -19121,8 +20111,13 @@ async fn commit_kimi_thinking_replay(
                     kimi_replay_now_ms(),
                 )
                 .await;
+            crate::metrics::record_kimi_thinking_replay(
+                if stored { "stored" } else { "write_conflict" },
+                1,
+            );
         }
         Some(_) => {
+            crate::metrics::record_kimi_thinking_replay("invalid_content", 1);
             state
                 .kimi_thinking_replays
                 .delete_if_unchanged(&context.scope, context.snapshot)
@@ -19165,7 +20160,9 @@ async fn kimi_thinking_replay_binding_is_current(
     else {
         return false;
     };
-    if account.auth_identity_generation != context.auth_identity_generation {
+    if account.auth_identity_generation != context.auth_identity_generation
+        || account.token_refresh_generation != context.token_refresh_generation
+    {
         return false;
     }
     let shares = state.shares.read().await;
@@ -19216,6 +20213,7 @@ struct StreamForwardState {
     sse_error_detector: Option<ClaudeSseErrorDetector>,
     sse_error_outcome_recorded: bool,
     responses_semantics: Option<ResponsesSseInspector>,
+    normalize_responses_transport: bool,
     anthropic_semantics: Option<AnthropicSseInspector>,
     semantic_provider_outcome_recorded: bool,
     terminal_frame_sent: bool,
@@ -19286,6 +20284,7 @@ struct KimiThinkingReplayWriteContext {
     runtime_fingerprint: String,
     account_id: String,
     auth_identity_generation: u64,
+    token_refresh_generation: u64,
     share_id: String,
 }
 
@@ -19630,6 +20629,12 @@ impl StreamForwardState {
         error: ProxyError,
     ) -> Result<Option<(Bytes, Self)>, std::io::Error> {
         let message = error.client_message().to_string();
+        let stream_status =
+            if stream_error_code_and_message(&message).0 == "upstream_stream_protocol_error" {
+                "protocol_error"
+            } else {
+                "transform_error"
+            };
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
         let usage = usage_result.usage;
         let status = error.status.as_u16();
@@ -19641,7 +20646,7 @@ impl StreamForwardState {
             self.started.elapsed().as_millis(),
             self.first_token_ms,
             usage_result,
-            Some("transform_error"),
+            Some(stream_status),
         )
         .await;
         update_terminal_usage_error(&self.state, &self.request_id, message.clone()).await;
@@ -19661,10 +20666,7 @@ impl StreamForwardState {
         )
         .await;
         if self.stored.provider_type == ProviderType::ClaudeOAuth {
-            crate::metrics::record_claude_stream_duration(
-                "transform_error",
-                self.started.elapsed(),
-            );
+            crate::metrics::record_claude_stream_duration(stream_status, self.started.elapsed());
         }
         self.terminal_usage_published = true;
         self.interrupted_update_armed
@@ -20952,7 +21954,7 @@ fn stream_terminal_error_frame(
     match route {
         ProxyRoute::CodexResponses | ProxyRoute::CodexResponsesCompact => {
             Some(Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\ndata: [DONE]\n\n",
+                "event: response.failed\ndata: {}\n\n",
                 json!({
                     "type": "response.failed",
                     "response": {
@@ -20981,6 +21983,28 @@ fn stream_terminal_error_frame(
 }
 
 fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("upstream stream") && normalized.contains("timeout") {
+        return ("upstream_stream_timeout", message);
+    }
+    if normalized.contains("upstream stream error")
+        || normalized.contains("stream disconnected")
+        || normalized.contains("connection reset")
+    {
+        return ("upstream_stream_break", message);
+    }
+    if normalized.contains("responses sse")
+        || normalized.contains("responses json")
+        || normalized.contains("responses pending json")
+        || normalized.contains("responses stream ended")
+        || normalized.contains("responses stream emitted")
+        || normalized.contains("responses undecided transport")
+        || normalized.contains("responses content output repeat limit")
+        || normalized.contains("responses reasoning output repeat limit")
+        || normalized.contains("terminal event exceeded")
+    {
+        return ("upstream_stream_protocol_error", message);
+    }
     for (prefix, code) in [
         ("[TOOL_JSON_INVALID] ", "TOOL_JSON_INVALID"),
         ("[TOOL_JSON_INCOMPLETE] ", "TOOL_JSON_INCOMPLETE"),
@@ -21034,12 +22058,9 @@ mod tests {
             "anthropic-ratelimit-unified-5h-reset",
             HeaderValue::from_static("1700003600"),
         );
-        assert!(matches!(
-            classify_claude_rate_limit(&headers, b"{}", now),
-            ClaudeRateLimitScope::AccountUnified {
-                until: 1_700_003_600_000
-            }
-        ));
+        let effects = classify_claude_rate_limit(&headers, b"{}", false, now);
+        assert_eq!(effects.account_unified_until, Some(1_700_003_600_000));
+        assert!(effects.fable_pool_until.is_none());
 
         headers.insert(
             "anthropic-ratelimit-unified-status",
@@ -21051,13 +22072,9 @@ mod tests {
         );
         headers.remove("anthropic-ratelimit-unified-5h-status");
         headers.remove("anthropic-ratelimit-unified-7d-status");
-        assert!(matches!(
-            classify_claude_rate_limit(&headers, b"{}", now),
-            ClaudeRateLimitScope::ShareModel {
-                reason: "anthropic_fable_7d_oi",
-                ..
-            }
-        ));
+        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
+        assert!(effects.account_unified_until.is_none());
+        assert!(effects.fable_pool_until.is_some());
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -21072,21 +22089,26 @@ mod tests {
             "anthropic-ratelimit-unified-7d_oi-status",
             HeaderValue::from_static("rejected"),
         );
-        assert!(matches!(
-            classify_claude_rate_limit(&headers, b"{}", now),
-            ClaudeRateLimitScope::ShareModel {
-                reason: "anthropic_fable_7d_oi",
-                ..
-            }
-        ));
+        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
+        assert!(effects.account_unified_until.is_none());
+        assert!(effects.fable_pool_until.is_some());
 
-        assert_eq!(
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            HeaderValue::from_static("rejected"),
+        );
+        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
+        assert!(effects.account_unified_until.is_some());
+        assert!(effects.fable_pool_until.is_some());
+
+        assert!(
             classify_claude_rate_limit(
                 &HeaderMap::new(),
                 br#"{"error":{"message":"Fast request rejected: usage credits are required"}}"#,
+                true,
                 now,
-            ),
-            ClaudeRateLimitScope::RequestEntitlement
+            )
+            .request_entitlement
         );
     }
 
@@ -22492,6 +23514,90 @@ mod tests {
         }
     }
 
+    async fn install_deepseek_forwarder_test_provider(
+        state: &ServerState,
+        fixture: &str,
+        api_base: String,
+    ) -> (String, String) {
+        let bound_account_id = format!("{fixture}-bound-account");
+        let distractor_account_id = format!("{fixture}-distractor-account");
+        let bound_for_store = bound_account_id.clone();
+        let distractor_for_store = distractor_account_id.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for (id, token) in [
+                    (distractor_for_store, "distractor-deepseek-token"),
+                    (bound_for_store, "bound-deepseek-token"),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "deepseek_account",
+                            "accessToken": token,
+                            "raw": {"testDeepSeekApiBase": api_base}
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+
+        let provider_id = format!("{fixture}-provider");
+        let mut stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::DeepSeekAccount,
+            json!({"models":["configured-model-must-not-route"]}),
+            Some(&bound_account_id),
+        );
+        stored.provider.id = provider_id.clone();
+        stored.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse("claude.deepseek_account")
+                .unwrap(),
+        );
+        stored.resource.profile_schema_revision = Some(1);
+        stored.resource.revision = 1;
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        (provider_id, bound_account_id)
+    }
+
+    fn deepseek_forwarder_headers(share_id: &str, session_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        headers.insert(
+            "x-cc-switch-session-id",
+            HeaderValue::from_str(session_id).unwrap(),
+        );
+        headers
+    }
+
+    fn deepseek_forwarder_request(stream: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "model":"deepseek-v4-pro",
+                "max_tokens":64,
+                "stream":stream,
+                "thinking":{"type":"enabled","budget_tokens":1024},
+                "messages":[{"role":"user","content":"inspect"}]
+            })
+            .to_string(),
+        )
+    }
+
     fn share_image_generation_fixture(
         provider_type: ProviderType,
         codex_image_generation_enabled: Option<bool>,
@@ -22598,6 +23704,719 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    async fn install_web_session_forwarder_test_provider(
+        state: &ServerState,
+        app: AppKind,
+        driver: &str,
+        endpoint: String,
+        credential_generation: u64,
+    ) -> ProviderExecution {
+        let (profile_id, provider_type, cookie, upstream_model) = match (app, driver) {
+            (AppKind::Claude, "grok") => (
+                "claude.grok_web_session",
+                ProviderType::Claude,
+                "cf_clearance=clear-secret; sso=read-secret; sso-rw=write-secret",
+                "fast",
+            ),
+            (AppKind::Codex, "grok") => (
+                "codex.grok_web_session",
+                ProviderType::Codex,
+                "cf_clearance=clear-secret; sso=read-secret; sso-rw=write-secret",
+                "fast",
+            ),
+            (AppKind::Claude, "perplexity") => (
+                "claude.perplexity_web_session",
+                ProviderType::Claude,
+                "__Secure-next-auth.session-token.1=second; __Secure-next-auth.session-token.0=first",
+                "pplx-auto",
+            ),
+            (AppKind::Codex, "perplexity") => (
+                "codex.perplexity_web_session",
+                ProviderType::Codex,
+                "__Secure-next-auth.session-token.1=second; __Secure-next-auth.session-token.0=first",
+                "pplx-auto",
+            ),
+            _ => panic!("unsupported Web Session test fixture"),
+        };
+        let cookie = if credential_generation == 1 {
+            cookie.to_string()
+        } else if driver == "grok" {
+            format!("sso=read-secret-{credential_generation}; cf_clearance=clear-secret")
+        } else {
+            format!("__Secure-next-auth.session-token.0=rotated-{credential_generation}")
+        };
+        let provider_id = format!("web-session-{driver}-{}", app.as_str());
+        let stored = StoredProvider {
+            app,
+            provider: Provider {
+                id: provider_id,
+                name: format!("Web Session {driver} {}", app.as_str()),
+                settings_config: json!({
+                    "webSession": {"cookie": cookie},
+                    "modelMapping": {"mode": "single", "upstreamModel": upstream_model},
+                    "testRuntimeEndpoint": endpoint,
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some(provider_type.as_str().to_string()),
+                    ..ProviderMeta::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: credential_generation,
+                credential_generation,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution = ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    #[tokio::test]
+    async fn web_session_drivers_forward_claude_and_codex_text_lifecycles_with_fixed_rails() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(
+            move |method: Method,
+                  uri: axum::http::Uri,
+                  headers: HeaderMap,
+                  body: Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    observations.lock().unwrap().push(json!({
+                        "method": method.as_str(),
+                        "path": uri.path(),
+                        "origin": headers.get("origin").and_then(|value| value.to_str().ok()),
+                        "referer": headers.get("referer").and_then(|value| value.to_str().ok()),
+                        "cookie": headers.get("cookie").and_then(|value| value.to_str().ok()),
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        "malicious": headers.get("x-malicious-upstream").and_then(|value| value.to_str().ok()),
+                        "userAgent": headers.get("user-agent").and_then(|value| value.to_str().ok()),
+                        "body": body,
+                    }));
+                    let (content_type, wire) = if uri.path()
+                        == "/rest/app-chat/conversations/new"
+                    {
+                        (
+                            "application/json",
+                            concat!(
+                                "{\"result\":{\"response\":{\"token\":\"fixture-\",\"responseId\":\"grok-session\"}}}\n",
+                                "{\"result\":{\"response\":{\"modelResponse\":{\"message\":\"fixture-answer\"},\"responseId\":\"grok-session\"}}}\n"
+                            ),
+                        )
+                    } else {
+                        (
+                            "text/event-stream",
+                            concat!(
+                                "data: {\"backend_uuid\":\"pplx-session\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"fixture-\"]}}]}\n\n",
+                                "data: {\"status\":\"COMPLETED\",\"backend_uuid\":\"pplx-session\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"fixture-answer\"]}}]}\n\n",
+                                "event: end_of_stream\n\n"
+                            ),
+                        )
+                    };
+                    let chunks = wire
+                        .as_bytes()
+                        .chunks(3)
+                        .map(Bytes::copy_from_slice)
+                        .map(Ok::<_, std::convert::Infallible>)
+                        .collect::<Vec<_>>();
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, content_type)
+                        .header("set-cookie", "server-cookie=must-not-persist")
+                        .header("location", "https://attacker.invalid/")
+                        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                        .unwrap()
+                }
+            },
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("web-session-matrix");
+        let config_dir = state.config_dir.clone();
+
+        for driver in ["grok", "perplexity"] {
+            for (app, route, stream) in [
+                (AppKind::Claude, ProxyRoute::ClaudeMessages, false),
+                (AppKind::Claude, ProxyRoute::ClaudeMessages, true),
+                (AppKind::Codex, ProxyRoute::CodexChatCompletions, false),
+                (AppKind::Codex, ProxyRoute::CodexResponses, true),
+            ] {
+                let path = if driver == "grok" {
+                    "/rest/app-chat/conversations/new"
+                } else {
+                    "/rest/sse/perplexity_ask"
+                };
+                let execution = install_web_session_forwarder_test_provider(
+                    &state,
+                    app,
+                    driver,
+                    format!("http://{address}{path}"),
+                    1,
+                )
+                .await;
+                let body = match route {
+                    ProxyRoute::ClaudeMessages => json!({
+                        "model": "client-claude-alias",
+                        "max_tokens": 64,
+                        "stream": stream,
+                        "system": "stay literal",
+                        "messages": [{"role": "user", "content": "inspect the fixture"}]
+                    }),
+                    ProxyRoute::CodexChatCompletions => json!({
+                        "model": "client-chat-alias",
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": "inspect the fixture"}]
+                    }),
+                    ProxyRoute::CodexResponses => json!({
+                        "model": "client-responses-alias",
+                        "stream": stream,
+                        "instructions": "stay literal",
+                        "input": "inspect the fixture"
+                    }),
+                    _ => unreachable!(),
+                };
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers.insert(
+                    "authorization",
+                    HeaderValue::from_static("Bearer client-secret-must-not-forward"),
+                );
+                headers.insert(
+                    "x-malicious-upstream",
+                    HeaderValue::from_static("must-not-forward"),
+                );
+                let response = forward_provider_test(
+                    state.clone(),
+                    route,
+                    execution,
+                    None,
+                    headers,
+                    Bytes::from(body.to_string()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(response.headers().get("set-cookie").is_none());
+                assert!(response.headers().get("location").is_none());
+                let downstream = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let downstream = String::from_utf8(downstream.to_vec()).unwrap();
+                assert!(downstream.contains("fixture-answer"), "{downstream}");
+                if stream && app == AppKind::Claude {
+                    assert!(downstream.contains("event: message_stop"));
+                } else if stream {
+                    assert!(downstream.contains("data: [DONE]"));
+                } else {
+                    serde_json::from_str::<Value>(&downstream).unwrap();
+                }
+            }
+        }
+
+        let observations = observations.lock().unwrap().clone();
+        assert_eq!(observations.len(), 8);
+        for observation in observations {
+            assert_eq!(observation["method"], "POST");
+            assert!(observation["authorization"].is_null());
+            assert!(observation["malicious"].is_null());
+            assert!(observation["userAgent"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("Mozilla/5.0")));
+            match observation["path"].as_str().unwrap() {
+                "/rest/app-chat/conversations/new" => {
+                    assert_eq!(observation["origin"], "https://grok.com");
+                    assert_eq!(observation["referer"], "https://grok.com/");
+                    assert_eq!(
+                        observation["cookie"],
+                        "sso=read-secret; sso-rw=write-secret; cf_clearance=clear-secret"
+                    );
+                    assert_eq!(observation["body"]["modeId"], "fast");
+                }
+                "/rest/sse/perplexity_ask" => {
+                    assert_eq!(observation["origin"], "https://www.perplexity.ai");
+                    assert_eq!(observation["referer"], "https://www.perplexity.ai/");
+                    assert_eq!(
+                        observation["cookie"],
+                        "__Secure-next-auth.session-token.0=first; __Secure-next-auth.session-token.1=second"
+                    );
+                    assert_eq!(
+                        observation["body"]["params"]["model_preference"],
+                        "pplx_pro"
+                    );
+                }
+                path => panic!("unexpected Web Session path {path}"),
+            }
+        }
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_session_client_cancellation_after_partial_frame_never_retries_or_falls_back() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let (partial_tx, mut partial_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let requests = std::sync::Arc::clone(&requests_for_route);
+            let partial_tx = partial_tx.clone();
+            async move {
+                let path = uri.path().to_string();
+                requests.lock().unwrap().push(path.clone());
+                let (content_type, partial) = match path.as_str() {
+                    "/rest/app-chat/conversations/new" => (
+                        "application/json",
+                        Bytes::from_static(
+                            br#"{"result":{"response":{"token":"partial","responseId":"cancel-grok"}}}\n"#,
+                        ),
+                    ),
+                    "/rest/sse/perplexity_ask" => (
+                        "text/event-stream",
+                        Bytes::from_static(
+                            b"data: {\"backend_uuid\":\"cancel-pplx\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"partial\"]}}]}\n\n",
+                        ),
+                    ),
+                    other => panic!("unexpected Web Session cancellation path {other}"),
+                };
+                let chunks = futures_util::stream::once(async move {
+                    partial_tx.send(path).unwrap();
+                    Ok::<Bytes, std::convert::Infallible>(partial)
+                })
+                .chain(futures_util::stream::pending());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("web-session-client-cancellation");
+        let config_dir = state.config_dir.clone();
+
+        for (driver, path) in [
+            ("grok", "/rest/app-chat/conversations/new"),
+            ("perplexity", "/rest/sse/perplexity_ask"),
+        ] {
+            let execution = install_web_session_forwarder_test_provider(
+                &state,
+                AppKind::Claude,
+                driver,
+                format!("http://{address}{path}"),
+                1,
+            )
+            .await;
+            let request_state = state.clone();
+            let mut request = tokio::spawn(async move {
+                forward_provider_test(
+                    request_state,
+                    ProxyRoute::ClaudeMessages,
+                    execution,
+                    None,
+                    HeaderMap::new(),
+                    Bytes::from_static(
+                        br#"{"model":"client-alias","stream":true,"messages":[{"role":"user","content":"cancel after partial"}]}"#,
+                    ),
+                )
+                .await
+            });
+            let observed_path = tokio::time::timeout(Duration::from_secs(2), partial_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed_path, path);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut request)
+                    .await
+                    .is_err(),
+                "a non-terminal partial frame must leave the request pending"
+            );
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                if driver == "grok" { 1 } else { 2 },
+                "client cancellation must not retry the Cookie or enter another Provider"
+            );
+        }
+
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            [
+                "/rest/app-chat/conversations/new".to_string(),
+                "/rest/sse/perplexity_ask".to_string(),
+            ]
+        );
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_session_auth_failure_never_retries_and_only_explicit_generation_rotation_recovers()
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let cookies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cookies_for_route = std::sync::Arc::clone(&cookies);
+        let app = axum::Router::new().route(
+            "/rest/app-chat/conversations/new",
+            axum::routing::post(move |headers: HeaderMap| {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let cookies = std::sync::Arc::clone(&cookies_for_route);
+                async move {
+                    let attempt = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    cookies.lock().unwrap().push(
+                        headers
+                            .get("cookie")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    if attempt == 0 {
+                        Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("set-cookie", "server-auth-cookie=must-not-persist")
+                            .body(Body::from("{\"error\":\"expired\"}"))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("set-cookie", "server-success-cookie=must-not-persist")
+                            .body(Body::from(
+                                "{\"result\":{\"response\":{\"modelResponse\":{\"message\":\"rotated-success\"},\"responseId\":\"rotated-session\"}}}\n",
+                            ))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("web-session-auth-rotation");
+        let config_dir = state.config_dir.clone();
+        let endpoint = format!("http://{address}/rest/app-chat/conversations/new");
+        let first = install_web_session_forwarder_test_provider(
+            &state,
+            AppKind::Claude,
+            "grok",
+            endpoint.clone(),
+            1,
+        )
+        .await;
+        let body = Bytes::from_static(
+            br#"{"model":"client-alias","messages":[{"role":"user","content":"authenticate"}]}"#,
+        );
+        let first_error = forward_provider_test(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            first.clone(),
+            None,
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(first_error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let repeated_error = forward_provider_test(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            first.clone(),
+            None,
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(repeated_error.status, StatusCode::UNAUTHORIZED);
+        assert!(repeated_error.message.contains("re-import"));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an invalidated Cookie must never be retried"
+        );
+
+        let rotated = install_web_session_forwarder_test_provider(
+            &state,
+            AppKind::Claude,
+            "grok",
+            endpoint,
+            2,
+        )
+        .await;
+        let stale_error = forward_provider_test(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            first,
+            None,
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_error.status, StatusCode::CONFLICT);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        for _ in 0..2 {
+            let response = forward_provider_test(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                rotated.clone(),
+                None,
+                HeaderMap::new(),
+                body.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("set-cookie").is_none());
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let cookies = cookies.lock().unwrap().clone();
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(
+            cookies[0],
+            "sso=read-secret; sso-rw=write-secret; cf_clearance=clear-secret"
+        );
+        assert_eq!(cookies[1], "sso=read-secret-2; cf_clearance=clear-secret");
+        assert_eq!(cookies[2], "sso=read-secret-2; cf_clearance=clear-secret");
+        assert!(cookies.iter().all(|cookie| !cookie.contains("server-")));
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_session_tools_images_and_count_tokens_finish_before_any_upstream_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move || {
+            let requests = std::sync::Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("web-session-local-rejections");
+        let config_dir = state.config_dir.clone();
+        let execution = install_web_session_forwarder_test_provider(
+            &state,
+            AppKind::Claude,
+            "grok",
+            format!("http://{address}/rest/app-chat/conversations/new"),
+            1,
+        )
+        .await;
+        for body in [
+            json!({
+                "model": "fast",
+                "tools": [{"name": "shell"}],
+                "messages": [{"role": "user", "content": "do not run"}]
+            }),
+            json!({
+                "model": "fast",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "base64", "data": "AA=="}}]
+                }]
+            }),
+        ] {
+            let error = forward_provider_test(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                execution.clone(),
+                None,
+                HeaderMap::new(),
+                Bytes::from(body.to_string()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::NOT_IMPLEMENTED);
+        }
+        let response = forward_provider_test(
+            state.clone(),
+            ProxyRoute::ClaudeCountTokens,
+            execution,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"fast","messages":[{"role":"user","content":"count locally"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(&body).unwrap()["input_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 0)
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_session_share_forward_records_estimated_usage_without_account_pooling() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/rest/sse/perplexity_ask",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(concat!(
+                        "data: {\"status\":\"COMPLETED\",\"backend_uuid\":\"share-session\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"share-answer\"]}}]}\n\n",
+                        "event: end_of_stream\n\n"
+                    )))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("web-session-share-usage");
+        let config_dir = state.config_dir.clone();
+        let execution = install_web_session_forwarder_test_provider(
+            &state,
+            AppKind::Codex,
+            "perplexity",
+            format!("http://{address}/rest/sse/perplexity_ask"),
+            1,
+        )
+        .await;
+        let provider_id = execution.stored.provider.id.clone();
+        let share_id = "web-session-share";
+        let provider_id_for_share = provider_id.clone();
+        state
+            .mutate_shares_immediate(move |shares| {
+                shares.shares.push(
+                    serde_json::from_value(json!({
+                        "id": share_id,
+                        "app": "codex",
+                        "providerId": provider_id_for_share,
+                        "providerType": "codex",
+                        "ownerEmail": "owner@example.com",
+                        "enabled": true,
+                        "status": "active",
+                        "bindings": [{
+                            "app": "codex",
+                            "providerId": provider_id_for_share,
+                            "providerType": "codex"
+                        }],
+                        "userGrants": {
+                            "owner@example.com": {
+                                "email": "owner@example.com",
+                                "role": "owner",
+                                "active": true
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("x-cc-switch-share-id", HeaderValue::from_static(share_id));
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let response = forward(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"pplx-auto","input":"record the share usage","stream":false}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response_body).unwrap()["output_text"],
+            "share-answer"
+        );
+        let share = state
+            .shares
+            .read()
+            .await
+            .shares
+            .iter()
+            .find(|share| share.id == share_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(share.requests_count, 1);
+        assert!(share.tokens_used > 0);
+        let usage = state.usage.read().await.logs.last().cloned().unwrap();
+        assert_eq!(usage.provider_id, provider_id);
+        assert_eq!(usage.share_id.as_deref(), Some(share_id));
+        assert!(usage.usage_estimated);
+        assert_eq!(usage.outcome, UsageOutcome::Success);
+        assert!(usage.input_tokens.is_some_and(|tokens| tokens > 0));
+        assert!(usage.output_tokens.is_some_and(|tokens| tokens > 0));
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     async fn install_claude_oauth_forwarder_test_provider(
@@ -24052,8 +25871,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kimi_replay_write_is_blocked_by_account_or_provider_generation_drift() {
-        for drift in ["account", "provider"] {
+    async fn kimi_replay_write_is_blocked_by_credential_or_provider_generation_drift() {
+        for drift in ["account", "token", "provider"] {
             let state = forwarder_test_state(&format!("kimi-replay-{drift}-drift"));
             let (provider_id, account_id) = install_kimi_replay_test_provider(
                 &state,
@@ -24102,6 +25921,16 @@ mod tests {
                         .find(|account| account.id == account_id)
                         .unwrap();
                     account.auth_identity_generation += 1;
+                    state.replace_account_store_for_test(accounts).await;
+                }
+                "token" => {
+                    let mut accounts = state.accounts_snapshot().await;
+                    let account = accounts
+                        .accounts
+                        .iter_mut()
+                        .find(|account| account.id == account_id)
+                        .unwrap();
+                    account.token_refresh_generation += 1;
                     state.replace_account_store_for_test(accounts).await;
                 }
                 "provider" => {
@@ -26024,6 +27853,128 @@ mod tests {
         provider_id
     }
 
+    async fn install_amazon_q_test_bundle(
+        state: &ServerState,
+        name: &str,
+        api_base_url: String,
+        models_url: String,
+        oidc_base_url: String,
+    ) -> (String, String, String) {
+        let account_id = format!("{name}-account");
+        let decoy_account_id = format!("{name}-kiro-decoy");
+        let account_id_for_state = account_id.clone();
+        let decoy_for_state = decoy_account_id.clone();
+        let name_for_state = name.to_string();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id_for_state,
+                        "providerType": "amazon_q_oauth",
+                        "email": format!("{name_for_state}@example.com"),
+                        "accessToken": "amazon-q-old-access",
+                        "refreshToken": "amazon-q-old-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "scopes": [
+                            "codewhisperer:completions",
+                            "codewhisperer:analysis",
+                            "codewhisperer:conversations"
+                        ],
+                        "profile": {
+                            "accountId": format!("{name_for_state}-stable-subject"),
+                            "authRegion": "us-east-1",
+                            "runtimeRegion": "us-east-1",
+                            "startUrl": "https://view.awsapps.com/start",
+                            "authMethod": "builder_id",
+                            "provider": "AmazonQDeveloper",
+                            "endpoint": "amazon_q_cli"
+                        },
+                        "raw": {
+                            "clientId": "amazon-q-test-client",
+                            "clientSecret": "amazon-q-test-secret",
+                            "clientSecretExpiresAt": 4_102_444_800_i64,
+                            "authRegion": "us-east-1",
+                            "runtimeRegion": "us-east-1",
+                            "startUrl": "https://view.awsapps.com/start",
+                            "authMethod": "builder_id",
+                            "provider": "AmazonQDeveloper",
+                            "endpoint": "amazon_q_cli",
+                            "testAmazonQOidcBaseUrl": oidc_base_url
+                        }
+                    }))
+                    .unwrap(),
+                );
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": decoy_for_state,
+                        "providerType": "kiro_oauth",
+                        "accessToken": "kiro-decoy-access",
+                        "refreshToken": "kiro-decoy-refresh",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/decoy",
+                            "apiRegion": "us-east-1",
+                            "machineId": "kiro-decoy-machine",
+                            "authMethod": "social"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let mut stored_providers = Vec::new();
+        let mut provider_ids = Vec::new();
+        for app in [AppKind::Claude, AppKind::Codex] {
+            let provider_id = format!("{name}-{}-provider", app.as_str());
+            let mut stored = stored_provider(
+                app,
+                ProviderType::AmazonQOAuth,
+                json!({"env": {"AMAZON_Q_API_BASE_URL": api_base_url}}),
+                Some(&account_id),
+            );
+            stored.provider.id = provider_id.clone();
+            stored.resource.profile_id = Some(
+                crate::domain::providers::registry::ProfileId::parse(match app {
+                    AppKind::Claude => "claude.amazon_q_oauth",
+                    AppKind::Codex => "codex.amazon_q_oauth",
+                    AppKind::Gemini => unreachable!("Amazon Q has no Gemini Provider Surface"),
+                })
+                .unwrap(),
+            );
+            stored.resource.profile_schema_revision = Some(1);
+            stored_providers.push(stored);
+            provider_ids.push(provider_id);
+        }
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: stored_providers,
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        for (app, provider_id) in [AppKind::Claude, AppKind::Codex]
+            .into_iter()
+            .zip(provider_ids.iter())
+        {
+            let mut plan = providers
+                .runtime_plan(app, provider_id)
+                .expect("Amazon Q test runtime plan")
+                .as_ref()
+                .clone();
+            plan.driver_options
+                .insert("testAmazonQModelsUrl".to_string(), json!(models_url));
+            std::sync::Arc::make_mut(&mut providers.runtime_index).insert_plan_for_test(plan);
+        }
+        state.replace_provider_store_for_test(providers).await;
+        (
+            provider_ids[0].clone(),
+            provider_ids[1].clone(),
+            decoy_account_id,
+        )
+    }
+
     async fn set_kiro_test_stream_timeouts(
         state: &ServerState,
         app: AppKind,
@@ -26127,6 +28078,249 @@ mod tests {
             kiro::fixture_event_frame("endEvent", &json!({})),
         ]
         .concat()
+    }
+
+    #[tokio::test]
+    async fn amazon_q_uses_cli_catalog_and_eventstream_on_claude_and_codex_with_one_bound_refresh()
+    {
+        let token_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let token_app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move |body: Bytes| {
+                let requests = std::sync::Arc::clone(&token_requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["clientId"], "amazon-q-test-client");
+                    assert_eq!(body["refreshToken"], "amazon-q-old-refresh");
+                    assert_eq!(
+                        body["grantType"], "refresh_token",
+                        "Amazon Q must use the SSO OIDC refresh grant"
+                    );
+                    axum::Json(json!({
+                        "accessToken": "amazon-q-new-access",
+                        "tokenType": "Bearer",
+                        "expiresIn": 3600
+                    }))
+                }
+            }),
+        );
+        let token_server = tokio::spawn(async move {
+            axum::serve(token_listener, token_app).await.unwrap();
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let observations_for_route = std::sync::Arc::clone(&observations);
+        let upstream_app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let observations = std::sync::Arc::clone(&observations_for_route);
+                async move {
+                    let target = headers
+                        .get("x-amz-target")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let user_agent = headers
+                        .get("user-agent")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let content_types = headers
+                        .get_all(CONTENT_TYPE)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok().map(str::to_string))
+                        .collect::<Vec<_>>();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    observations.lock().unwrap().push(json!({
+                        "target": target,
+                        "authorization": authorization,
+                        "userAgent": user_agent,
+                        "contentTypes": content_types,
+                        "body": body,
+                    }));
+
+                    match target.as_str() {
+                        crate::domain::providers::amazon_q::AMAZON_Q_LIST_MODELS_TARGET => {
+                            let page_two = body.get("nextToken").is_some();
+                            let response = if page_two {
+                                json!({
+                                    "models": [{"modelId": "amazon-q-secondary"}]
+                                })
+                            } else {
+                                json!({
+                                    "models": [{
+                                        "modelId": "amazon-q-test-model",
+                                        "modelName": "Amazon Q Test Model",
+                                        "tokenLimits": {
+                                            "maxInputTokens": 200000,
+                                            "maxOutputTokens": 8192
+                                        },
+                                        "supportedInputTypes": ["text", "image"]
+                                    }],
+                                    "defaultModel": {"modelId": "amazon-q-test-model"},
+                                    "nextToken": "page-2"
+                                })
+                            };
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/x-amz-json-1.0")
+                                .body(Body::from(response.to_string()))
+                                .unwrap()
+                        }
+                        "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" => {
+                            if authorization == "Bearer amazon-q-old-access" {
+                                Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .body(Body::from("unauthorized"))
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                                    .body(Body::from(kiro_text_eventstream("hello from Amazon Q")))
+                                    .unwrap()
+                            }
+                        }
+                        _ => Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::from("unexpected target"))
+                            .unwrap(),
+                    }
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let state = forwarder_test_state("amazon-q-e2e");
+        let endpoint = format!("http://{upstream_address}/");
+        let (claude_provider, codex_provider, decoy_account_id) = install_amazon_q_test_bundle(
+            &state,
+            "amazon-q-e2e",
+            endpoint.clone(),
+            endpoint,
+            format!("http://{token_address}"),
+        )
+        .await;
+        let decoy_generation = state
+            .find_account_by_id(&decoy_account_id)
+            .await
+            .unwrap()
+            .token_refresh_generation;
+
+        let claude = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            claude_provider,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"auto","max_tokens":32,"messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claude.status(), StatusCode::OK);
+        let claude: Value = serde_json::from_slice(&collect_response_body(claude).await).unwrap();
+        assert_eq!(
+            claude.pointer("/content/0/text"),
+            Some(&json!("hello from Amazon Q"))
+        );
+
+        let codex = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            codex_provider,
+            None,
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"auto","input":"ping","stream":false}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(codex.status(), StatusCode::OK);
+        let codex: Value = serde_json::from_slice(&collect_response_body(codex).await).unwrap();
+        assert_eq!(codex["status"], "completed");
+        assert_eq!(codex["output_text"], "hello from Amazon Q");
+
+        assert_eq!(
+            token_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first inference 401 may refresh the bound Amazon Q account only once"
+        );
+        assert_eq!(
+            state
+                .find_account_by_id(&decoy_account_id)
+                .await
+                .unwrap()
+                .token_refresh_generation,
+            decoy_generation,
+            "a Kiro account must never participate in Amazon Q recovery"
+        );
+
+        let observations = observations.lock().unwrap();
+        let model_requests = observations
+            .iter()
+            .filter(|entry| {
+                entry["target"] == crate::domain::providers::amazon_q::AMAZON_Q_LIST_MODELS_TARGET
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            model_requests.len() >= 4,
+            "catalog must paginate for both token generations"
+        );
+        assert!(model_requests
+            .iter()
+            .all(|entry| entry["body"]["origin"] == "CLI"));
+        assert!(model_requests
+            .iter()
+            .any(|entry| entry["body"]["nextToken"] == "page-2"));
+
+        let inference_requests = observations
+            .iter()
+            .filter(|entry| {
+                entry["target"] == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inference_requests.len(), 3);
+        assert_eq!(
+            inference_requests[0]["authorization"],
+            "Bearer amazon-q-old-access"
+        );
+        assert!(inference_requests[1..]
+            .iter()
+            .all(|entry| entry["authorization"] == "Bearer amazon-q-new-access"));
+        for entry in observations.iter() {
+            assert!(entry["userAgent"]
+                .as_str()
+                .is_some_and(|value| value.contains("AmazonQ-For-CLI")));
+            assert_eq!(entry["contentTypes"], json!(["application/x-amz-json-1.0"]));
+            let body = entry["body"].to_string();
+            assert!(!body.contains("AI_EDITOR"), "{body}");
+            assert!(!body.contains("KIRO_CLI"), "{body}");
+        }
+        assert!(inference_requests.iter().all(|entry| {
+            entry["body"].pointer("/conversationState/currentMessage/userInputMessage/origin")
+                == Some(&json!("CLI"))
+        }));
+        drop(observations);
+        token_server.abort();
+        upstream_server.abort();
     }
 
     async fn collect_response_body(response: Response) -> Vec<u8> {
@@ -27210,6 +29404,8 @@ mod tests {
             status: StatusCode::OK,
             content_type: "text/event-stream",
             body: concat!(
+                ": upstream keepalive\n\n",
+                "data: ping\n\n",
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-non-stream\"}}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-non-stream\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n",
@@ -27276,6 +29472,340 @@ mod tests {
         assert_eq!(log.stream_status.as_deref(), Some("completed"));
         assert!(!log.is_streaming);
 
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_non_stream_error_done_terminates_without_upstream_eof() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![(
+                Duration::ZERO,
+                Bytes::from_static(concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad tool schema\"}}\n",
+                    "\n",
+                    "data: [DONE]\n",
+                    "\n"
+                ).as_bytes()),
+            )],
+            true,
+        )
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-non-stream-error-done-without-eof",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            forward_with_attempt(
+                state.clone(),
+                ProxyRoute::CodexResponses,
+                None,
+                headers,
+                Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":false}"#),
+                ForwardAttemptContext {
+                    execution: Some(execution),
+                    ..ForwardAttemptContext::default()
+                },
+            ),
+        )
+        .await
+        .expect("error + [DONE] must terminate without waiting for upstream EOF")
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("invalid_request_error"));
+        assert!(error.message.contains("bad tool schema"));
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("aggregated Responses usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("client_error"));
+        assert!(!log.is_streaming);
+
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_normalizes_liveness_and_response_headers() {
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/plain",
+            body: concat!(
+                ": upstream keepalive\r\n\r\n",
+                "id: 7\r\nretry: 1000\r\n\r\n",
+                "data: ping\r\n\r\n",
+                "event: response.created\r\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-normalized\"}}\r\n\r\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\r\n\r\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-normalized\",\"status\":\"completed\",\"output\":[]}}\r\n\r\n",
+                "data: [DONE]\r\n\r\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-sse-normalized",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream; charset=utf-8"
+        );
+        assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("upstream keepalive"));
+        assert!(!body.contains("id: 7"));
+        assert!(!body.contains("retry: 1000"));
+        assert!(!body.contains("data: ping"));
+        assert!(body.contains("event: response.created\n"));
+        assert!(body.contains("event: response.output_text.delta\n"));
+        assert!(body.contains("event: response.completed\n"));
+        for payload in body.lines().filter_map(|line| line.strip_prefix("data: ")) {
+            if payload != "[DONE]" {
+                serde_json::from_str::<Value>(payload).unwrap();
+            }
+        }
+
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_rejects_non_json_http_200_before_commit() {
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/html",
+            body: "<!doctype html>\n\nupstream gateway error".to_string(),
+        }])
+        .await;
+        let (state, execution) =
+            codex_bridge_test_context("responses-sse-html", format!("http://{}", upstream.address))
+                .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let error = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(
+            error.message.contains("unknown non-control field"),
+            "unexpected protocol error: {}",
+            error.message
+        );
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_liveness_does_not_satisfy_first_event_budget() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![
+                (
+                    Duration::ZERO,
+                    Bytes::from_static(b": upstream keepalive\n\n"),
+                ),
+                (
+                    Duration::from_millis(120),
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+                    ),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let (state, mut execution) = codex_bridge_test_context(
+            "responses-liveness-timeout",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        std::sync::Arc::make_mut(&mut execution.plan)
+            .transport_policy
+            .stream_first_byte_timeout_ms = Some(50);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let error = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(error.message.contains("first byte timeout"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_records_post_commit_malformed_sse_as_protocol_error() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![
+                (
+                    Duration::ZERO,
+                    Bytes::from_static(concat!(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-post-commit\"}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"committed\"}\n\n"
+                    ).as_bytes()),
+                ),
+                (
+                    Duration::from_millis(10),
+                    Bytes::from_static(b"data: {not-json}\n\n"),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-post-commit-protocol-error",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("committed"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("upstream_stream_protocol_error"));
+        assert!(!body.contains("data: [DONE]"));
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("streaming usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("protocol_error"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_error_frame_followed_by_done_terminates_without_upstream_eof() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![
+                (
+                    Duration::ZERO,
+                    Bytes::from_static(concat!(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-error-done\"}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"committed\"}\n\n"
+                    ).as_bytes()),
+                ),
+                (
+                    Duration::from_millis(10),
+                    Bytes::from_static(concat!(
+                        "event: error\n",
+                        "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 3s\"}}\n",
+                        "\n",
+                        "data: [DONE]\n",
+                        "\n"
+                    ).as_bytes()),
+                ),
+            ],
+            true,
+        )
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-error-done-without-eof",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("error + [DONE] must terminate without waiting for upstream EOF")
+        .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("committed"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("rate_limit_exceeded"));
+        assert!(!body.contains("data: [DONE]"));
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("streaming usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("provider_failed"));
         upstream.server.abort();
     }
 
@@ -27461,7 +29991,7 @@ mod tests {
                 "parse-error",
                 "data: {not-json}\n\n",
                 crate::domain::usage::store::UsageState::ParseError,
-                "parse_error",
+                "protocol_error",
                 None,
                 StatusCode::BAD_GATEWAY,
             ),
@@ -28257,6 +30787,8 @@ mod tests {
         CloseSizeThenStallHttpErrorBody,
         CloseSizeThenHttpBusinessThenEof,
         CloseSizeThenHttpBusinessThenStall,
+        CloseSizeThenHttpBusinessLivenessThenLateTerminal,
+        CloseSizeThenHttpErrorDoneThenStall,
         CloseSizeThenHttpMalformed,
         CloseSizeThenHttpBusinessThenProviderFailure,
         CloseSizeThenHttpRateLimited,
@@ -28514,6 +31046,8 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     | TestCodexWebSocketBehavior::CloseSizeThenStallHttpErrorBody
                                     | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenEof
                                     | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenStall
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessLivenessThenLateTerminal
+                                    | TestCodexWebSocketBehavior::CloseSizeThenHttpErrorDoneThenStall
                                     | TestCodexWebSocketBehavior::CloseSizeThenHttpMalformed
                                     | TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessThenProviderFailure
                                     | TestCodexWebSocketBehavior::CloseSizeThenHttpRateLimited
@@ -28638,6 +31172,11 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-interrupted\",\"status\":\"in_progress\"}}\n\n",
                             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"committed-http\"}\n\n"
                         );
+                        let error_done_sse = concat!(
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-error-done\",\"status\":\"in_progress\"}}\n\n",
+                            "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"retry later\"}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
                         let malformed_sse = concat!(
                             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-malformed\",\"status\":\"in_progress\"}}\n\n",
                             "data: {not-json}\n\n"
@@ -28674,6 +31213,43 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     futures_util::stream::once(async move {
                                         Ok::<_, std::convert::Infallible>(Bytes::from_static(
                                             business_without_terminal_sse.as_bytes(),
+                                        ))
+                                    })
+                                    .chain(futures_util::stream::pending::<Result<
+                                        Bytes,
+                                        std::convert::Infallible,
+                                    >>()),
+                                ),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessLivenessThenLateTerminal => (
+                                StatusCode::OK,
+                                Body::from_stream(futures_util::stream::iter([
+                                    (
+                                        Duration::ZERO,
+                                        Bytes::from_static(business_without_terminal_sse.as_bytes()),
+                                    ),
+                                    (
+                                        Duration::from_millis(60),
+                                        Bytes::from_static(b": keepalive\n\n"),
+                                    ),
+                                    (
+                                        Duration::from_millis(70),
+                                        Bytes::from_static(
+                                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-too-late\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                                        ),
+                                    ),
+                                ])
+                                .then(|(delay, chunk)| async move {
+                                    tokio::time::sleep(delay).await;
+                                    Ok::<_, std::convert::Infallible>(chunk)
+                                })),
+                            ),
+                            TestCodexWebSocketBehavior::CloseSizeThenHttpErrorDoneThenStall => (
+                                StatusCode::OK,
+                                Body::from_stream(
+                                    futures_util::stream::once(async move {
+                                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                            error_done_sse.as_bytes(),
                                         ))
                                     })
                                     .chain(futures_util::stream::pending::<Result<
@@ -28736,6 +31312,13 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     async fn spawn_test_codex_refresh_endpoint(access_token: String) -> TestCodexRefreshEndpoint {
+        spawn_test_delayed_codex_refresh_endpoint(access_token, Duration::ZERO).await
+    }
+
+    async fn spawn_test_delayed_codex_refresh_endpoint(
+        access_token: String,
+        delay: Duration,
+    ) -> TestCodexRefreshEndpoint {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -28749,6 +31332,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 let access_token = access_token.clone();
                 async move {
                     requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
                     axum::Json(json!({
                         "access_token": access_token,
                         "refresh_token": "rotated-refresh-token",
@@ -29116,6 +31700,8 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             started,
             request_id,
             status_code,
+            first_event_deadline: first_event_timeout
+                .map(|timeout| tokio::time::Instant::now() + timeout),
             first_event_timeout,
             idle_timeout,
             keepalive_interval,
@@ -29250,12 +31836,321 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::Client(
-                "upstream failed".to_string()
-            ))
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::Network {
+                operation: "completion",
+                message: "upstream failed".to_string(),
+            })
             .status,
             StatusCode::BAD_GATEWAY
         );
+        assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::Upstream {
+                operation: "create_session",
+                status_code: 401,
+                message: "expired".to_string(),
+            })
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeepSeekSessionFixtureMode {
+        RebuildCachedSession,
+        UnauthorizedCachedSession,
+    }
+
+    #[derive(Clone)]
+    struct DeepSeekSessionFixtureObservations {
+        session_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pow_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        completion_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        sessions: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        authorizations: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_deepseek_session_fixture(
+        mode: DeepSeekSessionFixtureMode,
+    ) -> (
+        std::net::SocketAddr,
+        DeepSeekSessionFixtureObservations,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let observations = DeepSeekSessionFixtureObservations {
+            session_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pow_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completion_requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            sessions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            authorizations: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let session_observations = observations.clone();
+        let pow_observations = observations.clone();
+        let completion_observations = observations.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v0/chat_session/create",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let observations = session_observations.clone();
+                    async move {
+                        observations.authorizations.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        let index = observations
+                            .session_requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        axum::Json(json!({
+                            "code":0,
+                            "data":{"biz_code":0,"biz_data":{"id":format!("deepseek-session-{index}")}}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v0/chat/create_pow_challenge",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let observations = pow_observations.clone();
+                    async move {
+                        observations.authorizations.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        observations
+                            .pow_requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let salt = "deepseek-forwarder-fixture";
+                        let expire_at = chrono::Utc::now().timestamp() + 60;
+                        let answer = 3i64;
+                        let challenge = crate::test_support::deepseek_hash_v1(
+                            format!("{salt}_{expire_at}_{answer}").as_bytes(),
+                        );
+                        axum::Json(json!({
+                            "code":0,
+                            "data":{"biz_code":0,"biz_data":{"challenge":{
+                                "algorithm":"DeepSeekHashV1",
+                                "challenge":hex::encode(challenge),
+                                "salt":salt,
+                                "expire_at":expire_at,
+                                "expire_after":60,
+                                "difficulty":answer + 1,
+                                "signature":"fixture-signature",
+                                "target_path":"/api/v0/chat/completion"
+                            }}}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v0/chat/completion",
+                axum::routing::post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let observations = completion_observations.clone();
+                    async move {
+                        observations.authorizations.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        assert!(headers.contains_key("x-ds-pow-response"));
+                        observations.sessions.lock().unwrap().push(
+                            body.get("chat_session_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        let request = observations
+                            .completion_requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let status = match (mode, request) {
+                            (DeepSeekSessionFixtureMode::RebuildCachedSession, 1) => {
+                                StatusCode::NOT_FOUND
+                            }
+                            (DeepSeekSessionFixtureMode::UnauthorizedCachedSession, 1) => {
+                                StatusCode::UNAUTHORIZED
+                            }
+                            _ => StatusCode::OK,
+                        };
+                        let body = if status == StatusCode::OK {
+                            concat!(
+                                "data: {\"p\":\"response/fragments\",\"v\":[{\"type\":\"THINK\",\"content\":\"why\"}]}\n",
+                                "data: {\"p\":\"response/fragments\",\"v\":[{\"type\":\"RESPONSE\",\"content\":\"answer\"}]}\n",
+                                "data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n"
+                            )
+                        } else {
+                            "{\"error\":\"rejected\"}"
+                        };
+                        Response::builder()
+                            .status(status)
+                            .header(
+                                CONTENT_TYPE,
+                                if status == StatusCode::OK {
+                                    "text/event-stream"
+                                } else {
+                                    "application/json"
+                                },
+                            )
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, observations, server)
+    }
+
+    #[tokio::test]
+    async fn deepseek_cached_session_rebuilds_once_on_same_account_before_commit() {
+        let (address, observations, server) =
+            spawn_deepseek_session_fixture(DeepSeekSessionFixtureMode::RebuildCachedSession).await;
+        let state = forwarder_test_state("deepseek-session-rebuild");
+        let (provider_id, _) = install_deepseek_forwarder_test_provider(
+            &state,
+            "deepseek-session-rebuild",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "deepseek-session-rebuild-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::DeepSeekAccount,
+            &provider_id,
+        )
+        .await;
+        for _ in 0..2 {
+            let response = forward_for_test_surface(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                provider_id.clone(),
+                None,
+                deepseek_forwarder_headers(share_id, "deepseek-client-session-a"),
+                deepseek_forwarder_request(false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["content"][0]["type"], "thinking");
+            assert_eq!(value["content"][1]["text"], "answer");
+        }
+        assert_eq!(
+            observations
+                .session_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            observations
+                .pow_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            observations
+                .completion_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            observations.sessions.lock().unwrap().as_slice(),
+            [
+                "deepseek-session-1",
+                "deepseek-session-1",
+                "deepseek-session-2"
+            ]
+        );
+        assert!(observations
+            .authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|authorization| authorization == "Bearer bound-deepseek-token"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deepseek_cached_session_401_is_terminal_without_rebuild_or_other_account() {
+        let (address, observations, server) =
+            spawn_deepseek_session_fixture(DeepSeekSessionFixtureMode::UnauthorizedCachedSession)
+                .await;
+        let state = forwarder_test_state("deepseek-session-401");
+        let (provider_id, _) = install_deepseek_forwarder_test_provider(
+            &state,
+            "deepseek-session-401",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "deepseek-session-401-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::DeepSeekAccount,
+            &provider_id,
+        )
+        .await;
+        let first = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            deepseek_forwarder_headers(share_id, "deepseek-client-session-b"),
+            deepseek_forwarder_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            deepseek_forwarder_headers(share_id, "deepseek-client-session-b"),
+            deepseek_forwarder_request(false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            observations
+                .session_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            observations
+                .completion_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(observations
+            .authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|authorization| authorization == "Bearer bound-deepseek-token"));
+        server.abort();
     }
 
     #[test]
@@ -30207,6 +33102,26 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         );
     }
 
+    #[test]
+    fn responses_websocket_semantics_require_json_object_frames() {
+        let business = TungsteniteMessage::Text(
+            json!({"type": "response.output_text.delta", "delta": "ok"}).to_string(),
+        );
+        assert_eq!(
+            classify_responses_websocket_message(&business, None).unwrap(),
+            Some(SemanticObservation::Business)
+        );
+
+        for message in [
+            TungsteniteMessage::Text(json!([{"type": "response.completed"}]).to_string()),
+            TungsteniteMessage::Binary(json!("response.completed").to_string().into_bytes()),
+        ] {
+            let error = classify_responses_websocket_message(&message, None).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+            assert!(error.message.contains("JSON object"));
+        }
+    }
+
     #[tokio::test]
     async fn codex_websocket_request_enforces_remote_image_count_before_fetching() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
@@ -30792,11 +33707,8 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
     #[test]
     fn codex_images_parser_rejects_raw_json_as_non_sse_protocol() {
         let mut parser = CodexImagesResponseParser::new();
-        parser
-            .push(br#"{"type":"response.completed","response":{"output":[]}}"#)
-            .unwrap();
-
-        let error = match parser.finish() {
+        let error = match parser.push(br#"{"type":"response.completed","response":{"output":[]}}"#)
+        {
             Ok(_) => panic!("raw JSON must not satisfy the SSE image protocol"),
             Err(error) => error,
         };
@@ -30806,17 +33718,27 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
     }
 
     #[test]
-    fn codex_images_parser_accepts_response_done_and_surfaces_text_refusal() {
+    fn codex_images_parser_requires_completed_terminal_and_surfaces_text_refusal() {
         let mut parser = CodexImagesResponseParser::new();
         let parsed = parser
             .push(
                 b"data: {\"type\":\"response.done\",\"response\":{\"created_at\":1800000000,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}]}}\n\n",
             )
             .unwrap();
-        assert!(matches!(
-            parsed.events.as_slice(),
-            [CodexImagesProtocolEvent::Completed(_)]
-        ));
+        assert!(parsed.events.is_empty());
+        let failure = match parser.finish() {
+            Ok(_) => panic!("response.done must not satisfy the Responses terminal contract"),
+            Err(failure) => failure,
+        };
+        assert!(failure.message.contains("before a terminal event"));
+
+        let mut parser = CodexImagesResponseParser::new();
+        let failure = match parser.push(b"data: [DONE]\n\n") {
+            Ok(_) => panic!("[DONE] must not defer failure until EOF"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, "invalid_upstream_image_response");
+        assert!(failure.message.contains("[DONE]"));
 
         let mut parser = CodexImagesResponseParser::new();
         let result = parser.push(
@@ -31214,10 +34136,12 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert!(cooldown.until_ms > now);
         assert!(
             ensure_share_model_available(&state, &execution, Some("share-a"), Some("gpt-5.4"),)
+                .await
                 .is_err()
         );
         assert!(
             ensure_share_model_available(&state, &execution, Some("share-b"), Some("gpt-5.4"),)
+                .await
                 .is_ok()
         );
     }
@@ -32269,7 +35193,34 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .unwrap();
         assert!(responses.contains("event: response.failed"));
         assert!(responses.contains("cc_switch_stream_error"));
-        assert!(responses.contains("data: [DONE]"));
+        assert!(!responses.contains("data: [DONE]"));
+
+        let timeout = stream_terminal_error_frame(
+            ProxyRoute::CodexResponses,
+            "upstream stream idle timeout after 300000ms",
+            504,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&timeout).contains("upstream_stream_timeout"));
+        let protocol = stream_terminal_error_frame(
+            ProxyRoute::CodexResponses,
+            "Responses SSE data is not valid JSON",
+            502,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&protocol).contains("upstream_stream_protocol_error"));
+        for message in [
+            "Responses pending JSON event exceeded 2097152 bytes",
+            "Responses stream emitted [DONE] before a terminal response event",
+            "Responses content output repeat limit exceeded",
+        ] {
+            let frame =
+                stream_terminal_error_frame(ProxyRoute::CodexResponses, message, 502).unwrap();
+            assert!(
+                String::from_utf8_lossy(&frame).contains("upstream_stream_protocol_error"),
+                "message={message}"
+            );
+        }
 
         let chat = stream_terminal_error_frame(ProxyRoute::CodexChatCompletions, "boom", 502)
             .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
@@ -32568,37 +35519,54 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .push(b"event: response.created\r\ndata: {\"type\":\"response.cre")
             .unwrap()
             .is_empty());
-        let payloads = decoder
+        let items = decoder
             .push(b"ated\",\"response\":{}}\r\n\r\n: keepalive\r\n\r\n")
             .unwrap();
 
-        assert_eq!(payloads.len(), 1);
+        assert_eq!(items.len(), 1);
+        let CodexHttpFallbackTransportItem::Payload(payload) = &items[0] else {
+            panic!("the Responses event must remain a JSON payload");
+        };
         assert_eq!(
-            serde_json::from_str::<Value>(&payloads[0]).unwrap()["type"],
+            serde_json::from_str::<Value>(payload).unwrap()["type"],
             "response.created"
         );
         assert!(decoder.finish().unwrap().is_empty());
     }
 
     #[test]
+    fn codex_http_fallback_sse_decoder_preserves_done_order() {
+        let mut decoder = CodexHttpFallbackSseDecoder::default();
+        let items = decoder
+            .push(
+                concat!(
+                    "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n",
+                    "data: [DONE]\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            items.as_slice(),
+            [
+                CodexHttpFallbackTransportItem::Payload(_),
+                CodexHttpFallbackTransportItem::Done,
+                CodexHttpFallbackTransportItem::Payload(_)
+            ]
+        ));
+    }
+
+    #[test]
     fn codex_http_fallback_sse_decoder_bounds_pending_and_final_events() {
-        let mut decoder = CodexHttpFallbackSseDecoder {
-            buffer: b"data:{}\n\ndata:123456789".to_vec(),
-        };
-        let error = decoder.drain_with_limit(false, 8).unwrap_err();
+        let mut pending = CodexHttpFallbackSseDecoder::with_limit(16);
+        let error = pending.push(b"data: 12345678901").unwrap_err();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 
-        let mut fragmented_delimiter = CodexHttpFallbackSseDecoder {
-            buffer: b"12345678\r\n\r".to_vec(),
-        };
-        assert!(fragmented_delimiter.drain_with_limit(false, 8).is_ok());
-        let error = fragmented_delimiter.drain_with_limit(true, 8).unwrap_err();
-        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
-
-        let mut final_event = CodexHttpFallbackSseDecoder {
-            buffer: b"123456789".to_vec(),
-        };
-        let error = final_event.drain_with_limit(true, 8).unwrap_err();
+        let mut final_event = CodexHttpFallbackSseDecoder::with_limit(16);
+        assert!(final_event.push(b"data: 1234567890").is_ok());
+        let error = final_event.finish().unwrap_err();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -33703,6 +36671,72 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
+    async fn codex_images_first_event_budget_restarts_after_forced_auth_refresh() {
+        let name = "codex-images-delayed-401-refresh";
+        let workspace = format!("{name}-workspace");
+        let refreshed_access_token = signed_openai_access_token(&workspace).await;
+        let upstream = spawn_test_unauthorized_codex_upstream(
+            refreshed_access_token.clone(),
+            "text/event-stream",
+            concat!(
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_delayed_refresh\",\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+        )
+        .await;
+        let refresh = spawn_test_delayed_codex_refresh_endpoint(
+            refreshed_access_token,
+            Duration::from_millis(120),
+        )
+        .await;
+        let (state, mut execution) =
+            codex_bridge_test_context(name, format!("http://{}", upstream.address)).await;
+        let plan = std::sync::Arc::make_mut(&mut execution.plan);
+        plan.transport_policy.stream_first_byte_timeout_ms = Some(50);
+        plan.transport_policy.stream_idle_timeout_ms = Some(500);
+        configure_codex_refresh_test_account(&state, name, refresh.url.clone()).await;
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"delayed refresh","response_format":"b64_json"}"#,
+        )
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_codex_images_request(
+                state,
+                execution,
+                HeaderMap::new(),
+                prepared,
+                UsageLogContext::default(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("bounded OAuth refresh plus replay must complete")
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+
+        assert_eq!(
+            body.pointer("/data/0/b64_json"),
+            Some(&json!("iVBORw0KGgo="))
+        );
+        assert_eq!(
+            refresh.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(upstream.authorizations.lock().unwrap().len(), 2);
+
+        upstream.server.abort();
+        refresh.server.abort();
+    }
+
+    #[tokio::test]
     async fn codex_images_rejects_oversized_upstream_response_body() {
         let name = "codex-images-oversized-response";
         let upstream = spawn_test_oversized_codex_upstream(StatusCode::OK).await;
@@ -34145,11 +37179,21 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         for (name, chunks, expected_phase) in [
             ("codex-images-first-timeout", Vec::new(), "first event"),
             (
-                "codex-images-idle-timeout",
+                "codex-images-lifecycle-does-not-end-first-timeout",
                 vec![(
                     Duration::ZERO,
                     Bytes::from_static(
                         b"data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+                    ),
+                )],
+                "first event",
+            ),
+            (
+                "codex-images-idle-timeout",
+                vec![(
+                    Duration::ZERO,
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}}\n\n",
                     ),
                 )],
                 "idle",
@@ -34196,6 +37240,65 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             assert_eq!(log.stream_status.as_deref(), Some("timeout"));
             upstream.server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn codex_images_liveness_does_not_extend_business_idle_timeout() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![
+                (
+                    Duration::ZERO,
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\"}}\n\n",
+                    ),
+                ),
+                (
+                    Duration::from_millis(60),
+                    Bytes::from_static(b": keepalive\n\n"),
+                ),
+                (
+                    Duration::from_millis(70),
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+                    ),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "codex-images-liveness-idle",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let prepared = codex_images_generation_request(
+            br#"{"model":"gpt-image-2","prompt":"idle liveness","stream":true}"#,
+        )
+        .unwrap();
+        let args = codex_images_stream_test_args(
+            &state,
+            &execution,
+            upstream.address,
+            prepared,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(100)),
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        let mut body = Body::from_stream(codex_images_response_stream(args)).into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), b": connected\n\n"[..]);
+
+        let failure = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("business idle must expire before the late terminal")
+            .unwrap()
+            .unwrap();
+        let failure = String::from_utf8(failure.to_vec()).unwrap();
+        assert!(failure.contains("event: error"), "{failure}");
+        assert!(failure.contains("upstream idle timeout"), "{failure}");
+        assert!(!failure.contains("image_generation.completed"), "{failure}");
+        upstream.server.abort();
     }
 
     #[tokio::test]
@@ -34252,9 +37355,10 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         .unwrap();
         let mut body = response.into_body().into_data_stream();
         assert_eq!(body.next().await.unwrap().unwrap(), b": connected\n\n"[..]);
-        let failure = tokio::time::timeout(Duration::from_millis(300), body.next())
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let failure = tokio::time::timeout(Duration::from_millis(80), body.next())
             .await
-            .expect("remaining first-event budget must expire before the delayed event")
+            .expect("the absolute first-event deadline must not restart when the body is polled")
             .unwrap()
             .unwrap();
         assert!(String::from_utf8(failure.to_vec())
@@ -35718,6 +38822,92 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
+    async fn codex_http_fallback_liveness_does_not_extend_business_idle_timeout() {
+        let (events, close_code, primary, fallback, bridge_server) =
+            run_codex_http_fallback_single_provider_case(
+                "fallback-liveness-after-business",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpBusinessLivenessThenLateTerminal,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_millis(100)),
+            )
+            .await;
+
+        assert!(events
+            .iter()
+            .any(|event| { event.get("delta").and_then(Value::as_str) == Some("committed-http") }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_timeout")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.pointer("/response/id").and_then(Value::as_str) == Some("resp-too-late")
+        }));
+        assert_eq!(close_code, Some(CloseCode::Error));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_error_done_terminates_without_waiting_for_eof() {
+        let (events, _, primary, fallback, bridge_server) = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_codex_http_fallback_single_provider_case(
+                "fallback-error-done-stall",
+                TestCodexWebSocketBehavior::CloseSizeThenHttpErrorDoneThenStall,
+                Some(Duration::from_secs(5)),
+                Some(Duration::from_secs(5)),
+            ),
+        )
+        .await
+        .expect("error + [DONE] must terminate before the stalled upstream idle timeout");
+
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("error")
+                && event.pointer("/error/code").and_then(Value::as_str)
+                    == Some("rate_limit_exceeded")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.failed")
+                && event
+                    .pointer("/response/error/code")
+                    .and_then(Value::as_str)
+                    == Some("rate_limit_exceeded")
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        assert_eq!(
+            primary
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .http_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        bridge_server.abort();
+        primary.server.abort();
+        fallback.server.abort();
+    }
+
+    #[tokio::test]
     async fn codex_http_fallback_malformed_event_does_not_switch_provider() {
         let (events, _, primary, fallback, bridge_server) =
             run_codex_http_fallback_single_provider_case(
@@ -35729,7 +38919,8 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .await;
 
         assert!(events.iter().any(|event| {
-            event.pointer("/error/code").and_then(Value::as_str) == Some("upstream_stream_error")
+            event.pointer("/error/code").and_then(Value::as_str)
+                == Some("upstream_stream_protocol_error")
         }));
         assert!(!events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("response.completed")
@@ -36792,6 +39983,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .grok_media_task_binding(
                 &format!("test-share:{provider_id}"),
                 None,
+                GrokMediaTaskKind::VideoGeneration,
                 "video-stale-owner",
             )
             .await
@@ -37015,6 +40207,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         );
         let base_binding = GrokMediaTaskBinding {
             task_id: "request-1".to_string(),
+            task_kind: GrokMediaTaskKind::VideoGeneration,
             creation_request_id: None,
             provider_id: provider_id.clone(),
             account_id: account_id.clone(),
@@ -37071,6 +40264,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         state
             .remember_grok_media_task(
                 "request-1".to_string(),
+                GrokMediaTaskKind::VideoGeneration,
                 Some("req_grok_video_creation".to_string()),
                 provider_id,
                 account_id,

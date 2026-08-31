@@ -59,6 +59,8 @@
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
 | Codex Responses keepalive | `CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS` 控制普通文本 Responses SSE 在下游已收到首个业务/终态事件后的注释心跳，默认 `15000` ms；`0` 禁用，非零值收敛到 `5000..60000` ms。Provider `driverOptions.codexResponsesKeepaliveIntervalMs` 优先于环境变量。心跳不提交首包，也不延长 `STREAM_FIRST_BYTE_TIMEOUT_MS` / `STREAM_IDLE_TIMEOUT_MS` |
+| Codex Responses SSE normalizer | `CC_SWITCH_CODEX_RESPONSES_SSE_NORMALIZER_ENABLED` 默认开启，对 OpenAI OAuth 上游 Responses SSE/JSON/NDJSON 做有界严格解析、liveness 白名单过滤和 canonical SSE 重编码；`0` 只用于事故回滚。回滚后不再保证坏 200 body 在下游提交前被拦截 |
+| 出站 HTTP/2 PING | `CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_ENABLED` 默认关闭；开启后 `CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_INTERVAL_MS` 默认 `45000`、限制 `10000..300000`，`CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_TIMEOUT_MS` 默认 `20000`、限制 `5000..60000`。只维持活动 HTTP/2 transport，不改变业务 first-event/idle/terminal timeout |
 | Codex routing hint | `CC_SWITCH_CODEX_ROUTING_HINT_ENABLED` 默认 `false`；Provider `driverOptions.codexRoutingHintEnabled` 可覆盖。开启后只从最终 HTTP body 的最终模型和已验证 `priority` tier 合成 Server 独占 `x-codex-routing-hint`；客户端/account 同名 header 会被删除或拒绝，WebSocket handshake 永不携带该 hint。真实 OAuth 验收前保持关闭 |
 | Codex Images | capability URL 固定使用 Router 签名 context 中的 Share host；短期图片默认保存到 `<config-dir>/image-capabilities`，仅多副本共享时用 `CC_SWITCH_IMAGE_STORE_DIR` 覆盖，底层文件系统必须支持跨进程锁和 atomic rename |
 

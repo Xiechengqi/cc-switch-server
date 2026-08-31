@@ -2943,16 +2943,25 @@
     "grokVideoGenerationEnabledDescription": "允許此 Grok OAuth Provider 或 Share 建立並查詢影片任務。"
   },
   "kimiOauth": {
-    "description": "管理 Kimi Code 訂閱帳號",
-    "authStatus": "Kimi Code OAuth 認證",
-    "loginWithKimi": "使用 Kimi Code 登入",
-    "userCodeHint": "Kimi Code 裝置驗證碼：",
-    "loginRequired": "請先登入 Kimi Code 帳號",
-    "selectAccountRequired": "Kimi Code 必須綁定一個 Kimi Code 帳號"
+    "description": "管理 Kimi 訂閱帳號",
+    "authStatus": "Kimi OAuth 認證",
+    "loginWithKimi": "使用 Kimi 登入",
+    "userCodeHint": "Kimi 裝置驗證碼：",
+    "loginRequired": "請先登入 Kimi 帳號",
+    "selectAccountRequired": "Kimi OAuth 必須綁定一個 Kimi 帳號"
+  },
+  "amazonQOauth": {
+    "title": "Amazon Q Developer",
+    "description": "管理 Amazon Q Developer 訂閱帳號",
+    "authStatus": "Amazon Q Developer 認證",
+    "loginWithAmazonQ": "使用 Amazon Q Developer 登入",
+    "userCodeHint": "Amazon Q Developer 裝置驗證碼：",
+    "loginRequired": "請先登入 Amazon Q Developer 帳號",
+    "selectAccountRequired": "Amazon Q Developer 必須綁定一個 Amazon Q 帳號"
   },
   "qoderOauth": {
-    "description": "管理 Qoder COSY 帳號",
-    "authStatus": "Qoder COSY 認證",
+    "description": "管理 Qoder OAuth 帳號",
+    "authStatus": "Qoder OAuth 認證",
     "deviceLogin": "裝置登入",
     "patImport": "PAT 匯入",
     "globalSite": "國際站",
@@ -3142,6 +3151,8 @@
     "thirtyDay": "30 天",
     "sevenDayOpus": "7 天 (Opus)",
     "sevenDaySonnet": "7 天 (Sonnet)",
+    "sevenDayFable": "Fable 7 天",
+    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的獨立週容量池，上限為一般週額度的 50%。百分比直接來自 Anthropic 7d_oi/seven_day_overage_included，不由一般週用量推算。",
     "geminiPro": "Pro",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",
@@ -3149,6 +3160,7 @@
     "monthly": "每月",
     "copilotPremium": "進階請求",
     "cursorCredits": "用量",
+    "cursorSubscriptionUnavailable": "訂閱資訊暫時無法取得",
     "grokCredits": "Grok Credits",
     "grokWeekly": "每週額度",
     "grokMonthly": "月度包含額度",

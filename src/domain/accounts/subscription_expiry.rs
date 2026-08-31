@@ -145,6 +145,7 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::AgyOAuth
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,

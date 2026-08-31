@@ -45,6 +45,7 @@ export function providerLabel(providerType: string): string {
     github_copilot: "GitHub Copilot",
     deepseek_account: "DeepSeek Account",
     kiro_oauth: "Kiro OAuth",
+    amazon_q_oauth: "Amazon Q Developer",
     cursor_oauth: "Cursor OAuth",
     cursor_apikey: "Cursor API Key",
     antigravity_oauth: "Antigravity OAuth",
@@ -53,6 +54,8 @@ export function providerLabel(providerType: string): string {
     aws_bedrock: "AWS Bedrock",
     nvidia: "Nvidia",
     deepseek_api: "DeepSeek API Key",
+    kimi_code: "Kimi OAuth",
+    qoder_cosy: "Qoder OAuth",
   };
   return labels[providerType] || providerType.replace(/_/g, " ");
 }

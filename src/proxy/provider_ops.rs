@@ -173,6 +173,12 @@ impl ProviderExecution {
             UpstreamProtocol::GeminiNative => Some("gemini_native"),
             UpstreamProtocol::Special => match self.plan.driver_id.as_str() {
                 "special.cursor" | "special.copilot" | "special.qoder_cosy" => Some("openai_chat"),
+                "special.grok_web_session" | "special.perplexity_web_session" => {
+                    Some(match self.plan.provider_key.app {
+                        AppKind::Claude => "anthropic",
+                        AppKind::Codex | AppKind::Gemini => "openai_chat",
+                    })
+                }
                 "special.antigravity" | "special.agy" => Some("gemini_native"),
                 "oauth.kimi_code" => Some(match self.plan.provider_key.app {
                     AppKind::Claude => "anthropic",
@@ -1111,6 +1117,12 @@ fn static_auth(
 }
 
 fn static_credential_slot_allowed(execution: &ProviderExecution, slot: &str) -> bool {
+    if matches!(
+        execution.plan.driver_id.as_str(),
+        "special.grok_web_session" | "special.perplexity_web_session"
+    ) {
+        return slot == crate::domain::providers::web_session::WEB_SESSION_CREDENTIAL_SLOT;
+    }
     if slot == "/settingsConfig/apiKey" {
         return true;
     }
@@ -2950,7 +2962,7 @@ mod tests {
                 0,
             );
             assert_eq!(execution.plan.driver_id.as_str(), "oauth.kimi_code");
-            assert_eq!(execution.plan.driver_contract_revision, 2);
+            assert_eq!(execution.plan.driver_contract_revision, 3);
             assert_eq!(execution.plan.upstream_protocol, UpstreamProtocol::Special);
             assert_eq!(
                 execution.managed_account_identity_target(),

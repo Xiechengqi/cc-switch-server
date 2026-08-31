@@ -1,22 +1,64 @@
 use super::pow::{solve_and_build_header, DeepSeekPowChallenge};
+use futures_util::StreamExt;
 use reqwest::{header::HeaderMap, Client, Response};
 use serde_json::Value;
+use std::time::Duration;
 use thiserror::Error;
 
-const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
+pub(crate) const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
+const DEEPSEEK_WEB_ORIGIN: &str = "https://chat.deepseek.com";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const COMPLETION_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONTROL_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum DeepSeekClientError {
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("api error: {0}")]
-    Api(String),
+    #[error("DeepSeek {operation} network error: {message}")]
+    Network {
+        operation: &'static str,
+        message: String,
+    },
+    #[error("DeepSeek {operation} returned HTTP {status_code}: {message}")]
+    Upstream {
+        operation: &'static str,
+        status_code: u16,
+        message: String,
+    },
+    #[error("DeepSeek {operation} protocol error: {message}")]
+    Protocol {
+        operation: &'static str,
+        message: String,
+    },
 }
 
-impl From<reqwest::Error> for DeepSeekClientError {
-    fn from(error: reqwest::Error) -> Self {
-        Self::Network(error.to_string())
+impl DeepSeekClientError {
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Upstream { status_code, .. } => Some(*status_code),
+            Self::Network { .. } | Self::Protocol { .. } => None,
+        }
     }
+
+    pub fn is_authentication_failure(&self) -> bool {
+        matches!(self.status_code(), Some(401 | 403))
+    }
+
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Network { operation, .. }
+            | Self::Upstream { operation, .. }
+            | Self::Protocol { operation, .. } => operation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepSeekCompletionRequest<'a> {
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub thinking_enabled: bool,
+    pub search_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -27,13 +69,19 @@ pub struct DeepSeekWebClient {
 
 impl DeepSeekWebClient {
     pub fn new() -> Self {
-        Self::with_api_base("https://chat.deepseek.com")
+        let http = crate::infra::http::direct_client_builder()
+            .build()
+            .unwrap_or_else(|_| {
+                crate::infra::http::direct_client().expect("default direct HTTP client must build")
+            });
+        Self::with_http_client_and_api_base(http, DEEPSEEK_WEB_ORIGIN)
     }
 
     pub fn with_http_client(http: Client) -> Self {
-        Self::with_http_client_and_api_base(http, "https://chat.deepseek.com")
+        Self::with_http_client_and_api_base(http, DEEPSEEK_WEB_ORIGIN)
     }
 
+    #[cfg(test)]
     pub fn with_api_base(api_base: impl Into<String>) -> Self {
         let http = crate::infra::http::direct_client_builder()
             .build()
@@ -43,11 +91,16 @@ impl DeepSeekWebClient {
         Self::with_http_client_and_api_base(http, api_base)
     }
 
-    fn with_http_client_and_api_base(http: Client, api_base: impl Into<String>) -> Self {
-        Self {
-            http,
-            api_base: api_base.into().trim_end_matches('/').to_string(),
-        }
+    pub(crate) fn with_http_client_and_api_base(http: Client, api_base: impl Into<String>) -> Self {
+        let requested = api_base.into().trim_end_matches('/').to_string();
+        #[cfg(test)]
+        let api_base = requested;
+        #[cfg(not(test))]
+        let api_base = {
+            let _ = requested;
+            DEEPSEEK_WEB_ORIGIN.to_string()
+        };
+        Self { http, api_base }
     }
 
     pub async fn start_completion(
@@ -58,11 +111,21 @@ impl DeepSeekWebClient {
     ) -> Result<Response, DeepSeekClientError> {
         let session_id = self.create_session(token).await?;
         let pow = self.create_pow_header(token).await?;
-        self.completion(token, &session_id, &pow, model, prompt)
-            .await
+        self.completion(
+            token,
+            &pow,
+            DeepSeekCompletionRequest {
+                session_id: &session_id,
+                model,
+                prompt,
+                thinking_enabled: false,
+                search_enabled: false,
+            },
+        )
+        .await
     }
 
-    async fn create_session(&self, token: &str) -> Result<String, DeepSeekClientError> {
+    pub(crate) async fn create_session(&self, token: &str) -> Result<String, DeepSeekClientError> {
         let value = self
             .post_json(
                 &format!("{}/api/v0/chat_session/create", self.api_base),
@@ -71,11 +134,16 @@ impl DeepSeekWebClient {
             )
             .await?;
         ensure_ok(&value, "create_session")?;
-        extract_session_id(&value)
-            .ok_or_else(|| DeepSeekClientError::Api("create_session missing id".to_string()))
+        extract_session_id(&value).ok_or_else(|| DeepSeekClientError::Protocol {
+            operation: "create_session",
+            message: "response is missing a session id".to_string(),
+        })
     }
 
-    async fn create_pow_header(&self, token: &str) -> Result<String, DeepSeekClientError> {
+    pub(crate) async fn create_pow_header(
+        &self,
+        token: &str,
+    ) -> Result<String, DeepSeekClientError> {
         let value = self
             .post_json(
                 &format!("{}/api/v0/chat/create_pow_challenge", self.api_base),
@@ -86,33 +154,57 @@ impl DeepSeekWebClient {
         ensure_ok(&value, "create_pow")?;
         let challenge_value = value
             .pointer("/data/biz_data/challenge")
-            .ok_or_else(|| DeepSeekClientError::Api("create_pow missing challenge".to_string()))?
+            .ok_or_else(|| DeepSeekClientError::Protocol {
+                operation: "create_pow",
+                message: "response is missing a challenge".to_string(),
+            })?
             .clone();
-        let challenge: DeepSeekPowChallenge = serde_json::from_value(challenge_value)
-            .map_err(|error| DeepSeekClientError::Api(error.to_string()))?;
+        let challenge: DeepSeekPowChallenge =
+            serde_json::from_value(challenge_value).map_err(|error| {
+                DeepSeekClientError::Protocol {
+                    operation: "create_pow",
+                    message: error.to_string(),
+                }
+            })?;
         solve_and_build_header(&challenge)
             .await
-            .map_err(|error| DeepSeekClientError::Api(error.to_string()))
+            .map_err(|error| DeepSeekClientError::Protocol {
+                operation: "create_pow",
+                message: error.to_string(),
+            })
     }
 
-    async fn completion(
+    pub(crate) async fn completion(
         &self,
         token: &str,
-        session_id: &str,
         pow_header: &str,
-        model: &str,
-        prompt: &str,
+        request: DeepSeekCompletionRequest<'_>,
     ) -> Result<Response, DeepSeekClientError> {
-        let payload = completion_payload(session_id, model, prompt);
-        Ok(self
+        let payload = completion_payload(&request);
+        let response = self
             .http
             .post(format!("{}/api/v0/chat/completion", self.api_base))
             .headers(deepseek_base_headers())
             .bearer_auth(token)
             .header("x-ds-pow-response", pow_header)
             .json(&payload)
+            .timeout(COMPLETION_HEADER_TIMEOUT)
             .send()
-            .await?)
+            .await
+            .map_err(|error| DeepSeekClientError::Network {
+                operation: "completion",
+                message: error.to_string(),
+            })?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > 64 * 1024 * 1024)
+        {
+            return Err(DeepSeekClientError::Protocol {
+                operation: "completion",
+                message: "declared response body exceeds 64 MiB".to_string(),
+            });
+        }
+        Ok(response)
     }
 
     async fn post_json(
@@ -127,16 +219,27 @@ impl DeepSeekWebClient {
             .headers(deepseek_base_headers())
             .bearer_auth(token)
             .json(payload)
+            .timeout(REQUEST_TIMEOUT)
             .send()
-            .await?;
+            .await
+            .map_err(|error| DeepSeekClientError::Network {
+                operation: control_operation(url),
+                message: error.to_string(),
+            })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let operation = control_operation(url);
+        let body = read_bounded_body(resp, operation).await?;
         if !status.is_success() {
-            return Err(DeepSeekClientError::Api(format!(
-                "{url} returned HTTP {status}: {body}"
-            )));
+            return Err(DeepSeekClientError::Upstream {
+                operation,
+                status_code: status.as_u16(),
+                message: sanitized_upstream_message(&body),
+            });
         }
-        serde_json::from_str(&body).map_err(|error| DeepSeekClientError::Api(error.to_string()))
+        serde_json::from_slice(&body).map_err(|error| DeepSeekClientError::Protocol {
+            operation,
+            message: format!("response is not valid JSON: {error}"),
+        })
     }
 }
 
@@ -193,9 +296,14 @@ fn ensure_ok(value: &Value, op: &str) -> Result<(), DeepSeekClientError> {
         .or_else(|| value.get("msg"))
         .and_then(Value::as_str)
         .unwrap_or("unknown error");
-    Err(DeepSeekClientError::Api(format!(
-        "{op} failed: code={code} biz_code={biz_code} msg={msg}"
-    )))
+    Err(DeepSeekClientError::Protocol {
+        operation: match op {
+            "create_session" => "create_session",
+            "create_pow" => "create_pow",
+            _ => "control",
+        },
+        message: format!("code={code} biz_code={biz_code} msg={msg}"),
+    })
 }
 
 fn extract_session_id(value: &Value) -> Option<String> {
@@ -208,16 +316,68 @@ fn extract_session_id(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn completion_payload(session_id: &str, model: &str, prompt: &str) -> Value {
+fn completion_payload(request: &DeepSeekCompletionRequest<'_>) -> Value {
     serde_json::json!({
-        "chat_session_id": session_id,
+        "chat_session_id": request.session_id,
         "parent_message_id": null,
-        "prompt": prompt,
+        "prompt": request.prompt,
         "ref_file_ids": [],
-        "thinking_enabled": false,
-        "search_enabled": false,
-        "model_type": model_type(model),
+        "thinking_enabled": request.thinking_enabled,
+        "search_enabled": request.search_enabled,
+        "preempt": false,
+        "model_type": model_type(request.model),
     })
+}
+
+fn control_operation(url: &str) -> &'static str {
+    if url.ends_with("/chat_session/create") {
+        "create_session"
+    } else if url.ends_with("/chat/create_pow_challenge") {
+        "create_pow"
+    } else {
+        "control"
+    }
+}
+
+async fn read_bounded_body(
+    response: Response,
+    operation: &'static str,
+) -> Result<Vec<u8>, DeepSeekClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CONTROL_BODY_BYTES as u64)
+    {
+        return Err(DeepSeekClientError::Protocol {
+            operation,
+            message: "declared response body exceeds 1 MiB".to_string(),
+        });
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| DeepSeekClientError::Network {
+            operation,
+            message: error.to_string(),
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_CONTROL_BODY_BYTES {
+            return Err(DeepSeekClientError::Protocol {
+                operation,
+                message: "response body exceeds 1 MiB".to_string(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn sanitized_upstream_message(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    if text.is_empty() {
+        "empty error response".to_string()
+    } else {
+        text.chars().take(1_024).collect()
+    }
 }
 
 fn model_type(model: &str) -> &'static str {
@@ -245,7 +405,7 @@ mod tests {
 
     fn solvable_pow_challenge() -> DeepSeekPowChallenge {
         let salt = "cc_switch_test";
-        let expire_at = 1_700_000_000_i64;
+        let expire_at = chrono::Utc::now().timestamp() + 60;
         let answer = 42_i64;
         let digest = deepseek_hash_v1(format!("{salt}_{expire_at}_{answer}").as_bytes());
         DeepSeekPowChallenge {
@@ -253,7 +413,8 @@ mod tests {
             challenge: hex::encode(digest),
             salt: salt.to_string(),
             expire_at,
-            difficulty: 0,
+            difficulty: answer + 1,
+            expire_after: Some(60),
             signature: "test-signature".to_string(),
             target_path: COMPLETION_TARGET_PATH.to_string(),
         }

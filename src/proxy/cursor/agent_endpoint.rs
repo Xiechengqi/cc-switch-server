@@ -261,7 +261,12 @@ fn required_bytes_field(payload: &[u8], field_number: u64) -> Result<Option<&[u8
             continue;
         }
         match field.value {
-            FieldValue::Bytes(value) => found = Some(value),
+            FieldValue::Bytes(value) => {
+                if found.is_some() {
+                    return Err(format!("protobuf field {field_number} is duplicated"));
+                }
+                found = Some(value);
+            }
             _ => {
                 return Err(format!(
                     "protobuf field {field_number} has the wrong wire type"
@@ -352,6 +357,28 @@ mod tests {
         ] {
             assert!(parse_cursor_agent_urls(&payload).is_err());
         }
+
+        let duplicate_config = concat_bytes(&[
+            server_config(
+                "https://agent.us.api5.cursor.sh",
+                "https://agentn.us.api5.cursor.sh",
+            ),
+            server_config(
+                "https://agent.eu.api5.cursor.sh",
+                "https://agentn.eu.api5.cursor.sh",
+            ),
+        ]);
+        assert!(parse_cursor_agent_urls(&duplicate_config).is_err());
+
+        let duplicate_agent_url = encode_message(
+            AGENT_URL_CONFIG_FIELD,
+            &[
+                encode_string(AGENT_URL_FIELD, "https://agent.us.api5.cursor.sh"),
+                encode_string(AGENT_URL_FIELD, "https://agent.eu.api5.cursor.sh"),
+                encode_string(AGENTN_URL_FIELD, "https://agentn.us.api5.cursor.sh"),
+            ],
+        );
+        assert!(parse_cursor_agent_urls(&duplicate_agent_url).is_err());
     }
 
     #[tokio::test]

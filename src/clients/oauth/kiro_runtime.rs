@@ -15,6 +15,7 @@ const IDE_METADATA_URL: &str =
     "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json";
 const MODEL_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 const STALE_MODEL_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct KiroModelCatalog {
@@ -22,6 +23,7 @@ pub struct KiroModelCatalog {
     pub source: &'static str,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
+    failure_status: Option<reqwest::StatusCode>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,11 +34,44 @@ struct CachedModels {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct ModelCacheKey {
+    app: String,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
     account_id: String,
     auth_identity_generation: u64,
     token_refresh_generation: u64,
     profile_scope: String,
     runtime_region: String,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct KiroModelCatalogScope {
+    app: String,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
+}
+
+impl KiroModelCatalogScope {
+    pub fn derive(
+        app: &str,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+    ) -> Self {
+        Self {
+            app: app.trim().to_string(),
+            provider_id: provider_id.trim().to_string(),
+            provider_revision,
+            runtime_fingerprint: runtime_fingerprint.trim().to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn fixture() -> Self {
+        Self::derive("claude", "kiro-fixture-provider", 1, "kiro-fixture-runtime")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -57,7 +92,7 @@ struct IdeMetadata {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AvailableModelsResponse {
-    #[serde(default)]
+    #[serde(alias = "availableModels")]
     models: Vec<AvailableModel>,
 }
 
@@ -101,6 +136,10 @@ impl KiroModelCatalog {
         self.descriptors
             .iter()
             .map(|descriptor| descriptor.model_id.as_str())
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.failure_status == Some(reqwest::StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -206,17 +245,43 @@ pub async fn effective_ide_version(http: &reqwest::Client) -> String {
     }
 }
 
+#[cfg(test)]
 pub async fn model_catalog(
     http: &reqwest::Client,
     account: &Account,
     endpoint_override: Option<&str>,
 ) -> KiroModelCatalog {
-    model_catalog_with_timeout(http, account, endpoint_override, Duration::from_secs(10)).await
+    model_catalog_scoped(
+        http,
+        account,
+        &KiroModelCatalogScope::fixture(),
+        endpoint_override,
+        Duration::from_secs(10),
+    )
+    .await
 }
 
+#[cfg(test)]
 pub async fn model_catalog_with_timeout(
     http: &reqwest::Client,
     account: &Account,
+    endpoint_override: Option<&str>,
+    request_timeout: Duration,
+) -> KiroModelCatalog {
+    model_catalog_scoped(
+        http,
+        account,
+        &KiroModelCatalogScope::fixture(),
+        endpoint_override,
+        request_timeout,
+    )
+    .await
+}
+
+pub async fn model_catalog_scoped(
+    http: &reqwest::Client,
+    account: &Account,
+    scope: &KiroModelCatalogScope,
     endpoint_override: Option<&str>,
     request_timeout: Duration,
 ) -> KiroModelCatalog {
@@ -243,6 +308,10 @@ pub async fn model_catalog_with_timeout(
         None => return unavailable_model_catalog("kiro_credential_unavailable"),
     };
     let cache_key = ModelCacheKey {
+        app: scope.app.clone(),
+        provider_id: scope.provider_id.clone(),
+        provider_revision: scope.provider_revision,
+        runtime_fingerprint: scope.runtime_fingerprint.clone(),
         account_id: account.id.clone(),
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
@@ -265,6 +334,7 @@ pub async fn model_catalog_with_timeout(
             source: "kiro_account_cache",
             stale: false,
             fetched_at_ms: Some(cached.fetched_at_ms),
+            failure_status: None,
         };
     }
 
@@ -291,11 +361,12 @@ pub async fn model_catalog_with_timeout(
                 source: "kiro_list_available_models",
                 stale: false,
                 fetched_at_ms: Some(now),
+                failure_status: None,
             }
         }
         Err(error) if error.kind == ModelDiscoveryFailureKind::Unavailable => {
             tracing::warn!(account_id = %account.id, error = %error, "Kiro model discovery rejected bound account capability");
-            unavailable_model_catalog("kiro_model_access_unavailable")
+            unavailable_model_catalog_with_status("kiro_model_access_unavailable", error.status)
         }
         Err(error) => {
             tracing::warn!(account_id = %account.id, error = %error, "Kiro model discovery failed transiently");
@@ -314,22 +385,32 @@ pub async fn model_catalog_with_timeout(
                     source: "kiro_account_cache",
                     stale: true,
                     fetched_at_ms: Some(cached.fetched_at_ms),
+                    failure_status: None,
                 }
             } else {
-                static_model_catalog("kiro_static_fallback")
+                unavailable_model_catalog_with_status(
+                    "kiro_model_discovery_transient_without_cache",
+                    error.status,
+                )
             }
         }
     }
 }
 
-pub(crate) async fn cached_model_descriptor(
+#[cfg(test)]
+async fn cached_model_descriptor(
     account: &Account,
+    scope: &KiroModelCatalogScope,
     model_id: &str,
 ) -> Option<Option<KiroModelDescriptor>> {
     let now = now_ms().min(i64::MAX as u128) as i64;
     let identity =
         crate::domain::providers::kiro::operational_runtime_identity_from_account(account).ok()?;
     let cache_key = ModelCacheKey {
+        app: scope.app.clone(),
+        provider_id: scope.provider_id.clone(),
+        provider_revision: scope.provider_revision,
+        runtime_fingerprint: scope.runtime_fingerprint.clone(),
         account_id: account.id.clone(),
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
@@ -369,15 +450,24 @@ pub fn static_model_catalog(source: &'static str) -> KiroModelCatalog {
         source,
         stale: true,
         fetched_at_ms: None,
+        failure_status: None,
     }
 }
 
 pub fn unavailable_model_catalog(source: &'static str) -> KiroModelCatalog {
+    unavailable_model_catalog_with_status(source, None)
+}
+
+fn unavailable_model_catalog_with_status(
+    source: &'static str,
+    failure_status: Option<reqwest::StatusCode>,
+) -> KiroModelCatalog {
     KiroModelCatalog {
         descriptors: Vec::new(),
         source,
         stale: false,
         fetched_at_ms: None,
+        failure_status,
     }
 }
 
@@ -558,12 +648,19 @@ async fn fetch_models_request(
             },
         );
     }
-    let payload = response
-        .json::<AvailableModelsResponse>()
-        .await
-        .map_err(|_| {
-            ModelDiscoveryFailure::transient("model discovery response was not valid JSON")
-        })?;
+    let payload = response.bytes().await.map_err(|error| {
+        ModelDiscoveryFailure::transient(format!("model discovery response body failed: {error}"))
+    })?;
+    if payload.len() > MAX_MODEL_CATALOG_BYTES {
+        return Err(ModelDiscoveryFailure::unavailable(format!(
+            "model discovery response exceeded {MAX_MODEL_CATALOG_BYTES} bytes"
+        )));
+    }
+    let payload = serde_json::from_slice::<AvailableModelsResponse>(&payload).map_err(|_| {
+        ModelDiscoveryFailure::unavailable(
+            "model discovery response did not satisfy the models contract",
+        )
+    })?;
     let models = payload
         .models
         .into_iter()
@@ -781,6 +878,10 @@ mod tests {
         assert_eq!(
             discovery["cacheScope"],
             json!([
+                "app",
+                "provider_id",
+                "provider_revision",
+                "runtime_fingerprint",
                 "account_id",
                 "auth_identity_generation",
                 "token_refresh_generation",
@@ -794,8 +895,14 @@ mod tests {
         assert_eq!(discovery["crossAccountUnion"], false);
         assert_eq!(
             discovery["fallbackEligibility"],
-            "validated_identity_and_credential_after_upstream_failure_only"
+            "network_timeout_408_429_5xx_only"
         );
+        assert_eq!(discovery["staticFallbackAllowed"], false);
+        assert_eq!(
+            discovery["malformedSuccessPolicy"],
+            "fail_closed_without_stale"
+        );
+        assert_eq!(discovery["sameAccount401Replay"], 1);
         assert_eq!(
             discovery["unresolvedIdentityPolicy"],
             json!({
@@ -1012,6 +1119,158 @@ mod tests {
                 "Bearer account-a-generation-2-token"
             ]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_isolated_by_provider_runtime_scope() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app =
+            axum::Router::new().route(
+                "/models",
+                axum::routing::get(move || {
+                    let request =
+                        requests_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    async move {
+                        axum::Json(json!({"models": [{"modelId": format!("model-{request}")}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-runtime-scope-{}", crate::infra::time::now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 3,
+            "tokenRefreshGeneration": 5,
+            "accessToken": "scope-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/scope"
+            }
+        }))
+        .unwrap();
+        let endpoint = format!("http://{address}/models");
+        let scope_a = KiroModelCatalogScope::derive("claude", "provider-a", 1, "runtime-a");
+        let scope_b = KiroModelCatalogScope::derive("claude", "provider-b", 1, "runtime-b");
+        let http = reqwest::Client::new();
+
+        let first_a = model_catalog_scoped(
+            &http,
+            &account,
+            &scope_a,
+            Some(&endpoint),
+            Duration::from_secs(2),
+        )
+        .await;
+        let first_b = model_catalog_scoped(
+            &http,
+            &account,
+            &scope_b,
+            Some(&endpoint),
+            Duration::from_secs(2),
+        )
+        .await;
+        let cached_a = model_catalog_scoped(
+            &http,
+            &account,
+            &scope_a,
+            Some(&endpoint),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(first_a.model_ids().collect::<Vec<_>>(), ["model-1"]);
+        assert_eq!(first_b.model_ids().collect::<Vec<_>>(), ["model-2"]);
+        assert_eq!(cached_a.model_ids().collect::<Vec<_>>(), ["model-1"]);
+        assert_eq!(cached_a.source, "kiro_account_cache");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_success_does_not_reuse_same_scope_stale_catalog() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/good",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"models": [{"modelId": "good-model"}]}))
+                }),
+            )
+            .route(
+                "/malformed",
+                axum::routing::get(|| async { axum::Json(json!({"unexpected": []})) }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-malformed-scope-{}", crate::infra::time::now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "malformed-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/malformed"
+            }
+        }))
+        .unwrap();
+        let scope = KiroModelCatalogScope::derive("codex", "provider", 9, "runtime");
+        let http = reqwest::Client::new();
+        let good = model_catalog_scoped(
+            &http,
+            &account,
+            &scope,
+            Some(&format!("http://{address}/good")),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(good.model_ids().collect::<Vec<_>>(), ["good-model"]);
+
+        let identity =
+            crate::domain::providers::kiro::operational_runtime_identity_from_account(&account)
+                .unwrap();
+        let key = ModelCacheKey {
+            app: scope.app.clone(),
+            provider_id: scope.provider_id.clone(),
+            provider_revision: scope.provider_revision,
+            runtime_fingerprint: scope.runtime_fingerprint.clone(),
+            account_id: account.id.clone(),
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            profile_scope: identity.profile_arn.unwrap(),
+            runtime_region: identity.runtime_region,
+        };
+        CACHE
+            .lock()
+            .await
+            .models
+            .get_mut(&key)
+            .unwrap()
+            .fetched_at_ms =
+            (now_ms().min(i64::MAX as u128) as i64).saturating_sub(MODEL_CACHE_TTL_MS);
+
+        let malformed = model_catalog_scoped(
+            &http,
+            &account,
+            &scope,
+            Some(&format!("http://{address}/malformed")),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(malformed.descriptors.is_empty());
+        assert_eq!(malformed.source, "kiro_model_access_unavailable");
+        assert!(!malformed.stale);
         server.abort();
     }
 
@@ -1241,12 +1500,12 @@ mod tests {
             Some(&format!("http://{address}/transient")),
         )
         .await;
+        assert!(transient.descriptors.is_empty());
         assert_eq!(
-            transient.model_ids().collect::<Vec<_>>(),
-            crate::domain::providers::kiro::STATIC_MODEL_IDS
+            transient.source,
+            "kiro_model_discovery_transient_without_cache"
         );
-        assert_eq!(transient.source, "kiro_static_fallback");
-        assert!(transient.stale);
+        assert!(!transient.stale);
         server.abort();
     }
 
@@ -1267,7 +1526,12 @@ mod tests {
         let identity =
             crate::domain::providers::kiro::operational_runtime_identity_from_account(&account)
                 .unwrap();
+        let scope = KiroModelCatalogScope::fixture();
         let key = ModelCacheKey {
+            app: scope.app.clone(),
+            provider_id: scope.provider_id.clone(),
+            provider_revision: scope.provider_revision,
+            runtime_fingerprint: scope.runtime_fingerprint.clone(),
             account_id: account.id.clone(),
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
@@ -1291,7 +1555,7 @@ mod tests {
         );
 
         assert_eq!(
-            cached_model_descriptor(&account, "expired-model").await,
+            cached_model_descriptor(&account, &scope, "expired-model").await,
             None
         );
     }

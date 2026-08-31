@@ -1,0 +1,95 @@
+{
+  "format": "cc-switch-web-session-registry",
+  "schemaVersion": 1,
+  "rail": {
+    "id": "web_session",
+    "credentialSlot": "/settingsConfig/webSession/cookie",
+    "credentialOwnership": "provider_owned",
+    "maxCredentialBytes": 16384,
+    "maxCookiePairs": 16,
+    "redirectPolicy": "disabled",
+    "cookieJarPolicy": "disabled",
+    "crossOriginPolicy": "disabled",
+    "downstreamSetCookiePolicy": "drop",
+    "authRecovery": "explicit_reimport_only",
+    "accountBindingAllowed": false,
+    "apiKeySlotAllowed": false,
+    "extraHeadersAllowed": false
+  },
+  "profiles": [
+    {
+      "profileId": "web_session.grok_web",
+      "providerId": "grok-web",
+      "label": "Grok Web Session",
+      "fixedOrigin": "https://grok.com",
+      "method": "POST",
+      "path": "/rest/app-chat/conversations/new",
+      "cookieRules": [
+        {"kind": "exact", "name": "sso", "family": "grok_sso"},
+        {"kind": "exact", "name": "sso-rw", "family": "grok_sso_write"},
+        {"kind": "exact", "name": "cf_clearance", "family": "cloudflare_clearance"},
+        {"kind": "exact", "name": "__cf_bm", "family": "cloudflare_bot_management"}
+      ],
+      "requiredCookieFamilies": ["grok_sso"],
+      "csrfPolicy": "none_observed",
+      "sessionRefreshPolicy": "explicit_reimport_only",
+      "terminal": {
+        "format": "ndjson",
+        "upstreamTerminal": "model_response_then_explicit_eof",
+        "downstreamTerminal": "[DONE]",
+        "eofWithoutTerminalIsError": true
+      },
+      "requestBodyLimitBytes": 1048576,
+      "responseBodyLimitBytes": 8388608,
+      "visibility": "hidden",
+      "maturity": "experimental",
+      "risk": "high",
+      "implementationState": "implemented",
+      "fixtureState": "fixture_verified",
+      "liveState": "live_pending",
+      "evidenceRefs": [
+        "omniroute:open-sse/config/providers/registry/grok-web/index.ts",
+        "omniroute:open-sse/executors/grok-web.ts",
+        "omniroute:src/lib/providers/webCookieAuth.ts",
+        "9router:open-sse/providers/registry/grok-web.js",
+        "9router:open-sse/executors/grok-web.js"
+      ]
+    },
+    {
+      "profileId": "web_session.perplexity_web",
+      "providerId": "perplexity-web",
+      "label": "Perplexity Web Session",
+      "fixedOrigin": "https://www.perplexity.ai",
+      "method": "POST",
+      "path": "/rest/sse/perplexity_ask",
+      "cookieRules": [
+        {"kind": "exact", "name": "__Secure-next-auth.session-token", "family": "next_auth_session_token"},
+        {"kind": "numeric_suffix", "prefix": "__Secure-next-auth.session-token.", "family": "next_auth_session_token", "maxIndex": 15}
+      ],
+      "requiredCookieFamilies": ["next_auth_session_token"],
+      "csrfPolicy": "none_observed",
+      "sessionRefreshPolicy": "explicit_reimport_only",
+      "terminal": {
+        "format": "sse",
+        "upstreamTerminal": "COMPLETED_then_event_end_of_stream",
+        "downstreamTerminal": "[DONE]",
+        "eofWithoutTerminalIsError": true
+      },
+      "requestBodyLimitBytes": 1048576,
+      "responseBodyLimitBytes": 8388608,
+      "visibility": "hidden",
+      "maturity": "experimental",
+      "risk": "high",
+      "implementationState": "implemented",
+      "fixtureState": "fixture_verified",
+      "liveState": "live_pending",
+      "evidenceRefs": [
+        "omniroute:open-sse/config/providers/registry/perplexity/web/index.ts",
+        "omniroute:open-sse/executors/perplexity-web.ts",
+        "omniroute:open-sse/executors/perplexity-web/protocol.ts",
+        "9router:open-sse/providers/registry/perplexity-web.js",
+        "9router:open-sse/executors/perplexity-web.js"
+      ]
+    }
+  ]
+}

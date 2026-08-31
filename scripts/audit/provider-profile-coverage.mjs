@@ -22,8 +22,8 @@ export const serverCompatibilityProviderTypes = Object.freeze([
   ["nvidia", "Nvidia OpenAI-compatible API", ["claude", "codex"]],
   ["deepseek_api", "DeepSeek API key", ["claude", "codex"]],
   ["grok_oauth", "Grok/xAI OAuth reverse proxy", ["claude", "codex", "gemini"]],
-  ["kimi_code", "Kimi Code OAuth", ["claude", "codex", "gemini"]],
-  ["qoder_cosy", "Qoder COSY", ["claude", "codex", "gemini"]],
+  ["kimi_code", "Kimi OAuth", ["claude", "codex", "gemini"]],
+  ["qoder_cosy", "Qoder OAuth", ["claude", "codex", "gemini"]],
 ]);
 
 export function requiredProviderProfilePairs() {

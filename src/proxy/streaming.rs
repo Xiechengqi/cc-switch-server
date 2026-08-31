@@ -7,6 +7,7 @@ use crate::domain::usage::store::{
     usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
 };
 
+use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
 use super::ProxyError;
 
 const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -109,7 +110,7 @@ impl ResponsesSseAggregationError {
 
 #[derive(Debug)]
 pub struct ResponsesSseAggregator {
-    decoder: JsonStreamEventDecoder,
+    decoder: ResponsesTransportDecoder,
     response: Option<Value>,
     response_bytes: usize,
     output_items: BTreeMap<u64, Value>,
@@ -131,6 +132,22 @@ enum JsonStreamMode {
 struct JsonStreamEvent {
     event: Option<String>,
     value: Value,
+}
+
+fn responses_aggregation_events(items: Vec<ResponsesTransportItem>) -> Vec<JsonStreamEvent> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            ResponsesTransportItem::Json {
+                declared_event,
+                value,
+            } => Some(JsonStreamEvent {
+                event: declared_event,
+                value,
+            }),
+            ResponsesTransportItem::Done | ResponsesTransportItem::Liveness(_) => None,
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -491,7 +508,10 @@ impl ResponsesSseAggregator {
 
     fn with_limits(max_event_bytes: usize, max_retained_bytes: usize) -> Self {
         Self {
-            decoder: JsonStreamEventDecoder::new(max_event_bytes),
+            decoder: ResponsesTransportDecoder::new(
+                max_event_bytes.min(2 * 1024 * 1024),
+                max_event_bytes,
+            ),
             response: None,
             response_bytes: 0,
             output_items: BTreeMap::new(),
@@ -504,7 +524,11 @@ impl ResponsesSseAggregator {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), ResponsesSseAggregationError> {
-        let events = self.decoder.push(chunk).map_err(stream_aggregation_error)?;
+        let events = responses_aggregation_events(
+            self.decoder
+                .push(chunk)
+                .map_err(stream_aggregation_transport_error)?,
+        );
         self.process_events(events)
     }
 
@@ -514,7 +538,11 @@ impl ResponsesSseAggregator {
 
     pub fn finish(mut self) -> Result<ResponsesSseAggregation, ResponsesSseAggregationError> {
         if !self.is_terminal() {
-            let events = self.decoder.finish().map_err(stream_aggregation_error)?;
+            let events = responses_aggregation_events(
+                self.decoder
+                    .finish()
+                    .map_err(stream_aggregation_transport_error)?,
+            );
             self.process_events(events)?;
         }
         if !self.is_terminal() {
@@ -575,16 +603,21 @@ impl ResponsesSseAggregator {
                     return Err(stream_terminal_error(&event.value));
                 }
                 "error" => self.last_error = Some(event.value),
-                _ => match event.value.get("status").and_then(Value::as_str) {
-                    Some("completed") => self.retain_terminal_response(event.value, "completed")?,
-                    Some("incomplete") => {
-                        self.retain_terminal_response(event.value, "incomplete")?
+                _ if event_type.is_empty() => {
+                    match event.value.get("status").and_then(Value::as_str) {
+                        Some("completed") => {
+                            self.retain_terminal_response(event.value, "completed")?
+                        }
+                        Some("incomplete") => {
+                            self.retain_terminal_response(event.value, "incomplete")?
+                        }
+                        Some("failed" | "cancelled" | "canceled") => {
+                            return Err(stream_terminal_error(&event.value));
+                        }
+                        _ => {}
                     }
-                    Some("failed" | "cancelled" | "canceled") => {
-                        return Err(stream_terminal_error(&event.value));
-                    }
-                    _ => {}
-                },
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -869,6 +902,22 @@ fn stream_aggregation_error(error: String) -> ResponsesSseAggregationError {
         ResponsesSseAggregationErrorKind::ParseError,
         ProxyError::bad_gateway(format!("invalid OpenAI Responses stream: {error}")),
     )
+}
+
+fn stream_aggregation_transport_error(
+    error: super::responses_transport::ResponsesTransportError,
+) -> ResponsesSseAggregationError {
+    if error.is_capacity() {
+        ResponsesSseAggregationError::new(
+            ResponsesSseAggregationErrorKind::Capacity,
+            ProxyError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                message: format!("invalid OpenAI Responses stream: {error}"),
+            },
+        )
+    } else {
+        stream_aggregation_error(error.to_string())
+    }
 }
 
 fn stream_terminal_error(value: &Value) -> ResponsesSseAggregationError {
@@ -1211,6 +1260,31 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let error = oversized.push(event.as_bytes()).unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn responses_aggregator_preserves_transport_capacity_classification() {
+        let mut aggregator = ResponsesSseAggregator::with_limits(16, 1024);
+        let error = aggregator.push(b"data: 12345678901").unwrap_err();
+
+        assert_eq!(error.kind, ResponsesSseAggregationErrorKind::Capacity);
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn responses_aggregator_does_not_promote_non_terminal_event_status() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(
+                br#"{"type":"response.done","status":"completed","response":{"status":"completed"}}"#,
+            )
+            .unwrap();
+
+        let error = aggregator.finish().unwrap_err();
+        assert_eq!(
+            error.kind,
+            ResponsesSseAggregationErrorKind::MissingTerminal
+        );
     }
 
     #[test]

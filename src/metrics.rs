@@ -105,6 +105,15 @@ pub fn record_responses_downstream_keepalive(surface: &'static str) {
     .increment(1);
 }
 
+pub fn record_responses_sse_transport(surface: &'static str, observation: &'static str) {
+    metrics::counter!(
+        "cc_switch_responses_sse_transport_total",
+        "surface" => surface,
+        "observation" => observation
+    )
+    .increment(1);
+}
+
 pub fn set_previous_response_cache_stats(stats: &PreviousResponseCacheStats) {
     for (name, value) in [
         ("current_entries", stats.current_entries as f64),
@@ -447,6 +456,14 @@ pub fn record_reasoning_bridge(direction: &'static str, outcome: &'static str) {
     .increment(1);
 }
 
+pub fn record_kimi_thinking_replay(outcome: &'static str, count: u64) {
+    metrics::counter!(
+        "cc_switch_kimi_thinking_replay_total",
+        "outcome" => outcome
+    )
+    .increment(count);
+}
+
 pub fn record_proxy_semantic_guard(surface: &'static str, observation: &'static str) {
     metrics::counter!(
         "cc_switch_proxy_semantic_guard_total",
@@ -618,8 +635,16 @@ fn describe() {
         "Authenticated cross-protocol reasoning envelope operations"
     );
     metrics::describe_counter!(
+        "cc_switch_kimi_thinking_replay_total",
+        "Kimi signed-thinking replay cache outcomes without tenant identifiers"
+    );
+    metrics::describe_counter!(
         "cc_switch_proxy_semantic_guard_total",
         "Bounded Responses semantic classifications at downstream commit boundaries"
+    );
+    metrics::describe_counter!(
+        "cc_switch_responses_sse_transport_total",
+        "Bounded OpenAI Responses SSE normalization and liveness classifications"
     );
 }
 

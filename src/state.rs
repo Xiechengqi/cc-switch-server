@@ -20,6 +20,7 @@ use crate::cli::Cli;
 use crate::clients::coding_plan_quota::{
     build_coding_plan_quota_client, fetch_coding_plan_quota, CodingPlanQuotaCredentials,
 };
+use crate::clients::oauth::amazon_q_device::{AmazonQDeviceFlowStore, PendingAmazonQDeviceFlow};
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
@@ -59,6 +60,12 @@ use crate::clients::router::tunnel::{
     self, ActivateTunnelFn, LeaseFn, RenewLeaseFn, TunnelLeaseRequest, TunnelRenewalError,
     TunnelStateFn, TunnelSupervisor,
 };
+use crate::domain::accounts::capability_evidence::{
+    record_observation_drafts, AccountCapabilityObservationDraft,
+    AccountCapabilityObservationState, CLAUDE_QUOTA_FAMILY_DIMENSION,
+    GEMINI_QUOTA_FAMILY_DIMENSION, GPT_QUOTA_FAMILY_DIMENSION, MODEL_CAPACITY_DIMENSION,
+    MODEL_CATALOG_DIMENSION,
+};
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::{
     account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
@@ -67,9 +74,9 @@ use crate::domain::accounts::managers::{
 };
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    active_account_usage_block, effective_codex_workspace_id, gemini_v1internal_project_id,
-    native_refresh_snapshot_matches, Account, AccountRefreshUpdate, AccountStore,
-    ManualSubscriptionExpiryError,
+    active_account_capacity_pool_limit, active_account_usage_block, effective_codex_workspace_id,
+    gemini_v1internal_project_id, native_refresh_snapshot_matches, Account,
+    AccountCapacityPoolLimit, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
@@ -748,6 +755,7 @@ pub struct ServerStateInner {
     image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
     kiro_device_flows: RwLock<KiroDeviceFlowStore>,
+    amazon_q_device_flows: RwLock<AmazonQDeviceFlowStore>,
     kimi_device_flows: RwLock<KimiDeviceFlowStore>,
     qoder_device_flows: RwLock<QoderDeviceFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
@@ -761,6 +769,9 @@ pub struct ServerStateInner {
     pub(crate) kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache,
     pub(crate) kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache,
     pub(crate) qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache,
+    pub(crate) deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache,
+    web_session_runtime: RwLock<crate::domain::providers::web_session::WebSessionRuntimeStore>,
+    web_session_http_client: RwLock<reqwest::Client>,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     managed_account_refreshes: ManagedAccountRefreshCoordinator,
     pub account_refresh_locks: AccountRefreshLocks,
@@ -887,6 +898,16 @@ impl RouterRegistrationFlight {
 
 pub type ServerState = Arc<ServerStateInner>;
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum WebSessionStateError {
+    #[error("Web Session Provider identity changed")]
+    IdentityChanged,
+    #[error("Web Session authentication requires explicit Cookie re-import")]
+    ExplicitReimportRequired,
+    #[error("invalid Web Session state: {0}")]
+    Invalid(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum ManagedAccountRefreshError {
     Conflict {
@@ -908,11 +929,10 @@ pub enum ManagedAccountRefreshError {
 fn kimi_refresh_error_is_retryable(error: &ManagedAccountRefreshError) -> bool {
     matches!(
         error,
-        ManagedAccountRefreshError::CredentialPersistenceDegraded
-            | ManagedAccountRefreshError::Refresh {
-                status_code: 429 | 500..=599,
-                ..
-            }
+        ManagedAccountRefreshError::Refresh {
+            status_code: 408 | 429 | 500..=599,
+            ..
+        }
     )
 }
 
@@ -1184,6 +1204,21 @@ enum GeminiProjectCommitSkip {
     Stale(Box<Account>),
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct BoundAccountQuotaRefreshFailure {
+    pub status_code: u16,
+    pub retryable: bool,
+    message: String,
+}
+
+impl BoundAccountQuotaRefreshFailure {
+    pub(crate) fn allows_same_generation_stale_catalog(&self) -> bool {
+        self.retryable
+            && (self.status_code == 408 || self.status_code == 429 || self.status_code >= 500)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum AccountQuotaCommitSkip {
     NotFound,
@@ -1367,7 +1402,42 @@ pub enum DeepSeekUpstreamError {
     IdentityChanged,
     CredentialPersistenceDegraded,
     MissingToken,
-    Client(String),
+    Network {
+        operation: &'static str,
+        message: String,
+    },
+    Upstream {
+        operation: &'static str,
+        status_code: u16,
+        message: String,
+    },
+    Protocol {
+        operation: &'static str,
+        message: String,
+    },
+}
+
+fn deepseek_client_runtime_error(
+    error: crate::clients::deepseek::client::DeepSeekClientError,
+) -> DeepSeekUpstreamError {
+    use crate::clients::deepseek::client::DeepSeekClientError;
+    match error {
+        DeepSeekClientError::Network { operation, message } => {
+            DeepSeekUpstreamError::Network { operation, message }
+        }
+        DeepSeekClientError::Upstream {
+            operation,
+            status_code,
+            message,
+        } => DeepSeekUpstreamError::Upstream {
+            operation,
+            status_code,
+            message,
+        },
+        DeepSeekClientError::Protocol { operation, message } => {
+            DeepSeekUpstreamError::Protocol { operation, message }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1543,6 +1613,7 @@ fn ollama_cloud_share_projection(
                     used: None,
                     limit: None,
                     unit: None,
+                    ..Default::default()
                 })
                 .collect()
         })
@@ -1993,6 +2064,34 @@ pub enum GrokVideoPlane {
     Xai,
 }
 
+impl GrokVideoPlane {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Xai => "xai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokMediaTaskKind {
+    VideoGeneration,
+}
+
+impl GrokMediaTaskKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VideoGeneration => "video_generation",
+        }
+    }
+}
+
+const fn default_grok_media_task_kind() -> GrokMediaTaskKind {
+    // Schemas v1-v3 only persisted asynchronous video-generation tasks.
+    GrokMediaTaskKind::VideoGeneration
+}
+
 const fn default_grok_video_plane() -> GrokVideoPlane {
     // Schema v1 only supported the direct api.x.ai endpoint.
     GrokVideoPlane::Xai
@@ -2002,6 +2101,8 @@ const fn default_grok_video_plane() -> GrokVideoPlane {
 #[serde(rename_all = "camelCase")]
 pub struct GrokMediaTaskBinding {
     pub task_id: String,
+    #[serde(default = "default_grok_media_task_kind")]
+    pub task_kind: GrokMediaTaskKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_request_id: Option<String>,
     pub provider_id: String,
@@ -2059,16 +2160,26 @@ impl GrokMediaTaskStore {
             .with_context(|| format!("parse Grok media task store {}", path.display()))?;
         if !matches!(
             store.schema_version,
-            1 | 2 | GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
+            1 | 2 | 3 | GROK_MEDIA_TASK_STORE_SCHEMA_VERSION
         ) {
             anyhow::bail!(
                 "unsupported Grok media task store schema version {}",
                 store.schema_version
             );
         }
-        // Version 1 had one hard-coded plane: direct api.x.ai. The serde default above is
-        // therefore an exact migration, not a guessed route. A later successful domain write
-        // persists the upgraded schema atomically through the normal snapshot path.
+        // Version 1 had one hard-coded plane: direct api.x.ai, and schemas v1-v3 only stored
+        // video-generation tasks. The serde defaults are therefore exact migrations. Schema v4
+        // also puts the complete immutable upstream identity into the owner key.
+        if store.schema_version < GROK_MEDIA_TASK_STORE_SCHEMA_VERSION {
+            let mut migrated = BTreeMap::new();
+            for binding in store.bindings.into_values() {
+                let key = grok_media_task_owner_key(&binding);
+                if migrated.insert(key, binding).is_some() {
+                    anyhow::bail!("Grok media task migration produced a duplicate owner key");
+                }
+            }
+            store.bindings = migrated;
+        }
         store.schema_version = grok_media_task_schema_version();
         for (key, binding) in &store.bindings {
             validate_grok_media_task_binding(key, binding)?;
@@ -2120,7 +2231,7 @@ impl PersistedStateSnapshot for GrokMediaTaskStore {
 }
 
 const GROK_MEDIA_TASK_STORE_FILE: &str = "grok-media-tasks.json";
-const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 3;
+const GROK_MEDIA_TASK_STORE_SCHEMA_VERSION: u32 = 4;
 const GROK_MEDIA_TASK_MAX_BINDINGS: usize = 4_096;
 const GROK_MEDIA_TASK_MAX_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -2142,14 +2253,39 @@ fn grok_media_task_user_namespace(user_identity: Option<&str>) -> String {
     format!("principal_{}", hex::encode(&digest[..16]))
 }
 
-fn grok_media_task_owner_key(share_id: &str, user_namespace: &str, task_id: &str) -> String {
+fn grok_media_task_owner_key(binding: &GrokMediaTaskBinding) -> String {
     let mut digest = Sha256::new();
-    digest.update(share_id.trim().as_bytes());
+    digest.update(binding.share_id.trim().as_bytes());
     digest.update(b"\0");
-    digest.update(user_namespace.as_bytes());
+    digest.update(binding.user_namespace.as_bytes());
     digest.update(b"\0");
-    digest.update(task_id.as_bytes());
+    digest.update(binding.task_kind.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.task_id.trim().as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.provider_id.trim().as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.account_id.trim().as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.auth_identity_generation.to_be_bytes());
+    digest.update(b"\0");
+    digest.update(binding.runtime_fingerprint.as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.upstream_plane.as_str().as_bytes());
     format!("task_{}", hex::encode(&digest.finalize()[..20]))
+}
+
+fn grok_media_task_matches_owner_scope(
+    binding: &GrokMediaTaskBinding,
+    share_id: &str,
+    user_namespace: &str,
+    task_kind: GrokMediaTaskKind,
+    task_id: &str,
+) -> bool {
+    binding.share_id == share_id.trim()
+        && binding.user_namespace == user_namespace
+        && binding.task_kind == task_kind
+        && binding.task_id == task_id.trim()
 }
 
 fn validate_grok_media_task_binding(
@@ -2176,8 +2312,7 @@ fn validate_grok_media_task_binding(
     if binding.expires_at_ms.saturating_sub(binding.created_at_ms) > GROK_MEDIA_TASK_MAX_TTL_MS {
         anyhow::bail!("Grok media task binding exceeds the maximum lifetime");
     }
-    let expected_key =
-        grok_media_task_owner_key(&binding.share_id, &binding.user_namespace, &binding.task_id);
+    let expected_key = grok_media_task_owner_key(binding);
     if key != expected_key {
         anyhow::bail!("Grok media task binding owner key does not match its scope");
     }
@@ -5676,6 +5811,271 @@ impl ServerStateInner {
         })
     }
 
+    pub(crate) async fn refresh_bound_account_quota_for_generation(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        auth_identity_generation: u64,
+        force: bool,
+    ) -> anyhow::Result<Account> {
+        if self.credential_persistence_degraded() {
+            anyhow::bail!("managed account credentials are waiting for durable persistence");
+        }
+        self.refresh_managed_account_if_needed_for_generation(
+            provider_type,
+            account_id,
+            auth_identity_generation,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{} quota token refresh failed: {error:?}",
+                provider_type.as_str()
+            )
+        })?;
+        let mut refresh_guard = self
+            .account_refresh_locks
+            .lock(provider_type, account_id)
+            .await;
+        let account_before_refresh = self
+            .find_account_for_provider(provider_type, account_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "{} account disappeared before quota refresh",
+                    provider_type.as_str()
+                )
+            })?;
+        if account_before_refresh.auth_identity_generation != auth_identity_generation {
+            anyhow::bail!(
+                "{} account identity changed before quota refresh",
+                provider_type.as_str()
+            );
+        }
+        let now = crate::infra::time::now_ms() as i64;
+        let http = self.http_client().await;
+        let timeout_ms = self.oauth_quota_refresh_timeout_ms().await;
+        let success_cooldown_ms = self.oauth_quota_refresh_interval_ms().await;
+        let mut active_account = account_before_refresh.clone();
+        let mut result = refresh_account_quota(
+            &http,
+            &active_account,
+            now,
+            force,
+            success_cooldown_ms,
+            timeout_ms,
+        )
+        .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.upstream_status == Some(401))
+            && !active_account.needs_relogin
+            && provider_native_refresh_available(active_account.provider_type)
+            && account_has_refresh_token(&active_account)
+        {
+            refresh_guard.release();
+            self.refresh_managed_account_now_for_generation(
+                provider_type,
+                account_id,
+                auth_identity_generation,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{} quota OAuth recovery failed: {error:?}",
+                    provider_type.as_str()
+                )
+            })?;
+            refresh_guard = self
+                .account_refresh_locks
+                .lock(provider_type, account_id)
+                .await;
+            active_account = self
+                .find_account_for_provider(provider_type, account_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} account disappeared during quota auth recovery",
+                        provider_type.as_str()
+                    )
+                })?;
+            if active_account.auth_identity_generation != auth_identity_generation {
+                anyhow::bail!(
+                    "{} account identity changed during quota auth recovery",
+                    provider_type.as_str()
+                );
+            }
+            result = refresh_account_quota(
+                &http,
+                &active_account,
+                now,
+                true,
+                success_cooldown_ms,
+                timeout_ms,
+            )
+            .await;
+        }
+        match result {
+            Ok(QuotaRefreshResult::Updated { update, .. }) => {
+                let updated = self
+                    .commit_account_quota_refresh_update(&active_account, update)
+                    .await?
+                    .map_err(|_| {
+                        anyhow::anyhow!("{} quota response became stale", provider_type.as_str())
+                    })?;
+                self.refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                    .await?;
+                emit_oauth_quota_updated(self, &updated, true);
+                Ok(updated)
+            }
+            Ok(QuotaRefreshResult::SkippedCooldown { .. }) => {
+                self.refresh_account_runtime_metadata_if_changed(
+                    &account_before_refresh,
+                    &active_account,
+                )
+                .await?;
+                Ok(active_account)
+            }
+            Err(error) => {
+                let diagnostic = redact_account_error_for_log(&active_account, &error.message);
+                let next_refresh_at = error
+                    .next_refresh_at
+                    .unwrap_or_else(|| now.saturating_add(QUOTA_FAILURE_COOLDOWN_MS));
+                refresh_guard.record_failure(AccountRefreshFlightFailure::for_account(
+                    &active_account,
+                    AccountRefreshFlightStage::QuotaRefresh,
+                    AccountRefreshFlightFailureDetails {
+                        status_code: error.status_code,
+                        upstream_status: error.upstream_status,
+                        message: diagnostic.clone(),
+                        public_message: Some(format!(
+                            "{} quota refresh failed",
+                            provider_type.as_str()
+                        )),
+                        kind: crate::domain::accounts::oauth::OAuthErrorKind::Unknown,
+                        retryable: error.retryable,
+                        retry_after_ms: Some(next_refresh_at.saturating_sub(now)),
+                        immediate_relogin: false,
+                    },
+                ));
+                let mut update = error
+                    .partial_update
+                    .map(|update| *update)
+                    .unwrap_or_default();
+                update.quota_next_refresh_at = Some(next_refresh_at);
+                update.last_refresh_error = Some(diagnostic.clone());
+                let updated = self
+                    .commit_account_quota_refresh_update(&active_account, update)
+                    .await?
+                    .map_err(|_| {
+                        anyhow::anyhow!("{} quota failure became stale", provider_type.as_str())
+                    })?;
+                self.refresh_account_runtime_metadata_if_changed(&account_before_refresh, &updated)
+                    .await?;
+                emit_oauth_quota_updated(self, &updated, false);
+                Err(anyhow::Error::new(BoundAccountQuotaRefreshFailure {
+                    status_code: error.status_code,
+                    retryable: error.retryable,
+                    message: format!(
+                        "{} quota refresh failed: {diagnostic}",
+                        provider_type.as_str()
+                    ),
+                }))
+            }
+        }
+    }
+
+    pub(crate) async fn record_antigravity_model_catalog_observations_for_generation(
+        &self,
+        provider_type: ProviderType,
+        account_id: &str,
+        auth_identity_generation: u64,
+        catalog: &crate::clients::oauth::antigravity_models::AntigravityModelCatalog,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) {
+            anyhow::bail!("model catalog observations require Antigravity or Agy");
+        }
+        if catalog.stale {
+            return Ok(());
+        }
+        let observed_at_ms = catalog.fetched_at_ms;
+        let expires_at_ms = observed_at_ms.saturating_add(
+            crate::domain::accounts::capability_evidence::ANTIGRAVITY_CAPABILITY_EVIDENCE_TTL_MS,
+        );
+        let catalog_state = if catalog.descriptors.is_empty() {
+            AccountCapabilityObservationState::Unsupported
+        } else {
+            AccountCapabilityObservationState::Supported
+        };
+        let family_observation = |dimension: &'static str, family: &'static str| {
+            let supported = catalog
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.family == family);
+            AccountCapabilityObservationDraft::antigravity_feature(
+                dimension,
+                if supported {
+                    AccountCapabilityObservationState::Supported
+                } else {
+                    AccountCapabilityObservationState::Unknown
+                },
+                "fetch_available_models",
+                (!supported).then_some("catalog_has_no_explicit_family"),
+                observed_at_ms,
+                Some(expires_at_ms),
+            )
+        };
+        let has_capacity = catalog.descriptors.iter().any(|descriptor| {
+            descriptor.remaining_fraction.is_some() || descriptor.reset_time.is_some()
+        });
+        let observations = vec![
+            AccountCapabilityObservationDraft::antigravity_feature(
+                MODEL_CATALOG_DIMENSION,
+                catalog_state,
+                "fetch_available_models",
+                catalog
+                    .descriptors
+                    .is_empty()
+                    .then_some("authoritative_empty_catalog"),
+                observed_at_ms,
+                Some(expires_at_ms),
+            ),
+            family_observation(GEMINI_QUOTA_FAMILY_DIMENSION, "gemini"),
+            family_observation(CLAUDE_QUOTA_FAMILY_DIMENSION, "claude"),
+            family_observation(GPT_QUOTA_FAMILY_DIMENSION, "gpt"),
+            AccountCapabilityObservationDraft::antigravity_feature(
+                MODEL_CAPACITY_DIMENSION,
+                if has_capacity {
+                    AccountCapabilityObservationState::Supported
+                } else {
+                    AccountCapabilityObservationState::Unknown
+                },
+                "fetch_available_models",
+                (!has_capacity).then_some("catalog_has_no_model_quota_info"),
+                observed_at_ms,
+                Some(expires_at_ms),
+            ),
+        ];
+        let account_id = account_id.to_string();
+        self.try_mutate_accounts_immediate(move |accounts| {
+            let account = accounts
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == account_id && account.provider_type == provider_type)
+                .ok_or("bound Antigravity account disappeared")?;
+            if account.auth_identity_generation != auth_identity_generation {
+                return Err("bound Antigravity account identity changed");
+            }
+            record_observation_drafts(account, observations);
+            Ok(())
+        })
+        .await?
+        .map_err(anyhow::Error::msg)
+    }
+
     pub(crate) async fn refresh_codex_quota_for_account(
         self: &Arc<Self>,
         account_id: &str,
@@ -6012,6 +6412,7 @@ impl ServerStateInner {
             image_capabilities,
             grok_device_flows: RwLock::new(GrokDeviceFlowStore::default()),
             kiro_device_flows: RwLock::new(KiroDeviceFlowStore::default()),
+            amazon_q_device_flows: RwLock::new(AmazonQDeviceFlowStore::default()),
             kimi_device_flows: RwLock::new(KimiDeviceFlowStore::default()),
             qoder_device_flows: RwLock::new(QoderDeviceFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
@@ -6028,6 +6429,13 @@ impl ServerStateInner {
             kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache::default(),
             kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache::default(),
             qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache::default(),
+            deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache::default(),
+            web_session_runtime: RwLock::new(
+                crate::domain::providers::web_session::WebSessionRuntimeStore::default(),
+            ),
+            web_session_http_client: RwLock::new(
+                build_web_session_http_client().context("build Web Session HTTP client")?,
+            ),
             cursor_api_key_verifier,
             managed_account_refreshes: ManagedAccountRefreshCoordinator::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
@@ -6210,8 +6618,10 @@ impl ServerStateInner {
         config.provider_request_defaults = current.provider_request_defaults.clone();
         config.provider_health_check = current.provider_health_check.clone();
         let http_client = build_http_client()?;
+        let web_session_http_client = build_web_session_http_client()?;
         persist_state_snapshot(&self.config_dir, config.clone()).await?;
         *self.http_client.write().await = http_client;
+        *self.web_session_http_client.write().await = web_session_http_client;
         *self.config.write().await = config;
         self.config_persistence.mark_published();
         Ok(())
@@ -6289,10 +6699,15 @@ impl ServerStateInner {
                 .iter()
                 .map(|provider| (provider.app, provider.provider.id.clone()))
                 .collect::<BTreeSet<_>>();
+            let web_session_scopes = web_session_scopes_from_store(&candidate_providers);
 
             persist_state_snapshot(&self.config_dir, candidate_config.clone()).await?;
             *self.config.write().await = candidate_config;
             *self.providers.write().await = candidate_providers;
+            self.web_session_runtime
+                .write()
+                .await
+                .retain_scopes(&web_session_scopes);
             self.config_persistence.mark_published();
             provider_keys
         };
@@ -7073,6 +7488,7 @@ impl ServerStateInner {
         let mut config = ServerConfig::load_or_default(&self.config_dir)?;
         let current_config = self.config.read().await.clone();
         let http_client = build_http_client()?;
+        let web_session_http_client = build_web_session_http_client()?;
         let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
             .context("resolve proxy reasoning bridge root key")?;
         let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
@@ -7132,9 +7548,15 @@ impl ServerStateInner {
             persist_state_snapshot(&self.config_dir, config.clone()).await?;
         }
 
+        let web_session_scopes = web_session_scopes_from_store(&providers);
         *self.http_client.write().await = http_client;
+        *self.web_session_http_client.write().await = web_session_http_client;
         *self.config.write().await = config;
         *self.providers.write().await = providers;
+        self.web_session_runtime
+            .write()
+            .await
+            .retain_scopes(&web_session_scopes);
         *self.accounts.write().await = accounts;
         *self.usage.write().await = usage;
         *self.shares.write().await = shares;
@@ -7203,24 +7625,244 @@ impl ServerStateInner {
         self.http_client.read().await.clone()
     }
 
+    pub(crate) async fn web_session_http_client(&self) -> reqwest::Client {
+        self.web_session_http_client.read().await.clone()
+    }
+
+    pub(crate) async fn prepare_web_session_scope(
+        &self,
+        scope: &crate::domain::providers::web_session::WebSessionScope,
+    ) -> Result<(), WebSessionStateError> {
+        scope
+            .validate()
+            .map_err(|error| WebSessionStateError::Invalid(error.to_string()))?;
+        let providers = self.providers.read().await;
+        if !web_session_scope_matches_store(&providers, scope) {
+            return Err(WebSessionStateError::IdentityChanged);
+        }
+        let mut runtime = self.web_session_runtime.write().await;
+        runtime.retain_current(scope);
+        if runtime.requires_explicit_reimport(scope) {
+            return Err(WebSessionStateError::ExplicitReimportRequired);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_web_session_authentication(
+        &self,
+        scope: &crate::domain::providers::web_session::WebSessionScope,
+    ) -> Result<(), WebSessionStateError> {
+        scope
+            .validate()
+            .map_err(|error| WebSessionStateError::Invalid(error.to_string()))?;
+        let providers = self.providers.read().await;
+        if !web_session_scope_matches_store(&providers, scope) {
+            return Err(WebSessionStateError::IdentityChanged);
+        }
+        self.web_session_runtime
+            .write()
+            .await
+            .invalidate_authentication(scope);
+        Ok(())
+    }
+
+    pub(crate) async fn record_web_session_success(
+        &self,
+        scope: &crate::domain::providers::web_session::WebSessionScope,
+        session_id: Option<&str>,
+    ) -> Result<(), WebSessionStateError> {
+        use crate::domain::providers::web_session::WebSessionStateRecord;
+
+        scope
+            .validate()
+            .map_err(|error| WebSessionStateError::Invalid(error.to_string()))?;
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if session_id.as_ref().is_some_and(|value| {
+            value.len() > 512 || value.bytes().any(|byte| byte.is_ascii_control())
+        }) {
+            return Err(WebSessionStateError::Invalid(
+                "upstream session id is invalid".to_string(),
+            ));
+        }
+
+        let providers = self.providers.read().await;
+        if !web_session_scope_matches_store(&providers, scope) {
+            return Err(WebSessionStateError::IdentityChanged);
+        }
+        let mut runtime = self.web_session_runtime.write().await;
+        runtime.retain_current(scope);
+        if runtime.requires_explicit_reimport(scope) {
+            return Err(WebSessionStateError::ExplicitReimportRequired);
+        }
+        if let Some(session_id) = session_id {
+            runtime
+                .insert_session(
+                    scope.clone(),
+                    WebSessionStateRecord {
+                        session_id,
+                        observed_at_ms: now_ms_i64(),
+                    },
+                )
+                .map_err(|error| WebSessionStateError::Invalid(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn kiro_ide_version(&self) -> String {
         crate::clients::oauth::kiro_runtime::effective_ide_version(&self.http_client().await).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn kiro_model_catalog(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        endpoint_override: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> crate::clients::oauth::kiro_runtime::KiroModelCatalog {
+        use crate::clients::oauth::kiro_runtime::{
+            model_catalog_scoped, unavailable_model_catalog, KiroModelCatalogScope,
+        };
+
+        if self.credential_persistence_degraded()
+            || !self
+                .kiro_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+        {
+            return unavailable_model_catalog("kiro_runtime_binding_unavailable");
+        }
+        if let Err(error) = self
+            .refresh_managed_account_if_needed_for_generation(
+                ProviderType::KiroOAuth,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            tracing::warn!(account_id, error = ?error, "Kiro model discovery token refresh failed");
+            return unavailable_model_catalog("kiro_token_refresh_failed");
+        }
+        let Some(mut account) = self
+            .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+            .await
+            .filter(|account| {
+                account.auth_identity_generation == expected_auth_identity_generation
+            })
+        else {
+            return unavailable_model_catalog("kiro_bound_account_unavailable");
+        };
+        let scope = KiroModelCatalogScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+        );
+        let http = self.http_client().await;
+        let mut catalog =
+            model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
+        let can_refresh = account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        if catalog.is_unauthorized() && can_refresh {
+            if let Err(error) = self
+                .refresh_managed_account_now_for_generation(
+                    ProviderType::KiroOAuth,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                tracing::warn!(account_id, error = ?error, "Kiro model discovery same-account refresh failed");
+                return unavailable_model_catalog("kiro_forced_refresh_failed");
+            }
+            if !self
+                .kiro_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                return unavailable_model_catalog("kiro_runtime_changed_after_refresh");
+            }
+            let Some(refreshed) = self
+                .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+                .await
+                .filter(|current| {
+                    current.auth_identity_generation == expected_auth_identity_generation
+                })
+            else {
+                return unavailable_model_catalog("kiro_bound_account_changed_after_refresh");
+            };
+            account = refreshed;
+            catalog =
+                model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
+        }
+        let current = self
+            .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+            .await;
+        if current.as_ref().is_none_or(|current| {
+            current.auth_identity_generation != expected_auth_identity_generation
+                || current.token_refresh_generation != account.token_refresh_generation
+        }) || !self
+            .kiro_catalog_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return unavailable_model_catalog("kiro_identity_changed_during_discovery");
+        }
+        catalog
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn kiro_catalog_model(
-        &self,
-        account: &crate::domain::accounts::store::Account,
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
         model_id: &str,
         endpoint_override: Option<&str>,
         timeout: std::time::Duration,
     ) -> Option<(String, Option<u64>)> {
-        let catalog = crate::clients::oauth::kiro_runtime::model_catalog_with_timeout(
-            &self.http_client().await,
-            account,
-            endpoint_override,
-            timeout,
-        )
-        .await;
+        let catalog = self
+            .kiro_model_catalog(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+                endpoint_override,
+                timeout,
+            )
+            .await;
         catalog
             .descriptors
             .iter()
@@ -7228,15 +7870,237 @@ impl ServerStateInner {
             .map(|model| (model.model_id.clone(), model.max_input_tokens))
     }
 
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) async fn kiro_cached_catalog_model(
+    #[allow(clippy::too_many_arguments)]
+    async fn kiro_catalog_runtime_matches(
         &self,
-        account: &crate::domain::accounts::store::Account,
-        model_id: &str,
-    ) -> Option<Option<(String, Option<u64>)>> {
-        crate::clients::oauth::kiro_runtime::cached_model_descriptor(account, model_id)
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(_stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::KiroOAuth
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        plan.provider_revision == provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: current_account_id,
+                    expected_provider_type: ProviderType::KiroOAuth,
+                    auth_identity_generation,
+                } if current_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn amazon_q_model_catalog(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        endpoint_override: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> crate::clients::oauth::amazon_q_runtime::AmazonQModelCatalog {
+        use crate::clients::oauth::amazon_q_runtime::{
+            model_catalog_scoped, unavailable_model_catalog, AmazonQModelCatalogScope,
+        };
+
+        if self.credential_persistence_degraded()
+            || !self
+                .amazon_q_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+        {
+            return unavailable_model_catalog("amazon_q_runtime_binding_unavailable");
+        }
+        if let Err(error) = self
+            .refresh_managed_account_if_needed_for_generation(
+                ProviderType::AmazonQOAuth,
+                account_id,
+                expected_auth_identity_generation,
+            )
             .await
-            .map(|model| model.map(|model| (model.model_id, model.max_input_tokens)))
+        {
+            tracing::warn!(account_id, error = ?error, "Amazon Q model discovery token refresh failed");
+            return unavailable_model_catalog("amazon_q_token_refresh_failed");
+        }
+        let Some(mut account) = self
+            .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+            .await
+            .filter(|account| {
+                account.auth_identity_generation == expected_auth_identity_generation
+            })
+        else {
+            return unavailable_model_catalog("amazon_q_bound_account_unavailable");
+        };
+        let scope = AmazonQModelCatalogScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+        );
+        let http = self.http_client().await;
+        let mut catalog =
+            model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
+        let can_refresh = account
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        if catalog.is_unauthorized() && can_refresh {
+            if let Err(error) = self
+                .refresh_managed_account_now_for_generation(
+                    ProviderType::AmazonQOAuth,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                tracing::warn!(account_id, error = ?error, "Amazon Q model discovery same-account refresh failed");
+                return unavailable_model_catalog("amazon_q_forced_refresh_failed");
+            }
+            if !self
+                .amazon_q_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
+            {
+                return unavailable_model_catalog("amazon_q_runtime_changed_after_refresh");
+            }
+            let Some(refreshed) = self
+                .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+                .await
+                .filter(|current| {
+                    current.auth_identity_generation == expected_auth_identity_generation
+                })
+            else {
+                return unavailable_model_catalog("amazon_q_bound_account_changed_after_refresh");
+            };
+            account = refreshed;
+            catalog =
+                model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
+        }
+        let current = self
+            .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+            .await;
+        if current.as_ref().is_none_or(|current| {
+            current.auth_identity_generation != expected_auth_identity_generation
+                || current.token_refresh_generation != account.token_refresh_generation
+        }) || !self
+            .amazon_q_catalog_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return unavailable_model_catalog("amazon_q_identity_changed_during_discovery");
+        }
+        catalog
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn amazon_q_catalog_model(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        model_id: &str,
+        endpoint_override: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Option<(String, Option<u64>)> {
+        let catalog = self
+            .amazon_q_model_catalog(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+                endpoint_override,
+                timeout,
+            )
+            .await;
+        let selected = if model_id.eq_ignore_ascii_case("auto") {
+            catalog
+                .default_model_id
+                .as_deref()
+                .and_then(|default| catalog.model(default))
+        } else {
+            catalog.model(model_id)
+        }?;
+        Some((selected.model_id.clone(), selected.max_input_tokens))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn amazon_q_catalog_runtime_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(_stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::AmazonQOAuth
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        plan.provider_revision == provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: current_account_id,
+                    expected_provider_type: ProviderType::AmazonQOAuth,
+                    auth_identity_generation,
+                } if current_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
     }
 
     pub fn emit_event(&self, event: ServerEvent) {
@@ -9476,7 +10340,12 @@ impl ServerStateInner {
 
     #[cfg(test)]
     pub(crate) async fn replace_provider_store_for_test(&self, providers: ProviderStore) {
+        let web_session_scopes = web_session_scopes_from_store(&providers);
         *self.providers.write().await = providers;
+        self.web_session_runtime
+            .write()
+            .await
+            .retain_scopes(&web_session_scopes);
     }
 
     #[cfg(test)]
@@ -9530,6 +10399,13 @@ impl ServerStateInner {
         providers
             .rebuild_runtime_index(&accounts)
             .context("rebuild Provider runtime index for test endpoint")?;
+        let web_session_scopes = web_session_scopes_from_store(&providers);
+        drop(accounts);
+        drop(providers);
+        self.web_session_runtime
+            .write()
+            .await
+            .retain_scopes(&web_session_scopes);
         Ok(())
     }
 
@@ -9669,6 +10545,7 @@ impl ServerStateInner {
         let previous_ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&current);
         let ollama_cloud_cache_keys = ollama_cloud_cache_keys_from_store(&candidate);
         let cursor_account_cache_keys = cursor_account_cache_keys_from_store(&candidate);
+        let web_session_scopes = web_session_scopes_from_store(&candidate);
         let ollama_cloud_refresh_keys = ollama_cloud_cache_keys
             .difference(&previous_ollama_cloud_cache_keys)
             .map(|key| key.credential_source_key.clone())
@@ -9731,6 +10608,10 @@ impl ServerStateInner {
         }
 
         *self.providers.write().await = candidate;
+        self.web_session_runtime
+            .write()
+            .await
+            .retain_scopes(&web_session_scopes);
         self.ollama_cloud_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -12988,6 +13869,89 @@ impl ServerStateInner {
         account
     }
 
+    pub async fn active_account_capacity_pool_limit_if_current(
+        &self,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        capacity_pool: &str,
+        now_ms: i64,
+    ) -> Option<AccountCapacityPoolLimit> {
+        let account = self.find_account_by_id(account_id).await?;
+        if account.provider_type != provider_type
+            || account.auth_identity_generation != auth_identity_generation
+        {
+            return None;
+        }
+        active_account_capacity_pool_limit(&account, capacity_pool, now_ms).cloned()
+    }
+
+    #[allow(clippy::too_many_arguments)] // The generation-safe state transition records one complete observation.
+    pub async fn mark_account_capacity_pool_limit_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        capacity_pool: &str,
+        until_ms: i64,
+        observed_at_ms: i64,
+        reason: &str,
+        utilization: Option<f64>,
+        source: &str,
+    ) -> Option<Account> {
+        let capacity_pool = capacity_pool.to_string();
+        let limit = AccountCapacityPoolLimit {
+            until_ms,
+            observed_at_ms,
+            auth_identity_generation,
+            reason: reason.to_string(),
+            utilization,
+            source: source.to_string(),
+        };
+        let (before, account) = self
+            .mutate_accounts(|accounts| {
+                let before = accounts
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                    .cloned();
+                let matches = before.as_ref().is_some_and(|account| {
+                    account.provider_type == provider_type
+                        && account.auth_identity_generation == auth_identity_generation
+                });
+                let account = matches
+                    .then(|| accounts.mark_capacity_pool_limit(account_id, &capacity_pool, limit))
+                    .flatten();
+                (before, account)
+            })
+            .await;
+        if let Some(account) = account.as_ref() {
+            save_accounts_debounced(self);
+            if let Some(before) = before.as_ref() {
+                let before_active =
+                    active_account_capacity_pool_limit(before, &capacity_pool, observed_at_ms)
+                        .is_some();
+                let after_active =
+                    active_account_capacity_pool_limit(account, &capacity_pool, observed_at_ms)
+                        .is_some();
+                if before_active != after_active {
+                    if let Err(error) = self
+                        .refresh_account_runtime_metadata_if_changed(before, account)
+                        .await
+                    {
+                        tracing::warn!(
+                            account_id,
+                            capacity_pool,
+                            %error,
+                            "account capacity-pool Share descriptor sync remains pending"
+                        );
+                    }
+                }
+            }
+        }
+        account
+    }
+
     pub async fn update_account_entitlement_snapshot(
         self: &Arc<Self>,
         account_id: &str,
@@ -13221,6 +14185,7 @@ impl ServerStateInner {
     pub async fn remember_grok_media_task(
         &self,
         task_id: String,
+        task_kind: GrokMediaTaskKind,
         creation_request_id: Option<String>,
         provider_id: String,
         account_id: String,
@@ -13233,6 +14198,7 @@ impl ServerStateInner {
         let _persistence = self.grok_media_task_persistence.lock().await;
         self.remember_grok_media_task_under_persistence(
             task_id,
+            task_kind,
             creation_request_id,
             provider_id,
             account_id,
@@ -13255,6 +14221,7 @@ impl ServerStateInner {
         account_id: String,
         auth_identity_generation: u64,
         task_id: String,
+        task_kind: GrokMediaTaskKind,
         creation_request_id: Option<String>,
         share_id: String,
         user_identity: Option<&str>,
@@ -13295,6 +14262,7 @@ impl ServerStateInner {
         }
         self.remember_grok_media_task_under_persistence(
             task_id,
+            task_kind,
             creation_request_id,
             provider_id,
             account_id,
@@ -13312,6 +14280,7 @@ impl ServerStateInner {
     async fn remember_grok_media_task_under_persistence(
         &self,
         task_id: String,
+        task_kind: GrokMediaTaskKind,
         creation_request_id: Option<String>,
         provider_id: String,
         account_id: String,
@@ -13325,21 +14294,24 @@ impl ServerStateInner {
         let task_id = task_id.trim().to_string();
         let share_id = share_id.trim().to_string();
         let user_namespace = grok_media_task_user_namespace(user_identity);
-        let key = grok_media_task_owner_key(&share_id, &user_namespace, &task_id);
         let expires_at_ms = now_ms.saturating_add(ttl_ms.clamp(1, GROK_MEDIA_TASK_MAX_TTL_MS));
         let binding = GrokMediaTaskBinding {
             task_id,
-            creation_request_id,
-            provider_id,
-            account_id,
+            task_kind,
+            creation_request_id: creation_request_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            provider_id: provider_id.trim().to_string(),
+            account_id: account_id.trim().to_string(),
             auth_identity_generation,
             share_id,
-            runtime_fingerprint,
+            runtime_fingerprint: runtime_fingerprint.trim().to_string(),
             user_namespace,
             upstream_plane: GrokVideoPlane::Xai,
             created_at_ms: now_ms,
             expires_at_ms,
         };
+        let key = grok_media_task_owner_key(&binding);
         validate_grok_media_task_binding(&key, &binding)?;
 
         let mut candidate = self
@@ -13348,12 +14320,16 @@ impl ServerStateInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         candidate.cleanup(now_ms);
-        if let Some(existing) = candidate.bindings.get(&key) {
-            if existing.provider_id != binding.provider_id
-                || existing.account_id != binding.account_id
-                || existing.auth_identity_generation != binding.auth_identity_generation
-                || existing.runtime_fingerprint != binding.runtime_fingerprint
-            {
+        if let Some(existing) = candidate.bindings.values().find(|existing| {
+            grok_media_task_matches_owner_scope(
+                existing,
+                &binding.share_id,
+                &binding.user_namespace,
+                binding.task_kind,
+                &binding.task_id,
+            )
+        }) {
+            if grok_media_task_owner_key(existing) != key {
                 anyhow::bail!(
                     "Grok media task is already owned by a different Provider/account identity"
                 );
@@ -13373,12 +14349,12 @@ impl ServerStateInner {
         &self,
         share_id: &str,
         user_identity: Option<&str>,
+        task_kind: GrokMediaTaskKind,
         task_id: &str,
     ) -> anyhow::Result<Option<GrokMediaTaskBinding>> {
         let _persistence = self.grok_media_task_persistence.lock().await;
         let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         let user_namespace = grok_media_task_user_namespace(user_identity);
-        let key = grok_media_task_owner_key(share_id, &user_namespace, task_id);
         let mut candidate = self
             .grok_media_tasks
             .lock()
@@ -13393,7 +14369,20 @@ impl ServerStateInner {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate.clone();
         }
-        Ok(candidate.bindings.get(&key).cloned())
+        let mut matches = candidate.bindings.values().filter(|binding| {
+            grok_media_task_matches_owner_scope(
+                binding,
+                share_id,
+                &user_namespace,
+                task_kind,
+                task_id,
+            )
+        });
+        let binding = matches.next().cloned();
+        if matches.next().is_some() {
+            anyhow::bail!("Grok media task owner scope resolved to multiple upstream identities");
+        }
+        Ok(binding)
     }
 
     pub async fn bind_device_flow_principal(
@@ -13460,6 +14449,9 @@ impl ServerStateInner {
                 self.remove_kiro_device_flow(device_code).await;
                 self.remove_kiro_social_device_flow(device_code).await;
             }
+            ProviderType::AmazonQOAuth => {
+                self.remove_amazon_q_device_flow(device_code).await;
+            }
             ProviderType::CodexOAuth => {
                 self.cancel_codex_device_flow(device_code).await;
             }
@@ -13494,6 +14486,9 @@ impl ServerStateInner {
                 ProviderType::KiroOAuth => {
                     self.remove_kiro_device_flow(device_code).await;
                     self.remove_kiro_social_device_flow(device_code).await;
+                }
+                ProviderType::AmazonQOAuth => {
+                    self.remove_amazon_q_device_flow(device_code).await;
                 }
                 ProviderType::CodexOAuth => {
                     self.cancel_codex_device_flow(device_code).await;
@@ -13573,6 +14568,33 @@ impl ServerStateInner {
             .write()
             .await
             .remove_social(device_code);
+    }
+
+    pub async fn insert_amazon_q_device_flow(
+        &self,
+        device_code: String,
+        flow: PendingAmazonQDeviceFlow,
+        now_ms: i64,
+    ) {
+        self.amazon_q_device_flows
+            .write()
+            .await
+            .insert(device_code, flow, now_ms);
+    }
+
+    pub async fn get_amazon_q_device_flow(
+        &self,
+        device_code: &str,
+        now_ms: i64,
+    ) -> Option<PendingAmazonQDeviceFlow> {
+        self.amazon_q_device_flows
+            .write()
+            .await
+            .get(device_code, now_ms)
+    }
+
+    pub async fn remove_amazon_q_device_flow(&self, device_code: &str) {
+        self.amazon_q_device_flows.write().await.remove(device_code);
     }
 
     pub async fn insert_grok_device_flow(
@@ -14057,11 +15079,12 @@ impl ServerStateInner {
         self.ensure_copilot_model_catalog_key_current(&key).await?;
 
         match fetched {
-            Ok(models) => {
+            Ok(descriptors) => {
                 let fetched_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                let has_entitlement = !descriptors.is_empty();
                 let catalog = self
                     .copilot_model_catalogs
-                    .insert(key, models, fetched_at_ms)
+                    .insert(key, descriptors, fetched_at_ms)
                     .await;
                 if let Err(error) = self
                     .record_copilot_capability_observation_if_current(
@@ -14076,15 +15099,31 @@ impl ServerStateInner {
                 {
                     tracing::warn!(account_id, error = %error, "failed to persist Copilot model capability evidence");
                 }
+                if let Err(error) = self
+                    .record_copilot_capability_observation_if_current(
+                        account_id,
+                        expected_auth_identity_generation,
+                        crate::domain::accounts::capability_evidence::MODEL_ENTITLEMENT_DIMENSION,
+                        if has_entitlement {
+                            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported
+                        } else {
+                            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported
+                        },
+                        "copilot_models_api",
+                        (!has_entitlement).then_some("authoritative_empty_catalog"),
+                    )
+                    .await
+                {
+                    tracing::warn!(account_id, error = %error, "failed to persist Copilot entitlement capability evidence");
+                }
                 Ok(catalog)
             }
             Err(error) => {
                 tracing::warn!(account_id, error = %error, "GitHub Copilot model discovery failed");
-                if let Some(catalog) = self.copilot_model_catalogs.stale(&key, now_ms).await {
-                    return Ok(catalog);
-                }
-                if !copilot_device::is_ghes(&domain) {
-                    return Ok(crate::clients::oauth::copilot_models::public_static_catalog());
+                if error.is_transient() {
+                    if let Some(catalog) = self.copilot_model_catalogs.stale(&key, now_ms).await {
+                        return Ok(catalog);
+                    }
                 }
                 Err(copilot_model_fetch_error(error))
             }
@@ -14111,6 +15150,34 @@ impl ServerStateInner {
                 status_code: 409,
                 message: "bound account credentials changed during model discovery; retry"
                     .to_string(),
+            });
+        }
+        let cached = self
+            .copilot_upstream_auth
+            .read()
+            .await
+            .get(&key.account_id)
+            .cloned()
+            .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message: "bound Copilot runtime token changed during model discovery; retry"
+                    .to_string(),
+            })?;
+        let current_origin =
+            copilot_device::validate_copilot_api_endpoint(&cached.api_endpoint, &key.github_domain)
+                .map_err(|error| CopilotModelCatalogError::Discovery {
+                    status_code: error.status.as_u16(),
+                    message: error.message,
+                })?;
+        if cached.token_generation != key.copilot_token_generation
+            || current_origin != key.api_origin
+            || !cached.binding_matches(&account, &domain)
+        {
+            return Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message:
+                    "bound Copilot runtime token or endpoint changed during model discovery; retry"
+                        .to_string(),
             });
         }
         Ok(())
@@ -14164,8 +15231,7 @@ impl ServerStateInner {
         #[cfg(test)] models_url_override: Option<&str>,
     ) -> crate::proxy::kimi_runtime::KimiModelCatalog {
         use crate::proxy::kimi_runtime::{
-            fetch_kimi_models, reviewed_fallback_catalog, unavailable_catalog,
-            KimiModelCatalogScope,
+            fetch_kimi_models, unavailable_catalog, KimiModelCatalogScope,
         };
 
         if self.credential_persistence_degraded()
@@ -14182,6 +15248,24 @@ impl ServerStateInner {
         {
             return unavailable_catalog();
         }
+        let Some(account_before_refresh) = self
+            .find_account_for_provider(ProviderType::KimiCode, account_id)
+            .await
+            .filter(|account| {
+                account.auth_identity_generation == expected_auth_identity_generation
+            })
+        else {
+            return unavailable_catalog();
+        };
+        let scope_before_refresh = KimiModelCatalogScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            expected_auth_identity_generation,
+            account_before_refresh.token_refresh_generation,
+        );
         if let Err(error) = self
             .refresh_managed_account_if_needed_for_generation(
                 ProviderType::KimiCode,
@@ -14192,8 +15276,17 @@ impl ServerStateInner {
         {
             tracing::warn!(account_id, error = ?error, "Kimi model discovery token refresh failed");
             return if kimi_refresh_error_is_retryable(&error) {
-                reviewed_fallback_catalog()
+                self.kimi_model_catalogs
+                    .stale(
+                        &scope_before_refresh,
+                        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+                    )
+                    .await
+                    .unwrap_or_else(unavailable_catalog)
             } else {
+                self.kimi_model_catalogs
+                    .invalidate(&scope_before_refresh)
+                    .await;
                 unavailable_catalog()
             };
         }
@@ -14260,14 +15353,8 @@ impl ServerStateInner {
                 .await
             {
                 tracing::warn!(account_id, error = ?error, "Kimi model discovery same-account refresh failed");
-                return if kimi_refresh_error_is_retryable(&error) {
-                    self.kimi_model_catalogs
-                        .stale(&scope, now_ms)
-                        .await
-                        .unwrap_or_else(reviewed_fallback_catalog)
-                } else {
-                    unavailable_catalog()
-                };
+                self.kimi_model_catalogs.invalidate(&scope).await;
+                return unavailable_catalog();
             }
             let Some(refreshed) = self
                 .find_account_for_provider(ProviderType::KimiCode, account_id)
@@ -14373,7 +15460,7 @@ impl ServerStateInner {
                     self.kimi_model_catalogs
                         .stale(&scope, now_ms)
                         .await
-                        .unwrap_or_else(reviewed_fallback_catalog)
+                        .unwrap_or_else(unavailable_catalog)
                 } else {
                     self.kimi_model_catalogs.invalidate(&scope).await;
                     unavailable_catalog()
@@ -14697,13 +15784,14 @@ impl ServerStateInner {
                         return Err(runtime_error);
                     }
                 };
-                let fetched = parse_qoder_model_catalog(&value).map_err(|message| {
-                    QoderRuntimeError::Upstream {
-                        status_code: 502,
-                        message,
-                        retryable: false,
-                    }
-                })?;
+                let fetched =
+                    parse_qoder_model_catalog(&value, profile.site).map_err(|message| {
+                        QoderRuntimeError::Upstream {
+                            status_code: 502,
+                            message,
+                            retryable: false,
+                        }
+                    })?;
                 if !self
                     .qoder_runtime_snapshot_matches(
                         app,
@@ -14991,13 +16079,26 @@ impl ServerStateInner {
         Ok(cached)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_deepseek_chat_completion(
         self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
         account_id: &str,
         expected_auth_identity_generation: u64,
+        share_id: &str,
+        user_identity: &str,
+        client_session_id: &str,
         model: &str,
         prompt: &str,
+        thinking_enabled: bool,
+        search_enabled: bool,
     ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
+        use crate::clients::deepseek::client::DeepSeekCompletionRequest;
+        use crate::proxy::deepseek_runtime::{DeepSeekCachedSession, DeepSeekRuntimeScope};
+
         let accounts = self
             .accounts_snapshot_if_credentials_persisted()
             .await
@@ -15011,14 +16112,246 @@ impl ServerStateInner {
         }
         let token = account
             .access_token
-            .filter(|value| !value.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
             .ok_or(DeepSeekUpstreamError::MissingToken)?;
-        let client =
-            crate::clients::deepseek::DeepSeekWebClient::with_http_client(self.http_client().await);
-        client
-            .start_completion(&token, model, prompt)
+        let token_refresh_generation = account.token_refresh_generation;
+        let scope = DeepSeekRuntimeScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            account.auth_identity_generation,
+            token_refresh_generation,
+            share_id,
+            user_identity,
+            client_session_id,
+            model,
+        )
+        .map_err(|message| DeepSeekUpstreamError::Protocol {
+            operation: "runtime_scope",
+            message,
+        })?;
+        if !self
+            .deepseek_runtime_generation_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+                token_refresh_generation,
+            )
             .await
-            .map_err(|error| DeepSeekUpstreamError::Client(error.to_string()))
+        {
+            return Err(DeepSeekUpstreamError::IdentityChanged);
+        }
+
+        #[cfg(test)]
+        let api_base = account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("testDeepSeekApiBase"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        #[cfg(not(test))]
+        let api_base: Option<String> = None;
+        let client = if let Some(api_base) = api_base {
+            crate::clients::deepseek::DeepSeekWebClient::with_http_client_and_api_base(
+                self.http_client().await,
+                api_base,
+            )
+        } else {
+            crate::clients::deepseek::DeepSeekWebClient::with_http_client(self.http_client().await)
+        };
+
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let (mut session, mut reused) =
+            if let Some(session) = self.deepseek_runtime.session(&scope, now_ms).await {
+                (session, true)
+            } else {
+                let _session_guard = self.deepseek_runtime.session_lock(&scope).await;
+                let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                if let Some(session) = self.deepseek_runtime.session(&scope, now_ms).await {
+                    (session, true)
+                } else {
+                    let session_id = client
+                        .create_session(&token)
+                        .await
+                        .map_err(deepseek_client_runtime_error)?;
+                    if !self
+                        .deepseek_runtime_generation_matches(
+                            app,
+                            provider_id,
+                            provider_revision,
+                            runtime_fingerprint,
+                            account_id,
+                            expected_auth_identity_generation,
+                            token_refresh_generation,
+                        )
+                        .await
+                    {
+                        return Err(DeepSeekUpstreamError::IdentityChanged);
+                    }
+                    let session =
+                        DeepSeekCachedSession::new(session_id, now_ms).map_err(|message| {
+                            DeepSeekUpstreamError::Protocol {
+                                operation: "create_session",
+                                message,
+                            }
+                        })?;
+                    self.deepseek_runtime
+                        .insert_session(scope.clone(), session.clone())
+                        .await;
+                    (session, false)
+                }
+            };
+
+        let mut rebuilt = false;
+        loop {
+            let pow_header = client
+                .create_pow_header(&token)
+                .await
+                .map_err(deepseek_client_runtime_error)?;
+            if !self
+                .deepseek_runtime_generation_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                    token_refresh_generation,
+                )
+                .await
+            {
+                self.deepseek_runtime.invalidate_session(&scope).await;
+                return Err(DeepSeekUpstreamError::IdentityChanged);
+            }
+            let response = client
+                .completion(
+                    &token,
+                    &pow_header,
+                    DeepSeekCompletionRequest {
+                        session_id: &session.session_id,
+                        model,
+                        prompt,
+                        thinking_enabled,
+                        search_enabled,
+                    },
+                )
+                .await
+                .map_err(deepseek_client_runtime_error)?;
+            if !self
+                .deepseek_runtime_generation_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                    token_refresh_generation,
+                )
+                .await
+            {
+                self.deepseek_runtime.invalidate_session(&scope).await;
+                return Err(DeepSeekUpstreamError::IdentityChanged);
+            }
+            let status = response.status().as_u16();
+            if reused && !rebuilt && matches!(status, 400 | 404 | 409) {
+                // A rejected cached session is recoverable before any downstream bytes exist.
+                // Authentication/rate-limit/server failures never enter this path.
+                rebuilt = true;
+                reused = false;
+                self.deepseek_runtime.invalidate_session(&scope).await;
+                let _session_guard = self.deepseek_runtime.session_lock(&scope).await;
+                let session_id = client
+                    .create_session(&token)
+                    .await
+                    .map_err(deepseek_client_runtime_error)?;
+                if !self
+                    .deepseek_runtime_generation_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        account_id,
+                        expected_auth_identity_generation,
+                        token_refresh_generation,
+                    )
+                    .await
+                {
+                    return Err(DeepSeekUpstreamError::IdentityChanged);
+                }
+                let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                session = DeepSeekCachedSession::new(session_id, now_ms).map_err(|message| {
+                    DeepSeekUpstreamError::Protocol {
+                        operation: "create_session",
+                        message,
+                    }
+                })?;
+                self.deepseek_runtime
+                    .insert_session(scope.clone(), session.clone())
+                    .await;
+                continue;
+            }
+            if matches!(status, 400 | 401 | 403 | 404 | 409) {
+                self.deepseek_runtime.invalidate_session(&scope).await;
+            }
+            return Ok(response);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deepseek_runtime_generation_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        auth_identity_generation: u64,
+        token_refresh_generation: u64,
+    ) -> bool {
+        let provider_matches = {
+            let providers = self.providers.read().await;
+            let Some(stored) = providers.providers.iter().find(|stored| {
+                stored.app == app
+                    && stored.provider.id == provider_id
+                    && stored.provider_type == ProviderType::DeepSeekAccount
+                    && stored.resource.revision == provider_revision
+            }) else {
+                return false;
+            };
+            let Some(plan) = providers.runtime_plan(app, provider_id) else {
+                return false;
+            };
+            stored.resource.revision == plan.provider_revision
+                && plan.runtime_fingerprint == runtime_fingerprint
+                && plan.driver_id.as_str() == "special.deepseek_account"
+                && matches!(
+                    &plan.auth_ref,
+                    crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                        account_id: bound_account_id,
+                        expected_provider_type: ProviderType::DeepSeekAccount,
+                        auth_identity_generation: bound_generation,
+                    } if bound_account_id == account_id
+                        && *bound_generation == auth_identity_generation
+                )
+        };
+        provider_matches
+            && self
+                .find_account_for_provider(ProviderType::DeepSeekAccount, account_id)
+                .await
+                .is_some_and(|account| {
+                    account.auth_identity_generation == auth_identity_generation
+                        && account.token_refresh_generation == token_refresh_generation
+                })
     }
 
     pub async fn mutate_shares<R>(&self, mutate: impl FnOnce(&mut ShareStore) -> R) -> R {
@@ -15611,14 +16944,131 @@ fn now_ms_i64() -> i64 {
     crate::infra::time::now_ms().min(i64::MAX as u128) as i64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutboundHttp2KeepaliveConfig {
+    interval: Duration,
+    timeout: Duration,
+}
+
+fn outbound_http2_keepalive_config() -> Option<OutboundHttp2KeepaliveConfig> {
+    let enabled = std::env::var("CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_ENABLED").ok();
+    let interval = std::env::var("CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_INTERVAL_MS").ok();
+    let timeout = std::env::var("CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_TIMEOUT_MS").ok();
+    parse_outbound_http2_keepalive_config(
+        enabled.as_deref(),
+        interval.as_deref(),
+        timeout.as_deref(),
+    )
+}
+
+fn parse_outbound_http2_keepalive_config(
+    enabled: Option<&str>,
+    interval_ms: Option<&str>,
+    timeout_ms: Option<&str>,
+) -> Option<OutboundHttp2KeepaliveConfig> {
+    let enabled = enabled.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "enabled"
+        )
+    });
+    enabled.then(|| OutboundHttp2KeepaliveConfig {
+        interval: Duration::from_millis(outbound_http2_duration_ms(
+            interval_ms,
+            45_000,
+            10_000,
+            300_000,
+        )),
+        timeout: Duration::from_millis(outbound_http2_duration_ms(
+            timeout_ms, 20_000, 5_000, 60_000,
+        )),
+    })
+}
+
+fn outbound_http2_duration_ms(
+    value: Option<&str>,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(minimum, maximum)
+}
+
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    crate::infra::http::outbound_client_builder()?
+    let mut builder = crate::infra::http::outbound_client_builder()?
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Duration::from_secs(60))
+        .no_gzip();
+    if let Some(config) = outbound_http2_keepalive_config() {
+        builder = builder
+            .http2_keep_alive_interval(config.interval)
+            .http2_keep_alive_timeout(config.timeout)
+            .http2_keep_alive_while_idle(false);
+    }
+    builder.build().context("build shared outbound HTTP client")
+}
+
+fn build_web_session_http_client() -> anyhow::Result<reqwest::Client> {
+    crate::infra::http::outbound_client_builder()?
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(false)
+        .connect_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(2)
+        .tcp_keepalive(Duration::from_secs(60))
         .no_gzip()
         .build()
-        .context("build shared outbound HTTP client")
+        .context("build isolated Web Session outbound HTTP client")
+}
+
+fn web_session_scopes_from_store(
+    providers: &ProviderStore,
+) -> BTreeSet<crate::domain::providers::web_session::WebSessionScope> {
+    use crate::domain::providers::runtime::{RuntimeAuthRef, RuntimeConfigurationState};
+    use crate::domain::providers::web_session::{
+        web_session_profile_for_driver, WebSessionScope, WEB_SESSION_CREDENTIAL_SLOT,
+    };
+
+    providers
+        .providers
+        .iter()
+        .filter_map(|stored| {
+            let plan = providers.runtime_plan(stored.app, &stored.provider.id)?;
+            let profile = web_session_profile_for_driver(plan.driver_id.as_str())?;
+            if plan.configuration_state == RuntimeConfigurationState::NeedsAttention
+                || !plan.extra_headers.is_empty()
+            {
+                return None;
+            }
+            let credential_generation = match &plan.auth_ref {
+                RuntimeAuthRef::StaticCredential {
+                    auth_scheme: crate::domain::providers::registry::AuthScheme::None,
+                    slots,
+                    credential_generation,
+                } if slots.as_slice() == [WEB_SESSION_CREDENTIAL_SLOT] => *credential_generation,
+                _ => return None,
+            };
+            let scope = WebSessionScope {
+                provider_key: plan.provider_key.clone(),
+                provider_revision: plan.provider_revision,
+                runtime_fingerprint: plan.runtime_fingerprint.clone(),
+                credential_generation,
+                profile_id: profile.profile_id.clone(),
+                fixed_origin: profile.fixed_origin.clone(),
+            };
+            scope.validate().ok().map(|_| scope)
+        })
+        .collect()
+}
+
+fn web_session_scope_matches_store(
+    providers: &ProviderStore,
+    scope: &crate::domain::providers::web_session::WebSessionScope,
+) -> bool {
+    web_session_scopes_from_store(providers).contains(scope)
 }
 
 pub async fn refresh_router_installation_registration(state: &ServerState) -> bool {
@@ -17136,6 +18586,7 @@ fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -
         | ProviderType::AgyOAuth
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::CursorOAuth
         | ProviderType::CursorApiKey
         | ProviderType::GrokOAuth
@@ -19720,6 +21171,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outbound_http2_keepalive_is_opt_in_and_bounded() {
+        for disabled in [
+            None,
+            Some("0"),
+            Some("false"),
+            Some("disabled"),
+            Some("garbage"),
+        ] {
+            assert_eq!(
+                parse_outbound_http2_keepalive_config(disabled, Some("10000"), Some("5000")),
+                None
+            );
+        }
+
+        assert_eq!(
+            parse_outbound_http2_keepalive_config(Some("YES"), None, None),
+            Some(OutboundHttp2KeepaliveConfig {
+                interval: Duration::from_millis(45_000),
+                timeout: Duration::from_millis(20_000),
+            })
+        );
+        assert_eq!(
+            parse_outbound_http2_keepalive_config(Some("1"), Some("1"), Some("999999")),
+            Some(OutboundHttp2KeepaliveConfig {
+                interval: Duration::from_millis(10_000),
+                timeout: Duration::from_millis(60_000),
+            })
+        );
+        assert_eq!(
+            parse_outbound_http2_keepalive_config(
+                Some(" enabled "),
+                Some("not-a-number"),
+                Some("not-a-number"),
+            ),
+            Some(OutboundHttp2KeepaliveConfig {
+                interval: Duration::from_millis(45_000),
+                timeout: Duration::from_millis(20_000),
+            })
+        );
+    }
+
+    #[test]
     fn upgrade_task_report_fingerprint_ignores_poll_timestamp_only() {
         let snapshot = crate::self_update::upgrade::UpgradeStatusSnapshot {
             task_id: "task-fingerprint".into(),
@@ -20330,6 +21823,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }
@@ -20478,6 +21972,7 @@ mod tests {
             crate::domain::accounts::capability_evidence::TOKEN_EXCHANGE_DIMENSION,
             crate::domain::accounts::capability_evidence::ENDPOINT_PROVENANCE_DIMENSION,
             crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+            crate::domain::accounts::capability_evidence::MODEL_ENTITLEMENT_DIMENSION,
         ] {
             assert_eq!(
                 account.capability_observations[&format!("github_copilot_code_plan:{dimension}")]
@@ -20605,7 +22100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copilot_ghes_model_discovery_never_uses_public_static_fallback() {
+    async fn copilot_model_discovery_never_uses_public_static_fallback() {
         async fn unavailable() -> (StatusCode, Json<Value>) {
             (
                 StatusCode::BAD_GATEWAY,
@@ -20651,6 +22146,43 @@ mod tests {
             .await;
         assert!(matches!(
             result,
+            Err(CopilotModelCatalogError::Discovery {
+                status_code: 502,
+                ..
+            })
+        ));
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "copilot-public-model-account",
+                        "providerType": "github_copilot",
+                        "accessToken": "public-copilot-token",
+                        "refreshToken": "public-github-token",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {"githubDomain": "github.com", "ghes": false},
+                        "raw": {
+                            "githubDomain": "github.com",
+                            "githubToken": "public-github-token",
+                            "copilotToken": {"token": "public-copilot-token"},
+                            "copilotApiBase": "https://api.githubcopilot.com"
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let public_result = state
+            .copilot_model_catalog(
+                "copilot-public-model-account",
+                1,
+                Duration::from_secs(2),
+                Some(&format!("http://{address}/models")),
+            )
+            .await;
+        assert!(matches!(
+            public_result,
             Err(CopilotModelCatalogError::Discovery {
                 status_code: 502,
                 ..
@@ -24844,7 +26376,7 @@ mod tests {
             "modelMapping": {"mode": "single", "upstreamModel": "gpt-fixed"}
         });
 
-        let rejected = state
+        let stored_official = state
             .upsert_provider_command(
                 AppKind::Codex,
                 official,
@@ -24855,12 +26387,20 @@ mod tests {
             )
             .await
             .unwrap()
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(
+            stored_official.provider.settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "gpt-fixed"})
+        );
         assert!(matches!(
-            rejected,
-            ProviderCommandError::Invalid(message) if message.contains("does not allow modelMapping.mode=single")
+            state
+                .provider_runtime_plan(AppKind::Codex, &stored_official.provider.id)
+                .await
+                .unwrap()
+                .model_policy,
+            crate::domain::providers::runtime::RuntimeModelPolicy::Single { ref upstream_model }
+                if upstream_model == "gpt-fixed"
         ));
-        assert!(state.providers_snapshot().await.providers.is_empty());
 
         let mut configurable = test_provider("configurable-passthrough", "OpenRouter");
         configurable.settings_config = json!({
@@ -26676,10 +28216,19 @@ mod tests {
 
         let deepseek_error = state
             .start_deepseek_chat_completion(
+                AppKind::Claude,
+                "generation-bound-provider",
+                1,
+                "generation-bound-runtime",
                 "generation-bound-deepseek",
                 1,
-                "deepseek-chat",
+                "share-a",
+                "user@example.com",
+                "session-a",
+                "deepseek-v4-flash",
                 "hello",
+                false,
+                false,
             )
             .await
             .unwrap_err();
@@ -28678,6 +30227,7 @@ mod tests {
         let user_namespace = grok_media_task_user_namespace(Some("owner@example.com"));
         let binding = GrokMediaTaskBinding {
             task_id: task_id.to_string(),
+            task_kind: GrokMediaTaskKind::VideoGeneration,
             creation_request_id: None,
             provider_id: "grok-provider".to_string(),
             account_id: "grok-account".to_string(),
@@ -28689,8 +30239,54 @@ mod tests {
             created_at_ms,
             expires_at_ms: created_at_ms.saturating_add(120_000),
         };
-        let key = grok_media_task_owner_key(&share_id, &user_namespace, task_id);
+        let key = grok_media_task_owner_key(&binding);
         (key, binding)
+    }
+
+    #[test]
+    fn grok_media_task_owner_key_covers_every_upstream_identity_dimension() {
+        let (_, base) = grok_media_task_binding_for_test("task-owner-key", 1_000);
+        let variants = [
+            GrokMediaTaskBinding {
+                share_id: "share-b".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                user_namespace: "principal-other".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                task_id: "task-owner-key-other".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                provider_id: "grok-provider-other".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                account_id: "grok-account-other".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                auth_identity_generation: 2,
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                runtime_fingerprint: "runtime-other".to_string(),
+                ..base.clone()
+            },
+            GrokMediaTaskBinding {
+                upstream_plane: GrokVideoPlane::Build,
+                ..base.clone()
+            },
+        ];
+        let base_key = grok_media_task_owner_key(&base);
+        let keys = variants
+            .iter()
+            .map(grok_media_task_owner_key)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), variants.len());
+        assert!(keys.iter().all(|key| key != &base_key));
     }
 
     #[test]
@@ -28772,31 +30368,39 @@ mod tests {
     }
 
     #[test]
-    fn grok_media_task_schema_v1_migrates_only_to_the_historical_xai_plane() {
-        let config_dir = provider_restore_test_dir("grok-media-task-v1-plane");
-        let (key, binding) = grok_media_task_binding_for_test("video-v1", 1_000);
-        let mut binding_value = serde_json::to_value(binding).unwrap();
-        binding_value
-            .as_object_mut()
-            .unwrap()
-            .remove("upstreamPlane");
-        std::fs::write(
-            grok_media_tasks_path(&config_dir),
-            serde_json::to_vec(&json!({
-                "schemaVersion": 1,
-                "bindings": {key: binding_value}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+    fn grok_media_task_schemas_v1_through_v3_migrate_to_video_kind_and_full_owner_key() {
+        for schema_version in 1..=3 {
+            let config_dir =
+                provider_restore_test_dir(&format!("grok-media-task-v{schema_version}-full-owner"));
+            let (_, binding) =
+                grok_media_task_binding_for_test(&format!("video-v{schema_version}"), 1_000);
+            let mut binding_value = serde_json::to_value(&binding).unwrap();
+            binding_value.as_object_mut().unwrap().remove("taskKind");
+            if schema_version == 1 {
+                binding_value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("upstreamPlane");
+            }
+            std::fs::write(
+                grok_media_tasks_path(&config_dir),
+                serde_json::to_vec(&json!({
+                    "schemaVersion": schema_version,
+                    "bindings": {"legacy-owner-key": binding_value}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
 
-        let loaded = GrokMediaTaskStore::load_or_default(&config_dir, 1_001).unwrap();
-        assert_eq!(loaded.schema_version, GROK_MEDIA_TASK_STORE_SCHEMA_VERSION);
-        assert_eq!(
-            loaded.bindings.values().next().unwrap().upstream_plane,
-            GrokVideoPlane::Xai
-        );
-        std::fs::remove_dir_all(config_dir).unwrap();
+            let loaded = GrokMediaTaskStore::load_or_default(&config_dir, 1_001).unwrap();
+            assert_eq!(loaded.schema_version, GROK_MEDIA_TASK_STORE_SCHEMA_VERSION);
+            let (key, migrated) = loaded.bindings.iter().next().unwrap();
+            assert_eq!(migrated.upstream_plane, GrokVideoPlane::Xai);
+            assert_eq!(migrated.task_kind, GrokMediaTaskKind::VideoGeneration);
+            assert_eq!(key, &grok_media_task_owner_key(migrated));
+            assert_ne!(key, "legacy-owner-key");
+            std::fs::remove_dir_all(config_dir).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -28811,6 +30415,7 @@ mod tests {
         let binding = state
             .remember_grok_media_task(
                 "video-1".to_string(),
+                GrokMediaTaskKind::VideoGeneration,
                 Some("creation-request-1".to_string()),
                 "provider-a".to_string(),
                 "account-a".to_string(),
@@ -28836,18 +30441,33 @@ mod tests {
         let restored = test_state_at(config_dir.clone());
         assert_eq!(
             restored
-                .grok_media_task_binding("share-a", Some("owner@example.com"), "video-1")
+                .grok_media_task_binding(
+                    "share-a",
+                    Some("owner@example.com"),
+                    GrokMediaTaskKind::VideoGeneration,
+                    "video-1",
+                )
                 .await
                 .unwrap(),
             Some(binding)
         );
         assert!(restored
-            .grok_media_task_binding("share-b", Some("owner@example.com"), "video-1")
+            .grok_media_task_binding(
+                "share-b",
+                Some("owner@example.com"),
+                GrokMediaTaskKind::VideoGeneration,
+                "video-1",
+            )
             .await
             .unwrap()
             .is_none());
         assert!(restored
-            .grok_media_task_binding("share-a", Some("other@example.com"), "video-1")
+            .grok_media_task_binding(
+                "share-a",
+                Some("other@example.com"),
+                GrokMediaTaskKind::VideoGeneration,
+                "video-1",
+            )
             .await
             .unwrap()
             .is_none());

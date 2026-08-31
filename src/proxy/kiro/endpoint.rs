@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::{next_uuid_like, KiroAccountData};
+use super::{next_uuid_like, CodeWhispererProduct, KiroAccountData};
 use crate::proxy::ProxyError;
 
 pub(super) const FALLBACK_IDE_VERSION: &str = "0.9.2";
@@ -12,10 +12,14 @@ const NODE_VERSION: &str = "22.22.0";
 pub(super) enum EndpointKind {
     Ide,
     Cli,
+    AmazonQCli,
 }
 
 impl EndpointKind {
     pub(super) fn from_account(account: &KiroAccountData) -> Self {
+        if account.product == CodeWhispererProduct::AmazonQ {
+            return Self::AmazonQCli;
+        }
         match account.endpoint.as_deref().map(str::trim) {
             Some(value) if value.eq_ignore_ascii_case("cli") => Self::Cli,
             _ => Self::Ide,
@@ -83,7 +87,7 @@ pub(super) fn prepare(
                 body,
             )
         }
-        EndpointKind::Cli => {
+        EndpointKind::Cli | EndpointKind::AmazonQCli => {
             let cli_version = account
                 .cli_version
                 .as_deref()
@@ -109,7 +113,12 @@ pub(super) fn prepare(
                     ),
                 ),
             ];
-            (format!("https://{host}/"), headers, cli_body(body))
+            let origin = if kind == EndpointKind::AmazonQCli {
+                "CLI"
+            } else {
+                "KIRO_CLI"
+            };
+            (format!("https://{host}/"), headers, cli_body(body, origin))
         }
     };
 
@@ -140,8 +149,8 @@ fn token_type_header(account: &KiroAccountData) -> Option<&'static str> {
     }
 }
 
-fn cli_body(mut body: Value) -> Value {
-    replace_origin(&mut body);
+fn cli_body(mut body: Value, origin: &str) -> Value {
+    replace_origin(&mut body, origin);
     if let Some(state) = body
         .get_mut("conversationState")
         .and_then(Value::as_object_mut)
@@ -161,18 +170,20 @@ fn cli_body(mut body: Value) -> Value {
     body
 }
 
-fn replace_origin(value: &mut Value) {
+fn replace_origin(value: &mut Value, origin: &str) {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
                 if key == "origin" && child.as_str() == Some("AI_EDITOR") {
-                    *child = Value::String("KIRO_CLI".to_string());
+                    *child = Value::String(origin.to_string());
                 } else {
-                    replace_origin(child);
+                    replace_origin(child, origin);
                 }
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(replace_origin),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| replace_origin(item, origin)),
         _ => {}
     }
 }
@@ -184,6 +195,9 @@ pub(super) fn profile_arn(account: &KiroAccountData) -> Result<Option<String>, P
         .filter(|value| !value.trim().is_empty())
     {
         return Ok(Some(profile_arn.to_string()));
+    }
+    if account.product == CodeWhispererProduct::AmazonQ {
+        return Ok(None);
     }
     let auth_method = account
         .auth_method
@@ -215,6 +229,7 @@ mod tests {
 
     fn account(endpoint: &str) -> KiroAccountData {
         KiroAccountData {
+            product: CodeWhispererProduct::Kiro,
             account_id: "account".to_string(),
             email: None,
             refresh_token: "refresh".to_string(),
@@ -324,5 +339,44 @@ mod tests {
                 .map(|(_, value)| value.as_str())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn amazon_q_forces_official_cli_origin_and_never_uses_kiro_origin() {
+        let mut amazon_q = account("ide");
+        amazon_q.product = CodeWhispererProduct::AmazonQ;
+        amazon_q.profile_arn = None;
+        amazon_q.auth_method = Some("builder_id".to_string());
+        let prepared = prepare(
+            EndpointKind::from_account(&amazon_q),
+            &amazon_q,
+            "amazon-q-token",
+            serde_json::json!({
+                "conversationState": {
+                    "currentMessage": {"userInputMessage": {"origin": "AI_EDITOR"}},
+                    "history": [{"userInputMessage": {"origin": "AI_EDITOR"}}]
+                }
+            }),
+            FALLBACK_IDE_VERSION,
+        );
+        assert_eq!(prepared.url, "https://q.us-east-1.amazonaws.com/");
+        assert_eq!(
+            prepared
+                .body
+                .pointer("/conversationState/currentMessage/userInputMessage/origin"),
+            Some(&serde_json::json!("CLI"))
+        );
+        assert_eq!(
+            prepared
+                .body
+                .pointer("/conversationState/history/0/userInputMessage/origin"),
+            Some(&serde_json::json!("CLI"))
+        );
+        assert!(!prepared.body.to_string().contains("KIRO_CLI"));
+        assert!(prepared.headers.iter().any(|(name, value)| {
+            *name == "x-amz-target"
+                && value == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        }));
+        assert_eq!(profile_arn(&amazon_q).unwrap(), None);
     }
 }

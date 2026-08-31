@@ -17,6 +17,11 @@ for (const file of [
   'assets/contract/provider-field-consumption.json',
   'assets/contract/provider-legacy-behavior.json',
   'assets/contract/provider-writer-inventory.json',
+  'assets/contract/coding-plan-source-baseline.json',
+  'assets/contract/coding-plan-registry-manifest.json',
+  'assets/contract/web-session-source-baseline.json',
+  'assets/contract/web-session-registry.json',
+  'assets/contract/web-session-registry-manifest.json',
   'assets/contract/provider-coverage.json',
   'assets/contract/provider-fixtures/structures.json',
   'assets/contract/router-provider-channel-baseline.json',
@@ -47,6 +52,8 @@ node --test scripts/audit/*.test.mjs
 node scripts/audit/audit-upstream-provider-baseline.mjs --check
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
+node scripts/audit/audit-coding-plan-registry.mjs --check
+node scripts/audit/audit-web-session-registry.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 node scripts/audit/audit-server-product-boundary.mjs
 node scripts/audit/audit-web-i18n-literals.mjs

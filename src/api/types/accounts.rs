@@ -527,6 +527,23 @@ pub(in crate::api) struct PollKiroDeviceLoginRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartAmazonQDeviceLoginRequest {}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartAmazonQDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) device: crate::clients::oauth::amazon_q_device::AmazonQDeviceCodeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollAmazonQDeviceLoginRequest {
+    pub(in crate::api) device_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct StartCodexDeviceLoginRequest {}
 
 #[derive(Debug, Serialize)]
@@ -713,6 +730,18 @@ pub(in crate::api) struct ImportQoderPatResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct PollKiroDeviceLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollAmazonQDeviceLoginResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) pending: bool,
     pub(in crate::api) message: String,

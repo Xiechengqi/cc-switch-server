@@ -469,6 +469,9 @@ impl AccountManager for AccountProviderDriver {
             ProviderType::KiroOAuth => {
                 "kiro device import is available via /api/accounts/kiro/device/start|poll; native login remains disabled until real proxy validation"
             }
+            ProviderType::AmazonQOAuth => {
+                "Amazon Q device import is available via /api/accounts/amazon-q/device/start|poll; native login remains live-pending"
+            }
             ProviderType::CursorOAuth => unreachable!(),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 "antigravity oauth browser login is disabled until real account validation; use login exchange/import preview"
@@ -692,6 +695,7 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::GeminiCli
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
@@ -714,20 +718,121 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
 fn validate_required_account_credential(
     input: &UpsertAccountInput,
 ) -> Result<(), AccountManagerError> {
-    if input.provider_type == ProviderType::DeepSeekAccount
-        && input
-            .access_token
-            .as_deref()
-            .is_none_or(|value| value.trim().is_empty())
-    {
-        return Err(AccountManagerError::CredentialUnavailable(
-            "deepseek_account requires a non-empty accessToken".to_string(),
-        ));
+    if input.provider_type == ProviderType::DeepSeekAccount {
+        validate_deepseek_account_input(input)?;
     }
     if input.provider_type == ProviderType::QoderCosy {
         validate_qoder_account_input(input)?;
     }
     Ok(())
+}
+
+fn validate_deepseek_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
+    const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+
+    let access_token = input
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AccountManagerError::CredentialUnavailable(
+                "deepseek_account requires a non-empty accessToken".to_string(),
+            )
+        })?;
+    if access_token.len() > MAX_ACCESS_TOKEN_BYTES
+        || access_token
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "deepseek_account accessToken must be a token-only value of at most 16 KiB with no whitespace or control characters"
+                .to_string(),
+        ));
+    }
+    if input
+        .refresh_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || input
+            .id_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || input
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || input
+            .extra_headers
+            .as_ref()
+            .is_some_and(|headers| !headers.is_empty())
+        || !input.scopes.is_empty()
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "deepseek_account accepts exactly one import-only bearer accessToken and forbids refreshToken, idToken, apiKey, scopes, and extraHeaders"
+                .to_string(),
+        ));
+    }
+    if input
+        .token_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("bearer"))
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "deepseek_account tokenType must be Bearer when present".to_string(),
+        ));
+    }
+    for (root, value) in [
+        ("profile", input.profile.as_ref()),
+        ("raw", input.raw.as_ref()),
+    ] {
+        if let Some(path) = value.and_then(|value| deepseek_forbidden_import_field(value, root)) {
+            return Err(AccountManagerError::CredentialUnavailable(format!(
+                "deepseek_account {path} is a forbidden alternate credential/session field"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn deepseek_forbidden_import_field(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => object.iter().find_map(|(key, value)| {
+            let compact = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .map(|character| character.to_ascii_lowercase())
+                .collect::<String>();
+            let forbidden = matches!(
+                compact.as_str(),
+                "accesstoken"
+                    | "refreshtoken"
+                    | "idtoken"
+                    | "apikey"
+                    | "authorization"
+                    | "bearertoken"
+                    | "cookie"
+                    | "setcookie"
+                    | "password"
+                    | "sessioncookie"
+                    | "sessiontoken"
+                    | "credential"
+                    | "credentials"
+            ) || compact.ends_with("cookie")
+                || compact.ends_with("password")
+                || compact.ends_with("sessiontoken");
+            let child = format!("{path}.{key}");
+            forbidden
+                .then_some(child.clone())
+                .or_else(|| deepseek_forbidden_import_field(value, &child))
+        }),
+        Value::Array(values) => values.iter().enumerate().find_map(|(index, value)| {
+            deepseek_forbidden_import_field(value, &format!("{path}[{index}]"))
+        }),
+        _ => None,
+    }
 }
 
 fn validate_qoder_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
@@ -804,7 +909,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 17] {
+fn account_provider_types() -> [ProviderType; 18] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -813,6 +918,7 @@ fn account_provider_types() -> [ProviderType; 17] {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::AmazonQOAuth,
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
@@ -936,6 +1042,7 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
@@ -969,6 +1076,7 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
         ProviderType::CodexOAuth
             | ProviderType::GitHubCopilot
             | ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::GrokOAuth
@@ -1058,14 +1166,28 @@ fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemp
             provider_type,
             credential_kind: "access_token",
             required_fields: vec!["providerType", "accessToken"],
-            optional_fields: optional_oauth_fields.clone(),
+            optional_fields: vec![
+                "id",
+                "email",
+                "tokenType=Bearer",
+                "profile (non-secret metadata only)",
+                "raw (non-secret metadata only)",
+                "subscriptionLevel",
+                "entitlementStatus",
+                "quotaPercent",
+                "quota",
+                "quotaRefreshedAt",
+                "quotaNextRefreshAt",
+                "expiresAt",
+                "rateLimitedUntil",
+                "lastRefreshError",
+            ],
             profile_hints: vec!["email", "name", "plan", "subscription"],
             raw_hints: vec![
-                "DeepSeek account token/session export",
-                "provider profile response",
-                "billing or quota snapshot",
+                "non-secret provider profile response",
+                "billing or quota snapshot without credentials",
             ],
-            notes: "import-only; cc-switch-server does not store DeepSeek account passwords",
+            notes: "import-only bearer-only rail; refresh tokens, ID tokens, API keys, scopes, extra headers, passwords, cookies, session credentials, and duplicate secrets in profile/raw are rejected; cc-switch-server does not store DeepSeek account passwords",
         },
         ProviderType::GitHubCopilot => AccountImportTemplate {
             provider_type,
@@ -1094,6 +1216,15 @@ fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemp
                 "kiroUsageLimits",
             ],
             notes: "AWS Builder ID device flow import is available via /api/accounts/kiro/device/start|poll; Claude CodeWhisperer forwarding and server-native refresh are wired, with native capability still gated on real Kiro validation",
+        },
+        ProviderType::AmazonQOAuth => AccountImportTemplate {
+            provider_type,
+            credential_kind: "oauth_token",
+            required_fields: vec!["providerType", "accessToken", "refreshToken"],
+            optional_fields: optional_oauth_fields.clone(),
+            profile_hints: vec!["accountId", "authRegion", "runtimeRegion", "profileArn"],
+            raw_hints: vec!["clientId", "clientSecret", "clientSecretExpiresAt"],
+            notes: "independent Amazon Q Developer AWS SSO OIDC device flow is available via /api/accounts/amazon-q/device/start|poll; Kiro credentials are rejected",
         },
         ProviderType::KimiCode => AccountImportTemplate {
             provider_type,
@@ -1153,6 +1284,7 @@ fn refresh_lock_key(provider_type: ProviderType, account_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn codex_account_input(id: &str, refresh_token: &str) -> UpsertAccountInput {
         UpsertAccountInput {
@@ -1307,6 +1439,84 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_account_manager_accepts_only_the_imported_bearer_rail() {
+        fn valid_input(id: &str) -> UpsertAccountInput {
+            let mut input = codex_account_input(id, "unused-refresh");
+            input.provider_type = ProviderType::DeepSeekAccount;
+            input.access_token = Some("deepseek.token-only_value".to_string());
+            input.refresh_token = None;
+            input.token_type = Some("Bearer".to_string());
+            input
+        }
+
+        let manager = manager_for(ProviderType::DeepSeekAccount);
+        let mut valid_store = AccountStore::default();
+        manager
+            .finish_login(&mut valid_store, valid_input("deepseek-valid"))
+            .unwrap();
+        assert_eq!(valid_store.accounts.len(), 1);
+
+        let mut cases = Vec::new();
+
+        let mut value = valid_input("deepseek-whitespace");
+        value.access_token = Some("Bearer token".to_string());
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-oversized");
+        value.access_token = Some("a".repeat(16 * 1024 + 1));
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-refresh");
+        value.refresh_token = Some("refresh-token".to_string());
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-id-token");
+        value.id_token = Some("id-token".to_string());
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-api-key");
+        value.api_key = Some("api-key".to_string());
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-headers");
+        value.extra_headers = Some(BTreeMap::from([(
+            "Cookie".to_string(),
+            "session=value".to_string(),
+        )]));
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-scopes");
+        value.scopes = vec!["offline_access".to_string()];
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-basic");
+        value.token_type = Some("Basic".to_string());
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-raw-cookie");
+        value.raw = Some(json!({"nested":{"sessionCookie":"secret"}}));
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-profile-password");
+        value.profile = Some(json!({"password":"secret"}));
+        cases.push(value);
+
+        let mut value = valid_input("deepseek-duplicate-token");
+        value.raw = Some(json!({"access_token":"duplicate"}));
+        cases.push(value);
+
+        for input in cases {
+            let mut store = AccountStore::default();
+            let error = manager.finish_login(&mut store, input).unwrap_err();
+            assert!(matches!(
+                error,
+                AccountManagerError::CredentialUnavailable(_)
+            ));
+            assert!(store.accounts.is_empty());
+        }
+    }
+
+    #[test]
     fn account_capabilities_expose_subscription_expiry_policy() {
         assert_eq!(
             capability_for(ProviderType::ClaudeOAuth).subscription_expiry_capability,
@@ -1449,6 +1659,12 @@ mod tests {
                 true,
             ),
             (
+                ProviderType::AmazonQOAuth,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
                 ProviderType::KimiCode,
                 OAuthRefreshCapability::OAuthRequest,
                 OAuthQuotaCapability::LiveRefresh,
@@ -1580,7 +1796,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            11
+            12
         );
         assert_eq!(
             registrations

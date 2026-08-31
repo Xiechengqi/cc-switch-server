@@ -31,6 +31,10 @@ pub(in crate::api) struct OpenAiModel {
     pub(in crate::api) reasoning_efforts: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) input_modalities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) supports_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -93,7 +93,7 @@ Claude / Codex / Gemini client
 | Kiro OAuth | 🧪 | 🧪 | — | Experimental（Claude/Codex fixture-verified，live-unverified） |
 | DeepSeek Account | ⚠️ | — | — | Planned（仅 Claude） |
 | Kimi Code | ✅ | ✅ | ✅ | Native contract（固定账号，live-unverified） |
-| Qoder COSY | 🧪 | 🧪 | 🧪 | Experimental（固定账号与三 Surface contract，live-unverified） |
+| Qoder OAuth | 🧪 | 🧪 | 🧪 | Experimental（固定账号与三 Surface contract，live-unverified） |
 
 完整 provider 类型与 preset 覆盖见 [`docs/provider/coverage.md`](docs/provider/coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
 

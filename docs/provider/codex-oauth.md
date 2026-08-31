@@ -148,7 +148,11 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 - Token 换票 / refresh / Device 流使用与推理同源的官方 `originator` + User-Agent，凭据面不发 `version` 头。推理面继续配对 `originator` / User-Agent / `version`。关闭 Codex 版本同步并长期停在内置 `0.144.1` 会提高被上游优先降载的概率。
 - 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；容量降载的改码是唯一例外。
 - Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和空 `response.completed.output` 恢复使用同一执行身份。
+- 普通 Responses HTTP/SSE、下游非流聚合、Dedicated Images 和 WS→HTTP fallback 共用有界增量 transport decoder：支持任意 chunk 边界、LF/CRLF/单 CR、多行 `data` 与 EOF tail，业务载荷必须是 UTF-8 JSON object。只丢弃 comment、无 data 控制帧、精确 `ping`/`keepalive` 以及仅含对应 `type` 的 JSON liveness；HTML、普通文本、JSON scalar/array、冲突 liveness 和其他坏 payload 均 fail closed。下游 Responses SSE 被重编码为单行 JSON data 的 canonical event，并固定使用 `text/event-stream; charset=utf-8`、`no-store/no-transform`、`X-Accel-Buffering: no` 与 `nosniff`。
+- `response.completed`、`response.failed` 和 `response.incomplete` 是 Responses 终态；`[DONE]` 与非标准 `response.done` 都不能单独证明成功。提交后协议故障使用合法 `response.failed` 帧和 `upstream_stream_protocol_error`，不再追加 `[DONE]`；usage 记录 `protocol_error`，而不是把坏 SSE 伪装成普通断流。
+- 首事件 timeout 是每次实际上游尝试从发送请求之前开始的一次绝对预算，HTTP headers、lifecycle 和 liveness 都不重置；首个业务/终态事件之后才切换到 business-idle 预算。OAuth refresh 属于请求准备，使用独立 30 秒有界 singleflight，不消耗首事件预算；原账号首次 401 强刷后重放时会为这次新尝试创建一份完整的新预算，但仍不得更换账号或 Provider。SSE 未完成事件和完整事件分别受 2 MiB 与 128 MiB 上限约束，Dedicated Images 继续使用自身更严格的累计上限。
 - 普通文本 SSE 只在首个业务或终态事件已经提交后启动 `: keepalive`，默认 15 秒；首包前不发 comment。心跳有独立下游时钟，不推进上游 first-event/idle deadline，因而不会把真实上游静默伪装成健康流。`CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS=0` 可关闭，非零值限制为 5 到 60 秒。
+- `CC_SWITCH_CODEX_RESPONSES_SSE_NORMALIZER_ENABLED=0` 仅用于事故回滚，默认必须开启。`CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_ENABLED=1` 可实验性启用活动 HTTP/2 连接的协议级 PING，默认关闭；interval/timeout 默认 45/20 秒并分别限制为 10..300 秒与 5..60 秒。它不替代 Responses 业务首事件、idle 和 terminal 判定。
 - Images generation/edit 使用固定 Codex bridge、身份头和 body 上限；401 重放后仍返回原始上游错误 body，不用另一个账号掩盖错误。
 - models manifest 与 alpha search 只访问固定 ChatGPT Codex endpoint，并采用同账号一次 401 refresh 边界。
 
@@ -204,6 +208,7 @@ Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provid
 - fallback 复用原 `ProviderExecution`、账号、workspace、session、request body 和 in-flight lease，不重新进入 Router。
 - 首次握手/HTTP 401 只强刷原账号一次；不会借 fallback 获得额外的 refresh 或 Provider failover 次数。
 - `response.create` 一旦成功发送到上游，后续失败只终止当前 lifecycle，不重放整个请求。
+- 上游 Text/Binary 业务帧必须是顶层 JSON object；坏 JSON、scalar 和 array 都按协议错误终止，即使 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 也不会绕过这项 transport 校验。WebSocket Ping/Pong/Close 控制帧仍按协议独立处理。
 - `codexWebsocketEnabled=false` 可关闭 WS，但不影响 POST Responses HTTP/SSE。
 
 ## Context Overflow 自动压缩

@@ -7,6 +7,7 @@ mod tool_bridge;
 mod wire;
 
 use crate::domain::accounts::store::Account;
+use crate::domain::providers::amazon_q::AMAZON_Q_RUNTIME_REGIONS;
 use crate::domain::providers::model::ProviderType;
 use crate::proxy::ProxyError;
 use base64::Engine;
@@ -72,6 +73,7 @@ static KIRO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub(crate) struct KiroAccountData {
+    pub product: CodeWhispererProduct,
     pub account_id: String,
     pub email: Option<String>,
     pub refresh_token: String,
@@ -89,6 +91,12 @@ pub(crate) struct KiroAccountData {
     pub client_version: Option<String>,
     pub cli_version: Option<String>,
     pub authenticated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeWhispererProduct {
+    Kiro,
+    AmazonQ,
 }
 
 struct KiroRequestBuild {
@@ -161,12 +169,20 @@ fn machine_id_from_refresh_token(refresh_token: &str) -> String {
 
 impl KiroAccountData {
     pub(crate) fn from_account(account: &Account) -> Result<Self, ProxyError> {
-        if account.provider_type != ProviderType::KiroOAuth {
+        if !matches!(
+            account.provider_type,
+            ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
+        ) {
             return Err(ProxyError::bad_request(format!(
-                "expected kiro_oauth account, got {}",
+                "expected kiro_oauth or amazon_q_oauth account, got {}",
                 account.provider_type.as_str()
             )));
         }
+        let product = if account.provider_type == ProviderType::AmazonQOAuth {
+            CodeWhispererProduct::AmazonQ
+        } else {
+            CodeWhispererProduct::Kiro
+        };
         let access_token = account
             .access_token
             .as_deref()
@@ -184,11 +200,33 @@ impl KiroAccountData {
             .to_string();
         let profile = account.profile.as_ref();
         let raw = account.raw.as_ref();
-        let runtime =
-            crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
-                .map_err(|error| {
-                    ProxyError::bad_request(format!("kiro account {} has {error}", account.id))
-                })?;
+        let (profile_arn, runtime_region) = match product {
+            CodeWhispererProduct::Kiro => {
+                let runtime =
+                    crate::domain::providers::kiro::operational_runtime_identity_from_account(
+                        account,
+                    )
+                    .map_err(|error| {
+                        ProxyError::bad_request(format!("kiro account {} has {error}", account.id))
+                    })?;
+                (runtime.profile_arn, runtime.runtime_region)
+            }
+            CodeWhispererProduct::AmazonQ => {
+                let runtime_region =
+                    string_at(profile, &["/runtimeRegion", "/apiRegion", "/region"])
+                        .or_else(|| string_at(raw, &["/runtimeRegion", "/apiRegion", "/region"]))
+                        .unwrap_or_else(|| "us-east-1".to_string());
+                if !AMAZON_Q_RUNTIME_REGIONS.contains(&runtime_region.as_str()) {
+                    return Err(ProxyError::bad_request(format!(
+                        "Amazon Q account {} has unsupported runtime region",
+                        account.id
+                    )));
+                }
+                let profile_arn = string_at(profile, &["/profileArn", "/resolvedProfileArn"])
+                    .or_else(|| string_at(raw, &["/profileArn", "/resolvedProfileArn"]));
+                (profile_arn, runtime_region)
+            }
+        };
         let auth_region = string_at(profile, &["/authRegion", "/auth_region"])
             .or_else(|| string_at(raw, &["/authRegion", "/auth_region"]))
             .unwrap_or_else(|| crate::domain::providers::kiro::DEFAULT_REGION.to_string());
@@ -200,15 +238,16 @@ impl KiroAccountData {
                 ))
             })?;
         Ok(Self {
+            product,
             account_id: account.id.clone(),
             email: account
                 .email
                 .clone()
                 .or_else(|| string_at(profile, &["/email"])),
             refresh_token: refresh_token.clone(),
-            profile_arn: runtime.profile_arn,
+            profile_arn,
             auth_region,
-            api_region: runtime.runtime_region,
+            api_region: runtime_region,
             machine_id: string_at(profile, &["/machineId", "/machine_id"])
                 .or_else(|| string_at(raw, &["/machineId", "/machine_id"]))
                 .or_else(|| Some(machine_id_from_refresh_token(&refresh_token))),
@@ -3407,6 +3446,7 @@ mod tests {
 
     fn test_account() -> KiroAccountData {
         KiroAccountData {
+            product: CodeWhispererProduct::Kiro,
             account_id: "kiro_test".to_string(),
             email: None,
             refresh_token: "refresh".to_string(),
@@ -3472,6 +3512,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }

@@ -45,6 +45,8 @@ pub enum ProviderType {
     DeepSeekAccount,
     #[serde(rename = "kiro_oauth")]
     KiroOAuth,
+    #[serde(rename = "amazon_q_oauth")]
+    AmazonQOAuth,
     #[serde(rename = "kimi_code")]
     KimiCode,
     #[serde(rename = "qoder_cosy")]
@@ -83,6 +85,7 @@ impl ProviderType {
             Self::GitHubCopilot => "github_copilot",
             Self::DeepSeekAccount => "deepseek_account",
             Self::KiroOAuth => "kiro_oauth",
+            Self::AmazonQOAuth => "amazon_q_oauth",
             Self::KimiCode => "kimi_code",
             Self::QoderCosy => "qoder_cosy",
             Self::CursorOAuth => "cursor_oauth",
@@ -262,6 +265,9 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("grok_oauth") => return ProviderType::GrokOAuth,
         Some("ollama_cloud") => return ProviderType::OllamaCloud,
         Some("kiro_oauth") => return ProviderType::KiroOAuth,
+        Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => {
+            return ProviderType::AmazonQOAuth
+        }
         Some("kimi_code") => return ProviderType::KimiCode,
         Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("cursor_oauth") => return ProviderType::CursorOAuth,
@@ -313,6 +319,7 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("kimi_code") => ProviderType::KimiCode,
         Some("qoder_cosy") => ProviderType::QoderCosy,
         Some("kiro_oauth") => ProviderType::KiroOAuth,
+        Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => ProviderType::AmazonQOAuth,
         _ => {
             if provider_base_url(provider).is_some_and(|url| url.contains("githubcopilot.com")) {
                 ProviderType::GitHubCopilot
@@ -351,6 +358,9 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("grok_oauth") => return ProviderType::GrokOAuth,
         Some("kimi_code") => return ProviderType::KimiCode,
         Some("qoder_cosy") => return ProviderType::QoderCosy,
+        Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => {
+            return ProviderType::AmazonQOAuth
+        }
         Some("antigravity_oauth") => return ProviderType::AntigravityOAuth,
         Some("agy_oauth") => return ProviderType::AgyOAuth,
         Some("google_gemini_oauth") => return ProviderType::GeminiCli,

@@ -10,6 +10,7 @@ export type ManagedAuthProvider =
   | "agy_oauth"
   | "cursor_oauth"
   | "kiro_oauth"
+  | "amazon_q_oauth"
   | "kimi_code"
   | "qoder_cosy";
 

@@ -11,6 +11,8 @@ SKELETON_TOTAL=0
 OAUTH_NATIVE_READY=false
 OAUTH_GATE_STATUS="unknown"
 GROK_GATE_STATUS="unknown"
+COPILOT_GATE_STATUS="unknown"
+AMAZON_Q_GATE_STATUS="unknown"
 CLAUDE_MAX_5X_GATE_STATUS="unknown"
 CLAUDE_MAX_20X_GATE_STATUS="unknown"
 
@@ -90,6 +92,54 @@ check_grok_external_gate() {
   done
 }
 
+check_copilot_external_gate() {
+  local missing=()
+  local var
+  for var in GITHUB_COPILOT_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID CC_SWITCH_COPILOT_CODEX_PROVIDER_ID CC_SWITCH_COPILOT_GEMINI_PROVIDER_ID; do
+    if ! env_present "$var"; then
+      missing+=("$var")
+    fi
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    COPILOT_GATE_STATUS="inputs-ready"
+    echo "[EXTERNAL-READY] GitHub Copilot three-surface inputs present; live smoke has not run"
+  else
+    COPILOT_GATE_STATUS="blocked-inputs"
+    echo "[EXTERNAL-BLOCKED] GitHub Copilot three-surface smoke missing $(join_missing "${missing[@]}")"
+  fi
+  for var in GITHUB_COPILOT_GITHUB_DOMAIN GITHUB_COPILOT_TOKEN_FIXTURE CC_SWITCH_COPILOT_MODEL; do
+    if env_present "$var"; then
+      echo "[EXTERNAL-SET] $var"
+    else
+      echo "[EXTERNAL-OPTIONAL] $var is not set"
+    fi
+  done
+}
+
+check_amazon_q_external_gate() {
+  local missing=()
+  local var
+  for var in AMAZON_Q_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID; do
+    if ! env_present "$var"; then
+      missing+=("$var")
+    fi
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    AMAZON_Q_GATE_STATUS="inputs-ready"
+    echo "[EXTERNAL-READY] Amazon Q bound-account two-surface inputs present; live smoke has not run"
+  else
+    AMAZON_Q_GATE_STATUS="blocked-inputs"
+    echo "[EXTERNAL-BLOCKED] Amazon Q two-surface smoke missing $(join_missing "${missing[@]}")"
+  fi
+  for var in AMAZON_Q_REFRESH_TOKEN_FIXTURE CC_SWITCH_AMAZON_Q_MODEL CC_SWITCH_AMAZON_Q_RUNTIME_REGION CC_SWITCH_AMAZON_Q_PROFILE_ARN; do
+    if env_present "$var"; then
+      echo "[EXTERNAL-SET] $var"
+    else
+      echo "[EXTERNAL-OPTIONAL] $var is not set"
+    fi
+  done
+}
+
 check_claude_max_external_gate() {
   local label="$1"
   local account_var="$2"
@@ -158,9 +208,10 @@ check_any_var "AB6 Antigravity/Agy refresh/import fixture" ANTIGRAVITY_OAUTH_REF
 check_grok_external_gate
 check_required_vars "AB7 Cursor OAuth" CURSOR_OAUTH_TEST_ACCOUNT CURSOR_OAUTH_CALLBACK_URL
 check_any_var "AB7 Cursor credential fixture" CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE CURSOR_API_KEY_FIXTURE
-check_required_vars "AB7 GitHub Copilot device flow" GITHUB_COPILOT_TEST_ACCOUNT
+check_copilot_external_gate
 check_required_vars "AB7 Kiro device flow" KIRO_TEST_ACCOUNT KIRO_REGION KIRO_START_URL
 check_any_var "AB7 Kiro refresh/import fixture" KIRO_REFRESH_TOKEN_FIXTURE
+check_amazon_q_external_gate
 check_required_vars "AB7 AWS Bedrock signed request" AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY BEDROCK_MODEL_ID
 
 echo "== summary =="
@@ -168,7 +219,7 @@ if [[ "$FAILURES" -gt 0 ]]; then
   OAUTH_GATE_STATUS="fail"
 fi
 echo "failures=${FAILURES} warnings=${WARNINGS}"
-echo "oauthNativeReady=${OAUTH_NATIVE_READY} oauthGateStatus=${OAUTH_GATE_STATUS} grokGateStatus=${GROK_GATE_STATUS} skeletonTotal=${SKELETON_TOTAL}"
+echo "oauthNativeReady=${OAUTH_NATIVE_READY} oauthGateStatus=${OAUTH_GATE_STATUS} grokGateStatus=${GROK_GATE_STATUS} copilotGateStatus=${COPILOT_GATE_STATUS} amazonQGateStatus=${AMAZON_Q_GATE_STATUS} skeletonTotal=${SKELETON_TOTAL}"
 if [[ -n "$EVIDENCE_FILE" ]]; then
   EVIDENCE_STAGE="${EVIDENCE_STAGE:-AB5-AB7-oauth-readiness}" \
   EVIDENCE_STATUS="$([[ "$FAILURES" -eq 0 ]] && echo pass || echo fail)" \
@@ -177,7 +228,8 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   CLAUDE_MAX_5X_GATE_STATUS="$CLAUDE_MAX_5X_GATE_STATUS" \
   CLAUDE_MAX_20X_GATE_STATUS="$CLAUDE_MAX_20X_GATE_STATUS" \
   CURSOR_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
-  COPILOT_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
+  COPILOT_GATE_STATUS="$COPILOT_GATE_STATUS" \
+  AMAZON_Q_GATE_STATUS="$AMAZON_Q_GATE_STATUS" \
   KIRO_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   BEDROCK_GATE_STATUS="$([[ "$WARNINGS" -eq 0 ]] && echo ready || echo blocked-inputs)" \
   SKELETON_TOTAL="$SKELETON_TOTAL" \

@@ -2440,6 +2440,9 @@ pub(in crate::api) fn web_parse_auth_provider_type(value: &str) -> Result<Provid
         "antigravity_oauth" => Ok(ProviderType::AntigravityOAuth),
         "cursor_oauth" => Ok(ProviderType::CursorOAuth),
         "kiro_oauth" => Ok(ProviderType::KiroOAuth),
+        "amazon_q" | "amazon-q" | "amazon_q_oauth" | "amazon-q-oauth" => {
+            Ok(ProviderType::AmazonQOAuth)
+        }
         "agy_oauth" => Ok(ProviderType::AgyOAuth),
         other => web_parse_provider_type(other),
     }
@@ -2462,6 +2465,7 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::AgyOAuth => "agy_oauth",
         ProviderType::CursorOAuth => "cursor_oauth",
         ProviderType::KiroOAuth => "kiro_oauth",
+        ProviderType::AmazonQOAuth => "amazon_q_oauth",
         ProviderType::QoderCosy => "qoder_cosy",
         ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
@@ -2568,6 +2572,16 @@ mod managed_auth_provider_label_tests {
             web_parse_auth_provider_type("qoder_cosy").unwrap(),
             ProviderType::QoderCosy
         );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::AmazonQOAuth),
+            "amazon_q_oauth"
+        );
+        for alias in ["amazon_q", "amazon-q", "amazon_q_oauth", "amazon-q-oauth"] {
+            assert_eq!(
+                web_parse_auth_provider_type(alias).unwrap(),
+                ProviderType::AmazonQOAuth
+            );
+        }
     }
 
     #[test]
@@ -2923,6 +2937,23 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 response.device.interval,
             ))
         }
+        ProviderType::AmazonQOAuth => {
+            let response = start_amazon_q_device_login(
+                State(state),
+                headers,
+                Json(StartAmazonQDeviceLoginRequest {}),
+            )
+            .await?
+            .0;
+            Ok(map_managed_auth_device_code(
+                provider_label,
+                &response.device.device_code,
+                &response.device.user_code,
+                &response.device.verification_uri,
+                response.device.expires_in,
+                response.device.interval,
+            ))
+        }
         ProviderType::KimiCode => {
             let response = start_kimi_device_login(
                 State(state),
@@ -3075,6 +3106,26 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 .map(|account| account.id.as_str())
                 .ok_or_else(|| {
                     ApiError::bad_gateway("kiro device flow completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        ProviderType::AmazonQOAuth => {
+            let response = poll_amazon_q_device_login(
+                State(state.clone()),
+                headers,
+                Json(PollAmazonQDeviceLoginRequest { device_code }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("Amazon Q device flow completed without account")
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
@@ -3247,7 +3298,10 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
     }
     if matches!(
         provider_type,
-        ProviderType::GitHubCopilot | ProviderType::KiroOAuth | ProviderType::KimiCode
+        ProviderType::GitHubCopilot
+            | ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
+            | ProviderType::KimiCode
     ) {
         let principal = require_web_admin_session(&state, &headers).await?;
         let managed_auth_operation = state.lock_managed_auth_operations().await;

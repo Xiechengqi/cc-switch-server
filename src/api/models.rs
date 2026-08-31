@@ -25,6 +25,10 @@ pub(in crate::api) async fn gemini_models_response(
     let openai_models =
         super::proxy_models_for_selection(state, Some(AppKind::Gemini), Some(&provider_id))
             .await
+            .map_err(|error| ProxyError {
+                status: error.status,
+                message: error.message,
+            })?
             .0
             .data;
     let models = openai_models
@@ -116,6 +120,11 @@ pub(in crate::api) fn openai_model_list(
         if provider.provider_type == ProviderType::KiroOAuth {
             provider_models.extend(crate::proxy::kiro::supported_models());
         }
+        if provider.provider_type == ProviderType::AmazonQOAuth {
+            // Amazon Q entitlement is authoritative only after the bound
+            // account's ListAvailableModels response has been validated.
+            provider_models.clear();
+        }
         if provider.provider_type == ProviderType::CursorOAuth {
             provider_models.extend(crate::proxy::cursor::model::cursor_supported_models());
         }
@@ -154,6 +163,8 @@ pub(in crate::api) fn openai_model_list(
                         .as_ref()
                         .and_then(|capability| capability.input_modalities.clone())
                 }),
+                context_window: None,
+                supports_tools: None,
             });
         }
     }
@@ -316,6 +327,8 @@ mod tests {
             owned_by: "gemini".to_string(),
             reasoning_efforts: None,
             input_modalities: None,
+            context_window: None,
+            supports_tools: None,
         });
 
         assert_eq!(model.name, "models/gemini-2.5-pro");

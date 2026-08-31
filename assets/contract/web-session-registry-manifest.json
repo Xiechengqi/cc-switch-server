@@ -1,0 +1,222 @@
+{
+  "format": "cc-switch-web-session-registry-manifest",
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-30T00:00:00Z",
+  "generatedFrom": {
+    "registry": "assets/contract/web-session-registry.json",
+    "registrySha256": "1d45c22e1d9aad13666df809fabcab047f32c1845bdbccfc12b403faadf81701",
+    "sourceBaseline": "assets/contract/web-session-source-baseline.json",
+    "sourceBaselineSha256": "9528ca30e2df2da1c51c535b8cf9a184c3c28d266a051da58ef39a0c952bd43e",
+    "sourceCommits": {
+      "omniroute": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+      "9router": "90b52e06ffd666b7929554211474d01588f6b1f8"
+    }
+  },
+  "rail": {
+    "id": "web_session",
+    "credentialSlot": "/settingsConfig/webSession/cookie",
+    "credentialOwnership": "provider_owned",
+    "maxCredentialBytes": 16384,
+    "maxCookiePairs": 16,
+    "redirectPolicy": "disabled",
+    "cookieJarPolicy": "disabled",
+    "crossOriginPolicy": "disabled",
+    "downstreamSetCookiePolicy": "drop",
+    "authRecovery": "explicit_reimport_only",
+    "accountBindingAllowed": false,
+    "apiKeySlotAllowed": false,
+    "extraHeadersAllowed": false
+  },
+  "invariants": {
+    "credentialOwnership": "provider_owned",
+    "accountPool": false,
+    "crossAccountFallback": false,
+    "crossProviderFallback": false,
+    "crossCredentialRailFallback": false,
+    "oauthAccountReuse": false,
+    "apiKeySlotReuse": false,
+    "extraHeaderCredentialReuse": false,
+    "redirects": false,
+    "cookieJar": false,
+    "crossOrigin": false,
+    "downstreamSetCookie": false,
+    "authenticationRetry": false,
+    "explicitReimportOn401Or403": true,
+    "liveWithoutReceipt": false
+  },
+  "summary": {
+    "reviewedProfiles": 2,
+    "visibleProfiles": 0,
+    "inferenceImplementedProfiles": 2,
+    "fixtureState": "fixture_verified",
+    "liveState": "live_pending"
+  },
+  "profiles": [
+    {
+      "profileId": "web_session.grok_web",
+      "providerId": "grok-web",
+      "visibility": "hidden",
+      "maturity": "experimental",
+      "risk": "high",
+      "implementationState": "implemented",
+      "fixtureState": "fixture_verified",
+      "liveState": "live_pending",
+      "request": {
+        "fixedOrigin": "https://grok.com",
+        "method": "POST",
+        "path": "/rest/app-chat/conversations/new",
+        "requestBodyLimitBytes": 1048576,
+        "responseBodyLimitBytes": 8388608
+      },
+      "credential": {
+        "requiredCookieFamilies": [
+          "grok_sso"
+        ],
+        "cookieRules": [
+          {
+            "kind": "exact",
+            "name": "sso",
+            "family": "grok_sso"
+          },
+          {
+            "kind": "exact",
+            "name": "sso-rw",
+            "family": "grok_sso_write"
+          },
+          {
+            "kind": "exact",
+            "name": "cf_clearance",
+            "family": "cloudflare_clearance"
+          },
+          {
+            "kind": "exact",
+            "name": "__cf_bm",
+            "family": "cloudflare_bot_management"
+          }
+        ],
+        "csrfPolicy": "none_observed",
+        "sessionRefreshPolicy": "explicit_reimport_only"
+      },
+      "terminal": {
+        "format": "ndjson",
+        "upstreamTerminal": "model_response_then_explicit_eof",
+        "downstreamTerminal": "[DONE]",
+        "eofWithoutTerminalIsError": true
+      },
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/grok-web/index.ts",
+          "sha256": "f406695462a015f4791b19f44ffd92284bcc1b0278e5780ba3eab27417f7bcd1"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/executors/grok-web.ts",
+          "sha256": "fd3b5c10dee1574b94e1d7274a675b40ce7dcd1a1564e70f05099173c55b526f"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "src/lib/providers/webCookieAuth.ts",
+          "sha256": "23cc43fd9a2dddd89f80234cffccc944b3c3011d210f1680522bb6851d534637"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/providers/registry/grok-web.js",
+          "sha256": "9f3747848bddbc96135298b5d45ca2c66a44e80dea5a0d045e29f06e75492328"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/executors/grok-web.js",
+          "sha256": "1045a0e61260c5810f3d03cfc7dd59699e4aa26986032c45c73cfa1ff0b070ba"
+        }
+      ]
+    },
+    {
+      "profileId": "web_session.perplexity_web",
+      "providerId": "perplexity-web",
+      "visibility": "hidden",
+      "maturity": "experimental",
+      "risk": "high",
+      "implementationState": "implemented",
+      "fixtureState": "fixture_verified",
+      "liveState": "live_pending",
+      "request": {
+        "fixedOrigin": "https://www.perplexity.ai",
+        "method": "POST",
+        "path": "/rest/sse/perplexity_ask",
+        "requestBodyLimitBytes": 1048576,
+        "responseBodyLimitBytes": 8388608
+      },
+      "credential": {
+        "requiredCookieFamilies": [
+          "next_auth_session_token"
+        ],
+        "cookieRules": [
+          {
+            "kind": "exact",
+            "name": "__Secure-next-auth.session-token",
+            "family": "next_auth_session_token"
+          },
+          {
+            "kind": "numeric_suffix",
+            "prefix": "__Secure-next-auth.session-token.",
+            "family": "next_auth_session_token",
+            "maxIndex": 15
+          }
+        ],
+        "csrfPolicy": "none_observed",
+        "sessionRefreshPolicy": "explicit_reimport_only"
+      },
+      "terminal": {
+        "format": "sse",
+        "upstreamTerminal": "COMPLETED_then_event_end_of_stream",
+        "downstreamTerminal": "[DONE]",
+        "eofWithoutTerminalIsError": true
+      },
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/perplexity/web/index.ts",
+          "sha256": "139ab467400347e037af576387c534b2f3b08615840a1bd58d406bbcdc29d5ad"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/executors/perplexity-web.ts",
+          "sha256": "de16700312731e26b6cfdcabeaf0ba318411e214a3b74e424be27c5b77bb4b9a"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/executors/perplexity-web/protocol.ts",
+          "sha256": "683795104a43b967819b31df6c790504bc211c85e96d8491156d0ed1493ca28f"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/providers/registry/perplexity-web.js",
+          "sha256": "a9fef1ecf0f870b1ac5145122ebcc83aa174bd5e48145995cdb66e86deeb25b6"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/executors/perplexity-web.js",
+          "sha256": "03a41ffccdf5fc659414c7131b0e32449f833548371f434e821f1bb84f39f907"
+        }
+      ]
+    }
+  ],
+  "explicitlyNotAdopted": [
+    "OmniRoute account pools, combo routing, cooldown selection, and connection rotation",
+    "browser Cookie jars, automatic Cloudflare clearance acquisition, and redirect following",
+    "Perplexity Bearer fallback and automatic Set-Cookie persistence",
+    "9router rotate-cookies guidance and any cross-connection recovery",
+    "unreviewed Web Cookie providers and model catalogs without independent receipts"
+  ]
+}

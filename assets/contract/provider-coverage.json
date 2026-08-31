@@ -140,7 +140,7 @@
     {
       "variant": "KimiCode",
       "id": "kimi_code",
-      "label": "Kimi Code OAuth",
+      "label": "Kimi OAuth",
       "apps": [
         "claude",
         "codex",
@@ -153,7 +153,7 @@
     {
       "variant": "QoderCosy",
       "id": "qoder_cosy",
-      "label": "Qoder COSY",
+      "label": "Qoder OAuth",
       "apps": [
         "claude",
         "codex",

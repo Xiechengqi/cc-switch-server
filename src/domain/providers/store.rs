@@ -778,6 +778,7 @@ pub fn canonical_provider_type(
     resource: &ProviderResourceMetadata,
 ) -> anyhow::Result<ProviderType> {
     let Some(profile_id) = resource.profile_id.as_ref() else {
+        reject_untyped_amazon_q_provider(provider)?;
         return Ok(classify_provider(app, provider));
     };
     let profile = profile_by_id(profile_id.as_str())
@@ -799,12 +800,31 @@ pub fn canonical_provider_type(
             })
         }
         DriverBinding::Fixed { driver_id } if driver_id.as_str() == "legacy.frozen" => {
+            reject_untyped_amazon_q_provider(provider)?;
             Ok(classify_provider(app, provider))
         }
         DriverBinding::Fixed { .. } => {
             anyhow::bail!("fixed Provider profile {profile_id} has no compatibilityProviderType")
         }
     }
+}
+
+fn reject_untyped_amazon_q_provider(provider: &Provider) -> anyhow::Result<()> {
+    let declared = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        .map(str::trim)
+        .unwrap_or_default();
+    if matches!(
+        declared,
+        "amazon_q" | "amazon-q" | "amazon_q_oauth" | "amazon-q-oauth"
+    ) {
+        anyhow::bail!(
+            "Amazon Q requires its independent typed Profile, amazon_q_oauth Account entitlement, and special.amazon_q Driver; untyped aliases cannot reuse Kiro or generic HTTP credentials"
+        );
+    }
+    Ok(())
 }
 
 fn is_zero_revision(revision: &u64) -> bool {
@@ -916,6 +936,32 @@ mod tests {
             canonical_provider_type(AppKind::Codex, &provider, &resource).unwrap(),
             ProviderType::Codex
         );
+    }
+
+    #[test]
+    fn untyped_amazon_q_cannot_fall_through_to_kiro_or_generic_http() {
+        for declared in ["amazon_q", "amazon-q", "amazon_q_oauth", "amazon-q-oauth"] {
+            let provider = Provider {
+                id: format!("reserved-{declared}"),
+                name: "Amazon Q".to_string(),
+                settings_config: json!({}),
+                category: Some("oauth".to_string()),
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(declared.to_string()),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            };
+            let error = canonical_provider_type(
+                AppKind::Claude,
+                &provider,
+                &ProviderResourceMetadata::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("independent typed Profile"), "{error}");
+            assert!(error.contains("cannot reuse Kiro"), "{error}");
+        }
     }
 
     #[test]

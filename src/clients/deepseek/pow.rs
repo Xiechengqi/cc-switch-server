@@ -10,9 +10,17 @@ pub struct DeepSeekPowChallenge {
     pub expire_at: i64,
     #[serde(default)]
     pub difficulty: i64,
+    #[serde(default)]
+    pub expire_after: Option<i64>,
     pub signature: String,
     pub target_path: String,
 }
+
+const DEFAULT_DIFFICULTY: i64 = 144_000;
+const MAX_DIFFICULTY: i64 = 1_000_000;
+const MAX_CLOCK_SKEW_SECS: i64 = 30;
+const MAX_FUTURE_EXPIRY_SECS: i64 = 15 * 60;
+const COMPLETION_TARGET_PATH: &str = "/api/v0/chat/completion";
 
 pub fn deepseek_hash_v1(data: &[u8]) -> [u8; 32] {
     const RATE: usize = 136;
@@ -39,6 +47,15 @@ pub fn deepseek_hash_v1(data: &[u8]) -> [u8; 32] {
 }
 
 pub async fn solve_and_build_header(challenge: &DeepSeekPowChallenge) -> anyhow::Result<String> {
+    let now_secs = chrono::Utc::now().timestamp();
+    solve_and_build_header_at(challenge, now_secs).await
+}
+
+async fn solve_and_build_header_at(
+    challenge: &DeepSeekPowChallenge,
+    now_secs: i64,
+) -> anyhow::Result<String> {
+    let difficulty = validate_challenge(challenge, now_secs)?;
     if challenge.algorithm != "DeepSeekHashV1" {
         anyhow::bail!(
             "unsupported DeepSeek PoW algorithm: {}",
@@ -51,11 +68,73 @@ pub async fn solve_and_build_header(challenge: &DeepSeekPowChallenge) -> anyhow:
             &challenge.challenge,
             &challenge.salt,
             challenge.expire_at,
-            challenge.difficulty,
+            difficulty,
         )?;
         build_pow_header(&challenge, answer)
     })
     .await?
+}
+
+fn validate_challenge(challenge: &DeepSeekPowChallenge, now_secs: i64) -> anyhow::Result<i64> {
+    if challenge.algorithm != "DeepSeekHashV1" {
+        anyhow::bail!(
+            "unsupported DeepSeek PoW algorithm: {}",
+            challenge.algorithm
+        );
+    }
+    if challenge.target_path != COMPLETION_TARGET_PATH {
+        anyhow::bail!(
+            "DeepSeek PoW target path must be {COMPLETION_TARGET_PATH}, got {}",
+            challenge.target_path
+        );
+    }
+    if challenge.challenge.len() != 64
+        || !challenge
+            .challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("DeepSeek PoW challenge must be exactly 64 hexadecimal characters");
+    }
+    if challenge.salt.is_empty() || challenge.salt.len() > 512 {
+        anyhow::bail!("DeepSeek PoW salt is empty or exceeds 512 bytes");
+    }
+    if challenge.signature.is_empty() || challenge.signature.len() > 16 * 1024 {
+        anyhow::bail!("DeepSeek PoW signature is empty or exceeds 16 KiB");
+    }
+    let expiry_secs = normalize_expiry_secs(challenge.expire_at)?;
+    if expiry_secs < now_secs.saturating_sub(MAX_CLOCK_SKEW_SECS) {
+        anyhow::bail!("DeepSeek PoW challenge has expired");
+    }
+    if expiry_secs > now_secs.saturating_add(MAX_FUTURE_EXPIRY_SECS) {
+        anyhow::bail!("DeepSeek PoW expiry exceeds the 15 minute horizon");
+    }
+    if challenge
+        .expire_after
+        .is_some_and(|seconds| !(1..=MAX_FUTURE_EXPIRY_SECS).contains(&seconds))
+    {
+        anyhow::bail!("DeepSeek PoW expire_after is outside the reviewed bounds");
+    }
+    let difficulty = if challenge.difficulty == 0 {
+        DEFAULT_DIFFICULTY
+    } else {
+        challenge.difficulty
+    };
+    if !(1..=MAX_DIFFICULTY).contains(&difficulty) {
+        anyhow::bail!("DeepSeek PoW difficulty is outside the reviewed bounds");
+    }
+    Ok(difficulty)
+}
+
+fn normalize_expiry_secs(value: i64) -> anyhow::Result<i64> {
+    if value <= 0 {
+        anyhow::bail!("DeepSeek PoW expiry must be positive");
+    }
+    Ok(if value > 10_000_000_000 {
+        value / 1_000
+    } else {
+        value
+    })
 }
 
 fn solve_pow(
@@ -74,7 +153,10 @@ fn solve_pow(
         u64::from_le_bytes(target[16..24].try_into()?),
         u64::from_le_bytes(target[24..32].try_into()?),
     ];
-    let limit = if difficulty <= 0 { 144_000 } else { difficulty };
+    if !(1..=MAX_DIFFICULTY).contains(&difficulty) {
+        anyhow::bail!("PoW difficulty is outside the reviewed bounds");
+    }
+    let limit = difficulty;
     let prefix = format!("{salt}_{expire_at}_");
     for answer in 0..limit {
         let digest = deepseek_hash_v1(format!("{prefix}{answer}").as_bytes());
@@ -268,4 +350,62 @@ fn keccak_f23(s: &mut [u64; 25]) {
     s[22] = a22.0;
     s[23] = a23.0;
     s[24] = a24.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn challenge(now_secs: i64, answer: i64) -> DeepSeekPowChallenge {
+        let salt = "strict-pow";
+        let expire_at = now_secs + 60;
+        let digest = deepseek_hash_v1(format!("{salt}_{expire_at}_{answer}").as_bytes());
+        DeepSeekPowChallenge {
+            algorithm: "DeepSeekHashV1".to_string(),
+            challenge: hex::encode(digest),
+            salt: salt.to_string(),
+            expire_at,
+            difficulty: answer + 1,
+            expire_after: Some(60),
+            signature: "fixture-signature".to_string(),
+            target_path: COMPLETION_TARGET_PATH.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pow_accepts_exact_current_completion_challenge() {
+        let encoded = solve_and_build_header_at(&challenge(1_700_000_000, 42), 1_700_000_000)
+            .await
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(value["answer"], 42);
+        assert_eq!(value["target_path"], COMPLETION_TARGET_PATH);
+    }
+
+    #[tokio::test]
+    async fn pow_rejects_expiry_target_algorithm_and_difficulty_drift() {
+        let now = 1_700_000_000;
+        let mut expired = challenge(now, 1);
+        expired.expire_at = now - 31;
+        assert!(solve_and_build_header_at(&expired, now).await.is_err());
+
+        let mut future = challenge(now, 1);
+        future.expire_at = now + MAX_FUTURE_EXPIRY_SECS + 1;
+        assert!(solve_and_build_header_at(&future, now).await.is_err());
+
+        let mut target = challenge(now, 1);
+        target.target_path = "/api/v0/other".to_string();
+        assert!(solve_and_build_header_at(&target, now).await.is_err());
+
+        let mut algorithm = challenge(now, 1);
+        algorithm.algorithm = "FutureHash".to_string();
+        assert!(solve_and_build_header_at(&algorithm, now).await.is_err());
+
+        let mut difficulty = challenge(now, 1);
+        difficulty.difficulty = MAX_DIFFICULTY + 1;
+        assert!(solve_and_build_header_at(&difficulty, now).await.is_err());
+    }
 }

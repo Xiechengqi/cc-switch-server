@@ -8,7 +8,6 @@ import openrouter from "./openrouter.svg?raw";
 import zhipu from "./zhipu.svg?raw";
 import qwen from "./qwen.svg?raw";
 import alibaba from "./alibaba.svg?raw";
-import bailian from "./bailian.svg?raw";
 import kimi from "./kimi.svg?raw";
 import nvidia from "./nvidia.svg?raw";
 import aws from "./aws.svg?raw";
@@ -71,6 +70,8 @@ import xiaomimimo from "./xiaomimimo.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
 import hermesUrl from "./hermes.png";
+import qoderUrl from "./qoder.png";
+import bailianUrl from "./bailian.png";
 
 import { IconMetadata, iconMetadata } from "./metadata";
 
@@ -85,7 +86,6 @@ export const icons: Record<string, string> = {
   zhipu,
   qwen,
   alibaba,
-  bailian,
   kimi,
   nvidia,
   aws,
@@ -151,6 +151,8 @@ export const iconUrls: Record<string, string> = {
   cursor: cursorUrl,
   kiro: kiroUrl,
   hermes: hermesUrl,
+  qoder: qoderUrl,
+  bailian: bailianUrl,
 };
 
 export const iconList = [...Object.keys(icons), ...Object.keys(iconUrls)].sort();

@@ -12,6 +12,11 @@ export interface QuotaTier {
   usedValueUsd?: number | null;
   maxValueUsd?: number | null;
   planLabel?: string | null;
+  scope?: "account" | "model_family" | null;
+  capacityPool?: string | null;
+  modelFamily?: string | null;
+  relativeWeeklyCapacity?: number | null;
+  source?: string | null;
 }
 
 export interface ExtraUsage {

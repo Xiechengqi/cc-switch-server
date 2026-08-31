@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
+import type { ManagedAuthProvider } from "@/lib/api";
 import {
   logoutAccountsAndClearSelection,
   removeAccountAndUpdateSelection,
@@ -39,7 +40,21 @@ interface KimiOAuthSectionProps {
   allowDefaultAccountOption?: boolean;
 }
 
-export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
+interface DeviceCodeManagedAccountSectionProps
+  extends KimiOAuthSectionProps {
+  authProvider: ManagedAuthProvider;
+  authStatusLabel: string;
+  loginLabel: string;
+  userCodeHint: string;
+}
+
+export const DeviceCodeManagedAccountSection: React.FC<
+  DeviceCodeManagedAccountSectionProps
+> = ({
+  authProvider,
+  authStatusLabel,
+  loginLabel,
+  userCodeHint,
   className,
   selectedAccountId,
   onAccountSelect,
@@ -68,7 +83,7 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
     removeAccountAsync,
     setDefaultAccount,
     refetchStatus,
-  } = useManagedAuth("kimi_code");
+  } = useManagedAuth(authProvider);
 
   React.useEffect(() => {
     if (!selectedAccountId && accounts.length === 1) {
@@ -126,7 +141,7 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
     return (
       <ManagedAuthStatusNotice
         className={className}
-        title={t("kimiOauth.authStatus")}
+        title={authStatusLabel}
         error={error}
         isError={isStatusError}
         isFetching={isFetchingStatus}
@@ -138,7 +153,7 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
   return (
     <div className={`space-y-4 ${className || ""}`}>
       <div className="flex items-center justify-between gap-3">
-        <Label>{t("kimiOauth.authStatus")}</Label>
+        <Label>{authStatusLabel}</Label>
         <Badge
           variant={hasAnyAccount ? "default" : "secondary"}
           className={hasAnyAccount ? "bg-green-500 hover:bg-green-600" : ""}
@@ -261,7 +276,7 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
           )}
           {hasAnyAccount
             ? t("accountAuth.addAnotherAccount")
-            : t("kimiOauth.loginWithKimi")}
+            : loginLabel}
         </Button>
       ) : null}
 
@@ -276,7 +291,7 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
           </div>
           <div className="text-center">
             <p className="mb-1 text-xs text-muted-foreground">
-              {t("kimiOauth.userCodeHint")}
+              {userCodeHint}
             </p>
             <div className="flex items-center justify-center gap-2">
               <code className="rounded border bg-background px-4 py-2 font-mono text-xl font-bold">
@@ -362,6 +377,19 @@ export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = ({
         </Button>
       ) : null}
     </div>
+  );
+};
+
+export const KimiOAuthSection: React.FC<KimiOAuthSectionProps> = (props) => {
+  const { t } = useTranslation();
+  return (
+    <DeviceCodeManagedAccountSection
+      {...props}
+      authProvider="kimi_code"
+      authStatusLabel={t("kimiOauth.authStatus")}
+      loginLabel={t("kimiOauth.loginWithKimi")}
+      userCodeHint={t("kimiOauth.userCodeHint")}
+    />
   );
 };
 

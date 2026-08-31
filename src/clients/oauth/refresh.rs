@@ -181,7 +181,7 @@ impl AccountRefreshFailure {
 pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
     if matches!(
         provider_type,
-        ProviderType::KiroOAuth | ProviderType::QoderCosy
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth | ProviderType::QoderCosy
     ) {
         return true;
     }
@@ -392,6 +392,13 @@ where
             receipt_hook,
         )
         .await?;
+        return validate_native_account_refresh_receipt(http, account, receipt).await;
+    }
+    if account.provider_type == ProviderType::AmazonQOAuth {
+        let receipt =
+            crate::clients::oauth::amazon_q_device::refresh_amazon_q_account(http, account, now_ms)
+                .await?;
+        receipt_hook(&receipt)?;
         return validate_native_account_refresh_receipt(http, account, receipt).await;
     }
     if account.provider_type == ProviderType::QoderCosy {
@@ -1333,6 +1340,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }

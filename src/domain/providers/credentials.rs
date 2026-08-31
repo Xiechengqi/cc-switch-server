@@ -17,6 +17,7 @@ pub const SECRET_KEEP_SENTINEL: &str = "__CC_SWITCH_SECRET_KEEP__";
 const KNOWN_JSON_SECRET_POINTERS: &[&str] = &[
     "/settingsConfig/auth/OPENAI_API_KEY",
     "/settingsConfig/apiKey",
+    "/settingsConfig/webSession/cookie",
     "/settingsConfig/env/ANTHROPIC_API_KEY",
     "/settingsConfig/env/ANTHROPIC_AUTH_TOKEN",
     "/settingsConfig/env/API_KEY",
@@ -1393,6 +1394,42 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.contains("/credentials/opaque")));
+    }
+
+    #[test]
+    fn web_session_cookie_uses_one_dedicated_provider_owned_secret_slot() {
+        let mut provider = provider();
+        provider.settings_config = json!({
+            "webSession": {
+                "profileId": "web_session.grok_web",
+                "cookie": "sso=secret-read; sso-rw=secret-write"
+            }
+        });
+
+        let (redacted, summary) = redact_provider(&provider);
+
+        assert_eq!(
+            summary.slots,
+            vec![super::super::web_session::WEB_SESSION_CREDENTIAL_SLOT.to_string()]
+        );
+        assert_eq!(
+            redacted.settings_config["webSession"]["cookie"],
+            json!(SECRET_KEEP_SENTINEL)
+        );
+        assert!(provider_credential_slot_is_supported(
+            super::super::web_session::WEB_SESSION_CREDENTIAL_SLOT
+        ));
+        assert_eq!(
+            reveal_provider_credential(
+                &provider,
+                super::super::web_session::WEB_SESSION_CREDENTIAL_SLOT
+            )
+            .unwrap(),
+            "sso=secret-read; sso-rw=secret-write"
+        );
+        assert!(!serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("secret-read"));
     }
 
     #[test]

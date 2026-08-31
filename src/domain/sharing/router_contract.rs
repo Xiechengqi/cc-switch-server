@@ -27,7 +27,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::Share;
 
-pub const SHARE_CONTRACT_VERSION: u16 = 5;
+pub const SHARE_CONTRACT_VERSION: u16 = 6;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -480,6 +480,16 @@ pub struct ShareUpstreamQuotaTier {
     pub limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1568,6 +1578,11 @@ fn share_upstream_quota_tier_from_account(tier: &AccountQuotaTier) -> ShareUpstr
         used: tier.used,
         limit: tier.limit,
         unit: tier.unit.clone(),
+        scope: Some(tier.scope.clone().unwrap_or_else(|| "account".to_string())),
+        capacity_pool: tier.capacity_pool.clone(),
+        model_family: tier.model_family.clone(),
+        relative_weekly_capacity: tier.relative_weekly_capacity,
+        source: tier.source.clone(),
     }
 }
 
@@ -1579,6 +1594,7 @@ fn share_quota_tier_label(name: &str) -> String {
         "seven_day_opus" => "7d Opus".to_string(),
         "seven_day_omelette" => "7d Opus".to_string(),
         "seven_day_sonnet" => "7d Sonnet".to_string(),
+        "seven_day_fable" => "Fable 7d".to_string(),
         "premium" => "premium".to_string(),
         "kiro_agentic_requests" => "Kiro".to_string(),
         other => other.replace('_', " "),
@@ -1936,7 +1952,7 @@ mod tests {
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         let provider = descriptor.app_providers.codex.first().unwrap();
 
-        assert_eq!(descriptor.contract_version, 5);
+        assert_eq!(descriptor.contract_version, 6);
         assert_eq!(provider.bundle_id.as_deref(), Some("p1"));
         assert_eq!(provider.supported_apps, ["claude", "codex", "gemini"]);
         assert_eq!(provider.model_policy_scope, Some(ModelPolicyScope::Global));
@@ -2953,6 +2969,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }

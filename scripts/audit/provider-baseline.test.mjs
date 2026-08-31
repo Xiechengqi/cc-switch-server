@@ -98,6 +98,7 @@ test("first-class Server Profiles are committed additions, not candidates", () =
   const unmappedFirstClassProfiles = registry.profiles
     .filter(
       (profile) =>
+        profile.visibility === "visible" &&
         profile.formComposition !== "custom" &&
         profile.formComposition !== "legacy" &&
         !mappedProfileIds.has(profile.profileId),

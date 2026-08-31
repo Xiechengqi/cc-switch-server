@@ -56,17 +56,36 @@ pub struct CopilotModelCatalogKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotModelDescriptor {
+    pub model_id: String,
+    pub display_name: Option<String>,
+    pub vendor: Option<String>,
+    pub model_picker_enabled: Option<bool>,
+    pub policy_state: Option<String>,
+    pub preview: Option<bool>,
+    pub model_type: Option<String>,
+    pub supported_endpoints: Vec<String>,
+    pub max_context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_reasoning: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopilotModelCatalog {
     pub models: Vec<String>,
+    pub descriptors: Vec<CopilotModelDescriptor>,
     pub source: &'static str,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
     pub api_origin: Option<String>,
+    pub github_domain: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedCopilotModelCatalog {
-    models: Vec<String>,
+    descriptors: Vec<CopilotModelDescriptor>,
     fetched_at_ms: i64,
 }
 
@@ -87,13 +106,7 @@ impl CopilotModelCatalogCache {
             .await
             .get(key)
             .filter(|catalog| now_ms.saturating_sub(catalog.fetched_at_ms) < MODEL_CACHE_TTL_MS)
-            .map(|catalog| CopilotModelCatalog {
-                models: catalog.models.clone(),
-                source: "copilot_account_cache",
-                stale: false,
-                fetched_at_ms: Some(catalog.fetched_at_ms),
-                api_origin: Some(key.api_origin.clone()),
-            })
+            .map(|catalog| cached_catalog(key, catalog, false))
     }
 
     pub async fn stale(
@@ -108,24 +121,19 @@ impl CopilotModelCatalogCache {
             .filter(|catalog| {
                 now_ms.saturating_sub(catalog.fetched_at_ms) < STALE_MODEL_CACHE_TTL_MS
             })
-            .map(|catalog| CopilotModelCatalog {
-                models: catalog.models.clone(),
-                source: "copilot_account_cache",
-                stale: true,
-                fetched_at_ms: Some(catalog.fetched_at_ms),
-                api_origin: Some(key.api_origin.clone()),
-            })
+            .map(|catalog| cached_catalog(key, catalog, true))
     }
 
     pub async fn insert(
         &self,
         key: CopilotModelCatalogKey,
-        models: Vec<String>,
+        descriptors: Vec<CopilotModelDescriptor>,
         fetched_at_ms: i64,
     ) -> CopilotModelCatalog {
         let api_origin = key.api_origin.clone();
+        let github_domain = key.github_domain.clone();
         let cached = CachedCopilotModelCatalog {
-            models: models.clone(),
+            descriptors: descriptors.clone(),
             fetched_at_ms,
         };
         let mut catalogs = self.catalogs.write().await;
@@ -141,11 +149,16 @@ impl CopilotModelCatalogCache {
             catalogs.remove(&oldest);
         }
         CopilotModelCatalog {
-            models,
+            models: descriptors
+                .iter()
+                .map(|descriptor| descriptor.model_id.clone())
+                .collect(),
+            descriptors,
             source: "copilot_models_api",
             stale: false,
             fetched_at_ms: Some(fetched_at_ms),
             api_origin: Some(api_origin),
+            github_domain: Some(github_domain),
         }
     }
 
@@ -159,6 +172,26 @@ impl CopilotModelCatalogCache {
                 .clone()
         };
         flight.lock_owned().await
+    }
+}
+
+fn cached_catalog(
+    key: &CopilotModelCatalogKey,
+    cached: &CachedCopilotModelCatalog,
+    stale: bool,
+) -> CopilotModelCatalog {
+    CopilotModelCatalog {
+        models: cached
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.model_id.clone())
+            .collect(),
+        descriptors: cached.descriptors.clone(),
+        source: "copilot_account_cache",
+        stale,
+        fetched_at_ms: Some(cached.fetched_at_ms),
+        api_origin: Some(key.api_origin.clone()),
+        github_domain: Some(key.github_domain.clone()),
     }
 }
 
@@ -176,12 +209,22 @@ impl std::fmt::Display for CopilotModelFetchError {
 
 impl std::error::Error for CopilotModelFetchError {}
 
+impl CopilotModelFetchError {
+    pub fn is_transient(&self) -> bool {
+        self.status.is_none_or(|status| {
+            status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+        })
+    }
+}
+
 pub async fn fetch_copilot_models(
     http: &reqwest::Client,
     url: &str,
     copilot_token: &str,
     timeout: Duration,
-) -> Result<Vec<String>, CopilotModelFetchError> {
+) -> Result<Vec<CopilotModelDescriptor>, CopilotModelFetchError> {
     let mut response = http
         .get(url)
         .bearer_auth(copilot_token)
@@ -223,17 +266,18 @@ pub async fn fetch_copilot_models(
             status: Some(status),
             message: format!("Copilot model response is not valid JSON: {error}"),
         })?;
-    let models = parse_copilot_models(&payload);
-    if models.is_empty() {
+    if !payload.get("data").is_some_and(Value::is_array)
+        && !payload.get("models").is_some_and(Value::is_array)
+    {
         return Err(CopilotModelFetchError {
             status: Some(status),
-            message: "Copilot model response contains no usable model IDs".to_string(),
+            message: "Copilot model response does not contain a data/models array".to_string(),
         });
     }
-    Ok(models)
+    Ok(parse_copilot_models(&payload))
 }
 
-pub fn parse_copilot_models(payload: &Value) -> Vec<String> {
+pub fn parse_copilot_models(payload: &Value) -> Vec<CopilotModelDescriptor> {
     let items = payload
         .get("data")
         .and_then(Value::as_array)
@@ -241,31 +285,207 @@ pub fn parse_copilot_models(payload: &Value) -> Vec<String> {
     let mut models = items
         .into_iter()
         .flatten()
-        .filter_map(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("model").and_then(Value::as_str))
-                .or_else(|| item.get("name").and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        })
+        .filter_map(parse_copilot_model_descriptor)
         .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
+    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    models.dedup_by(|left, right| left.model_id == right.model_id);
     models
 }
 
+fn parse_copilot_model_descriptor(item: &Value) -> Option<CopilotModelDescriptor> {
+    let model_id = model_identifier(item)?;
+    let capabilities = item.get("capabilities").filter(|value| value.is_object());
+    let model_picker_enabled = item.get("model_picker_enabled").and_then(Value::as_bool);
+    if model_picker_enabled == Some(false) {
+        return None;
+    }
+    let policy_state = item
+        .pointer("/policy/state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .map(str::to_string);
+    if policy_state.as_deref().is_some_and(|state| {
+        !state.eq_ignore_ascii_case("enabled") && !state.eq_ignore_ascii_case("preview")
+    }) {
+        return None;
+    }
+    let model_type = capabilities
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if model_type
+        .as_deref()
+        .is_some_and(|value| !value.eq_ignore_ascii_case("chat"))
+    {
+        return None;
+    }
+    let supported_endpoints = string_array(
+        item.get("supported_endpoints")
+            .or_else(|| capabilities.and_then(|value| value.get("supported_endpoints"))),
+    );
+    if !supported_endpoints.is_empty()
+        && !supported_endpoints.iter().any(|endpoint| {
+            endpoint.contains("/chat/completions")
+                || endpoint.contains("/responses")
+                || endpoint.contains("/v1/messages")
+        })
+    {
+        return None;
+    }
+    if model_type.is_none() && supported_endpoints.is_empty() {
+        let normalized = model_id.to_ascii_lowercase();
+        if normalized.contains("embedding") || normalized == "gpt-41-copilot" {
+            return None;
+        }
+    }
+    let preview = item
+        .get("preview")
+        .or_else(|| item.get("is_preview"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            policy_state
+                .as_deref()
+                .map(|state| state.eq_ignore_ascii_case("preview"))
+        });
+    Some(CopilotModelDescriptor {
+        display_name: first_non_empty_string(item, &["name", "display_name", "label"])
+            .filter(|name| name != &model_id),
+        vendor: first_non_empty_string(item, &["vendor", "owned_by", "provider"]),
+        model_picker_enabled,
+        policy_state,
+        preview,
+        model_type,
+        supported_endpoints,
+        max_context_window_tokens: first_u64(
+            item,
+            &[
+                "/capabilities/limits/max_context_window_tokens",
+                "/capabilities/limits/max_context_tokens",
+            ],
+        ),
+        max_output_tokens: first_u64(
+            item,
+            &[
+                "/capabilities/limits/max_output_tokens",
+                "/capabilities/limits/max_completion_tokens",
+            ],
+        ),
+        supports_tools: first_bool(
+            item,
+            &[
+                "/capabilities/supports/tool_calls",
+                "/capabilities/supports/tools",
+                "/capabilities/supports_tools",
+            ],
+        ),
+        supports_vision: first_bool(
+            item,
+            &[
+                "/capabilities/supports/vision",
+                "/capabilities/supports/image_input",
+                "/capabilities/supports_vision",
+            ],
+        ),
+        supports_reasoning: first_bool(
+            item,
+            &[
+                "/capabilities/supports/reasoning",
+                "/capabilities/supports/thinking",
+                "/capabilities/supports_reasoning",
+            ],
+        ),
+        model_id,
+    })
+}
+
+fn model_identifier(value: &Value) -> Option<String> {
+    for name in ["id", "model", "name"] {
+        if let Some(raw) = value.get(name) {
+            return raw
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn first_non_empty_string(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        value
+            .get(*name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    let mut values = value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn first_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        value.pointer(pointer).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        })
+    })
+}
+
+fn first_bool(value: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_bool))
+}
+
 pub fn public_static_catalog() -> CopilotModelCatalog {
+    let descriptors = PUBLIC_STATIC_MODEL_IDS
+        .iter()
+        .map(|model| CopilotModelDescriptor {
+            model_id: (*model).to_string(),
+            display_name: None,
+            vendor: Some("github".to_string()),
+            model_picker_enabled: None,
+            policy_state: None,
+            preview: None,
+            model_type: Some("chat".to_string()),
+            supported_endpoints: Vec::new(),
+            max_context_window_tokens: None,
+            max_output_tokens: None,
+            supports_tools: None,
+            supports_vision: None,
+            supports_reasoning: None,
+        })
+        .collect::<Vec<_>>();
     CopilotModelCatalog {
-        models: PUBLIC_STATIC_MODEL_IDS
+        models: descriptors
             .iter()
-            .map(|model| (*model).to_string())
+            .map(|descriptor| descriptor.model_id.clone())
             .collect(),
+        descriptors,
         source: "copilot_public_static_compatibility",
         stale: true,
         fetched_at_ms: None,
         api_origin: None,
+        github_domain: Some("github.com".to_string()),
     }
 }
 
@@ -276,22 +496,69 @@ mod tests {
 
     #[test]
     fn parser_accepts_public_and_enterprise_shapes_and_deduplicates() {
+        let public = parse_copilot_models(&json!({
+            "data": [
+                {"id": "claude-sonnet-5"},
+                {"id": " claude-sonnet-5 "},
+                {"model": "gpt-enterprise"},
+                {"id": ""},
+                {"name": "ignored-when-id-is-empty", "id": ""}
+            ]
+        }));
         assert_eq!(
-            parse_copilot_models(&json!({
-                "data": [
-                    {"id": "claude-sonnet-5"},
-                    {"id": " claude-sonnet-5 "},
-                    {"model": "gpt-enterprise"},
-                    {"id": ""},
-                    {"name": "ignored-when-id-is-empty", "id": ""}
-                ]
-            })),
+            public
+                .iter()
+                .map(|descriptor| descriptor.model_id.as_str())
+                .collect::<Vec<_>>(),
             ["claude-sonnet-5", "gpt-enterprise"]
         );
+        let enterprise = parse_copilot_models(&json!({"models": [{"name": "ghe-model"}]}));
+        assert_eq!(enterprise[0].model_id, "ghe-model");
+    }
+
+    #[test]
+    fn parser_is_capability_and_policy_driven_and_preserves_safe_metadata() {
+        let models = parse_copilot_models(&json!({
+            "data": [
+                {
+                    "id": "gpt-entitled",
+                    "name": "GPT Entitled",
+                    "vendor": "openai",
+                    "model_picker_enabled": true,
+                    "preview": true,
+                    "policy": {"state": "enabled"},
+                    "supported_endpoints": ["/responses", "/chat/completions", "/responses"],
+                    "capabilities": {
+                        "type": "chat",
+                        "limits": {
+                            "max_context_window_tokens": 128000,
+                            "max_output_tokens": 16384
+                        },
+                        "supports": {"tool_calls": true, "vision": false, "reasoning": true}
+                    }
+                },
+                {"id": "disabled-picker", "model_picker_enabled": false, "capabilities": {"type": "chat"}},
+                {"id": "disabled-policy", "policy": {"state": "disabled"}, "capabilities": {"type": "chat"}},
+                {"id": "embedding", "capabilities": {"type": "embeddings"}},
+                {"id": "completion-only", "supported_endpoints": ["/completions"]}
+            ]
+        }));
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.model_id, "gpt-entitled");
+        assert_eq!(model.display_name.as_deref(), Some("GPT Entitled"));
+        assert_eq!(model.vendor.as_deref(), Some("openai"));
+        assert_eq!(model.policy_state.as_deref(), Some("enabled"));
+        assert_eq!(model.preview, Some(true));
         assert_eq!(
-            parse_copilot_models(&json!({"models": [{"name": "ghe-model"}]})),
-            ["ghe-model"]
+            model.supported_endpoints,
+            ["/chat/completions", "/responses"]
         );
+        assert_eq!(model.max_context_window_tokens, Some(128_000));
+        assert_eq!(model.max_output_tokens, Some(16_384));
+        assert_eq!(model.supports_tools, Some(true));
+        assert_eq!(model.supports_vision, Some(false));
+        assert_eq!(model.supports_reasoning, Some(true));
     }
 
     #[tokio::test]
@@ -352,8 +619,79 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(models, ["model-a", "model-b"]);
+        assert_eq!(
+            models
+                .iter()
+                .map(|descriptor| descriptor.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["model-a", "model-b"]
+        );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_empty_catalog_is_authoritative_and_bad_shape_is_rejected() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/empty", get(|| async { axum::Json(json!({"data": []})) }))
+            .route("/bad", get(|| async { axum::Json(json!({"items": []})) }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        let empty = fetch_copilot_models(
+            &http,
+            &format!("http://{address}/empty"),
+            "token",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(empty.is_empty());
+        let bad = fetch_copilot_models(
+            &http,
+            &format!("http://{address}/bad"),
+            "token",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(!bad.is_transient());
+        server.abort();
+    }
+
+    #[test]
+    fn only_network_timeout_rate_limit_and_server_errors_are_transient() {
+        for status in [
+            None,
+            Some(StatusCode::REQUEST_TIMEOUT),
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            Some(StatusCode::BAD_GATEWAY),
+        ] {
+            assert!(CopilotModelFetchError {
+                status,
+                message: "transient".to_string()
+            }
+            .is_transient());
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
+        ] {
+            assert!(!CopilotModelFetchError {
+                status: Some(status),
+                message: "terminal".to_string()
+            }
+            .is_transient());
+        }
     }
 
     #[tokio::test]
@@ -368,7 +706,11 @@ mod tests {
             api_origin: "https://api.githubcopilot.com".to_string(),
         };
         cache
-            .insert(key.clone(), vec!["model-a".to_string()], 1_000)
+            .insert(
+                key.clone(),
+                parse_copilot_models(&json!({"data": [{"id": "model-a"}]})),
+                1_000,
+            )
             .await;
         assert_eq!(cache.fresh(&key, 1_001).await.unwrap().models, ["model-a"]);
 

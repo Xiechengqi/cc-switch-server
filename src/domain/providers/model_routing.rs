@@ -644,24 +644,33 @@ mod tests {
     }
 
     #[test]
-    fn locked_official_profile_rejects_single_on_write_but_normalizes_on_load() {
+    fn official_openai_oauth_honors_explicit_single_model() {
         let profile = super::super::registry::profile_by_id("codex.openai_oauth").unwrap();
-        let mut provider = provider(
+        let mut explicit = provider(
             Some("codex_oauth"),
             json!({"modelMapping": {"mode": "single", "upstreamModel": "gpt-5.4"}}),
         );
 
-        let error = normalize_and_validate_provider_model_routing(
+        normalize_and_validate_provider_model_routing(
             AppKind::Codex,
-            &mut provider,
+            &mut explicit,
             Some(profile),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("does not allow"));
-
-        normalize_provider_model_routing(AppKind::Codex, &mut provider, Some(profile));
+        .unwrap();
         assert_eq!(
-            provider.settings_config["modelMapping"],
+            explicit.settings_config["modelMapping"],
+            json!({"mode": "single", "upstreamModel": "gpt-5.4"})
+        );
+
+        let mut missing = provider(Some("codex_oauth"), json!({}));
+        normalize_and_validate_provider_model_routing(
+            AppKind::Codex,
+            &mut missing,
+            Some(profile),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.settings_config["modelMapping"],
             json!({"mode": "passthrough"})
         );
     }

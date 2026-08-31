@@ -8,6 +8,7 @@ import {
   useAccountCapabilitiesQuery,
 } from "@/lib/query/accounts";
 import { AntigravityOAuthSection } from "./AntigravityOAuthSection";
+import { AmazonQOAuthSection } from "./AmazonQOAuthSection";
 import { ClaudeOAuthSection } from "./ClaudeOAuthSection";
 import { CodexOAuthSection } from "./CodexOAuthSection";
 import { CopilotAuthSection } from "./CopilotAuthSection";
@@ -29,6 +30,7 @@ export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "agy_oauth",
   "cursor_oauth",
   "kiro_oauth",
+  "amazon_q_oauth",
   "kimi_code",
   "qoder_cosy",
   "deepseek_account",
@@ -149,6 +151,8 @@ export function ManagedAccountSection({
       return <CursorOAuthSection {...common} />;
     case "kiro_oauth":
       return <KiroOAuthSection {...common} />;
+    case "amazon_q_oauth":
+      return <AmazonQOAuthSection {...common} />;
     case "kimi_code":
       return <KimiOAuthSection {...common} />;
     case "qoder_cosy":

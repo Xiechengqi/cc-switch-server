@@ -519,25 +519,23 @@ describe("Provider Bundle drafts", () => {
     });
   });
 
-  it("locks Claude OAuth while OpenAI OAuth uses Claude model policies", () => {
+  it("lets Claude OAuth choose a fixed model and keeps OpenAI OAuth per-app by default", () => {
     const claudeFamily = familyById("family.claude_oauth")!;
     const claudeDraft = createProviderBundleDraft(claudeFamily);
-    expect(modelPoliciesForFamily(claudeFamily)).toEqual(["passthrough"]);
+    expect(modelPoliciesForFamily(claudeFamily)).toEqual([
+      "single",
+      "passthrough",
+    ]);
+    expect(claudeDraft.modelPolicy).toBe("passthrough");
     claudeDraft.accountId = "official-account";
     claudeDraft.accountGeneration = 1;
     claudeDraft.modelPolicy = "single";
     claudeDraft.upstreamModel = "forced-model";
-    expect(validateProviderBundleDraft(claudeDraft)).toBe(
-      "Provider model policy is invalid",
-    );
-    expect(validateProviderBundleDraftIssue(claudeDraft)).toMatchObject({
-      code: "modelPolicyInvalid",
-      field: "modelPolicy",
-    });
+    expect(validateProviderBundleDraft(claudeDraft)).toBeNull();
 
     const openaiFamily = familyById("family.openai_oauth")!;
     expect(supportsPerAppModelPolicy(openaiFamily)).toBe(true);
-    expect(requiresPerAppModelPolicy(openaiFamily)).toBe(true);
+    expect(requiresPerAppModelPolicy(openaiFamily)).toBe(false);
     const openaiDraft = createProviderBundleDraft(openaiFamily);
     expect(openaiDraft.modelPolicyScope).toBe("per_app");
     expect(openaiDraft.surfaces).toMatchObject([
@@ -563,7 +561,7 @@ describe("Provider Bundle drafts", () => {
         },
         {
           app: "codex",
-          modelPolicy: undefined,
+          modelPolicy: "passthrough",
           upstreamModel: undefined,
         },
       ],
@@ -573,7 +571,7 @@ describe("Provider Bundle drafts", () => {
     openaiDraft.surfaces[0]!.upstreamModel = "";
     expect(validateProviderBundleDraft(openaiDraft)).toBeNull();
     expect(changeModelPolicyScope(openaiDraft, "global").modelPolicyScope).toBe(
-      "per_app",
+      "global",
     );
   });
 

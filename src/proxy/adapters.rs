@@ -613,6 +613,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::AmazonQOAuth,
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
@@ -673,10 +674,13 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
             ("claude_to_copilot_chat", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::DeepSeekAccount) => {
-            planned("claude_deepseek_account_planned")
+            ("claude_deepseek_web", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::KiroOAuth) => {
             ("claude_kiro_codewhisperer", AdapterSupport::Native)
+        }
+        (AppKind::Claude, ProviderType::AmazonQOAuth) => {
+            ("claude_amazon_q_codewhisperer", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::CursorOAuth) => {
             ("claude_cursor_agentservice", AdapterSupport::Native)
@@ -739,6 +743,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::KiroOAuth) => {
             ("codex_to_kiro_anthropic", AdapterSupport::Native)
         }
+        (AppKind::Codex, ProviderType::AmazonQOAuth) => {
+            ("codex_to_amazon_q_anthropic", AdapterSupport::Native)
+        }
         (AppKind::Codex, ProviderType::AntigravityOAuth | ProviderType::AgyOAuth) => {
             ("codex_antigravity_gemini_native", AdapterSupport::Native)
         }
@@ -776,6 +783,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Gemini, ProviderType::DeepSeekAccount) => fallback("gemini_deepseek_skeleton"),
         (AppKind::Gemini, ProviderType::KiroOAuth) => fallback("gemini_kiro_skeleton"),
+        (AppKind::Gemini, ProviderType::AmazonQOAuth) => fallback("gemini_amazon_q_unsupported"),
         (AppKind::Gemini, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
             ("gemini_cursor_agentservice", AdapterSupport::Native)
         }
@@ -829,6 +837,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GeminiCli
                 | ProviderType::GitHubCopilot
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::DeepSeekAccount
                 | ProviderType::CursorOAuth
                 | ProviderType::CursorApiKey
@@ -856,6 +865,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::KimiCode
         ),
         AppKind::Gemini => matches!(
@@ -896,6 +906,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::OllamaCloud
                 | ProviderType::Nvidia
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::DeepSeekAccount
                 | ProviderType::GitHubCopilot
                 | ProviderType::GrokOAuth
@@ -917,6 +928,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::KimiCode
         ) | (
@@ -953,6 +965,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::GitHubCopilot
         ) | (
             AppKind::Codex,
@@ -963,6 +976,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::DeepSeekApi
                 | ProviderType::GrokOAuth
                 | ProviderType::KiroOAuth
+                | ProviderType::AmazonQOAuth
                 | ProviderType::GitHubCopilot
         ) | (
             AppKind::Gemini,
@@ -1014,6 +1028,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         ProviderType::GitHubCopilot | ProviderType::DeepSeekAccount | ProviderType::KiroOAuth => {
             app
         }
+        ProviderType::AmazonQOAuth => app,
         ProviderType::AwsBedrock => AppKind::Claude,
         ProviderType::Nvidia | ProviderType::DeepSeekApi => {
             if app == AppKind::Gemini {
@@ -1468,7 +1483,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
     match stored.app {
         AppKind::Claude => match stored.provider_type {
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
-            ProviderType::KiroOAuth => Some(UpstreamFormat::AnthropicMessages),
+            ProviderType::KiroOAuth | ProviderType::AmazonQOAuth => {
+                Some(UpstreamFormat::AnthropicMessages)
+            }
             ProviderType::GitHubCopilot => Some(UpstreamFormat::OpenAiChat),
             ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
                 Some(UpstreamFormat::OpenAiChat)
@@ -1494,7 +1511,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::Nvidia | ProviderType::DeepSeekApi => Some(UpstreamFormat::OpenAiChat),
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::KimiCode | ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
-            ProviderType::KiroOAuth => Some(UpstreamFormat::AnthropicMessages),
+            ProviderType::KiroOAuth | ProviderType::AmazonQOAuth => {
+                Some(UpstreamFormat::AnthropicMessages)
+            }
             ProviderType::Claude | ProviderType::ClaudeAuth | ProviderType::ClaudeOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
             }
@@ -4498,6 +4517,7 @@ mod tests {
             last_refresh_error: None,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
         }
     }
@@ -4734,10 +4754,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_deepseek_account_capability_is_planned_with_stream_usage() {
+    fn claude_deepseek_account_capability_is_native_with_stream_usage() {
         let capability = capability_for(AppKind::Claude, ProviderType::DeepSeekAccount);
-        assert_eq!(capability.adapter, "claude_deepseek_account_planned");
-        assert_eq!(capability.support, AdapterSupport::Planned);
+        assert_eq!(capability.adapter, "claude_deepseek_web");
+        assert_eq!(capability.support, AdapterSupport::Native);
         assert!(capability.requires_transform);
         assert!(capability.supports_stream_usage);
     }
@@ -5596,7 +5616,7 @@ mod tests {
     #[test]
     fn exposes_all_provider_type_capabilities_for_each_app() {
         let capabilities = all_capabilities();
-        assert_eq!(capabilities.len(), 66);
+        assert_eq!(capabilities.len(), 69);
         assert!(capabilities.iter().any(|item| {
             item.app == AppKind::Gemini && item.provider_type == ProviderType::AntigravityOAuth
         }));

@@ -171,6 +171,11 @@ export interface AccountQuotaTier {
   limit?: number | null;
   unit?: string | null;
   resetsAt?: number | null;
+  scope?: "account" | "model_family" | null;
+  capacityPool?: string | null;
+  modelFamily?: string | null;
+  relativeWeeklyCapacity?: number | null;
+  source?: string | null;
 }
 
 export interface AccountManagerCapability {
@@ -275,6 +280,7 @@ const LEGACY_MANAGED_ACCOUNT_PROVIDER_TYPES = new Set([
   "github_copilot",
   "deepseek_account",
   "kiro_oauth",
+  "amazon_q_oauth",
   "cursor_oauth",
   "antigravity_oauth",
   "agy_oauth",
@@ -286,6 +292,7 @@ const LEGACY_LIVE_QUOTA_PROVIDER_TYPES = new Set([
   "grok_oauth",
   "gemini_cli",
   "kiro_oauth",
+  "amazon_q_oauth",
   "antigravity_oauth",
   "agy_oauth",
   "ollama_cloud",

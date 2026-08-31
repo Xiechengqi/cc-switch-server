@@ -29,6 +29,15 @@ function runEnvCheck(overrides) {
       CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT: "",
       CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "",
       CC_SWITCH_CODEX_IMAGES_SMOKE: "0",
+      GITHUB_COPILOT_TEST_ACCOUNT: "",
+      CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID: "",
+      CC_SWITCH_COPILOT_CODEX_PROVIDER_ID: "",
+      CC_SWITCH_COPILOT_GEMINI_PROVIDER_ID: "",
+      AMAZON_Q_TEST_ACCOUNT: "",
+      CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID: "",
+      CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID: "",
+      CC_SWITCH_SERVER_TOKEN: "",
+      SERVER_URL: "",
       ...overrides,
     },
     encoding: "utf8",
@@ -78,4 +87,57 @@ test("Codex Images gate distinguishes disabled, blocked, and input-ready states"
     ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(ready.checks.codexImagesGateStatus, "inputs-ready");
+});
+
+test("Copilot external gate requires one account, control plane, Share, and three Provider IDs", () => {
+  const blocked = runEnvCheck({
+    STAGE: "AB7",
+    GITHUB_COPILOT_TEST_ACCOUNT: "copilot-test-account",
+    CC_SWITCH_SHARE_URL: "https://copilot-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+  });
+  assert.equal(blocked.checks.copilotGateStatus, "blocked-inputs");
+
+  const ready = runEnvCheck({
+    STAGE: "AB7",
+    GITHUB_COPILOT_TEST_ACCOUNT: "copilot-test-account",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://copilot-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID: "provider-claude",
+    CC_SWITCH_COPILOT_CODEX_PROVIDER_ID: "provider-codex",
+    CC_SWITCH_COPILOT_GEMINI_PROVIDER_ID: "provider-gemini",
+  });
+  assert.equal(ready.checks.copilotGateStatus, "inputs-ready");
+  assert.equal(ready.longTailInputsPresent.githubCopilotClaudeProviderId, true);
+  assert.equal(ready.longTailInputsPresent.githubCopilotCodexProviderId, true);
+  assert.equal(ready.longTailInputsPresent.githubCopilotGeminiProviderId, true);
+});
+
+test("Amazon Q external gate is independent from Kiro and requires two explicit Provider IDs", () => {
+  const blocked = runEnvCheck({
+    STAGE: "AB7",
+    AMAZON_Q_TEST_ACCOUNT: "amazon-q-test-account",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://amazon-q-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    KIRO_TEST_ACCOUNT: "kiro-decoy-account",
+  });
+  assert.equal(blocked.checks.amazonQGateStatus, "blocked-inputs");
+
+  const ready = runEnvCheck({
+    STAGE: "AB7",
+    AMAZON_Q_TEST_ACCOUNT: "amazon-q-test-account",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://amazon-q-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID: "amazon-q-claude",
+    CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID: "amazon-q-codex",
+  });
+  assert.equal(ready.checks.amazonQGateStatus, "inputs-ready");
+  assert.equal(ready.longTailInputsPresent.amazonQClaudeProviderId, true);
+  assert.equal(ready.longTailInputsPresent.amazonQCodexProviderId, true);
 });

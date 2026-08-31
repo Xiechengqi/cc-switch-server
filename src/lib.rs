@@ -16,3 +16,5 @@ pub mod proxy;
 pub mod self_update;
 pub mod setup;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;

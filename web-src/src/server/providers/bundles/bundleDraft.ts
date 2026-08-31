@@ -319,7 +319,8 @@ function defaultsToPerAppModelPolicy(family: ProviderFamilySpec): boolean {
   const defaultModels = new Set(
     profiles.map((profile) => profile.defaultUpstreamModel ?? ""),
   );
-  return defaultModels.size > 1;
+  const defaultPolicies = new Set(profiles.map((profile) => profile.modelPolicy));
+  return defaultModels.size > 1 || defaultPolicies.size > 1;
 }
 
 export function supportsPerAppModelPolicy(family: ProviderFamilySpec): boolean {

@@ -175,7 +175,9 @@ scripts/smoke/router-share-smoke.sh
 
 建议外层使用 Caddy/Nginx/Cloudflare Tunnel 终止 TLS，再反代到 `127.0.0.1:15721` 或内网地址。`router` tunnel 暴露的 public URL 与本机管理入口可以并存，但生产管理入口必须使用强密码和最小暴露面。
 
-Codex OAuth 的普通 Responses SSE 和 Images 穿过 Nginx/Cloudflare 时，反代必须流式透传源站 Body并关闭响应缓冲。Nginx 至少应对这些路径设置 `proxy_buffering off`、`proxy_cache off`，并让 `proxy_read_timeout` 高于 Server 的上游 idle timeout；不要依赖把超时设得很短来发现断流。Cloudflare Worker 不能调用 `.text()`、`.json()` 或 `.arrayBuffer()`，必须直接返回上游 `ReadableStream`，并确认约 15 秒一次的 SSE comment/JSON 空白能立即 flush。普通文本 keepalive 只在首个业务或终态事件已提交后启动，不会掩盖首包前真实错误，也不会延长 Server 对上游的 first-event/idle deadline；`X-Accel-Buffering: no` 不应被中间层覆盖。
+Codex OAuth 的普通 Responses SSE 和 Images 穿过 Nginx/Cloudflare 时，反代必须流式透传源站 Body并关闭响应缓冲。Nginx 至少应对这些路径设置 `proxy_buffering off`、`proxy_cache off`，并让 `proxy_read_timeout` 高于 Server 的上游 idle timeout；不要依赖把超时设得很短来发现断流。Cloudflare Worker 不能调用 `.text()`、`.json()` 或 `.arrayBuffer()`，必须直接返回上游 `ReadableStream`，并确认约 15 秒一次的 SSE comment/JSON 空白能立即 flush。普通文本 keepalive 只在首个业务或终态事件已提交后启动，不会掩盖首包前真实错误，也不会延长 Server 对上游的 first-event/idle deadline。Server 会固定 Responses 下游的 `Content-Type`、`Cache-Control: no-store, no-cache, must-revalidate, no-transform`、`X-Accel-Buffering: no` 与 `X-Content-Type-Options: nosniff`，中间层不得覆盖或重新压缩/聚合这些小帧。
+
+`CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_ENABLED=1` 只适合在已确认 OpenAI 出站协商 HTTP/2、且真实长链路存在中间网络静默回收时灰度启用。协议级 PING 默认关闭，不能用来放宽 `STREAM_FIRST_BYTE_TIMEOUT_MS`、`STREAM_IDLE_TIMEOUT_MS` 或终态检查；HTTP/1.1 链路也不会从该开关获益。启用前后都应通过同一 Share 做超过 60 秒的真实流，并观察 transport/protocol error 指标。
 
 Capability URL 的 host 固定来自 Router 签名 Share context，不从源站 Host 或 forwarded header 推导。Capability 文件默认持久化到 `<config-dir>/image-capabilities`；多副本应把 `CC_SWITCH_IMAGE_STORE_DIR` 指向同一个支持跨进程文件锁、atomic rename 和目录同步的挂载目录，让 `/v1/images/files/<token>` 的 Router 鉴权 GET/HEAD 可落到任一副本。不能共享该目录时才配置生成与下载的粘性回源。Cloudflare/WAF 上传规则需允许 48 MiB Codex Images HTTP envelope。Images 响应和 capability 文件都必须保持 `no-store`；详细约束和 524 验收见 [`../provider/codex-oauth.md`](../provider/codex-oauth.md#cloudflare-proxy)。
 
@@ -190,6 +192,7 @@ Responses JSON、SSE、WebSocket 和 WS→HTTP fallback 共享下游提交边界
 事故回滚只设置 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 并重启服务；默认值为开启。回滚会关闭普通 Responses 的语义分类/提交门禁，但不会关闭 HMAC reasoning envelope 验证。包含 `image_generation` tool 的 Responses 图片传输仍强制执行最小 lifecycle/terminal 检查：它已经用心跳提交 wire `200`，因此必须继续把 `response.failed`、`response.incomplete` 和客户端取消写成真实终态，不能由该事故开关回滚。观察 `/metrics`：
 
 - `cc_switch_proxy_semantic_guard_total{surface,observation}`：`lifecycle`、`business`、`success_terminal`、`incomplete_terminal`、`client_failure`、`provider_failure`、`protocol_error`。
+- `cc_switch_responses_sse_transport_total{surface,observation}`：canonical event、comment/control/text/event/JSON liveness、`[DONE]` 与 protocol error 的有界分类；labels 不含模型、账号、Share 或 response id。
 - `cc_switch_reasoning_bridge_total{direction,outcome}`：reasoning envelope encode/decode 成功、过大、MAC 或 envelope 校验失败。
 
 真实 Claude/OpenAI OAuth、ChatGPT upstream、Router callback、Market 和 Share grant 仍按 `docs/acceptance/real-acceptance-runbook.md` 提供输入后执行；离线 fixture、mock 和 readiness 不能标记这些项目真实通过。

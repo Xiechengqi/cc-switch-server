@@ -123,6 +123,15 @@ export function familyLabel(
  */
 const FAMILY_SEARCH_ALIASES: Record<string, string[]> = {
   "family.custom_http": ["custom http", "自定义", "自訂", "カスタム"],
+  "family.kimi_code": ["kimi code oauth", "kimi code"],
+  "family.kimi_coding_api_key": ["kimi code api key"],
+  "family.qoder_cosy": ["qoder cosy"],
+  "family.bailian_coding_plan_cn": ["alibaba", "alibaba china"],
+  "family.bailian_coding_plan_global": [
+    "alibaba",
+    "alibaba global",
+    "alibaba singapore",
+  ],
 };
 
 export function familyAuthKind(family: ProviderFamilySpec): FamilyAuthKind {

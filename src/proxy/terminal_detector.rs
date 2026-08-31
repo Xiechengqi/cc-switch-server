@@ -1,13 +1,26 @@
 use serde_json::Value;
 
 use super::adapters::UpstreamFormat;
+use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
 
 const MAX_TERMINAL_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OPENAI_RESPONSES_TERMINAL_EVENT_BYTES: usize = 128 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalDetectorError {
     EventTooLarge,
+    Protocol(String),
+}
+
+impl TerminalDetectorError {
+    pub(super) fn proxy_message(&self, max_event_bytes: usize) -> String {
+        match self {
+            Self::EventTooLarge => {
+                format!("Upstream terminal event exceeded the {max_event_bytes} byte limit")
+            }
+            Self::Protocol(message) => message.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +36,7 @@ pub(super) struct UpstreamTerminalDetector {
     pending: Vec<u8>,
     terminal: Option<UpstreamTerminal>,
     max_event_bytes: usize,
+    responses: Option<ResponsesTransportDecoder>,
 }
 
 impl UpstreamTerminalDetector {
@@ -36,6 +50,12 @@ impl UpstreamTerminalDetector {
             pending: Vec::new(),
             terminal: None,
             max_event_bytes,
+            responses: (format == UpstreamFormat::OpenAiResponses).then(|| {
+                ResponsesTransportDecoder::new(
+                    MAX_TERMINAL_EVENT_BYTES,
+                    MAX_OPENAI_RESPONSES_TERMINAL_EVENT_BYTES,
+                )
+            }),
         }
     }
 
@@ -49,6 +69,33 @@ impl UpstreamTerminalDetector {
 
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<(), TerminalDetectorError> {
         if self.terminal.is_some() {
+            return Ok(());
+        }
+        if let Some(decoder) = self.responses.as_mut() {
+            let items = decoder.push(chunk).map_err(|error| {
+                if error.is_capacity() {
+                    TerminalDetectorError::EventTooLarge
+                } else {
+                    TerminalDetectorError::Protocol(error.to_string())
+                }
+            })?;
+            for item in items {
+                let ResponsesTransportItem::Json {
+                    declared_event,
+                    value,
+                } = item
+                else {
+                    continue;
+                };
+                if let Some(terminal) = declared_event
+                    .as_deref()
+                    .and_then(|event| declared_event_terminal(self.format, event))
+                    .or_else(|| value_terminal(self.format, &value))
+                {
+                    self.terminal = Some(terminal);
+                    break;
+                }
+            }
             return Ok(());
         }
         self.pending.extend_from_slice(chunk);
@@ -68,6 +115,43 @@ impl UpstreamTerminalDetector {
             return Err(TerminalDetectorError::EventTooLarge);
         }
         Ok(())
+    }
+}
+
+fn value_terminal(format: UpstreamFormat, value: &Value) -> Option<UpstreamTerminal> {
+    if format != UpstreamFormat::OpenAiResponses
+        && (value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("type").and_then(Value::as_str) == Some("error"))
+    {
+        return Some(UpstreamTerminal::Failed);
+    }
+    match format {
+        UpstreamFormat::OpenAiResponses => {
+            let event_type = value.get("type").and_then(Value::as_str);
+            let status = value
+                .get("response")
+                .and_then(|response| response.get("status"))
+                .or_else(|| value.get("status"))
+                .and_then(Value::as_str);
+            match event_type.or(status) {
+                Some("response.completed" | "completed") => Some(UpstreamTerminal::Completed),
+                Some("response.incomplete" | "incomplete") => Some(UpstreamTerminal::Incomplete),
+                Some(
+                    "response.failed" | "response.cancelled" | "response.canceled" | "failed"
+                    | "cancelled" | "canceled",
+                ) => Some(UpstreamTerminal::Failed),
+                _ => None,
+            }
+        }
+        UpstreamFormat::OpenAiChat => None,
+        UpstreamFormat::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
+            Some("message_stop") => Some(UpstreamTerminal::Completed),
+            Some("error") => Some(UpstreamTerminal::Failed),
+            _ => None,
+        },
+        UpstreamFormat::GeminiNative => {
+            gemini_terminal(value).then_some(UpstreamTerminal::Completed)
+        }
     }
 }
 
@@ -130,40 +214,7 @@ fn payload_terminal(format: UpstreamFormat, payload: &str) -> Option<UpstreamTer
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return None;
     };
-    if format != UpstreamFormat::OpenAiResponses
-        && (value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("type").and_then(Value::as_str) == Some("error"))
-    {
-        return Some(UpstreamTerminal::Failed);
-    }
-    match format {
-        UpstreamFormat::OpenAiResponses => {
-            let event_type = value.get("type").and_then(Value::as_str);
-            let status = value
-                .get("response")
-                .and_then(|response| response.get("status"))
-                .or_else(|| value.get("status"))
-                .and_then(Value::as_str);
-            match event_type.or(status) {
-                Some("response.completed" | "completed") => Some(UpstreamTerminal::Completed),
-                Some("response.incomplete" | "incomplete") => Some(UpstreamTerminal::Incomplete),
-                Some(
-                    "response.failed" | "response.cancelled" | "response.canceled" | "failed"
-                    | "cancelled" | "canceled",
-                ) => Some(UpstreamTerminal::Failed),
-                _ => None,
-            }
-        }
-        UpstreamFormat::OpenAiChat => None,
-        UpstreamFormat::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
-            Some("message_stop") => Some(UpstreamTerminal::Completed),
-            Some("error") => Some(UpstreamTerminal::Failed),
-            _ => None,
-        },
-        UpstreamFormat::GeminiNative => {
-            gemini_terminal(&value).then_some(UpstreamTerminal::Completed)
-        }
-    }
+    value_terminal(format, &value)
 }
 
 fn gemini_terminal(value: &Value) -> bool {
@@ -310,5 +361,17 @@ mod tests {
                 "format={format:?}"
             );
         }
+    }
+
+    #[test]
+    fn responses_reports_malformed_payload_as_protocol_error() {
+        let mut detector = UpstreamTerminalDetector::new(UpstreamFormat::OpenAiResponses);
+        let error = detector
+            .push(b"<!doctype html>\n\n")
+            .expect_err("HTML must not be classified as an oversized terminal event");
+        assert!(matches!(error, TerminalDetectorError::Protocol(_)));
+        assert!(error
+            .proxy_message(detector.max_event_bytes())
+            .contains("unknown non-control field"));
     }
 }

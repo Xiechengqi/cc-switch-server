@@ -22,6 +22,7 @@ pub const PRIVACY_DIMENSION: &str = "privacy";
 pub const TIER_ENTITLEMENT_DIMENSION: &str = "tier_entitlement";
 pub const GEMINI_QUOTA_FAMILY_DIMENSION: &str = "gemini_quota_family";
 pub const CLAUDE_QUOTA_FAMILY_DIMENSION: &str = "claude_quota_family";
+pub const GPT_QUOTA_FAMILY_DIMENSION: &str = "gpt_quota_family";
 pub const MODEL_CAPACITY_DIMENSION: &str = "model_capacity";
 pub const WEBSOCKET_DIMENSION: &str = "websocket";
 pub const IMAGE_GENERATION_DIMENSION: &str = "image_generation";
@@ -347,6 +348,7 @@ fn copilot_capability_projection(account: &Account, now_ms: i64) -> AccountCapab
         TOKEN_EXCHANGE_DIMENSION,
         ENDPOINT_PROVENANCE_DIMENSION,
         MODEL_CATALOG_DIMENSION,
+        MODEL_ENTITLEMENT_DIMENSION,
         PREMIUM_INTERACTIONS_DIMENSION,
     ] {
         dimensions.insert(
@@ -410,8 +412,10 @@ fn antigravity_capability_projection(
         PROJECT_BOOTSTRAP_DIMENSION,
         PRIVACY_DIMENSION,
         TIER_ENTITLEMENT_DIMENSION,
+        MODEL_CATALOG_DIMENSION,
         GEMINI_QUOTA_FAMILY_DIMENSION,
         CLAUDE_QUOTA_FAMILY_DIMENSION,
+        GPT_QUOTA_FAMILY_DIMENSION,
         MODEL_CAPACITY_DIMENSION,
     ] {
         dimensions.insert(
@@ -798,6 +802,7 @@ mod tests {
             TOKEN_EXCHANGE_DIMENSION,
             ENDPOINT_PROVENANCE_DIMENSION,
             MODEL_CATALOG_DIMENSION,
+            MODEL_ENTITLEMENT_DIMENSION,
             PREMIUM_INTERACTIONS_DIMENSION,
         ] {
             assert_eq!(
@@ -1001,6 +1006,14 @@ mod tests {
                         Some(5_000),
                     ),
                     AccountCapabilityObservationDraft::antigravity_feature(
+                        MODEL_CATALOG_DIMENSION,
+                        AccountCapabilityObservationState::Supported,
+                        "fetch_available_models",
+                        None,
+                        1_000,
+                        Some(5_000),
+                    ),
+                    AccountCapabilityObservationDraft::antigravity_feature(
                         GEMINI_QUOTA_FAMILY_DIMENSION,
                         AccountCapabilityObservationState::Supported,
                         "retrieve_user_quota",
@@ -1012,6 +1025,14 @@ mod tests {
                         CLAUDE_QUOTA_FAMILY_DIMENSION,
                         AccountCapabilityObservationState::Supported,
                         "retrieve_user_quota",
+                        None,
+                        1_000,
+                        Some(5_000),
+                    ),
+                    AccountCapabilityObservationDraft::antigravity_feature(
+                        GPT_QUOTA_FAMILY_DIMENSION,
+                        AccountCapabilityObservationState::Supported,
+                        "fetch_available_models",
                         None,
                         1_000,
                         Some(5_000),

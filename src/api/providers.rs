@@ -1199,6 +1199,11 @@ pub(in crate::api) async fn test_provider_inner(
         .await;
     }
 
+    if execution.driver_is("special.deepseek_account") {
+        return test_deepseek_provider_inner(state, execution, query, model, requested_stream)
+            .await;
+    }
+
     if query.network.unwrap_or(false) {
         ensure_provider_outbound_allowed(state, &execution).await?;
         if let Some((provider_type, account_id, expected_generation)) =
@@ -1770,6 +1775,404 @@ async fn test_cursor_provider_inner(
     ))
 }
 
+async fn test_deepseek_provider_inner(
+    state: &ServerState,
+    execution: proxy::provider_ops::ProviderExecution,
+    query: &TestProviderQuery,
+    model: String,
+    requested_stream: bool,
+) -> Result<TestProviderResponse, ApiError> {
+    let stored = execution.runtime_stored_view();
+    let (account_id, expected_generation) = match execution.managed_account_identity_target() {
+        Some((ProviderType::DeepSeekAccount, account_id, expected_generation))
+            if stored.app == AppKind::Claude =>
+        {
+            (account_id.to_string(), expected_generation)
+        }
+        _ => {
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                false,
+                None,
+                None,
+                None,
+                Some(
+                    "DeepSeek provider test requires one explicit managed Account binding"
+                        .to_string(),
+                ),
+                ProviderOperationOutcome::InvalidConfig,
+                "DeepSeek provider test requires one explicit managed Account binding".to_string(),
+            ));
+        }
+    };
+    let accounts = state.accounts_snapshot().await;
+    let account = accounts.accounts.iter().find(|account| {
+        account.id == account_id && account.provider_type == ProviderType::DeepSeekAccount
+    });
+    let account_ready = account.is_some_and(|account| {
+        account.auth_identity_generation == expected_generation
+            && account
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|token| !token.is_empty())
+    });
+    if !account_ready {
+        let message =
+            "DeepSeek managed Account binding changed or its imported bearer token is unavailable"
+                .to_string();
+        return Ok(deepseek_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            ProviderOperationOutcome::MissingCredential,
+            message,
+        ));
+    }
+    if let Err(error) = execution.materialize_auth(&accounts) {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(deepseek_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            provider_test_outcome(false, Some(error.status.as_u16()), Some(&message)),
+            message,
+        ));
+    }
+
+    let deepseek_model = match crate::proxy::deepseek::resolve_model(&model) {
+        Ok(model) => model,
+        Err(error) => {
+            let message = redact_provider_test_error(&error.message);
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                false,
+                None,
+                None,
+                None,
+                Some(message.clone()),
+                ProviderOperationOutcome::InvalidConfig,
+                message,
+            ));
+        }
+    };
+    let body = provider_test_body(
+        stored.app,
+        &stored,
+        Some(&model),
+        query.test_prompt.as_deref().unwrap_or("ping"),
+        requested_stream,
+    );
+    let request_body: Value = serde_json::from_str(&body).map_err(ApiError::internal)?;
+    let prepared = match crate::proxy::deepseek::prepare_request(&request_body, &deepseek_model) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let message = redact_provider_test_error(&error.message);
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                false,
+                None,
+                None,
+                None,
+                Some(message.clone()),
+                ProviderOperationOutcome::InvalidConfig,
+                message,
+            ));
+        }
+    };
+
+    if !query.network.unwrap_or(false) {
+        return Ok(deepseek_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            None,
+            ProviderOperationOutcome::Success,
+            "configuration check passed; DeepSeek fixed origin, reviewed model, bearer-only Account rail, and generation binding are valid; upstream network/model call is not executed".to_string(),
+        ));
+    }
+
+    if let Err(error) = ensure_provider_outbound_allowed(state, &execution).await {
+        let message = redact_provider_test_error(&error.message);
+        return Ok(deepseek_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            ProviderOperationOutcome::InvalidConfig,
+            message,
+        ));
+    }
+    let timeout = query
+        .timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
+    let client_session_id = crate::proxy::deepseek::request_scoped_session_id();
+    let provider_test_scope = format!("provider-test:{}", stored.provider.id);
+    let upstream = state.start_deepseek_chat_completion(
+        stored.app,
+        &stored.provider.id,
+        stored.resource.revision,
+        &execution.plan.runtime_fingerprint,
+        &account_id,
+        expected_generation,
+        &provider_test_scope,
+        "provider-test",
+        &client_session_id,
+        &deepseek_model,
+        &prepared.prompt,
+        prepared.thinking_enabled,
+        prepared.search_enabled,
+    );
+    let mut response = match tokio::time::timeout_at(deadline, upstream).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let (outcome, status, message) = deepseek_provider_test_upstream_error(error);
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                status,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                outcome,
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = "DeepSeek provider test timed out before response headers".to_string();
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                ProviderOperationOutcome::Timeout,
+                message,
+            ));
+        }
+    };
+    let status = response.status().as_u16();
+    let response_body = match tokio::time::timeout_at(
+        deadline,
+        read_provider_control_response_body(&mut response, PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(message)) => {
+            let message = redact_provider_test_error(&message);
+            let outcome = provider_test_outcome(true, Some(status), Some(&message));
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                outcome,
+                message,
+            ));
+        }
+        Err(_) => {
+            let message = "DeepSeek provider test timed out while reading the response".to_string();
+            return Ok(deepseek_provider_test_response(
+                &execution,
+                &model,
+                requested_stream,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                ProviderOperationOutcome::Timeout,
+                message,
+            ));
+        }
+    };
+
+    if !(200..=299).contains(&status) {
+        let detail = redact_provider_test_error(&String::from_utf8_lossy(&response_body));
+        let message = if detail.trim().is_empty() {
+            format!("DeepSeek provider returned HTTP {status}")
+        } else {
+            detail
+        };
+        let outcome = provider_test_outcome(true, Some(status), Some(&message));
+        return Ok(deepseek_provider_test_response(
+            &execution,
+            &model,
+            requested_stream,
+            true,
+            Some(status),
+            Some(started.elapsed().as_millis()),
+            requested_stream.then_some(false),
+            Some(message.clone()),
+            outcome,
+            message,
+        ));
+    }
+
+    let collected = crate::proxy::deepseek::collect_deepseek_response(
+        futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(response_body)]),
+        prepared.thinking_enabled,
+    )
+    .await;
+    let network_error = collected
+        .and_then(|collected| {
+            crate::proxy::deepseek::finalize_collected_response(collected, &prepared)
+        })
+        .err()
+        .map(|error| redact_provider_test_error(&error.message));
+    let outcome = provider_test_outcome(true, Some(status), network_error.as_deref());
+    let message = network_error.clone().unwrap_or_else(|| {
+        "configuration check passed; DeepSeek native session, PoW, terminal stream, and bound Account network/model call executed".to_string()
+    });
+    Ok(deepseek_provider_test_response(
+        &execution,
+        &model,
+        requested_stream,
+        true,
+        Some(status),
+        Some(started.elapsed().as_millis()),
+        requested_stream.then_some(network_error.is_none()),
+        network_error,
+        outcome,
+        message,
+    ))
+}
+
+fn deepseek_provider_test_upstream_error(
+    error: crate::state::DeepSeekUpstreamError,
+) -> (ProviderOperationOutcome, Option<u16>, String) {
+    use crate::state::DeepSeekUpstreamError;
+    let (outcome, status, message) = match error {
+        DeepSeekUpstreamError::NotFound => (
+            ProviderOperationOutcome::InvalidConfig,
+            None,
+            "DeepSeek managed Account was not found".to_string(),
+        ),
+        DeepSeekUpstreamError::IdentityChanged => (
+            ProviderOperationOutcome::InvalidConfig,
+            None,
+            "DeepSeek Provider or Account identity changed during the test".to_string(),
+        ),
+        DeepSeekUpstreamError::CredentialPersistenceDegraded => (
+            ProviderOperationOutcome::InvalidConfig,
+            None,
+            "DeepSeek managed credential persistence is degraded".to_string(),
+        ),
+        DeepSeekUpstreamError::MissingToken => (
+            ProviderOperationOutcome::MissingCredential,
+            None,
+            "DeepSeek imported bearer token is missing".to_string(),
+        ),
+        DeepSeekUpstreamError::Network { operation, message } => (
+            ProviderOperationOutcome::Network,
+            None,
+            format!("DeepSeek {operation} network error: {message}"),
+        ),
+        DeepSeekUpstreamError::Upstream {
+            operation,
+            status_code,
+            message,
+        } => {
+            let message = format!("DeepSeek {operation} returned HTTP {status_code}: {message}");
+            (
+                provider_test_outcome(true, Some(status_code), Some(&message)),
+                Some(status_code),
+                message,
+            )
+        }
+        DeepSeekUpstreamError::Protocol { operation, message } => (
+            ProviderOperationOutcome::Protocol,
+            None,
+            format!("DeepSeek {operation} protocol error: {message}"),
+        ),
+    };
+    (outcome, status, redact_provider_test_error(&message))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deepseek_provider_test_response(
+    execution: &proxy::provider_ops::ProviderExecution,
+    model: &str,
+    stream: bool,
+    network_checked: bool,
+    network_status_code: Option<u16>,
+    network_latency_ms: Option<u128>,
+    network_stream_completed: Option<bool>,
+    network_error: Option<String>,
+    outcome: ProviderOperationOutcome,
+    message: String,
+) -> TestProviderResponse {
+    let stored = execution.runtime_stored_view();
+    let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
+        .capability(stored.app, stored.provider_type);
+    TestProviderResponse {
+        ok: outcome == ProviderOperationOutcome::Success,
+        outcome,
+        driver_id: execution.plan.driver_id.to_string(),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_id: stored.provider.id.clone(),
+        app: stored.app,
+        provider_type: stored.provider_type,
+        provider_revision: stored.resource.revision,
+        adapter: capability.adapter,
+        support: capability.support,
+        endpoint: redact_provider_endpoint(&execution.plan.endpoint),
+        model: model.to_string(),
+        stream,
+        header_names: vec![
+            "authorization".to_string(),
+            "x-ds-pow-response".to_string(),
+            "x-client-platform".to_string(),
+            "x-client-version".to_string(),
+        ],
+        network_checked,
+        network_status_code,
+        network_latency_ms,
+        network_stream_completed,
+        network_error,
+        reconciliation: None,
+        message,
+    }
+}
+
 fn validate_cursor_provider_test_configuration(
     execution: &proxy::provider_ops::ProviderExecution,
     accounts: &crate::domain::accounts::store::AccountStore,
@@ -2242,6 +2645,7 @@ fn redact_provider_endpoint(endpoint: &str) -> String {
     url.to_string()
 }
 
+#[derive(Debug)]
 pub(in crate::api) struct ProviderModelsFetchResult {
     url: String,
     models: Vec<FetchedProviderModel>,
@@ -2287,7 +2691,103 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             crate::clients::oauth::claude_models::static_claude_model_catalog(),
         ));
     }
+    if crate::proxy::web_session::is_web_session_driver(execution.plan.driver_id.as_str()) {
+        let models = crate::proxy::web_session::reviewed_models_for_driver(
+            execution.plan.driver_id.as_str(),
+        )
+        .ok_or_else(|| ApiError::bad_request("Web Session Driver has no reviewed model catalog"))?;
+        return Ok(ProviderModelsFetchResult {
+            url: format!("registry://{}/models", execution.plan.profile_id),
+            models: models
+                .iter()
+                .map(|model| FetchedProviderModel {
+                    id: model.id.to_string(),
+                    upstream_model: model.id.to_string(),
+                    display_name: Some(model.display_name.to_string()),
+                    raw: serde_json::json!({
+                        "id": model.id,
+                        "source": "reviewed_web_session_catalog",
+                        "fixtureState": "fixture_verified",
+                        "liveState": "live_pending",
+                        "entitlement": "not_asserted",
+                        "capabilities": {
+                            "stream": true,
+                            "tools": false,
+                            "images": false,
+                            "inputModalities": ["text"],
+                            "outputModalities": ["text"]
+                        }
+                    }),
+                })
+                .collect(),
+            source: Some("reviewed_web_session_catalog".to_string()),
+            stale: Some(false),
+            fetched_at_ms: None,
+        });
+    }
     ensure_provider_outbound_allowed(state, execution).await?;
+    if stored.provider_type == ProviderType::DeepSeekAccount {
+        let (account_id, expected_generation) = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::DeepSeekAccount,
+                auth_identity_generation,
+            } if execution.driver_is("special.deepseek_account")
+                && !account_id.trim().is_empty() =>
+            {
+                (account_id.as_str(), *auth_identity_generation)
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "deepseek_account model discovery requires one explicit managed account binding",
+                ));
+            }
+        };
+        let account = state
+            .find_account_for_provider(ProviderType::DeepSeekAccount, account_id)
+            .await
+            .filter(|account| account.auth_identity_generation == expected_generation)
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "deepseek_account model discovery binding changed; rebind the Provider",
+                )
+            })?;
+        if account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|token| token.is_empty())
+        {
+            return Err(ApiError::unauthorized(
+                "deepseek_account model discovery requires the imported bearer token",
+            ));
+        }
+        return Ok(ProviderModelsFetchResult {
+            url: format!("registry://{}/models", execution.plan.profile_id),
+            models: crate::proxy::deepseek::reviewed_model_catalog()
+                .iter()
+                .map(|model| FetchedProviderModel {
+                    id: model.id.to_string(),
+                    upstream_model: model.id.to_string(),
+                    display_name: Some(model.display_name.to_string()),
+                    raw: serde_json::json!({
+                        "id": model.id,
+                        "source": "reviewed_deepseek_web_catalog",
+                        "entitlement": "live_pending",
+                        "capabilities": {
+                            "thinking": model.thinking,
+                            "search": model.search,
+                            "tools": true,
+                            "inputModalities": ["text"]
+                        }
+                    }),
+                })
+                .collect(),
+            source: Some("reviewed_deepseek_web_catalog".to_string()),
+            stale: Some(false),
+            fetched_at_ms: None,
+        });
+    }
     if stored.provider_type == ProviderType::GitHubCopilot {
         let (account_id, expected_generation) = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
@@ -2325,6 +2825,251 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             .map_err(copilot_model_catalog_error_to_api_error)?;
         return Ok(copilot_provider_models_fetch_result(catalog));
     }
+    if stored.provider_type == ProviderType::GeminiCli {
+        let (account_id, expected_generation) = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::GeminiCli,
+                auth_identity_generation,
+            } if execution.driver_is("oauth.gemini_code_assist")
+                && !account_id.trim().is_empty() =>
+            {
+                (account_id.as_str(), *auth_identity_generation)
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "gemini_cli model discovery requires one explicit managed account binding",
+                ));
+            }
+        };
+        let refresh = state
+            .refresh_bound_account_quota_for_generation(
+                ProviderType::GeminiCli,
+                account_id,
+                expected_generation,
+                true,
+            )
+            .await;
+        let (account, force_stale) = match refresh {
+            Ok(account) => (account, false),
+            Err(error) => {
+                tracing::warn!(
+                    account_id,
+                    error = %error,
+                    "Gemini Code Assist model discovery quota refresh failed"
+                );
+                if !error
+                    .downcast_ref::<crate::state::BoundAccountQuotaRefreshFailure>()
+                    .is_some_and(|failure| failure.allows_same_generation_stale_catalog())
+                {
+                    return Err(ApiError::bad_gateway(
+                        "Gemini Code Assist model discovery failed for the bound account",
+                    ));
+                }
+                let account = state
+                    .find_account_for_provider(ProviderType::GeminiCli, account_id)
+                    .await
+                    .filter(|account| account.auth_identity_generation == expected_generation)
+                    .ok_or_else(|| {
+                        ApiError::bad_gateway(
+                            "Gemini Code Assist model discovery failed for the bound account",
+                        )
+                    })?;
+                (account, true)
+            }
+        };
+        let max_age_ms = state
+            .oauth_quota_refresh_interval_ms()
+            .await
+            .saturating_mul(2)
+            .max(60_000);
+        let catalog = crate::clients::oauth::gemini_models::model_catalog_from_account(
+            &account,
+            crate::infra::time::now_ms() as i64,
+            max_age_ms,
+            force_stale,
+        );
+        if catalog.descriptors.is_empty() && catalog.stale {
+            return Err(ApiError::bad_gateway(
+                "Gemini Code Assist model discovery has no current bound-account catalog",
+            ));
+        }
+        return Ok(gemini_provider_models_fetch_result(catalog));
+    }
+    if matches!(
+        stored.provider_type,
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    ) {
+        let provider_type = stored.provider_type;
+        let expected_driver = match provider_type {
+            ProviderType::AntigravityOAuth => "special.antigravity",
+            ProviderType::AgyOAuth => "special.agy",
+            _ => unreachable!("provider type was matched above"),
+        };
+        let (account_id, expected_generation) = match &execution.plan.auth_ref {
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type,
+                auth_identity_generation,
+            } if *expected_provider_type == provider_type
+                && execution.driver_is(expected_driver)
+                && !account_id.trim().is_empty() =>
+            {
+                (account_id.as_str(), *auth_identity_generation)
+            }
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "{} model discovery requires one explicit managed account binding",
+                    provider_type.as_str()
+                )));
+            }
+        };
+        state
+            .refresh_managed_account_if_needed_for_generation(
+                provider_type,
+                account_id,
+                expected_generation,
+            )
+            .await
+            .map_err(map_managed_account_refresh_error)?;
+        state
+            .ensure_gemini_v1internal_project_for_generation(
+                provider_type,
+                account_id,
+                expected_generation,
+            )
+            .await
+            .map_err(map_managed_account_refresh_error)?;
+        let timeout = timeout_ms
+            .filter(|value| *value > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| execution.request_timeout());
+        #[cfg(test)]
+        let endpoint_override = execution
+            .plan
+            .driver_options
+            .get("testAntigravityModelsUrl")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        #[cfg(not(test))]
+        let endpoint_override: Option<String> = None;
+        let mut account = state
+            .find_account_for_provider(provider_type, account_id)
+            .await
+            .filter(|account| account.auth_identity_generation == expected_generation)
+            .ok_or_else(|| {
+                ApiError::conflict("bound Antigravity account identity changed during discovery")
+            })?;
+        #[cfg(test)]
+        let endpoint_override = endpoint_override.or_else(|| {
+            account.raw.as_ref().and_then(|raw| {
+                raw.get("testAntigravityModelsUrl")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        raw.get("testGeminiCodeAssistBaseUrl")
+                            .and_then(Value::as_str)
+                            .map(|base| {
+                                format!(
+                                    "{}/v1internal:fetchAvailableModels",
+                                    base.trim_end_matches('/')
+                                )
+                            })
+                    })
+            })
+        });
+        let http = state.http_client().await;
+        let mut catalog = crate::clients::oauth::antigravity_models::model_catalog(
+            &http,
+            &account,
+            timeout,
+            endpoint_override.as_deref(),
+        )
+        .await;
+        if catalog.as_ref().is_err_and(|error| error.is_unauthorized())
+            && !account.needs_relogin
+            && account
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+        {
+            state
+                .refresh_managed_account_now_for_generation(
+                    provider_type,
+                    account_id,
+                    expected_generation,
+                )
+                .await
+                .map_err(map_managed_account_refresh_error)?;
+            account = state
+                .find_account_for_provider(provider_type, account_id)
+                .await
+                .filter(|account| account.auth_identity_generation == expected_generation)
+                .ok_or_else(|| {
+                    ApiError::conflict(
+                        "bound Antigravity account identity changed during auth recovery",
+                    )
+                })?;
+            catalog = crate::clients::oauth::antigravity_models::model_catalog(
+                &http,
+                &account,
+                timeout,
+                endpoint_override.as_deref(),
+            )
+            .await;
+        }
+        let catalog = catalog.map_err(|error| {
+            tracing::warn!(
+                account_id,
+                provider_type = provider_type.as_str(),
+                status_code = error.status_code,
+                retryable = error.retryable,
+                error = %error,
+                "Antigravity model discovery failed"
+            );
+            ApiError::bad_gateway("Antigravity model discovery failed for the bound account")
+        })?;
+        let current_plan = state
+            .provider_runtime_plan(stored.app, &stored.provider.id)
+            .await
+            .filter(|plan| {
+                plan.provider_revision == execution.plan.provider_revision
+                    && plan.runtime_fingerprint == execution.plan.runtime_fingerprint
+            })
+            .ok_or_else(|| {
+                ApiError::conflict("Provider binding changed during Antigravity model discovery")
+            })?;
+        if !matches!(
+            &current_plan.auth_ref,
+            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                account_id: current_account_id,
+                expected_provider_type,
+                auth_identity_generation,
+            } if current_account_id == account_id
+                && *expected_provider_type == provider_type
+                && *auth_identity_generation == expected_generation
+        ) {
+            return Err(ApiError::conflict(
+                "Provider account binding changed during Antigravity model discovery",
+            ));
+        }
+        state
+            .record_antigravity_model_catalog_observations_for_generation(
+                provider_type,
+                account_id,
+                expected_generation,
+                &catalog,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(account_id, error = %error, "persisting Antigravity model evidence failed");
+                ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Antigravity model evidence could not be durably persisted",
+                )
+            })?;
+        return Ok(antigravity_provider_models_fetch_result(catalog));
+    }
     if stored.provider_type == ProviderType::KiroOAuth {
         let managed_binding = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
@@ -2342,143 +3087,106 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                 "managed_account_binding_unavailable",
             ),
             Some((account_id, expected_generation)) => {
-                let refresh = state
-                    .refresh_managed_account_if_needed_for_generation(
-                        ProviderType::KiroOAuth,
-                        account_id,
-                        expected_generation,
-                    )
-                    .await;
-                if let Err(error) = refresh {
-                    tracing::warn!(error = ?error, "Kiro model discovery token refresh failed");
-                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
-                        "token_refresh_failed",
-                    )
-                } else if let Some(account) = state
+                #[cfg(test)]
+                let endpoint_override = execution
+                    .plan
+                    .driver_options
+                    .get("testKiroModelsUrl")
+                    .and_then(Value::as_str);
+                #[cfg(not(test))]
+                let endpoint_override: Option<&str> = None;
+                let discovery_url = state
                     .find_account_for_provider(ProviderType::KiroOAuth, account_id)
                     .await
-                    .filter(|account| account.auth_identity_generation == expected_generation)
-                {
-                    #[cfg(test)]
-                    let endpoint_override = execution
-                        .plan
-                        .driver_options
-                        .get("testKiroModelsUrl")
-                        .and_then(Value::as_str);
-                    #[cfg(not(test))]
-                    let endpoint_override: Option<&str> = None;
-                    result_url = endpoint_override
-                        .map(str::to_string)
-                        .or_else(|| {
-                            crate::clients::oauth::kiro_runtime::model_discovery_url(&account).ok()
-                        })
-                        .unwrap_or_else(|| "unavailable://kiro/models".to_string());
-                    let timeout = timeout_ms
-                        .filter(|value| *value > 0)
-                        .map(std::time::Duration::from_millis)
-                        .unwrap_or_else(|| execution.request_timeout());
-                    crate::clients::oauth::kiro_runtime::model_catalog_with_timeout(
-                        &state.http_client().await,
-                        &account,
+                    .and_then(|account| {
+                        crate::clients::oauth::kiro_runtime::model_discovery_url(&account).ok()
+                    });
+                result_url = endpoint_override
+                    .map(str::to_string)
+                    .or(discovery_url)
+                    .unwrap_or_else(|| "unavailable://kiro/models".to_string());
+                let timeout = timeout_ms
+                    .filter(|value| *value > 0)
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or_else(|| execution.request_timeout());
+                state
+                    .kiro_model_catalog(
+                        stored.app,
+                        &stored.provider.id,
+                        execution.plan.provider_revision,
+                        &execution.plan.runtime_fingerprint,
+                        account_id,
+                        expected_generation,
                         endpoint_override,
                         timeout,
                     )
                     .await
-                } else {
-                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
-                        "bound_account_unavailable",
-                    )
-                }
             }
         };
         return Ok(kiro_provider_models_fetch_result(catalog, &result_url));
     }
-    if stored.provider_type == ProviderType::GrokOAuth {
+    if stored.provider_type == ProviderType::AmazonQOAuth {
         let managed_binding = match &execution.plan.auth_ref {
             crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
                 account_id,
-                expected_provider_type: ProviderType::GrokOAuth,
+                expected_provider_type: ProviderType::AmazonQOAuth,
                 auth_identity_generation,
-            } if execution.driver_is("oauth.grok_responses") && !account_id.trim().is_empty() => {
+            } if execution.driver_is("special.amazon_q") && !account_id.trim().is_empty() => {
                 Some((account_id.as_str(), *auth_identity_generation))
             }
             _ => None,
         };
+        let mut result_url = "unavailable://amazon-q/models".to_string();
         let catalog = match managed_binding {
-            None => crate::clients::oauth::grok_models::static_grok_model_catalog(
+            None => crate::clients::oauth::amazon_q_runtime::unavailable_model_catalog(
                 "managed_account_binding_unavailable",
             ),
-            Some(_) if state.credential_persistence_degraded() => {
-                crate::clients::oauth::grok_models::static_grok_model_catalog(
-                    "credential_persistence_degraded",
-                )
-            }
             Some((account_id, expected_generation)) => {
-                let refresh = state
-                    .refresh_managed_account_if_needed_for_generation(
-                        ProviderType::GrokOAuth,
+                #[cfg(test)]
+                let endpoint_override = execution
+                    .plan
+                    .driver_options
+                    .get("testAmazonQModelsUrl")
+                    .and_then(Value::as_str);
+                #[cfg(not(test))]
+                let endpoint_override: Option<&str> = None;
+                let discovery_url = state
+                    .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+                    .await
+                    .and_then(|account| {
+                        crate::clients::oauth::amazon_q_runtime::model_discovery_url(&account).ok()
+                    });
+                result_url = endpoint_override
+                    .map(str::to_string)
+                    .or(discovery_url)
+                    .unwrap_or_else(|| "unavailable://amazon-q/models".to_string());
+                let timeout = timeout_ms
+                    .filter(|value| *value > 0)
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or_else(|| execution.request_timeout());
+                state
+                    .amazon_q_model_catalog(
+                        stored.app,
+                        &stored.provider.id,
+                        execution.plan.provider_revision,
+                        &execution.plan.runtime_fingerprint,
                         account_id,
                         expected_generation,
+                        endpoint_override,
+                        timeout,
                     )
-                    .await;
-                if let Err(error) = refresh {
-                    tracing::warn!(error = ?error, "Grok model discovery token refresh failed");
-                    crate::clients::oauth::grok_models::static_grok_model_catalog(
-                        "token_refresh_failed",
-                    )
-                } else if state.credential_persistence_degraded() {
-                    crate::clients::oauth::grok_models::static_grok_model_catalog(
-                        "credential_persistence_degraded",
-                    )
-                } else {
-                    let account = state
-                        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
-                        .await
-                        .filter(|account| account.auth_identity_generation == expected_generation);
-                    if let Some((account, access_token)) = account.as_ref().and_then(|account| {
-                        account
-                            .access_token
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|token| !token.is_empty())
-                            .map(|token| (account, token))
-                    }) {
-                        #[cfg(test)]
-                        if let Some(url) = execution
-                            .plan
-                            .driver_options
-                            .get("testGrokModelsUrl")
-                            .and_then(Value::as_str)
-                        {
-                            return Ok(grok_provider_models_fetch_result(
-                                crate::clients::oauth::grok_models::grok_model_catalog_at_test_url(
-                                    &state.http_client().await,
-                                    &account.id,
-                                    access_token,
-                                    url,
-                                )
-                                .await,
-                                url,
-                            ));
-                        }
-                        crate::clients::oauth::grok_models::grok_model_catalog(
-                            &state.http_client().await,
-                            &account.id,
-                            access_token,
-                        )
-                        .await
-                    } else {
-                        crate::clients::oauth::grok_models::static_grok_model_catalog(
-                            "access_token_unavailable",
-                        )
-                    }
-                }
+                    .await
             }
         };
-        return Ok(grok_provider_models_fetch_result(
-            catalog,
-            crate::clients::oauth::grok_models::GROK_MODELS_URL,
-        ));
+        return Ok(amazon_q_provider_models_fetch_result(catalog, &result_url));
+    }
+    if stored.provider_type == ProviderType::GrokOAuth {
+        let timeout = timeout_ms
+            .filter(|value| *value > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| execution.request_timeout());
+        let catalog = fetch_bound_grok_model_catalog(state, execution, timeout).await?;
+        return Ok(grok_provider_models_fetch_result(catalog));
     }
     let accounts = state.accounts_snapshot().await;
     let adapter = proxy::adapters::adapter_for(stored.app, stored.provider_type);
@@ -2612,9 +3320,212 @@ async fn ensure_provider_outbound_allowed(
     ensure_stored_provider_outbound_allowed(state, &execution.stored).await
 }
 
+pub(in crate::api) async fn fetch_bound_grok_model_catalog(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    timeout: std::time::Duration,
+) -> Result<crate::clients::oauth::grok_models::GrokModelCatalog, ApiError> {
+    let (account_id, expected_generation) = match &execution.plan.auth_ref {
+        crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::GrokOAuth,
+            auth_identity_generation,
+        } if execution.stored.provider_type == ProviderType::GrokOAuth
+            && execution.driver_is("oauth.grok_responses")
+            && !account_id.trim().is_empty() =>
+        {
+            (account_id.as_str(), *auth_identity_generation)
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "Grok model discovery requires one explicit Grok OAuth managed account binding",
+            ));
+        }
+    };
+    ensure_stored_provider_outbound_allowed(state, &execution.stored).await?;
+    state
+        .refresh_managed_account_if_needed_for_generation(
+            ProviderType::GrokOAuth,
+            account_id,
+            expected_generation,
+        )
+        .await
+        .map_err(map_managed_account_refresh_error)?;
+    ensure_stored_provider_outbound_allowed(state, &execution.stored).await?;
+
+    let mut account =
+        current_grok_catalog_account(state, execution, account_id, expected_generation, None)
+            .await?;
+    let mut scope = grok_model_catalog_scope(execution, &account);
+    let mut catalog =
+        fetch_grok_model_catalog_once(state, execution, &scope, &account, timeout).await;
+    if catalog
+        .as_ref()
+        .is_err_and(crate::clients::oauth::grok_models::GrokModelCatalogFailure::is_unauthorized)
+    {
+        state
+            .refresh_managed_account_now_for_generation(
+                ProviderType::GrokOAuth,
+                account_id,
+                expected_generation,
+            )
+            .await
+            .map_err(map_managed_account_refresh_error)?;
+        ensure_stored_provider_outbound_allowed(state, &execution.stored).await?;
+        account =
+            current_grok_catalog_account(state, execution, account_id, expected_generation, None)
+                .await?;
+        scope = grok_model_catalog_scope(execution, &account);
+        catalog = fetch_grok_model_catalog_once(state, execution, &scope, &account, timeout).await;
+    }
+    let catalog = catalog.map_err(grok_model_catalog_error_to_api_error)?;
+    current_grok_catalog_account(
+        state,
+        execution,
+        account_id,
+        expected_generation,
+        Some(scope.token_refresh_generation),
+    )
+    .await?;
+    Ok(catalog)
+}
+
+async fn current_grok_catalog_account(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    account_id: &str,
+    expected_generation: u64,
+    expected_token_generation: Option<u64>,
+) -> Result<crate::domain::accounts::store::Account, ApiError> {
+    let current_plan = state
+        .provider_runtime_plan(execution.stored.app, &execution.stored.provider.id)
+        .await
+        .filter(|plan| {
+            plan.provider_revision == execution.plan.provider_revision
+                && plan.runtime_fingerprint == execution.plan.runtime_fingerprint
+        })
+        .ok_or_else(|| {
+            ApiError::conflict("Provider binding changed during Grok model discovery")
+        })?;
+    if !matches!(
+        &current_plan.auth_ref,
+        crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+            account_id: current_account_id,
+            expected_provider_type: ProviderType::GrokOAuth,
+            auth_identity_generation,
+        } if current_account_id == account_id
+            && *auth_identity_generation == expected_generation
+    ) {
+        return Err(ApiError::conflict(
+            "Provider account binding changed during Grok model discovery",
+        ));
+    }
+    let account = state
+        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
+        .await
+        .filter(|account| account.auth_identity_generation == expected_generation)
+        .ok_or_else(|| ApiError::conflict("Bound Grok account changed during model discovery"))?;
+    if expected_token_generation
+        .is_some_and(|generation| account.token_refresh_generation != generation)
+    {
+        return Err(ApiError::conflict(
+            "Bound Grok account token changed during model discovery",
+        ));
+    }
+    if account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(ApiError::unauthorized(
+            "Bound Grok account has no usable access token",
+        ));
+    }
+    Ok(account)
+}
+
+fn grok_model_catalog_scope(
+    execution: &proxy::provider_ops::ProviderExecution,
+    account: &crate::domain::accounts::store::Account,
+) -> crate::clients::oauth::grok_models::GrokModelCatalogScope {
+    crate::clients::oauth::grok_models::GrokModelCatalogScope {
+        app: execution.stored.app.as_str().to_string(),
+        provider_id: execution.stored.provider.id.clone(),
+        provider_revision: execution.plan.provider_revision,
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        account_id: account.id.clone(),
+        auth_identity_generation: account.auth_identity_generation,
+        token_refresh_generation: account.token_refresh_generation,
+    }
+}
+
+async fn fetch_grok_model_catalog_once(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    scope: &crate::clients::oauth::grok_models::GrokModelCatalogScope,
+    account: &crate::domain::accounts::store::Account,
+    timeout: std::time::Duration,
+) -> Result<
+    crate::clients::oauth::grok_models::GrokModelCatalog,
+    crate::clients::oauth::grok_models::GrokModelCatalogFailure,
+> {
+    let access_token = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    #[cfg(test)]
+    if let Some(url) = execution
+        .plan
+        .driver_options
+        .get("testGrokModelsUrl")
+        .and_then(Value::as_str)
+    {
+        return crate::clients::oauth::grok_models::grok_model_catalog_at_test_url(
+            &state.http_client().await,
+            scope,
+            access_token,
+            url,
+            timeout,
+        )
+        .await;
+    }
+    #[cfg(not(test))]
+    let _ = execution;
+    crate::clients::oauth::grok_models::grok_model_catalog(
+        &state.http_client().await,
+        scope,
+        access_token,
+        timeout,
+    )
+    .await
+}
+
+fn grok_model_catalog_error_to_api_error(
+    error: crate::clients::oauth::grok_models::GrokModelCatalogFailure,
+) -> ApiError {
+    let status = axum::http::StatusCode::from_u16(error.status_code)
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    tracing::warn!(
+        status_code = error.status_code,
+        retryable = error.retryable,
+        error = %error,
+        "Grok model discovery failed"
+    );
+    ApiError::new(
+        status,
+        if matches!(error.status_code, 401 | 403) {
+            "Grok model discovery authorization was rejected for the bound account"
+        } else {
+            "Grok model discovery failed for the bound account"
+        },
+    )
+    .with_retryable(error.retryable)
+}
+
 fn grok_provider_models_fetch_result(
     catalog: crate::clients::oauth::grok_models::GrokModelCatalog,
-    url: &str,
 ) -> ProviderModelsFetchResult {
     let models = catalog
         .models
@@ -2626,11 +3537,14 @@ fn grok_provider_models_fetch_result(
             raw: serde_json::json!({
                 "id": id,
                 "object": "model",
+                "capabilityManifestVersion": 1,
+                "modelFamily": grok_model_family(id),
+                "accountCapability": grok_account_capability_manifest(id),
             }),
         })
         .collect();
     ProviderModelsFetchResult {
-        url: url.to_string(),
+        url: catalog.source_url.clone(),
         models,
         source: Some(catalog.source.to_string()),
         stale: Some(catalog.stale),
@@ -2638,20 +3552,68 @@ fn grok_provider_models_fetch_result(
     }
 }
 
+fn grok_model_family(id: &str) -> &'static str {
+    let id = id.to_ascii_lowercase();
+    if id.contains("imagine-video") || id.contains("video") {
+        "video"
+    } else if id.contains("imagine") || id.contains("image") {
+        "image"
+    } else if id.starts_with("grok-build") || id.contains("composer") {
+        "build_text"
+    } else if id.starts_with("grok-") {
+        "text"
+    } else {
+        "unknown"
+    }
+}
+
+fn grok_account_capability_manifest(id: &str) -> Value {
+    let family = grok_model_family(id);
+    let text_entitlement = matches!(family, "text" | "build_text");
+    serde_json::json!({
+        "scope": "bound_account_entitlement",
+        "evidence": "authoritative_model_catalog",
+        "responsesHttpSse": if text_entitlement { "supported" } else { "unknown" },
+        "responsesWebSocket": if text_entitlement { "supported" } else { "unknown" },
+        "hostedSearch": "unknown",
+        "imageGeneration": "unknown",
+        "imageEdit": "unknown",
+        "videoGeneration": "unknown",
+        "asyncTask": "unknown",
+    })
+}
+
 fn copilot_provider_models_fetch_result(
     catalog: crate::clients::oauth::copilot_models::CopilotModelCatalog,
 ) -> ProviderModelsFetchResult {
     let models = catalog
-        .models
+        .descriptors
         .iter()
-        .map(|id| FetchedProviderModel {
-            id: id.clone(),
-            upstream_model: id.clone(),
-            display_name: None,
+        .map(|descriptor| FetchedProviderModel {
+            id: descriptor.model_id.clone(),
+            upstream_model: descriptor.model_id.clone(),
+            display_name: descriptor.display_name.clone(),
             raw: serde_json::json!({
-                "id": id,
+                "id": descriptor.model_id,
                 "object": "model",
-                "owned_by": "github",
+                "owned_by": descriptor.vendor.as_deref().unwrap_or("github"),
+                "modelPickerEnabled": descriptor.model_picker_enabled,
+                "policyState": descriptor.policy_state,
+                "preview": descriptor.preview,
+                "modelType": descriptor.model_type,
+                "supportedEndpoints": descriptor.supported_endpoints,
+                "limits": {
+                    "maxContextWindowTokens": descriptor.max_context_window_tokens,
+                    "maxOutputTokens": descriptor.max_output_tokens,
+                },
+                "capabilities": {
+                    "tools": descriptor.supports_tools,
+                    "vision": descriptor.supports_vision,
+                    "reasoning": descriptor.supports_reasoning,
+                },
+                "entitlementSource": "copilot_models_api",
+                "githubDomain": catalog.github_domain,
+                "apiOrigin": catalog.api_origin,
             }),
         })
         .collect();
@@ -2660,11 +3622,80 @@ fn copilot_provider_models_fetch_result(
             .api_origin
             .as_deref()
             .map(|origin| format!("{origin}/models"))
-            .unwrap_or_else(|| "static://github-copilot/models".to_string()),
+            .unwrap_or_else(|| "unavailable://github-copilot/models".to_string()),
         models,
         source: Some(catalog.source.to_string()),
         stale: Some(catalog.stale),
         fetched_at_ms: catalog.fetched_at_ms,
+    }
+}
+
+fn gemini_provider_models_fetch_result(
+    catalog: crate::clients::oauth::gemini_models::GeminiCodeAssistModelCatalog,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .descriptors
+        .iter()
+        .map(|descriptor| FetchedProviderModel {
+            id: descriptor.model_id.clone(),
+            upstream_model: descriptor.model_id.clone(),
+            display_name: descriptor.display_name.clone(),
+            raw: serde_json::json!({
+                "id": descriptor.model_id,
+                "object": "model",
+                "entitlementSource": "retrieveUserQuota",
+                "remainingFraction": descriptor.remaining_fraction,
+                "resetTime": descriptor.reset_time,
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: crate::clients::oauth::gemini_models::GEMINI_CODE_ASSIST_MODELS_SOURCE_URL.to_string(),
+        models,
+        source: Some(catalog.source),
+        stale: Some(catalog.stale),
+        fetched_at_ms: catalog.fetched_at_ms,
+    }
+}
+
+fn antigravity_provider_models_fetch_result(
+    catalog: crate::clients::oauth::antigravity_models::AntigravityModelCatalog,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .descriptors
+        .iter()
+        .map(|descriptor| FetchedProviderModel {
+            id: descriptor.model_id.clone(),
+            upstream_model: descriptor.model_id.clone(),
+            display_name: descriptor.display_name.clone(),
+            raw: serde_json::json!({
+                "id": descriptor.model_id,
+                "object": "model",
+                "entitlementSource": "fetchAvailableModels",
+                "family": descriptor.family,
+                "quota": {
+                    "remainingFraction": descriptor.remaining_fraction,
+                    "resetTime": descriptor.reset_time,
+                },
+                "capabilities": {
+                    "supportsImages": descriptor.supports_images,
+                    "supportsThinking": descriptor.supports_thinking,
+                    "thinkingBudget": descriptor.thinking_budget,
+                    "recommended": descriptor.recommended,
+                    "maxTokens": descriptor.max_tokens,
+                    "maxOutputTokens": descriptor.max_output_tokens,
+                    "supportedMimeTypes": descriptor.supported_mime_types,
+                },
+                "deprecatedAliases": descriptor.deprecated_aliases,
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: catalog.source_url,
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: Some(catalog.fetched_at_ms),
     }
 }
 
@@ -2687,6 +3718,41 @@ fn kiro_provider_models_fetch_result(
                     "max_input_tokens": descriptor.max_input_tokens,
                     "max_output_tokens": descriptor.max_output_tokens,
                 }
+            }),
+        })
+        .collect();
+    ProviderModelsFetchResult {
+        url: url.to_string(),
+        models,
+        source: Some(catalog.source.to_string()),
+        stale: Some(catalog.stale),
+        fetched_at_ms: catalog.fetched_at_ms,
+    }
+}
+
+fn amazon_q_provider_models_fetch_result(
+    catalog: crate::clients::oauth::amazon_q_runtime::AmazonQModelCatalog,
+    url: &str,
+) -> ProviderModelsFetchResult {
+    let models = catalog
+        .descriptors
+        .iter()
+        .map(|descriptor| FetchedProviderModel {
+            id: descriptor.model_id.clone(),
+            upstream_model: descriptor.model_id.clone(),
+            display_name: descriptor.display_name.clone(),
+            raw: serde_json::json!({
+                "id": descriptor.model_id,
+                "object": "model",
+                "description": descriptor.description,
+                "default": catalog.default_model_id.as_deref() == Some(descriptor.model_id.as_str()),
+                "token_limits": {
+                    "max_input_tokens": descriptor.max_input_tokens,
+                    "max_output_tokens": descriptor.max_output_tokens,
+                },
+                "supported_input_types": descriptor.supported_input_types,
+                "supports_prompt_cache": descriptor.supports_prompt_cache,
+                "origin": crate::clients::oauth::amazon_q_runtime::AMAZON_Q_ORIGIN,
             }),
         })
         .collect();
@@ -2837,6 +3903,32 @@ fn s1_provider_for_profile(
     state: &ServerState,
     profile: &crate::domain::providers::registry::ProfileSpec,
 ) -> Result<Provider, ApiError> {
+    // These are server-native Profiles. Amazon Q retains a legacy display-name
+    // mapping for import compatibility, while the high-risk Web Session
+    // Profiles are intentionally hidden and addressable only by explicit ID.
+    // None has an upstream cc-switch fixture to clone. Keep that distinction
+    // explicit instead of weakening historical missing-fixture failures.
+    if matches!(
+        profile.profile_id.as_str(),
+        "claude.amazon_q_oauth"
+            | "codex.amazon_q_oauth"
+            | "claude.grok_web_session"
+            | "codex.grok_web_session"
+            | "claude.perplexity_web_session"
+            | "codex.perplexity_web_session"
+    ) {
+        let mut provider = Provider {
+            id: String::new(),
+            name: profile.label.clone(),
+            settings_config: json!({}),
+            category: None,
+            meta: None,
+            extra: Default::default(),
+        };
+        apply_s1_profile_creation_defaults(profile, &mut provider)?;
+        return Ok(provider);
+    }
+
     if let Some(legacy_name) = crate::domain::providers::registry::provider_registry()
         .legacy_preset_mappings
         .iter()
@@ -2871,8 +3963,10 @@ fn s1_provider_for_profile(
             ("GitHub Copilot", json!({}))
         }
         "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
-        "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi Code OAuth", json!({})),
-        "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => ("Qoder COSY", json!({})),
+        "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => {
+            ("Kimi OAuth", json!({}))
+        }
+        "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => ("Qoder OAuth", json!({})),
         "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
         "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),
         "codex.openai_api_key" => (
@@ -3456,6 +4550,452 @@ mod tests {
         execution
     }
 
+    async fn install_deepseek_provider_test_execution(
+        state: &ServerState,
+        test_api_base: Option<String>,
+    ) -> proxy::provider_ops::ProviderExecution {
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "deepseek-provider-test-account",
+                        "providerType": "deepseek_account",
+                        "email": "deepseek-provider-test@example.com",
+                        "accessToken": "deepseek-bound-bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "raw": test_api_base.map(|base| json!({"testDeepSeekApiBase": base}))
+                    }))
+                    .unwrap(),
+                );
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "deepseek-provider-test-decoy",
+                        "providerType": "deepseek_account",
+                        "accessToken": "deepseek-decoy-bearer",
+                        "expiresAt": i64::MAX / 2
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let stored = StoredProvider {
+            app: AppKind::Claude,
+            provider: Provider {
+                id: "deepseek-provider-test".to_string(),
+                name: "DeepSeek Provider test".to_string(),
+                settings_config: json!({
+                    "modelMapping": {
+                        "mode": "single",
+                        "upstreamModel": "deepseek-v4-flash"
+                    }
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("deepseek_account".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some("deepseek_account".to_string()),
+                        account_id: Some("deepseek-provider-test-account".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::DeepSeekAccount,
+            provider_type_id: "deepseek_account".to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse("claude.deepseek_account")
+                        .unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 3,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution =
+            proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    async fn install_web_session_provider_test_execution(
+        state: &ServerState,
+        app: AppKind,
+        driver: &str,
+    ) -> proxy::provider_ops::ProviderExecution {
+        let (profile_id, provider_type, cookie, upstream_model) = match (app, driver) {
+            (AppKind::Claude, "grok") => (
+                "claude.grok_web_session",
+                ProviderType::Claude,
+                "sso=reviewed-session",
+                "fast",
+            ),
+            (AppKind::Codex, "perplexity") => (
+                "codex.perplexity_web_session",
+                ProviderType::Codex,
+                "__Secure-next-auth.session-token=reviewed-session",
+                "pplx-auto",
+            ),
+            _ => panic!("unsupported Web Session discovery test fixture"),
+        };
+        let stored = StoredProvider {
+            app,
+            provider: Provider {
+                id: format!("{driver}-web-session-discovery"),
+                name: format!("{driver} Web Session discovery"),
+                settings_config: json!({
+                    "webSession": {"cookie": cookie},
+                    "modelMapping": {"mode": "single", "upstreamModel": upstream_model}
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some(provider_type.as_str().to_string()),
+                    ..ProviderMeta::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution =
+            proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    #[tokio::test]
+    async fn web_session_discovery_is_reviewed_static_and_never_claims_live_entitlement() {
+        let state = provider_api_test_state("web-session-reviewed-discovery");
+        let config_dir = state.config_dir.clone();
+        for (app, driver, expected_ids) in [
+            (AppKind::Claude, "grok", vec!["fast", "expert", "heavy"]),
+            (
+                AppKind::Codex,
+                "perplexity",
+                vec!["pplx-auto", "pplx-sonar", "pplx-sonnet", "pplx-opus"],
+            ),
+        ] {
+            let execution = install_web_session_provider_test_execution(&state, app, driver).await;
+            let fetched = fetch_provider_models_inner(&state, &execution, Some(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                fetched.source.as_deref(),
+                Some("reviewed_web_session_catalog")
+            );
+            assert_eq!(fetched.stale, Some(false));
+            assert_eq!(fetched.fetched_at_ms, None);
+            assert!(fetched.url.starts_with("registry://"));
+            assert_eq!(
+                fetched
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            for model in fetched.models {
+                assert_eq!(model.raw["source"], "reviewed_web_session_catalog");
+                assert_eq!(model.raw["fixtureState"], "fixture_verified");
+                assert_eq!(model.raw["liveState"], "live_pending");
+                assert_eq!(model.raw["entitlement"], "not_asserted");
+                assert_eq!(model.raw["capabilities"]["tools"], false);
+                assert_eq!(model.raw["capabilities"]["images"], false);
+            }
+        }
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepseek_provider_test_dry_run_validates_fixed_bearer_binding_without_network() {
+        let state = provider_api_test_state("deepseek-dry-run");
+        let config_dir = state.config_dir.clone();
+        let execution = install_deepseek_provider_test_execution(
+            &state,
+            Some("http://127.0.0.1:9/must-not-run".to_string()),
+        )
+        .await;
+
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Claude,
+                network: Some(false),
+                timeout_ms: Some(1_000),
+                model: Some("deepseek-v4-pro-search".to_string()),
+                test_prompt: Some("dry-run only".to_string()),
+                stream: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(response.outcome, ProviderOperationOutcome::Success);
+        assert_eq!(response.driver_id, "special.deepseek_account");
+        assert_eq!(response.provider_type, ProviderType::DeepSeekAccount);
+        assert_eq!(response.model, "deepseek-v4-pro-search");
+        assert!(!response.network_checked);
+        assert!(response.endpoint.contains("chat.deepseek.com"));
+        assert!(!response.endpoint.contains("127.0.0.1"));
+        assert!(response.header_names.contains(&"authorization".to_string()));
+        assert!(response
+            .header_names
+            .contains(&"x-ds-pow-response".to_string()));
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepseek_reviewed_discovery_requires_the_exact_account_generation() {
+        let state = provider_api_test_state("deepseek-reviewed-discovery");
+        let config_dir = state.config_dir.clone();
+        let execution = install_deepseek_provider_test_execution(&state, None).await;
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(1_000))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetched.source.as_deref(),
+            Some("reviewed_deepseek_web_catalog")
+        );
+        assert_eq!(fetched.stale, Some(false));
+        assert_eq!(
+            fetched
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            crate::proxy::deepseek::reviewed_model_catalog()
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(fetched.models.iter().all(|model| {
+            model.raw["entitlement"] == "live_pending"
+                && model.raw["capabilities"]["tools"] == true
+                && model.raw["capabilities"]["inputModalities"] == json!(["text"])
+        }));
+
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "deepseek-provider-test-account")
+                    .unwrap()
+                    .auth_identity_generation = 2;
+            })
+            .await
+            .unwrap();
+        let error = fetch_provider_models_inner(&state, &execution, Some(1_000))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deepseek_provider_network_test_executes_native_chain_on_bound_account() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let completion_observations =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let expire_at = chrono::Utc::now().timestamp() + 60;
+        let salt = "deepseek-provider-test-pow";
+        let answer = 0_i64;
+        let challenge = hex::encode(crate::clients::deepseek::pow::deepseek_hash_v1(
+            format!("{salt}_{expire_at}_{answer}").as_bytes(),
+        ));
+        let app = axum::Router::new()
+            .route(
+                "/api/v0/chat_session/create",
+                axum::routing::post({
+                    let request_count = std::sync::Arc::clone(&request_count);
+                    let authorizations = std::sync::Arc::clone(&authorizations);
+                    move |headers: axum::http::HeaderMap| {
+                        let request_count = std::sync::Arc::clone(&request_count);
+                        let authorizations = std::sync::Arc::clone(&authorizations);
+                        async move {
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            authorizations.lock().unwrap().push(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            axum::Json(json!({
+                                "code": 0,
+                                "data": {"biz_code": 0, "biz_data": {"id": "provider-test-session"}}
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v0/chat/create_pow_challenge",
+                axum::routing::post({
+                    let request_count = std::sync::Arc::clone(&request_count);
+                    let authorizations = std::sync::Arc::clone(&authorizations);
+                    let challenge = challenge.clone();
+                    move |headers: axum::http::HeaderMap| {
+                        let request_count = std::sync::Arc::clone(&request_count);
+                        let authorizations = std::sync::Arc::clone(&authorizations);
+                        let challenge = challenge.clone();
+                        async move {
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            authorizations.lock().unwrap().push(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            axum::Json(json!({
+                                "code": 0,
+                                "data": {
+                                    "biz_code": 0,
+                                    "biz_data": {"challenge": {
+                                        "algorithm": "DeepSeekHashV1",
+                                        "challenge": challenge,
+                                        "salt": salt,
+                                        "expire_at": expire_at,
+                                        "difficulty": 1,
+                                        "expire_after": 60,
+                                        "signature": "provider-test-signature",
+                                        "target_path": "/api/v0/chat/completion"
+                                    }}
+                                }
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v0/chat/completion",
+                axum::routing::post({
+                    let request_count = std::sync::Arc::clone(&request_count);
+                    let authorizations = std::sync::Arc::clone(&authorizations);
+                    let completion_observations = std::sync::Arc::clone(&completion_observations);
+                    move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                        let request_count = std::sync::Arc::clone(&request_count);
+                        let authorizations = std::sync::Arc::clone(&authorizations);
+                        let completion_observations =
+                            std::sync::Arc::clone(&completion_observations);
+                        async move {
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            authorizations.lock().unwrap().push(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            completion_observations.lock().unwrap().push((
+                                headers.get("x-ds-pow-response").is_some(),
+                                body["chat_session_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            ));
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                concat!(
+                                    "data: {\"p\":\"response/content\",\"v\":\"pong\"}\n",
+                                    "data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n"
+                                ),
+                            )
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("deepseek-native-network-test");
+        let config_dir = state.config_dir.clone();
+        let execution =
+            install_deepseek_provider_test_execution(&state, Some(format!("http://{address}")))
+                .await;
+
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Claude,
+                network: Some(true),
+                timeout_ms: Some(5_000),
+                model: Some("deepseek-v4-flash".to_string()),
+                test_prompt: Some("ping".to_string()),
+                stream: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(response.outcome, ProviderOperationOutcome::Success);
+        assert!(response.network_checked);
+        assert_eq!(response.network_status_code, Some(200));
+        assert_eq!(response.network_stream_completed, Some(true));
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|authorization| authorization == "Bearer deepseek-bound-bearer"));
+        assert_eq!(
+            completion_observations.lock().unwrap().as_slice(),
+            [(true, "provider-test-session".to_string())]
+        );
+        assert_eq!(
+            state
+                .find_account_by_id("deepseek-provider-test-decoy")
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("deepseek-decoy-bearer")
+        );
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn cursor_provider_test_dry_run_validates_both_rails_without_exposing_endpoints() {
         for provider_type in [ProviderType::CursorOAuth, ProviderType::CursorApiKey] {
@@ -3695,15 +5235,20 @@ mod tests {
         state: &ServerState,
         endpoint: String,
         token_url: String,
+        account_id: &str,
+        refresh_token: &str,
     ) -> proxy::provider_ops::ProviderExecution {
+        let account_id = account_id.to_string();
+        let account_id_for_binding = account_id.clone();
+        let refresh_token = refresh_token.to_string();
         state
             .mutate_accounts_immediate(move |accounts| {
                 accounts.upsert(
                     serde_json::from_value(json!({
-                        "id": "grok-reconciliation-account",
+                        "id": account_id,
                         "providerType": "grok_oauth",
                         "accessToken": "grok-reconciliation-old-access",
-                        "refreshToken": "grok-reconciliation-refresh",
+                        "refreshToken": refresh_token,
                         "expiresAt": 1,
                         "profile": {
                             "verifiedGrokClaims": {"subject": "grok-reconciliation-subject"}
@@ -3729,7 +5274,7 @@ mod tests {
                             auth_binding: Some(AuthBinding {
                                 source: Some("account_store".to_string()),
                                 auth_provider: Some("grok_oauth".to_string()),
-                                account_id: Some("grok-reconciliation-account".to_string()),
+                                account_id: Some(account_id_for_binding),
                                 auth_identity_generation: Some(1),
                             }),
                             ..Default::default()
@@ -3824,6 +5369,8 @@ mod tests {
             &state,
             format!("http://{address}"),
             format!("http://{address}/token"),
+            "grok-reconciliation-success-account",
+            "grok-reconciliation-success-refresh",
         )
         .await;
         let dry_run = test_provider_inner(
@@ -3974,6 +5521,8 @@ mod tests {
             &state,
             format!("http://{address}"),
             format!("http://{address}/token"),
+            "grok-reconciliation-rejected-account",
+            "grok-reconciliation-rejected-refresh",
         )
         .await;
 
@@ -4041,7 +5590,7 @@ mod tests {
             0
         );
         let account = state
-            .find_account_by_id("grok-reconciliation-account")
+            .find_account_by_id("grok-reconciliation-rejected-account")
             .await
             .unwrap();
         assert_eq!(account.refresh_consecutive_failures, 1);
@@ -4056,6 +5605,8 @@ mod tests {
             &state,
             "http://127.0.0.1:9".to_string(),
             "http://127.0.0.1:9/token".to_string(),
+            "grok-reconciliation-stale-account",
+            "grok-reconciliation-stale-refresh",
         )
         .await;
         state
@@ -4063,7 +5614,7 @@ mod tests {
                 let account = accounts
                     .accounts
                     .iter_mut()
-                    .find(|account| account.id == "grok-reconciliation-account")
+                    .find(|account| account.id == "grok-reconciliation-stale-account")
                     .unwrap();
                 account.auth_identity_generation += 1;
             })
@@ -4145,6 +5696,7 @@ mod tests {
             .await
             .unwrap();
         let models_url = format!("http://{address}/models");
+        let expected_models_url = models_url.clone();
         state
             .mutate_providers_immediate(move |providers| {
                 providers.upsert(
@@ -4152,7 +5704,10 @@ mod tests {
                     Provider {
                         id: "grok-model-provider".to_string(),
                         name: "Grok model provider".to_string(),
-                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        settings_config: json!({
+                            "testGrokModelsUrl": models_url,
+                            "models": ["configured-model-must-not-leak"]
+                        }),
                         category: None,
                         meta: Some(ProviderMeta {
                             provider_type: Some("grok_oauth".to_string()),
@@ -4181,13 +5736,705 @@ mod tests {
         assert_eq!(fetched.source.as_deref(), Some("upstream"));
         assert_eq!(fetched.stale, Some(false));
         assert!(fetched.fetched_at_ms.is_some_and(|value| value > 0));
+        assert_eq!(fetched.url, expected_models_url);
         assert_eq!(fetched.models.len(), 1);
         assert_eq!(fetched.models[0].id, "grok-mock-live");
+        assert_eq!(fetched.models[0].raw["modelFamily"], "text");
+        assert_eq!(
+            fetched.models[0].raw["accountCapability"]["responsesHttpSse"],
+            "supported"
+        );
+        assert_eq!(
+            fetched.models[0].raw["accountCapability"]["hostedSearch"],
+            "unknown"
+        );
         assert_eq!(
             observed_authorization.lock().unwrap().as_str(),
             "Bearer grok-model-access"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_model_discovery_401_refreshes_and_replays_only_the_bound_account_once() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let authorizations_for_route = std::sync::Arc::clone(&model_authorizations);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "access_token": "refreshed-bound-grok-token",
+                            "refresh_token": "refreshed-bound-grok-refresh",
+                            "expires_in": 3_600,
+                            "token_type": "Bearer"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        authorizations.lock().unwrap().push(authorization.clone());
+                        if authorization == "Bearer initial-bound-grok-token" {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error": "expired"})),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({"data": [{"id": "grok-refreshed"}]})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("grok-model-catalog-401");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for (id, access_token, refresh_token, subject, raw) in [
+                    (
+                        "grok-model-401-distractor",
+                        "distractor-grok-token",
+                        "distractor-grok-refresh",
+                        "distractor-grok-subject",
+                        None,
+                    ),
+                    (
+                        "grok-model-401-bound",
+                        "initial-bound-grok-token",
+                        "initial-bound-grok-refresh",
+                        "bound-grok-subject",
+                        Some(json!({"testOAuthTokenUrl": token_url})),
+                    ),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "grok_oauth",
+                            "accessToken": access_token,
+                            "refreshToken": refresh_token,
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {"verifiedGrokClaims": {"subject": subject}},
+                            "raw": raw
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-model-401-provider".to_string(),
+                        name: "Grok model 401 provider".to_string(),
+                        settings_config: json!({"testGrokModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-model-401-bound".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "grok-model-401-provider")
+                .await
+                .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "grok-refreshed");
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            model_authorizations.lock().unwrap().as_slice(),
+            &[
+                "Bearer initial-bound-grok-token".to_string(),
+                "Bearer refreshed-bound-grok-token".to_string(),
+            ]
+        );
+        let account = state
+            .find_account_for_provider(ProviderType::GrokOAuth, "grok-model-401-bound")
+            .await
+            .unwrap();
+        assert_eq!(account.token_refresh_generation, 2);
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("refreshed-bound-grok-token")
+        );
+        let distractor = state
+            .find_account_for_provider(ProviderType::GrokOAuth, "grok-model-401-distractor")
+            .await
+            .unwrap();
+        assert_eq!(
+            distractor.access_token.as_deref(),
+            Some("distractor-grok-token")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_code_assist_discovery_refreshes_only_the_bound_account_and_keeps_stale_cache() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let failure_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let observed_authorizations =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let failure_status_for_route = std::sync::Arc::clone(&failure_status);
+        let authorizations_for_route = std::sync::Arc::clone(&observed_authorizations);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, headers: HeaderMap| {
+                let failure_status = std::sync::Arc::clone(&failure_status_for_route);
+                let observed = std::sync::Arc::clone(&authorizations_for_route);
+                async move {
+                    observed.lock().unwrap().push(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    let failure_status =
+                        failure_status.load(std::sync::atomic::Ordering::SeqCst);
+                    if failure_status != 0 {
+                        return (
+                            StatusCode::from_u16(failure_status).unwrap(),
+                            axum::Json(json!({"error": {"message": "temporary failure"}})),
+                        );
+                    }
+                    match uri.path() {
+                        "/v1internal:loadCodeAssist" => (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "cloudaicompanionProject": "bound-project",
+                                "paidTier": {"id": "standard-tier", "name": "Gemini Code Assist"}
+                            })),
+                        ),
+                        "/v1internal:retrieveUserQuota" => (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "buckets": [
+                                    {"modelId": "gemini-3.1-pro", "remainingFraction": 0.75},
+                                    {"modelId": "models/gemini-3.1-flash", "remainingFraction": 0.0},
+                                    {"modelId": "claude-sonnet-4-6", "remainingFraction": 1.0}
+                                ]
+                            })),
+                        ),
+                        path => panic!("unexpected Gemini model discovery request: {path}"),
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("gemini-code-assist-model-catalog");
+        let test_base_url = format!("http://{address}");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "gemini-bound-model-account",
+                        "providerType": "gemini_cli",
+                        "accessToken": "gemini-bound-access",
+                        "expiresAt": i64::MAX / 2,
+                        "raw": {"testGeminiCodeAssistBaseUrl": test_base_url}
+                    }))
+                    .unwrap(),
+                );
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "gemini-unbound-model-account",
+                        "providerType": "gemini_cli",
+                        "accessToken": "gemini-unbound-must-not-be-used",
+                        "expiresAt": i64::MAX / 2
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Gemini,
+                    Provider {
+                        id: "gemini-bound-model-provider".to_string(),
+                        name: "Gemini bound model provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("gemini_cli".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("gemini_cli".to_string()),
+                                account_id: Some("gemini-bound-model-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Gemini,
+            "gemini-bound-model-provider",
+        )
+        .await
+        .unwrap();
+        assert!(execution.driver_is("oauth.gemini_code_assist"));
+
+        let fresh = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.source.as_deref(),
+            Some("authenticated_retrieve_user_quota")
+        );
+        assert_eq!(fresh.stale, Some(false));
+        assert_eq!(
+            fresh
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gemini-3.1-flash", "gemini-3.1-pro"]
+        );
+        assert!(observed_authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|value| value == "Bearer gemini-bound-access"));
+
+        failure_status.store(
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let stale = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.source.as_deref(),
+            Some("same_account_cached_retrieve_user_quota")
+        );
+        assert_eq!(stale.stale, Some(true));
+        assert_eq!(stale.models.len(), 2);
+
+        failure_status.store(
+            StatusCode::UNAUTHORIZED.as_u16(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let auth_error = match fetch_provider_models_inner(&state, &execution, Some(2_000)).await {
+            Ok(_) => panic!("authentication failure must not use a stale model catalog"),
+            Err(error) => error,
+        };
+        assert_eq!(auth_error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            auth_error.message,
+            "Gemini Code Assist model discovery failed for the bound account"
+        );
+
+        let conformance = crate::domain::providers::registry::provider_registry()
+            .conformance
+            .iter()
+            .find(|item| item.driver_id.as_str() == "oauth.gemini_code_assist")
+            .unwrap();
+        assert_eq!(
+            conformance.discovery,
+            crate::domain::providers::registry::ConformanceState::FixtureVerified
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_discovery_uses_exact_account_capabilities_and_generation_scoped_stale() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let model_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let model_status_for_route = std::sync::Arc::clone(&model_status);
+        let observed_for_route = std::sync::Arc::clone(&observed);
+        let app = axum::Router::new().fallback(axum::routing::post(
+            move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                let model_status = std::sync::Arc::clone(&model_status_for_route);
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((uri.path().to_string(), authorization));
+                    match uri.path() {
+                        "/v1internal:loadCodeAssist" => (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "cloudaicompanionProject": "antigravity-bound-project",
+                                "paidTier": {"id": "standard-tier", "name": "Antigravity Pro"}
+                            })),
+                        ),
+                        "/v1internal:fetchAvailableModels" => {
+                            assert_eq!(
+                                serde_json::from_slice::<Value>(&body).unwrap()["project"],
+                                "antigravity-bound-project"
+                            );
+                            let status = StatusCode::from_u16(
+                                model_status.load(std::sync::atomic::Ordering::SeqCst),
+                            )
+                            .unwrap();
+                            if status != StatusCode::OK {
+                                return (status, axum::Json(json!({"error": "catalog failure"})));
+                            }
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "models": {
+                                        "gemini-3.1-pro": {
+                                            "displayName": "Gemini 3.1 Pro",
+                                            "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-09-01T00:00:00Z"},
+                                            "supportsImages": true,
+                                            "supportsThinking": true,
+                                            "thinkingBudget": 32768,
+                                            "maxTokens": 1048576,
+                                            "maxOutputTokens": 65536,
+                                            "supportedMimeTypes": {"image/png": true}
+                                        },
+                                        "claude-sonnet-4-6": {"supportsThinking": true},
+                                        "gpt-oss-120b-medium": {"recommended": true}
+                                    },
+                                    "deprecatedModelIds": {
+                                        "gemini-old": {"newModelId": "gemini-3.1-pro"}
+                                    }
+                                })),
+                            )
+                        }
+                        path => panic!("unexpected Antigravity model request: {path}"),
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("antigravity-model-catalog");
+        let base_url = format!("http://{address}");
+        let models_url = format!("{base_url}/v1internal:fetchAvailableModels");
+        let account_base_url = base_url.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for (id, provider_type, access_token) in [
+                    (
+                        "antigravity-bound-model-account",
+                        "antigravity_oauth",
+                        "antigravity-bound-access",
+                    ),
+                    ("agy-bound-model-account", "agy_oauth", "agy-bound-access"),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": provider_type,
+                            "accessToken": access_token,
+                            "expiresAt": i64::MAX / 2,
+                            "raw": {"testGeminiCodeAssistBaseUrl": account_base_url}
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(move |providers| {
+                for (id, name, provider_type, account_id) in [
+                    (
+                        "antigravity-bound-model-provider",
+                        "Antigravity bound model provider",
+                        "antigravity_oauth",
+                        "antigravity-bound-model-account",
+                    ),
+                    (
+                        "agy-bound-model-provider",
+                        "Agy bound model provider",
+                        "agy_oauth",
+                        "agy-bound-model-account",
+                    ),
+                ] {
+                    providers.upsert(
+                        AppKind::Gemini,
+                        Provider {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            settings_config: json!({"testAntigravityModelsUrl": models_url}),
+                            category: None,
+                            meta: Some(ProviderMeta {
+                                provider_type: Some(provider_type.to_string()),
+                                auth_binding: Some(AuthBinding {
+                                    source: Some("account_store".to_string()),
+                                    auth_provider: Some(provider_type.to_string()),
+                                    account_id: Some(account_id.to_string()),
+                                    auth_identity_generation: Some(1),
+                                }),
+                                ..Default::default()
+                            }),
+                            extra: Default::default(),
+                        },
+                    );
+                }
+            })
+            .await
+            .unwrap();
+
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Gemini,
+            "antigravity-bound-model-provider",
+        )
+        .await
+        .unwrap();
+        assert!(execution.driver_is("special.antigravity"));
+        let fresh = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.source.as_deref(),
+            Some("authenticated_fetch_available_models")
+        );
+        assert_eq!(fresh.stale, Some(false));
+        assert_eq!(
+            fresh
+                .models
+                .iter()
+                .map(|model| (model.id.as_str(), model.raw["family"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                ("claude-sonnet-4-6", "claude"),
+                ("gemini-3.1-pro", "gemini"),
+                ("gpt-oss-120b-medium", "gpt"),
+            ]
+        );
+        let gemini = fresh
+            .models
+            .iter()
+            .find(|model| model.id == "gemini-3.1-pro")
+            .unwrap();
+        assert_eq!(gemini.raw["quota"]["remainingFraction"], 0.0);
+        assert_eq!(gemini.raw["capabilities"]["supportsImages"], true);
+        assert_eq!(gemini.raw["deprecatedAliases"], json!(["gemini-old"]));
+
+        model_status.store(503, std::sync::atomic::Ordering::SeqCst);
+        let stale = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.source.as_deref(),
+            Some("same_identity_cached_fetch_available_models")
+        );
+        assert_eq!(stale.stale, Some(true));
+
+        let agy_execution =
+            resolve_provider_execution_by_key(&state, AppKind::Gemini, "agy-bound-model-provider")
+                .await
+                .unwrap();
+        let agy_without_own_cache =
+            match fetch_provider_models_inner(&state, &agy_execution, Some(2_000)).await {
+                Ok(_) => panic!("Agy must not reuse the Antigravity account cache"),
+                Err(error) => error,
+            };
+        assert_eq!(agy_without_own_cache.status, StatusCode::BAD_GATEWAY);
+
+        model_status.store(401, std::sync::atomic::Ordering::SeqCst);
+        let auth_error = match fetch_provider_models_inner(&state, &execution, Some(2_000)).await {
+            Ok(_) => panic!("authentication failure must not use a stale catalog"),
+            Err(error) => error,
+        };
+        assert_eq!(auth_error.status, StatusCode::BAD_GATEWAY);
+
+        let account = state
+            .find_account_for_provider(
+                ProviderType::AntigravityOAuth,
+                "antigravity-bound-model-account",
+            )
+            .await
+            .unwrap();
+        for dimension in [
+            crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+            crate::domain::accounts::capability_evidence::GEMINI_QUOTA_FAMILY_DIMENSION,
+            crate::domain::accounts::capability_evidence::CLAUDE_QUOTA_FAMILY_DIMENSION,
+            crate::domain::accounts::capability_evidence::GPT_QUOTA_FAMILY_DIMENSION,
+            crate::domain::accounts::capability_evidence::MODEL_CAPACITY_DIMENSION,
+        ] {
+            let key = crate::domain::accounts::capability_evidence::observation_key(
+                crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                dimension,
+            );
+            assert_eq!(
+                account.capability_observations[&key].auth_identity_generation,
+                1
+            );
+        }
+        assert!(observed.lock().unwrap().iter().all(|(_, authorization)| {
+            authorization == "Bearer antigravity-bound-access"
+                || authorization == "Bearer agy-bound-access"
+        }));
+        let requests_before_generation_drift = observed.lock().unwrap().len();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "antigravity-bound-model-account")
+                    .unwrap()
+                    .auth_identity_generation += 1;
+            })
+            .await
+            .unwrap();
+        let generation_error =
+            match fetch_provider_models_inner(&state, &execution, Some(2_000)).await {
+                Ok(_) => panic!("old Provider binding must not reuse a prior-generation catalog"),
+                Err(error) => error,
+            };
+        assert_eq!(generation_error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            requests_before_generation_drift
+        );
+        for driver_id in ["special.antigravity", "special.agy"] {
+            let conformance = crate::domain::providers::registry::provider_registry()
+                .conformance
+                .iter()
+                .find(|item| item.driver_id.as_str() == driver_id)
+                .unwrap();
+            assert_eq!(
+                conformance.discovery,
+                crate::domain::providers::registry::ConformanceState::FixtureVerified
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gemini_code_assist_discovery_rejects_binding_generation_drift_before_network() {
+        let state = provider_api_test_state("gemini-code-assist-model-generation");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "gemini-generation-account",
+                        "providerType": "gemini_cli",
+                        "authIdentityGeneration": 1,
+                        "accessToken": "gemini-generation-access",
+                        "expiresAt": i64::MAX / 2
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.upsert(
+                    AppKind::Gemini,
+                    Provider {
+                        id: "gemini-generation-provider".to_string(),
+                        name: "Gemini generation provider".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("gemini_cli".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("gemini_cli".to_string()),
+                                account_id: Some("gemini-generation-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Gemini,
+            "gemini-generation-provider",
+        )
+        .await
+        .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "gemini-generation-account")
+                    .unwrap()
+                    .auth_identity_generation = 2;
+            })
+            .await
+            .unwrap();
+
+        let error = match fetch_provider_models_inner(&state, &execution, Some(100)).await {
+            Ok(_) => panic!("generation drift must fail model discovery"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "Gemini Code Assist model discovery failed for the bound account"
+        );
     }
 
     #[tokio::test]
@@ -4228,9 +6475,27 @@ mod tests {
                     };
                     axum::Json(json!({
                         "data": [
-                            {"id": "claude-sonnet-5"},
+                            {
+                                "id": "claude-sonnet-5",
+                                "name": "Claude Sonnet 5",
+                                "vendor": "anthropic",
+                                "model_picker_enabled": true,
+                                "preview": true,
+                                "policy": {"state": "enabled"},
+                                "supported_endpoints": ["/v1/messages"],
+                                "capabilities": {
+                                    "type": "chat",
+                                    "limits": {
+                                        "max_context_window_tokens": 200000,
+                                        "max_output_tokens": 32000
+                                    },
+                                    "supports": {"tool_calls": true, "vision": true, "reasoning": true}
+                                }
+                            },
                             {"id": "claude-sonnet-5"},
                             {"id": "gpt-5.6-codex"},
+                            {"id": "disabled-model", "policy": {"state": "disabled"}, "capabilities": {"type": "chat"}},
+                            {"id": "embedding-model", "capabilities": {"type": "embeddings"}},
                             {"id": "   "},
                             {"not_a_model": "ignored"}
                         ]
@@ -4319,6 +6584,42 @@ mod tests {
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             ["claude-sonnet-5", "gpt-5.6-codex"]
+        );
+        let claude = fetched
+            .models
+            .iter()
+            .find(|model| model.id == "claude-sonnet-5")
+            .unwrap();
+        assert_eq!(claude.display_name.as_deref(), Some("Claude Sonnet 5"));
+        assert_eq!(
+            claude.raw.pointer("/owned_by").and_then(Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            claude.raw.pointer("/policyState").and_then(Value::as_str),
+            Some("enabled")
+        );
+        assert_eq!(
+            claude
+                .raw
+                .pointer("/limits/maxContextWindowTokens")
+                .and_then(Value::as_u64),
+            Some(200_000)
+        );
+        assert_eq!(
+            claude
+                .raw
+                .pointer("/capabilities/tools")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            claude.raw.pointer("/githubDomain").and_then(Value::as_str),
+            Some("github.com")
+        );
+        assert_eq!(
+            claude.raw.pointer("/apiOrigin").and_then(Value::as_str),
+            Some("https://api.githubcopilot.com")
         );
         let observation = observation.lock().unwrap();
         assert_eq!(observation.authorization, "Bearer copilot-model-sub-token");
@@ -4458,6 +6759,169 @@ mod tests {
         assert_eq!(
             observed_authorizations.lock().unwrap().as_slice(),
             ["Bearer kiro-bound-model-access"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_model_discovery_401_refreshes_and_replays_only_the_bound_account_once() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_models = std::sync::Arc::clone(&observed);
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let app = axum::Router::new()
+            .route(
+                "/models",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let observed = std::sync::Arc::clone(&observed_for_models);
+                    async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        observed.lock().unwrap().push(authorization.clone());
+                        if authorization == "Bearer kiro-old-model-token" {
+                            (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"message": "expired"})),
+                            )
+                                .into_response()
+                        } else {
+                            axum::Json(json!({
+                                "models": [{"modelId": "kiro-refreshed-model"}]
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                axum::routing::post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(json!({
+                            "accessToken": "kiro-new-model-token",
+                            "refreshToken": "kiro-new-model-refresh",
+                            "tokenType": "Bearer",
+                            "expiresIn": 3600
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_api_test_state("kiro-model-catalog-401");
+        let token_url = format!("http://{address}/token");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                for (id, access_token, refresh_token, raw) in [
+                    (
+                        "kiro-model-401-bound",
+                        "kiro-old-model-token",
+                        "kiro-old-model-refresh",
+                        Some(json!({
+                            "authMethod": "social",
+                            "testOAuthTokenUrl": token_url
+                        })),
+                    ),
+                    (
+                        "kiro-model-401-decoy",
+                        "kiro-decoy-model-token",
+                        "kiro-decoy-model-refresh",
+                        None,
+                    ),
+                ] {
+                    accounts.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "kiro_oauth",
+                            "accessToken": access_token,
+                            "refreshToken": refresh_token,
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {
+                                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                                "apiRegion": "us-east-1",
+                                "machineId": id,
+                                "authMethod": "social"
+                            },
+                            "raw": raw
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let models_url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "kiro-model-401-provider".to_string(),
+                        name: "Kiro model 401 Provider".to_string(),
+                        settings_config: json!({"testKiroModelsUrl": models_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("kiro_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("kiro_oauth".to_string()),
+                                account_id: Some("kiro-model-401-bound".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "kiro-model-401-provider")
+                .await
+                .unwrap();
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "kiro-refreshed-model");
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            ["Bearer kiro-old-model-token", "Bearer kiro-new-model-token"]
+        );
+        assert_eq!(
+            state
+                .find_account_by_id("kiro-model-401-bound")
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("kiro-new-model-token")
+        );
+        assert_eq!(
+            state
+                .find_account_by_id("kiro-model-401-decoy")
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("kiro-decoy-model-token")
         );
         server.abort();
     }
@@ -4757,12 +7221,14 @@ mod tests {
         .await
         .unwrap();
 
-        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+        let error = fetch_provider_models_inner(&state, &execution, Some(2_000))
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(fetched.source.as_deref(), Some("static_fallback"));
-        assert_eq!(fetched.stale, Some(true));
+        assert!(matches!(
+            error.status,
+            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED
+        ));
         assert!(!state.credential_persistence_degraded());
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -4853,12 +7319,11 @@ mod tests {
                 .await
                 .unwrap();
 
-        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+        let error = fetch_provider_models_inner(&state, &execution, Some(2_000))
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(fetched.source.as_deref(), Some("static_fallback"));
-        assert_eq!(fetched.stale, Some(true));
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         server.abort();

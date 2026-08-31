@@ -117,6 +117,7 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::GitHubCopilot,
         ProviderType::DeepSeekAccount,
         ProviderType::KiroOAuth,
+        ProviderType::AmazonQOAuth,
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CursorOAuth,
@@ -143,6 +144,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::GitHubCopilot,
             ProviderType::DeepSeekAccount,
             ProviderType::KiroOAuth,
+            ProviderType::AmazonQOAuth,
             ProviderType::KimiCode,
             ProviderType::QoderCosy,
             ProviderType::CursorOAuth,
@@ -169,6 +171,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::KimiCode,
             ProviderType::QoderCosy,
             ProviderType::KiroOAuth,
+            ProviderType::AmazonQOAuth,
             ProviderType::Claude,
             ProviderType::ClaudeAuth,
             ProviderType::ClaudeOAuth,
@@ -259,6 +262,7 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
@@ -281,6 +285,7 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
             Some("https://www.deepseek.com")
         }
         ProviderType::KiroOAuth => Some("https://kiro.dev"),
+        ProviderType::AmazonQOAuth => Some("https://aws.amazon.com/q/developer/"),
         ProviderType::KimiCode => Some("https://kimi.com"),
         ProviderType::QoderCosy => Some("https://qoder.com"),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
@@ -307,8 +312,9 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::GitHubCopilot => "GitHub Copilot",
         ProviderType::DeepSeekAccount => "DeepSeek Account",
         ProviderType::KiroOAuth => "Kiro OAuth",
-        ProviderType::KimiCode => "Kimi Code OAuth",
-        ProviderType::QoderCosy => "Qoder COSY",
+        ProviderType::AmazonQOAuth => "Amazon Q Developer",
+        ProviderType::KimiCode => "Kimi OAuth",
+        ProviderType::QoderCosy => "Qoder OAuth",
         ProviderType::CursorOAuth => "Cursor OAuth",
         ProviderType::CursorApiKey => "Cursor API Key",
         ProviderType::AntigravityOAuth => "Antigravity OAuth",
@@ -397,6 +403,13 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             base_url: "https://q.us-east-1.amazonaws.com",
             api_format: "anthropic",
             model: "claude-sonnet-4-8",
+            key: "ANTHROPIC_AUTH_TOKEN",
+            aws_region: None,
+        },
+        ProviderType::AmazonQOAuth => ProviderDefaults {
+            base_url: "https://q.us-east-1.amazonaws.com",
+            api_format: "anthropic",
+            model: "auto",
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
@@ -496,9 +509,10 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
             &["GOOGLE_GEMINI_BASE_URL", "GEMINI_API_KEY", "GEMINI_MODEL"]
         }
         ProviderType::OpenRouter => &["OPENAI_BASE_URL", "OPENAI_API_KEY"],
-        ProviderType::GitHubCopilot | ProviderType::DeepSeekAccount | ProviderType::KiroOAuth => {
-            &["ANTHROPIC_AUTH_TOKEN"]
-        }
+        ProviderType::GitHubCopilot
+        | ProviderType::DeepSeekAccount
+        | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth => &["ANTHROPIC_AUTH_TOKEN"],
         ProviderType::KimiCode => &["OPENAI_BASE_URL"],
         ProviderType::QoderCosy => &[],
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
@@ -538,6 +552,7 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
+        | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CursorOAuth
@@ -556,6 +571,7 @@ fn account_supported(provider_type: ProviderType) -> bool {
             | ProviderType::GitHubCopilot
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
@@ -583,6 +599,7 @@ fn managed_account_recommended(provider_type: ProviderType) -> bool {
             | ProviderType::GitHubCopilot
             | ProviderType::DeepSeekAccount
             | ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CursorOAuth
@@ -606,6 +623,9 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         (AppKind::Claude | AppKind::Codex, ProviderType::KiroOAuth) => {
             "single-account CodeWhisperer forwarder supports Anthropic Messages, OpenAI Chat, and OpenAI Responses; real Kiro account validation remains external"
         }
+        (AppKind::Claude | AppKind::Codex, ProviderType::AmazonQOAuth) => {
+            "independent Amazon Q Developer CLI account and CodeWhisperer EventStream driver are fixture-verified; real Builder ID/IdC acceptance remains external"
+        }
         (_, ProviderType::DeepSeekAccount) => {
             "Claude forwarder protocol bridge is wired; real upstream validation remains pending"
         }
@@ -617,6 +637,9 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         }
         (AppKind::Gemini, ProviderType::KiroOAuth) => {
             "diagnostic capability only; Kiro forwarding does not expose a Gemini surface"
+        }
+        (AppKind::Gemini, ProviderType::AmazonQOAuth) => {
+            "diagnostic capability only; Amazon Q Developer forwarding does not expose a Gemini surface"
         }
         (_, ProviderType::CursorOAuth | ProviderType::CursorApiKey) => {
             "Cursor AgentService h2/protobuf driver is wired by default with one fixed credential; profile maturity remains experimental until real OAuth/API-key validation"

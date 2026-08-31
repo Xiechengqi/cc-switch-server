@@ -1266,6 +1266,8 @@ mod tests {
         let mut claude = grok_surface(AppKind::Claude, "claude.openai_oauth");
         claude.model_policy = Some(ModelPolicyKind::Single);
         claude.upstream_model = Some("gpt-5.6-sol".to_string());
+        let mut codex = grok_surface(AppKind::Codex, "codex.openai_oauth");
+        codex.model_policy = Some(ModelPolicyKind::Passthrough);
         ProviderBundleWriteDraft {
             id: "openai-oauth-bundle".to_string(),
             family_id: "family.openai_oauth".to_string(),
@@ -1286,7 +1288,7 @@ mod tests {
                 auth_identity_generation: 1,
             }),
             aws_region: None,
-            surfaces: vec![claude, grok_surface(AppKind::Codex, "codex.openai_oauth")],
+            surfaces: vec![claude, codex],
             credential_patches: BTreeMap::new(),
             expected_revision: None,
             client_request_id: None,
@@ -1386,11 +1388,18 @@ mod tests {
 
         draft.model_policy_scope = ModelPolicyScope::Global;
         draft.model_policy = Some(ModelPolicyKind::Passthrough);
-        assert!(draft
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("requires per-app model policies"));
+        draft.upstream_model = None;
+        for surface in &mut draft.surfaces {
+            surface.model_policy = None;
+            surface.upstream_model = None;
+        }
+        assert!(draft.validate().is_ok());
+        for surface in &draft.surfaces {
+            assert_eq!(
+                draft.provider_for_surface(surface).unwrap().settings_config["modelMapping"],
+                json!({"mode": "passthrough"})
+            );
+        }
     }
 
     #[test]

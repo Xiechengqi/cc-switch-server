@@ -1264,6 +1264,116 @@ pub(in crate::api) async fn poll_kiro_device_login(
     }))
 }
 
+pub(in crate::api) async fn start_amazon_q_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_input): Json<StartAmazonQDeviceLoginRequest>,
+) -> Result<Json<StartAmazonQDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let http_client = state.http_client().await;
+    let now = now_ms() as i64;
+    let (device, flow) =
+        crate::clients::oauth::amazon_q_device::start_device_flow(&http_client, now)
+            .await
+            .map_err(map_amazon_q_device_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .insert_amazon_q_device_flow(device.device_code.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::AmazonQOAuth,
+            device.device_code.clone(),
+            principal_id,
+            device_flow_expires_at(now, device.expires_in),
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(StartAmazonQDeviceLoginResponse { ok: true, device }))
+}
+
+pub(in crate::api) async fn poll_amazon_q_device_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollAmazonQDeviceLoginRequest>,
+) -> Result<Json<PollAmazonQDeviceLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let now = now_ms() as i64;
+    require_device_flow_owner(
+        &state,
+        ProviderType::AmazonQOAuth,
+        &input.device_code,
+        &principal_id,
+        now,
+        "amazon_q",
+    )
+    .await?;
+    let flow = state
+        .get_amazon_q_device_flow(&input.device_code, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("Amazon Q device flow is expired or unknown"))?;
+    let http_client = state.http_client().await;
+    let result = crate::clients::oauth::amazon_q_device::poll_device_flow(
+        &http_client,
+        &input.device_code,
+        flow,
+        now,
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if matches!(
+                error.status,
+                StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST
+            ) {
+                let managed_auth_operation = state.lock_managed_auth_operations().await;
+                state
+                    .remove_device_flow_for_principal_under_managed_auth_guard(
+                        &managed_auth_operation,
+                        ProviderType::AmazonQOAuth,
+                        &input.device_code,
+                        &principal_id,
+                        now,
+                    )
+                    .await;
+                drop(managed_auth_operation);
+            }
+            return Err(map_amazon_q_device_error(error));
+        }
+    };
+    if result.pending {
+        return Ok(Json(PollAmazonQDeviceLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    let account_input = result
+        .account_input
+        .ok_or_else(|| ApiError::bad_gateway("Amazon Q device flow completed without account"))?;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::AmazonQOAuth,
+        &input.device_code,
+        &principal_id,
+        account_input,
+    )
+    .await?;
+    Ok(Json(PollAmazonQDeviceLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
 pub(in crate::api) async fn start_codex_device_login(
     State(state): State<ServerState>,
     headers: HeaderMap,

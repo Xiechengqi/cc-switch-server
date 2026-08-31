@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const QODER_COSY_USER_AGENT: &str = "Go-http-client/2.0";
+const QODER_MAX_SIGNING_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
 const STANDARD_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -503,6 +504,13 @@ impl QoderCosySession {
         if request_id.trim().is_empty() {
             return Err("Qoder request id is required".to_string());
         }
+        if !is_qoder_uuid_nonce(request_id.trim()) {
+            return Err("Qoder request id must be a UUID nonce".to_string());
+        }
+        let wall_clock_seconds = chrono::Utc::now().timestamp();
+        if unix_seconds.abs_diff(wall_clock_seconds) > QODER_MAX_SIGNING_CLOCK_SKEW_SECONDS as u64 {
+            return Err("Qoder signing timestamp exceeds the allowed clock skew".to_string());
+        }
         let payload = json!({
             "cosyVersion": self.client_version,
             "ideVersion": "",
@@ -600,6 +608,20 @@ impl QoderCosySession {
         }
         Ok(headers)
     }
+}
+
+fn is_qoder_uuid_nonce(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        && bytes[14] == b'4'
+        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b')
 }
 
 pub fn qoder_encode(plaintext: &[u8]) -> String {
@@ -783,12 +805,14 @@ mod tests {
         )
         .unwrap();
         let body = qoder_encode(br#"{"messages":[]}"#);
+        let unix_seconds = chrono::Utc::now().timestamp();
+        let request_id = "018f47ec-51d8-4c2a-9c2b-4f859709c9e7";
         let headers = session
             .signed_headers(
                 body.as_bytes(),
                 QODER_GENERATION_SIGNATURE_PATH,
-                1_700_000_000,
-                "request-a",
+                unix_seconds,
+                request_id,
                 "x86_64_linux",
                 "127.0.0.1",
             )
@@ -807,5 +831,28 @@ mod tests {
         assert_eq!(value("cosy-bodylength"), body.len().to_string());
         assert_eq!(value("cosy-sigpath"), QODER_GENERATION_SIGNATURE_PATH);
         assert!(!headers.iter().any(|(_, value)| value == "secret-token"));
+
+        assert!(session
+            .signed_headers(
+                body.as_bytes(),
+                QODER_GENERATION_SIGNATURE_PATH,
+                unix_seconds - QODER_MAX_SIGNING_CLOCK_SKEW_SECONDS - 1,
+                request_id,
+                "x86_64_linux",
+                "127.0.0.1",
+            )
+            .unwrap_err()
+            .contains("clock skew"));
+        assert!(session
+            .signed_headers(
+                body.as_bytes(),
+                QODER_GENERATION_SIGNATURE_PATH,
+                unix_seconds,
+                "not-a-uuid",
+                "x86_64_linux",
+                "127.0.0.1",
+            )
+            .unwrap_err()
+            .contains("UUID nonce"));
     }
 }

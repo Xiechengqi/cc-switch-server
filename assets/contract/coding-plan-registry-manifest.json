@@ -1,0 +1,2628 @@
+{
+  "format": "cc-switch-coding-plan-registry-manifest",
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-30T00:00:00Z",
+  "generatedFrom": {
+    "providerRegistry": "assets/contract/provider-registry.json",
+    "providerRegistrySha256": "175921ce471551a28dbe6f096363fe5808be161e5cd022e77c221b57cf56cbad",
+    "sourceBaseline": "assets/contract/coding-plan-source-baseline.json",
+    "sourceBaselineSha256": "48b6e580862e4186d5f5206e8ddfff68870218fffa6f7060b9d7c39c7735fe4a",
+    "sourceCommits": {
+      "omniroute": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+      "cc-switch": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+      "9router": "90b52e06ffd666b7929554211474d01588f6b1f8"
+    }
+  },
+  "invariants": {
+    "credentialOwnership": "provider_owned",
+    "accountPool": false,
+    "crossAccountFallback": false,
+    "crossProviderFallback": false,
+    "crossCredentialRailFallback": false,
+    "quotaSelection": false,
+    "consoleCookieScraping": false,
+    "liveWithoutReceipt": false
+  },
+  "summary": {
+    "typedFamilies": 10,
+    "typedProfiles": 20,
+    "regions": [
+      "china",
+      "china_beijing",
+      "global",
+      "global_singapore",
+      "singapore"
+    ],
+    "surfaces": [
+      "claude",
+      "codex"
+    ],
+    "fixtureState": "fixture_verified",
+    "liveState": "live_pending"
+  },
+  "families": [
+    {
+      "familyId": "family.kimi_coding_api_key",
+      "label": "Kimi API Key",
+      "region": "global",
+      "upstreamPlanIds": [
+        "kimi-coding-apikey"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.kimi_coding_api_key",
+          "app": "claude",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.kimi.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/coding/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/coding/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 1,
+            "inputModalities": [
+              "text"
+            ],
+            "maxContextWindow": 262144,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "kimi-for-coding",
+                "displayName": "Kimi For Coding",
+                "contextWindow": 262144,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "kimi",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.kimi.com/coding/v1/usages",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Kimi Coding API-key rail and cc-switch preset review",
+            "capturedAt": "2026-08-13T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.kimi_coding_api_key",
+          "app": "codex",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.kimi.com",
+            "protocol": "open_ai_chat",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_chat_completions",
+                "path": "/coding/v1/chat/completions"
+              },
+              {
+                "route": "codex_responses",
+                "path": "/coding/v1/chat/completions"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 1,
+            "inputModalities": [
+              "text"
+            ],
+            "maxContextWindow": 262144,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "kimi-for-coding",
+                "displayName": "Kimi For Coding",
+                "contextWindow": 262144,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "kimi",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.kimi.com/coding/v1/usages",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_chat_sse",
+            "terminalEvent": "[DONE]",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Kimi Coding API-key rail and cc-switch preset review",
+            "capturedAt": "2026-08-13T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/kimi/coding-apikey/index.ts",
+          "sha256": "b38d94281d9fca16d47c8537df9f549f3291dfd5cb4899d1e3fca3d8527887c2"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/kimi.ts",
+          "sha256": "305319fe73e9a1891039e8f908d824684a6f8b6547bae94e6a4db4a55de0d36d"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_cn",
+      "label": "Zhipu (China)",
+      "region": "china",
+      "upstreamPlanIds": [
+        "glm-cn"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.zhipu_glm_cn",
+          "app": "claude",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://open.bigmodel.cn",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/api/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/api/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 11,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.1",
+                "displayName": "GLM-5.1",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5-turbo",
+                "displayName": "GLM-5 Turbo",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7-flash",
+                "displayName": "GLM-4.7 Flash",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.6v",
+                "displayName": "GLM-4.6V",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.6",
+                "displayName": "GLM-4.6",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5v",
+                "displayName": "GLM-4.5V",
+                "contextWindow": 16000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.5",
+                "displayName": "GLM-4.5",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5-air",
+                "displayName": "GLM-4.5 Air",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "zhipu",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute GLM contracts and cc-switch Zhipu Coding Plan review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.zhipu_glm_cn",
+          "app": "codex",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://open.bigmodel.cn",
+            "protocol": "open_ai_chat",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_chat_completions",
+                "path": "/api/coding/paas/v4/chat/completions"
+              },
+              {
+                "route": "codex_responses",
+                "path": "/api/coding/paas/v4/chat/completions"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 12,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "glm-5.3",
+                "displayName": "GLM-5.3",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.1",
+                "displayName": "GLM-5.1",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5-turbo",
+                "displayName": "GLM-5 Turbo",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7-flash",
+                "displayName": "GLM-4.7 Flash",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.6v",
+                "displayName": "GLM-4.6V",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.6",
+                "displayName": "GLM-4.6",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5v",
+                "displayName": "GLM-4.5V",
+                "contextWindow": 16000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.5",
+                "displayName": "GLM-4.5",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5-air",
+                "displayName": "GLM-4.5 Air",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "zhipu",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_chat_sse",
+            "terminalEvent": "[DONE]",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute GLM contracts, 9router live GLM-5.3 Coding endpoint evidence, and cc-switch Zhipu review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/glm/cn/index.ts",
+          "sha256": "274851a4ccd835d44f3d2ee86254eeb656e017d560be0208728b54de400d2bf1"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/glm.ts",
+          "sha256": "f11a50f0c2b241049eccdd80f162ed930a8b37f1ee6ab67d9205e437ca59e2d7"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/services/usage/glm.js",
+          "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_global",
+      "label": "Zhipu (Global)",
+      "region": "global",
+      "upstreamPlanIds": [
+        "zai",
+        "glm"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.zhipu_glm_global",
+          "app": "claude",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.z.ai",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/api/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/api/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 11,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.1",
+                "displayName": "GLM-5.1",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5-turbo",
+                "displayName": "GLM-5 Turbo",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7-flash",
+                "displayName": "GLM-4.7 Flash",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.6v",
+                "displayName": "GLM-4.6V",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.6",
+                "displayName": "GLM-4.6",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5v",
+                "displayName": "GLM-4.5V",
+                "contextWindow": 16000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.5",
+                "displayName": "GLM-4.5",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5-air",
+                "displayName": "GLM-4.5 Air",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "zhipu",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute GLM contracts and cc-switch Zhipu Coding Plan review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.zhipu_glm_global",
+          "app": "codex",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.z.ai",
+            "protocol": "open_ai_chat",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_chat_completions",
+                "path": "/api/coding/paas/v4/chat/completions"
+              },
+              {
+                "route": "codex_responses",
+                "path": "/api/coding/paas/v4/chat/completions"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 12,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "glm-5.3",
+                "displayName": "GLM-5.3",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5.1",
+                "displayName": "GLM-5.1",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-5-turbo",
+                "displayName": "GLM-5 Turbo",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7-flash",
+                "displayName": "GLM-4.7 Flash",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.6v",
+                "displayName": "GLM-4.6V",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.6",
+                "displayName": "GLM-4.6",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5v",
+                "displayName": "GLM-4.5V",
+                "contextWindow": 16000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-4.5",
+                "displayName": "GLM-4.5",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.5-air",
+                "displayName": "GLM-4.5 Air",
+                "contextWindow": 128000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "zhipu",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_chat_sse",
+            "terminalEvent": "[DONE]",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute GLM contracts, 9router live GLM-5.3 Coding endpoint evidence, and cc-switch Zhipu review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/zai/index.ts",
+          "sha256": "f888014a3ab80f7d68e2dd3fe7769b8f918f4e42742da474fb0dab5446258cab"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/glm.ts",
+          "sha256": "f11a50f0c2b241049eccdd80f162ed930a8b37f1ee6ab67d9205e437ca59e2d7"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/services/usage/glm.js",
+          "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_cn",
+      "label": "Bailian",
+      "region": "china",
+      "upstreamPlanIds": [
+        "bailian-coding-plan",
+        "alicode"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.bailian_coding_plan_cn",
+          "app": "claude",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://coding.dashscope.aliyuncs.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/apps/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/apps/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 7,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "qwen3.8-max-preview",
+                "displayName": "Qwen3.8 Max Preview",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "qwen3.7-max",
+                "displayName": "Qwen3.7 Max",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3.7-plus",
+                "displayName": "Qwen3.7 Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "qwen3.6-flash",
+                "displayName": "Qwen3.6 Flash",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "deepseek-v4-pro",
+                "displayName": "DeepSeek V4 Pro",
+                "contextWindow": 163840,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-plus",
+                "displayName": "Qwen3 Coder Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Bailian regional Anthropic contract and cc-switch Bailian For Coding preset review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.bailian_coding_plan_cn",
+          "app": "codex",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://coding.dashscope.aliyuncs.com",
+            "protocol": "open_ai_chat",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_chat_completions",
+                "path": "/v1/chat/completions"
+              },
+              {
+                "route": "codex_responses",
+                "path": "/v1/chat/completions"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 8,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "qwen3.5-plus",
+                "displayName": "Qwen3.5 Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "kimi-k2.5",
+                "displayName": "Kimi K2.5",
+                "contextWindow": 164000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-max-2026-01-23",
+                "displayName": "Qwen3 Max",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-next",
+                "displayName": "Qwen3 Coder Next",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-plus",
+                "displayName": "Qwen3 Coder Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_chat_sse",
+            "terminalEvent": "[DONE]",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "9router Alibaba Coding Chat catalog and cc-switch Bailian For Coding review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/bailian-coding-plan/index.ts",
+          "sha256": "052682eafdfb639e36b5730211166a494ae6a64fd9f8978b8663c6a1f0aa1abc"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/providers/registry/alicode.js",
+          "sha256": "a9975605e1d45a30da3170532ee9a97f11986247871c4a139b8ce05a95aee6fc"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_global",
+      "label": "Bailian",
+      "region": "global_singapore",
+      "upstreamPlanIds": [
+        "bailian-coding-plan",
+        "alicode-intl"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.bailian_coding_plan_global",
+          "app": "claude",
+          "region": "global_singapore",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://coding-intl.dashscope.aliyuncs.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/apps/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/apps/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 7,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "qwen3.8-max-preview",
+                "displayName": "Qwen3.8 Max Preview",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "qwen3.7-max",
+                "displayName": "Qwen3.7 Max",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3.7-plus",
+                "displayName": "Qwen3.7 Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "qwen3.6-flash",
+                "displayName": "Qwen3.6 Flash",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-5.2",
+                "displayName": "GLM-5.2",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "deepseek-v4-pro",
+                "displayName": "DeepSeek V4 Pro",
+                "contextWindow": 163840,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-plus",
+                "displayName": "Qwen3 Coder Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Bailian regional Anthropic contract and cc-switch Bailian For Coding preset review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.bailian_coding_plan_global",
+          "app": "codex",
+          "region": "global_singapore",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://coding-intl.dashscope.aliyuncs.com",
+            "protocol": "open_ai_chat",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_chat_completions",
+                "path": "/v1/chat/completions"
+              },
+              {
+                "route": "codex_responses",
+                "path": "/v1/chat/completions"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 7,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1000000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "qwen3.5-plus",
+                "displayName": "Qwen3.5 Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "kimi-k2.5",
+                "displayName": "Kimi K2.5",
+                "contextWindow": 164000,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "glm-5",
+                "displayName": "GLM-5",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-next",
+                "displayName": "Qwen3 Coder Next",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "qwen3-coder-plus",
+                "displayName": "Qwen3 Coder Plus",
+                "contextWindow": 1000000,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "glm-4.7",
+                "displayName": "GLM-4.7",
+                "contextWindow": 200000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_chat_sse",
+            "terminalEvent": "[DONE]",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "9router Alibaba Coding Chat catalog and OmniRoute regional endpoint review",
+            "capturedAt": "2026-08-23T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/bailian-coding-plan/index.ts",
+          "sha256": "052682eafdfb639e36b5730211166a494ae6a64fd9f8978b8663c6a1f0aa1abc"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/providers/registry/alicode-intl.js",
+          "sha256": "e60f662277ad3dc5a167c1a253d8077f1f20d8922f468004dce58ba55d1dfa95"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.minimax_cn",
+      "label": "MiniMax (China)",
+      "region": "china",
+      "upstreamPlanIds": [
+        "minimax-cn"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.minimax_cn",
+          "app": "claude",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.minimaxi.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 5,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "MiniMax-M3",
+                "displayName": "MiniMax-M3",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7",
+                "displayName": "MiniMax-M2.7",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7-highspeed",
+                "displayName": "MiniMax-M2.7 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5-highspeed",
+                "displayName": "MiniMax-M2.5 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "minimax",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.minimax_cn",
+          "app": "codex",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.minimaxi.com",
+            "protocol": "open_ai_responses",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_responses",
+                "path": "/v1/responses"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 5,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "MiniMax-M3",
+                "displayName": "MiniMax-M3",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7",
+                "displayName": "MiniMax-M2.7",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7-highspeed",
+                "displayName": "MiniMax-M2.7 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5-highspeed",
+                "displayName": "MiniMax-M2.5 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "minimax",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_responses_sse",
+            "terminalEvent": "response.completed",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/minimax/cn/index.ts",
+          "sha256": "1020a08e911a474bd78c43fb3c03141f9d8ee7ee06e26cb390eca664799be9e1"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/minimax.ts",
+          "sha256": "c0475a10fe58bfe8dab908167230c851b5166f63440dc6e6171b978b9a2666ad"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/services/usage/minimax.js",
+          "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.minimax_global",
+      "label": "MiniMax (Global)",
+      "region": "global",
+      "upstreamPlanIds": [
+        "minimax"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.minimax_global",
+          "app": "claude",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.minimax.io",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 5,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "MiniMax-M3",
+                "displayName": "MiniMax-M3",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7",
+                "displayName": "MiniMax-M2.7",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7-highspeed",
+                "displayName": "MiniMax-M2.7 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5-highspeed",
+                "displayName": "MiniMax-M2.5 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "minimax",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.minimax_global",
+          "app": "codex",
+          "region": "global",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://api.minimax.io",
+            "protocol": "open_ai_responses",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_responses",
+                "path": "/v1/responses"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 5,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "MiniMax-M3",
+                "displayName": "MiniMax-M3",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7",
+                "displayName": "MiniMax-M2.7",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.7-highspeed",
+                "displayName": "MiniMax-M2.7 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5",
+                "displayName": "MiniMax-M2.5",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "MiniMax-M2.5-highspeed",
+                "displayName": "MiniMax-M2.5 Highspeed",
+                "contextWindow": 204800,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "minimax",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+            "credentialSlots": [
+              {
+                "role": "inference_credential",
+                "slot": "/settingsConfig/apiKey"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_responses_sse",
+            "terminalEvent": "response.completed",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/minimax/index.ts",
+          "sha256": "b4464182b79bf099935280348d7cd03a0e21e42d88890fae7a442d3201e4cf42"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/minimax.ts",
+          "sha256": "c0475a10fe58bfe8dab908167230c851b5166f63440dc6e6171b978b9a2666ad"
+        },
+        {
+          "sourceId": "9router",
+          "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+          "path": "open-sse/services/usage/minimax.js",
+          "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.volcengine_coding_plan",
+      "label": "Volcengine",
+      "region": "china_beijing",
+      "upstreamPlanIds": [
+        "volcengine-coding-plan"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.volcengine_coding_plan",
+          "app": "claude",
+          "region": "china_beijing",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://ark.cn-beijing.volces.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/api/coding/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/api/coding/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 1,
+            "inputModalities": [
+              "text"
+            ],
+            "maxContextWindow": 256000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "ark-code-latest",
+                "displayName": "Ark Code Latest",
+                "contextWindow": 256000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "volcengine",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://open.volcengineapi.com/",
+            "credentialSlots": [
+              {
+                "role": "access_key_id",
+                "slot": "/settingsConfig/env/VOLC_ACCESS_KEY_ID"
+              },
+              {
+                "role": "secret_access_key",
+                "slot": "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "cc-switch Volcengine V4 quota implementation and fixed Coding Plan endpoint review",
+            "capturedAt": "2026-08-13T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.volcengine_coding_plan",
+          "app": "codex",
+          "region": "china_beijing",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://ark.cn-beijing.volces.com",
+            "protocol": "open_ai_responses",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_responses",
+                "path": "/api/coding/v3/responses"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 1,
+            "inputModalities": [
+              "text"
+            ],
+            "maxContextWindow": 256000,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "ark-code-latest",
+                "displayName": "Ark Code Latest",
+                "contextWindow": 256000,
+                "inputModalities": [
+                  "text"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "volcengine",
+            "provenance": "reviewed_plan_api",
+            "endpoint": "https://open.volcengineapi.com/",
+            "credentialSlots": [
+              {
+                "role": "access_key_id",
+                "slot": "/settingsConfig/env/VOLC_ACCESS_KEY_ID"
+              },
+              {
+                "role": "secret_access_key",
+                "slot": "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+              }
+            ],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_responses_sse",
+            "terminalEvent": "response.completed",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "cc-switch Volcengine V4 quota implementation and fixed Coding Plan endpoint review",
+            "capturedAt": "2026-08-13T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/volcengine/coding-plan/index.ts",
+          "sha256": "ef4129606cc6da5bda43ca76ce7178267226451e8fa917b130d50fb671a4b03c"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/volcenginePlan.ts",
+          "sha256": "bbed6078e15fb33f366c7bd25583c10e9ebe41e15d0b462953a68f44360975ba"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan",
+      "label": "Xiaomi MiMo (China)",
+      "region": "china",
+      "upstreamPlanIds": [
+        "xiaomi-mimo-token-plan"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.xiaomi_mimo_token_plan",
+          "app": "claude",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://token-plan-cn.xiaomimimo.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 2,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "mimo-v2.5-pro",
+                "displayName": "MiMo V2.5 Pro",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "mimo-v2.5",
+                "displayName": "MiMo V2.5",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "cc-switch China Token Plan preset and OmniRoute quota limitation review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.xiaomi_mimo_token_plan",
+          "app": "codex",
+          "region": "china",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://token-plan-cn.xiaomimimo.com",
+            "protocol": "open_ai_responses",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_responses",
+                "path": "/v1/responses"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 2,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "mimo-v2.5-pro",
+                "displayName": "MiMo V2.5 Pro",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "mimo-v2.5",
+                "displayName": "MiMo V2.5",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_responses_sse",
+            "terminalEvent": "response.completed",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "cc-switch China Token Plan preset and OmniRoute quota limitation review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts",
+          "sha256": "d4961466492e45ab0c00f86ffcfb0a33795812b22cbe868b799bab15dfba9a80"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/xiaomi-mimo.ts",
+          "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan_sgp",
+      "label": "Xiaomi MiMo (Singapore)",
+      "region": "singapore",
+      "upstreamPlanIds": [
+        "xiaomi-mimo-token-plan"
+      ],
+      "surfaces": [
+        {
+          "profileId": "claude.xiaomi_mimo_token_plan_sgp",
+          "app": "claude",
+          "region": "singapore",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://token-plan-sgp.xiaomimimo.com",
+            "protocol": "anthropic_messages",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "api_key",
+            "routes": [
+              {
+                "route": "claude_messages",
+                "path": "/anthropic/v1/messages"
+              },
+              {
+                "route": "claude_count_tokens",
+                "path": "/anthropic/v1/messages/count_tokens"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 2,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "mimo-v2.5-pro",
+                "displayName": "MiMo V2.5 Pro",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "mimo-v2.5",
+                "displayName": "MiMo V2.5",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "anthropic_sse",
+            "terminalEvent": "message_stop",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "anthropic",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Singapore Token Plan fixed endpoint and quota limitation review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        },
+        {
+          "profileId": "codex.xiaomi_mimo_token_plan_sgp",
+          "app": "codex",
+          "region": "singapore",
+          "maturity": "experimental",
+          "fixtureState": "fixture_verified",
+          "liveState": "live_pending",
+          "providerOwnedCredential": true,
+          "accountBindingSupported": false,
+          "inference": {
+            "fixedOrigin": "https://token-plan-sgp.xiaomimimo.com",
+            "protocol": "open_ai_responses",
+            "credentialSlot": "/settingsConfig/apiKey",
+            "authScheme": "bearer",
+            "routes": [
+              {
+                "route": "codex_responses",
+                "path": "/v1/responses"
+              }
+            ]
+          },
+          "catalog": {
+            "modelCount": 2,
+            "inputModalities": [
+              "image",
+              "text"
+            ],
+            "maxContextWindow": 1048576,
+            "tools": "not_inferred_without_explicit_model_evidence",
+            "models": [
+              {
+                "id": "mimo-v2.5-pro",
+                "displayName": "MiMo V2.5 Pro",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text"
+                ]
+              },
+              {
+                "id": "mimo-v2.5",
+                "displayName": "MiMo V2.5",
+                "contextWindow": 1048576,
+                "inputModalities": [
+                  "text",
+                  "image"
+                ]
+              }
+            ]
+          },
+          "quota": {
+            "adapter": "unavailable",
+            "provenance": "explicit_unavailable_no_console_cookie",
+            "endpoint": null,
+            "credentialSlots": [],
+            "cacheTtlMs": 60000,
+            "staleTtlMs": 900000
+          },
+          "stream": {
+            "format": "open_ai_responses_sse",
+            "terminalEvent": "response.completed",
+            "errorBeforeTerminalIsFatal": true
+          },
+          "error": {
+            "envelope": "open_ai",
+            "retrySameCredentialOnceOn401": false,
+            "retryAfterCommit": false
+          },
+          "pricingEvidence": {
+            "evidence": "flat_rate_subscription_no_usd",
+            "source": "OmniRoute Singapore Token Plan fixed endpoint and quota limitation review",
+            "capturedAt": "2026-08-14T00:00:00Z"
+          }
+        }
+      ],
+      "evidenceFiles": [
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts",
+          "sha256": "d4961466492e45ab0c00f86ffcfb0a33795812b22cbe868b799bab15dfba9a80"
+        },
+        {
+          "sourceId": "omniroute",
+          "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+          "path": "open-sse/services/usage/xiaomi-mimo.ts",
+          "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/claudeProviderPresets.ts",
+          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
+        },
+        {
+          "sourceId": "cc-switch",
+          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
+          "path": "src/config/codexProviderPresets.ts",
+          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
+        }
+      ]
+    }
+  ],
+  "ollamaCloud": {
+    "familyId": "family.ollama_cloud",
+    "region": "global",
+    "credentialOwnership": "provider_owned",
+    "inferenceAccountRows": false,
+    "cookieOrHtmlCredential": false,
+    "profiles": [
+      {
+        "profileId": "claude.ollama_cloud",
+        "app": "claude",
+        "maturity": "stable",
+        "liveState": "live_pending"
+      },
+      {
+        "profileId": "codex.ollama_cloud",
+        "app": "codex",
+        "maturity": "stable",
+        "liveState": "live_pending"
+      }
+    ],
+    "accountProjection": {
+      "fixedOrigin": "https://ollama.com",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/me",
+          "body": "empty"
+        },
+        {
+          "method": "GET",
+          "path": "/api/usage"
+        }
+      ],
+      "concurrentPartialSections": true,
+      "redirects": "disabled",
+      "maxResponseBytes": 524288,
+      "cacheScope": [
+        "credential_source_key",
+        "credential_generation"
+      ],
+      "staleOnlyFor": [
+        "rate_limited",
+        "transient"
+      ],
+      "authenticationFailureClearsCache": true,
+      "inferenceSchedulingEffect": "none_display_only"
+    },
+    "fixtureState": "fixture_verified",
+    "liveState": "live_pending",
+    "evidenceFiles": [
+      {
+        "sourceId": "omniroute",
+        "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+        "path": "open-sse/config/providers/registry/ollama-cloud/index.ts",
+        "sha256": "466fef0b9a51b844f27c0119a60a0b4c66d3ff66c720fee6b3a91df3bf4d3da7"
+      },
+      {
+        "sourceId": "9router",
+        "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+        "path": "open-sse/providers/registry/ollama.js",
+        "sha256": "3d8b0c0d82a9bae3192c564c4e2dac2fe2833a2f53acde03b99f6d791ceaa38d"
+      },
+      {
+        "sourceId": "9router",
+        "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+        "path": "tests/unit/ollama-usage.test.js",
+        "sha256": "44a91ccd794e6e5a96b74715c0ad69f46b572c215dfe9e1c542ffce19439b12e"
+      }
+    ]
+  }
+}

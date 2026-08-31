@@ -55,6 +55,7 @@ export const TIER_I18N_KEYS: Record<string, string> = {
   // Upstream has occasionally exposed this typo-like key; treat it as Opus.
   seven_day_omelette: "subscription.sevenDayOpus",
   seven_day_sonnet: "subscription.sevenDaySonnet",
+  seven_day_fable: "subscription.sevenDayFable",
   // Gemini 模型分类
   gemini_pro: "subscription.geminiPro",
   gemini_flash: "subscription.geminiFlash",
@@ -264,6 +265,7 @@ const COMPACT_TIER_LABELS: Record<string, string> = {
   seven_day_opus: "7d Opus",
   seven_day_omelette: "7d Opus",
   seven_day_sonnet: "7d Sonnet",
+  seven_day_fable: "Fable 7d",
   premium: "Premium",
   kiro_agentic_requests: "Kiro",
   grok_credits: "Credits",
@@ -616,6 +618,11 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     ? inlineTiers
     : tiers.filter((tier) => !SUPPRESSED_TIERS.has(tier.name));
   const summaryText = formatQuotaSummary(quota, summaryTiers, t, now);
+  const fablePoolHelp = summaryTiers.some(
+    (tier) => tier.name === "seven_day_fable",
+  )
+    ? t("subscription.fablePoolHelp")
+    : undefined;
   if (tiers.length === 0 && !summaryText) return null;
 
   // ── inline 模式：紧凑两行显示 ──
@@ -638,7 +645,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
         />
 
         {/* 第二行：plan · expire · tiers */}
-        <div className="min-w-0 max-w-full text-right text-[10px] font-medium text-gray-700 dark:text-gray-200 break-words">
+        <div
+          className="min-w-0 max-w-full text-right text-[10px] font-medium text-gray-700 dark:text-gray-200 break-words"
+          title={fablePoolHelp}
+        >
           {summaryText}
         </div>
       </div>
@@ -674,7 +684,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
       </div>
 
       {summaryText && (
-        <div className="mb-2 text-xs font-medium text-gray-700 dark:text-gray-200 break-words">
+        <div
+          className="mb-2 text-xs font-medium text-gray-700 dark:text-gray-200 break-words"
+          title={fablePoolHelp}
+        >
           {summaryText}
         </div>
       )}
@@ -754,9 +767,13 @@ const TierBar: React.FC<{
     tier.label?.trim() ||
     (TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const resetText = formatResetTime(tier.resetsAt, t);
+  const help =
+    tier.name === "seven_day_fable"
+      ? t("subscription.fablePoolHelp")
+      : undefined;
 
   return (
-    <div className="flex items-center gap-3 text-xs">
+    <div className="flex items-center gap-3 text-xs" title={help}>
       <span
         className="text-gray-500 dark:text-gray-400 min-w-0 font-medium"
         style={{ width: "25%" }}

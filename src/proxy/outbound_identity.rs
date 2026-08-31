@@ -116,6 +116,10 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
         }
+        ManagedIdentityFamily::AmazonQCli => set_user_agent(
+            headers,
+            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+        ),
         ManagedIdentityFamily::Cursor => set_user_agent(headers, "connect-es/1.6.1".to_string()),
         ManagedIdentityFamily::Copilot => set_user_agent(
             headers,

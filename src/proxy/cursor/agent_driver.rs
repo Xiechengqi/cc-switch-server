@@ -54,7 +54,7 @@ use super::agent_proto::{
     encode_request_context_response, encode_rich_request_context_response, wrap_connect_frame,
     AgentRunInput, ConnectFrame, ExecServerEvent, InteractionDelta, KvServerEvent, ProtoError,
 };
-use super::credential_cache::CursorApiKeyCredentialScope;
+use super::credential_cache::{CursorApiKeyCredentialScope, CursorModelCatalogScope};
 use super::event_emitter::{
     AgentEvent, AgentSseWriter, CapturedToolCall, ComposerMarkerFilter, MarkerEvent,
 };
@@ -138,6 +138,7 @@ enum CursorCredential {
         account: CursorAccountData,
         access_token: String,
         endpoint_principal: String,
+        model_catalog_scope: CursorModelCatalogScope,
     },
 }
 
@@ -171,6 +172,16 @@ impl CursorCredential {
             | Self::ApiKeySdk {
                 endpoint_principal, ..
             } => endpoint_principal,
+        }
+    }
+
+    fn model_catalog_scope(&self) -> Option<&CursorModelCatalogScope> {
+        match self {
+            Self::OAuthCli { .. } => None,
+            Self::ApiKeySdk {
+                model_catalog_scope,
+                ..
+            } => Some(model_catalog_scope),
         }
     }
 }
@@ -3566,10 +3577,20 @@ async fn open_agent_stream(
     timeouts: CursorH2Timeouts,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
     let images = load_images(plan.images.clone()).await?;
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let live_catalog_ids = match credential.model_catalog_scope() {
+        Some(scope) => state
+            .cursor_model_catalogs
+            .fresh(scope, now_ms)
+            .await
+            .map(|catalog| catalog.models.into_iter().collect::<HashSet<_>>()),
+        None => None,
+    };
     let mut blob_store = HashMap::new();
     let mut input = AgentRunInput {
         rail: credential.rail(),
         model_id: &plan.model_id,
+        live_catalog_ids: live_catalog_ids.as_ref(),
         user_text: &plan.user_text,
         conversation_id: Some(session_key.conversation_id()),
         message_id: None,
@@ -5576,6 +5597,14 @@ async fn resolve_cursor_credential(
         }
         ProviderType::CursorApiKey => {
             let api_key = cursor_api_key(stored)?;
+            let model_catalog_scope = CursorModelCatalogScope::derive(
+                stored.app.as_str(),
+                &stored.provider.id,
+                stored.resource.revision,
+                stored.resource.credential_generation,
+                runtime_fingerprint,
+                &cursor_api_key_hash(&api_key),
+            );
             let access_token = cached_cursor_api_key_token(
                 state,
                 stored,
@@ -5598,6 +5627,7 @@ async fn resolve_cursor_credential(
                 account,
                 access_token,
                 endpoint_principal,
+                model_catalog_scope,
             })
         }
         _ => Err(ProxyError::bad_request(

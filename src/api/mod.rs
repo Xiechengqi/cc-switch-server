@@ -42,11 +42,11 @@ pub use control::{
 pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
-    map_account_write_error, map_codex_active_account_selection_error, map_codex_device_error,
-    map_codex_workspace_rebind_error, map_copilot_device_error, map_email_auth_error,
-    map_grok_device_error, map_kimi_device_error, map_kiro_device_error, map_qoder_client_error,
-    map_share_patch_error, map_subscription_binding_error, map_web_auth_error, ErrorResponse,
-    InferenceApiError, InferenceSurface,
+    map_account_write_error, map_amazon_q_device_error, map_codex_active_account_selection_error,
+    map_codex_device_error, map_codex_workspace_rebind_error, map_copilot_device_error,
+    map_email_auth_error, map_grok_device_error, map_kimi_device_error, map_kiro_device_error,
+    map_qoder_client_error, map_share_patch_error, map_subscription_binding_error,
+    map_web_auth_error, ErrorResponse, InferenceApiError, InferenceSurface,
 };
 pub(in crate::api) use events::*;
 pub(in crate::api) use invoke::dispatch::web_invoke_compat;
@@ -454,6 +454,14 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/accounts/kiro/device/poll",
             post(poll_kiro_device_login),
+        )
+        .route(
+            "/api/accounts/amazon-q/device/start",
+            post(start_amazon_q_device_login),
+        )
+        .route(
+            "/api/accounts/amazon-q/device/poll",
+            post(poll_amazon_q_device_login),
         )
         .route(
             "/api/accounts/codex/device/start",
@@ -1306,8 +1314,10 @@ async fn proxy_models(
     let request_id = inference_request_id(&headers);
     let (provider_id, _share_guard) = validate_router_share_surface(&state, &headers, app)
         .await
-        .map_err(|error| InferenceApiError::proxy(surface, request_id, error))?;
-    Ok(proxy_models_for_selection(&state, Some(app), Some(&provider_id)).await)
+        .map_err(|error| InferenceApiError::proxy(surface, request_id.clone(), error))?;
+    proxy_models_for_selection(&state, Some(app), Some(&provider_id))
+        .await
+        .map_err(|error| InferenceApiError::api(surface, request_id, error))
 }
 
 pub(super) async fn validate_router_share_surface(
@@ -1373,12 +1383,13 @@ async fn proxy_models_for_selection(
     state: &ServerState,
     app: Option<AppKind>,
     provider_id: Option<&str>,
-) -> Json<OpenAiModelsResponse> {
+) -> Result<Json<OpenAiModelsResponse>, ApiError> {
     let providers = state.providers.read().await.clone();
     let mut data = openai_model_list(&providers.providers, app, provider_id);
     let claude_catalog = resolve_claude_catalog_provider(&providers, app, provider_id)
         .map(|_| crate::clients::oauth::claude_models::static_claude_model_catalog());
     let kimi_catalog = append_kimi_models(state, &providers, app, provider_id, &mut data).await;
+    let qoder_catalog = append_qoder_models(state, &providers, app, provider_id, &mut data).await?;
     let cursor_catalog =
         append_cursor_api_key_models(state, &providers, app, provider_id, &mut data).await;
     let kiro_provider = resolve_kiro_catalog_provider(&providers, app, provider_id).cloned();
@@ -1386,51 +1397,31 @@ async fn proxy_models_for_selection(
         if let Some((account_id, expected_generation)) =
             kiro_catalog_managed_account_binding(&providers, provider)
         {
-            let refresh = state
-                .refresh_managed_account_if_needed_for_generation(
-                    ProviderType::KiroOAuth,
-                    &account_id,
-                    expected_generation,
-                )
-                .await;
-            if let Err(error) = refresh {
-                tracing::warn!(error = ?error, "Kiro model discovery token refresh failed");
-                Some(
-                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
-                        "token_refresh_failed",
-                    ),
-                )
-            } else if let Some(account) = state
-                .find_account_for_provider(ProviderType::KiroOAuth, &account_id)
-                .await
-                .filter(|account| account.auth_identity_generation == expected_generation)
-            {
-                #[cfg(test)]
-                let endpoint_override = providers
-                    .runtime_plan(provider.app, &provider.provider.id)
-                    .and_then(|plan| {
-                        plan.driver_options
-                            .get("testKiroModelsUrl")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                #[cfg(not(test))]
-                let endpoint_override: Option<String> = None;
-                Some(
-                    crate::clients::oauth::kiro_runtime::model_catalog(
-                        &state.http_client().await,
-                        &account,
+            let plan = providers
+                .runtime_plan(provider.app, &provider.provider.id)
+                .expect("validated Kiro binding has a runtime plan");
+            #[cfg(test)]
+            let endpoint_override = plan
+                .driver_options
+                .get("testKiroModelsUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            #[cfg(not(test))]
+            let endpoint_override: Option<String> = None;
+            Some(
+                state
+                    .kiro_model_catalog(
+                        provider.app,
+                        &provider.provider.id,
+                        plan.provider_revision,
+                        &plan.runtime_fingerprint,
+                        &account_id,
+                        expected_generation,
                         endpoint_override.as_deref(),
+                        std::time::Duration::from_secs(10),
                     )
                     .await,
-                )
-            } else {
-                Some(
-                    crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
-                        "bound_account_unavailable",
-                    ),
-                )
-            }
+            )
         } else {
             Some(
                 crate::clients::oauth::kiro_runtime::unavailable_model_catalog(
@@ -1453,109 +1444,47 @@ async fn proxy_models_for_selection(
                     owned_by: owned_by.clone(),
                     reasoning_efforts: None,
                     input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+                    context_window: None,
+                    supports_tools: None,
                 });
             }
         }
         data.sort_by(|left, right| left.id.cmp(&right.id));
     }
-    let grok_provider = resolve_grok_catalog_provider(&providers, app, provider_id).cloned();
-    #[cfg(test)]
-    let grok_models_test_url = grok_provider.as_ref().and_then(|provider| {
-        providers
-            .runtime_plan(provider.app, &provider.provider.id)
-            .and_then(|plan| {
-                plan.driver_options
-                    .get("testGrokModelsUrl")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-    });
-    let grok_catalog = if let Some(provider) = grok_provider.as_ref() {
+    let amazon_q_provider =
+        resolve_amazon_q_catalog_provider(&providers, app, provider_id).cloned();
+    let amazon_q_catalog = if let Some(provider) = amazon_q_provider.as_ref() {
         if let Some((account_id, expected_generation)) =
-            grok_catalog_managed_account_binding(&providers, provider)
+            amazon_q_catalog_managed_account_binding(&providers, provider)
         {
-            if state.credential_persistence_degraded() {
-                Some(
-                    crate::clients::oauth::grok_models::static_grok_model_catalog(
-                        "credential_persistence_degraded",
-                    ),
-                )
-            } else {
-                let refresh = state
-                    .refresh_managed_account_if_needed_for_generation(
-                        ProviderType::GrokOAuth,
-                        account_id.as_str(),
+            let plan = providers
+                .runtime_plan(provider.app, &provider.provider.id)
+                .expect("validated Amazon Q binding has a runtime plan");
+            #[cfg(test)]
+            let endpoint_override = plan
+                .driver_options
+                .get("testAmazonQModelsUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            #[cfg(not(test))]
+            let endpoint_override: Option<String> = None;
+            Some(
+                state
+                    .amazon_q_model_catalog(
+                        provider.app,
+                        &provider.provider.id,
+                        plan.provider_revision,
+                        &plan.runtime_fingerprint,
+                        &account_id,
                         expected_generation,
+                        endpoint_override.as_deref(),
+                        std::time::Duration::from_secs(10),
                     )
-                    .await;
-                if let Err(error) = refresh {
-                    tracing::warn!(error = ?error, "Grok model discovery token refresh failed");
-                    Some(
-                        crate::clients::oauth::grok_models::static_grok_model_catalog(
-                            "token_refresh_failed",
-                        ),
-                    )
-                } else if state.credential_persistence_degraded() {
-                    Some(
-                        crate::clients::oauth::grok_models::static_grok_model_catalog(
-                            "credential_persistence_degraded",
-                        ),
-                    )
-                } else {
-                    let account = state
-                        .find_account_for_provider(ProviderType::GrokOAuth, account_id.as_str())
-                        .await
-                        .filter(|account| account.auth_identity_generation == expected_generation);
-                    if let Some((account, access_token)) = account.as_ref().and_then(|account| {
-                        account
-                            .access_token
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|token| !token.is_empty())
-                            .map(|token| (account, token))
-                    }) {
-                        #[cfg(test)]
-                        if let Some(url) = grok_models_test_url.as_deref() {
-                            Some(
-                                crate::clients::oauth::grok_models::grok_model_catalog_at_test_url(
-                                    &state.http_client().await,
-                                    &account.id,
-                                    access_token,
-                                    url,
-                                )
-                                .await,
-                            )
-                        } else {
-                            Some(
-                                crate::clients::oauth::grok_models::grok_model_catalog(
-                                    &state.http_client().await,
-                                    &account.id,
-                                    access_token,
-                                )
-                                .await,
-                            )
-                        }
-                        #[cfg(not(test))]
-                        Some(
-                            crate::clients::oauth::grok_models::grok_model_catalog(
-                                &state.http_client().await,
-                                &account.id,
-                                access_token,
-                            )
-                            .await,
-                        )
-                    } else {
-                        Some(
-                            crate::clients::oauth::grok_models::static_grok_model_catalog(
-                                "access_token_unavailable",
-                            ),
-                        )
-                    }
-                }
-            }
+                    .await,
+            )
         } else {
             Some(
-                crate::clients::oauth::grok_models::static_grok_model_catalog(
+                crate::clients::oauth::amazon_q_runtime::unavailable_model_catalog(
                     "managed_account_binding_unavailable",
                 ),
             )
@@ -1563,7 +1492,44 @@ async fn proxy_models_for_selection(
     } else {
         None
     };
+    if let (Some(provider), Some(catalog)) = (amazon_q_provider.as_ref(), amazon_q_catalog.as_ref())
+    {
+        data.clear();
+        let owned_by = model_owner(provider);
+        for descriptor in &catalog.descriptors {
+            if !data.iter().any(|model| model.id == descriptor.model_id) {
+                data.push(OpenAiModel {
+                    id: descriptor.model_id.clone(),
+                    object: "model",
+                    owned_by: owned_by.clone(),
+                    reasoning_efforts: None,
+                    input_modalities: Some(if descriptor.supported_input_types.is_empty() {
+                        vec!["text".to_string()]
+                    } else {
+                        descriptor.supported_input_types.clone()
+                    }),
+                    context_window: descriptor.max_input_tokens,
+                    supports_tools: None,
+                });
+            }
+        }
+        data.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    let grok_provider = resolve_grok_catalog_provider(&providers, app, provider_id).cloned();
+    let grok_catalog = if let Some(provider) = grok_provider.as_ref() {
+        let execution = proxy::provider_ops::ProviderExecution::from_store_for_operation(
+            &providers,
+            provider.clone(),
+        )
+        .map_err(ApiError::proxy)?;
+        let timeout = execution.request_timeout();
+        Some(fetch_bound_grok_model_catalog(state, &execution, timeout).await?)
+    } else {
+        None
+    };
     if let (Some(provider), Some(catalog)) = (grok_provider.as_ref(), grok_catalog.as_ref()) {
+        // A successful bound-account response is authoritative, including an empty catalog.
+        data.clear();
         let owned_by = model_owner(provider);
         for id in &catalog.models {
             if !data.iter().any(|model| model.id == *id) {
@@ -1573,17 +1539,24 @@ async fn proxy_models_for_selection(
                     owned_by: owned_by.clone(),
                     reasoning_efforts: None,
                     input_modalities: None,
+                    context_window: None,
+                    supports_tools: None,
                 });
             }
         }
         data.sort_by(|left, right| left.id.cmp(&right.id));
     }
-    Json(OpenAiModelsResponse {
+    Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
         source: grok_catalog
             .as_ref()
             .map(|catalog| catalog.source.to_string())
+            .or_else(|| {
+                qoder_catalog
+                    .as_ref()
+                    .map(|_| "qoder_live_model_catalog".to_string())
+            })
             .or_else(|| {
                 kimi_catalog
                     .as_ref()
@@ -1591,6 +1564,11 @@ async fn proxy_models_for_selection(
             })
             .or_else(|| {
                 kiro_catalog
+                    .as_ref()
+                    .map(|catalog| catalog.source.to_string())
+            })
+            .or_else(|| {
+                amazon_q_catalog
                     .as_ref()
                     .map(|catalog| catalog.source.to_string())
             })
@@ -1607,21 +1585,171 @@ async fn proxy_models_for_selection(
         stale: grok_catalog
             .as_ref()
             .map(|catalog| catalog.stale)
+            .or_else(|| qoder_catalog.as_ref().map(|_| false))
             .or_else(|| kimi_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| kiro_catalog.as_ref().map(|catalog| catalog.stale))
+            .or_else(|| amazon_q_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| claude_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
         fetched_at_ms: grok_catalog
             .and_then(|catalog| catalog.fetched_at_ms)
+            .or_else(|| qoder_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| {
                 kimi_catalog.as_ref().and_then(|catalog| {
                     (catalog.fetched_at_ms > 0).then_some(catalog.fetched_at_ms)
                 })
             })
             .or_else(|| kiro_catalog.and_then(|catalog| catalog.fetched_at_ms))
+            .or_else(|| amazon_q_catalog.and_then(|catalog| catalog.fetched_at_ms))
             .or_else(|| claude_catalog.map(|catalog| catalog.fetched_at_ms))
             .or_else(|| cursor_catalog.map(|catalog| catalog.fetched_at_ms)),
-    })
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QoderCatalogUse {
+    fetched_at_ms: i64,
+}
+
+async fn append_qoder_models(
+    state: &ServerState,
+    providers: &ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+    data: &mut Vec<OpenAiModel>,
+) -> Result<Option<QoderCatalogUse>, ApiError> {
+    let Some(provider) = resolve_qoder_catalog_provider(providers, app, provider_id) else {
+        return Ok(None);
+    };
+    data.clear();
+    let plan = providers
+        .runtime_plan(provider.app, &provider.provider.id)
+        .ok_or_else(|| ApiError::conflict("Qoder model discovery runtime plan is unavailable"))?;
+    let (account_id, expected_generation) =
+        qoder_catalog_managed_account_binding(providers, provider).ok_or_else(|| {
+            ApiError::conflict("Qoder model discovery requires one exact managed Account binding")
+        })?;
+
+    let mut recovery_attempted = false;
+    let runtime = loop {
+        match state
+            .prepare_qoder_runtime(
+                provider.app,
+                &provider.provider.id,
+                provider.resource.revision,
+                &plan.runtime_fingerprint,
+                &account_id,
+                expected_generation,
+                Duration::from_millis(plan.transport_policy.timeout_ms.max(1)),
+            )
+            .await
+        {
+            Ok(runtime) => break runtime,
+            Err(error) if error.is_authentication_failure() && !recovery_attempted => {
+                recovery_attempted = true;
+                let account = state
+                    .find_account_for_provider(ProviderType::QoderCosy, &account_id)
+                    .await
+                    .ok_or_else(|| ApiError::not_found("Qoder managed Account not found"))?;
+                let profile =
+                    crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref())
+                        .map_err(ApiError::bad_request)?;
+                if profile.credential_rail != crate::domain::qoder::QoderCredentialRail::PatJobToken
+                {
+                    state
+                        .refresh_managed_account_now_for_generation(
+                            ProviderType::QoderCosy,
+                            &account_id,
+                            expected_generation,
+                        )
+                        .await
+                        .map_err(qoder_refresh_api_error)?;
+                }
+            }
+            Err(error) => return Err(qoder_runtime_api_error(error)),
+        }
+    };
+
+    let owner = model_owner(provider);
+    data.extend(
+        runtime
+            .catalog
+            .public_models(runtime.session.session.site)
+            .into_iter()
+            .map(|model| OpenAiModel {
+                id: model.id,
+                object: "model",
+                owned_by: owner.clone(),
+                reasoning_efforts: (!model.route.reasoning_efforts.is_empty())
+                    .then_some(model.route.reasoning_efforts),
+                input_modalities: Some(model.route.input_modalities),
+                context_window: model.route.max_input_tokens,
+                supports_tools: Some(model.route.supports_tools),
+            }),
+    );
+    data.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(Some(QoderCatalogUse {
+        fetched_at_ms: runtime.catalog.fetched_at_ms,
+    }))
+}
+
+fn qoder_refresh_api_error(error: crate::state::ManagedAccountRefreshError) -> ApiError {
+    match error {
+        crate::state::ManagedAccountRefreshError::NotFound => {
+            ApiError::not_found("Qoder managed Account not found")
+        }
+        crate::state::ManagedAccountRefreshError::IdentityChanged { .. }
+        | crate::state::ManagedAccountRefreshError::Conflict { .. } => {
+            ApiError::conflict("Qoder Account identity changed during model discovery")
+        }
+        crate::state::ManagedAccountRefreshError::InactiveCodexAccount => {
+            ApiError::conflict("Qoder Account is not active")
+        }
+        crate::state::ManagedAccountRefreshError::CredentialPersistenceDegraded => {
+            ApiError::service_unavailable_code(
+                "qoder_credential_persistence_degraded",
+                "Qoder credentials are waiting for durable persistence",
+            )
+        }
+        crate::state::ManagedAccountRefreshError::Refresh { status_code, .. } => ApiError::new(
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            "Qoder same-account refresh failed during model discovery",
+        ),
+    }
+}
+
+fn qoder_runtime_api_error(error: crate::state::QoderRuntimeError) -> ApiError {
+    match error {
+        crate::state::QoderRuntimeError::NotFound => {
+            ApiError::not_found("Qoder managed Account not found")
+        }
+        crate::state::QoderRuntimeError::IdentityChanged => {
+            ApiError::conflict("Qoder Provider or Account identity changed during model discovery")
+        }
+        crate::state::QoderRuntimeError::CredentialPersistenceDegraded => {
+            ApiError::service_unavailable_code(
+                "qoder_credential_persistence_degraded",
+                "Qoder credentials are waiting for durable persistence",
+            )
+        }
+        crate::state::QoderRuntimeError::InvalidAccount(message) => ApiError::bad_request(message),
+        crate::state::QoderRuntimeError::Refresh(error) => qoder_refresh_api_error(error),
+        crate::state::QoderRuntimeError::Upstream {
+            status_code,
+            retryable,
+            ..
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ApiError::new(
+                if retryable && status != StatusCode::TOO_MANY_REQUESTS {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                "Qoder live model discovery failed for the bound Account",
+            )
+        }
+    }
 }
 
 async fn append_kimi_models(
@@ -1670,6 +1798,8 @@ async fn append_kimi_models(
                 owned_by: owner.clone(),
                 reasoning_efforts: None,
                 input_modalities: None,
+                context_window: None,
+                supports_tools: None,
             }),
     );
     data.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1786,7 +1916,10 @@ async fn append_cursor_api_key_models(
                             );
                             if transient {
                                 (
-                                    state.cursor_model_catalogs.last_known_good(&scope).await,
+                                    state
+                                        .cursor_model_catalogs
+                                        .last_known_good(&scope, now)
+                                        .await,
                                     true,
                                 )
                             } else {
@@ -1823,6 +1956,8 @@ async fn append_cursor_api_key_models(
                     owned_by: owner.clone(),
                     reasoning_efforts: None,
                     input_modalities: None,
+                    context_window: None,
+                    supports_tools: None,
                 });
             }
         }
@@ -2156,6 +2291,42 @@ fn resolve_kimi_catalog_provider<'a>(
     matches.next().is_none().then_some(provider)
 }
 
+fn resolve_qoder_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::QoderCosy
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
+fn qoder_catalog_managed_account_binding(
+    providers: &crate::domain::providers::store::ProviderStore,
+    provider: &StoredProvider,
+) -> Option<(String, u64)> {
+    let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+    if plan.provider_revision != provider.resource.revision
+        || plan.configuration_state == RuntimeConfigurationState::NeedsAttention
+        || plan.driver_id.as_str() != "special.qoder_cosy"
+    {
+        return None;
+    }
+    match &plan.auth_ref {
+        RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::QoderCosy,
+            auth_identity_generation,
+        } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
+        _ => None,
+    }
+}
+
 fn kimi_catalog_managed_account_binding(
     providers: &crate::domain::providers::store::ProviderStore,
     provider: &StoredProvider,
@@ -2192,27 +2363,6 @@ fn resolve_claude_catalog_provider<'a>(
     matches.next().is_none().then_some(provider)
 }
 
-fn grok_catalog_managed_account_binding(
-    providers: &crate::domain::providers::store::ProviderStore,
-    provider: &StoredProvider,
-) -> Option<(String, u64)> {
-    let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
-    if plan.provider_revision != provider.resource.revision
-        || plan.configuration_state == RuntimeConfigurationState::NeedsAttention
-        || plan.driver_id.as_str() != "oauth.grok_responses"
-    {
-        return None;
-    }
-    match &plan.auth_ref {
-        RuntimeAuthRef::ManagedAccount {
-            account_id,
-            expected_provider_type: ProviderType::GrokOAuth,
-            auth_identity_generation,
-        } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
-        _ => None,
-    }
-}
-
 fn resolve_kiro_catalog_provider<'a>(
     providers: &'a crate::domain::providers::store::ProviderStore,
     app: Option<AppKind>,
@@ -2221,6 +2371,21 @@ fn resolve_kiro_catalog_provider<'a>(
     let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
     let mut matches = providers.providers.iter().filter(|provider| {
         provider.provider_type == ProviderType::KiroOAuth
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
+fn resolve_amazon_q_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::AmazonQOAuth
             && provider.provider.id == provider_id
             && app.is_none_or(|app| provider.app == app)
     });
@@ -2243,6 +2408,27 @@ fn kiro_catalog_managed_account_binding(
         RuntimeAuthRef::ManagedAccount {
             account_id,
             expected_provider_type: ProviderType::KiroOAuth,
+            auth_identity_generation,
+        } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
+        _ => None,
+    }
+}
+
+fn amazon_q_catalog_managed_account_binding(
+    providers: &crate::domain::providers::store::ProviderStore,
+    provider: &StoredProvider,
+) -> Option<(String, u64)> {
+    let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+    if plan.provider_revision != provider.resource.revision
+        || plan.configuration_state == RuntimeConfigurationState::NeedsAttention
+        || plan.driver_id.as_str() != "special.amazon_q"
+    {
+        return None;
+    }
+    match &plan.auth_ref {
+        RuntimeAuthRef::ManagedAccount {
+            account_id,
+            expected_provider_type: ProviderType::AmazonQOAuth,
             auth_identity_generation,
         } if !account_id.trim().is_empty() => Some((account_id.clone(), *auth_identity_generation)),
         _ => None,
@@ -3687,16 +3873,15 @@ mod grok_catalog_provider_tests {
             .unwrap();
         state.inject_account_refresh_persist_failures(1);
 
-        let response = proxy_models_for_selection(
+        let error = proxy_models_for_selection(
             &state,
             Some(AppKind::Codex),
             Some("grok-degraded-model-provider"),
         )
         .await
-        .0;
+        .unwrap_err();
 
-        assert_eq!(response.source.as_deref(), Some("static_fallback"));
-        assert_eq!(response.stale, Some(true));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(state.credential_persistence_degraded());
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3789,16 +3974,18 @@ mod grok_catalog_provider_tests {
             .await
             .unwrap();
 
-        let response = proxy_models_for_selection(
+        let error = proxy_models_for_selection(
             &state,
             Some(AppKind::Codex),
             Some("grok-refresh-rejected-provider"),
         )
         .await
-        .0;
+        .unwrap_err();
 
-        assert_eq!(response.source.as_deref(), Some("static_fallback"));
-        assert_eq!(response.stale, Some(true));
+        assert!(matches!(
+            error.status,
+            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED
+        ));
         assert!(!state.credential_persistence_degraded());
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3897,13 +4084,13 @@ mod grok_catalog_provider_tests {
             .unwrap();
 
         for provider_id in ["grok-unbound-model-provider", "grok-stale-model-provider"] {
-            let response =
-                proxy_models_for_selection(&state, Some(AppKind::Codex), Some(provider_id))
-                    .await
-                    .0;
-            assert_eq!(response.source.as_deref(), Some("static_fallback"));
-            assert_eq!(response.stale, Some(true));
-            assert_eq!(response.fetched_at_ms, None);
+            let error = proxy_models_for_selection(&state, Some(AppKind::Codex), Some(provider_id))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.status,
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+            ));
         }
 
         assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3993,6 +4180,7 @@ mod grok_catalog_provider_tests {
             Some("grok-runtime-bound-provider"),
         )
         .await
+        .unwrap()
         .0;
 
         assert_eq!(response.source.as_deref(), Some("upstream"));
@@ -4092,6 +4280,7 @@ mod grok_catalog_provider_tests {
             Some("kiro-runtime-bound-provider"),
         )
         .await
+        .unwrap()
         .0;
 
         assert_eq!(
@@ -4196,6 +4385,7 @@ mod grok_catalog_provider_tests {
             Some("kiro-unresolved-idc-provider"),
         )
         .await
+        .unwrap()
         .0;
 
         assert!(response.data.is_empty());
@@ -4282,6 +4472,140 @@ mod grok_catalog_provider_tests {
             .unwrap();
     }
 
+    async fn seed_kimi_stale_catalog(
+        state: &ServerState,
+        provider_id: &str,
+        account_id: &str,
+        models: &[&str],
+    ) -> crate::proxy::kimi_runtime::KimiModelCatalogScope {
+        let (app, provider_revision, runtime_fingerprint) = {
+            let providers = state.providers.read().await;
+            let stored = providers
+                .providers
+                .iter()
+                .find(|stored| stored.provider.id == provider_id)
+                .unwrap();
+            let plan = providers.runtime_plan(stored.app, provider_id).unwrap();
+            (
+                stored.app,
+                stored.resource.revision,
+                plan.runtime_fingerprint.clone(),
+            )
+        };
+        let account = state
+            .find_account_for_provider(ProviderType::KimiCode, account_id)
+            .await
+            .unwrap();
+        let scope = crate::proxy::kimi_runtime::KimiModelCatalogScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            &runtime_fingerprint,
+            account_id,
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        );
+        let fetched_at_ms = (crate::infra::time::now_ms().min(i64::MAX as u128) as i64)
+            .saturating_sub(crate::proxy::kimi_runtime::KIMI_MODEL_CATALOG_TTL_MS)
+            .saturating_sub(1);
+        state
+            .kimi_model_catalogs
+            .insert(
+                scope.clone(),
+                models.iter().map(|model| (*model).to_string()).collect(),
+                fetched_at_ms,
+            )
+            .await;
+        scope
+    }
+
+    async fn configure_qoder_catalog_fixture(
+        state: &ServerState,
+        provider_id: &str,
+        origin: &str,
+        site: crate::domain::qoder::QoderSite,
+        accounts: &[(&str, &str)],
+        bound_account_id: &str,
+    ) {
+        let accounts = accounts
+            .iter()
+            .map(|(id, uid)| ((*id).to_string(), (*uid).to_string()))
+            .collect::<Vec<_>>();
+        let origin_for_store = origin.to_string();
+        state
+            .mutate_accounts_immediate(move |store| {
+                for (id, uid) in accounts {
+                    let rail = match site {
+                        crate::domain::qoder::QoderSite::Global => "global_oauth",
+                        crate::domain::qoder::QoderSite::Cn => "cn_oauth",
+                    };
+                    let refresh_mode = match site {
+                        crate::domain::qoder::QoderSite::Global => "cosy",
+                        crate::domain::qoder::QoderSite::Cn => "qodercn20",
+                    };
+                    store.upsert(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "providerType": "qoder_cosy",
+                            "accessToken": format!("qoder-access-{uid}"),
+                            "refreshToken": format!("qoder-refresh-{uid}"),
+                            "expiresAt": i64::MAX / 2,
+                            "profile": {
+                                "site": site.as_str(),
+                                "credentialRail": rail,
+                                "refreshMode": refresh_mode,
+                                "uid": uid,
+                                "aid": format!("aid-{uid}"),
+                                "name": "Qoder Catalog Fixture",
+                                "userType": "personal_standard",
+                                "machineId": format!("machine-{uid}"),
+                                "machineType": "5"
+                            },
+                            "raw": {
+                                "qoderSecrets": {"machineToken": format!("machine-token-{uid}")},
+                                "testQoderEndpoints": {
+                                    "openapiBaseUrl": origin_for_store,
+                                    "centerBaseUrl": origin_for_store,
+                                    "gatewayBaseUrl": origin_for_store,
+                                    "jobGatewayBaseUrl": origin_for_store
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        let provider_id = provider_id.to_string();
+        let bound_account_id = bound_account_id.to_string();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: provider_id,
+                        name: "Qoder catalog fixture".to_string(),
+                        settings_config: json!({"models": ["configured-model-must-not-survive"]}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("qoder_cosy".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("qoder_cosy".to_string()),
+                                account_id: Some(bound_account_id),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn kimi_catalog_uses_only_bound_account_and_filters_unreviewed_models() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -4338,6 +4662,7 @@ mod grok_catalog_provider_tests {
         let response =
             proxy_models_for_selection(&state, Some(AppKind::Codex), Some("kimi-bound-provider"))
                 .await
+                .unwrap()
                 .0;
 
         assert_eq!(response.source.as_deref(), Some("coding_v1_models"));
@@ -4388,6 +4713,7 @@ mod grok_catalog_provider_tests {
         let response =
             proxy_models_for_selection(&state, Some(AppKind::Codex), Some("kimi-empty-provider"))
                 .await
+                .unwrap()
                 .0;
         assert!(response.data.is_empty());
         assert_eq!(response.source.as_deref(), Some("coding_v1_models"));
@@ -4487,6 +4813,7 @@ mod grok_catalog_provider_tests {
         let response =
             proxy_models_for_selection(&state, Some(AppKind::Codex), Some("kimi-401-provider"))
                 .await
+                .unwrap()
                 .0;
         assert_eq!(response.source.as_deref(), Some("coding_v1_models"));
         assert!(response.data.iter().any(|model| model.id == "k3"));
@@ -4504,6 +4831,581 @@ mod grok_catalog_provider_tests {
             .unwrap();
         assert_eq!(account.token_refresh_generation, 2);
         assert_eq!(account.access_token.as_deref(), Some(refreshed_access));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_catalog_transient_failure_uses_only_exact_scope_stale() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let upstream = Router::new().route(
+            "/models",
+            get(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "temporary"})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let models_url = format!("http://{address}/models");
+
+        let state_with_stale = catalog_test_state("kimi-exact-stale");
+        configure_kimi_catalog_fixture(
+            &state_with_stale,
+            "kimi-exact-stale-provider",
+            models_url.clone(),
+            &[("kimi-exact-stale-account", "stale-token")],
+            "kimi-exact-stale-account",
+            None,
+            None,
+        )
+        .await;
+        seed_kimi_stale_catalog(
+            &state_with_stale,
+            "kimi-exact-stale-provider",
+            "kimi-exact-stale-account",
+            &["k3"],
+        )
+        .await;
+        let cached = proxy_models_for_selection(
+            &state_with_stale,
+            Some(AppKind::Codex),
+            Some("kimi-exact-stale-provider"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(cached.source.as_deref(), Some("kimi_models_cache"));
+        assert_eq!(cached.stale, Some(true));
+        assert!(cached.data.iter().any(|model| model.id == "kimi-k3"));
+
+        let state_without_stale = catalog_test_state("kimi-no-static-fallback");
+        configure_kimi_catalog_fixture(
+            &state_without_stale,
+            "kimi-no-cache-provider",
+            models_url,
+            &[("kimi-no-cache-account", "no-cache-token")],
+            "kimi-no-cache-account",
+            None,
+            None,
+        )
+        .await;
+        let unavailable = proxy_models_for_selection(
+            &state_without_stale,
+            Some(AppKind::Codex),
+            Some("kimi-no-cache-provider"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(unavailable.data.is_empty());
+        assert_eq!(
+            unavailable.source.as_deref(),
+            Some("kimi_models_unavailable")
+        );
+        assert_eq!(unavailable.stale, Some(false));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_catalog_protocol_drift_invalidates_stale_instead_of_authorizing_it() {
+        for (fixture, payload) in [
+            ("malformed", json!({"data": {"id": "k3"}})),
+            (
+                "unknown-only",
+                json!({"data": [{"id": "future-unreviewed-model"}]}),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream_payload = payload.clone();
+            let upstream = Router::new().route(
+                "/models",
+                get(move || {
+                    let payload = upstream_payload.clone();
+                    async move { Json(payload) }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, upstream).await.unwrap();
+            });
+            let state = catalog_test_state(&format!("kimi-{fixture}-catalog"));
+            let provider_id = format!("kimi-{fixture}-provider");
+            let account_id = format!("kimi-{fixture}-account");
+            configure_kimi_catalog_fixture(
+                &state,
+                &provider_id,
+                format!("http://{address}/models"),
+                &[(&account_id, "protocol-drift-token")],
+                &account_id,
+                None,
+                None,
+            )
+            .await;
+            let scope = seed_kimi_stale_catalog(&state, &provider_id, &account_id, &["k3"]).await;
+
+            let response =
+                proxy_models_for_selection(&state, Some(AppKind::Codex), Some(&provider_id))
+                    .await
+                    .unwrap()
+                    .0;
+            assert!(response.data.is_empty(), "fixture={fixture}");
+            assert_eq!(
+                response.source.as_deref(),
+                Some("kimi_models_unavailable"),
+                "fixture={fixture}"
+            );
+            assert_eq!(response.stale, Some(false), "fixture={fixture}");
+            assert!(
+                state
+                    .kimi_model_catalogs
+                    .stale(
+                        &scope,
+                        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+                    )
+                    .await
+                    .is_none(),
+                "fixture={fixture}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn kimi_catalog_second_401_is_terminal_after_one_same_account_refresh() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({
+                            "access_token": "e30.eyJ1c2VyX2lkIjoia2ltaS1jYXRhbG9nLXVzZXIifQ.still-rejected",
+                            "refresh_token": "rotated-once",
+                            "expires_in": 3600,
+                            "token_type": "Bearer"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "still unauthorized"})),
+                        )
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = catalog_test_state("kimi-second-401");
+        configure_kimi_catalog_fixture(
+            &state,
+            "kimi-second-401-provider",
+            format!("http://{address}/models"),
+            &[("kimi-second-401-account", "initial-token")],
+            "kimi-second-401-account",
+            Some("initial-refresh"),
+            Some(format!("http://{address}/token")),
+        )
+        .await;
+
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("kimi-second-401-provider"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(response.data.is_empty());
+        assert_eq!(response.source.as_deref(), Some("kimi_models_unavailable"));
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_initial_refresh_transient_can_only_use_pre_refresh_exact_scope_stale() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_requests_for_route = std::sync::Arc::clone(&token_requests);
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let upstream = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&token_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "temporary"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({"data": [{"id": "must-not-be-requested"}]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = catalog_test_state("kimi-initial-refresh-stale");
+        configure_kimi_catalog_fixture(
+            &state,
+            "kimi-initial-refresh-provider",
+            format!("http://{address}/models"),
+            &[("kimi-initial-refresh-account", "expired-token")],
+            "kimi-initial-refresh-account",
+            Some("refresh-token"),
+            Some(format!("http://{address}/token")),
+        )
+        .await;
+        seed_kimi_stale_catalog(
+            &state,
+            "kimi-initial-refresh-provider",
+            "kimi-initial-refresh-account",
+            &["k3"],
+        )
+        .await;
+        let mut accounts = state.accounts_snapshot().await;
+        accounts
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == "kimi-initial-refresh-account")
+            .unwrap()
+            .expires_at = Some(1);
+        state.replace_account_store_for_test(accounts).await;
+
+        let response = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("kimi-initial-refresh-provider"),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.source.as_deref(), Some("kimi_models_cache"));
+        assert_eq!(response.stale, Some(true));
+        assert!(response.data.iter().any(|model| model.id == "kimi-k3"));
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn qoder_catalog_is_bound_account_authoritative_and_projects_site_capabilities() {
+        for site in [
+            crate::domain::qoder::QoderSite::Global,
+            crate::domain::qoder::QoderSite::Cn,
+        ] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let observed_users = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let observed_users_for_route = std::sync::Arc::clone(&observed_users);
+            let upstream = Router::new().route(
+                crate::domain::qoder::QODER_MODEL_LIST_PATH,
+                get(move |headers: HeaderMap| {
+                    let observed_users = std::sync::Arc::clone(&observed_users_for_route);
+                    async move {
+                        observed_users.lock().unwrap().push(
+                            headers
+                                .get("cosy-user")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        let catalog = json!({"chat": [
+                            {"key":"gmodel","display_name":"GLM-5.3","enable":true},
+                            {"key":"mmodel","display_name":"MiniMax","enable":true},
+                            {"key":"future-route","display_name":"Future","enable":true},
+                            {"key":"qmodel","display_name":"Hidden","enable":false}
+                        ]});
+                        Json(json!({
+                            "statusCodeValue": 200,
+                            "body": catalog.to_string()
+                        }))
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, upstream).await.unwrap();
+            });
+            let suffix = site.as_str();
+            let state = catalog_test_state(&format!("qoder-{suffix}-catalog"));
+            let provider_id = format!("qoder-{suffix}-provider");
+            let bound_account_id = format!("qoder-{suffix}-bound");
+            let distractor_account_id = format!("qoder-{suffix}-distractor");
+            configure_qoder_catalog_fixture(
+                &state,
+                &provider_id,
+                &format!("http://{address}"),
+                site,
+                &[
+                    (&distractor_account_id, "distractor-user"),
+                    (&bound_account_id, "bound-user"),
+                ],
+                &bound_account_id,
+            )
+            .await;
+
+            let response =
+                proxy_models_for_selection(&state, Some(AppKind::Codex), Some(&provider_id))
+                    .await
+                    .unwrap()
+                    .0;
+            assert_eq!(response.source.as_deref(), Some("qoder_live_model_catalog"));
+            assert_eq!(response.stale, Some(false));
+            assert!(response.fetched_at_ms.is_some());
+            assert!(!response
+                .data
+                .iter()
+                .any(|model| model.id.contains("configured-model") || model.id == "qwen3.7-plus"));
+            let glm = response
+                .data
+                .iter()
+                .find(|model| model.id == "glm-5.3")
+                .unwrap();
+            assert_eq!(
+                glm.reasoning_efforts.as_deref(),
+                Some(
+                    ["none", "low", "high", "max"]
+                        .map(str::to_string)
+                        .as_slice()
+                )
+            );
+            assert_eq!(glm.context_window, Some(1_000_000));
+            assert_eq!(
+                glm.input_modalities.as_deref(),
+                Some(["text".to_string()].as_slice())
+            );
+            assert_eq!(glm.supports_tools, Some(true));
+            let minimax_id = match site {
+                crate::domain::qoder::QoderSite::Global => "minimax-m3",
+                crate::domain::qoder::QoderSite::Cn => "minimax-m2.7",
+            };
+            let minimax = response
+                .data
+                .iter()
+                .find(|model| model.id == minimax_id)
+                .unwrap();
+            assert_eq!(
+                minimax.context_window,
+                Some(match site {
+                    crate::domain::qoder::QoderSite::Global => 1_000_000,
+                    crate::domain::qoder::QoderSite::Cn => 200_000,
+                })
+            );
+            let future = response
+                .data
+                .iter()
+                .find(|model| model.id == "future-route")
+                .unwrap();
+            assert_eq!(future.reasoning_efforts, None);
+            assert_eq!(future.context_window, None);
+            assert_eq!(observed_users.lock().unwrap().as_slice(), ["bound-user"]);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn qoder_authoritative_empty_catalog_hides_static_models() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            crate::domain::qoder::QODER_MODEL_LIST_PATH,
+            get(|| async {
+                Json(json!({
+                    "statusCodeValue": 200,
+                    "body": json!({"chat": []}).to_string()
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = catalog_test_state("qoder-empty-catalog");
+        configure_qoder_catalog_fixture(
+            &state,
+            "qoder-empty-provider",
+            &format!("http://{address}"),
+            crate::domain::qoder::QoderSite::Global,
+            &[("qoder-empty-account", "empty-user")],
+            "qoder-empty-account",
+        )
+        .await;
+
+        let response =
+            proxy_models_for_selection(&state, Some(AppKind::Codex), Some("qoder-empty-provider"))
+                .await
+                .unwrap()
+                .0;
+        assert!(response.data.is_empty());
+        assert_eq!(response.source.as_deref(), Some("qoder_live_model_catalog"));
+        assert_eq!(response.stale, Some(false));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn qoder_catalog_second_401_is_terminal_after_one_same_account_refresh() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let model_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_users = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let model_requests_for_route = std::sync::Arc::clone(&model_requests);
+        let refresh_requests_for_route = std::sync::Arc::clone(&refresh_requests);
+        let observed_users_for_route = std::sync::Arc::clone(&observed_users);
+        let upstream = Router::new()
+            .route(
+                crate::domain::qoder::QODER_MODEL_LIST_PATH,
+                get(move |headers: HeaderMap| {
+                    let requests = std::sync::Arc::clone(&model_requests_for_route);
+                    let observed_users = std::sync::Arc::clone(&observed_users_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        observed_users.lock().unwrap().push(
+                            headers
+                                .get("cosy-user")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        (StatusCode::UNAUTHORIZED, Json(json!({"error": "expired"})))
+                    }
+                }),
+            )
+            .route(
+                "/algo/api/v3/user/jobToken",
+                post(move || {
+                    let requests = std::sync::Arc::clone(&refresh_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({
+                            "statusCodeValue": 200,
+                            "body": json!({
+                                "securityOauthToken": "qoder-refreshed-access-bound-user",
+                                "refreshToken": "qoder-refreshed-refresh-bound-user",
+                                "id": "bound-user",
+                                "name": "Qoder Catalog Fixture",
+                                "expireTime": chrono::Utc::now().timestamp_millis() + 3_600_000
+                            }).to_string()
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/userinfo",
+                get(|| async {
+                    Json(json!({
+                        "id": "bound-user",
+                        "user_id": "bound-user",
+                        "account_id": "aid-bound-user",
+                        "name": "Qoder Catalog Fixture",
+                        "user_type": "personal_standard"
+                    }))
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let state = catalog_test_state("qoder-second-401");
+        configure_qoder_catalog_fixture(
+            &state,
+            "qoder-second-401-provider",
+            &format!("http://{address}"),
+            crate::domain::qoder::QoderSite::Global,
+            &[
+                ("qoder-second-401-distractor", "distractor-user"),
+                ("qoder-second-401-bound", "bound-user"),
+            ],
+            "qoder-second-401-bound",
+        )
+        .await;
+
+        let error = proxy_models_for_selection(
+            &state,
+            Some(AppKind::Codex),
+            Some("qoder-second-401-provider"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refresh_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(model_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_users.lock().unwrap().as_slice(),
+            ["bound-user", "bound-user"]
+        );
+        let accounts = state.accounts_snapshot().await;
+        assert_eq!(
+            accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == "qoder-second-401-bound")
+                .unwrap()
+                .token_refresh_generation,
+            2
+        );
+        assert_eq!(
+            accounts
+                .accounts
+                .iter()
+                .find(|account| account.id == "qoder-second-401-distractor")
+                .unwrap()
+                .token_refresh_generation,
+            1
+        );
         server.abort();
     }
 }

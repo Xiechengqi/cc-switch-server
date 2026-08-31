@@ -117,7 +117,25 @@ pub struct Account {
     #[serde(default)]
     pub needs_relogin: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capacity_pool_limits: BTreeMap<String, AccountCapacityPoolLimit>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capability_observations: BTreeMap<String, AccountCapabilityObservation>,
+}
+
+pub const CLAUDE_FABLE_CAPACITY_POOL: &str = "claude_fable_7d_oi";
+pub const CLAUDE_FABLE_QUOTA_TIER: &str = "seven_day_fable";
+pub const CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY: f64 = 0.5;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCapacityPoolLimit {
+    pub until_ms: i64,
+    pub observed_at_ms: i64,
+    pub auth_identity_generation: u64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -149,6 +167,30 @@ pub struct AccountQuotaTier {
     pub unit: Option<String>,
     #[serde(default)]
     pub resets_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+pub fn active_account_capacity_pool_limit<'a>(
+    account: &'a Account,
+    capacity_pool: &str,
+    now_ms: i64,
+) -> Option<&'a AccountCapacityPoolLimit> {
+    account
+        .capacity_pool_limits
+        .get(capacity_pool)
+        .filter(|limit| {
+            limit.auth_identity_generation == account.auth_identity_generation
+                && limit.until_ms > now_ms
+        })
 }
 
 pub fn gemini_v1internal_project_id(account: &Account) -> Option<String> {
@@ -265,14 +307,21 @@ pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<Acco
         {
             ("upstream reported the Grok spending limit", "grok_account")
         }
-        ProviderType::KiroOAuth
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
             if extra.pointer("/overageEnabled").and_then(Value::as_bool) == Some(false)
                 && quota
                     .tiers
                     .iter()
                     .any(kiro_inference_quota_tier_is_exhausted) =>
         {
-            ("upstream reported the Kiro usage limit", "kiro_account")
+            if account.provider_type == ProviderType::AmazonQOAuth {
+                (
+                    "upstream reported the Amazon Q usage limit",
+                    "amazon_q_account",
+                )
+            } else {
+                ("upstream reported the Kiro usage limit", "kiro_account")
+            }
         }
         ProviderType::QoderCosy
             if extra
@@ -288,7 +337,9 @@ pub fn active_account_usage_block(account: &Account, now_ms: i64) -> Option<Acco
         .tiers
         .iter()
         .filter(|tier| match account.provider_type {
-            ProviderType::KiroOAuth => kiro_inference_quota_tier_is_exhausted(tier),
+            ProviderType::KiroOAuth | ProviderType::AmazonQOAuth => {
+                kiro_inference_quota_tier_is_exhausted(tier)
+            }
             _ => quota_tier_is_exhausted(tier),
         })
         .filter_map(|tier| tier.resets_at)
@@ -769,6 +820,7 @@ impl AccountStore {
             last_refresh_error: input.last_refresh_error,
             refresh_consecutive_failures: 0,
             needs_relogin: false,
+            capacity_pool_limits: BTreeMap::new(),
             capability_observations: BTreeMap::new(),
         };
 
@@ -791,6 +843,7 @@ impl AccountStore {
                 account.extra_headers = existing.extra_headers.clone();
             }
             if account.provider_type == existing.provider_type {
+                account.capacity_pool_limits = existing.capacity_pool_limits.clone();
                 account.capability_observations = existing.capability_observations.clone();
             }
             if account.provider_type == ProviderType::CodexOAuth {
@@ -1133,6 +1186,37 @@ impl AccountStore {
         Some(account.clone())
     }
 
+    pub fn mark_capacity_pool_limit(
+        &mut self,
+        account_id: &str,
+        capacity_pool: &str,
+        limit: AccountCapacityPoolLimit,
+    ) -> Option<Account> {
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|item| item.id == account_id)?;
+        if limit.auth_identity_generation != account.auth_identity_generation {
+            return None;
+        }
+        let should_replace =
+            account
+                .capacity_pool_limits
+                .get(capacity_pool)
+                .is_none_or(|current| {
+                    current.auth_identity_generation != limit.auth_identity_generation
+                        || limit.observed_at_ms > current.observed_at_ms
+                        || (limit.observed_at_ms == current.observed_at_ms
+                            && limit.until_ms >= current.until_ms)
+                });
+        if should_replace {
+            account
+                .capacity_pool_limits
+                .insert(capacity_pool.to_string(), limit);
+        }
+        Some(account.clone())
+    }
+
     pub fn update_entitlement_snapshot(
         &mut self,
         account_id: &str,
@@ -1396,6 +1480,7 @@ fn advance_account_generations(previous: &Account, current: &mut Account) {
     current.token_refresh_generation = previous.token_refresh_generation;
     if account_auth_identity_changed(&previous_identity, &current_identity) {
         current.auth_identity_generation = current.auth_identity_generation.saturating_add(1);
+        current.capacity_pool_limits.clear();
     }
     if previous_token != current_token {
         current.token_refresh_generation = current.token_refresh_generation.saturating_add(1);
@@ -2575,6 +2660,56 @@ mod tests {
 
         assert_eq!(account.rate_limited_until, Some(1_000_000));
         assert!(account.last_refresh_error.is_none());
+    }
+
+    #[test]
+    fn capacity_pool_limits_follow_the_account_identity_generation() {
+        let now_ms = 1_000_000;
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("fable-capacity-account".to_string());
+        input.email = Some("first@example.com".to_string());
+        input.subscription_level = Some("claude_max_20x".to_string());
+        let account = store.upsert(input.clone());
+        let generation = account.auth_identity_generation;
+        store
+            .mark_capacity_pool_limit(
+                &account.id,
+                CLAUDE_FABLE_CAPACITY_POOL,
+                AccountCapacityPoolLimit {
+                    until_ms: now_ms + 60_000,
+                    observed_at_ms: now_ms,
+                    auth_identity_generation: generation,
+                    reason: "test".to_string(),
+                    utilization: Some(1.0),
+                    source: "test".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(active_account_capacity_pool_limit(
+            store
+                .accounts
+                .iter()
+                .find(|item| item.id == account.id)
+                .unwrap(),
+            CLAUDE_FABLE_CAPACITY_POOL,
+            now_ms,
+        )
+        .is_some());
+
+        let same_identity = store.upsert(input.clone());
+        assert_eq!(same_identity.auth_identity_generation, generation);
+        assert!(active_account_capacity_pool_limit(
+            &same_identity,
+            CLAUDE_FABLE_CAPACITY_POOL,
+            now_ms,
+        )
+        .is_some());
+
+        input.email = Some("second@example.com".to_string());
+        let replaced_identity = store.upsert(input);
+        assert!(replaced_identity.auth_identity_generation > generation);
+        assert!(replaced_identity.capacity_pool_limits.is_empty());
     }
 
     #[test]
@@ -3918,6 +4053,7 @@ mod tests {
                         limit: Some(1000.0),
                         unit: Some("requests".to_string()),
                         resets_at: Some(123456),
+                        ..Default::default()
                     }],
                     extra_usage: Some(json!({"raw": true})),
                 }),

@@ -173,7 +173,7 @@ describe("Server Provider profile drafts", () => {
       expect(profile, profileId).toBeDefined();
 
       const draft = createDraftForProfile(profile!);
-      expect(draft.name, profileId).toBe("Qoder COSY");
+      expect(draft.name, profileId).toBe("Qoder OAuth");
       expect(draft.icon, profileId).toBe("qoder");
       expect(draft.meta.providerType, profileId).toBe("qoder_cosy");
       expect(readUpstreamModel(draft.settingsConfig), profileId).toBe("auto");
@@ -217,13 +217,20 @@ describe("Server Provider profile drafts", () => {
     expect(readUpstreamModel(draft.settingsConfig)).toBe(defaultModel);
   });
 
-  it("keeps official profiles locked to passthrough", () => {
+  it("lets official OpenAI API Key profiles choose a fixed upstream model", () => {
     const profile = providerRegistry.profiles.find(
       (item) => item.profileId === "codex.openai_api_key",
     );
     expect(profile).toBeDefined();
-    expect(modelPoliciesForProfile(profile!)).toEqual(["passthrough"]);
+    expect(modelPoliciesForProfile(profile!)).toEqual([
+      "single",
+      "passthrough",
+    ]);
+    expect(profile!.modelPolicy).toBe("passthrough");
+    expect(profile!.defaultUpstreamModel).toBe("gpt-5.4");
 
+    const draft = createDraftForProfile(profile!);
+    expect(readModelPolicy(draft.settingsConfig, profile!)).toBe("passthrough");
     expect(
       readModelPolicy(
         {
@@ -231,7 +238,7 @@ describe("Server Provider profile drafts", () => {
         },
         profile!,
       ),
-    ).toBe("passthrough");
+    ).toBe("single");
   });
 
   it("reads fixed Codex endpoints from the structured TOML provider section", () => {

@@ -749,7 +749,9 @@ fn assert_generation_observation(observation: &QoderRequestObservation) {
         Some("1.24.2")
     );
     let body = observation.decoded_body.as_ref().unwrap();
-    assert_eq!(body["model_config"], model_config());
+    let mut expected_model_config = model_config();
+    expected_model_config["max_input_tokens"] = json!(180_000);
+    assert_eq!(body["model_config"], expected_model_config);
     assert_eq!(
         body["chat_context"]["extra"]["modelConfig"]["key"],
         MODEL_KEY
@@ -758,6 +760,11 @@ fn assert_generation_observation(observation: &QoderRequestObservation) {
         body["chat_context"]["extra"]["modelConfig"]["source"],
         MODEL_SOURCE
     );
+    assert_eq!(
+        body["chat_context"]["extra"]["modelConfig"]["max_input_tokens"],
+        180_000
+    );
+    assert!(body["parameters"].get("context_length").is_none());
     assert_eq!(body["stream"], true);
     assert_signed_request(observation, QODER_GENERATION_SIGNATURE_PATH);
 }

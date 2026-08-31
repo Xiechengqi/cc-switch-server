@@ -55,6 +55,7 @@ use cc_switch_server::domain::usage::store::{
 use cc_switch_server::state::{ServerState, ServerStateInner};
 
 static TEST_INGRESS_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static TEST_STATE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 // Public, test-only certificate material for the fixed Kiro production hostname.
 const KIRO_TLS_TEST_CERT_DER_BASE64: &str = "MIIBwzCCAWmgAwIBAgIUM5mNJa+Y4w+TfYE0tby7+cwCgvkwCgYIKoZIzj0EAwIwJDEiMCAGA1UEAwwZcS51cy1lYXN0LTEuYW1hem9uYXdzLmNvbTAeFw0yNjA4MTAwNDI1MTJaFw0zNjA4MDcwNDI1MTJaMCQxIjAgBgNVBAMMGXEudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASDTVpLMmPpEjKM0NBdwzX3ijYr8sltBchwDbP2jCwiMT8vnz7i+ohH3fybHZkFTl0+V2+Ob5Elu/bz21OS6sIlo3kwdzAdBgNVHQ4EFgQUmTHPCLDJQWn1yVGAVnL0qYy/lEUwHwYDVR0jBBgwFoAUmTHPCLDJQWn1yVGAVnL0qYy/lEUwDwYDVR0TAQH/BAUwAwEB/zAkBgNVHREEHTAbghlxLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tMAoGCCqGSM49BAMCA0gAMEUCIQCiWhmyUjuQKxGbK3gwPoYa2HFN0q9SNWDMwT/oDRg+DAIgesGfJzyaLQRvPfaW5KNQ+XN00MXVr2mtP/IHOeMGMk4=";
@@ -364,7 +365,8 @@ fn openai_oauth_provider_bundle_draft(
             {
                 "app": "codex",
                 "enabled": true,
-                "profileId": "codex.openai_oauth"
+                "profileId": "codex.openai_oauth",
+                "modelPolicy": "passthrough"
             }
         ],
         "clientRequestId": client_request_id
@@ -3065,6 +3067,20 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
     let seen = Arc::new(AtomicUsize::new(0));
     let upstream = Router::new()
         .route(
+            "/ListAvailableModels",
+            get(|| async {
+                Json(json!({
+                    "models": [{
+                        "modelId": "claude-sonnet-4.8",
+                        "tokenLimits": {
+                            "maxInputTokens": 200_000,
+                            "maxOutputTokens": 8_192
+                        }
+                    }]
+                }))
+            }),
+        )
+        .route(
             "/generateAssistantResponse",
             post(
                 |State(seen): State<Arc<AtomicUsize>>,
@@ -3283,6 +3299,20 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
 async fn claude_kiro_managed_account_bridges_stream_response() {
     let seen = Arc::new(AtomicUsize::new(0));
     let upstream = Router::new()
+        .route(
+            "/ListAvailableModels",
+            get(|| async {
+                Json(json!({
+                    "models": [{
+                        "modelId": "claude-sonnet-4.8",
+                        "tokenLimits": {
+                            "maxInputTokens": 200_000,
+                            "maxOutputTokens": 8_192
+                        }
+                    }]
+                }))
+            }),
+        )
         .route(
             "/generateAssistantResponse",
             post(
@@ -5254,7 +5284,7 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(body.contains("msg-before-break"));
-    assert!(body.contains("cc_switch_stream_error"));
+    assert!(body.contains("upstream_stream_break"));
     assert!(body.contains("event: message_stop"));
     assert!(!body.contains("must-not-replay"));
     assert_eq!(broken_requests.load(Ordering::SeqCst), 1);
@@ -5375,7 +5405,7 @@ async fn stream_proxy_marks_upstream_chunk_error() {
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body_text = String::from_utf8_lossy(&body);
     assert!(body_text.contains("response.failed"));
-    assert!(body_text.contains("cc_switch_stream_error"));
+    assert!(body_text.contains("upstream_stream_break"));
 
     for _ in 0..20 {
         let usage = state.usage_snapshot().await;
@@ -5432,6 +5462,7 @@ fn codex_oauth_schema_fixture_preserves_future_native_fields() {
                     limit: Some(1000.0),
                     unit: Some("requests".to_string()),
                     resets_at: Some(123456),
+                    ..Default::default()
                 },
             ],
             extra_usage: None,
@@ -7583,11 +7614,11 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["optionSchemas"]
             .as_array()
             .map(Vec::len),
-        Some(20)
+        Some(23)
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        70
+        76
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7622,8 +7653,11 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         .find(|profile| profile["profileId"] == "codex.openai_api_key")
         .unwrap();
     assert_eq!(official["modelPolicy"], "passthrough");
-    assert!(official.get("allowedModelPolicies").is_none());
-    assert!(official.get("defaultUpstreamModel").is_none());
+    assert_eq!(
+        official["allowedModelPolicies"],
+        json!(["single", "passthrough"])
+    );
+    assert_eq!(official["defaultUpstreamModel"], "gpt-5.4");
     let configurable = profiles
         .iter()
         .find(|profile| profile["profileId"] == "codex.openrouter")
@@ -7648,7 +7682,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 24);
+    assert_eq!(presets.len(), 25);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));
@@ -7664,6 +7698,9 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.kiro_oauth"));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["profileId"] == "codex.amazon_q_oauth"));
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.github_copilot"));
@@ -7934,10 +7971,14 @@ async fn ollama_account_usage_is_session_scoped_provider_owned_and_secret_free()
 }
 
 #[tokio::test]
-async fn openai_oauth_bundle_requires_per_app_model_policies() {
+async fn openai_oauth_bundle_defaults_to_per_app_model_policies() {
     let state = test_state();
     state
         .mutate_accounts_immediate(|accounts| {
+            accounts.upsert(test_account_input(
+                "bundle-openai-global-account",
+                ProviderType::CodexOAuth,
+            ));
             accounts.upsert(test_account_input(
                 "bundle-openai-account",
                 ProviderType::CodexOAuth,
@@ -7950,7 +7991,7 @@ async fn openai_oauth_bundle_requires_per_app_model_policies() {
 
     let mut global = openai_oauth_provider_bundle_draft(
         "bundle-openai-global",
-        "bundle-openai-account",
+        "bundle-openai-global-account",
         "bundle-openai-global-request",
     );
     global["modelPolicyScope"] = json!("global");
@@ -7964,7 +8005,11 @@ async fn openai_oauth_bundle_requires_per_app_model_policies() {
         .as_object_mut()
         .unwrap()
         .remove("upstreamModel");
-    let rejected = app
+    global["surfaces"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("modelPolicy");
+    let created_global = app
         .clone()
         .oneshot(json_request(
             Method::POST,
@@ -7974,7 +8019,17 @@ async fn openai_oauth_bundle_requires_per_app_model_policies() {
         ))
         .await
         .unwrap();
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(created_global.status(), StatusCode::OK);
+    let global_bundle = json_body(created_global).await["bundle"].clone();
+    assert_eq!(global_bundle["modelPolicyScope"], "global");
+    assert_eq!(
+        global_bundle["surfaces"]["claude"]["runtime"]["modelPolicy"],
+        json!({"mode": "single", "upstreamModel": "gpt-5.6-sol"})
+    );
+    assert_eq!(
+        global_bundle["surfaces"]["codex"]["runtime"]["modelPolicy"],
+        json!({"mode": "single", "upstreamModel": "gpt-5.6-sol"})
+    );
 
     let created = app
         .oneshot(json_request(
@@ -10655,13 +10710,19 @@ fn test_state() -> ServerState {
     test_state_with_host(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
-fn test_state_with_cursor_api_key_verifier() -> ServerState {
+fn unique_test_state_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let sequence = TEST_STATE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{sequence}", std::process::id())
+}
+
+fn test_state_with_cursor_api_key_verifier() -> ServerState {
+    let suffix = unique_test_state_suffix();
     let config_dir =
-        std::env::temp_dir().join(format!("cc-switch-server-http-cursor-test-{nanos}"));
+        std::env::temp_dir().join(format!("cc-switch-server-http-cursor-test-{suffix}"));
     let config = cc_switch_server::domain::settings::config::ServerConfig::empty();
     config.save(&config_dir).unwrap();
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
@@ -10683,11 +10744,8 @@ fn test_state_with_cursor_api_key_verifier() -> ServerState {
 }
 
 fn test_state_with_host(host: IpAddr) -> ServerState {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let config_dir = std::env::temp_dir().join(format!("cc-switch-server-http-test-{nanos}"));
+    let suffix = unique_test_state_suffix();
+    let config_dir = std::env::temp_dir().join(format!("cc-switch-server-http-test-{suffix}"));
     let config = cc_switch_server::domain::settings::config::ServerConfig::empty();
     config.save(&config_dir).unwrap();
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
@@ -10708,11 +10766,8 @@ fn test_state_with_host(host: IpAddr) -> ServerState {
 }
 
 fn test_state_with_external_web_dist() -> ServerState {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("cc-switch-server-http-external-{nanos}"));
+    let suffix = unique_test_state_suffix();
+    let root = std::env::temp_dir().join(format!("cc-switch-server-http-external-{suffix}"));
     let web_dist = root.join("web-dist");
     std::fs::create_dir_all(&web_dist).unwrap();
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(

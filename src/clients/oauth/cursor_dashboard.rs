@@ -128,6 +128,7 @@ impl CursorDashboardSnapshot {
                     limit: (limit > 0.0).then_some(limit / 100.0),
                     unit: (limit > 0.0).then(|| "USD".to_string()),
                     resets_at: usage.and_then(cursor_billing_cycle_end_ms),
+                    ..Default::default()
                 }
             })
             .into_iter()

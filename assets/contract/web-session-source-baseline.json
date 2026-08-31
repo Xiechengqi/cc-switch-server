@@ -1,0 +1,33 @@
+{
+  "format": "cc-switch-web-session-source-baseline",
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-30T00:00:00Z",
+  "sources": [
+    {
+      "id": "omniroute",
+      "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+      "rootEnv": "CC_SWITCH_WEB_SESSION_OMNIROUTE_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/OmniRoute",
+      "files": [
+        {"path": "open-sse/config/providers/registry/grok-web/index.ts", "sha256": "f406695462a015f4791b19f44ffd92284bcc1b0278e5780ba3eab27417f7bcd1"},
+        {"path": "open-sse/executors/grok-web.ts", "sha256": "fd3b5c10dee1574b94e1d7274a675b40ce7dcd1a1564e70f05099173c55b526f"},
+        {"path": "src/lib/providers/webCookieAuth.ts", "sha256": "23cc43fd9a2dddd89f80234cffccc944b3c3011d210f1680522bb6851d534637"},
+        {"path": "open-sse/config/providers/registry/perplexity/web/index.ts", "sha256": "139ab467400347e037af576387c534b2f3b08615840a1bd58d406bbcdc29d5ad"},
+        {"path": "open-sse/executors/perplexity-web.ts", "sha256": "de16700312731e26b6cfdcabeaf0ba318411e214a3b74e424be27c5b77bb4b9a"},
+        {"path": "open-sse/executors/perplexity-web/protocol.ts", "sha256": "683795104a43b967819b31df6c790504bc211c85e96d8491156d0ed1493ca28f"}
+      ]
+    },
+    {
+      "id": "9router",
+      "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
+      "rootEnv": "CC_SWITCH_WEB_SESSION_9ROUTER_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/9router",
+      "files": [
+        {"path": "open-sse/providers/registry/grok-web.js", "sha256": "9f3747848bddbc96135298b5d45ca2c66a44e80dea5a0d045e29f06e75492328"},
+        {"path": "open-sse/executors/grok-web.js", "sha256": "1045a0e61260c5810f3d03cfc7dd59699e4aa26986032c45c73cfa1ff0b070ba"},
+        {"path": "open-sse/providers/registry/perplexity-web.js", "sha256": "a9fef1ecf0f870b1ac5145122ebcc83aa174bd5e48145995cdb66e86deeb25b6"},
+        {"path": "open-sse/executors/perplexity-web.js", "sha256": "03a41ffccdf5fc659414c7131b0e32449f833548371f434e821f1bb84f39f907"}
+      ]
+    }
+  ]
+}
