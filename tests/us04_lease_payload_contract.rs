@@ -3,11 +3,8 @@ use cc_switch_server::domain::sharing::router_contract::ShareDescriptor;
 
 #[test]
 fn namespace_lease_payload_matches_router_signature_blob() {
-    let request_json =
-        include_str!("../../cc-switch-router/tests/fixtures/us04_share_lease_request.json");
-    let expected_signed =
-        include_str!("../../cc-switch-router/tests/fixtures/us04_share_lease_signed_payload.json")
-            .trim();
+    let request_json = include_str!("fixtures/us04_share_lease_request.json");
+    let expected_signed = include_str!("fixtures/us04_share_lease_signed_payload.json").trim();
     let value: serde_json::Value = serde_json::from_str(request_json).expect("request json");
     let share: ShareDescriptor =
         serde_json::from_value(value.get("share").cloned().expect("share"))
