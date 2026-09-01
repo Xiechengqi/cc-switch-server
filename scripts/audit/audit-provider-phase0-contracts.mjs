@@ -7,7 +7,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const routerRoot = process.env.CC_SWITCH_ROUTER_ROOT || "../cc-switch-router";
+const routerRepository = "../cc-switch-router";
+const routerRoot = process.env.CC_SWITCH_ROUTER_ROOT || routerRepository;
 const serverBaselineCommit = "90329f4a4681552ca85e48a107c7e1fc67466dd0";
 const routerBaselineCommit = "43ebea0ea20f7ab8be081d929c4fdd7cf79a40b1";
 const checkMode = process.argv.includes("--check");
@@ -1096,7 +1097,7 @@ function buildRouterBaseline() {
   return {
     schemaVersion: 1,
     authority: "phase-0-router-channel-baseline",
-    router: { repository: routerRoot, commit: routerBaselineCommit },
+    router: { repository: routerRepository, commit: routerBaselineCommit },
     sources: [
       { path: "src/models.rs", sha256: sha256(models) },
       { path: "src/main.rs", sha256: sha256(main) },

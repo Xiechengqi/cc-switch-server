@@ -18,12 +18,13 @@ jobs:
     env:
       CC_SWITCH_PROVIDER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch
       CC_SWITCH_ROUTER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
+      CC_SWITCH_ROUTER_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Checkout pinned Provider audit baseline
         uses: actions/checkout@v4
@@ -39,7 +40,7 @@ jobs:
           repository: Xiechengqi/cc-switch-router
           ref: 0b737e09e78a268e0dbb2de7c4aec0b61ee7e04d
           path: provider-audit/cc-switch-router
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
