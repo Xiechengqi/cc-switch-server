@@ -42,6 +42,11 @@ jobs:
           path: provider-audit/cc-switch-router
           fetch-depth: 0
 
+      - name: Install static-check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:

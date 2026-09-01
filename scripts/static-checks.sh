@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "static checks require ripgrep (rg)" >&2
+  exit 1
+fi
+
 echo "== rustfmt check =="
 mapfile -t rust_files < <(rg --files -g '*.rs' src)
 if [[ "${#rust_files[@]}" -gt 0 ]]; then
