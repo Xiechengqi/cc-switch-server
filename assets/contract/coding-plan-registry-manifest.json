@@ -4,7 +4,7 @@
   "capturedAt": "2026-08-30T00:00:00Z",
   "generatedFrom": {
     "providerRegistry": "assets/contract/provider-registry.json",
-    "providerRegistrySha256": "175921ce471551a28dbe6f096363fe5808be161e5cd022e77c221b57cf56cbad",
+    "providerRegistrySha256": "38a1cee09c4c052f8ba98bd7e0eb61bdcc563c63622c14a9b7ecfbf506b70684",
     "sourceBaseline": "assets/contract/coding-plan-source-baseline.json",
     "sourceBaselineSha256": "48b6e580862e4186d5f5206e8ddfff68870218fffa6f7060b9d7c39c7735fe4a",
     "sourceCommits": {

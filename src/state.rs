@@ -21228,6 +21228,7 @@ mod tests {
                 at: "2026-08-11T10:00:00Z".into(),
             }],
             target_commit_id: Some("aabbccddeeff".into()),
+            failure: None,
             restart_after: true,
             updated_at: "2026-08-11T10:00:01Z".into(),
         };

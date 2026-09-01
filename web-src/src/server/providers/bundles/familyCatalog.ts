@@ -48,6 +48,7 @@ export const SUBSCRIPTION_FAMILY_IDS = [
   "family.cursor_api_key",
   "family.ollama_cloud",
   "family.kiro_oauth",
+  "family.amazon_q_oauth",
   "family.github_copilot",
   "family.kimi_code",
   "family.qoder_cosy",

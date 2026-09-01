@@ -108,6 +108,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
+          target_commitish: ${{ github.sha }}
           name: Latest Build (${{ steps.metadata.outputs.version }})
           body: |
             ## Latest automatic build

@@ -28,7 +28,10 @@ const TOTAL_STEPS: usize = 7;
 const DOWNLOAD_PROGRESS_PERCENT_STEP: u8 = 20;
 const DOWNLOAD_PROGRESS_UNKNOWN_BYTES: u64 = 8 * 1024 * 1024;
 const SANITY_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_CONTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const MIN_UPGRADE_MEMORY_LIMIT_BYTES: u64 = 96 * 1024 * 1024;
+const MIN_UPGRADE_MEMORY_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
 const STATE_FILENAME: &str = "upgrade-state.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -61,6 +64,43 @@ pub enum UpgradeStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeFailureDiagnostic {
+    pub failure_code: String,
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub diagnostic: String,
+}
+
+impl UpgradeFailureDiagnostic {
+    fn upgrade(error: &SelfUpdateError) -> Self {
+        Self::from_error("upgrade_failed", "upgrade", error)
+    }
+
+    fn resource_preflight(error: &SelfUpdateError) -> Self {
+        Self::from_error("resource_preflight_failed", "resource_preflight", error)
+    }
+
+    fn startup_contract_preflight(error: &SelfUpdateError) -> Self {
+        Self::from_error(
+            "startup_contract_preflight_failed",
+            "staged_preflight",
+            error,
+        )
+    }
+
+    fn from_error(failure_code: &str, stage: &str, error: &SelfUpdateError) -> Self {
+        Self {
+            failure_code: failure_code.into(),
+            stage: stage.into(),
+            exit_code: None,
+            diagnostic: bounded_diagnostic(&error.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeStatusSnapshot {
@@ -70,6 +110,8 @@ pub struct UpgradeStatusSnapshot {
     pub logs: Vec<UpgradeLogEntry>,
     #[serde(default)]
     pub target_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<UpgradeFailureDiagnostic>,
     #[serde(default)]
     pub restart_after: bool,
     #[serde(default)]
@@ -84,6 +126,7 @@ pub struct UpgradeHandle {
     pub history: Arc<Mutex<Vec<UpgradeLogEntry>>>,
     pub restart_pending: Arc<Mutex<bool>>,
     target_commit_id: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<UpgradeFailureDiagnostic>>>,
     restart_after: bool,
 }
 
@@ -153,6 +196,7 @@ impl UpgradeRegistry {
             history: Arc::new(Mutex::new(Vec::new())),
             restart_pending: Arc::new(Mutex::new(false)),
             target_commit_id: Arc::new(Mutex::new(None)),
+            failure: Arc::new(Mutex::new(None)),
             restart_after,
         };
         *guard = Some(handle.clone());
@@ -182,6 +226,11 @@ impl UpgradeRegistry {
                 }
                 Err(error) => {
                     *task_handle.status.lock().await = UpgradeStatus::Failed;
+                    let mut failure = task_handle.failure.lock().await;
+                    if failure.is_none() {
+                        *failure = Some(UpgradeFailureDiagnostic::upgrade(&error));
+                    }
+                    drop(failure);
                     if let Err(persist_error) = registry.persist(&task_handle).await {
                         warn!(error = %persist_error, "persist failed upgrade failed");
                     }
@@ -237,6 +286,7 @@ impl UpgradeRegistry {
         *handle.status.lock().await = snapshot.status;
         *handle.restart_pending.lock().await = snapshot.restart_pending;
         *handle.target_commit_id.lock().await = snapshot.target_commit_id;
+        *handle.failure.lock().await = snapshot.failure;
     }
 
     pub async fn clear_restart_pending(&self) {
@@ -441,6 +491,46 @@ async fn run_upgrade(
         .await;
         return Err(error);
     }
+    match current_cgroup_memory_preflight() {
+        Ok(Some(report)) => {
+            let level = if report.oom_kill_count > 0 {
+                UpgradeLogLevel::Warn
+            } else {
+                UpgradeLogLevel::Info
+            };
+            emit(
+                registry,
+                handle,
+                4,
+                level,
+                format!(
+                    "cgroup memory preflight passed: limit={} MiB, current={} MiB, headroom={} MiB, prior oom_kill={}",
+                    report.limit_bytes / 1024 / 1024,
+                    report.current_bytes / 1024 / 1024,
+                    report.headroom_bytes / 1024 / 1024,
+                    report.oom_kill_count
+                ),
+                Some(progress_pct(4, 20)),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            cleanup_tmp(target);
+            *handle.failure.lock().await =
+                Some(UpgradeFailureDiagnostic::resource_preflight(&error));
+            emit(
+                registry,
+                handle,
+                4,
+                UpgradeLogLevel::Error,
+                format!("resource preflight failed: {error}"),
+                None,
+            )
+            .await;
+            return Err(error);
+        }
+    }
     emit(
         registry,
         handle,
@@ -450,10 +540,16 @@ async fn run_upgrade(
         Some(progress_pct(4, 40)),
     )
     .await;
-    let target_commit = match sanity_exec(target).await {
+    let config_dir = registry
+        .state_path
+        .parent()
+        .ok_or_else(|| SelfUpdateError::Internal("upgrade state path has no parent".into()))?;
+    let target_commit = match sanity_exec(target, config_dir).await {
         Ok(commit) => commit,
         Err(error) => {
             cleanup_tmp(target);
+            *handle.failure.lock().await =
+                Some(UpgradeFailureDiagnostic::startup_contract_preflight(&error));
             emit(
                 registry,
                 handle,
@@ -675,7 +771,7 @@ fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("chmod staged file failed: {err}")))
 }
 
-async fn sanity_exec(path: &Path) -> Result<String, SelfUpdateError> {
+async fn sanity_exec(path: &Path, config_dir: &Path) -> Result<String, SelfUpdateError> {
     let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
         .await
         .map_err(|_| SelfUpdateError::Internal("sanity --help timed out".into()))?
@@ -699,7 +795,151 @@ async fn sanity_exec(path: &Path) -> Result<String, SelfUpdateError> {
             output.status
         )));
     }
-    validate_staged_version_output(&output.stdout)
+    let commit = validate_staged_version_output(&output.stdout)?;
+    let output = tokio::time::timeout(
+        STARTUP_CONTRACT_TIMEOUT,
+        Command::new(path)
+            .arg("--config-dir")
+            .arg(config_dir)
+            .args(["doctor", "--startup-contracts-only"])
+            .output(),
+    )
+    .await
+    .map_err(|_| SelfUpdateError::Internal("startup contract preflight timed out".into()))?
+    .map_err(|err| {
+        SelfUpdateError::Internal(format!("startup contract preflight exec failed: {err}"))
+    })?;
+    if !output.status.success() {
+        let diagnostic = command_diagnostic(&output.stdout, &output.stderr);
+        return Err(SelfUpdateError::Internal(format!(
+            "startup contract preflight exited with status {}: {diagnostic}",
+            output.status
+        )));
+    }
+    Ok(commit)
+}
+
+fn command_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut value = String::from_utf8_lossy(stderr).trim().to_string();
+    if value.is_empty() {
+        value = String::from_utf8_lossy(stdout).trim().to_string();
+    }
+    bounded_diagnostic(&value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupMemoryReport {
+    limit_bytes: u64,
+    current_bytes: u64,
+    headroom_bytes: u64,
+    oom_kill_count: u64,
+}
+
+fn current_cgroup_memory_preflight() -> Result<Option<CgroupMemoryReport>, SelfUpdateError> {
+    let mount_root = Path::new("/sys/fs/cgroup");
+    let cgroup = match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(value) => value,
+        Err(_) => return cgroup_memory_preflight(mount_root),
+    };
+    let Some(current) = cgroup_v2_path(mount_root, &cgroup) else {
+        return cgroup_memory_preflight(mount_root);
+    };
+
+    let mut path = Some(current.as_path());
+    let mut most_constrained: Option<CgroupMemoryReport> = None;
+    while let Some(candidate) = path {
+        if !candidate.starts_with(mount_root) {
+            break;
+        }
+        if let Some(report) = cgroup_memory_preflight(candidate)? {
+            let replace = most_constrained
+                .as_ref()
+                .is_none_or(|current| report.headroom_bytes < current.headroom_bytes);
+            if replace {
+                most_constrained = Some(report);
+            }
+        }
+        if candidate == mount_root {
+            break;
+        }
+        path = candidate.parent();
+    }
+    Ok(most_constrained)
+}
+
+fn cgroup_v2_path(mount_root: &Path, cgroup: &str) -> Option<PathBuf> {
+    let relative = cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    })?;
+    let mut resolved = mount_root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(value) => resolved.push(value),
+            _ => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn cgroup_memory_preflight(root: &Path) -> Result<Option<CgroupMemoryReport>, SelfUpdateError> {
+    let max_path = root.join("memory.max");
+    let current_path = root.join("memory.current");
+    if !max_path.is_file() || !current_path.is_file() {
+        return Ok(None);
+    }
+    let max = std::fs::read_to_string(&max_path)
+        .map_err(|error| SelfUpdateError::Internal(format!("read memory.max failed: {error}")))?;
+    if max.trim() == "max" {
+        return Ok(None);
+    }
+    let limit_bytes = max
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| SelfUpdateError::Internal(format!("parse memory.max failed: {error}")))?;
+    let current_bytes = std::fs::read_to_string(&current_path)
+        .map_err(|error| SelfUpdateError::Internal(format!("read memory.current failed: {error}")))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            SelfUpdateError::Internal(format!("parse memory.current failed: {error}"))
+        })?;
+    let headroom_bytes = limit_bytes.saturating_sub(current_bytes);
+    let oom_kill_count = std::fs::read_to_string(root.join("memory.events"))
+        .ok()
+        .and_then(|events| {
+            events.lines().find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == "oom_kill")
+                    .then(|| value.trim().parse::<u64>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(0);
+    if limit_bytes < MIN_UPGRADE_MEMORY_LIMIT_BYTES {
+        return Err(SelfUpdateError::Forbidden(format!(
+            "cgroup memory limit is {} MiB; at least {} MiB is required for safe replacement",
+            limit_bytes / 1024 / 1024,
+            MIN_UPGRADE_MEMORY_LIMIT_BYTES / 1024 / 1024
+        )));
+    }
+    if headroom_bytes < MIN_UPGRADE_MEMORY_HEADROOM_BYTES {
+        return Err(SelfUpdateError::Forbidden(format!(
+            "cgroup memory headroom is {} MiB; at least {} MiB is required before staged preflight",
+            headroom_bytes / 1024 / 1024,
+            MIN_UPGRADE_MEMORY_HEADROOM_BYTES / 1024 / 1024
+        )));
+    }
+    Ok(Some(CgroupMemoryReport {
+        limit_bytes,
+        current_bytes,
+        headroom_bytes,
+        oom_kill_count,
+    }))
 }
 
 fn validate_staged_version_output(stdout: &[u8]) -> Result<String, SelfUpdateError> {
@@ -752,6 +992,7 @@ async fn snapshot_from_handle(handle: &UpgradeHandle) -> UpgradeStatusSnapshot {
         restart_pending: *handle.restart_pending.lock().await,
         logs: handle.history.lock().await.clone(),
         target_commit_id: handle.target_commit_id.lock().await.clone(),
+        failure: handle.failure.lock().await.clone(),
         restart_after: handle.restart_after,
         updated_at: Utc::now().to_rfc3339(),
     }
@@ -766,6 +1007,7 @@ fn handle_from_snapshot(snapshot: UpgradeStatusSnapshot) -> UpgradeHandle {
         history: Arc::new(Mutex::new(snapshot.logs)),
         restart_pending: Arc::new(Mutex::new(snapshot.restart_pending)),
         target_commit_id: Arc::new(Mutex::new(snapshot.target_commit_id)),
+        failure: Arc::new(Mutex::new(snapshot.failure)),
         restart_after: snapshot.restart_after,
     }
 }
@@ -864,6 +1106,16 @@ pub fn record_helper_outcome(
     success: bool,
     message: &str,
 ) -> anyhow::Result<()> {
+    record_helper_outcome_with_diagnostic(config_dir, task_id, success, message, None)
+}
+
+pub fn record_helper_outcome_with_diagnostic(
+    config_dir: &Path,
+    task_id: &str,
+    success: bool,
+    message: &str,
+    failure: Option<UpgradeFailureDiagnostic>,
+) -> anyhow::Result<()> {
     let path = config_dir.join(STATE_FILENAME);
     let bytes = std::fs::read(&path)?;
     let mut snapshot: UpgradeStatusSnapshot = serde_json::from_slice(&bytes)?;
@@ -876,6 +1128,11 @@ pub fn record_helper_outcome(
         UpgradeStatus::Failed
     };
     snapshot.restart_pending = false;
+    if success {
+        snapshot.failure = None;
+    } else if failure.is_some() {
+        snapshot.failure = failure;
+    }
     append_recovery_log(
         &mut snapshot,
         if success {
@@ -889,9 +1146,57 @@ pub fn record_helper_outcome(
     write_snapshot_atomic(&path, &snapshot).map_err(anyhow::Error::msg)
 }
 
+fn bounded_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    let mut value = crate::logging::redact_sensitive_text(value)
+        .trim()
+        .replace(['\r', '\n'], " ");
+    if value.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut boundary = MAX_DIAGNOSTIC_BYTES - TRUNCATED_SUFFIX.len();
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+        value.push_str(TRUNCATED_SUFFIX);
+    }
+    if value.is_empty() {
+        "no diagnostic output".into()
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_bounds_are_utf8_safe_and_protocol_compatible() {
+        let diagnostic =
+            bounded_diagnostic(&format!("token=super-secret-token\n{}", "测".repeat(2_000)));
+        assert!(diagnostic.len() <= 4_096);
+        assert!(diagnostic.ends_with("...[truncated]"));
+        assert!(!diagnostic.contains('\r'));
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn failure_categories_keep_rollout_determinism_boundaries() {
+        let error = SelfUpdateError::Internal("fixture".into());
+        let ordinary = UpgradeFailureDiagnostic::upgrade(&error);
+        assert_eq!(ordinary.failure_code, "upgrade_failed");
+        assert_eq!(ordinary.stage, "upgrade");
+
+        let resource = UpgradeFailureDiagnostic::resource_preflight(&error);
+        assert_eq!(resource.failure_code, "resource_preflight_failed");
+        assert_eq!(resource.stage, "resource_preflight");
+
+        let startup = UpgradeFailureDiagnostic::startup_contract_preflight(&error);
+        assert_eq!(startup.failure_code, "startup_contract_preflight_failed");
+        assert_eq!(startup.stage, "staged_preflight");
+    }
 
     #[test]
     fn progress_pct_is_monotonic_and_finishes_at_100() {
@@ -969,6 +1274,7 @@ mod tests {
             restart_pending: true,
             logs: Vec::new(),
             target_commit_id: Some("abc1234".into()),
+            failure: None,
             restart_after: false,
             updated_at: Utc::now().to_rfc3339(),
         };
@@ -982,6 +1288,45 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_memory_preflight_rejects_low_limits_and_low_headroom() {
+        let dir = std::env::temp_dir().join(format!("cc-switch-memory-test-{}", new_task_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.events"), "oom 1\noom_kill 1\n").unwrap();
+
+        std::fs::write(dir.join("memory.max"), (80 * 1024 * 1024).to_string()).unwrap();
+        std::fs::write(dir.join("memory.current"), (20 * 1024 * 1024).to_string()).unwrap();
+        assert!(cgroup_memory_preflight(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("memory limit"));
+
+        std::fs::write(dir.join("memory.max"), (128 * 1024 * 1024).to_string()).unwrap();
+        std::fs::write(dir.join("memory.current"), (110 * 1024 * 1024).to_string()).unwrap();
+        assert!(cgroup_memory_preflight(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("memory headroom"));
+
+        std::fs::write(dir.join("memory.current"), (64 * 1024 * 1024).to_string()).unwrap();
+        let report = cgroup_memory_preflight(&dir).unwrap().unwrap();
+        assert_eq!(report.headroom_bytes, 64 * 1024 * 1024);
+        assert_eq!(report.oom_kill_count, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cgroup_v2_path_resolves_the_current_process_scope_safely() {
+        let root = Path::new("/sys/fs/cgroup");
+        assert_eq!(
+            cgroup_v2_path(root, "0::/system.slice/cc-switch-server.service\n"),
+            Some(root.join("system.slice/cc-switch-server.service"))
+        );
+        assert_eq!(cgroup_v2_path(root, "0::/\n"), Some(root.to_path_buf()));
+        assert_eq!(cgroup_v2_path(root, "0::/../../tmp\n"), None);
+        assert_eq!(cgroup_v2_path(root, "2:memory:/legacy\n"), None);
+    }
+
+    #[test]
     fn startup_reconciles_upgrade_against_running_commit() {
         let mut applied = UpgradeStatusSnapshot {
             task_id: "applied".into(),
@@ -989,6 +1334,7 @@ mod tests {
             restart_pending: false,
             logs: Vec::new(),
             target_commit_id: Some(crate::build_info::build_info().commit_id.to_string()),
+            failure: None,
             restart_after: true,
             updated_at: String::new(),
         };
@@ -1002,6 +1348,7 @@ mod tests {
             restart_pending: true,
             logs: Vec::new(),
             target_commit_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            failure: None,
             restart_after: false,
             updated_at: String::new(),
         };
@@ -1015,6 +1362,7 @@ mod tests {
             restart_pending: false,
             logs: Vec::new(),
             target_commit_id: None,
+            failure: None,
             restart_after: true,
             updated_at: String::new(),
         };

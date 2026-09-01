@@ -15,6 +15,7 @@ node - <<'NODE'
 const fs = require('fs');
 for (const file of [
   'assets/contract/provider-field-consumption.json',
+  'assets/contract/provider-registry-expectations.json',
   'assets/contract/provider-legacy-behavior.json',
   'assets/contract/provider-writer-inventory.json',
   'assets/contract/coding-plan-source-baseline.json',

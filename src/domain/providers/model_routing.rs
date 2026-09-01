@@ -651,24 +651,16 @@ mod tests {
             json!({"modelMapping": {"mode": "single", "upstreamModel": "gpt-5.4"}}),
         );
 
-        normalize_and_validate_provider_model_routing(
-            AppKind::Codex,
-            &mut explicit,
-            Some(profile),
-        )
-        .unwrap();
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut explicit, Some(profile))
+            .unwrap();
         assert_eq!(
             explicit.settings_config["modelMapping"],
             json!({"mode": "single", "upstreamModel": "gpt-5.4"})
         );
 
         let mut missing = provider(Some("codex_oauth"), json!({}));
-        normalize_and_validate_provider_model_routing(
-            AppKind::Codex,
-            &mut missing,
-            Some(profile),
-        )
-        .unwrap();
+        normalize_and_validate_provider_model_routing(AppKind::Codex, &mut missing, Some(profile))
+            .unwrap();
         assert_eq!(
             missing.settings_config["modelMapping"],
             json!({"mode": "passthrough"})

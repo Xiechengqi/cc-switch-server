@@ -27,7 +27,7 @@ const refreshSource = process.argv.includes("--refresh-source");
 
 const expectedCounts = Object.freeze({
   upstreamProviderTypes: 16,
-  serverProviderTypes: 22,
+  serverProviderTypes: 23,
   appPresets: Object.freeze({ claude: 15, codex: 7, gemini: 4 }),
   universalRecipes: 2,
   serverPresets: Object.freeze({ claude: 16, codex: 8, gemini: 5 }),

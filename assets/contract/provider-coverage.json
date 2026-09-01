@@ -4,7 +4,7 @@
     "serverLegacyInventory": "assets/contract/server-provider-legacy-inventory.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "53e71e1512cc59c02fd9319166006d0fdbad98c6f492e25089d9ecdc6cf580c4"
+      "sha256": "2d84b959ed370d994fa1ef9f29a56edd84181184c0ab5c7e7bde6ac9eddad2a1"
     },
     "upstreamCommit": "b1dee0153da94316fb50416c679a11f74cc66f14"
   },
@@ -135,6 +135,18 @@
       ],
       "required": true,
       "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "AmazonQOAuth",
+      "id": "amazon_q_oauth",
+      "label": "Amazon Q Developer",
+      "apps": [
+        "claude",
+        "codex"
+      ],
+      "required": false,
+      "presentInSource": false,
       "presentInServer": true
     },
     {

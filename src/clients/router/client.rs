@@ -235,6 +235,8 @@ pub struct InstallationUpgradeTaskReportPayload {
     pub restart_pending: bool,
     pub logs: Vec<crate::self_update::upgrade::UpgradeLogEntry>,
     pub target_commit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::self_update::upgrade::UpgradeFailureDiagnostic>,
     pub restart_after: bool,
     pub updated_at: String,
 }
@@ -247,6 +249,7 @@ impl From<UpgradeStatusSnapshot> for InstallationUpgradeTaskReportPayload {
             restart_pending: snapshot.restart_pending,
             logs: snapshot.logs,
             target_commit_id: snapshot.target_commit_id,
+            failure: snapshot.failure,
             restart_after: snapshot.restart_after,
             updated_at: snapshot.updated_at,
         }
@@ -2716,12 +2719,18 @@ impl Serialize for CanonicalInstallationUpgradeTaskReportPayload<'_> {
         S: serde::Serializer,
     {
         let payload = self.0;
-        let mut state = serializer.serialize_struct("InstallationUpgradeTaskReportPayload", 7)?;
+        let mut state = serializer.serialize_struct(
+            "InstallationUpgradeTaskReportPayload",
+            if payload.failure.is_some() { 8 } else { 7 },
+        )?;
         state.serialize_field("taskId", &payload.task_id)?;
         state.serialize_field("status", &payload.status)?;
         state.serialize_field("restartPending", &payload.restart_pending)?;
         state.serialize_field("logs", &payload.logs)?;
         state.serialize_field("targetCommitId", &payload.target_commit_id)?;
+        if let Some(failure) = payload.failure.as_ref() {
+            state.serialize_field("failure", failure)?;
+        }
         state.serialize_field("restartAfter", &payload.restart_after)?;
         state.serialize_field("updatedAt", &payload.updated_at)?;
         state.end()
@@ -3353,6 +3362,7 @@ mod tests {
                 at: "2026-08-11T10:00:00Z".into(),
             }],
             target_commit_id: Some("7b5e172c9cb4".into()),
+            failure: None,
             restart_after: true,
             updated_at: "2026-08-11T10:00:01Z".into(),
         };
@@ -3424,6 +3434,12 @@ mod tests {
                 at: "2026-08-11T10:00:00Z".into(),
             }],
             target_commit_id: Some("aabbccddeeff".into()),
+            failure: Some(crate::self_update::upgrade::UpgradeFailureDiagnostic {
+                failure_code: "replacement_exited".into(),
+                stage: "replacement_startup".into(),
+                exit_code: Some(1),
+                diagnostic: "replacement exited with status 1".into(),
+            }),
             restart_after: true,
             updated_at: "2026-08-11T10:00:01Z".into(),
         };
@@ -3442,6 +3458,9 @@ mod tests {
         assert_eq!(request["taskId"], "task-upgrade-report");
         assert_eq!(request["status"], "failed");
         assert_eq!(request["logs"][0]["level"], "error");
+        assert_eq!(request["failure"]["failureCode"], "replacement_exited");
+        assert_eq!(request["failure"]["stage"], "replacement_startup");
+        assert_eq!(request["failure"]["exitCode"], 1);
         assert!(request.get("payload").is_none());
         let timestamp_ms = request["timestampMs"].as_i64().unwrap();
         let nonce = request["nonce"].as_str().unwrap();

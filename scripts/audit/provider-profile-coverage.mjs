@@ -18,6 +18,7 @@ export const requiredProviderTypes = Object.freeze([
 ]);
 
 export const serverCompatibilityProviderTypes = Object.freeze([
+  ["amazon_q_oauth", "Amazon Q Developer", ["claude", "codex"]],
   ["aws_bedrock", "AWS Bedrock compatibility schema", ["claude"]],
   ["nvidia", "Nvidia OpenAI-compatible API", ["claude", "codex"]],
   ["deepseek_api", "DeepSeek API key", ["claude", "codex"]],

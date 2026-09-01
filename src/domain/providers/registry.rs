@@ -92,6 +92,48 @@ pub struct ProviderRegistry {
     pub conformance: Vec<DriverConformance>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderRegistryExpectations {
+    format: String,
+    schema_version: u32,
+    counts: ProviderRegistryExpectedCounts,
+    first_class_profiles: ProviderRegistryExpectedFirstClassProfiles,
+    required_profile_ids: Vec<String>,
+    required_driver_ids: Vec<String>,
+    required_family_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderRegistryExpectedCounts {
+    families: usize,
+    profiles: usize,
+    legacy_preset_mappings: usize,
+    drivers: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderRegistryExpectedFirstClassProfiles {
+    claude: usize,
+    codex: usize,
+    gemini: usize,
+}
+
+fn provider_registry_expectations() -> anyhow::Result<ProviderRegistryExpectations> {
+    let expectations: ProviderRegistryExpectations = serde_json::from_str(include_str!(
+        "../../../assets/contract/provider-registry-expectations.json"
+    ))
+    .context("embedded Provider registry expectations must decode")?;
+    if expectations.format != "cc-switch-provider-registry-expectations"
+        || expectations.schema_version != 1
+    {
+        bail!("unsupported Provider registry expectations format or schema");
+    }
+    Ok(expectations)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DriverOptionSchemaSpec {
@@ -469,6 +511,14 @@ pub enum ConformanceState {
 
 static REGISTRY: OnceLock<ProviderRegistry> = OnceLock::new();
 
+pub fn validate_embedded_registry() -> anyhow::Result<()> {
+    let registry: ProviderRegistry = serde_json::from_str(include_str!(
+        "../../../assets/contract/provider-registry.json"
+    ))
+    .context("embedded Provider registry must decode")?;
+    validate_registry(&registry).context("embedded Provider registry must be valid")
+}
+
 pub fn provider_registry() -> &'static ProviderRegistry {
     REGISTRY.get_or_init(|| {
         let registry: ProviderRegistry = serde_json::from_str(include_str!(
@@ -634,6 +684,7 @@ pub fn custom_binding_compatibility_provider_type(
 }
 
 pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
+    let expectations = provider_registry_expectations()?;
     if registry.format != PROVIDER_REGISTRY_FORMAT {
         bail!("unexpected Provider registry format {}", registry.format);
     }
@@ -975,9 +1026,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
     }
 
     let expected_counts = BTreeMap::from([
-        (AppKind::Claude, 33usize),
-        (AppKind::Codex, 26usize),
-        (AppKind::Gemini, 11usize),
+        (AppKind::Claude, expectations.first_class_profiles.claude),
+        (AppKind::Codex, expectations.first_class_profiles.codex),
+        (AppKind::Gemini, expectations.first_class_profiles.gemini),
     ]);
     for (app, expected) in expected_counts {
         let actual = registry
@@ -998,10 +1049,22 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             );
         }
     }
-    if registry.profiles.len() != 76 {
+    if registry.profiles.len() != expectations.counts.profiles {
         bail!(
-            "Provider registry contains {} profiles, expected 76",
-            registry.profiles.len()
+            "Provider registry contains {} profiles, expected {}",
+            registry.profiles.len(),
+            expectations.counts.profiles
+        );
+    }
+    if registry.families.len() != expectations.counts.families
+        || registry.drivers.len() != expectations.counts.drivers
+    {
+        bail!(
+            "Provider registry family/Driver inventory is {}/{}, expected {}/{}",
+            registry.families.len(),
+            registry.drivers.len(),
+            expectations.counts.families,
+            expectations.counts.drivers
         );
     }
     if registry.custom_recipes.len() != 1 {
@@ -1010,11 +1073,27 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
             registry.custom_recipes.len()
         );
     }
-    if registry.legacy_preset_mappings.len() != 31 {
+    if registry.legacy_preset_mappings.len() != expectations.counts.legacy_preset_mappings {
         bail!(
-            "Provider registry contains {} legacy preset mappings, expected 31",
-            registry.legacy_preset_mappings.len()
+            "Provider registry contains {} legacy preset mappings, expected {}",
+            registry.legacy_preset_mappings.len(),
+            expectations.counts.legacy_preset_mappings
         );
+    }
+    for required in &expectations.required_profile_ids {
+        if !profile_ids.contains(required.as_str()) {
+            bail!("Provider registry is missing required profile {required}");
+        }
+    }
+    for required in &expectations.required_driver_ids {
+        if !driver_ids.contains(required.as_str()) {
+            bail!("Provider registry is missing required Driver {required}");
+        }
+    }
+    for required in &expectations.required_family_ids {
+        if !family_ids.contains(required.as_str()) {
+            bail!("Provider registry is missing required family {required}");
+        }
     }
 
     let mut mappings = BTreeSet::new();

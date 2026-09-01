@@ -1,0 +1,31 @@
+{
+  "format": "cc-switch-provider-registry-expectations",
+  "schemaVersion": 1,
+  "counts": {
+    "families": 34,
+    "profiles": 76,
+    "legacyPresetMappings": 31,
+    "drivers": 23
+  },
+  "firstClassProfiles": {
+    "claude": 33,
+    "codex": 26,
+    "gemini": 11
+  },
+  "requiredProfileIds": [
+    "claude.amazon_q_oauth",
+    "codex.amazon_q_oauth",
+    "claude.grok_web_session",
+    "codex.grok_web_session",
+    "claude.perplexity_web_session",
+    "codex.perplexity_web_session"
+  ],
+  "requiredDriverIds": [
+    "special.amazon_q",
+    "special.grok_web_session",
+    "special.perplexity_web_session"
+  ],
+  "requiredFamilyIds": [
+    "family.amazon_q_oauth"
+  ]
+}

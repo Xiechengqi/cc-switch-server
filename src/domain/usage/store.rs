@@ -502,6 +502,17 @@ impl UsageStore {
     }
 
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_with_recovery_persistence(config_dir, true)
+    }
+
+    pub fn load_read_only(config_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_with_recovery_persistence(config_dir, false)
+    }
+
+    fn load_with_recovery_persistence(
+        config_dir: &Path,
+        persist_recovery: bool,
+    ) -> anyhow::Result<Self> {
         let path = usage_path(config_dir);
         let provider_health = ProviderHealthStore::load_rebuildable(config_dir);
         let usage_dir = usage_directory(config_dir);
@@ -510,7 +521,9 @@ impl UsageStore {
                 provider_health,
                 ..Self::default()
             };
-            store.save(config_dir)?;
+            if persist_recovery {
+                store.save(config_dir)?;
+            }
             return Ok(store);
         }
 
@@ -550,7 +563,9 @@ impl UsageStore {
                 journal.entries.is_empty(),
                 "Usage events exist without their authoritative snapshot"
             );
-            store.save(config_dir)?;
+            if persist_recovery {
+                store.save(config_dir)?;
+            }
             return Ok(store);
         }
 
@@ -564,7 +579,7 @@ impl UsageStore {
         let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
         store.writes_since_compact = replayed as u64;
         store.trim_recent_window();
-        if store.recover_pending_after_restart() {
+        if store.recover_pending_after_restart() && persist_recovery {
             store.save(config_dir)?;
         }
         Ok(store)

@@ -57,6 +57,10 @@ pub enum Command {
         /// Also check whether the configured host:port can be bound.
         #[arg(long)]
         check_port: bool,
+        /// Validate embedded startup contracts and existing state only. This mode is read-only
+        /// and is used to preflight a staged replacement before stopping the running server.
+        #[arg(long)]
+        startup_contracts_only: bool,
     },
     /// Print binary version and build metadata.
     Version {
@@ -315,6 +319,26 @@ mod tests {
         assert!(matches!(
             cli.effective_command(),
             Command::Version { json: false }
+        ));
+    }
+
+    #[test]
+    fn parses_read_only_startup_contract_preflight() {
+        let cli = Cli::try_parse_from([
+            "cc-switch-server",
+            "--config-dir",
+            "/tmp/cc-switch-server-preflight",
+            "doctor",
+            "--startup-contracts-only",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Doctor {
+                check_port: false,
+                startup_contracts_only: true,
+            }
         ));
     }
 

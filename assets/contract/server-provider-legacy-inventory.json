@@ -4,7 +4,7 @@
   "note": "This freezes the legacy Web preset inventory. Phase 2 replaces it with the Rust ProfileSpec registry.",
   "providerTypeSource": {
     "path": "src/domain/providers/model.rs",
-    "sha256": "53e71e1512cc59c02fd9319166006d0fdbad98c6f492e25089d9ecdc6cf580c4"
+    "sha256": "2d84b959ed370d994fa1ef9f29a56edd84181184c0ab5c7e7bde6ac9eddad2a1"
   },
   "providerTypes": [
     {
@@ -50,6 +50,10 @@
     {
       "variant": "KiroOAuth",
       "id": "kiro_oauth"
+    },
+    {
+      "variant": "AmazonQOAuth",
+      "id": "amazon_q_oauth"
     },
     {
       "variant": "KimiCode",
@@ -1310,7 +1314,7 @@
     ]
   },
   "counts": {
-    "providerTypes": 22,
+    "providerTypes": 23,
     "presets": {
       "claude": 16,
       "codex": 8,

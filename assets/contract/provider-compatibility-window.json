@@ -17,7 +17,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "4f33f16a85f68c2b901ad73749b1bc0c63490e7edaff472672aac07bac4af5a6"
+      "sha256": "786f0c1be2ae4162ca1fdaf6afe14726b17acf19aaa816a74e536c7ae16b4132"
     },
     {
       "path": "src/domain/providers/credentials.rs",
@@ -29,7 +29,7 @@
     },
     {
       "path": "src/domain/providers/model_routing.rs",
-      "sha256": "e179d7c8ff497ab6ce38349ffadc631cf9184d1514febddbbce40be9a243c570"
+      "sha256": "cf3a4f9d793175c45257f0342adf9db31d0bace7a5cba5a32c5e509e28111fe1"
     },
     {
       "path": "src/domain/providers/runtime.rs",

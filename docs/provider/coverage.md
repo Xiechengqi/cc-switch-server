@@ -24,6 +24,7 @@ Note: server compatibility provider types are explicit cc-switch-server classifi
 | `github_copilot` | claude, codex, gemini | yes | yes |
 | `deepseek_account` | claude | yes | yes |
 | `kiro_oauth` | claude, codex | yes | yes |
+| `amazon_q_oauth` | claude, codex | no | NO |
 | `kimi_code` | claude, codex, gemini | no | NO |
 | `qoder_cosy` | claude, codex, gemini | no | NO |
 | `cursor_oauth` | claude, codex, gemini | yes | yes |

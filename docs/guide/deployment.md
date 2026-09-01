@@ -126,11 +126,13 @@ Web 管理端的一键升级使用同文件系统 staging 和持久 rollback：
 - rollback：`/usr/local/bin/cc-switch-server.bak`
 - 任务状态：`<config-dir>/upgrade-state.json`
 
-release binary 和 checksum 下载请求使用目标 commit 作为 cache key。下载后必须通过 release `.sha256`、`--help` 和 staged binary `version --json` commit 校验，全部成功后才允许停止当前服务，避免 mutable `latest` CDN 返回上一版资产。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
+release binary 和 checksum 下载请求使用目标 commit 作为 cache key。下载后必须通过 release `.sha256`、`--help`、staged binary `version --json` commit 校验和 `doctor --startup-contracts-only` 只读启动契约预检，全部成功后才允许停止当前服务，避免 mutable `latest` CDN 返回上一版资产或带有不完整 Provider/Web Session registry 的 binary 进入替换阶段。该 doctor 模式只读取并验证 embedded registry 与既有 config/providers/accounts/shares/usage/tunnels，重建内存 runtime index；不检查目录可写性、不绑定端口、不写回状态。
+
+在 cgroup v2 有限内存环境中，staged binary 预检前还要求 memory limit 至少 96 MiB、当前 headroom 至少 32 MiB；不满足时以 `resource_preflight_failed` 在旧进程仍运行时拒绝升级。历史 `memory.events` 中存在 `oom_kill` 只产生 warning。systemd 部署通过独立 transient helper 原子替换 binary，重启后检查 `/version` 的 commit；`activating` 视为启动中，只有明确的 `failed`/`inactive`/`dead` 或 replacement 子进程已退出才提前失败，其他情况等待健康检查 deadline。检查失败会恢复 rollback。standalone 模式只终止当前 PID，不使用进程名全局 kill。容器内默认禁用一键升级，必须发布并部署新 image。
 
 普通重启与升级替换分开执行：systemd 部署通过延迟 transient unit 调用 `systemctl restart --no-block`；standalone/nohup 部署启动独立 helper，终止当前 PID 后从 `/proc/self/exe` 对应的实际 binary 路径恢复原启动参数。替代进程将 stdout/stderr 写入 `<config-dir>/log/server.log`，不依赖 `/usr/local/bin` 或 `/var/log` 权限；helper 自身输出写入 `<config-dir>/log/restart-helper.log`。管理页同时以 PID 和 `processInstanceId` 判断重启完成。
 
-replacement helper 会把最后一次本机 `/version` probe 的连接、HTTP、JSON 或 commit mismatch 原因和 rollback 结果写入任务日志。Client Tunnel 在进程替换期间可能短暂返回 Router 404/503；Web 会持续按原 task ID 恢复 status，只有 replacement commit 通过校验才 reload，回滚则显示 failed 和 helper 诊断。
+replacement helper 会把最后一次本机 `/version` probe 的连接、HTTP、JSON 或 commit mismatch 原因和 rollback 结果写入任务日志，并持久化 `failureCode`、`stage`、可选 `exitCode` 与最多 4096 字节的单行 `diagnostic`。Client Tunnel 在进程替换期间可能短暂返回 Router 404/503；Web 会持续按原 task ID 恢复 status，只有 replacement commit 通过校验才 reload，回滚则显示 failed 和 helper 诊断。Router 对同一目标 commit 在两个不同 installation 上出现 `startup_contract_preflight_failed` 或 `replacement_exited` 时打开 rollout circuit，拒绝继续批量重试；下载、网络、checksum、资源余量和单纯健康检查超时不会触发这个确定性熔断。
 
 Client Tunnel 下所有非登录类 `/web-api/*` 都由 Router 先做 owner/admin 鉴权。SSE 使用带 `Authorization` 的 fetch stream，不允许把 access token 放入 query string。
 

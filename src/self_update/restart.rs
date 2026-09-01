@@ -77,6 +77,37 @@ pub struct RestartOperationSnapshot {
     pub requested_at: String,
     pub updated_at: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplacementFailure {
+    failure_code: String,
+    stage: String,
+    exit_code: Option<i32>,
+    diagnostic: String,
+}
+
+impl std::fmt::Display for ReplacementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl ReplacementFailure {
+    fn upgrade_diagnostic(&self) -> crate::self_update::upgrade::UpgradeFailureDiagnostic {
+        crate::self_update::upgrade::UpgradeFailureDiagnostic {
+            failure_code: self.failure_code.clone(),
+            stage: self.stage.clone(),
+            exit_code: self.exit_code,
+            diagnostic: self.diagnostic.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -109,6 +140,23 @@ fn update_restart_operation(
     if new_pid.is_some() {
         snapshot.new_pid = new_pid;
     }
+    write_json_atomic(&path, &snapshot).map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+fn update_restart_failure(
+    config_dir: &Path,
+    operation_id: &str,
+    failure: &ReplacementFailure,
+) -> anyhow::Result<()> {
+    let path = config_dir.join(RESTART_OPERATION_FILENAME);
+    let mut snapshot: RestartOperationSnapshot = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if snapshot.operation_id != operation_id {
+        return Ok(());
+    }
+    snapshot.failure_code = Some(failure.failure_code.clone());
+    snapshot.exit_code = failure.exit_code;
+    snapshot.diagnostic = Some(failure.diagnostic.clone());
+    snapshot.updated_at = chrono::Utc::now().to_rfc3339();
     write_json_atomic(&path, &snapshot).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -333,6 +381,9 @@ fn launch_helper(spec: UpdateHelperSpec) -> Result<String, SelfUpdateError> {
             requested_at: now.clone(),
             updated_at: now,
             message: "restart helper is being launched".into(),
+            failure_code: None,
+            exit_code: None,
+            diagnostic: None,
         },
     )?;
     let spec_path = spec.config_dir.join(HELPER_SPEC_FILENAME);
@@ -567,9 +618,15 @@ fn run_update_helper_inner_with_timeout(
     };
 
     let replacement_result = match restart_error.as_ref() {
-        Some(error) => Err(format!("restart failed: {error}")),
+        Some(error) => Err(ReplacementFailure {
+            failure_code: "replacement_start_failed".into(),
+            stage: "replacement_start".into(),
+            exit_code: None,
+            diagnostic: bounded_diagnostic(&format!("restart failed: {error}")),
+        }),
         None => wait_for_expected_version(
-            spec.health_addr,
+            spec,
+            started_process.as_mut(),
             spec.expected_commit.as_deref(),
             Some(spec.parent_pid),
             health_timeout,
@@ -597,8 +654,9 @@ fn run_update_helper_inner_with_timeout(
     }
 
     stop_replacement_process(spec, started_process.as_mut());
-    let replacement_error =
+    let replacement_failure =
         replacement_result.expect_err("failed replacement must carry probe or restart diagnostics");
+    let replacement_error = replacement_failure.to_string();
     update_restart_operation(
         &spec.config_dir,
         &spec.operation_id,
@@ -607,35 +665,39 @@ fn run_update_helper_inner_with_timeout(
         &replacement_error,
         None,
     )?;
+    update_restart_failure(&spec.config_dir, &spec.operation_id, &replacement_failure)?;
     if let Some(task_id) = spec.task_id.as_deref() {
-        crate::self_update::upgrade::record_helper_outcome(
+        crate::self_update::upgrade::record_helper_outcome_with_diagnostic(
             &spec.config_dir,
             task_id,
             false,
             &format!("replacement failed: {replacement_error}; attempting rollback"),
+            Some(replacement_failure.upgrade_diagnostic()),
         )?;
     }
-    let (rollback_stage, rollback_result) =
-        match rollback_source.as_deref().filter(|path| path.exists()) {
-            Some(source) => match (|| -> anyhow::Result<()> {
-                std::fs::copy(source, &spec.staging_path)?;
-                install_staged_binary(&spec.staging_path, &spec.install_path)?;
-                let _ = start_process(spec)?;
-                wait_for_expected_version(spec.health_addr, None, None, health_timeout)
-                    .map(|_| ())
-                    .map_err(anyhow::Error::msg)
-            })() {
-                Ok(()) => (
-                    "rollback_succeeded",
-                    "rollback passed health checks".to_string(),
-                ),
-                Err(error) => ("rollback_failed", format!("rollback failed: {error}")),
-            },
-            None => (
-                "rollback_unavailable",
-                "rollback was not available".to_string(),
+    let (rollback_stage, rollback_result) = match rollback_source
+        .as_deref()
+        .filter(|path| path.exists())
+    {
+        Some(source) => match (|| -> anyhow::Result<()> {
+            std::fs::copy(source, &spec.staging_path)?;
+            install_staged_binary(&spec.staging_path, &spec.install_path)?;
+            let mut rollback_process = start_process(spec)?;
+            wait_for_expected_version(spec, rollback_process.as_mut(), None, None, health_timeout)
+                .map(|_| ())
+                .map_err(anyhow::Error::msg)
+        })() {
+            Ok(()) => (
+                "rollback_succeeded",
+                "rollback passed health checks".to_string(),
             ),
-        };
+            Err(error) => ("rollback_failed", format!("rollback failed: {error}")),
+        },
+        None => (
+            "rollback_unavailable",
+            "rollback was not available".to_string(),
+        ),
+    };
     let final_message = format!("replacement failed: {replacement_error}; {rollback_result}");
     let _ = update_restart_operation(
         &spec.config_dir,
@@ -876,24 +938,173 @@ fn install_staged_binary(staging: &Path, install: &Path) -> anyhow::Result<()> {
 }
 
 fn wait_for_expected_version(
-    addr: SocketAddr,
+    spec: &UpdateHelperSpec,
+    mut child: Option<&mut std::process::Child>,
     expected_commit: Option<&str>,
     replaced_pid: Option<u32>,
     timeout: Duration,
-) -> Result<u32, String> {
+) -> Result<u32, ReplacementFailure> {
     let deadline = Instant::now() + timeout;
     let mut last_error = "version endpoint did not respond".to_string();
     while Instant::now() < deadline {
-        match probe_version_pid(addr, expected_commit, replaced_pid) {
+        if let Some(failure) = replacement_exited(spec, child.as_deref_mut()) {
+            return Err(failure);
+        }
+        match probe_version_pid(spec.health_addr, expected_commit, replaced_pid) {
             Ok(pid) => return Ok(pid),
             Err(error) => last_error = error,
         }
-        std::thread::sleep(Duration::from_secs(1));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_secs(1).min(remaining));
     }
-    Err(format!(
-        "health/version checks timed out after {}s; last probe: {last_error}",
-        timeout.as_secs()
-    ))
+    Err(ReplacementFailure {
+        failure_code: "health_check_timeout".into(),
+        stage: "health_check".into(),
+        exit_code: None,
+        diagnostic: bounded_diagnostic(&format!(
+            "health/version checks timed out after {}s; last probe: {last_error}",
+            timeout.as_secs()
+        )),
+    })
+}
+
+fn replacement_exited(
+    spec: &UpdateHelperSpec,
+    child: Option<&mut std::process::Child>,
+) -> Option<ReplacementFailure> {
+    match spec.strategy {
+        RestartStrategy::Standalone => {
+            let child = child?;
+            let status = child.try_wait().ok()??;
+            let exit_code = status.code();
+            let log_tail = process_log_diagnostic(&spec.config_dir);
+            Some(ReplacementFailure {
+                failure_code: "replacement_exited".into(),
+                stage: "replacement_startup".into(),
+                exit_code,
+                diagnostic: bounded_diagnostic(&format!(
+                    "replacement exited with {status}{}",
+                    log_tail
+                        .as_deref()
+                        .map(|value| format!("; startup log: {value}"))
+                        .unwrap_or_default()
+                )),
+            })
+        }
+        RestartStrategy::Systemd | RestartStrategy::OpenRc => service_exit_failure(spec),
+    }
+}
+
+fn service_exit_failure(spec: &UpdateHelperSpec) -> Option<ReplacementFailure> {
+    let unit = spec.service_unit.as_deref()?;
+    let (program, args): (&str, Vec<&str>) = match spec.strategy {
+        RestartStrategy::Systemd => (
+            "systemctl",
+            vec![
+                "show",
+                unit,
+                "--property=ActiveState,SubState,MainPID,ExecMainStatus",
+            ],
+        ),
+        RestartStrategy::OpenRc => ("rc-service", vec![unit, "status"]),
+        RestartStrategy::Standalone => return None,
+    };
+    let mut command = Command::new(program);
+    command.args(&args);
+    let output = run_command_with_timeout(command, SERVICE_DETECTION_TIMEOUT).ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match spec.strategy {
+        RestartStrategy::Systemd => {
+            match classify_systemd_service(output.status.success(), &text) {
+                SystemdServiceState::RunningOrStarting | SystemdServiceState::Unknown => {
+                    return None;
+                }
+                SystemdServiceState::Stopped => {}
+            }
+        }
+        RestartStrategy::OpenRc if output.status.success() => return None,
+        RestartStrategy::OpenRc => {}
+        RestartStrategy::Standalone => return None,
+    }
+    let exit_code = text.lines().find_map(|line| {
+        line.strip_prefix("ExecMainStatus=")
+            .and_then(|value| value.trim().parse::<i32>().ok())
+    });
+    Some(ReplacementFailure {
+        failure_code: "replacement_exited".into(),
+        stage: "replacement_startup".into(),
+        exit_code,
+        diagnostic: bounded_diagnostic(&format!(
+            "{} service is not running after start: {}",
+            spec.strategy.label(),
+            text.trim()
+        )),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdServiceState {
+    RunningOrStarting,
+    Stopped,
+    Unknown,
+}
+
+fn classify_systemd_service(command_succeeded: bool, output: &str) -> SystemdServiceState {
+    if !command_succeeded {
+        return SystemdServiceState::Unknown;
+    }
+    let active_state = systemd_property(output, "ActiveState");
+    let sub_state = systemd_property(output, "SubState");
+    let main_pid = systemd_property(output, "MainPID")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
+    if active_state == Some("activating") || (active_state == Some("active") && main_pid > 0) {
+        return SystemdServiceState::RunningOrStarting;
+    }
+    if matches!(active_state, Some("failed" | "inactive"))
+        || matches!(sub_state, Some("failed" | "dead"))
+    {
+        return SystemdServiceState::Stopped;
+    }
+    SystemdServiceState::Unknown
+}
+
+fn systemd_property<'a>(output: &'a str, name: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
+        .map(str::trim)
+}
+
+fn process_log_diagnostic(config_dir: &Path) -> Option<String> {
+    let path = crate::logging::process_log_path(config_dir);
+    let lines = crate::logging::tail_file_lines(&path, 20).ok()?;
+    (!lines.is_empty()).then(|| lines.join(" | "))
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4_096;
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    let mut value = crate::logging::redact_sensitive_text(value)
+        .trim()
+        .replace(['\r', '\n'], " ");
+    if value.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut boundary = MAX_DIAGNOSTIC_BYTES - TRUNCATED_SUFFIX.len();
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+        value.push_str(TRUNCATED_SUFFIX);
+    }
+    if value.is_empty() {
+        "no diagnostic output".into()
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]
@@ -1114,6 +1325,60 @@ mod tests {
     }
 
     #[test]
+    fn helper_diagnostic_bounds_are_utf8_safe_and_protocol_compatible() {
+        let diagnostic = bounded_diagnostic(&format!(
+            "Authorization: Bearer super-secret-token\n{}",
+            "测\n".repeat(2_000)
+        ));
+        assert!(diagnostic.len() <= 4_096);
+        assert!(diagnostic.ends_with("...[truncated]"));
+        assert!(!diagnostic.contains('\r'));
+        assert!(!diagnostic.contains('\n'));
+        assert!(!diagnostic.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn systemd_activating_state_waits_for_health_check() {
+        let output = "ActiveState=activating\nSubState=start-pre\nMainPID=0\nExecMainStatus=0\n";
+        assert_eq!(
+            classify_systemd_service(true, output),
+            SystemdServiceState::RunningOrStarting
+        );
+    }
+
+    #[test]
+    fn systemd_only_reports_definitive_stops_as_exits() {
+        assert_eq!(
+            classify_systemd_service(
+                true,
+                "ActiveState=active\nSubState=running\nMainPID=42\nExecMainStatus=0\n"
+            ),
+            SystemdServiceState::RunningOrStarting
+        );
+        assert_eq!(
+            classify_systemd_service(
+                true,
+                "ActiveState=failed\nSubState=failed\nMainPID=0\nExecMainStatus=1\n"
+            ),
+            SystemdServiceState::Stopped
+        );
+        assert_eq!(
+            classify_systemd_service(
+                true,
+                "ActiveState=deactivating\nSubState=stop-sigterm\nMainPID=42\nExecMainStatus=0\n"
+            ),
+            SystemdServiceState::Unknown
+        );
+        assert_eq!(
+            classify_systemd_service(
+                false,
+                "ActiveState=inactive\nSubState=dead\nMainPID=0\nExecMainStatus=1\n"
+            ),
+            SystemdServiceState::Unknown
+        );
+    }
+
+    #[test]
     fn pending_upgrade_requires_success_and_restart_pending() {
         let dir = std::env::temp_dir().join(format!(
             "cc-switch-pending-upgrade-test-{}-{}",
@@ -1132,6 +1397,7 @@ mod tests {
             restart_pending: true,
             logs: Vec::new(),
             target_commit_id: Some("abcdef012345".into()),
+            failure: None,
             restart_after: false,
             updated_at: String::new(),
         };
@@ -1264,7 +1530,41 @@ mod tests {
     }
 
     #[test]
-    fn standalone_helper_rolls_back_mismatched_replacement_and_persists_diagnostics() {
+    fn replacement_health_timeout_has_a_structured_failure_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let health_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let spec = UpdateHelperSpec {
+            operation_id: "health-timeout".into(),
+            task_id: None,
+            mode: HelperMode::InstallStaged,
+            strategy: RestartStrategy::Standalone,
+            service_unit: None,
+            parent_pid: u32::MAX,
+            health_addr,
+            expected_commit: Some("aabbccddeeff".into()),
+            config_dir: std::env::temp_dir(),
+            server_args: Vec::new(),
+            install_path: PathBuf::from("/nonexistent/server"),
+            staging_path: PathBuf::from("/nonexistent/server.new"),
+            rollback_path: PathBuf::from("/nonexistent/server.bak"),
+        };
+
+        let failure = wait_for_expected_version(
+            &spec,
+            None,
+            spec.expected_commit.as_deref(),
+            None,
+            Duration::from_millis(10),
+        )
+        .expect_err("unbound health address must time out");
+        assert_eq!(failure.failure_code, "health_check_timeout");
+        assert_eq!(failure.stage, "health_check");
+        assert!(failure.diagnostic.contains("Connection refused"));
+    }
+
+    #[test]
+    fn standalone_helper_rolls_back_exited_replacement_and_persists_diagnostics() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -1280,8 +1580,13 @@ mod tests {
         let staging_path = dir.join(".cc-switch-server.new");
         let rollback_path = dir.join("cc-switch-server.bak");
         let spec_path = dir.join(HELPER_SPEC_FILENAME);
-        let executable = b"#!/bin/sh\nexit 0\n";
-        for path in [&install_path, &staging_path, &rollback_path] {
+        let replacement_executable = b"#!/bin/sh\nexit 0\n";
+        let rollback_executable = b"#!/bin/sh\nsleep 2\n";
+        for (path, executable) in [
+            (&install_path, rollback_executable.as_slice()),
+            (&staging_path, replacement_executable.as_slice()),
+            (&rollback_path, rollback_executable.as_slice()),
+        ] {
             std::fs::write(path, executable).unwrap();
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -1294,6 +1599,7 @@ mod tests {
             restart_pending: false,
             logs: Vec::new(),
             target_commit_id: Some("bbbbbbbbbbbb".into()),
+            failure: None,
             restart_after: true,
             updated_at: String::new(),
         };
@@ -1343,6 +1649,9 @@ mod tests {
                 requested_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 message: "test".into(),
+                failure_code: None,
+                exit_code: None,
+                diagnostic: None,
             },
         )
         .unwrap();
@@ -1364,8 +1673,8 @@ mod tests {
 
         let error =
             run_update_helper_inner_with_timeout(&spec_path, &spec, Duration::from_millis(100))
-                .expect_err("mismatched replacement must roll back");
-        assert!(error.to_string().contains("version commit mismatch"));
+                .expect_err("exited replacement must roll back");
+        assert!(error.to_string().contains("replacement exited"));
         let persisted: crate::self_update::upgrade::UpgradeStatusSnapshot =
             serde_json::from_slice(&std::fs::read(dir.join("upgrade-state.json")).unwrap())
                 .unwrap();
@@ -1373,16 +1682,26 @@ mod tests {
             persisted.status,
             crate::self_update::upgrade::UpgradeStatus::Failed
         );
-        assert!(persisted.logs.iter().any(|entry| {
-            entry
-                .message
-                .contains("expected bbbbbbbbbbbb, got aaaaaaaaaaaa; rollback passed health checks")
-        }));
+        assert_eq!(
+            persisted
+                .failure
+                .as_ref()
+                .map(|value| value.failure_code.as_str()),
+            Some("replacement_exited")
+        );
+        assert!(persisted.logs.iter().any(|entry| entry
+            .message
+            .contains("replacement exited with exit status: 0; rollback passed health checks")));
         let operation = read_restart_operation(&dir).unwrap();
         assert_eq!(operation.status, "failed");
         assert_eq!(operation.stage, "rollback_succeeded");
+        assert_eq!(
+            operation.failure_code.as_deref(),
+            Some("replacement_exited")
+        );
+        assert_eq!(operation.exit_code, Some(0));
         assert!(operation.message.contains("rollback passed health checks"));
-        assert_eq!(std::fs::read(&install_path).unwrap(), executable);
+        assert_eq!(std::fs::read(&install_path).unwrap(), rollback_executable);
 
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();

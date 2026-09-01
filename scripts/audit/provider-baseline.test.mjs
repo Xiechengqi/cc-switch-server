@@ -47,6 +47,34 @@ test("checked-in provider inventories satisfy the reviewed contract", () => {
   );
 });
 
+test("Provider registry matches the shared runtime inventory expectations", () => {
+  const registry = contract("provider-registry.json");
+  const expected = contract("provider-registry-expectations.json");
+  assert.equal(registry.families.length, expected.counts.families);
+  assert.equal(registry.profiles.length, expected.counts.profiles);
+  assert.equal(registry.legacyPresetMappings.length, expected.counts.legacyPresetMappings);
+  assert.equal(registry.drivers.length, expected.counts.drivers);
+  for (const [app, count] of Object.entries(expected.firstClassProfiles)) {
+    assert.equal(
+      registry.profiles.filter(
+        (profile) =>
+          profile.app === app
+          && profile.formComposition !== "custom"
+          && profile.formComposition !== "legacy",
+      ).length,
+      count,
+      app,
+    );
+  }
+  const ids = (items, key) => new Set(items.map((item) => item[key]));
+  const profileIds = ids(registry.profiles, "profileId");
+  const driverIds = ids(registry.drivers, "driverId");
+  const familyIds = ids(registry.families, "familyId");
+  for (const id of expected.requiredProfileIds) assert.equal(profileIds.has(id), true, id);
+  for (const id of expected.requiredDriverIds) assert.equal(driverIds.has(id), true, id);
+  for (const id of expected.requiredFamilyIds) assert.equal(familyIds.has(id), true, id);
+});
+
 test("first-class Server Profiles are committed additions, not candidates", () => {
   const mappings = contract("server-provider-legacy-inventory.json").coverageMappings;
   const registry = contract("provider-registry.json");
@@ -140,7 +168,7 @@ test("inventory validation rejects altered Custom HTTP recipe additions", () => 
 
 test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 44);
+  assert.equal(requiredProviderProfilePairs().length, 46);
   assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);

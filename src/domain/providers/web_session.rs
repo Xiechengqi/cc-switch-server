@@ -237,6 +237,14 @@ pub enum WebSessionLiveState {
 
 static REGISTRY: OnceLock<WebSessionRegistry> = OnceLock::new();
 
+pub fn validate_embedded_registry() -> anyhow::Result<()> {
+    let registry: WebSessionRegistry = serde_json::from_str(include_str!(
+        "../../../assets/contract/web-session-registry.json"
+    ))
+    .context("embedded Web Session registry must decode")?;
+    validate_registry(&registry).context("embedded Web Session registry must be valid")
+}
+
 pub fn web_session_registry() -> &'static WebSessionRegistry {
     REGISTRY.get_or_init(|| {
         let registry: WebSessionRegistry = serde_json::from_str(include_str!(

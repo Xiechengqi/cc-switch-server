@@ -14,7 +14,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.effective_command() {
         Command::Serve => serve(cli, log_capture).await,
         Command::Config { command } => cc_switch_server::admin::run_config_command(&cli, command),
-        Command::Doctor { check_port } => cc_switch_server::admin::run_doctor(&cli, check_port),
+        Command::Doctor {
+            check_port,
+            startup_contracts_only,
+        } => cc_switch_server::admin::run_doctor(&cli, check_port, startup_contracts_only),
         Command::Version { json } => print_version(json),
         Command::Password { command } => {
             cc_switch_server::admin::run_password_command(&cli, command)

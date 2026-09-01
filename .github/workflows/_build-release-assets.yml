@@ -12,8 +12,51 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate release contracts
+    runs-on: ubuntu-latest
+    env:
+      CC_SWITCH_PROVIDER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Checkout pinned Provider audit baseline
+        uses: actions/checkout@v4
+        with:
+          repository: farion1231/cc-switch
+          ref: b1dee0153da94316fb50416c679a11f74cc66f14
+          path: provider-audit/cc-switch
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web-src/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci --prefix web-src --ignore-scripts --no-audit --no-fund
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run static contract checks
+        run: scripts/static-checks.sh
+
+      - name: Run startup-contract regression tests
+        run: |
+          cargo test domain::providers::registry::tests --lib
+          cargo test amazon_q --lib
+          cargo test web_session --lib
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: validate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -67,6 +110,12 @@ jobs:
         with:
           version: 0.13.0
 
+      - name: Install cross-architecture runtime
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild
 
@@ -93,6 +142,12 @@ jobs:
           chmod +x "${{ matrix.asset }}"
           sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
           ls -lh "${{ matrix.asset }}" "${{ matrix.asset }}.sha256"
+
+      - name: Smoke release asset
+        env:
+          RELEASE_ASSET: ${{ matrix.asset }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: scripts/smoke/release-asset-startup.sh "./${RELEASE_ASSET}" "${RELEASE_ARCH}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

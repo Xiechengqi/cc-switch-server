@@ -139,8 +139,8 @@ fn reset_password(cli: &Cli, password: Option<String>, stdin: bool) -> anyhow::R
     Ok(())
 }
 
-pub fn run_doctor(cli: &Cli, check_port: bool) -> anyhow::Result<()> {
-    let report = doctor_report(cli, check_port);
+pub fn run_doctor(cli: &Cli, check_port: bool, startup_contracts_only: bool) -> anyhow::Result<()> {
+    let report = doctor_report(cli, check_port, startup_contracts_only);
     println!("{}", report.format());
     report.into_result()
 }
@@ -168,6 +168,10 @@ pub(crate) fn config_print_json(cli: &Cli) -> anyhow::Result<String> {
 }
 
 pub(crate) fn validate_config_stores(cli: &Cli) -> anyhow::Result<ConfigSnapshot> {
+    validate_config_stores_with_mode(cli, false)
+}
+
+fn validate_config_stores_with_mode(cli: &Cli, read_only: bool) -> anyhow::Result<ConfigSnapshot> {
     let config_dir = cli.resolved_config_dir()?;
     let web_dist_dir = cli.resolved_web_dist_dir();
     let config = ServerConfig::load_or_default(&config_dir)?;
@@ -180,7 +184,11 @@ pub(crate) fn validate_config_stores(cli: &Cli) -> anyhow::Result<ConfigSnapshot
     providers.set_runtime_defaults(config.provider_runtime_defaults());
     providers.rebuild_runtime_index(&accounts)?;
     let shares = ShareStore::load_or_default(&config_dir)?;
-    let usage = UsageStore::load_or_default(&config_dir)?;
+    let usage = if read_only {
+        UsageStore::load_read_only(&config_dir)?
+    } else {
+        UsageStore::load_or_default(&config_dir)?
+    };
     let tunnels = TunnelRuntimeStoreForCli::load_or_default(&config_dir)?;
 
     let stores = vec![
@@ -257,8 +265,10 @@ fn validation_report(snapshot: &ConfigSnapshot) -> String {
     lines.join("\n")
 }
 
-fn doctor_report(cli: &Cli, check_port: bool) -> DoctorReport {
+fn doctor_report(cli: &Cli, check_port: bool, startup_contracts_only: bool) -> DoctorReport {
     let mut report = DoctorReport::default();
+
+    check_embedded_startup_contracts(&mut report);
 
     let config_dir = match cli.resolved_config_dir() {
         Ok(path) => path,
@@ -268,11 +278,12 @@ fn doctor_report(cli: &Cli, check_port: bool) -> DoctorReport {
         }
     };
 
-    check_config_dir(&mut report, &config_dir);
-    check_web_dist_dir(&mut report, cli.resolved_web_dist_dir().as_deref());
-    check_provider_coverage(&mut report);
+    if !startup_contracts_only {
+        check_config_dir(&mut report, &config_dir);
+        check_web_dist_dir(&mut report, cli.resolved_web_dist_dir().as_deref());
+    }
 
-    match validate_config_stores(cli) {
+    match validate_config_stores_with_mode(cli, startup_contracts_only) {
         Ok(snapshot) => {
             report.ok(
                 "stores",
@@ -281,20 +292,37 @@ fn doctor_report(cli: &Cli, check_port: bool) -> DoctorReport {
                     config_dir.display()
                 ),
             );
-            check_setup(&mut report, &snapshot.config);
-            check_share_provider_links(&mut report, &snapshot);
-            check_cursor_runtime_configuration(&mut report, &snapshot.providers);
+            if !startup_contracts_only {
+                check_setup(&mut report, &snapshot.config);
+                check_share_provider_links(&mut report, &snapshot);
+                check_cursor_runtime_configuration(&mut report, &snapshot.providers);
+            }
         }
         Err(error) => {
             report.fail("stores", error.to_string());
         }
     }
 
-    if check_port {
+    if check_port && !startup_contracts_only {
         check_bind_addr(&mut report, cli);
     }
 
     report
+}
+
+fn check_embedded_startup_contracts(report: &mut DoctorReport) {
+    match crate::domain::providers::registry::validate_embedded_registry() {
+        Ok(()) => report.ok("provider-registry", "embedded Provider registry is valid"),
+        Err(error) => report.fail("provider-registry", error.to_string()),
+    }
+    match crate::domain::providers::web_session::validate_embedded_registry() {
+        Ok(()) => report.ok(
+            "web-session-registry",
+            "embedded Web Session registry is valid",
+        ),
+        Err(error) => report.fail("web-session-registry", error.to_string()),
+    }
+    check_provider_coverage(report);
 }
 
 fn check_config_dir(report: &mut DoctorReport, config_dir: &Path) {
@@ -919,7 +947,7 @@ mod tests {
         let config_dir = temp_config_dir("doctor-fresh");
         let cli = test_cli(config_dir.clone());
 
-        let report = doctor_report(&cli, false);
+        let report = doctor_report(&cli, false, false);
 
         assert!(report
             .checks
@@ -929,6 +957,33 @@ mod tests {
             .checks
             .iter()
             .all(|check| check.level != DoctorLevel::Fail));
+        let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn startup_contract_doctor_does_not_create_a_fresh_config_directory() {
+        let config_dir = temp_config_dir("doctor-startup-contract-read-only");
+        let cli = test_cli(config_dir.clone());
+
+        let report = doctor_report(&cli, true, true);
+
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| check.level != DoctorLevel::Fail));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "provider-registry"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "web-session-registry"));
+        assert!(report.checks.iter().any(|check| check.name == "stores"));
+        assert!(
+            !config_dir.exists(),
+            "startup contract preflight must not create config or Usage state"
+        );
     }
 
     #[test]
