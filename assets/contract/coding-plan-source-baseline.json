@@ -1,5 +1,5 @@
 {
-  "format": "cc-switch-coding-plan-source-baseline",
+  "format": "cc-switch-server-coding-plan-source-baseline",
   "schemaVersion": 1,
   "capturedAt": "2026-08-30T00:00:00Z",
   "sources": [
@@ -10,32 +10,62 @@
       "defaultRelativeRoot": "../proxy/OmniRoute",
       "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
       "files": [
-        {"path": "open-sse/config/providers/registry/kimi/coding-apikey/index.ts", "sha256": "b38d94281d9fca16d47c8537df9f549f3291dfd5cb4899d1e3fca3d8527887c2"},
-        {"path": "open-sse/config/providers/registry/zai/index.ts", "sha256": "f888014a3ab80f7d68e2dd3fe7769b8f918f4e42742da474fb0dab5446258cab"},
-        {"path": "open-sse/config/providers/registry/glm/cn/index.ts", "sha256": "274851a4ccd835d44f3d2ee86254eeb656e017d560be0208728b54de400d2bf1"},
-        {"path": "open-sse/config/providers/registry/bailian-coding-plan/index.ts", "sha256": "052682eafdfb639e36b5730211166a494ae6a64fd9f8978b8663c6a1f0aa1abc"},
-        {"path": "open-sse/config/providers/registry/minimax/index.ts", "sha256": "b4464182b79bf099935280348d7cd03a0e21e42d88890fae7a442d3201e4cf42"},
-        {"path": "open-sse/config/providers/registry/minimax/cn/index.ts", "sha256": "1020a08e911a474bd78c43fb3c03141f9d8ee7ee06e26cb390eca664799be9e1"},
-        {"path": "open-sse/config/providers/registry/volcengine/coding-plan/index.ts", "sha256": "ef4129606cc6da5bda43ca76ce7178267226451e8fa917b130d50fb671a4b03c"},
-        {"path": "open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts", "sha256": "d4961466492e45ab0c00f86ffcfb0a33795812b22cbe868b799bab15dfba9a80"},
-        {"path": "open-sse/config/providers/registry/ollama-cloud/index.ts", "sha256": "466fef0b9a51b844f27c0119a60a0b4c66d3ff66c720fee6b3a91df3bf4d3da7"},
-        {"path": "open-sse/services/usage/kimi.ts", "sha256": "305319fe73e9a1891039e8f908d824684a6f8b6547bae94e6a4db4a55de0d36d"},
-        {"path": "open-sse/services/usage/glm.ts", "sha256": "f11a50f0c2b241049eccdd80f162ed930a8b37f1ee6ab67d9205e437ca59e2d7"},
-        {"path": "open-sse/services/usage/minimax.ts", "sha256": "c0475a10fe58bfe8dab908167230c851b5166f63440dc6e6171b978b9a2666ad"},
-        {"path": "open-sse/services/usage/volcenginePlan.ts", "sha256": "bbed6078e15fb33f366c7bd25583c10e9ebe41e15d0b462953a68f44360975ba"},
-        {"path": "open-sse/services/usage/xiaomi-mimo.ts", "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"}
-      ]
-    },
-    {
-      "id": "cc-switch",
-      "label": "cc-switch",
-      "rootEnv": "CC_SWITCH_CODE_PLAN_CC_SWITCH_AUDIT_ROOT",
-      "defaultRelativeRoot": "../proxy/cc-switch",
-      "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-      "files": [
-        {"path": "src/config/claudeProviderPresets.ts", "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"},
-        {"path": "src/config/codexProviderPresets.ts", "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"},
-        {"path": "src-tauri/src/services/subscription.rs", "sha256": "3039d68a8a7010c9419dfa3eacf955c9892776724476236eded7ce9abbfb7c38"}
+        {
+          "path": "open-sse/config/providers/registry/kimi/coding-apikey/index.ts",
+          "sha256": "b38d94281d9fca16d47c8537df9f549f3291dfd5cb4899d1e3fca3d8527887c2"
+        },
+        {
+          "path": "open-sse/config/providers/registry/zai/index.ts",
+          "sha256": "f888014a3ab80f7d68e2dd3fe7769b8f918f4e42742da474fb0dab5446258cab"
+        },
+        {
+          "path": "open-sse/config/providers/registry/glm/cn/index.ts",
+          "sha256": "274851a4ccd835d44f3d2ee86254eeb656e017d560be0208728b54de400d2bf1"
+        },
+        {
+          "path": "open-sse/config/providers/registry/bailian-coding-plan/index.ts",
+          "sha256": "052682eafdfb639e36b5730211166a494ae6a64fd9f8978b8663c6a1f0aa1abc"
+        },
+        {
+          "path": "open-sse/config/providers/registry/minimax/index.ts",
+          "sha256": "b4464182b79bf099935280348d7cd03a0e21e42d88890fae7a442d3201e4cf42"
+        },
+        {
+          "path": "open-sse/config/providers/registry/minimax/cn/index.ts",
+          "sha256": "1020a08e911a474bd78c43fb3c03141f9d8ee7ee06e26cb390eca664799be9e1"
+        },
+        {
+          "path": "open-sse/config/providers/registry/volcengine/coding-plan/index.ts",
+          "sha256": "ef4129606cc6da5bda43ca76ce7178267226451e8fa917b130d50fb671a4b03c"
+        },
+        {
+          "path": "open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts",
+          "sha256": "d4961466492e45ab0c00f86ffcfb0a33795812b22cbe868b799bab15dfba9a80"
+        },
+        {
+          "path": "open-sse/config/providers/registry/ollama-cloud/index.ts",
+          "sha256": "466fef0b9a51b844f27c0119a60a0b4c66d3ff66c720fee6b3a91df3bf4d3da7"
+        },
+        {
+          "path": "open-sse/services/usage/kimi.ts",
+          "sha256": "305319fe73e9a1891039e8f908d824684a6f8b6547bae94e6a4db4a55de0d36d"
+        },
+        {
+          "path": "open-sse/services/usage/glm.ts",
+          "sha256": "f11a50f0c2b241049eccdd80f162ed930a8b37f1ee6ab67d9205e437ca59e2d7"
+        },
+        {
+          "path": "open-sse/services/usage/minimax.ts",
+          "sha256": "c0475a10fe58bfe8dab908167230c851b5166f63440dc6e6171b978b9a2666ad"
+        },
+        {
+          "path": "open-sse/services/usage/volcenginePlan.ts",
+          "sha256": "bbed6078e15fb33f366c7bd25583c10e9ebe41e15d0b462953a68f44360975ba"
+        },
+        {
+          "path": "open-sse/services/usage/xiaomi-mimo.ts",
+          "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"
+        }
       ]
     },
     {
@@ -45,26 +75,151 @@
       "defaultRelativeRoot": "../proxy/9router",
       "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
       "files": [
-        {"path": "open-sse/providers/registry/alicode.js", "sha256": "a9975605e1d45a30da3170532ee9a97f11986247871c4a139b8ce05a95aee6fc"},
-        {"path": "open-sse/providers/registry/alicode-intl.js", "sha256": "e60f662277ad3dc5a167c1a253d8077f1f20d8922f468004dce58ba55d1dfa95"},
-        {"path": "open-sse/providers/registry/ollama.js", "sha256": "3d8b0c0d82a9bae3192c564c4e2dac2fe2833a2f53acde03b99f6d791ceaa38d"},
-        {"path": "tests/unit/ollama-usage.test.js", "sha256": "44a91ccd794e6e5a96b74715c0ad69f46b572c215dfe9e1c542ffce19439b12e"},
-        {"path": "open-sse/services/usage/glm.js", "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"},
-        {"path": "open-sse/services/usage/minimax.js", "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"}
+        {
+          "path": "open-sse/providers/registry/alicode.js",
+          "sha256": "a9975605e1d45a30da3170532ee9a97f11986247871c4a139b8ce05a95aee6fc"
+        },
+        {
+          "path": "open-sse/providers/registry/alicode-intl.js",
+          "sha256": "e60f662277ad3dc5a167c1a253d8077f1f20d8922f468004dce58ba55d1dfa95"
+        },
+        {
+          "path": "open-sse/providers/registry/ollama.js",
+          "sha256": "3d8b0c0d82a9bae3192c564c4e2dac2fe2833a2f53acde03b99f6d791ceaa38d"
+        },
+        {
+          "path": "tests/unit/ollama-usage.test.js",
+          "sha256": "44a91ccd794e6e5a96b74715c0ad69f46b572c215dfe9e1c542ffce19439b12e"
+        },
+        {
+          "path": "open-sse/services/usage/glm.js",
+          "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"
+        },
+        {
+          "path": "open-sse/services/usage/minimax.js",
+          "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"
+        }
       ]
     }
   ],
   "families": [
-    {"familyId": "family.kimi_coding_api_key", "region": "global", "upstreamPlanIds": ["kimi-coding-apikey"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/kimi/coding-apikey/index.ts", "omniroute:open-sse/services/usage/kimi.ts", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.zhipu_glm_cn", "region": "china", "upstreamPlanIds": ["glm-cn"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/glm/cn/index.ts", "omniroute:open-sse/services/usage/glm.ts", "9router:open-sse/services/usage/glm.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.zhipu_glm_global", "region": "global", "upstreamPlanIds": ["zai", "glm"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/zai/index.ts", "omniroute:open-sse/services/usage/glm.ts", "9router:open-sse/services/usage/glm.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.bailian_coding_plan_cn", "region": "china", "upstreamPlanIds": ["bailian-coding-plan", "alicode"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/bailian-coding-plan/index.ts", "9router:open-sse/providers/registry/alicode.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.bailian_coding_plan_global", "region": "global_singapore", "upstreamPlanIds": ["bailian-coding-plan", "alicode-intl"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/bailian-coding-plan/index.ts", "9router:open-sse/providers/registry/alicode-intl.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.minimax_cn", "region": "china", "upstreamPlanIds": ["minimax-cn"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/minimax/cn/index.ts", "omniroute:open-sse/services/usage/minimax.ts", "9router:open-sse/services/usage/minimax.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.minimax_global", "region": "global", "upstreamPlanIds": ["minimax"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/minimax/index.ts", "omniroute:open-sse/services/usage/minimax.ts", "9router:open-sse/services/usage/minimax.js", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.volcengine_coding_plan", "region": "china_beijing", "upstreamPlanIds": ["volcengine-coding-plan"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/volcengine/coding-plan/index.ts", "omniroute:open-sse/services/usage/volcenginePlan.ts", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.xiaomi_mimo_token_plan", "region": "china", "upstreamPlanIds": ["xiaomi-mimo-token-plan"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts", "omniroute:open-sse/services/usage/xiaomi-mimo.ts", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]},
-    {"familyId": "family.xiaomi_mimo_token_plan_sgp", "region": "singapore", "upstreamPlanIds": ["xiaomi-mimo-token-plan"], "evidenceFiles": ["omniroute:open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts", "omniroute:open-sse/services/usage/xiaomi-mimo.ts", "cc-switch:src/config/claudeProviderPresets.ts", "cc-switch:src/config/codexProviderPresets.ts"]}
+    {
+      "familyId": "family.kimi_coding_api_key",
+      "region": "global",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/kimi/coding-apikey/index.ts",
+        "omniroute:open-sse/services/usage/kimi.ts"
+      ],
+      "planIds": [
+        "kimi-coding-apikey"
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_cn",
+      "region": "china",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/glm/cn/index.ts",
+        "omniroute:open-sse/services/usage/glm.ts",
+        "9router:open-sse/services/usage/glm.js"
+      ],
+      "planIds": [
+        "glm-cn"
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_global",
+      "region": "global",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/zai/index.ts",
+        "omniroute:open-sse/services/usage/glm.ts",
+        "9router:open-sse/services/usage/glm.js"
+      ],
+      "planIds": [
+        "zai",
+        "glm"
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_cn",
+      "region": "china",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/bailian-coding-plan/index.ts",
+        "9router:open-sse/providers/registry/alicode.js"
+      ],
+      "planIds": [
+        "bailian-coding-plan",
+        "alicode"
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_global",
+      "region": "global_singapore",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/bailian-coding-plan/index.ts",
+        "9router:open-sse/providers/registry/alicode-intl.js"
+      ],
+      "planIds": [
+        "bailian-coding-plan",
+        "alicode-intl"
+      ]
+    },
+    {
+      "familyId": "family.minimax_cn",
+      "region": "china",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/minimax/cn/index.ts",
+        "omniroute:open-sse/services/usage/minimax.ts",
+        "9router:open-sse/services/usage/minimax.js"
+      ],
+      "planIds": [
+        "minimax-cn"
+      ]
+    },
+    {
+      "familyId": "family.minimax_global",
+      "region": "global",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/minimax/index.ts",
+        "omniroute:open-sse/services/usage/minimax.ts",
+        "9router:open-sse/services/usage/minimax.js"
+      ],
+      "planIds": [
+        "minimax"
+      ]
+    },
+    {
+      "familyId": "family.volcengine_coding_plan",
+      "region": "china_beijing",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/volcengine/coding-plan/index.ts",
+        "omniroute:open-sse/services/usage/volcenginePlan.ts"
+      ],
+      "planIds": [
+        "volcengine-coding-plan"
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan",
+      "region": "china",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts",
+        "omniroute:open-sse/services/usage/xiaomi-mimo.ts"
+      ],
+      "planIds": [
+        "xiaomi-mimo-token-plan"
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan_sgp",
+      "region": "singapore",
+      "evidenceFiles": [
+        "omniroute:open-sse/config/providers/registry/xiaomi-mimo-token-plan/index.ts",
+        "omniroute:open-sse/services/usage/xiaomi-mimo.ts"
+      ],
+      "planIds": [
+        "xiaomi-mimo-token-plan"
+      ]
+    }
   ],
   "ollamaCloud": {
     "familyId": "family.ollama_cloud",

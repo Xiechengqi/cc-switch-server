@@ -268,9 +268,8 @@ export function AuthCenterPanel({
 
     setSavingQuotaSettings(true);
     try {
-      const { webdavSync: _, ...rest } = settings;
       await settingsApi.save({
-        ...rest,
+        ...settings,
         oauthQuotaRefreshIntervalMinutes: parsedRefreshInterval,
         oauthQuotaRefreshTimeoutSeconds: parsedRefreshTimeout,
       });

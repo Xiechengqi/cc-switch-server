@@ -1332,7 +1332,7 @@ export function validatePhase0Contracts(contracts) {
 }
 
 function generatedContracts() {
-  const inventory = readJson("assets/contract/server-provider-legacy-inventory.json");
+  const inventory = readJson("assets/contract/provider-legacy-compatibility.json");
   const coverage = readJson("assets/contract/provider-coverage.json");
   const contracts = {
     fields: buildFieldConsumption(inventory),

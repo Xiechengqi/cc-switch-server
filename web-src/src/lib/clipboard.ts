@@ -1,7 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-
-import { isServerWebRuntime } from "@/lib/runtime";
-
 async function copyWithWebFallback(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     try {
@@ -33,14 +29,5 @@ async function copyWithWebFallback(text: string): Promise<void> {
 }
 
 export async function copyText(text: string): Promise<void> {
-  if (!isServerWebRuntime()) {
-    try {
-      await invoke("copy_text_to_clipboard", { text });
-      return;
-    } catch {
-      // Desktop invoke can fail in dev; fall back to browser APIs.
-    }
-  }
-
   await copyWithWebFallback(text);
 }

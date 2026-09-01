@@ -6,7 +6,6 @@ const runtimeMocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/runtime", () => ({
   invokeCommand: runtimeMocks.invokeCommand,
-  isTauriRuntime: () => false,
 }));
 
 import {
@@ -68,16 +67,6 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
         "http://client.example.com",
       ),
     ).toBe(false);
-  });
-
-  it("allows the embedded runtime without a secure browser origin", () => {
-    expect(
-      isOpenAiCliOAuthOriginAllowed(
-        "http://server.example.com",
-        undefined,
-        true,
-      ),
-    ).toBe(true);
   });
 
   it("imports DeepSeek accounts with an access token and no password", async () => {

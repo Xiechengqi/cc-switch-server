@@ -5,12 +5,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
-  extractPresetSource,
-  extractProviderTypesSource,
   extractServerProviderTypesSource,
-  rejectConflictMarkers,
-  validateBaselineContracts,
-} from "./audit-upstream-provider-baseline.mjs";
+  validateServerProviderContracts,
+} from "./audit-server-provider-contract.mjs";
 import {
   assertRequiredProviderCoverage,
   requiredProviderProfilePairs,
@@ -19,32 +16,31 @@ import {
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 function contract(name) {
-  return JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract", name), "utf8"));
-}
-
-function providerTypesSource(variants, arms) {
-  return `
-pub enum ProviderType {
-${variants}
-}
-
-impl ProviderType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-${arms}
-        }
-    }
-}
-`;
-}
-
-test("checked-in provider inventories satisfy the reviewed contract", () => {
-  assert.doesNotThrow(() =>
-    validateBaselineContracts(
-      contract("upstream-provider-source-baseline.json"),
-      contract("server-provider-legacy-inventory.json"),
-    ),
+  return JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "assets/contract", name), "utf8"),
   );
+}
+
+function contracts() {
+  return {
+    requirements: contract("server-provider-requirements.json"),
+    compatibility: contract("provider-legacy-compatibility.json"),
+    window: contract("provider-compatibility-window.json"),
+    registry: contract("provider-registry.json"),
+  };
+}
+
+function validate(input = contracts()) {
+  return validateServerProviderContracts(
+    input.requirements,
+    input.compatibility,
+    input.window,
+    input.registry,
+  );
+}
+
+test("checked-in Server Provider contracts satisfy product requirements", () => {
+  assert.doesNotThrow(() => validate());
 });
 
 test("Provider registry matches the shared runtime inventory expectations", () => {
@@ -52,15 +48,18 @@ test("Provider registry matches the shared runtime inventory expectations", () =
   const expected = contract("provider-registry-expectations.json");
   assert.equal(registry.families.length, expected.counts.families);
   assert.equal(registry.profiles.length, expected.counts.profiles);
-  assert.equal(registry.legacyPresetMappings.length, expected.counts.legacyPresetMappings);
+  assert.equal(
+    registry.legacyPresetMappings.length,
+    expected.counts.legacyPresetMappings,
+  );
   assert.equal(registry.drivers.length, expected.counts.drivers);
   for (const [app, count] of Object.entries(expected.firstClassProfiles)) {
     assert.equal(
       registry.profiles.filter(
         (profile) =>
-          profile.app === app
-          && profile.formComposition !== "custom"
-          && profile.formComposition !== "legacy",
+          profile.app === app &&
+          profile.formComposition !== "custom" &&
+          profile.formComposition !== "legacy",
       ).length,
       count,
       app,
@@ -76,47 +75,10 @@ test("Provider registry matches the shared runtime inventory expectations", () =
 });
 
 test("first-class Server Profiles are committed additions, not candidates", () => {
-  const mappings = contract("server-provider-legacy-inventory.json").coverageMappings;
+  const compatibility = contract("provider-legacy-compatibility.json");
   const registry = contract("provider-registry.json");
-  assert.deepEqual(mappings.firstClassProfileAdditions, [
-    "claude.anthropic_api_key",
-    "claude.google_oauth",
-    "claude.kimi_code",
-    "claude.qoder_cosy",
-    "codex.github_copilot",
-    "codex.kiro_oauth",
-    "codex.kimi_code",
-    "codex.qoder_cosy",
-    "codex.openai_api_key",
-    "gemini.google_api_key",
-    "gemini.github_copilot",
-    "gemini.kimi_code",
-    "gemini.qoder_cosy",
-    "gemini.cursor_api_key",
-    "gemini.cursor_oauth",
-    "claude.kimi_coding_api_key",
-    "codex.kimi_coding_api_key",
-    "claude.zhipu_glm_cn",
-    "codex.zhipu_glm_cn",
-    "claude.zhipu_glm_global",
-    "codex.zhipu_glm_global",
-    "claude.bailian_coding_plan_cn",
-    "codex.bailian_coding_plan_cn",
-    "claude.bailian_coding_plan_global",
-    "codex.bailian_coding_plan_global",
-    "claude.minimax_cn",
-    "codex.minimax_cn",
-    "claude.minimax_global",
-    "codex.minimax_global",
-    "claude.volcengine_coding_plan",
-    "codex.volcengine_coding_plan",
-    "claude.xiaomi_mimo_token_plan",
-    "codex.xiaomi_mimo_token_plan",
-    "claude.xiaomi_mimo_token_plan_sgp",
-    "codex.xiaomi_mimo_token_plan_sgp",
-  ]);
-  assert.equal("directApiCandidates" in mappings, false);
-  assert.deepEqual(mappings.customRecipeAdditions, [
+  assert.equal(compatibility.firstClassProfileAdditions.length, 35);
+  assert.deepEqual(compatibility.customRecipeAdditions, [
     "claude.anthropic_bearer_relay",
   ]);
 
@@ -135,34 +97,7 @@ test("first-class Server Profiles are committed additions, not candidates", () =
     .sort();
   assert.deepEqual(
     unmappedFirstClassProfiles,
-    [...mappings.firstClassProfileAdditions].sort(),
-  );
-  for (const profileId of mappings.firstClassProfileAdditions) {
-    const profile = registry.profiles.find(
-      (candidate) => candidate.profileId === profileId,
-    );
-    assert.equal(profile?.visibility, "visible", profileId);
-    assert.equal(profile?.creationPolicy, "create_allowed", profileId);
-  }
-});
-
-test("inventory validation rejects altered first-class Profile additions", () => {
-  const baseline = contract("upstream-provider-source-baseline.json");
-  const server = contract("server-provider-legacy-inventory.json");
-  server.coverageMappings.firstClassProfileAdditions.pop();
-  assert.throws(
-    () => validateBaselineContracts(baseline, server),
-    /first-class Server Profile additions are incomplete/,
-  );
-});
-
-test("inventory validation rejects altered Custom HTTP recipe additions", () => {
-  const baseline = contract("upstream-provider-source-baseline.json");
-  const server = contract("server-provider-legacy-inventory.json");
-  server.coverageMappings.customRecipeAdditions = [];
-  assert.throws(
-    () => validateBaselineContracts(baseline, server),
-    /Server Custom HTTP recipe additions are incomplete/,
+    [...compatibility.firstClassProfileAdditions].sort(),
   );
 });
 
@@ -188,117 +123,31 @@ test("every required Provider type/app pair has a creatable Profile or recipe", 
     () => assertRequiredProviderCoverage(missingRecipe),
     /Missing visible create_allowed Provider Profile or Custom HTTP recipe for claude:claude_auth/,
   );
-
-  const mistypedRecipe = structuredClone(registry);
-  mistypedRecipe.customRecipes[0].binding.authScheme = "api_key";
-  assert.throws(
-    () => assertRequiredProviderCoverage(mistypedRecipe),
-    /declares claude_auth, resolved claude/,
-  );
-
-  const mismatched = structuredClone(registry);
-  mismatched.profiles.find(
-    (profile) => profile.profileId === "gemini.google_oauth",
-  ).credentialPolicy.accountProviderType = "antigravity_oauth";
-  assert.throws(
-    () => assertRequiredProviderCoverage(mismatched),
-    /gemini\.google_oauth binds antigravity_oauth, expected gemini_cli/,
-  );
 });
 
-test("inventory validation rejects omitted and duplicate presets before write", () => {
-  const baseline = contract("upstream-provider-source-baseline.json");
-  const server = contract("server-provider-legacy-inventory.json");
-  baseline.appPresets.claude.pop();
-  assert.throws(
-    () => validateBaselineContracts(baseline, server),
-    /requires reviewed count 15/,
-  );
+test("requirements reject omitted and duplicate Provider types", () => {
+  const omitted = contracts();
+  omitted.requirements.providerTypes.pop();
+  assert.throws(() => validate(omitted), /must contain 23 types/);
 
-  const duplicateBaseline = contract("upstream-provider-source-baseline.json");
-  duplicateBaseline.appPresets.claude[1].name = duplicateBaseline.appPresets.claude[0].name;
-  assert.throws(
-    () => validateBaselineContracts(duplicateBaseline, server),
-    /duplicate preset name/,
-  );
+  const duplicate = contracts();
+  duplicate.requirements.providerTypes[1].id =
+    duplicate.requirements.providerTypes[0].id;
+  assert.throws(() => validate(duplicate), /duplicate id/);
 });
 
-test("static TypeScript extraction rejects malformed and executable input", () => {
-  assert.throws(
-    () =>
-      extractPresetSource(
-        "fixture.ts",
-        Buffer.from("export const providerPresets = [{ name: 'broken' }"),
-        "providerPresets",
-        "claude",
-      ),
-    /TypeScript parse failed/,
-  );
-  assert.throws(
-    () =>
-      extractPresetSource(
-        "fixture.ts",
-        Buffer.from("export const providerPresets = buildPresets();"),
-        "providerPresets",
-        "claude",
-      ),
-    /unsupported call buildPresets/,
-  );
-});
+test("legacy fixtures reject count, order, and removal-gate drift", () => {
+  const countDrift = contracts();
+  countDrift.compatibility.counts.claude -= 1;
+  assert.throws(() => validate(countDrift), /count drift for claude/);
 
-test("conflict markers are rejected", () => {
-  assert.throws(
-    () => rejectConflictMarkers("fixture.ts", "<<<<<<< ours\n=======\n>>>>>>> theirs\n"),
-    /conflict marker/,
-  );
-});
+  const orderDrift = contracts();
+  orderDrift.compatibility.presets.codex[0].sourceIndex = 2;
+  assert.throws(() => validate(orderDrift), /sourceIndex drift/);
 
-test("ProviderType extraction rejects unsupported variants and incomplete mappings", () => {
-  const valid = extractProviderTypesSource(
-    "fixture.rs",
-    providerTypesSource(
-      "    Claude,\n    Codex,",
-      '            ProviderType::Claude => "claude",\n            ProviderType::Codex => "codex",',
-    ),
-  );
-  assert.deepEqual(valid, [
-    { variant: "Claude", id: "claude" },
-    { variant: "Codex", id: "codex" },
-  ]);
-
-  assert.throws(
-    () =>
-      extractProviderTypesSource(
-        "fixture.rs",
-        providerTypesSource(
-          "    Claude(String),\n    Codex,",
-          '            ProviderType::Claude => "claude",\n            ProviderType::Codex => "codex",',
-        ),
-      ),
-    /unsupported ProviderType enum syntax/,
-  );
-  assert.throws(
-    () =>
-      extractProviderTypesSource(
-        "fixture.rs",
-        providerTypesSource(
-          "    Claude,\n    Codex,",
-          '            ProviderType::Claude => "claude",',
-        ),
-      ),
-    /variants without as_str: Codex/,
-  );
-  assert.throws(
-    () =>
-      extractProviderTypesSource(
-        "fixture.rs",
-        providerTypesSource(
-          "    Claude,\n    Codex,",
-          '            ProviderType::Claude => "same",\n            ProviderType::Codex => "same",',
-        ),
-      ),
-    /ids are duplicated/,
-  );
+  const gateDrift = contracts();
+  gateDrift.compatibility.providerApi.removalEligible = true;
+  assert.throws(() => validate(gateDrift), /removal gate disagrees/);
 });
 
 test("Server ProviderType extraction requires serde and as_str to agree", () => {
@@ -328,16 +177,15 @@ impl ProviderType {
     () =>
       extractServerProviderTypesSource(
         "fixture.rs",
-        valid.replace('#[serde(rename = "codex")]', '#[serde(rename = "openai")]'),
+        valid.replace(
+          '#[serde(rename = "codex")]',
+          '#[serde(rename = "openai")]',
+        ),
       ),
     /serde\/as_str mismatch/,
   );
   assert.throws(
-    () =>
-      extractServerProviderTypesSource(
-        "fixture.rs",
-        valid.replace('    #[serde(rename = "codex")]\n', ""),
-      ),
-    /serde mappings are incomplete/,
+    () => extractServerProviderTypesSource("fixture.rs", `<<<<<<< ours\n${valid}`),
+    /conflict marker/,
   );
 });

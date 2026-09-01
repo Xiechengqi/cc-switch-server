@@ -372,7 +372,7 @@ function validateOllamaContract(registry, baseline, sources) {
 
 function buildManifest(registry, baseline) {
   assert(
-    baseline.format === "cc-switch-coding-plan-source-baseline" &&
+    baseline.format === "cc-switch-server-coding-plan-source-baseline" &&
       baseline.schemaVersion === 1,
     "unsupported coding-plan source baseline",
   );
@@ -425,7 +425,7 @@ function buildManifest(registry, baseline) {
       familyId: family.familyId,
       label: family.label,
       region: metadata.region,
-      upstreamPlanIds: metadata.upstreamPlanIds,
+      planIds: metadata.planIds,
       surfaces: profiles,
       evidenceFiles: expandEvidenceFiles(
         metadata.evidenceFiles,
@@ -436,7 +436,7 @@ function buildManifest(registry, baseline) {
   });
 
   return {
-    format: "cc-switch-coding-plan-registry-manifest",
+    format: "cc-switch-server-coding-plan-registry-manifest",
     schemaVersion: 1,
     capturedAt: baseline.capturedAt,
     generatedFrom: {

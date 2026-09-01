@@ -104,7 +104,8 @@
 | --- | --- | --- |
 | [../README.md](../README.md) | 权威 | 产品定位、能力矩阵、快速入口 |
 | [../AGENTS.md](../AGENTS.md) | 权威 | 开发约定：产品边界、依赖方向、状态写入、UI 独立性、验证清单 |
-| [../UPSTREAM_IMPORT.md](../UPSTREAM_IMPORT.md) | 权威 | 外部 Provider 审计台账 |
+| [../PROTOCOL_EVIDENCE.md](../PROTOCOL_EVIDENCE.md) | 权威 | Provider 合同权威与外部协议证据边界 |
+| [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | 权威 | 第三方代码、资产许可证与归属 |
 
 ## 外部真值来源
 
@@ -114,7 +115,7 @@
 | Router ↔ Server 协议线格式 | `cc-switch-router/PROTOCOL.md`（11 节） |
 | Router UI 测试计划 | `cc-switch-router/UI_TEST_PLAN.md` |
 | 系统级文档站 | `tokenswitch-docsify` → https://docs.tokenswitch.org |
-| Provider 预置审计基线 | `cc-switch`（Tauri 仓库，**仅作审计基线**，非 Router 客户端） |
+| Provider 产品范围与身份 | `assets/contract/server-provider-requirements.json` 与 `assets/contract/provider-registry.json` |
 
 ## 旧路径映射
 

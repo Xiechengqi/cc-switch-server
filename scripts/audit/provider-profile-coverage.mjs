@@ -1,31 +1,27 @@
-export const requiredProviderTypes = Object.freeze([
-  ["claude", "Anthropic official / API key", ["claude"]],
-  ["claude_auth", "Claude bearer-only relay", ["claude"]],
-  ["claude_oauth", "Claude Official OAuth", ["claude"]],
-  ["codex", "OpenAI/Codex compatible", ["codex"]],
-  ["codex_oauth", "OpenAI ChatGPT OAuth", ["claude", "codex"]],
-  ["gemini", "Google Gemini API key", ["gemini"]],
-  ["gemini_cli", "Google Gemini OAuth / CLI", ["gemini", "claude"]],
-  ["openrouter", "OpenRouter", ["claude", "codex", "gemini"]],
-  ["github_copilot", "GitHub Copilot", ["claude", "codex", "gemini"]],
-  ["deepseek_account", "DeepSeek account", ["claude"]],
-  ["kiro_oauth", "Kiro OAuth", ["claude", "codex"]],
-  ["cursor_oauth", "Cursor OAuth", ["claude", "codex", "gemini"]],
-  ["cursor_apikey", "Cursor API key", ["claude", "codex", "gemini"]],
-  ["antigravity_oauth", "Antigravity OAuth", ["claude", "gemini"]],
-  ["agy_oauth", "Antigravity CLI / agy", ["claude", "gemini"]],
-  ["ollama_cloud", "Ollama API key", ["claude", "codex"]],
-]);
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const serverCompatibilityProviderTypes = Object.freeze([
-  ["amazon_q_oauth", "Amazon Q Developer", ["claude", "codex"]],
-  ["aws_bedrock", "AWS Bedrock compatibility schema", ["claude"]],
-  ["nvidia", "Nvidia OpenAI-compatible API", ["claude", "codex"]],
-  ["deepseek_api", "DeepSeek API key", ["claude", "codex"]],
-  ["grok_oauth", "Grok/xAI OAuth reverse proxy", ["claude", "codex", "gemini"]],
-  ["kimi_code", "Kimi OAuth", ["claude", "codex", "gemini"]],
-  ["qoder_cosy", "Qoder OAuth", ["claude", "codex", "gemini"]],
-]);
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const requirements = JSON.parse(
+  fs.readFileSync(
+    path.join(repoRoot, "assets/contract/server-provider-requirements.json"),
+    "utf8",
+  ),
+);
+const tuple = ({ id, label, apps }) => [id, label, apps];
+
+export const requiredProviderTypes = Object.freeze(
+  requirements.providerTypes
+    .filter((entry) => entry.coverageClass === "core")
+    .map(tuple),
+);
+
+export const serverCompatibilityProviderTypes = Object.freeze(
+  requirements.providerTypes
+    .filter((entry) => entry.coverageClass === "server_extension")
+    .map(tuple),
+);
 
 export function requiredProviderProfilePairs() {
   return [

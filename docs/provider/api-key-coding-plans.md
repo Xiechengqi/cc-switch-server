@@ -5,7 +5,7 @@
 ## 机器可读真值与漂移门禁
 
 - 运行时真值仍是 `assets/contract/provider-registry.json` 中的 typed `codingPlan` Profile。
-- `assets/contract/coding-plan-source-baseline.json` 固定本轮 OmniRoute、cc-switch、9router 的 commit 与逐文件 SHA-256，只收录用于 origin、route、catalog、quota 或 Ollama 合同的证据文件。
+- `assets/contract/coding-plan-source-baseline.json` 固定本轮 OmniRoute 与 9router 的 commit 和逐文件 SHA-256，只收录用于 origin、route、catalog、quota 或 Ollama 合同的证据文件；它不读取桌面项目或 preset 仓库。
 - `assets/contract/coding-plan-registry-manifest.json` 由 `scripts/audit/audit-coding-plan-registry.mjs` 生成。它逐 region × Surface 输出 fixed origin、protocol、credential slot/auth、routes、模型 capability、quota provenance、stream terminal、error policy、maturity、`fixture_verified` 与 `live_pending`。
 - `node scripts/audit/audit-coding-plan-registry.mjs --check` 校验当前 Registry 与 manifest 等价；加 `--check-sources` 时还读取本地外部仓库，复核 commit 和每个 evidence file hash。外部目录缺失不影响普通离线门禁，但不能宣称完成了本轮 source drift review。
 - 新条目只有在 fixed HTTPS origin、Provider-owned credential、精确 route、reviewed catalog、quota 的 supported/unavailable 语义、严格 stream terminal 与无 post-commit retry 全部可建模时，才能进入 typed Registry。通用 OpenAI-compatible upstream 不能自动升级成某个套餐。

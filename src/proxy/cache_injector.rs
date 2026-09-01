@@ -1,3 +1,5 @@
+// Historical adaptation attribution is recorded in SOURCE_PROVENANCE.json.
+// This behavior is maintained as repository-owned code with in-module tests.
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

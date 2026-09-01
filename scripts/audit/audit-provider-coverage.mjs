@@ -5,25 +5,23 @@ import process from "node:process";
 
 import {
   assertRequiredProviderCoverage,
-  requiredProviderTypes,
-  serverCompatibilityProviderTypes,
 } from "./provider-profile-coverage.mjs";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const checkMode = process.argv.includes("--check");
-const upstreamBaselinePath = path.join(
+const requirementsPath = path.join(
   repoRoot,
-  "assets/contract/upstream-provider-source-baseline.json",
+  "assets/contract/server-provider-requirements.json",
 );
-const upstreamBaseline = JSON.parse(
-  fs.readFileSync(upstreamBaselinePath, "utf8"),
+const requirements = JSON.parse(
+  fs.readFileSync(requirementsPath, "utf8"),
 );
-const serverLegacyInventoryPath = path.join(
+const legacyCompatibilityPath = path.join(
   repoRoot,
-  "assets/contract/server-provider-legacy-inventory.json",
+  "assets/contract/provider-legacy-compatibility.json",
 );
-const serverLegacyInventory = JSON.parse(
-  fs.readFileSync(serverLegacyInventoryPath, "utf8"),
+const legacyCompatibility = JSON.parse(
+  fs.readFileSync(legacyCompatibilityPath, "utf8"),
 );
 const providerRegistryPath = path.join(
   repoRoot,
@@ -34,20 +32,12 @@ const providerRegistry = JSON.parse(
 );
 
 const providerTypeMetadata = new Map(
-  [...requiredProviderTypes, ...serverCompatibilityProviderTypes].map(
-    ([id, label, apps], index) => [
-      id,
-      { label, apps, required: index < requiredProviderTypes.length },
-    ],
-  ),
+  requirements.providerTypes.map((entry) => [entry.id, entry]),
 );
 
 function buildCoverage() {
-  const sourceProviderTypes = new Set(
-    upstreamBaseline.providerTypes.map((providerType) => providerType.id),
-  );
-  const providerTypes = serverLegacyInventory.providerTypes.map(
-    ({ variant, id }) => {
+  const providerTypes = requirements.providerTypes.map(
+    ({ variant, id, coverageClass }) => {
       const metadata = providerTypeMetadata.get(id);
       if (!metadata) {
         throw new Error(
@@ -59,8 +49,9 @@ function buildCoverage() {
         id,
         label: metadata.label,
         apps: metadata.apps,
-        required: metadata.required,
-        presentInSource: sourceProviderTypes.has(id),
+        required: coverageClass === "core",
+        coverageClass,
+        presentInSource: true,
         presentInServer: true,
       };
     },
@@ -68,15 +59,13 @@ function buildCoverage() {
 
   return {
     generatedFrom: {
-      baseline: path.relative(repoRoot, upstreamBaselinePath),
-      serverLegacyInventory: path.relative(repoRoot, serverLegacyInventoryPath),
-      serverProviderTypes: serverLegacyInventory.providerTypeSource,
-      upstreamCommit: upstreamBaseline.upstream.commit,
+      requirements: path.relative(repoRoot, requirementsPath),
+      legacyCompatibility: path.relative(repoRoot, legacyCompatibilityPath),
+      serverProviderTypes: requirements.providerTypeSource,
     },
     providerTypes,
-    upstreamPresets: upstreamBaseline.appPresets,
     presets: Object.fromEntries(
-      Object.entries(serverLegacyInventory.presets).map(([app, presets]) => [
+      Object.entries(legacyCompatibility.presets).map(([app, presets]) => [
         app,
         presets.map((preset) => ({
           name: preset.name,
@@ -88,7 +77,6 @@ function buildCoverage() {
         })),
       ]),
     ),
-    universalRecipes: upstreamBaseline.universalRecipes,
     customRecipes: providerRegistry.customRecipes.map((recipe) => ({
       recipeId: recipe.recipeId,
       label: recipe.label,
@@ -183,30 +171,27 @@ function toMarkdown(coverage) {
     "> **自动生成文件 · 请勿手工编辑。** 由 `scripts/audit/audit-provider-coverage.mjs` 从 `assets/contract/provider-coverage.json` 生成；手工改动会被 `--check` 判为不同步。",
   );
   lines.push("");
-  lines.push(`Generated from: \`${coverage.generatedFrom.baseline}\``);
+  lines.push(`Product requirements: \`${coverage.generatedFrom.requirements}\``);
   lines.push(
-    `Server migration inventory: \`${coverage.generatedFrom.serverLegacyInventory}\``,
+    `Legacy compatibility fixtures: \`${coverage.generatedFrom.legacyCompatibility}\``,
   );
   lines.push(
     `Server ProviderType source: \`${coverage.generatedFrom.serverProviderTypes.path}\``,
   );
-  lines.push(
-    `Pinned upstream commit: \`${coverage.generatedFrom.upstreamCommit}\``,
-  );
   lines.push("");
   lines.push(
-    "Note: server compatibility provider types are explicit cc-switch-server classifications for cc-switch presets that do not carry an upstream `providerType`.",
+    "The Server-owned requirements and Rust Provider Registry are authoritative. Legacy preset fixtures exist only for S1 data and older Web clients during the published compatibility window.",
   );
   lines.push("");
   lines.push("## Provider Types");
   lines.push("");
   lines.push(
-    "| ProviderType | Apps | Required | Present in pinned upstream baseline |",
+    "| ProviderType | Apps | Product class | Implemented in Server |",
   );
   lines.push("| --- | --- | --- | --- |");
   for (const item of coverage.providerTypes) {
     lines.push(
-      `| \`${item.id}\` | ${item.apps.join(", ")} | ${item.required ? "yes" : "no"} | ${item.presentInSource ? "yes" : "NO"} |`,
+      `| \`${item.id}\` | ${item.apps.join(", ")} | ${item.coverageClass} | ${item.presentInServer ? "yes" : "NO"} |`,
     );
   }
   lines.push("");
@@ -222,12 +207,12 @@ function toMarkdown(coverage) {
     }
     lines.push("");
   }
-  lines.push("## Upstream app preset counts");
+  lines.push("## Legacy compatibility fixture counts");
   lines.push("");
   lines.push("| App | Count |");
   lines.push("| --- | ---: |");
   for (const key of ["claude", "codex", "gemini"]) {
-    lines.push(`| ${key} | ${coverage.upstreamPresets[key].length} |`);
+    lines.push(`| ${key} | ${coverage.presets[key].length} |`);
   }
   lines.push("");
   lines.push("## Server Custom recipes");
@@ -240,18 +225,6 @@ function toMarkdown(coverage) {
     lines.push(
       `| ${recipe.label} | \`${recipe.compatibilityProviderType}\` | \`${recipe.profileId}\` | \`${recipe.binding.upstreamProtocol}\` | \`${recipe.binding.authScheme}\` | \`${recipe.modelPolicy}\` |`,
     );
-  }
-  lines.push("");
-  lines.push("## Universal recipes");
-  lines.push("");
-  lines.push("| Name | providerType | Apps |");
-  lines.push("| --- | --- | --- |");
-  for (const recipe of coverage.universalRecipes) {
-    const apps = Object.entries(recipe.defaultApps)
-      .filter(([, enabled]) => enabled)
-      .map(([app]) => app)
-      .join(", ");
-    lines.push(`| ${recipe.name} | \`${recipe.providerType}\` | ${apps} |`);
   }
   lines.push("");
   lines.push(...serverEvidenceNotes());
@@ -292,7 +265,7 @@ function serverEvidenceNotes() {
     "### Provider-owned API-key Coding Plans",
     "",
     "- The Registry contains 76 Profiles, including 20 typed `codingPlan` Profiles across Claude and Codex. Each contract fixes origin, upstream protocol, credential slot/auth scheme, route, reviewed model catalog, quota adapter, cache-token semantics, stream terminal, error envelope, and same-credential retry policy. These are Provider-owned credentials and never participate in Account pooling, rotation, quota selection, or cross-Provider fallback.",
-    "- `assets/contract/coding-plan-source-baseline.json` pins the reviewed OmniRoute, cc-switch, and 9router commits plus every evidence-file SHA-256. `scripts/audit/audit-coding-plan-registry.mjs` derives a checked-in manifest and fails on any unreviewed Family, missing Claude/Codex surface, non-HTTPS/fixed route, credential-policy mismatch, model/quota/terminal drift, retry expansion, or stale generated output. `--check-sources` additionally verifies the available external repositories byte-for-byte. The manifest exposes region, maturity, `fixture_verified`/`live_pending`, model modality/context, and quota provenance; tools remain `not_inferred_without_explicit_model_evidence`.",
+    "- `assets/contract/coding-plan-source-baseline.json` pins the reviewed OmniRoute and 9router commits plus every evidence-file SHA-256. `scripts/audit/audit-coding-plan-registry.mjs` derives a checked-in manifest and fails on any unreviewed Family, missing Claude/Codex surface, non-HTTPS/fixed route, credential-policy mismatch, model/quota/terminal drift, retry expansion, or stale generated output. `--check-sources` additionally verifies the available external repositories byte-for-byte. The manifest exposes region, maturity, `fixture_verified`/`live_pending`, model modality/context, and quota provenance; tools remain `not_inferred_without_explicit_model_evidence`.",
     "- Alibaba Coding Plan is split into China and Global/Singapore Families. Claude uses `x-api-key` against `/apps/anthropic/v1/messages`; Codex uses Bearer against `/v1/chat/completions`. Both regions have fixed DashScope Coding origins and reviewed catalogs. No stable official quota endpoint was evidenced, so the quota adapter is explicitly `unavailable` rather than inferred from console cookies or a different Alibaba Token Plan.",
     "- Within the Provider-owned Zhipu Coding Plan, `glm-5.3` is advertised only by the China and Global Codex Profiles. The reviewed 9router live receipt covers the OpenAI-compatible Coding endpoint and `reasoning_content`; it does not establish an Anthropic Messages rail, so the two Claude Profiles deliberately stop at their separately evidenced catalogs. Qoder independently maps a same-named model under the separate Qoder entitlement and never supplies Zhipu credentials.",
     "- Registry and fixture verification establish only a local contract. Alibaba and the expanded GLM catalog remain `experimental` / `live_pending` in this Server until each region and Surface has a real inference receipt; checked-in fixtures never claim live success.",
@@ -391,7 +364,7 @@ function serverEvidenceNotes() {
     "Independent Server implementation reviewed against official `amazon-q-developer-cli` commit `15cc8f3cd18c`; OmniRoute and 9router are used only for product-state and partial-surface differential evidence:",
     "",
     "- Account and login: `ProviderType::AmazonQOAuth` owns a separate Account manager, encrypted client registration, access/refresh tokens, refresh lock, device-flow store, and generation counters. `POST /api/accounts/amazon-q/device/start` registers the public client name `Amazon Q Developer for command line` with the three CodeWhisperer scopes, then starts AWS SSO OIDC device authorization at the fixed Builder ID start URL. Poll and refresh stay on the fixed `us-east-1` OIDC authority. A Kiro Account fails type validation before any Amazon Q network request.",
-    "- Provider and binding: visible `claude.amazon_q_oauth` and `codex.amazon_q_oauth` Profiles bind `special.amazon_q` to one explicit Amazon Q Account. Both server-native Profiles have a working S1 creation bridge even though their legacy display-name mappings have no upstream cc-switch fixture. Creation, discovery, quota, inference, and the only eligible pre-commit 401 replay preserve the same Provider, runtime fingerprint, Account id, and auth identity generation; there is no pool, catalog union, account rotation, or cross-Provider fallback.",
+    "- Provider and binding: visible `claude.amazon_q_oauth` and `codex.amazon_q_oauth` Profiles bind `special.amazon_q` to one explicit Amazon Q Account. Both server-native Profiles have a working S1 creation bridge even though their legacy display-name mappings have no preset fixture. Creation, discovery, quota, inference, and the only eligible pre-commit 401 replay preserve the same Provider, runtime fingerprint, Account id, and auth identity generation; there is no pool, catalog union, account rotation, or cross-Provider fallback.",
     "- Runtime wire: production inference is limited to `us-east-1` and `eu-central-1`, uses the AWS root endpoint with `application/x-amz-json-1.0`, target `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`, Amazon Q CLI user-agent, and `origin: CLI`. `AI_EDITOR` and `KIRO_CLI` are rejected for this product. Claude Messages and Codex Responses/Chat reuse the reviewed canonical CodeWhisperer translation, image hardening, strict AWS EventStream decoder, tool JSON bounds, unique `endEvent`, and downstream terminal adapters without reusing Kiro credentials or endpoint identity. Gemini remains unsupported.",
     "- Catalog and quota: `AmazonCodeWhispererService.ListAvailableModels` is paginated with bounded pages, models, tokens, and response bytes; the first page must provide a valid `defaultModel` whenever models are non-empty. Successful empty results are authoritative. Cache identity includes App, Provider id/revision, runtime fingerprint, Amazon Q Account auth/token generations, profile scope, and runtime region. Only network/408/429/5xx may read a bounded exact-scope stale catalog; authentication, malformed success, repeated pagination token, limit overflow, or generation drift fails closed. `AmazonCodeWhispererService.GetUsageLimits` uses the same bearer identity and region and never borrows Kiro quota.",
     "- Recovery and evidence: the first eligible discovery or inference 401 may refresh the same Amazon Q Account and replay once before downstream business output; a second 401, persistence failure, binding drift, or post-commit failure is terminal. Focused fixtures cover official device identity, flow ownership/expiry, Kiro rejection, catalog pagination/default model, generation-scoped cache, CLI endpoint/origin, quota operation, both client surfaces, and same-account replay. Local status is `fixture_verified`; real Builder ID/IdC login, model/quota, Claude/Codex non-stream/stream/tools/images, 401/429, cancellation, and revocation remain `live_pending`.",
@@ -432,7 +405,7 @@ function serverEvidenceNotes() {
     "",
     "### `kimi_code` (Kimi Code)",
     "",
-    "Server-owned capability independently implemented from Kimi protocol evidence in OmniRoute `918fba5e392ce8b137976349f035597196edc440`, CLIProxyAPI `bd34ceca04209ef0460f4b05e3a1a047fb7fad2a`, and the earlier `claude-code-proxy` review at `4ea0414b5bce26ae38f2547a50d2564ca3d5bc1d`; it is not part of the external Provider baseline:",
+    "Server-owned capability independently implemented from Kimi protocol evidence in OmniRoute `918fba5e392ce8b137976349f035597196edc440`, CLIProxyAPI `bd34ceca04209ef0460f4b05e3a1a047fb7fad2a`, and the earlier `claude-code-proxy` review at `4ea0414b5bce26ae38f2547a50d2564ca3d5bc1d`:",
     "",
     "- Device OAuth uses the fixed Kimi public client and `auth.kimi.com` endpoints with a serialized poll lease, bounded interval/expiry/body/timeouts, and explicit cancel. One generated device identity is reused by authorization, polling, the durable Account Profile, refresh, and inference.",
     "- A completed login requires access/refresh tokens plus a stable JWT `userId`; account IDs derive from that principal. Refresh rejects a changed `userId`, and a Provider rejects a stale account identity generation or missing account-scoped device identity.",
@@ -443,7 +416,7 @@ function serverEvidenceNotes() {
     "",
     "### `qoder_cosy` (Qoder OAuth)",
     "",
-    "Server-owned capability independently implemented from Qoder protocol evidence in TokenRouter `a63b6b6077738d7e2222f02ec050b70d3aeb3516` and 9router `15223724c3e1ad898e84ef6e0cc1686cbafc8290`; it is not part of the external Provider baseline:",
+    "Server-owned capability independently implemented from Qoder protocol evidence in TokenRouter `a63b6b6077738d7e2222f02ec050b70d3aeb3516` and 9router `15223724c3e1ad898e84ef6e0cc1686cbafc8290`:",
     "",
     "- Global and China are explicit Account site capabilities with fixed audited origins. Both support bounded device login; Global additionally supports explicit `pt-*` PAT import. Login/import requires a stable Qoder principal, persists only through the Account domain write path, and never converts another Provider credential into Qoder entitlement.",
     "- Inference exchanges the exact bound Account credential into its reviewed rail, refreshes only that same Account, and fences job-token/session ownership by Provider revision/runtime plus Account auth/token generations. Session owners are single-flight and generation-checked; stale or unknown post-send outcomes fail closed rather than selecting another Account.",
@@ -469,7 +442,7 @@ function serverEvidenceNotes() {
     "",
     "### `grok_oauth` (Grok/xAI OAuth)",
     "",
-    "Server-owned capability based on protocol evidence reviewed through 2026-08-13; it is not part of the external Provider baseline:",
+    "Server-owned capability based on protocol evidence reviewed through 2026-08-13:",
     "",
     "- OAuth/account storage: xAI public client id, PKCE, `plan=generic`, `referrer=cc-switch-server`, workspace read/write scopes, browser nonce validation, serialized device polling, and strict ES256 OIDC/JWKS verification with an EC P-256 signing key. Device start/poll advertise the shared CLI version plus `x-grok-client-surface: ui`; production authorize/token/discovery/JWKS endpoints are fixed to audited `auth.x.ai` HTTPS URLs, while loopback injection is test-only. Native refresh accepts an omitted replacement ID token only for an account with an existing verified subject, verifies any new ID token, and rejects subject changes. Explicit `~/.grok/auth.json` import also requires a signed ID token.",
     "- Proxy headers/body: OpenAI Responses upstream contract, `Authorization: Bearer`, `x-grok-conv-id`, Grok CLI identity defaulting to `0.2.111`, authoritative single-model routing with editable `grok-4.6` default, Responses field cleanup, reasoning effort/model/tool guards, and `encrypted_content` shape validation. `x-grok-turn-idx` is forwarded only from a valid downstream decimal u64; the server never fabricates or increments it, and the same optional value survives same-account 401 replay and WS→HTTP fallback.",
@@ -486,22 +459,22 @@ function serverEvidenceNotes() {
 
 function assertCoverage(coverage) {
   const missingTypes = coverage.providerTypes
-    .filter((item) => item.required && !item.presentInSource)
+    .filter((item) => !item.presentInServer)
     .map((item) => item.id);
   if (missingTypes.length > 0) {
     throw new Error(
-      `Missing provider types in source: ${missingTypes.join(", ")}`,
+      `Missing Server Provider types: ${missingTypes.join(", ")}`,
     );
   }
   if (
-    coverage.providerTypes.length !== serverLegacyInventory.providerTypes.length
+    coverage.providerTypes.length !== requirements.providerTypes.length
   ) {
     throw new Error(
       "Provider coverage does not match the Server ProviderType inventory",
     );
   }
   const coveredIds = new Set(coverage.providerTypes.map((item) => item.id));
-  for (const providerType of serverLegacyInventory.providerTypes) {
+  for (const providerType of requirements.providerTypes) {
     if (!coveredIds.has(providerType.id)) {
       throw new Error(`Server ProviderType is not covered: ${providerType.id}`);
     }

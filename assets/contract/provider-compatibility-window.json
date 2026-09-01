@@ -17,7 +17,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "786f0c1be2ae4162ca1fdaf6afe14726b17acf19aaa816a74e536c7ae16b4132"
+      "sha256": "0c9a6376272b435dd565ae1aa336a8d3a012d1a4dde212480526c721a81300b5"
     },
     {
       "path": "src/domain/providers/credentials.rs",

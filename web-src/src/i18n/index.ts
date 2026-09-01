@@ -1,14 +1,10 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 
-import en from "./locales/en.json";
-import ja from "./locales/ja.json";
-import zh from "./locales/zh.json";
-import zhTW from "./locales/zh-TW.json";
-import serverEn from "./server-locales/en.json";
-import serverJa from "./server-locales/ja.json";
-import serverZh from "./server-locales/zh.json";
-import serverZhTW from "./server-locales/zh-TW.json";
+import en from "./server-locales/en.json";
+import ja from "./server-locales/ja.json";
+import zh from "./server-locales/zh.json";
+import zhTW from "./server-locales/zh-TW.json";
 
 export type Language = "zh" | "zh-TW" | "en" | "ja";
 
@@ -79,29 +75,6 @@ const ACCOUNT_TRANSLATION_NAMESPACES = [
   "qoderOauth",
 ] as const;
 
-function mergeTranslationTrees(
-  base: Record<string, unknown>,
-  overlay: Record<string, unknown>,
-): Record<string, unknown> {
-  const merged = { ...base };
-  for (const [key, value] of Object.entries(overlay)) {
-    const existing = merged[key];
-    merged[key] =
-      existing &&
-      typeof existing === "object" &&
-      !Array.isArray(existing) &&
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value)
-        ? mergeTranslationTrees(
-            existing as Record<string, unknown>,
-            value as Record<string, unknown>,
-          )
-        : value;
-  }
-  return merged;
-}
-
 function withSharedAccountTranslations<T extends Record<string, unknown>>(
   locale: T,
 ): T {
@@ -124,24 +97,16 @@ function withSharedAccountTranslations<T extends Record<string, unknown>>(
 
 const resources = {
   en: {
-    translation: withSharedAccountTranslations(
-      mergeTranslationTrees(en, serverEn),
-    ),
+    translation: withSharedAccountTranslations(en),
   },
   ja: {
-    translation: withSharedAccountTranslations(
-      mergeTranslationTrees(ja, serverJa),
-    ),
+    translation: withSharedAccountTranslations(ja),
   },
   zh: {
-    translation: withSharedAccountTranslations(
-      mergeTranslationTrees(zh, serverZh),
-    ),
+    translation: withSharedAccountTranslations(zh),
   },
   "zh-TW": {
-    translation: withSharedAccountTranslations(
-      mergeTranslationTrees(zhTW, serverZhTW),
-    ),
+    translation: withSharedAccountTranslations(zhTW),
   },
 };
 

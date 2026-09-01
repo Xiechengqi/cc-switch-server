@@ -116,22 +116,6 @@ export const iconMetadata: Record<string, IconMetadata> = {
   vercel: { name: "vercel", displayName: "Vercel", defaultColor: "#111827" },
   ucloud: { name: "ucloud", displayName: "UCloud", defaultColor: "#2B70FF" },
   notion: { name: "notion", displayName: "Notion", defaultColor: "#111827" },
-  opencode: {
-    name: "opencode",
-    displayName: "OpenCode",
-    defaultColor: "#211E1E",
-  },
-  openclaw: {
-    name: "openclaw",
-    displayName: "OpenClaw",
-    defaultColor: "#ff4d4d",
-  },
-  hermes: { name: "hermes", displayName: "Hermes" },
-  "opencode-logo-light": {
-    name: "opencode-logo-light",
-    displayName: "OpenCode",
-    defaultColor: "#111827",
-  },
   "aihubmix-color": {
     name: "aihubmix-color",
     displayName: "AIHubMix",
@@ -152,7 +136,6 @@ export const iconMetadata: Record<string, IconMetadata> = {
     displayName: "CatCoder",
     defaultColor: "#FF7A1A",
   },
-  claw: { name: "claw", displayName: "Claw", defaultColor: "#111827" },
   cubence: { name: "cubence", displayName: "Cubence", defaultColor: "#2563EB" },
   "longcat-color": {
     name: "longcat-color",

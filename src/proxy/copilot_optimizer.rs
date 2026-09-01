@@ -1,3 +1,5 @@
+// Historical adaptation attribution is recorded in SOURCE_PROVENANCE.json.
+// This behavior is maintained as repository-owned code with in-module tests.
 use std::collections::HashSet;
 
 use rand::RngCore;

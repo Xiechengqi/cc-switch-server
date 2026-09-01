@@ -6,15 +6,12 @@ import {
 import {
   providersApi,
   settingsApi,
-  sessionsApi,
   type AppId,
 } from "@/lib/api";
 import type { ProviderResource } from "@/lib/api/providers";
 import type {
   Provider,
   Settings,
-  SessionMeta,
-  SessionMessage,
 } from "@/types";
 import { isServerWebRuntime } from "@/lib/runtime";
 import { SERVER_DEFAULT_SETTINGS } from "@/lib/serverDefaultSettings";
@@ -120,25 +117,5 @@ export const useSettingsQuery = (): UseQueryResult<Settings> => {
       }
     },
     placeholderData: isServerWebRuntime() ? SERVER_DEFAULT_SETTINGS : undefined,
-  });
-};
-
-export const useSessionsQuery = () => {
-  return useQuery<SessionMeta[]>({
-    queryKey: ["sessions"],
-    queryFn: async () => sessionsApi.list(),
-    staleTime: 30 * 1000,
-  });
-};
-
-export const useSessionMessagesQuery = (
-  providerId?: string,
-  sourcePath?: string,
-) => {
-  return useQuery<SessionMessage[]>({
-    queryKey: ["sessionMessages", providerId, sourcePath],
-    queryFn: async () => sessionsApi.getMessages(providerId!, sourcePath!),
-    enabled: Boolean(providerId && sourcePath),
-    staleTime: 30 * 1000,
   });
 };

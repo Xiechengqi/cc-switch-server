@@ -67,7 +67,7 @@ GitHub Copilot 的 2026-08-30 验收合同要求 Claude、Codex、Gemini 三个�
 
 DeepSeek Web 的 2026-08-30 合同只在 Claude Messages Surface 注册 `special.deepseek_account` Native Driver。导入为严格 bearer-only；生产 origin 固定 `chat.deepseek.com`；session/PoW/completion 状态绑定 Provider/runtime、Account auth/token generation、Share、用户、客户端 session 与 reviewed model。仅复用 session 的 400/404/409 可在提交前用原账号重建一次；401/403/429/5xx、代际漂移与提交后错误均终止。reviewed discovery 与 provider network test 已由 22 项 DeepSeek 聚焦测试覆盖，状态为 `fixture_verified` / `live_pending`；Codex、Gemini 与 images 明确 unsupported，不能落入 generic fallback 或 `deepseek_api`。
 
-API Key Coding Plans 的 2026-08-30 manifest 从 Registry 生成 10 个 Family、20 个 region × Claude/Codex Surface contract；外部 source baseline 固定 OmniRoute、cc-switch、9router commit 与 23 个 evidence file hash。生成审计逐项门禁 fixed HTTPS origin、Provider-owned credential、route、catalog、quota provenance、terminal、retry 与 maturity，quota unavailable 不允许 endpoint/Cookie，tools 无显式证据不外推。Coding Plan 29 项通过。Ollama 另以 Provider Bundle key 并发读取官方 `/api/me`/`/api/usage`，已覆盖 partial、redirect/body limit、同 generation stale、认证清理和 rotation fence；24 项通过，真实 Key 测试保持 ignored/live pending。
+API Key Coding Plans 的 2026-08-30 manifest 从 Registry 生成 10 个 Family、20 个 region × Claude/Codex Surface contract；外部 source baseline 固定 OmniRoute、9router commit 与 20 个 evidence file hash。生成审计逐项门禁 fixed HTTPS origin、Provider-owned credential、route、catalog、quota provenance、terminal、retry 与 maturity，quota unavailable 不允许 endpoint/Cookie，tools 无显式证据不外推。Coding Plan 29 项通过。Ollama 另以 Provider Bundle key 并发读取官方 `/api/me`/`/api/usage`，已覆盖 partial、redirect/body limit、同 generation stale、认证清理和 rotation fence；24 项通过，真实 Key 测试保持 ignored/live pending。
 
 | App 入口 | 路径 | 已有 native/static contract | 仍未真实关闭 |
 | --- | --- | --- | --- |

@@ -8,15 +8,7 @@
 
 ## 必须覆盖
 
-当前 cc-switch 中 Claude、Codex、Gemini 三类 app 已支持的所有供应商类型，都必须进入 server 覆盖范围。
-
-供应商覆盖以 Provider 基线仓库（`CC_SWITCH_PROVIDER_AUDIT_ROOT`，默认同级 `../cc-switch`）中以下五个权威来源为准，快照见 `assets/contract/upstream-provider-source-baseline.json`：
-
-- `src-tauri/src/proxy/providers/mod.rs`
-- `src/config/claudeProviderPresets.ts`
-- `src/config/codexProviderPresets.ts`
-- `src/config/geminiProviderPresets.ts`
-- `src/config/universalProviderPresets.ts`
+Claude、Codex、Gemini 三类 App 必须覆盖 `assets/contract/server-provider-requirements.json` 声明的全部 ProviderType/App Surface。Rust `Provider Registry` 是 Provider 身份、Profile、Driver 与运行时策略权威；`provider-legacy-compatibility.json` 只服务于兼容窗口内的 S1/旧 Web reader。
 
 ## 禁止默认迁移
 
@@ -29,9 +21,9 @@
 
 ## 外部 Provider 审计
 
-外部仓库改动只作为 Provider 类型和协议行为证据，不作为实现同步源。根据证据调整 Server 前，必须更新或核对：
+外部仓库只能在一次明确的协议研究中作为只读证据，不能成为构建、测试、发布、运行时或日常同步输入。根据证据调整 Server 前，必须更新或核对：
 
-- `UPSTREAM_IMPORT.md`
+- `PROTOCOL_EVIDENCE.md`
 - `docs/provider/coverage.md`
 
 ## 状态写入

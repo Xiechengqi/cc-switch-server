@@ -162,32 +162,16 @@ mod tests {
     }
 
     #[test]
-    fn exported_provider_structures_cover_required_fields() {
-        let raw = include_str!("../../../assets/contract/provider-fixtures/structures.json");
-        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let files = value
-            .get("files")
-            .and_then(serde_json::Value::as_array)
-            .expect("structures files must be an array");
-        assert!(files.len() >= 20, "provider structures export regressed");
-
-        for field in [
-            "settingsConfig",
-            "meta",
-            "models",
-            "modelMapping",
-            "authBinding",
-            "codexConfig",
-            "geminiConfig",
-        ] {
-            assert!(
-                files.iter().any(|file| {
-                    file.pointer(&format!("/coveredFields/{field}"))
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                }),
-                "provider structures do not cover {field}"
-            );
-        }
+    fn embedded_coverage_uses_server_owned_contracts() {
+        let coverage = ProviderCoverage::load_embedded().unwrap();
+        assert_eq!(
+            coverage.generated_from["requirements"],
+            "assets/contract/server-provider-requirements.json"
+        );
+        assert_eq!(
+            coverage.generated_from["legacyCompatibility"],
+            "assets/contract/provider-legacy-compatibility.json"
+        );
+        assert!(coverage.generated_from.get("upstreamCommit").is_none());
     }
 }

@@ -7,16 +7,35 @@ const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const checkMode = process.argv.includes("--check");
 
 const files = {
-  web: path.join(repoRoot, "web-dist/index.html"),
   adapters: path.join(repoRoot, "src/proxy/adapters.rs"),
   forwarder: path.join(repoRoot, "src/proxy/forwarder.rs"),
- providerMatrix: path.join(repoRoot, "src/domain/providers/matrix.rs"),
+  providerMatrix: path.join(repoRoot, "src/domain/providers/matrix.rs"),
   provider: path.join(repoRoot, "src/domain/providers/model.rs"),
   accountManagers: path.join(repoRoot, "src/domain/accounts/managers.rs"),
   accountRefresh: path.join(repoRoot, "src/clients/oauth/refresh.rs"),
   accountApi: path.join(repoRoot, "src/api/accounts.rs"),
   oauthClients: path.join(repoRoot, "src/domain/accounts/oauth.rs"),
-  providerCard: path.join(repoRoot, "web-src/src/components/providers/ProviderCard.tsx"),
+  providerRegistry: path.join(repoRoot, "assets/contract/provider-registry.json"),
+  providerRegistryModule: path.join(
+    repoRoot,
+    "web-src/src/server/providerRegistry.ts",
+  ),
+  providerBundlePage: path.join(
+    repoRoot,
+    "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx",
+  ),
+  providerBundleEditor: path.join(
+    repoRoot,
+    "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx",
+  ),
+  familyPicker: path.join(
+    repoRoot,
+    "web-src/src/server/providers/bundles/FamilyPicker.tsx",
+  ),
+  providerBundleCard: path.join(
+    repoRoot,
+    "web-src/src/server/providers/bundles/ProviderBundleCard.tsx",
+  ),
   providerMeta: path.join(repoRoot, "web-src/src/utils/providerMetaUtils.ts"),
   subscriptionQuery: path.join(repoRoot, "web-src/src/lib/query/subscription.ts"),
   subscriptionView: path.join(repoRoot, "web-src/src/components/SubscriptionQuotaFooter.tsx"),
@@ -32,44 +51,26 @@ function findBalanced(input, start, open, close) {
   let quote = "";
   let escaped = false;
 
-  for (let i = start; i < input.length; i += 1) {
-    const char = input[i];
+  for (let index = start; index < input.length; index += 1) {
+    const char = input[index];
     if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === quote) {
-        inString = false;
-      }
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) inString = false;
       continue;
     }
-
     if (char === '"' || char === "'" || char === "`") {
       inString = true;
       quote = char;
       continue;
     }
-
-    if (char === open) {
-      depth += 1;
-    } else if (char === close) {
+    if (char === open) depth += 1;
+    else if (char === close) {
       depth -= 1;
-      if (depth === 0) return i + 1;
+      if (depth === 0) return index + 1;
     }
   }
   throw new Error(`unterminated ${open}${close} literal`);
-}
-
-function extractConstObject(source, name) {
-  const marker = `const ${name} =`;
-  const markerIndex = source.indexOf(marker);
-  if (markerIndex < 0) throw new Error(`missing ${name} in web UI`);
-  const start = source.indexOf("{", markerIndex);
-  if (start < 0) throw new Error(`missing object literal for ${name}`);
-  const end = findBalanced(source, start, "{", "}");
-  const literal = source.slice(start, end);
-  return Function(`"use strict"; return (${literal});`)();
 }
 
 function extractProviderTypeMap(source) {
@@ -141,7 +142,6 @@ function assertUnique(values, label, errors) {
 }
 
 function audit() {
-  const web = read(files.web);
   const adapters = read(files.adapters);
   const forwarder = read(files.forwarder);
   const providerMatrix = read(files.providerMatrix);
@@ -150,22 +150,15 @@ function audit() {
   const accountRefresh = read(files.accountRefresh);
   const accountApi = read(files.accountApi);
   const oauthClients = read(files.oauthClients);
-  const providerCard = read(files.providerCard);
+  const providerRegistry = JSON.parse(read(files.providerRegistry));
+  const providerRegistryModule = read(files.providerRegistryModule);
+  const providerBundlePage = read(files.providerBundlePage);
+  const providerBundleEditor = read(files.providerBundleEditor);
+  const familyPicker = read(files.familyPicker);
+  const providerBundleCard = read(files.providerBundleCard);
   const providerMeta = read(files.providerMeta);
   const subscriptionQuery = read(files.subscriptionQuery);
   const subscriptionView = read(files.subscriptionView);
-
-  const hasLegacyWebProviderSchema = web.includes("const fallbackProviderTypesByApp =");
-  let providerTypesByApp = null;
-  let providerLabels = null;
-  let providerDefaults = null;
-  let providerTemplateEnv = null;
-  if (hasLegacyWebProviderSchema) {
-    providerTypesByApp = extractConstObject(web, "fallbackProviderTypesByApp");
-    providerLabels = extractConstObject(web, "fallbackProviderLabels");
-    providerDefaults = extractConstObject(web, "fallbackProviderDefaults");
-    providerTemplateEnv = extractConstObject(web, "fallbackProviderTemplateEnv");
-  }
 
   const variantToId = extractProviderTypeMap(provider);
   const adapterProviderTypes = extractProviderArray(adapters, "all_provider_types", variantToId);
@@ -181,25 +174,19 @@ function audit() {
     variantToId,
   );
   const capabilityApps = extractCapabilityApps(adapters);
-
-  if (!hasLegacyWebProviderSchema) {
-    providerTypesByApp = matrixProviderTypesByApp;
-    providerLabels = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
-    providerDefaults = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
-    providerTemplateEnv = Object.fromEntries(adapterProviderTypes.map((type) => [type, true]));
-  }
+  const providerTypesByApp = matrixProviderTypesByApp;
 
   const serverTypeSet = new Set(adapterProviderTypes);
   const capabilityAppSet = new Set(capabilityApps);
   const uiTypes = new Set(Object.values(providerTypesByApp).flat());
+  const registryProviderTypes = new Set();
   const errors = [];
 
   for (const [source, marker, label] of [
     [providerMeta, "provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH", "managed OAuth recognition"],
     [providerMeta, 'return "grok_oauth"', "Grok quota source"],
-    [providerCard, 'quotaSource === "grok_oauth"', "Grok quota card dispatch"],
-    [providerCard, "<GrokOauthQuotaFooter", "Grok quota footer"],
-    [providerCard, "return PROVIDER_TYPES.GROK_OAUTH", "Grok account-status mapping"],
+    [providerBundleCard, 'quotaSource === "grok_oauth"', "Grok quota card dispatch"],
+    [providerBundleCard, "<GrokOauthQuotaFooter", "Grok quota footer"],
     [subscriptionQuery, "useGrokOauthQuota", "Grok quota query"],
     [subscriptionQuery, 'credentialStatus !== "not_found"', "OAuth first-load refresh"],
     [subscriptionView, "grok_credits", "Grok credits tier"],
@@ -207,6 +194,113 @@ function audit() {
   ]) {
     if (!source.includes(marker)) {
       errors.push(`web UI is missing ${label}`);
+    }
+  }
+
+  for (const [source, marker, label] of [
+    [providerRegistryModule, "provider-registry.json", "Registry contract import"],
+    [familyPicker, "filterFamilies(providerRegistry.families", "Registry-backed family picker"],
+    [providerBundleEditor, "<FamilyPicker", "Bundle family selection"],
+    [providerBundleEditor, "createDraftForSelectedFamily", "Registry-backed bundle draft"],
+    [providerBundleEditor, "toProviderBundleWriteDraft", "typed bundle writer"],
+    [providerBundlePage, "<ProviderBundleEditor", "Bundle editor route"],
+    [providerBundlePage, "<ProviderBundleCard", "Bundle card route"],
+  ]) {
+    if (!source.includes(marker)) {
+      errors.push(`web UI is missing ${label}`);
+    }
+  }
+
+  if (providerRegistry.format !== "cc-switch-provider-registry") {
+    errors.push("provider Registry format is not cc-switch-provider-registry");
+  }
+  const profiles = providerRegistry.profiles ?? [];
+  const families = providerRegistry.families ?? [];
+  assertUnique(
+    profiles.map((profile) => profile.profileId),
+    "provider Registry profiles",
+    errors,
+  );
+  assertUnique(
+    families.map((family) => family.familyId),
+    "provider Registry families",
+    errors,
+  );
+  const profileById = new Map(
+    profiles.map((profile) => [profile.profileId, profile]),
+  );
+  const familyProfileIds = new Set();
+  for (const profile of profiles) {
+    if (!profile.compatibilityProviderType) continue;
+    registryProviderTypes.add(profile.compatibilityProviderType);
+    if (!serverTypeSet.has(profile.compatibilityProviderType)) {
+      errors.push(
+        `Registry Profile ${profile.profileId} has unknown ProviderType ${profile.compatibilityProviderType}`,
+      );
+    }
+    if (
+      !providerTypesByApp[profile.app]?.includes(
+        profile.compatibilityProviderType,
+      )
+    ) {
+      errors.push(
+        `Registry Profile ${profile.profileId} is outside the ${profile.app} UI Provider matrix`,
+      );
+    }
+  }
+  for (const family of families) {
+    const surfaceProfileIds = new Set(
+      family.surfaces.map((surface) => surface.profileId),
+    );
+    const credentialProfile = profileById.get(family.credentialProfileId);
+    if (!credentialProfile) {
+      errors.push(
+        `Registry family ${family.familyId} has missing credential Profile ${family.credentialProfileId}`,
+      );
+    }
+    assertUnique(
+      family.surfaces.map((surface) => surface.app),
+      `Registry family ${family.familyId} surfaces`,
+      errors,
+    );
+    for (const surface of family.surfaces) {
+      familyProfileIds.add(surface.profileId);
+      const profile = profileById.get(surface.profileId);
+      if (!profile) {
+        errors.push(
+          `Registry family ${family.familyId} has missing surface Profile ${surface.profileId}`,
+        );
+        continue;
+      }
+      if (profile.app !== surface.app) {
+        errors.push(
+          `Registry family ${family.familyId} surface ${surface.app} uses ${profile.app} Profile ${surface.profileId}`,
+        );
+      }
+      if (
+        profile.visibility !== "visible" ||
+        profile.creationPolicy !== "create_allowed"
+      ) {
+        errors.push(
+          `Registry family ${family.familyId} exposes non-creatable Profile ${surface.profileId}`,
+        );
+      }
+    }
+    if (!surfaceProfileIds.has(family.credentialProfileId)) {
+      errors.push(
+        `Registry family ${family.familyId} credential Profile is not a family surface`,
+      );
+    }
+  }
+  for (const profile of profiles) {
+    if (
+      profile.visibility === "visible" &&
+      profile.creationPolicy === "create_allowed" &&
+      !familyProfileIds.has(profile.profileId)
+    ) {
+      errors.push(
+        `visible creatable Registry Profile ${profile.profileId} is unreachable from the family picker`,
+      );
     }
   }
 
@@ -222,52 +316,11 @@ function audit() {
     if (!capabilityAppSet.has(app)) {
       errors.push(`UI app ${app} has no proxy capability app`);
     }
-    const matrixTypes = matrixProviderTypesByApp[app] || [];
-    if (types.join("\n") !== matrixTypes.join("\n")) {
-      errors.push(`fallbackProviderTypesByApp.${app} does not match provider_matrix ui_provider_types`);
-    }
     assertUnique(types, `UI providerTypesByApp.${app}`, errors);
     for (const type of types) {
       if (!serverTypeSet.has(type)) {
         errors.push(`UI provider ${app}:${type} is not in server all_provider_types`);
       }
-      if (!providerDefaults[type]) {
-        errors.push(`UI provider ${type} is missing providerDefaults`);
-      }
-      if (!providerTemplateEnv[type]) {
-        errors.push(`UI provider ${type} is missing providerTemplateEnv`);
-      }
-      if (!providerLabels[type]) {
-        errors.push(`UI provider ${type} is missing providerLabels`);
-      }
-    }
-  }
-
-  for (const type of adapterProviderTypes) {
-    if (!providerDefaults[type]) {
-      errors.push(`server provider ${type} is missing UI providerDefaults`);
-    }
-    if (!providerTemplateEnv[type]) {
-      errors.push(`server provider ${type} is missing UI providerTemplateEnv`);
-    }
-    if (!providerLabels[type]) {
-      errors.push(`server provider ${type} is missing UI providerLabels`);
-    }
-  }
-
-  for (const type of Object.keys(providerDefaults)) {
-    if (!serverTypeSet.has(type)) {
-      errors.push(`providerDefaults contains unknown provider ${type}`);
-    }
-  }
-  for (const type of Object.keys(providerTemplateEnv)) {
-    if (!serverTypeSet.has(type)) {
-      errors.push(`providerTemplateEnv contains unknown provider ${type}`);
-    }
-  }
-  for (const type of Object.keys(providerLabels)) {
-    if (!serverTypeSet.has(type)) {
-      errors.push(`providerLabels contains unknown provider ${type}`);
     }
   }
 
@@ -291,18 +344,6 @@ function audit() {
   }
   if (!accountManagers.includes("\"manual_import_native_refresh\"")) {
     errors.push("account capabilities no longer expose manual_import_native_refresh status");
-  }
-  if (hasLegacyWebProviderSchema) {
-    for (const marker of [
-      "manual refresh-token import",
-      "native refresh/profile",
-      "refreshToken is required",
-      "accountRefreshStateText",
-    ]) {
-      if (!web.includes(marker)) {
-        errors.push(`web UI no longer renders account refresh-ready marker: ${marker}`);
-      }
-    }
   }
   for (const marker of [
     "account_needs_native_refresh",
@@ -340,8 +381,8 @@ function audit() {
     if (!serverTypeSet.has(type)) {
       errors.push(`account provider ${type} is not in server all_provider_types`);
     }
-    if (!providerDefaults[type] || !providerTemplateEnv[type]) {
-      errors.push(`account provider ${type} is not importable from the Web provider schema`);
+    if (!registryProviderTypes.has(type)) {
+      errors.push(`account provider ${type} is not represented by a Registry Profile`);
     }
   }
 
@@ -361,7 +402,9 @@ function audit() {
       capabilityApps.length * adapterProviderTypes.length -
       Object.values(providerTypesByApp).reduce((total, types) => total + types.length, 0),
     accountProviderTypes: accountProviderTypes.length,
-    webSchema: hasLegacyWebProviderSchema ? "legacy-web-dist" : "react-web-src-pending",
+    registryFamilies: families.length,
+    registryProfiles: profiles.length,
+    webSchema: "registry-bundle-ui",
   };
 }
 
@@ -373,6 +416,8 @@ const message =
   `${summary.uiProviderPairs} UI app/provider pairs, ` +
   `${summary.diagnosticProviderPairs} diagnostic-only pairs, ` +
   `${summary.accountProviderTypes} account provider types, ` +
+  `${summary.registryFamilies} Registry families, ` +
+  `${summary.registryProfiles} Registry Profiles, ` +
   `web schema ${summary.webSchema}`;
 
 if (checkMode) {

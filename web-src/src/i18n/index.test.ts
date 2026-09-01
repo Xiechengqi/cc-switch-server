@@ -1,16 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import i18n, { normalizeLanguage } from "./index";
-import en from "./locales/en.json";
-import ja from "./locales/ja.json";
-import zh from "./locales/zh.json";
-import zhTW from "./locales/zh-TW.json";
 import serverEn from "./server-locales/en.json";
 import serverJa from "./server-locales/ja.json";
 import serverZh from "./server-locales/zh.json";
 import serverZhTW from "./server-locales/zh-TW.json";
 
-const locales = { en, ja, zh, "zh-TW": zhTW } as const;
 const serverLocales = {
   en: serverEn,
   ja: serverJa,
@@ -24,7 +19,6 @@ const criticalKeys = [
   "confirm.deleteProvider",
   "confirm.deleteProviderMessage",
   "provider.unsavedChanges.title",
-  "provider.unsavedChanges.addMessage",
   "provider.unsavedChanges.editMessage",
   "provider.unsavedChanges.discard",
   "provider.unsavedChanges.keepEditing",
@@ -43,11 +37,9 @@ const criticalKeys = [
   "share.confirmDeleteTitle",
   "share.confirmDeleteMessage",
   "share.freeAccess.label",
-  "share.freeAccess.hint",
 ] as const;
 
 const codexFeatureKeys = [
-  "featureOptionsTitle",
   "fastMode",
   "fastModeDescription",
   "imageGeneration",
@@ -110,13 +102,10 @@ describe("i18n resources", () => {
     }
   });
 
-  it("deep-merges server overlays without dropping desktop translations", () => {
+  it("loads the standalone Server locale resources", () => {
     for (const language of languages) {
       expect(i18n.t("provider.share.sectionTitle", { lng: language })).toBe(
         serverLocales[language].provider.share.sectionTitle,
-      );
-      expect(i18n.t("provider.name", { lng: language })).toBe(
-        locales[language].provider.name,
       );
     }
   });
@@ -180,11 +169,11 @@ describe("i18n resources", () => {
   it("shares account copy while retaining provider-specific overrides", () => {
     for (const language of languages) {
       expect(i18n.t("claudeOauth.retry", { lng: language })).toBe(
-        locales[language].accountAuth.retry,
+        serverLocales[language].accountAuth.retry,
       );
       expect(
         i18n.t("codexOauth.selectAccountPlaceholder", { lng: language }),
-      ).toBe(locales[language].codexOauth.selectAccountPlaceholder);
+      ).toBe(serverLocales[language].codexOauth.selectAccountPlaceholder);
     }
   });
 });

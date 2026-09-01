@@ -49,14 +49,10 @@ import midjourney from "./midjourney.svg?raw";
 import vercel from "./vercel.svg?raw";
 import ucloud from "./ucloud.svg?raw";
 import notion from "./notion.svg?raw";
-import opencodeLogoLight from "./opencode-logo-light.svg?raw";
-import opencode from "./opencode.svg?raw";
-import openclaw from "./openclaw.svg?raw";
 import aihubmixColor from "./aihubmix-color.svg?raw";
 import aicoding from "./aicoding.svg?raw";
 import algocode from "./algocode.svg?raw";
 import catcoder from "./catcoder.svg?raw";
-import claw from "./claw.svg?raw";
 import cubence from "./cubence.svg?raw";
 import longcatColor from "./longcat-color.svg?raw";
 import aicodemirror from "./aicodemirror.svg?raw";
@@ -69,7 +65,6 @@ import sssaicode from "./sssaicode.svg?raw";
 import xiaomimimo from "./xiaomimimo.svg?raw";
 import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
-import hermesUrl from "./hermes.png";
 import qoderUrl from "./qoder.png";
 import bailianUrl from "./bailian.png";
 
@@ -127,14 +122,10 @@ export const icons: Record<string, string> = {
   vercel,
   ucloud,
   notion,
-  opencode,
-  openclaw,
-  "opencode-logo-light": opencodeLogoLight,
   "aihubmix-color": aihubmixColor,
   aicoding,
   algocode,
   catcoder,
-  claw,
   cubence,
   "longcat-color": longcatColor,
   aicodemirror,
@@ -150,7 +141,6 @@ export const icons: Record<string, string> = {
 export const iconUrls: Record<string, string> = {
   cursor: cursorUrl,
   kiro: kiroUrl,
-  hermes: hermesUrl,
   qoder: qoderUrl,
   bailian: bailianUrl,
 };

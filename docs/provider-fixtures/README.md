@@ -1,17 +1,16 @@
 # Provider Fixture 目录
 
-本目录只保留说明文档。运行时使用的脱敏结构覆盖 JSON 已迁入 `assets/contract/provider-fixtures/structures.json`。
+本目录只保留说明文档。Provider 运行时身份以 `assets/contract/provider-registry.json` 为准；产品覆盖要求位于 `assets/contract/server-provider-requirements.json`，兼容窗口内的最小 preset fixture 位于 `assets/contract/provider-legacy-compatibility.json`。这些文件均由本仓库维护，不从外部工作树生成。
 
 约束：
 
-- `assets/contract/provider-fixtures/structures.json` 是固定的 legacy Provider 兼容证据，不从外部工作树自动重生成。
-- 新增结构只按 Server reader、writer 和 runtime contract 的实际需求手工补充，并在 review 中说明消费路径。
+- 新增结构只按 Server reader、writer 和 runtime contract 的实际需求补充，并在 review 中说明消费路径。
 - fixture 用于 adapter contract test、provider type 分类回归、usage parser snapshot。
 - OAuth/账号型 provider 没有真实凭据时，只能保存脱敏配置结构和协议样例，不能标记真实登录能力完成。
 
 OpenAI OAuth/Codex 的当前可执行协议样例保存在 `assets/contract/openai-oauth-protocol.json`。它固定官方 OAuth/上游地址、CLI callback、workspace header、可信 claim 合并样例和 WebSocket fallback 边界；Rust 单测直接消费 identity 与 fallback status 样例，修改实现或证据时必须同步更新并 review。
 
-Claude OAuth 的当前脱敏 wire capture 保存在 `assets/contract/claude-oauth-wire-profile.json`。它只保留 Claude Code/Stainless/Node/Axios 公开版本、endpoint identity family、token endpoint 顺序、CCH/beta 合同和静态模型 ID；token、账号标识、请求/响应 body 与未验证的私有 build metadata 明确排除。Rust 的 `ClaudeWireProfile`、Messages/CountTokens beta 矩阵、profile/bootstrap/roles 请求身份和静态模型目录以该 capture 为共同证据，任一项变化都必须同步更新 fixture、实现、测试和 `UPSTREAM_IMPORT.md`。
+Claude OAuth 的当前脱敏 wire capture 保存在 `assets/contract/claude-oauth-wire-profile.json`。它只保留 Claude Code/Stainless/Node/Axios 公开版本、endpoint identity family、token endpoint 顺序、CCH/beta 合同和静态模型 ID；token、账号标识、请求/响应 body 与未验证的私有 build metadata 明确排除。Rust 的 `ClaudeWireProfile`、Messages/CountTokens beta 矩阵、profile/bootstrap/roles 请求身份和静态模型目录以该 capture 为共同证据，任一项变化都必须同步更新 fixture、实现、测试和 `PROTOCOL_EVIDENCE.md`。
 
 Claude Max 20x 的本地 resolver 测试包含脱敏的 `default_claude_max_20x` 协议形状；5x 仅有同形解析规则。两者都不是 live credential evidence，仍必须分别通过 `scripts/smoke/claude-oauth-real.mjs` 的真实账号 gate 才能标记真实通过。
 

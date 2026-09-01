@@ -13,13 +13,7 @@
     "moduleResolution": "Bundler",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"],
-      "@tauri-apps/api/core": ["src/shims/tauri-apps/api/core.ts"],
-      "@tauri-apps/api/event": ["src/shims/tauri-apps/api/event.ts"],
-      "@tauri-apps/api/app": ["src/shims/tauri-apps/api/app.ts"],
-      "@tauri-apps/api/path": ["src/shims/tauri-apps/api/path.ts"],
-      "@tauri-apps/plugin-process": ["src/shims/tauri-apps/plugin-process.ts"],
-      "@tauri-apps/plugin-updater": ["src/shims/tauri-apps/plugin-updater.ts"]
+      "@/*": ["src/*"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

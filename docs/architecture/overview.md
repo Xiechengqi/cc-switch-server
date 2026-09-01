@@ -20,7 +20,7 @@ Token 路由交易系统由**三个角色**构成，运行时只有**两个进�
 
 - 独立 Token Market 服务（`cc-switch-market`）。Router 上 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 一律返回 `410 Gone`。
 - 独立 `cc-switch-share-market` 仓库，其能力已并入 Router 内置 Share Market。
-- Tauri 桌面端 `cc-switch` 作为 Router 客户端的角色。该仓库现在只是**Provider 预置审计基线**，见 [`UPSTREAM_IMPORT.md`](../../UPSTREAM_IMPORT.md)。
+- 任何 Tauri 桌面端或外部 Provider 仓库。Server 的 Provider 产品范围由本仓库 requirements/Registry 决定，证据边界见 [`PROTOCOL_EVIDENCE.md`](../../PROTOCOL_EVIDENCE.md)。
 - 账本抽成（10%+5%）与 Gate.io 提现。现行结算为 USD 赊账账户（按 买家×供应商 聚合）+ 线下付款声明 + 供应商确认 + 12h 健康时长试用。
 
 ## 2. 两条链路

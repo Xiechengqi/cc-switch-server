@@ -1,15 +1,14 @@
 {
-  "format": "cc-switch-coding-plan-registry-manifest",
+  "format": "cc-switch-server-coding-plan-registry-manifest",
   "schemaVersion": 1,
   "capturedAt": "2026-08-30T00:00:00Z",
   "generatedFrom": {
     "providerRegistry": "assets/contract/provider-registry.json",
-    "providerRegistrySha256": "38a1cee09c4c052f8ba98bd7e0eb61bdcc563c63622c14a9b7ecfbf506b70684",
+    "providerRegistrySha256": "6483a00237618ec130482d5a8654f18cef1ce1e29cf8952199cd7c6e7d3fbbb5",
     "sourceBaseline": "assets/contract/coding-plan-source-baseline.json",
-    "sourceBaselineSha256": "48b6e580862e4186d5f5206e8ddfff68870218fffa6f7060b9d7c39c7735fe4a",
+    "sourceBaselineSha256": "8bf2f22ed2bfb3fe8c37bc698bc8282396174859ac91615f2403611834ad59c0",
     "sourceCommits": {
       "omniroute": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
-      "cc-switch": "d8065cc628fcd373d00c4363d718095f19e78c9e",
       "9router": "90b52e06ffd666b7929554211474d01588f6b1f8"
     }
   },
@@ -45,7 +44,7 @@
       "familyId": "family.kimi_coding_api_key",
       "label": "Kimi API Key",
       "region": "global",
-      "upstreamPlanIds": [
+      "planIds": [
         "kimi-coding-apikey"
       ],
       "surfaces": [
@@ -117,7 +116,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute Kimi Coding API-key rail and cc-switch preset review",
+            "source": "OmniRoute Kimi Coding API-key rail and usage contract",
             "capturedAt": "2026-08-13T00:00:00Z"
           }
         },
@@ -189,7 +188,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute Kimi Coding API-key rail and cc-switch preset review",
+            "source": "OmniRoute Kimi Coding API-key rail and usage contract",
             "capturedAt": "2026-08-13T00:00:00Z"
           }
         }
@@ -206,18 +205,6 @@
           "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
           "path": "open-sse/services/usage/kimi.ts",
           "sha256": "305319fe73e9a1891039e8f908d824684a6f8b6547bae94e6a4db4a55de0d36d"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -225,7 +212,7 @@
       "familyId": "family.zhipu_glm_cn",
       "label": "Zhipu (China)",
       "region": "china",
-      "upstreamPlanIds": [
+      "planIds": [
         "glm-cn"
       ],
       "surfaces": [
@@ -380,7 +367,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute GLM contracts and cc-switch Zhipu Coding Plan review",
+            "source": "OmniRoute GLM registry and usage contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         },
@@ -543,7 +530,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute GLM contracts, 9router live GLM-5.3 Coding endpoint evidence, and cc-switch Zhipu review",
+            "source": "OmniRoute GLM registry and usage contracts plus 9router GLM-5.3 endpoint evidence",
             "capturedAt": "2026-08-23T00:00:00Z"
           }
         }
@@ -566,18 +553,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/services/usage/glm.js",
           "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -585,7 +560,7 @@
       "familyId": "family.zhipu_glm_global",
       "label": "Zhipu (Global)",
       "region": "global",
-      "upstreamPlanIds": [
+      "planIds": [
         "zai",
         "glm"
       ],
@@ -741,7 +716,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute GLM contracts and cc-switch Zhipu Coding Plan review",
+            "source": "OmniRoute GLM registry and usage contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         },
@@ -904,7 +879,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute GLM contracts, 9router live GLM-5.3 Coding endpoint evidence, and cc-switch Zhipu review",
+            "source": "OmniRoute GLM registry and usage contracts plus 9router GLM-5.3 endpoint evidence",
             "capturedAt": "2026-08-23T00:00:00Z"
           }
         }
@@ -927,18 +902,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/services/usage/glm.js",
           "sha256": "de19f01a4c4377a29aac2883552c785645e010f83feda5d1cc4e3e5691778906"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -946,7 +909,7 @@
       "familyId": "family.bailian_coding_plan_cn",
       "label": "Bailian",
       "region": "china",
-      "upstreamPlanIds": [
+      "planIds": [
         "bailian-coding-plan",
         "alicode"
       ],
@@ -1066,7 +1029,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute Bailian regional Anthropic contract and cc-switch Bailian For Coding preset review",
+            "source": "OmniRoute Bailian regional Anthropic contract",
             "capturedAt": "2026-08-23T00:00:00Z"
           }
         },
@@ -1192,7 +1155,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "9router Alibaba Coding Chat catalog and cc-switch Bailian For Coding review",
+            "source": "9router Alibaba Coding Chat catalog",
             "capturedAt": "2026-08-23T00:00:00Z"
           }
         }
@@ -1209,18 +1172,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/providers/registry/alicode.js",
           "sha256": "a9975605e1d45a30da3170532ee9a97f11986247871c4a139b8ce05a95aee6fc"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -1228,7 +1179,7 @@
       "familyId": "family.bailian_coding_plan_global",
       "label": "Bailian",
       "region": "global_singapore",
-      "upstreamPlanIds": [
+      "planIds": [
         "bailian-coding-plan",
         "alicode-intl"
       ],
@@ -1348,7 +1299,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute Bailian regional Anthropic contract and cc-switch Bailian For Coding preset review",
+            "source": "OmniRoute Bailian regional Anthropic contract",
             "capturedAt": "2026-08-23T00:00:00Z"
           }
         },
@@ -1483,18 +1434,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/providers/registry/alicode-intl.js",
           "sha256": "e60f662277ad3dc5a167c1a253d8077f1f20d8922f468004dce58ba55d1dfa95"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -1502,7 +1441,7 @@
       "familyId": "family.minimax_cn",
       "label": "MiniMax (China)",
       "region": "china",
-      "upstreamPlanIds": [
+      "planIds": [
         "minimax-cn"
       ],
       "surfaces": [
@@ -1608,7 +1547,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "source": "OmniRoute MiniMax registry and quota contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         },
@@ -1710,7 +1649,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "source": "OmniRoute MiniMax registry and quota contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         }
@@ -1733,18 +1672,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/services/usage/minimax.js",
           "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -1752,7 +1679,7 @@
       "familyId": "family.minimax_global",
       "label": "MiniMax (Global)",
       "region": "global",
-      "upstreamPlanIds": [
+      "planIds": [
         "minimax"
       ],
       "surfaces": [
@@ -1858,7 +1785,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "source": "OmniRoute MiniMax registry and quota contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         },
@@ -1960,7 +1887,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "OmniRoute MiniMax quota adapter and cc-switch Coding Plan preset review",
+            "source": "OmniRoute MiniMax registry and quota contracts",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         }
@@ -1983,18 +1910,6 @@
           "commit": "90b52e06ffd666b7929554211474d01588f6b1f8",
           "path": "open-sse/services/usage/minimax.js",
           "sha256": "79ed2c033035cfca50af06b8ab37e1408aaba2aa2fba8c41a7c2dfa03a8884ef"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -2002,7 +1917,7 @@
       "familyId": "family.volcengine_coding_plan",
       "label": "Volcengine",
       "region": "china_beijing",
-      "upstreamPlanIds": [
+      "planIds": [
         "volcengine-coding-plan"
       ],
       "surfaces": [
@@ -2078,7 +1993,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "cc-switch Volcengine V4 quota implementation and fixed Coding Plan endpoint review",
+            "source": "OmniRoute Volcengine fixed Coding Plan endpoint and quota contract",
             "capturedAt": "2026-08-13T00:00:00Z"
           }
         },
@@ -2150,7 +2065,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "cc-switch Volcengine V4 quota implementation and fixed Coding Plan endpoint review",
+            "source": "OmniRoute Volcengine fixed Coding Plan endpoint and quota contract",
             "capturedAt": "2026-08-13T00:00:00Z"
           }
         }
@@ -2167,18 +2082,6 @@
           "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
           "path": "open-sse/services/usage/volcenginePlan.ts",
           "sha256": "bbed6078e15fb33f366c7bd25583c10e9ebe41e15d0b462953a68f44360975ba"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -2186,7 +2089,7 @@
       "familyId": "family.xiaomi_mimo_token_plan",
       "label": "Xiaomi MiMo (China)",
       "region": "china",
-      "upstreamPlanIds": [
+      "planIds": [
         "xiaomi-mimo-token-plan"
       ],
       "surfaces": [
@@ -2263,7 +2166,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "cc-switch China Token Plan preset and OmniRoute quota limitation review",
+            "source": "OmniRoute Xiaomi Token Plan endpoint and quota limitation review",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         },
@@ -2336,7 +2239,7 @@
           },
           "pricingEvidence": {
             "evidence": "flat_rate_subscription_no_usd",
-            "source": "cc-switch China Token Plan preset and OmniRoute quota limitation review",
+            "source": "OmniRoute Xiaomi Token Plan endpoint and quota limitation review",
             "capturedAt": "2026-08-14T00:00:00Z"
           }
         }
@@ -2353,18 +2256,6 @@
           "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
           "path": "open-sse/services/usage/xiaomi-mimo.ts",
           "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     },
@@ -2372,7 +2263,7 @@
       "familyId": "family.xiaomi_mimo_token_plan_sgp",
       "label": "Xiaomi MiMo (Singapore)",
       "region": "singapore",
-      "upstreamPlanIds": [
+      "planIds": [
         "xiaomi-mimo-token-plan"
       ],
       "surfaces": [
@@ -2539,18 +2430,6 @@
           "commit": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
           "path": "open-sse/services/usage/xiaomi-mimo.ts",
           "sha256": "40b1a2c4dd32481a99fcc6e1602e20b5a258ec360410a23a69db082d60034635"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/claudeProviderPresets.ts",
-          "sha256": "f2dbee90cfea041b03864e7906569b4ccfbace8789a8f0c68051951d5d620ff8"
-        },
-        {
-          "sourceId": "cc-switch",
-          "commit": "d8065cc628fcd373d00c4363d718095f19e78c9e",
-          "path": "src/config/codexProviderPresets.ts",
-          "sha256": "3364b34e65ae1bdd20250b9bce52a6eedcab1baa50f6b65a6a557b0bcc17b8c0"
         }
       ]
     }

@@ -27,12 +27,8 @@ export interface ProxyServerInfo {
 
 export interface ProxyTakeoverStatus {
   claude: boolean;
-  "claude-desktop"?: boolean;
   codex: boolean;
   gemini: boolean;
-  opencode: boolean;
-  openclaw: boolean;
-  hermes: boolean;
   // 核心应用尚无已启用 Surface 时的待配置态。
   claude_pending?: boolean;
   codex_pending?: boolean;

@@ -105,9 +105,8 @@ export function useClaudeOauth() {
       authApi.authStartLogin(
         "claude_oauth",
         undefined,
-        // 远程 web 模式（通过 client URL 访问）走 platform.claude.com out-of-band
-        // 回调；桌面 Tauri 模式默认继续走 127.0.0.1:54545，但也允许用户
-        // 显式选择 platform.claude.com 官方回调。
+        // Client URL 模式走 platform.claude.com out-of-band 回调；Server
+        // 本地管理地址默认继续走 127.0.0.1:54545，也允许显式选择官方回调。
         params.flowMode ?? (isRemoteWebMode() ? "web_paste" : undefined),
       ),
     onSuccess: async (response, params) => {

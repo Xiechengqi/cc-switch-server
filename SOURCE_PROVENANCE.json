@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "project": "cc-switch-server",
+  "projectLicense": "MIT",
+  "policy": {
+    "runtimeAndBuildInputsMustBeRepositoryOwned": true,
+    "historicalAttributionIsNotATechnicalDependency": true
+  },
+  "adaptedSources": [
+    {
+      "id": "cc-switch-historical-adaptation",
+      "repository": "https://github.com/farion1231/cc-switch",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2025 Jason Young",
+      "scope": [
+        "historically adapted Web interaction patterns and components",
+        "selected proxy and OAuth protocol implementations",
+        "src/proxy/cache_injector.rs",
+        "src/proxy/copilot_optimizer.rs",
+        "src/proxy/copilot_model_map.rs"
+      ],
+      "technicalInput": false,
+      "notice": "THIRD_PARTY_NOTICES.md",
+      "reviewBoundary": {
+        "sources": [
+          "src/proxy/cache_injector.rs",
+          "src/proxy/copilot_optimizer.rs",
+          "src/proxy/copilot_model_map.rs"
+        ],
+        "tests": "in-module #[cfg(test)] unit tests",
+        "policy": "repository-owned behavior; no upstream checkout or runtime fetch"
+      }
+    },
+    {
+      "id": "lobehub-icons-static-svg",
+      "repository": "https://github.com/lobehub/lobe-icons",
+      "package": "@lobehub/icons-static-svg@1.91.0",
+      "license": "MIT",
+      "copyright": "Copyright LobeHub",
+      "scope": ["web-src public provider and product icon assets"],
+      "technicalInput": false,
+      "notice": "THIRD_PARTY_NOTICES.md"
+    }
+  ]
+}

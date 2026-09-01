@@ -26,7 +26,7 @@
 ## 外部证据边界
 
 - Cursor endpoint/refresh：OmniRoute `fa0cd5af1c9beec02fe0cf8eb964eb6757184e08`、`c130f2aa1ccc7aaddd7a7685bd6a0e08136dccf1`。
-- Alibaba Coding Plan：9router `55628eea02eccb4d80738cbf5be342a6dbf53026`、OmniRoute `c9d4a45f1883d7daf150bbff631f3e83b41aa5b4`、cc-switch `27d21c23ace926992ba0c50e34a611ecffd97c0c`。
+- Alibaba Coding Plan：9router `55628eea02eccb4d80738cbf5be342a6dbf53026`、OmniRoute `c9d4a45f1883d7daf150bbff631f3e83b41aa5b4`。
 - GLM-5.3 OpenAI Coding rail：9router `8ed9da7165340150be968e968f7d9ea33902c7e3`。
 
 这些仓库只提供协议和 Provider 类型证据。本仓库没有迁移其账号池、scheduler、sticky routing、quota 选号、组合路由、跨账号/Provider fallback、Web Cookie 逆向、Tauri、MCP 或 IDE 插件生态。

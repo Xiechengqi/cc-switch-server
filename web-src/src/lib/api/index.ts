@@ -2,25 +2,16 @@ export type { AppId } from "./types";
 export { providersApi } from "./providers";
 export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
-export { mcpApi } from "./mcp";
-export { promptsApi } from "./prompts";
-export { skillsApi } from "./skills";
 export { usageApi } from "./usage";
 export { subscriptionApi } from "./subscription";
-export { vscodeApi } from "./vscode";
-export { proxyApi } from "./proxy";
 export { codexBankedResetApi } from "./codexBankedReset";
 export { codexReferralsApi } from "./codexReferrals";
-export { openclawApi } from "./openclaw";
-export { sessionsApi } from "./sessions";
-export { workspaceApi } from "./workspace";
 export { shareApi } from "./share";
 export * as configApi from "./config";
 export * as authApi from "./auth";
 export { emailAuthApi } from "./emailAuth";
 export type { EmailAuthStatus, EmailSessionMeResponse } from "./emailAuth";
 export * as copilotApi from "./copilot";
-export type { Prompt } from "./prompts";
 export type {
   ShareRecord,
   ShareBindings,

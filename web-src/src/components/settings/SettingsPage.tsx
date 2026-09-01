@@ -14,7 +14,6 @@ import {
   LogOut,
   Save,
   FolderSearch,
-  Cloud,
   ScrollText,
   HardDriveDownload,
   FlaskConical,
@@ -22,13 +21,6 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   Accordion,
   AccordionContent,
@@ -40,26 +32,16 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
-import { settingsApi } from "@/lib/api";
 import { stableStringify } from "@/lib/stableStringify";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
-import { WindowSettings } from "@/components/settings/WindowSettings";
-import { AppVisibilitySettings } from "@/components/settings/AppVisibilitySettings";
-import { SkillStorageLocationSettings } from "@/components/settings/SkillStorageLocationSettings";
-import { SkillSyncMethodSettings } from "@/components/settings/SkillSyncMethodSettings";
-import { TerminalSettings } from "@/components/settings/TerminalSettings";
-import { DirectorySettings } from "@/components/settings/DirectorySettings";
 import { BackupListSection } from "@/components/settings/BackupListSection";
-import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
-import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
 import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
 import { ProviderRuntimeDefaultsPanel } from "@/components/settings/ProviderRuntimeDefaultsPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { ApiManagementPanel } from "@/components/settings/ApiManagementPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
-import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
 import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySettings";
 import { ServerUpgradePolicySettings } from "@/components/settings/ServerUpgradePolicySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
@@ -68,11 +50,9 @@ import {
   ShareSettingsTab,
   type ShareSettingsSaveState,
 } from "@/components/settings/ShareSettingsTab";
-import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useTranslation } from "react-i18next";
 import type { SettingsFormState } from "@/hooks/useSettings";
-import { isServerWebRuntime } from "@/lib/runtime";
 
 export type SettingsTab =
   "general" | "proxy" | "auth" | "share" | "advanced" | "usage";
@@ -104,39 +84,24 @@ export const SettingsPage = forwardRef<
     settings,
     isLoading,
     isSaving,
-    appConfigDir,
-    resolvedDirs,
+    configDir,
     updateSettings,
-    updateDirectory,
-    updateAppConfigDir,
-    browseDirectory,
-    browseAppConfigDir,
-    resetDirectory,
-    resetAppConfigDir,
     saveSettings,
     autoSaveSettings,
     resetSettings,
-    requiresRestart,
-    acknowledgeRestart,
   } = useSettings();
 
   const [shareSaveState, setShareSaveState] =
     useState<ShareSettingsSaveState | null>(null);
 
-  const serverMode = isServerWebRuntime();
-  const { data: installedSkills } = useInstalledSkills({
-    enabled: !serverMode,
-  });
-
   const [activeTab, setActiveTab] = useState<string>("general");
-  const [showRestartPrompt, setShowRestartPrompt] = useState(false);
   const [pendingNavigation, setPendingNavigation] =
     useState<PendingNavigation | null>(null);
   const tabScrollContainerRef = useRef<HTMLDivElement>(null);
   const advancedBaselineRef = useRef<string | null>(null);
   const advancedFingerprint = useMemo(
-    () => stableStringify({ settings, appConfigDir: appConfigDir ?? null }),
-    [appConfigDir, settings],
+    () => stableStringify(settings),
+    [settings],
   );
   const advancedDirty =
     activeTab === "advanced" &&
@@ -146,18 +111,16 @@ export const SettingsPage = forwardRef<
   useEffect(() => {
     if (open) {
       const normalizedTab =
-        defaultTab === "proxy" && serverMode
+        defaultTab === "proxy" || defaultTab === "tunnel" || defaultTab === "backup"
           ? "advanced"
           : defaultTab === "router" || defaultTab === "diagnostics"
             ? "share"
-            : defaultTab === "tunnel" || defaultTab === "backup"
-              ? "advanced"
-              : defaultTab;
+            : defaultTab;
       setActiveTab(normalizedTab);
       advancedBaselineRef.current = null;
       setPendingNavigation(null);
     }
-  }, [open, defaultTab, serverMode]);
+  }, [open, defaultTab]);
 
   useEffect(() => {
     if (
@@ -181,12 +144,6 @@ export const SettingsPage = forwardRef<
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [advancedDirty, open]);
 
-  useEffect(() => {
-    if (requiresRestart) {
-      setShowRestartPrompt(true);
-    }
-  }, [requiresRestart]);
-
   useLayoutEffect(() => {
     if (tabScrollContainerRef.current) {
       tabScrollContainerRef.current.scrollTop = 0;
@@ -194,10 +151,8 @@ export const SettingsPage = forwardRef<
   }, [activeTab]);
 
   const closeAfterSave = useCallback(() => {
-    // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
-    acknowledgeRestart();
     onOpenChange(false);
-  }, [acknowledgeRestart, onOpenChange]);
+  }, [onOpenChange]);
 
   const navigateWithoutGuard = useCallback(
     (navigation: PendingNavigation) => {
@@ -256,41 +211,13 @@ export const SettingsPage = forwardRef<
       const result = await saveSettings(undefined, { silent: false });
       if (!result) return;
       advancedBaselineRef.current = advancedFingerprint;
-      if (result.requiresRestart) {
-        setShowRestartPrompt(true);
-        return;
-      }
       closeAfterSave();
     } catch (error) {
       console.error("[SettingsPage] Failed to save settings", error);
     }
   }, [advancedFingerprint, closeAfterSave, saveSettings]);
 
-  const handleRestartLater = useCallback(() => {
-    setShowRestartPrompt(false);
-    closeAfterSave();
-  }, [closeAfterSave]);
-
-  const handleRestartNow = useCallback(async () => {
-    setShowRestartPrompt(false);
-    if (import.meta.env.DEV) {
-      toast.success(t("settings.devModeRestartHint"), { closeButton: true });
-      closeAfterSave();
-      return;
-    }
-
-    try {
-      await settingsApi.restart();
-    } catch (error) {
-      console.error("[SettingsPage] Failed to restart app", error);
-      toast.error(t("settings.restartFailed"));
-    } finally {
-      closeAfterSave();
-    }
-  }, [closeAfterSave, t]);
-
   // 通用设置即时保存（无需手动点击）
-  // 使用 autoSaveSettings 避免误触发系统 API（开机自启、Claude 插件等）
   // 返回保存是否成功：需要在保存成功后追加动作的调用方（如统一会话历史
   // 关闭后的备份还原）据此短路，其余调用方可忽略返回值。
   const handleAutoSave = useCallback(
@@ -349,17 +276,12 @@ export const SettingsPage = forwardRef<
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
-            {!serverMode ? (
-              <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
-            ) : null}
             <TabsTrigger value="auth">
               {t("settings.tabAuth", { defaultValue: "认证" })}
             </TabsTrigger>
-            {serverMode ? (
-              <TabsTrigger value="share">
-                {t("settings.tabShare", { defaultValue: "分享" })}
-              </TabsTrigger>
-            ) : null}
+            <TabsTrigger value="share">
+              {t("settings.tabShare", { defaultValue: "分享" })}
+            </TabsTrigger>
             <TabsTrigger value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
@@ -384,52 +306,9 @@ export const SettingsPage = forwardRef<
                       onChange={(lang) => handleAutoSave({ language: lang })}
                     />
                     <ThemeSettings />
-                    {!serverMode && (
-                      <AppVisibilitySettings
-                        settings={settings}
-                        onChange={handleAutoSave}
-                      />
-                    )}
-                    {!serverMode && (
-                      <>
-                        <SkillStorageLocationSettings
-                          value={settings.skillStorageLocation ?? "cc_switch"}
-                          installedCount={installedSkills?.length ?? 0}
-                          onMigrated={(location) =>
-                            updateSettings({ skillStorageLocation: location })
-                          }
-                        />
-                        <SkillSyncMethodSettings
-                          value={settings.skillSyncMethod ?? "auto"}
-                          onChange={(method) =>
-                            handleAutoSave({ skillSyncMethod: method })
-                          }
-                        />
-                        <WindowSettings
-                          settings={settings}
-                          onChange={handleAutoSave}
-                        />
-                        <TerminalSettings
-                          value={settings.preferredTerminal}
-                          onChange={(terminal) =>
-                            handleAutoSave({ preferredTerminal: terminal })
-                          }
-                        />
-                      </>
-                    )}
-                    {!serverMode && (
-                      <CodexAuthSettings
-                        settings={settings}
-                        onChange={handleAutoSave}
-                      />
-                    )}
-                    {serverMode && (
-                      <>
-                        <ServerSecuritySettings />
-                        <ServerVersionSettings />
-                        <ServerUpgradePolicySettings />
-                      </>
-                    )}
+                    <ServerSecuritySettings />
+                    <ServerVersionSettings />
+                    <ServerUpgradePolicySettings />
                   </motion.div>
                 ) : (
                   <p className="text-sm text-muted-foreground">
@@ -440,12 +319,6 @@ export const SettingsPage = forwardRef<
                 )}
               </TabsContent>
 
-              {!serverMode ? (
-                <TabsContent value="proxy" className="space-y-6 mt-0 pb-4">
-                  {settings ? <ProxyTabContent /> : null}
-                </TabsContent>
-              ) : null}
-
               <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
@@ -453,21 +326,19 @@ export const SettingsPage = forwardRef<
                   transition={{ duration: 0.3 }}
                   className="space-y-6"
                 >
-                  <AuthCenterPanel serverMode={serverMode} />
+                  <AuthCenterPanel serverMode />
                 </motion.div>
               </TabsContent>
 
-              {serverMode ? (
-                <TabsContent value="share" className="space-y-6 mt-0 pb-4">
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.3 }}
-                  >
-                    <ShareSettingsTab onSaveStateChange={setShareSaveState} />
-                  </motion.div>
-                </TabsContent>
-              ) : null}
+              <TabsContent value="share" className="space-y-6 mt-0 pb-4">
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  <ShareSettingsTab onSaveStateChange={setShareSaveState} />
+                </motion.div>
+              </TabsContent>
 
               <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
                 {settings ? (
@@ -477,19 +348,15 @@ export const SettingsPage = forwardRef<
                     transition={{ duration: 0.3 }}
                     className="space-y-4"
                   >
-                    {serverMode ? (
-                      <ProxyTabContent defaultOpen={false} />
-                    ) : null}
                     <Accordion
                       type="multiple"
                       defaultValue={[]}
                       className="w-full space-y-4"
                     >
-                      {serverMode ? (
-                        <AccordionItem
-                          value="providerRequestDefaults"
-                          className="rounded-xl glass-card overflow-hidden"
-                        >
+                      <AccordionItem
+                        value="providerRequestDefaults"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
                           <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
                             <div className="flex min-w-0 flex-1 items-center gap-3">
                               <Gauge className="h-5 w-5 shrink-0 text-sky-500" />
@@ -514,8 +381,7 @@ export const SettingsPage = forwardRef<
                           <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
                             <ProviderRuntimeDefaultsPanel />
                           </AccordionContent>
-                        </AccordionItem>
-                      ) : null}
+                      </AccordionItem>
 
                       <AccordionItem
                         value="directory"
@@ -526,50 +392,23 @@ export const SettingsPage = forwardRef<
                             <FolderSearch className="h-5 w-5 shrink-0 text-primary" />
                             <div className="min-w-0 space-y-1 text-left">
                               <h3 className="text-sm font-medium leading-none">
-                                {serverMode
-                                  ? t("settings.serverConfigDir.title", {
-                                      defaultValue: "Server 配置目录",
-                                    })
-                                  : t("settings.advanced.configDir.title")}
+                                {t("settings.serverConfigDir.title", {
+                                  defaultValue: "Server 配置目录",
+                                })}
                               </h3>
                               <p className="text-xs font-normal text-muted-foreground">
-                                {serverMode
-                                  ? t("settings.serverConfigDir.description", {
-                                      defaultValue:
-                                        "持久化数据目录（监听地址由启动参数配置）",
-                                    })
-                                  : t(
-                                      "settings.advanced.configDir.description",
-                                    )}
+                                {t("settings.serverConfigDir.description", {
+                                  defaultValue:
+                                    "持久化数据目录（监听地址由启动参数配置）",
+                                })}
                               </p>
                             </div>
                           </div>
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                          {serverMode ? (
-                            <ServerConfigDirSettings
-                              configDir={
-                                appConfigDir ?? resolvedDirs.appConfig ?? ""
-                              }
-                            />
-                          ) : (
-                            <DirectorySettings
-                              appConfigDir={appConfigDir}
-                              resolvedDirs={resolvedDirs}
-                              onAppConfigChange={updateAppConfigDir}
-                              onBrowseAppConfig={browseAppConfigDir}
-                              onResetAppConfig={resetAppConfigDir}
-                              claudeDir={settings.claudeConfigDir}
-                              codexDir={settings.codexConfigDir}
-                              geminiDir={settings.geminiConfigDir}
-                              opencodeDir={settings.opencodeConfigDir}
-                              openclawDir={settings.openclawConfigDir}
-                              hermesDir={settings.hermesConfigDir}
-                              onDirectoryChange={updateDirectory}
-                              onBrowseDirectory={browseDirectory}
-                              onResetDirectory={resetDirectory}
-                            />
-                          )}
+                          <ServerConfigDirSettings
+                            configDir={configDir}
+                          />
                         </AccordionContent>
                       </AccordionItem>
 
@@ -605,35 +444,6 @@ export const SettingsPage = forwardRef<
                           />
                         </AccordionContent>
                       </AccordionItem>
-
-                      {!serverMode ? (
-                        <AccordionItem
-                          value="cloudSync"
-                          className="rounded-xl glass-card overflow-hidden"
-                        >
-                          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-                            <div className="flex min-w-0 flex-1 items-center gap-3">
-                              <Cloud className="h-5 w-5 shrink-0 text-blue-500" />
-                              <div className="min-w-0 space-y-1 text-left">
-                                <h3 className="text-sm font-medium leading-none">
-                                  {t("settings.advanced.cloudSync.title")}
-                                </h3>
-                                <p className="text-xs font-normal text-muted-foreground">
-                                  {t("settings.advanced.cloudSync.description")}
-                                </p>
-                              </div>
-                            </div>
-                          </AccordionTrigger>
-                          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-                            <WebdavSyncSection
-                              config={settings?.webdavSync}
-                              s3Config={settings?.s3Sync}
-                              settings={settings}
-                              onAutoSave={handleAutoSave}
-                            />
-                          </AccordionContent>
-                        </AccordionItem>
-                      ) : null}
 
                       <AccordionItem
                         value="test"
@@ -718,7 +528,7 @@ export const SettingsPage = forwardRef<
               </TabsContent>
             </div>
 
-            {activeTab === "general" && serverMode && onSignOut ? (
+            {activeTab === "general" && onSignOut ? (
               <div
                 className="flex-shrink-0 pt-4 border-t border-border-default"
                 style={{ backgroundColor: "hsl(var(--background))" }}
@@ -792,37 +602,6 @@ export const SettingsPage = forwardRef<
           </div>
         </Tabs>
       )}
-
-      <Dialog
-        open={showRestartPrompt}
-        onOpenChange={(open) => !open && handleRestartLater()}
-      >
-        <DialogContent zIndex="alert" className="max-w-md glass border-border">
-          <DialogHeader>
-            <DialogTitle>{t("settings.restartRequired")}</DialogTitle>
-          </DialogHeader>
-          <div className="px-6">
-            <p className="text-sm text-muted-foreground">
-              {t("settings.restartRequiredMessage")}
-            </p>
-          </div>
-          <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={handleRestartLater}
-              className="hover:bg-muted/50"
-            >
-              {t("settings.restartLater")}
-            </Button>
-            <Button
-              onClick={handleRestartNow}
-              className="bg-primary hover:bg-primary/90"
-            >
-              {t("settings.restartNow")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <ConfirmDialog
         isOpen={pendingNavigation !== null}

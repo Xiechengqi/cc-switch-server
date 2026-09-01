@@ -16,7 +16,6 @@ jobs:
     name: Validate release contracts
     runs-on: ubuntu-latest
     env:
-      CC_SWITCH_PROVIDER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch
       CC_SWITCH_ROUTER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
       CC_SWITCH_ROUTER_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
     steps:
@@ -25,14 +24,6 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-
-      - name: Checkout pinned Provider audit baseline
-        uses: actions/checkout@v4
-        with:
-          repository: farion1231/cc-switch
-          ref: b1dee0153da94316fb50416c679a11f74cc66f14
-          path: provider-audit/cc-switch
-          fetch-depth: 1
 
       - name: Checkout pinned Router audit baseline
         uses: actions/checkout@v4

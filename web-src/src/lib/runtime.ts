@@ -298,12 +298,7 @@ export async function invokeCommand<T>(
   });
 }
 
-/** Server Web always runs outside Tauri; compatibility code gates on this flag. */
-export function isTauriRuntime(): boolean {
-  return false;
-}
-
-/** True when running in the embedded cc-switch-server administration UI. */
+/** True for this repository's Server administration UI. */
 export function isServerWebRuntime(): boolean {
-  return !isTauriRuntime();
+  return true;
 }

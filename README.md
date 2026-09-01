@@ -15,7 +15,7 @@
   Router <a href="https://github.com/Xiechengqi/cc-switch-router"><strong>cc-switch-router</strong></a>
 </p>
 
-`cc-switch-server` 是独立 server 产品，不是 `cc-switch` 的派生 UI 或整仓 fork。Server 的产品需求、API、运行时契约和 Web UI 均在本仓库独立设计与维护；外部项目只用于审计 Claude、Codex、Gemini Provider 类型和协议行为，不作为代码或界面同步源。
+`cc-switch-server` 是独立维护的 server 产品，不是桌面仓库的运行模式或整仓 fork。当前产品需求、API、运行时契约和 Web UI 均由本仓库维护，构建与运行不读取外部源码。历史改编工作的来源和 MIT 归属见 [`SOURCE_PROVENANCE.json`](SOURCE_PROVENANCE.json) 与 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 当前仓库只维护 server 运行路径：HTTP API、静态 Web UI、本地 JSON store、反代转发、router/share tunnel 和真实验收脚本。不迁移 Tauri window/tray/updater/deeplink、Claude Desktop profile 写入、MCP、skills、session manager 和桌面安装资产。
 
@@ -164,4 +164,4 @@ Router Share URL 下的反代入口：`POST /v1/messages`、`POST /v1/chat/compl
 - [快速开始](docs/guide/getting-started.md) · [配置参考](docs/guide/configuration.md) · [部署](docs/guide/deployment.md)
 - [Provider 覆盖](docs/provider/coverage.md) · [回归矩阵](docs/provider/regression-matrix.md)
 - [Share 访问策略](docs/share/access-policy.md)
-- [外部 Provider 审计台账](UPSTREAM_IMPORT.md) · [开发约定](AGENTS.md)
+- [协议证据策略](PROTOCOL_EVIDENCE.md) · [第三方声明](THIRD_PARTY_NOTICES.md) · [开发约定](AGENTS.md)

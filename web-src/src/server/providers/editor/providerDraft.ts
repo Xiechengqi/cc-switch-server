@@ -1,35 +1,11 @@
-import {
-  providerPresets,
-  type ProviderPreset,
-} from "@/config/claudeProviderPresets";
-import {
-  codexProviderPresets,
-  type CodexProviderPreset,
-} from "@/config/codexProviderPresets";
-import {
-  geminiProviderPresets,
-  type GeminiProviderPreset,
-} from "@/config/geminiProviderPresets";
 import type { ProviderCategory, ProviderMeta } from "@/types";
-import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
+import { extractCodexBaseUrl } from "@/server/codexEndpoint";
 import {
-  anthropicApiKeyPreset,
-  claudeGoogleOAuthPreset,
-  directProfileVisualPreset,
-  googleGeminiApiKeyPreset,
-  githubCopilotCodexPreset,
-  kiroCodexPreset,
-  kimiCodeClaudePreset,
-  kimiCodeCodexPreset,
-  kimiCodeGeminiPreset,
-  openAiApiKeyPreset,
-  qoderClaudePreset,
-  qoderCodexPreset,
-  qoderGeminiPreset,
+  serverProviderPresetForProfile,
+  type ServerProviderPreset,
 } from "@/server/directProviderPresets";
 import {
   driverForProfile,
-  legacyPresetNameForProfile,
   modelPoliciesForProfile,
   type CoreProviderApp,
   type ProviderModelPolicy,
@@ -130,97 +106,24 @@ function apiFormatForProtocol(
 
 export function providerPresetForProfile(
   profile: ProviderRegistryProfile,
-): ProviderPreset | CodexProviderPreset | GeminiProviderPreset | undefined {
-  if (profile.profileId === "claude.anthropic_api_key") {
-    return anthropicApiKeyPreset;
-  }
-  if (profile.profileId === "claude.google_oauth") {
-    return claudeGoogleOAuthPreset;
-  }
-  if (profile.profileId === "codex.openai_api_key") {
-    return openAiApiKeyPreset;
-  }
-  if (profile.profileId === "codex.github_copilot") {
-    return githubCopilotCodexPreset;
-  }
-  if (profile.profileId === "codex.kiro_oauth") {
-    return kiroCodexPreset;
-  }
-  if (profile.profileId === "gemini.google_api_key") {
-    return googleGeminiApiKeyPreset;
-  }
-  if (profile.profileId === "claude.kimi_code") {
-    return kimiCodeClaudePreset;
-  }
-  if (profile.profileId === "codex.kimi_code") {
-    return kimiCodeCodexPreset;
-  }
-  if (profile.profileId === "gemini.kimi_code") {
-    return kimiCodeGeminiPreset;
-  }
-  if (profile.profileId === "claude.qoder_cosy") {
-    return qoderClaudePreset;
-  }
-  if (profile.profileId === "codex.qoder_cosy") {
-    return qoderCodexPreset;
-  }
-  if (profile.profileId === "gemini.qoder_cosy") {
-    return qoderGeminiPreset;
-  }
-  const directVisual = directProfileVisualPreset(profile.profileId, profile.app);
-  if (directVisual) return directVisual;
-  const legacyName = legacyPresetNameForProfile(profile.app, profile.profileId);
-  if (!legacyName) return undefined;
-  if (profile.app === "claude") {
-    return providerPresets.find((preset) => preset.name === legacyName);
-  }
-  if (profile.app === "codex") {
-    return codexProviderPresets.find((preset) => preset.name === legacyName);
-  }
-  return geminiProviderPresets.find((preset) => preset.name === legacyName);
+): ServerProviderPreset | undefined {
+  return serverProviderPresetForProfile(profile.profileId);
 }
 
 function settingsFromPreset(
-  profile: ProviderRegistryProfile,
-  preset:
-    ProviderPreset | CodexProviderPreset | GeminiProviderPreset | undefined,
+  preset: ServerProviderPreset | undefined,
 ): Record<string, unknown> {
   if (!preset) return { env: {} };
-  if (profile.app === "codex") {
-    const codex = preset as CodexProviderPreset;
-    return {
-      auth: clone(codex.auth ?? {}),
-      config: codex.config ?? "",
-      ...(codex.modelCatalog?.length
-        ? { modelCatalog: { models: clone(codex.modelCatalog) } }
-        : {}),
-      ...(codex.modelMapping
-        ? { modelMapping: clone(codex.modelMapping) }
-        : {}),
-    };
-  }
-  if (profile.app === "gemini") {
-    return clone(
-      ((preset as GeminiProviderPreset).settingsConfig ?? {
-        env: {},
-      }) as Record<string, unknown>,
-    );
-  }
-  return clone(
-    ((preset as ProviderPreset).settingsConfig ?? {
-      env: {},
-    }) as Record<string, unknown>,
-  );
+  return clone(preset.settingsConfig);
 }
 
 export function createDraftForProfile(
   profile: ProviderRegistryProfile,
 ): CoreProviderDraft {
   const preset = providerPresetForProfile(profile);
-  const settingsConfig = settingsFromPreset(profile, preset);
+  const settingsConfig = settingsFromPreset(preset);
   sanitizePresetSettings(settingsConfig);
   const driver = driverForProfile(profile);
-  const presetRecord = (preset ?? {}) as Record<string, unknown>;
   const meta: ProviderMeta = {
     ...(profile.compatibilityProviderType
       ? { providerType: profile.compatibilityProviderType }
@@ -228,8 +131,8 @@ export function createDraftForProfile(
     ...(apiFormatForProtocol(driver?.upstreamProtocol)
       ? { apiFormat: apiFormatForProtocol(driver?.upstreamProtocol) }
       : {}),
-    ...(typeof presetRecord.apiKeyField === "string"
-      ? { apiKeyField: presetRecord.apiKeyField as ProviderMeta["apiKeyField"] }
+    ...(preset?.apiKeyField
+      ? { apiKeyField: preset.apiKeyField }
       : {}),
   };
   if (profile.modelPolicy === "passthrough") {
@@ -245,21 +148,14 @@ export function createDraftForProfile(
   return {
     name: preset?.name ?? profile.label,
     websiteUrl: preset?.websiteUrl ?? "",
-    notes:
-      "description" in (preset ?? {}) &&
-      typeof (preset as { description?: unknown }).description === "string"
-        ? ((preset as { description: string }).description ?? "")
-        : "",
+    notes: preset?.notes ?? "",
     settingsConfig,
     category:
       (preset?.category as ProviderCategory | undefined) ??
       (profile.formComposition === "custom" ? "custom" : undefined),
     meta,
-    icon: typeof presetRecord.icon === "string" ? presetRecord.icon : undefined,
-    iconColor:
-      typeof presetRecord.iconColor === "string"
-        ? presetRecord.iconColor
-        : undefined,
+    icon: preset?.icon,
+    iconColor: preset?.iconColor,
   };
 }
 

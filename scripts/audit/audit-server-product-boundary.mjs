@@ -264,23 +264,6 @@ export function contractBoundaryViolations(runtimeContract) {
 
 export function providerEditorBoundaryViolations(sources) {
   const violations = [];
-  for (const pathName of [
-    "web-src/src/components/providers/AddProviderDialog.tsx",
-    "web-src/src/components/providers/EditProviderDialog.tsx",
-  ]) {
-    const source = sources[pathName] ?? "";
-    if (!source.includes("@/server/providers/editor/ServerProviderForm")) {
-      violations.push(
-        `${pathName}: core dialog must import ServerProviderForm directly`,
-      );
-    }
-    if (source.includes("@/components/providers/forms/ProviderForm")) {
-      violations.push(
-        `${pathName}: core dialog imports the non-Server ProviderForm dispatcher`,
-      );
-    }
-  }
-
   const app = sources["web-src/src/ServerApp.tsx"] ?? "";
   if (!app.includes("@/server/providers/bundles/ProviderBundlesPage")) {
     violations.push(
@@ -312,19 +295,21 @@ export function providerEditorBoundaryViolations(sources) {
       "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx: missing Server Provider API boundary",
     );
   }
+  if (!bundleEditor.includes("@/server/providerRegistry")) {
+    violations.push(
+      "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx: missing authoritative Provider Registry boundary",
+    );
+  }
 
-  const actions =
-    sources["web-src/src/server/providers/useServerProviderActions.ts"] ?? "";
-  for (const forbidden of [
-    "openclaw",
-    "opencode",
-    "hermes",
-    "claude-desktop",
-    "updateTrayMenu",
+  const providerDraft =
+    sources["web-src/src/server/providers/editor/providerDraft.ts"] ?? "";
+  for (const requiredImport of [
+    "@/server/directProviderPresets",
+    "@/server/providerRegistry",
   ]) {
-    if (actions.toLowerCase().includes(forbidden.toLowerCase())) {
+    if (!providerDraft.includes(requiredImport)) {
       violations.push(
-        `web-src/src/server/providers/useServerProviderActions.ts: non-core Provider action ${forbidden}`,
+        `web-src/src/server/providers/editor/providerDraft.ts: missing ${requiredImport} boundary`,
       );
     }
   }
@@ -388,12 +373,10 @@ export function auditServerProductBoundary(root = repoRoot) {
   }
   violations.push(...contractBoundaryViolations(runtimeContract));
   const providerEditorPaths = [
-    "web-src/src/components/providers/AddProviderDialog.tsx",
-    "web-src/src/components/providers/EditProviderDialog.tsx",
     "web-src/src/ServerApp.tsx",
-    "web-src/src/server/providers/useServerProviderActions.ts",
     "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx",
     "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx",
+    "web-src/src/server/providers/editor/providerDraft.ts",
   ];
   violations.push(
     ...providerEditorBoundaryViolations(

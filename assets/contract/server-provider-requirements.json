@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "authority": "cc-switch-server-product-requirements",
+  "providerTypeSource": {
+    "path": "src/domain/providers/model.rs",
+    "sha256": "2d84b959ed370d994fa1ef9f29a56edd84181184c0ab5c7e7bde6ac9eddad2a1"
+  },
+  "providerTypes": [
+    { "variant": "Claude", "id": "claude", "label": "Anthropic official / API key", "apps": ["claude"], "coverageClass": "core" },
+    { "variant": "ClaudeAuth", "id": "claude_auth", "label": "Claude bearer-only relay", "apps": ["claude"], "coverageClass": "core" },
+    { "variant": "ClaudeOAuth", "id": "claude_oauth", "label": "Claude Official OAuth", "apps": ["claude"], "coverageClass": "core" },
+    { "variant": "Codex", "id": "codex", "label": "OpenAI/Codex compatible", "apps": ["codex"], "coverageClass": "core" },
+    { "variant": "CodexOAuth", "id": "codex_oauth", "label": "OpenAI ChatGPT OAuth", "apps": ["claude", "codex"], "coverageClass": "core" },
+    { "variant": "Gemini", "id": "gemini", "label": "Google Gemini API key", "apps": ["gemini"], "coverageClass": "core" },
+    { "variant": "GeminiCli", "id": "gemini_cli", "label": "Google Gemini OAuth / CLI", "apps": ["gemini", "claude"], "coverageClass": "core" },
+    { "variant": "OpenRouter", "id": "openrouter", "label": "OpenRouter", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
+    { "variant": "GitHubCopilot", "id": "github_copilot", "label": "GitHub Copilot", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
+    { "variant": "DeepSeekAccount", "id": "deepseek_account", "label": "DeepSeek account", "apps": ["claude"], "coverageClass": "core" },
+    { "variant": "KiroOAuth", "id": "kiro_oauth", "label": "Kiro OAuth", "apps": ["claude", "codex"], "coverageClass": "core" },
+    { "variant": "AmazonQOAuth", "id": "amazon_q_oauth", "label": "Amazon Q Developer", "apps": ["claude", "codex"], "coverageClass": "server_extension" },
+    { "variant": "KimiCode", "id": "kimi_code", "label": "Kimi OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
+    { "variant": "QoderCosy", "id": "qoder_cosy", "label": "Qoder OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
+    { "variant": "CursorOAuth", "id": "cursor_oauth", "label": "Cursor OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
+    { "variant": "CursorApiKey", "id": "cursor_apikey", "label": "Cursor API key", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
+    { "variant": "AntigravityOAuth", "id": "antigravity_oauth", "label": "Antigravity OAuth", "apps": ["claude", "gemini"], "coverageClass": "core" },
+    { "variant": "AgyOAuth", "id": "agy_oauth", "label": "Antigravity CLI / agy", "apps": ["claude", "gemini"], "coverageClass": "core" },
+    { "variant": "OllamaCloud", "id": "ollama_cloud", "label": "Ollama API key", "apps": ["claude", "codex"], "coverageClass": "core" },
+    { "variant": "AwsBedrock", "id": "aws_bedrock", "label": "AWS Bedrock compatibility schema", "apps": ["claude"], "coverageClass": "server_extension" },
+    { "variant": "Nvidia", "id": "nvidia", "label": "Nvidia OpenAI-compatible API", "apps": ["claude", "codex"], "coverageClass": "server_extension" },
+    { "variant": "DeepSeekApi", "id": "deepseek_api", "label": "DeepSeek API key", "apps": ["claude", "codex"], "coverageClass": "server_extension" },
+    { "variant": "GrokOAuth", "id": "grok_oauth", "label": "Grok/xAI OAuth reverse proxy", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" }
+  ]
+}

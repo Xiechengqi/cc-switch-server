@@ -1,66 +1,23 @@
 export type ProviderCategory =
-  | "official" // 官方
-  | "cn_official" // 开源官方（原"国产官方"）
-  | "cloud_provider" // 云服务商（AWS Bedrock 等）
-  | "aggregator" // 聚合网站
-  | "third_party" // 第三方供应商
-  | "custom" // 自定义
-  | "omo" // Oh My OpenCode
-  | "omo-slim"; // Oh My OpenCode Slim
+  | "official"
+  | "cn_official"
+  | "cloud_provider"
+  | "aggregator"
+  | "third_party"
+  | "custom";
 
 export interface Provider {
   id: string;
   name: string;
-  settingsConfig: Record<string, any>; // 应用配置对象：Claude 为 settings.json；Codex 为 { auth, config }
+  settingsConfig: Record<string, any>;
   websiteUrl?: string;
-  // 新增：供应商分类（用于差异化提示/能力开关）
   category?: ProviderCategory;
-  createdAt?: number; // 添加时间戳（毫秒）
-  sortIndex?: number; // 排序索引（用于自定义拖拽排序）
-  // 备注信息
+  createdAt?: number;
+  sortIndex?: number;
   notes?: string;
-  // 新增：是否为商业合作伙伴
-  isPartner?: boolean;
-  // 可选：供应商元数据（仅存于 ~/.cc-switch/config.json，不写入 live 配置）
   meta?: ProviderMeta;
-  // 图标配置
-  icon?: string; // 图标名称（如 "openai", "anthropic"）
-  iconColor?: string; // 图标颜色（Hex 格式，如 "#00A67E"）
-}
-
-export interface AppConfig {
-  providers: Record<string, Provider>;
-  current: string;
-}
-
-// 自定义端点配置
-export interface CustomEndpoint {
-  url: string;
-  addedAt: number;
-  lastUsed?: number;
-}
-
-// 端点候选项（用于端点测速弹窗）
-export interface EndpointCandidate {
-  id?: string;
-  url: string;
-  isCustom?: boolean;
-}
-
-// 供应商单独的模型测试配置（覆盖全局配置）
-export interface ProviderTestConfig {
-  // 是否启用单独配置（false 时使用全局配置）
-  enabled: boolean;
-  // 测试用的模型名称（覆盖全局配置）
-  testModel?: string;
-  // 超时时间（秒）
-  timeoutSecs?: number;
-  // 测试提示词
-  testPrompt?: string;
-  // 降级阈值（毫秒）
-  degradedThresholdMs?: number;
-  // 最大重试次数
-  maxRetries?: number;
+  icon?: string;
+  iconColor?: string;
 }
 
 export type AuthBindingSource =
@@ -76,337 +33,41 @@ export interface AuthBinding {
   authIdentityGeneration?: number;
 }
 
-export interface ClaudeDesktopModelRoute {
-  model: string;
-  labelOverride?: string;
-  supports1m?: boolean;
-}
+export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
 
-export type CodexChatThinkingParam =
-  | "none"
-  | "thinking"
-  | "enable_thinking"
-  | "reasoning_split";
-
-export type CodexChatEffortParam =
-  | "none"
-  | "reasoning_effort"
-  // OpenRouter 原生归一化对象 reasoning:{effort}（区别于顶层 OpenAI 别名 reasoning_effort）
-  | "reasoning.effort";
-
-export type CodexChatEffortValueMode =
-  | "passthrough"
-  | "low_high"
-  | "deepseek"
-  // OpenRouter effort 枚举 xhigh|high|medium|low|minimal（无 max，max 钳到 xhigh）
-  | "openrouter";
-
-export type CodexChatReasoningOutputFormat =
-  | "auto"
-  | "reasoning_content"
-  | "reasoning"
-  | "reasoning_details"
-  | "think_tags";
-
-export interface CodexChatReasoning {
-  supportsThinking?: boolean;
-  supportsEffort?: boolean;
-  thinkingParam?: CodexChatThinkingParam;
-  effortParam?: CodexChatEffortParam;
-  effortValueMode?: CodexChatEffortValueMode;
-  // 声明性字段：标注上游 reasoning 回传位置。当前提取靠穷举字段，未读取此值（think_tags 尚未接线）。
-  outputFormat?: CodexChatReasoningOutputFormat;
-}
-
-export interface LocalProxyRequestOverrides {
-  headers?: Record<string, string>;
-  body?: Record<string, unknown>;
-}
-
-// 供应商元数据（字段名与后端一致，保持 snake_case）
+/** Server-owned Provider metadata consumed by the current Web surfaces. */
 export interface ProviderMeta {
-  // 自定义端点：以 URL 为键，值为端点信息
-  custom_endpoints?: Record<string, CustomEndpoint>;
-  // 是否在切换/同步到 live 时应用通用配置片段
-  commonConfigEnabled?: boolean;
-  // Claude Desktop 3P 配置写入模式
-  claudeDesktopMode?: "direct" | "proxy";
-  // Claude Desktop 本地路由模式：Claude-safe route -> upstream model
-  claudeDesktopModelRoutes?: Record<string, ClaudeDesktopModelRoute>;
-  // 请求地址管理：测速后自动选择最佳端点
-  endpointAutoSelect?: boolean;
-  // 是否为官方合作伙伴
-  isPartner?: boolean;
-  // 合作伙伴促销 key（用于后端识别 PackyCode 等）
-  partnerPromotionKey?: string;
-  // 供应商单独的模型测试配置
-  testConfig?: ProviderTestConfig;
-  // API 格式（Claude / Codex 供应商使用）
-  // - "anthropic": 原生 Anthropic Messages API 格式，直接透传
-  // - "openai_chat": OpenAI Chat Completions 格式，需要格式转换
-  // - "openai_responses": OpenAI Responses API 格式，需要格式转换
-  // - "gemini_native": Gemini Native generateContent API 格式，需要格式转换
   apiFormat?:
     | "anthropic"
     | "openai_chat"
     | "openai_responses"
     | "gemini_native";
-  // 通用认证绑定
   authBinding?: AuthBinding;
-  // Claude 认证字段名
   apiKeyField?: ClaudeApiKeyField;
-  // 是否将 base_url 视为完整 API 端点（代理直接使用此 URL，不拼接路径）
-  isFullUrl?: boolean;
-  // Prompt cache key for OpenAI Responses-compatible endpoints (improves cache hit rate)
-  promptCacheKey?: string;
-  // Server-authoritative Codex OAuth FAST policy.
   codexFastMode?: boolean;
-  // Codex OAuth image generation via ChatGPT Codex backend
   codexImageGenerationEnabled?: boolean;
-  // Grok OAuth media policy. Each operation is independently opt-in.
   grokImageGenerationEnabled?: boolean;
   grokImageEditEnabled?: boolean;
   grokVideoGenerationEnabled?: boolean;
-  // Strip image_generation tools from Codex Responses requests.
-  codexImageToolStripPolicy?: "never" | "on-error" | "always";
-  // Per-provider incident rollback for the Codex Responses WebSocket path
   codexWebsocketEnabled?: boolean;
-  // Ordinary text Responses SSE downstream keepalive; 0 disables.
   codexResponsesKeepaliveIntervalMs?: number;
-  // Server-owned HTTP routing hint; disabled by default.
   codexRoutingHintEnabled?: boolean;
-  // Codex Responses -> Chat Completions reasoning capability metadata
-  codexChatReasoning?: CodexChatReasoning;
-  // Custom User-Agent for local proxy routing. Only applied by the local proxy.
   customUserAgent?: string;
-  // Local proxy request overrides. Only applied by the local proxy after route transforms.
-  localProxyRequestOverrides?: LocalProxyRequestOverrides;
-  // 供应商类型（用于识别 Copilot 等特殊供应商）
   providerType?: string;
-  // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
   githubAccountId?: string;
 }
 
-// Skill 同步方式
-export type SkillSyncMethod = "auto" | "symlink" | "copy";
-
-// Skill 存储位置
-export type SkillStorageLocation = "cc_switch" | "unified";
-
-// Claude API 格式类型
-// - "anthropic": 原生 Anthropic Messages API 格式，直接透传
-// - "openai_chat": OpenAI Chat Completions 格式，需要格式转换
-// - "openai_responses": OpenAI Responses API 格式，需要格式转换
-// - "gemini_native": Gemini Native generateContent API 格式，需要格式转换
-export type ClaudeApiFormat =
-  | "anthropic"
-  | "openai_chat"
-  | "openai_responses"
-  | "gemini_native";
-
-// Codex API 格式类型
-// - "openai_responses": OpenAI Responses API 格式，直接透传
-// - "openai_chat": OpenAI Chat Completions 格式，需要本地路由转换
-export type CodexApiFormat = "openai_responses" | "openai_chat";
-
-export interface CodexCatalogModel {
-  model: string;
-  upstreamModel?: string;
-  displayName?: string;
-  contextWindow?: string | number;
-  // Native Responses (direct) profile overrides for the generated
-  // model-catalogs.json. Ignored by the chat/proxy profile.
-  // e.g. MiniMax: supportsParallelToolCalls=true, inputModalities=["text","image"].
-  supportsParallelToolCalls?: boolean;
-  inputModalities?: string[];
-  // Vendor's OFFICIAL base_instructions (model identity / system preamble).
-  // Codex requires this field in every catalog entry; when omitted the backend
-  // falls back to a neutral default. e.g. MiMo "developed by Xiaomi".
-  baseInstructions?: string;
-}
-
-export interface SingleModelMapping {
-  mode: "single";
-  upstreamModel: string;
-}
-
-export interface PassthroughModelMapping {
-  mode: "passthrough";
-}
-
-export type ModelRoutingMapping =
-  | SingleModelMapping
-  | PassthroughModelMapping;
-
-// Claude 认证字段类型
-export type ClaudeApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
-
-// 主页面显示的应用配置
-export interface VisibleApps {
-  claude: boolean;
-  "claude-desktop": boolean;
-  codex: boolean;
-  gemini: boolean;
-  opencode: boolean;
-  openclaw: boolean;
-  hermes: boolean;
-}
-
-// WebDAV 同步状态
-export interface WebDavSyncStatus {
-  lastSyncAt?: number | null;
-  lastError?: string | null;
-  lastErrorSource?: string | null;
-  lastRemoteEtag?: string | null;
-  lastLocalManifestHash?: string | null;
-  lastRemoteManifestHash?: string | null;
-}
-
-// WebDAV 同步配置
-export interface WebDavSyncSettings {
-  enabled?: boolean;
-  autoSync?: boolean;
-  baseUrl?: string;
-  username?: string;
-  password?: string;
-  remoteRoot?: string;
-  profile?: string;
-  status?: WebDavSyncStatus;
-}
-
-// S3 同步配置
-export interface S3SyncSettings {
-  enabled?: boolean;
-  autoSync?: boolean;
-  region?: string;
-  bucket?: string;
-  accessKeyId?: string;
-  secretAccessKey?: string;
-  endpoint?: string;
-  remoteRoot?: string;
-  profile?: string;
-  status?: WebDavSyncStatus;
-}
-
-export type RemoteSnapshotLayout = "current" | "legacy";
-
-// 远端快照信息（下载前预览）
-export interface RemoteSnapshotInfo {
-  deviceName: string;
-  createdAt: string;
-  snapshotId: string;
-  version: number;
-  protocolVersion: number;
-  dbCompatVersion?: number | null;
-  compatible: boolean;
-  artifacts: string[];
-  layout: RemoteSnapshotLayout;
-  remotePath: string;
-}
-
-// 应用设置类型（用于设置对话框与 Tauri API）
-// 存储在本地 ~/.cc-switch/settings.json，不随数据库同步
+/**
+ * Server Web UI settings. Compatibility-only fields returned by older stores
+ * are retained by the backend merge and are deliberately not written by Web.
+ */
 export interface Settings {
-  // ===== 设备级 UI 设置 =====
-  // 是否在系统托盘（macOS 菜单栏）显示图标
-  showInTray: boolean;
-  // 点击关闭按钮时是否最小化到托盘而不是关闭应用
-  minimizeToTrayOnClose: boolean;
-  // 是否启用应用级窗口控制按钮（最小化/最大化/关闭）
-  useAppWindowControls?: boolean;
-  // 启用 Claude 插件联动（写入 ~/.claude/config.json 的 primaryApiKey）
-  enableClaudePluginIntegration?: boolean;
-  // 跳过 Claude Code 初次安装确认（写入 ~/.claude.json 的 hasCompletedOnboarding）
-  skipClaudeOnboarding?: boolean;
-  // 是否开机自启
-  launchOnStartup?: boolean;
-  // 静默启动（程序启动时不显示主窗口）
-  silentStartup?: boolean;
-  // 是否启用主页面本地代理功能（默认关闭）
-  enableLocalProxy?: boolean;
-  // User has confirmed the local proxy first-run notice
-  proxyConfirmed?: boolean;
-  // User has confirmed the usage query first-run notice
-  usageConfirmed?: boolean;
-  // User has confirmed the stream check first-run notice
-  streamCheckConfirmed?: boolean;
-  // Preserve Codex ChatGPT login in auth.json when switching third-party providers
-  preserveCodexOfficialAuthOnSwitch?: boolean;
-  // Run official Codex under the shared "custom" provider id so future
-  // sessions share one resume-history bucket with third-party providers
-  unifyCodexSessionHistory?: boolean;
-  // User opted in (enable dialog checkbox) to migrate existing official sessions
-  unifyCodexMigrateExisting?: boolean;
-  // User has confirmed the first-run welcome notice
-  firstRunNoticeConfirmed?: boolean;
-  // User has confirmed the auto-sync traffic warning
-  autoSyncConfirmed?: boolean;
-  // User has confirmed the common config first-run notice
-  commonConfigConfirmed?: boolean;
-  // OAuth 额度自动刷新间隔（分钟，默认 30）
   oauthQuotaRefreshIntervalMinutes?: number;
-  // OAuth 额度刷新请求超时（秒，默认 10）
   oauthQuotaRefreshTimeoutSeconds?: number;
-  // 首选语言（可选，默认中文）
   language?: "en" | "zh" | "zh-TW" | "ja";
-
-  // 主页面显示的应用（默认全部显示）
-  visibleApps?: VisibleApps;
-
-  // ===== 设备级目录覆盖 =====
-  // 覆盖 Claude Code 配置目录（可选）
-  claudeConfigDir?: string;
-  // 覆盖 Codex 配置目录（可选）
-  codexConfigDir?: string;
-  // 覆盖 Gemini 配置目录（可选）
-  geminiConfigDir?: string;
-  // 覆盖 OpenCode 配置目录（可选）
-  opencodeConfigDir?: string;
-  // 覆盖 OpenClaw 配置目录（可选）
-  openclawConfigDir?: string;
-  // 覆盖 Hermes 配置目录（可选）
-  hermesConfigDir?: string;
-
-  // ===== Skill 同步设置 =====
-  // Skill 同步方式：auto（默认，优先 symlink）、symlink、copy
-  skillSyncMethod?: SkillSyncMethod;
-  // Skill 存储位置：cc_switch（默认）或 unified（~/.agents/skills/）
-  skillStorageLocation?: SkillStorageLocation;
-
-  // ===== WebDAV v2 同步设置 =====
-  webdavSync?: WebDavSyncSettings;
-
-  // ===== S3 同步设置 =====
-  s3Sync?: S3SyncSettings;
-
-  // ===== 备份策略设置 =====
-  // Auto-backup interval in hours (0=disabled, default 12)
   backupIntervalHours?: number;
-  // Maximum backup files to retain (default 3)
   backupRetainCount?: number;
-
-  // ===== 终端设置 =====
-  // 首选终端应用（可选，默认使用系统默认终端）
-  // macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "wezterm" | "kaku"
-  // Windows: "cmd" | "powershell" | "wt"
-  // Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
-  preferredTerminal?: string;
-
-  // ===== Token Share / Tunnel =====
   shareRouterDomain?: string;
-
-  // ===== 本机自动迁移状态 =====
-  localMigrations?: {
-    codexThirdPartyHistoryProviderBucketV1?: {
-      completedAt: string;
-      targetProviderId: string;
-      sourceProviderIds?: string[];
-      migratedJsonlFiles?: number;
-      migratedStateRows?: number;
-    };
-  };
-
-  /** Server-only: upgrade delegation and auto-upgrade policy from server.json */
   upgradePolicy?: UpgradePolicy;
 }
 
@@ -414,227 +75,4 @@ export interface UpgradePolicy {
   delegateUpgradeToRouterOwner: boolean;
   autoUpgradeEnabled: boolean;
   autoUpgradeCheckIntervalMinutes: number;
-}
-
-export interface SessionMeta {
-  providerId: string;
-  sessionId: string;
-  title?: string;
-  summary?: string;
-  projectDir?: string | null;
-  createdAt?: number;
-  lastActiveAt?: number;
-  sourcePath?: string;
-  resumeCommand?: string;
-}
-
-export interface SessionMessage {
-  role: string;
-  content: string;
-  ts?: number;
-}
-
-// MCP 服务器连接参数（宽松：允许扩展字段）
-export interface McpServerSpec {
-  // 可选：社区常见 .mcp.json 中 stdio 配置可不写 type
-  type?: "stdio" | "http" | "sse";
-  // stdio 字段
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  cwd?: string;
-  // http 和 sse 字段
-  url?: string;
-  headers?: Record<string, string>;
-  // 通用字段
-  [key: string]: any;
-}
-
-// v3.7.0: MCP 服务器应用启用状态
-export interface McpApps {
-  claude: boolean;
-  "claude-desktop"?: boolean;
-  codex: boolean;
-  gemini: boolean;
-  opencode: boolean;
-  openclaw: boolean;
-  hermes: boolean;
-}
-
-// MCP 服务器条目（v3.7.0 统一结构）
-export interface McpServer {
-  id: string;
-  name: string;
-  server: McpServerSpec;
-  apps: McpApps; // v3.7.0: 标记应用到哪些客户端
-  description?: string;
-  tags?: string[];
-  homepage?: string;
-  docs?: string;
-  // 兼容旧字段（v3.6.x 及以前）
-  enabled?: boolean; // 已废弃，v3.7.0 使用 apps 字段
-  source?: string;
-  [key: string]: any;
-}
-
-// MCP 服务器映射（id -> McpServer）
-export type McpServersMap = Record<string, McpServer>;
-
-// MCP 配置状态
-export interface McpStatus {
-  userConfigPath: string;
-  userConfigExists: boolean;
-  serverCount: number;
-}
-
-// 新：来自 config.json 的 MCP 列表响应
-export interface McpConfigResponse {
-  configPath: string;
-  servers: Record<string, McpServer>;
-}
-
-// ============================================================================
-// OpenCode 专属配置（v3.9.2+）
-// ============================================================================
-
-// OpenCode 模型配置
-export interface OpenCodeModel {
-  name: string;
-  limit?: {
-    context?: number;
-    output?: number;
-  };
-  options?: Record<string, unknown>; // 模型级别额外选项（provider 路由等）
-  // 支持任意额外字段（cost、modalities、thinking、variants 等）
-  [key: string]: unknown;
-}
-
-// OpenCode 供应商选项
-export interface OpenCodeProviderOptions {
-  baseURL?: string;
-  apiKey?: string;
-  headers?: Record<string, string>;
-  // 支持额外选项（timeout, setCacheKey 等）
-  [key: string]: unknown;
-}
-
-// OpenCode 供应商配置（settings_config 结构）
-export interface OpenCodeProviderConfig {
-  npm: string; // AI SDK 包名，如 "@ai-sdk/openai-compatible"
-  name?: string; // 供应商显示名称
-  options: OpenCodeProviderOptions;
-  models: Record<string, OpenCodeModel>;
-}
-
-// OpenCode MCP 服务器配置（与统一格式不同）
-export interface OpenCodeMcpServerSpec {
-  type: "local" | "remote";
-  // local 类型字段
-  command?: string[]; // 与统一格式不同：命令和参数合并为数组
-  environment?: Record<string, string>; // 与统一格式不同：使用 environment 而非 env
-  // remote 类型字段
-  url?: string;
-  headers?: Record<string, string>;
-  // 通用字段
-  enabled?: boolean;
-}
-
-// ============================================================================
-// OpenClaw 专属配置（v3.11.0+）
-// ============================================================================
-
-// OpenClaw 模型配置
-export interface OpenClawModel {
-  id: string;
-  name: string;
-  alias?: string;
-  reasoning?: boolean; // 是否支持推理模式（如 o1、DeepSeek R1）
-  input?: string[]; // 支持的输入类型（如 ["text"]、["text", "image"]）
-  cost?: {
-    input: number;
-    output: number;
-    cacheRead?: number; // 缓存读取价格
-    cacheWrite?: number; // 缓存写入价格
-  };
-  contextWindow?: number;
-  maxTokens?: number; // 最大输出 token 数
-}
-
-// OpenClaw 默认模型配置（agents.defaults.model）
-export interface OpenClawDefaultModel {
-  primary: string;
-  fallbacks?: string[];
-}
-
-// OpenClaw 模型目录条目（agents.defaults.models 中的值）
-export interface OpenClawModelCatalogEntry {
-  alias?: string;
-}
-
-export interface OpenClawHealthWarning {
-  code: string;
-  message: string;
-  path?: string;
-}
-
-export interface OpenClawWriteOutcome {
-  backupPath?: string;
-  warnings: OpenClawHealthWarning[];
-}
-
-export type OpenClawToolsProfile = "minimal" | "coding" | "messaging" | "full";
-
-// OpenClaw 供应商配置（settings_config 结构）
-// 对应 OpenClaw 的 models.providers.<provider-id> 配置
-export interface OpenClawProviderConfig {
-  baseUrl?: string; // API 端点
-  apiKey?: string; // API 密钥
-  api?: string; // API 协议类型（如 "openai-completions"、"anthropic"）
-  models?: OpenClawModel[]; // 可用模型列表
-  headers?: Record<string, string>; // 自定义请求头（如 User-Agent）
-  authHeader?: boolean; // 供应商自定义认证开关（如 Longcat）
-}
-
-// OpenClaw agents.defaults 完整配置
-export interface OpenClawAgentsDefaults {
-  model?: OpenClawDefaultModel;
-  models?: Record<string, OpenClawModelCatalogEntry>;
-  timeoutSeconds?: number;
-  timeout?: number;
-  [key: string]: unknown; // preserve unknown fields
-}
-
-// OpenClaw env 配置（openclaw.json 的 env 节点）
-export interface OpenClawEnvConfig {
-  [key: string]: unknown;
-}
-
-// OpenClaw tools 配置（openclaw.json 的 tools 节点）
-export interface OpenClawToolsConfig {
-  profile?: OpenClawToolsProfile | string;
-  allow?: string[];
-  deny?: string[];
-  [key: string]: unknown; // preserve unknown fields
-}
-
-// ============================================================================
-// Hermes Agent 专属配置
-// ============================================================================
-
-export interface HermesModelConfig {
-  default?: string;
-  provider?: string;
-  base_url?: string;
-  context_length?: number;
-  max_tokens?: number;
-  [key: string]: unknown;
-}
-
-export type HermesMemoryKind = "memory" | "user";
-
-export interface HermesMemoryLimits {
-  memory: number;
-  user: number;
-  memoryEnabled: boolean;
-  userEnabled: boolean;
 }

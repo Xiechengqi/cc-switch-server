@@ -15,12 +15,12 @@
 | Code Plan | 报告分数 | 主参考 1 | 主参考 2 | 本地结果 |
 | --- | ---: | --- | --- | --- |
 | Antigravity / Agy | 8.9 | TokenRouter 9.7，`3d91c215ce811d71cc8a996c52aabb4a034f096a` | sub2api 9.6，`d45135d87df16d48637f04ccd245727bc955ba54` | 递归 schema、mixed tools、tier endpoint 完成；27 项聚焦测试 |
-| GitHub Copilot | 8.8 | OmniRoute 9.4，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | cc-switch 8.6，`5ca9459d50ea4beea6a81bbc509de6ec5b6b09ca` | Gemini Surface 完成；50 项聚焦测试 |
+| GitHub Copilot | 8.8 | OmniRoute 9.4，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | Server Copilot protocol fixtures | Gemini Surface 完成；50 项聚焦测试 |
 | Kimi Code | 8.8 | OmniRoute 9.2，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | CLIProxyAPI 8.9，`a7e3596b7e351d800e58ed29529fbca3d1c18737` | Claude native + scoped signed replay 完成；32 项聚焦测试 |
 | Kiro / Amazon Q | 8.8 | OmniRoute 9.5，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | 9router 8.4，`699edac3273e13d4744bc46f6082618f08560702` | 坏 tool JSON 按调用隔离；129 项聚焦测试 |
 | Qoder / COSY | 8.8 | TokenRouter 9.7，`3d91c215ce811d71cc8a996c52aabb4a034f096a` | OmniRoute 9.2，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | 1.24.2、GLM-5.3、effort 完成；43 项聚焦测试 |
 | Cursor | 8.7 | OmniRoute 9.3，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | 9router 8.0，`699edac3273e13d4744bc46f6082618f08560702` | 官方 discovery/exchange 与共享 401 预算完成；197 项聚焦测试 |
-| 国内 Coding Plan | 8.7 | OmniRoute 9.1，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | cc-switch 8.8，`5ca9459d50ea4beea6a81bbc509de6ec5b6b09ca` | Alibaba 双区域四 Profile、GLM-5.3 Codex-only 完成 |
+| 国内 Coding Plan | 8.7 | OmniRoute 9.1，`c68cda7dfb49f5741195b7398e4cc6349a6d07f2` | 9router live endpoint evidence | Alibaba 双区域四 Profile、GLM-5.3 Codex-only 完成 |
 
 聚焦数量是 `cargo test <keyword> --lib` 的关键词口径，可能包含同名的通用测试；它用于复现而不是宣称独立 live 用例数。
 
@@ -51,7 +51,7 @@
 ### 参考与取舍
 
 - OmniRoute：`src/lib/oauth/providers/{github.ts,ghe-copilot.ts}`、`open-sse/services/{githubCopilotModels.ts,usage/github.ts}`、`open-sse/executors/{github.ts,ghe-copilot.ts}`、GitHub/GHE registry。
-- cc-switch：`src-tauri/src/proxy/providers/{copilot_auth.rs,copilot_model_map.rs}`、`src-tauri/src/proxy/{copilot_optimizer.rs,forwarder.rs}`。
+- Server fixtures：Copilot token exchange、model map、optimizer、三 Surface bridge 与同账号 401 测试。
 - 采纳：GitHub OAuth 与短期 Copilot inference token 分离、受信动态 origin、models/quota generation fencing，以及 Gemini generateContent ↔ Copilot Chat 的 request/response/stream/tool/usage bridge。
 - 拒绝：desktop default-account、账号轮询、跨账号重试、M365 Copilot、Copilot Web Cookie、Provider failover 与桌面 UI/Tauri 行为。
 
@@ -161,8 +161,7 @@
 ### 参考与取舍
 
 - OmniRoute：`open-sse/config/providers/registry/bailian-coding-plan/index.ts`、`open-sse/services/{bailianQuotaFetcher.ts,usage/bailian.ts,usage/glm.ts}`、`open-sse/config/providers/registry/glm/*`；Alibaba 区域证据提交 `c9d4a45f1883d7daf150bbff631f3e83b41aa5b4`。
-- cc-switch：`src/config/codingPlanProviders.ts`、`src-tauri/src/{commands/coding_plan.rs,services/coding_plan.rs}`；Bailian preset 证据提交 `27d21c23ace926992ba0c50e34a611ecffd97c0c`。
-- 补充最小 live 证据：9router `55628eea02eccb4d80738cbf5be342a6dbf53026`（Alibaba Chat catalog）与 `8ed9da7165340150be968e968f7d9ea33902c7e3`（GLM-5.3 OpenAI Coding rail）。补充证据不改变“两个评分最高主参考”的选择。
+- 9router `55628eea02eccb4d80738cbf5be342a6dbf53026`（Alibaba Chat catalog）与 `8ed9da7165340150be968e968f7d9ea33902c7e3`（GLM-5.3 OpenAI Coding rail）提供补充最小 live 证据。
 - 采纳：Alibaba China/Global(Singapore) 两 Family、Claude Messages + `x-api-key`、Codex Chat + Bearer、固定区域 origin/route/catalog；无稳定官方 quota 时明确 `unavailable`；GLM-5.3 只进入有证据的 CN/Global Codex rails。
 - 拒绝：console Cookie/HTML、Alibaba Token Plan 冒充 Coding Plan、推测 quota/余额、API key 池、按余额/地区/模型切账号、跨 Provider fallback，以及把 Qoder 同名模型外推为 Zhipu entitlement。
 

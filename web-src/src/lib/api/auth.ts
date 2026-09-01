@@ -1,4 +1,4 @@
-import { invokeCommand, isTauriRuntime } from "@/lib/runtime";
+import { invokeCommand } from "@/lib/runtime";
 
 export type ManagedAuthProvider =
   | "github_copilot"
@@ -140,7 +140,7 @@ export interface ImportQoderPatResponse {
 }
 
 /**
- * `claude_oauth` / `grok_oauth` 在 web 模式（client URL 访问、非桌面 Tauri）下走手动粘贴回调，
+ * `claude_oauth` / `grok_oauth` 在 Client URL 模式下走手动粘贴回调，
  * 用户复制授权码或 callback URL 后调用 `authSubmitOauthCode` 提交。其它 provider 缺乏对应的 out-of-band 回调端点，
  * 维持原来的"web 模式禁用"行为。
  */
@@ -197,16 +197,14 @@ export function canUseOpenAiCliOAuth(
   return isOpenAiCliOAuthOriginAllowed(
     typeof window === "undefined" ? undefined : window.location.origin,
     configuredClientUrl,
-    isTauriRuntime(),
   );
 }
 
 export function isOpenAiCliOAuthOriginAllowed(
   currentOrigin: string | undefined,
   configuredClientUrl?: string | null,
-  tauriRuntime = false,
 ): boolean {
-  if (tauriRuntime || currentOrigin === undefined) return true;
+  if (currentOrigin === undefined) return true;
 
   let current: URL;
   try {
@@ -252,7 +250,6 @@ export function isLocalCallbackAuthProvider(
  * 的本机 localhost 端口不可达。用来决定 OAuth 流程要不要走 web-paste 分支。
  */
 export function isRemoteWebMode(): boolean {
-  if (isTauriRuntime()) return false;
   if (typeof window === "undefined") return false;
   return !isDirectServerWebAccess();
 }
@@ -271,7 +268,7 @@ export function supportsWebPasteFlow(
 export function shouldBlockLocalCallbackAuthInClientWeb(
   authProvider: ManagedAuthProvider,
 ): boolean {
-  if (!isLocalCallbackAuthProvider(authProvider) || isTauriRuntime()) {
+  if (!isLocalCallbackAuthProvider(authProvider)) {
     return false;
   }
   if (typeof window === "undefined") {
@@ -285,7 +282,7 @@ export function shouldBlockLocalCallbackAuthInClientWeb(
 }
 
 export function localCallbackAuthBlockedMessage(): string {
-  return "当前通过 client URL 访问，无法添加需要 localhost 回调的 OAuth 账号。请在 cc-switch 桌面端本机添加该账号后再回到 client URL 使用。Codex/Copilot/Kiro/Cursor 等非 localhost 回调登录不受影响。";
+  return "当前通过 Client URL 访问，无法添加需要 localhost 回调的 OAuth 账号。请通过 Server 的本地管理地址完成该账号登录，再回到 Client URL 使用。Codex、Copilot、Kiro、Cursor 等非 localhost 回调登录不受影响。";
 }
 
 export async function authStartLogin(

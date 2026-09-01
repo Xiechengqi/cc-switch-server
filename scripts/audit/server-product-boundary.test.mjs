@@ -120,28 +120,24 @@ test("runtime contract must preserve removed-feature exclusions", () => {
   );
 });
 
-test("Server Provider dialogs cannot re-import the non-Server dispatcher", () => {
+test("Server Provider Bundle editor stays on Registry-owned boundaries", () => {
   const valid = {
-    "web-src/src/components/providers/AddProviderDialog.tsx":
-      'import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";',
-    "web-src/src/components/providers/EditProviderDialog.tsx":
-      'import { ServerProviderForm } from "@/server/providers/editor/ServerProviderForm";',
     "web-src/src/ServerApp.tsx":
       'import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";',
-    "web-src/src/server/providers/useServerProviderActions.ts":
-      "export function useServerProviderActions() {}",
     "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx":
       'import { ProviderBundleEditor } from "./ProviderBundleEditor";',
     "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx":
-      'import { providersApi } from "@/lib/api/providers";',
+      'import { providersApi } from "@/lib/api/providers"; import { providerRegistry } from "@/server/providerRegistry";',
+    "web-src/src/server/providers/editor/providerDraft.ts":
+      'import { presets } from "@/server/directProviderPresets"; import { providerRegistry } from "@/server/providerRegistry";',
   };
   assert.deepEqual(providerEditorBoundaryViolations(valid), []);
 
-  valid["web-src/src/components/providers/AddProviderDialog.tsx"] =
-    'import { ProviderForm } from "@/components/providers/forms/ProviderForm";';
+  valid["web-src/src/server/providers/editor/providerDraft.ts"] =
+    'import { providerRegistry } from "@/server/providerRegistry";';
   assert.match(
     providerEditorBoundaryViolations(valid).join("\n"),
-    /non-Server ProviderForm dispatcher/,
+    /directProviderPresets/,
   );
 });
 

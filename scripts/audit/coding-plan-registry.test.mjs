@@ -24,6 +24,10 @@ test("coding-plan registry manifest is generated from the current typed contract
   assert.deepEqual(manifest.summary.surfaces, ["claude", "codex"]);
   assert.equal(manifest.summary.fixtureState, "fixture_verified");
   assert.equal(manifest.summary.liveState, "live_pending");
+  assert.deepEqual(Object.keys(manifest.generatedFrom.sourceCommits).sort(), [
+    "9router",
+    "omniroute",
+  ]);
   assert.deepEqual(manifest.invariants, {
     credentialOwnership: "provider_owned",
     accountPool: false,
@@ -43,6 +47,13 @@ test("coding-plan registry manifest is generated from the current typed contract
       family.familyId,
     );
     assert.ok(family.evidenceFiles.length > 0, family.familyId);
+    assert.ok(family.planIds.length > 0, family.familyId);
+    assert.ok(
+      family.evidenceFiles.every((evidence) =>
+        ["9router", "omniroute"].includes(evidence.sourceId),
+      ),
+      family.familyId,
+    );
     for (const surface of family.surfaces) {
       assert.equal(surface.region, family.region);
       assert.equal(surface.providerOwnedCredential, true);

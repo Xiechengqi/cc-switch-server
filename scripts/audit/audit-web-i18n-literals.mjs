@@ -186,18 +186,6 @@ function walk(directory) {
   });
 }
 
-function mergeTrees(base, overlay) {
-  const merged = { ...base };
-  for (const [key, value] of Object.entries(overlay)) {
-    const existing = merged[key];
-    merged[key] =
-      isObject(existing) && isObject(value)
-        ? mergeTrees(existing, value)
-        : value;
-  }
-  return merged;
-}
-
 function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -214,19 +202,13 @@ function flattenKeys(tree, prefix = "", output = new Set()) {
 function loadLocaleKeys() {
   return Object.fromEntries(
     LANGUAGES.map((language) => {
-      const base = JSON.parse(
-        fs.readFileSync(
-          path.join(WEB_SRC, "i18n", "locales", `${language}.json`),
-          "utf8",
-        ),
-      );
       const server = JSON.parse(
         fs.readFileSync(
           path.join(WEB_SRC, "i18n", "server-locales", `${language}.json`),
           "utf8",
         ),
       );
-      const keys = flattenKeys(mergeTrees(base, server));
+      const keys = flattenKeys(server);
       for (const namespace of ACCOUNT_TRANSLATION_NAMESPACES) {
         for (const key of ACCOUNT_TRANSLATION_KEYS) {
           keys.add(`${namespace}.${key}`);

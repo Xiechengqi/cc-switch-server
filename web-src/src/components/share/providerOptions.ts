@@ -6,7 +6,7 @@ import type {
 } from "@/lib/api/auth";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import type { Provider } from "@/types";
-import { getCodexBaseUrl } from "@/utils/providerConfigUtils";
+import { getCodexBaseUrl } from "@/server/codexEndpoint";
 
 export interface ProviderOption {
   id: string;

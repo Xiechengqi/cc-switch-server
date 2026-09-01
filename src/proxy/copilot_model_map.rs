@@ -1,3 +1,5 @@
+// Historical adaptation attribution is recorded in SOURCE_PROVENANCE.json.
+// This behavior is maintained as repository-owned code with in-module tests.
 use serde_json::Value;
 
 pub(super) fn normalize_to_copilot_id(client_id: &str) -> Option<String> {

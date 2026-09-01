@@ -3906,7 +3906,7 @@ fn s1_provider_for_profile(
     // These are server-native Profiles. Amazon Q retains a legacy display-name
     // mapping for import compatibility, while the high-risk Web Session
     // Profiles are intentionally hidden and addressable only by explicit ID.
-    // None has an upstream cc-switch fixture to clone. Keep that distinction
+    // None has a legacy preset fixture to clone. Keep that distinction
     // explicit instead of weakening historical missing-fixture failures.
     if matches!(
         profile.profile_id.as_str(),

@@ -23,17 +23,17 @@ for (const file of [
   'assets/contract/provider-registry-expectations.json',
   'assets/contract/provider-legacy-behavior.json',
   'assets/contract/provider-writer-inventory.json',
+  'assets/contract/server-provider-requirements.json',
+  'assets/contract/provider-legacy-compatibility.json',
   'assets/contract/coding-plan-source-baseline.json',
   'assets/contract/coding-plan-registry-manifest.json',
   'assets/contract/web-session-source-baseline.json',
   'assets/contract/web-session-registry.json',
   'assets/contract/web-session-registry-manifest.json',
   'assets/contract/provider-coverage.json',
-  'assets/contract/provider-fixtures/structures.json',
   'assets/contract/router-provider-channel-baseline.json',
-  'assets/contract/server-provider-legacy-inventory.json',
-  'assets/contract/upstream-provider-source-baseline.json',
   'assets/contract/web-runtime-contract.json',
+  'SOURCE_PROVENANCE.json',
   'docs/provider/regression-matrix.json',
 ]) {
   JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -55,13 +55,15 @@ done
 
 echo "== provider audits =="
 node --test scripts/audit/*.test.mjs
-node scripts/audit/audit-upstream-provider-baseline.mjs --check
+node scripts/audit/audit-server-provider-contract.mjs
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-coding-plan-registry.mjs --check
 node scripts/audit/audit-web-session-registry.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 node scripts/audit/audit-server-product-boundary.mjs
+node scripts/audit/audit-server-web-boundary.mjs
+node scripts/audit/audit-source-provenance.mjs
 node scripts/audit/audit-web-i18n-literals.mjs
 node scripts/audit/audit-web-runtime-contract.mjs
 

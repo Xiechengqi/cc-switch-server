@@ -251,7 +251,7 @@
 
 ### 设计与落点
 
-1. 对 OmniRoute 与 cc-switch 当前目录做自动 delta，只有 fixed origin、auth、route、catalog、quota 和 terminal 有证据的 plan 才新增 typed Profile。
+1. 对 OmniRoute、9router 固定证据与 Server Registry 做自动 delta，只有 fixed origin、auth、route、catalog、quota 和 terminal 有证据的 plan 才新增 typed Profile。
 2. 每个 plan 必须区分 region × Surface；同名模型不能跨 entitlement rail 外推。
 3. 增加 Registry drift manifest 和生成审计：source commit、capturedAt、maturity、live state、模型 capability、quota provenance。
 4. quota unavailable 必须诚实返回 unavailable，不抓 console Cookie；Provider-owned key 不创建推理 Account。
@@ -259,7 +259,7 @@
 
 ### 实施结果
 
-- [x] 新增 `coding-plan-source-baseline.json`：固定 OmniRoute `b342c1a361f2`、cc-switch `d8065cc628fc`、9router `90b52e06ffd6` 及 23 个 origin/route/catalog/quota/Ollama 证据文件的 SHA-256。
+- [x] 新增 `coding-plan-source-baseline.json`：固定 OmniRoute `b342c1a361f2`、9router `90b52e06ffd6` 及 20 个 origin/route/catalog/quota/Ollama 证据文件的 SHA-256。
 - [x] 新增 `audit-coding-plan-registry.mjs` 与生成 manifest；逐项校验 10 个 Family、20 个 Profile、5 个 region 标签和 Claude/Codex 两 Surface 的 fixed HTTPS origin、Provider-owned credential、exact route、模型 modality/context、quota provenance、terminal、error/retry 与 maturity。普通 `--check` 已进入静态门禁，`--check-sources` 对当前外部目录的 commit/hash 也通过。
 - [x] Manifest 明确所有 Profile 为 `fixture_verified` / `live_pending`，无真实证据时 tools 不从模型名外推；quota unavailable 强制 endpoint/credential slots 为空并标记 `explicit_unavailable_no_console_cookie`。
 - [x] Ollama contract 已复核并纳入同一 manifest：Provider-owned API Key、并发 `POST /api/me` + `GET /api/usage`、禁 redirect、512 KiB 上限、section partial success、仅 retryable 同 generation stale、认证清 cache、Bundle single-flight、删除/轮换清理和旧代际在途结果丢弃。

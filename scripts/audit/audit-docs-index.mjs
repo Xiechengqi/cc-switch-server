@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Docs hygiene audit:
-//   1. every markdown link inside docs/, README.md, AGENTS.md and UPSTREAM_IMPORT.md
+//   1. every markdown link inside docs/, README.md, AGENTS.md and PROTOCOL_EVIDENCE.md
 //      resolves to a file that exists;
 //   2. every content doc under docs/ is registered in the docs/README.md index;
 //   3. every docs/history/*.md carries the archived banner.
@@ -35,7 +35,7 @@ function walk(dir, out = []) {
 }
 
 const docFiles = fs.existsSync(docsDir) ? walk(docsDir).sort() : [];
-const rootDocs = ["README.md", "AGENTS.md", "UPSTREAM_IMPORT.md"].filter((rel) =>
+const rootDocs = ["README.md", "AGENTS.md", "PROTOCOL_EVIDENCE.md", "THIRD_PARTY_NOTICES.md"].filter((rel) =>
   fs.existsSync(path.join(repoRoot, rel)),
 );
 
