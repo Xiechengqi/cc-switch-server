@@ -13555,12 +13555,20 @@ fn classify_claude_rate_limit(
     let status_7d_oi = header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status");
     let account_window_rejected =
         status_5h.as_deref() == Some("rejected") || status_7d.as_deref() == Some("rejected");
+    let fable_only_rejected = fable_request
+        && status_7d_oi.as_deref() == Some("rejected")
+        && claude_shared_window_allowed(status_5h.as_deref())
+        && claude_shared_window_allowed(status_7d.as_deref());
+    let account_rejected = account_window_rejected
+        || (status_7d_oi.as_deref() == Some("rejected") && !fable_only_rejected)
+        || (unified.as_deref() == Some("rejected") && !fable_only_rejected);
     let mut effects = ClaudeRateLimitEffects::default();
-    if account_window_rejected {
+    if account_rejected {
         let until = [
             "anthropic-ratelimit-unified-reset",
             "anthropic-ratelimit-unified-5h-reset",
             "anthropic-ratelimit-unified-7d-reset",
+            "anthropic-ratelimit-unified-7d_oi-reset",
         ]
         .into_iter()
         .filter_map(|name| parse_anthropic_reset_header(headers, name, now))
@@ -13570,23 +13578,12 @@ fn classify_claude_rate_limit(
         effects.account_unified_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
-    if fable_request && status_7d_oi.as_deref() == Some("rejected") {
+    if fable_only_rejected {
         let until =
             parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-7d_oi-reset", now)
                 .or_else(|| super::grok::retry_after_until_ms(headers, now))
                 .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
         effects.fable_pool_until = Some(super::bounded_upstream_rate_limit_until(now, until));
-    }
-
-    if effects.account_unified_until.is_none()
-        && effects.fable_pool_until.is_none()
-        && status_7d_oi.as_deref() != Some("rejected")
-        && unified.as_deref() == Some("rejected")
-    {
-        let until = parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-reset", now)
-            .or_else(|| super::grok::retry_after_until_ms(headers, now))
-            .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
-        effects.account_unified_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
     if effects.account_unified_until.is_none() && effects.fable_pool_until.is_none() {
@@ -13605,6 +13602,10 @@ fn classify_claude_rate_limit(
         ));
     }
     effects
+}
+
+fn claude_shared_window_allowed(status: Option<&str>) -> bool {
+    matches!(status, Some("allowed" | "allowed_warning"))
 }
 
 fn header_lower(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -23971,20 +23972,24 @@ mod tests {
 
     #[test]
     fn claude_rate_limit_scope_distinguishes_account_model_and_entitlement() {
+        fn build_headers(values: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for (name, value) in values {
+                headers.insert(*name, HeaderValue::from_static(value));
+            }
+            headers
+        }
+
         let now = 1_700_000_000_000_i64;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-status",
-            HeaderValue::from_static("rejected"),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-reset",
-            HeaderValue::from_static("1700003600"),
-        );
+        let mut headers = build_headers(&[
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+        ]);
         let effects = classify_claude_rate_limit(&headers, b"{}", false, now);
         assert_eq!(effects.account_unified_until, Some(1_700_003_600_000));
         assert!(effects.fable_pool_until.is_none());
 
+        // A rejected Fable window is ambiguous without explicit healthy shared windows.
         headers.insert(
             "anthropic-ratelimit-unified-status",
             HeaderValue::from_static("rejected"),
@@ -23996,25 +24001,19 @@ mod tests {
         headers.remove("anthropic-ratelimit-unified-5h-status");
         headers.remove("anthropic-ratelimit-unified-7d-status");
         let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
-        assert!(effects.account_unified_until.is_none());
-        assert!(effects.fable_pool_until.is_some());
+        assert!(effects.account_unified_until.is_some());
+        assert!(effects.fable_pool_until.is_none());
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "anthropic-ratelimit-unified-5h-status",
-            HeaderValue::from_static("allowed"),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-status",
-            HeaderValue::from_static("allowed"),
-        );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d_oi-status",
-            HeaderValue::from_static("rejected"),
-        );
+        let mut headers = build_headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
         let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
         assert!(effects.account_unified_until.is_none());
         assert!(effects.fable_pool_until.is_some());
+        assert!(effects.exact_model_until.is_none());
 
         headers.insert(
             "anthropic-ratelimit-unified-7d-status",
@@ -24022,7 +24021,34 @@ mod tests {
         );
         let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
         assert!(effects.account_unified_until.is_some());
-        assert!(effects.fable_pool_until.is_some());
+        assert!(effects.fable_pool_until.is_none());
+
+        let non_fable = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert!(non_fable.account_unified_until.is_some());
+        assert!(non_fable.fable_pool_until.is_none());
+
+        let unified_only = classify_claude_rate_limit(
+            &build_headers(&[("anthropic-ratelimit-unified-status", "rejected")]),
+            b"{}",
+            true,
+            now,
+        );
+        assert!(unified_only.account_unified_until.is_some());
+        assert!(unified_only.fable_pool_until.is_none());
+
+        let ordinary = classify_claude_rate_limit(&HeaderMap::new(), b"{}", true, now);
+        assert!(ordinary.account_unified_until.is_none());
+        assert!(ordinary.fable_pool_until.is_none());
+        assert!(ordinary.exact_model_until.is_some());
 
         assert!(
             classify_claude_rate_limit(

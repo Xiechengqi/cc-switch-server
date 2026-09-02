@@ -396,10 +396,13 @@ pub fn record_claude_response_decoding(surface: &'static str, result: &'static s
 
 fn set_claude_wire_profile_info() {
     let profile = crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
+    let identity = crate::domain::claude_cli::claude_cli_identity();
     metrics::gauge!(
         "cc_switch_claude_wire_profile_info",
         "profile_id" => profile.id,
         "claude_code_version" => profile.claude_code_version,
+        "effective_claude_code_version" => identity.version,
+        "identity_source" => identity.source,
         "stainless_version" => profile.stainless_package_version,
         "node_version" => profile.node_version,
         "axios_version" => profile.axios_version

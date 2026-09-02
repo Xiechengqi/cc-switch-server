@@ -3,7 +3,7 @@ pub use crate::domain::accounts::claude_subscription::{
 };
 use crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
 
-pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_787_702_400_000;
+pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_788_307_200_000;
 pub const CLAUDE_MODEL_IDS: &[&str] = &[
     "claude-fable-5",
     "claude-opus-5",

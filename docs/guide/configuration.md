@@ -56,6 +56,7 @@
 | --- | --- |
 | Streaming 超时 | Provider 默认首业务事件超时 120 秒、后续事件空闲超时 300 秒；`STREAM_FIRST_BYTE_TIMEOUT_MS` / `UPSTREAM_STREAM_FIRST_BYTE_TIMEOUT_MS` 和 `STREAM_IDLE_TIMEOUT_MS` / `UPSTREAM_STREAM_IDLE_TIMEOUT_MS` 可覆盖，设为 `0` 关闭对应超时 |
 | Claude OAuth cache | billing/identity block 默认保持 CLI 兼容的 5 分钟 TTL；`CC_SWITCH_CLAUDE_CACHE_TTL=1h` 可启用 1 小时 prompt cache |
+| Claude OAuth CLI identity | 默认使用审计 profile 的 Claude Code `2.1.236`。`CC_SWITCH_CLI_UA_VERSION` 仅接受有界三段数字版本；`CC_SWITCH_CLI_UA` 仅接受以 `claude-cli/<三段数字版本>` 开头、无控制字符且长度有界的完整 UA，合法完整 UA 优先。两者仅用于上游版本门禁的紧急覆盖；无效候选会被忽略，没有任何合法覆盖时 fail closed 到固定 profile。启动日志和 `cc_switch_claude_wire_profile_info` 会显示 effective version 与来源 |
 | Codex WebSocket cache | 默认最多缓存 64 条空闲连接，idle TTL 5 分钟、max age 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS`、`CC_SWITCH_CODEX_WS_CACHE_IDLE_MS`、`CC_SWITCH_CODEX_WS_CACHE_MAX_AGE_MS` 可覆盖，provider 的 `codexWebsocketEnabled=false` 可紧急关闭 WS |
 | Codex overflow compact | `CC_SWITCH_CODEX_OVERFLOW_AUTO_COMPACT=1` 可在业务输出提交前对 `context_length_exceeded` 使用同账号做一次有界摘要和重试；默认关闭，摘要调用会单独计入 usage |
 | Codex Responses keepalive | `CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS` 控制普通文本 Responses SSE 在下游已收到首个业务/终态事件后的注释心跳，默认 `15000` ms；`0` 禁用，非零值收敛到 `5000..60000` ms。Provider `driverOptions.codexResponsesKeepaliveIntervalMs` 优先于环境变量。心跳不提交首包，也不延长 `STREAM_FIRST_BYTE_TIMEOUT_MS` / `STREAM_IDLE_TIMEOUT_MS` |

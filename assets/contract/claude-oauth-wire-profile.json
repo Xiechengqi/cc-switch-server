@@ -1,22 +1,22 @@
 {
   "format": "cc-switch-claude-oauth-wire-profile",
   "schemaVersion": 2,
-  "profileId": "claude-code-2.1.234-audited-2026-08-26",
-  "capturedAt": "2026-08-26T00:00:00Z",
+  "profileId": "claude-code-2.1.236-audited-2026-09-02",
+  "capturedAt": "2026-09-02T00:00:00Z",
   "versions": {
-    "claudeCode": "2.1.234",
+    "claudeCode": "2.1.236",
     "stainlessSdk": "0.112.1",
     "node": "v26.3.0",
     "axios": "1.15.2"
   },
   "endpointIdentities": {
-    "usage": "claude-code/2.1.234",
-    "bootstrap": "claude-cli/2.1.234 (external, cli)",
+    "usage": "claude-code/2.1.236",
+    "bootstrap": "claude-cli/2.1.236 (external, cli)",
     "profile": "axios/1.15.2",
     "roles": "axios/1.15.2",
     "token": "axios/1.15.2",
     "inference": {
-      "userAgent": "claude-cli/2.1.234 (external, cli)",
+      "userAgent": "claude-cli/2.1.236 (external, cli)",
       "xStainlessPackageVersion": "0.112.1",
       "xStainlessRuntime": "node",
       "xStainlessRuntimeVersion": "v26.3.0"
@@ -97,12 +97,17 @@
       "shapeGated": [
         "context-1m-2025-08-07",
         "mid-conversation-system-2026-04-07",
+        "advisor-tool-2026-03-01",
         "advanced-tool-use-2025-11-20",
-        "server-side-fallback-2026-06-01",
         "structured-outputs-2025-12-15",
         "fast-mode-2026-02-01",
         "cache-diagnosis-2026-04-07"
       ],
+      "explicitShapePaired": {
+        "fallbackArray": "server-side-fallback-2026-06-01",
+        "fallbackDefault": "server-side-fallback-2026-07-01",
+        "policy": "preserve_only_when_client_explicitly_requests_the_exact_beta_for_the_body_shape"
+      },
       "auditedClientCompatibility": [
         "prompt-caching-2024-07-31",
         "token-efficient-tools-2025-02-19"
@@ -116,7 +121,7 @@
         "context-management-2025-06-27",
         "token-counting-2024-11-01"
       ],
-      "shapeGated": ["context-1m-2025-08-07"],
+      "shapeGated": ["context-1m-2025-08-07", "advisor-tool-2026-03-01"],
       "generationOnlyBetasAllowed": false,
       "auditedClientCompatibility": [
         "prompt-caching-2024-07-31",
@@ -131,6 +136,7 @@
       "unknownModel": "shape_only_no_model_beta",
       "shapeDrivenCapabilities": [
         "advanced_tool_use",
+        "advisor_tool",
         "structured_outputs",
         "fast_mode",
         "server_side_fallback",
@@ -158,8 +164,9 @@
     ]
   },
   "provenance": {
-    "kind": "sanitized_installed_binary_audit",
+    "kind": "sanitized_npm_stable_native_binary_static_audit",
     "containsSecrets": false,
-    "notes": "Audited from the installed official Claude Code 2.1.234 binary and cross-checked against sanitized reference captures. Values retain only public endpoint, version, header-family, beta-policy, model capability, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, request bodies, response bodies, and private build metadata are excluded."
+    "realAccountVerification": "pending",
+    "notes": "Audited from the official npm stable Claude Code 2.1.236 native binary on 2026-09-02 and compared with the prior 2.1.234 profile; the static identity, beta, model, Stainless, and CCH token sets had no material delta. Values retain only public endpoint, version, header-family, beta-policy, model capability, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, request bodies, response bodies, and private build metadata are excluded. Real subscription-account verification remains pending."
   }
 }
