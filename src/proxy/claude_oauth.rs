@@ -34,8 +34,10 @@ const REDACT_THINKING_BETA: &str = "redact-thinking-2026-02-12";
 const THINKING_TOKEN_COUNT_BETA: &str = "thinking-token-count-2026-05-13";
 const PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
 const MID_CONVERSATION_SYSTEM_BETA: &str = "mid-conversation-system-2026-04-07";
+const ADVISOR_TOOL_BETA: &str = "advisor-tool-2026-03-01";
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
-const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
+const SERVER_SIDE_FALLBACK_ARRAY_BETA: &str = "server-side-fallback-2026-06-01";
+const SERVER_SIDE_FALLBACK_DEFAULT_BETA: &str = "server-side-fallback-2026-07-01";
 const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-06-01";
 const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-12-15";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
@@ -239,6 +241,13 @@ fn apply_forward_contract_inner(
             normalize_claude_sampling(&mut value);
         }
         internal_betas = take_internal_anthropic_betas(&mut value);
+        sanitize_claude_fallback_fields(
+            &mut value,
+            client_headers,
+            &internal_betas,
+            beta_operation,
+            client_class,
+        );
         if is_count_tokens {
             remove_generation_fields_for_count_tokens(&mut value);
         }
@@ -636,6 +645,8 @@ fn remove_generation_fields_for_count_tokens(body: &mut Value) {
         "output_config",
         "context_management",
         "tool_choice",
+        "fallbacks",
+        "fallback_credit_token",
     ] {
         object.remove(key);
     }
@@ -1320,21 +1331,14 @@ fn build_anthropic_beta_value_for_class(
     client_class: ClaudeClientClass,
 ) -> String {
     if client_class.is_confirmed_native() {
-        return native_passthrough_betas(headers, is_claude_oauth, operation);
+        return native_passthrough_betas(headers, body, internal_betas, is_claude_oauth, operation);
     }
 
-    let requested = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .chain(internal_betas.iter().map(String::as_str))
-        .collect::<Vec<_>>();
+    let requested = requested_anthropic_betas(headers, internal_betas);
+    let requested_refs = requested.iter().map(String::as_str).collect::<Vec<_>>();
     let mut betas = vec![CLAUDE_CODE_BETA.to_string()];
     if !is_claude_oauth {
-        for beta in requested {
+        for beta in requested_refs {
             push_beta(&mut betas, beta);
         }
         return betas.join(",");
@@ -1364,12 +1368,17 @@ fn build_anthropic_beta_value_for_class(
             if body.is_some_and(body_model_supports_mid_conversation_system) {
                 push_beta(&mut betas, MID_CONVERSATION_SYSTEM_BETA);
             }
+            if body.is_some_and(body_has_advisor_tool) {
+                push_beta(&mut betas, ADVISOR_TOOL_BETA);
+            }
             if body.is_some_and(body_has_tools) {
                 push_beta(&mut betas, ADVANCED_TOOL_USE_BETA);
             }
             push_beta(&mut betas, EFFORT_BETA);
-            if body.is_some_and(body_has_server_side_fallback) {
-                push_beta(&mut betas, SERVER_SIDE_FALLBACK_BETA);
+            if let Some(fallback_beta) = body.and_then(body_server_side_fallback_beta) {
+                if requested.iter().any(|requested| requested == fallback_beta) {
+                    push_beta(&mut betas, fallback_beta);
+                }
             }
             if is_claude_oauth || body.is_some_and(body_has_fallback_credit) {
                 push_beta(&mut betas, FALLBACK_CREDIT_BETA);
@@ -1390,6 +1399,9 @@ fn build_anthropic_beta_value_for_class(
         ClaudeBetaOperation::CountTokens => {
             push_beta(&mut betas, INTERLEAVED_THINKING_BETA);
             push_beta(&mut betas, CONTEXT_MANAGEMENT_BETA);
+            if body.is_some_and(body_has_advisor_tool) {
+                push_beta(&mut betas, ADVISOR_TOOL_BETA);
+            }
             push_beta(&mut betas, TOKEN_COUNTING_BETA);
         }
     }
@@ -1402,7 +1414,7 @@ fn build_anthropic_beta_value_for_class(
     let allowed = betas.iter().map(String::as_str).collect::<Vec<_>>();
     let dropped_count = requested
         .iter()
-        .filter(|requested| !allowed.contains(requested))
+        .filter(|requested| !allowed.contains(&requested.as_str()))
         .count();
     if dropped_count > 0 {
         tracing::debug!(
@@ -1415,6 +1427,19 @@ fn build_anthropic_beta_value_for_class(
         }
     }
     betas.join(",")
+}
+
+fn requested_anthropic_betas(headers: &HeaderMap, internal_betas: &[String]) -> Vec<String> {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .chain(internal_betas.iter().cloned())
+        .collect()
 }
 
 fn current_beta_profile_enabled() -> bool {
@@ -1433,20 +1458,21 @@ fn beta_profile_value_is_current(value: Option<&str>) -> bool {
 
 fn native_passthrough_betas(
     headers: &HeaderMap,
+    body: Option<&Value>,
+    internal_betas: &[String],
     is_claude_oauth: bool,
     operation: ClaudeBetaOperation,
 ) -> String {
     let mut betas = Vec::new();
-    for beta in headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if native_beta_allowed(beta, operation) {
-            push_beta(&mut betas, beta);
+    for beta in requested_anthropic_betas(headers, internal_betas) {
+        let fallback_shape_matches = match beta.as_str() {
+            SERVER_SIDE_FALLBACK_ARRAY_BETA | SERVER_SIDE_FALLBACK_DEFAULT_BETA => body
+                .and_then(body_server_side_fallback_beta)
+                .is_some_and(|required| required == beta),
+            _ => true,
+        };
+        if native_beta_allowed(&beta, operation) && fallback_shape_matches {
+            push_beta(&mut betas, &beta);
         } else {
             crate::metrics::record_claude_beta_decision(operation.as_str(), "dropped_unknown");
         }
@@ -1488,15 +1514,18 @@ fn native_beta_allowed(beta: &str, operation: ClaudeBetaOperation) -> bool {
                 | THINKING_TOKEN_COUNT_BETA
                 | PROMPT_CACHING_SCOPE_BETA
                 | MID_CONVERSATION_SYSTEM_BETA
+                | ADVISOR_TOOL_BETA
                 | ADVANCED_TOOL_USE_BETA
-                | SERVER_SIDE_FALLBACK_BETA
+                | SERVER_SIDE_FALLBACK_ARRAY_BETA
+                | SERVER_SIDE_FALLBACK_DEFAULT_BETA
                 | FALLBACK_CREDIT_BETA
                 | STRUCTURED_OUTPUTS_BETA
                 | FAST_MODE_BETA
                 | CACHE_DIAGNOSIS_BETA
-                | "advisor-tool-2026-03-01"
         ),
-        ClaudeBetaOperation::CountTokens => beta == TOKEN_COUNTING_BETA,
+        ClaudeBetaOperation::CountTokens => {
+            matches!(beta, TOKEN_COUNTING_BETA | ADVISOR_TOOL_BETA)
+        }
     }
 }
 
@@ -1601,6 +1630,16 @@ fn body_has_tools(body: &Value) -> bool {
         .is_some_and(|tools| !tools.is_empty())
 }
 
+fn body_has_advisor_tool(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("advisor_20260301"))
+        })
+}
+
 fn body_model_supports_mid_conversation_system(body: &Value) -> bool {
     let Some(model) = body.get("model").and_then(Value::as_str) else {
         return false;
@@ -1611,11 +1650,59 @@ fn body_model_supports_mid_conversation_system(body: &Value) -> bool {
     )
 }
 
-fn body_has_server_side_fallback(body: &Value) -> bool {
+fn body_server_side_fallback_beta(body: &Value) -> Option<&'static str> {
     match body.get("fallbacks") {
-        Some(Value::String(value)) => value == "default",
-        Some(Value::Array(values)) => !values.is_empty(),
-        _ => false,
+        Some(Value::String(value)) if value == "default" => Some(SERVER_SIDE_FALLBACK_DEFAULT_BETA),
+        Some(Value::Array(values))
+            if !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(|value| !value.trim().is_empty())) =>
+        {
+            Some(SERVER_SIDE_FALLBACK_ARRAY_BETA)
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_claude_fallback_fields(
+    body: &mut Value,
+    headers: &HeaderMap,
+    internal_betas: &[String],
+    operation: ClaudeBetaOperation,
+    client_class: ClaudeClientClass,
+) {
+    let requested = requested_anthropic_betas(headers, internal_betas);
+    let generation_beta_profile_enabled =
+        client_class.is_confirmed_native() || current_beta_profile_enabled();
+    let keep_fallbacks = operation == ClaudeBetaOperation::Messages
+        && generation_beta_profile_enabled
+        && body_server_side_fallback_beta(body)
+            .is_some_and(|required| requested.iter().any(|requested| requested == required));
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("fallbacks") && !keep_fallbacks {
+        object.remove("fallbacks");
+        crate::metrics::record_claude_beta_decision(operation.as_str(), "fallback_stripped");
+        tracing::debug!(
+            operation = operation.as_str(),
+            "stripped Claude fallback field without an exact approved beta/shape pair"
+        );
+    }
+    let valid_fallback_credit = operation == ClaudeBetaOperation::Messages
+        && generation_beta_profile_enabled
+        && object
+            .get("fallback_credit_token")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    if object.contains_key("fallback_credit_token") && !valid_fallback_credit {
+        object.remove("fallback_credit_token");
+        crate::metrics::record_claude_beta_decision(operation.as_str(), "fallback_credit_stripped");
+        tracing::debug!(
+            operation = operation.as_str(),
+            "stripped invalid Claude fallback credit field"
+        );
     }
 }
 
@@ -2085,7 +2172,10 @@ mod tests {
             "model": "claude-sonnet-5",
             "stream": true,
             "thinking": {"type": "adaptive"},
-            "tools": [{"type": "computer_use_20250124"}],
+            "tools": [
+                {"type": "computer_use_20250124"},
+                {"type": "advisor_20260301"}
+            ],
             "fallbacks": "default",
             "context_management": {"edits": []},
             "output_config": {"effort": "high", "format": {"type": "json_schema"}},
@@ -2097,7 +2187,7 @@ mod tests {
         let message_betas = build_anthropic_beta_value(
             &HeaderMap::new(),
             Some(&maximal_messages_body),
-            &[],
+            &[SERVER_SIDE_FALLBACK_DEFAULT_BETA.to_string()],
             true,
             true,
             ClaudeBetaOperation::Messages,
@@ -2113,9 +2203,29 @@ mod tests {
             strings(&messages["auditedClientCompatibility"]),
             MESSAGES_CLIENT_BETAS
         );
+        assert_eq!(
+            messages["explicitShapePaired"]["fallbackArray"],
+            SERVER_SIDE_FALLBACK_ARRAY_BETA
+        );
+        assert_eq!(
+            messages["explicitShapePaired"]["fallbackDefault"],
+            SERVER_SIDE_FALLBACK_DEFAULT_BETA
+        );
+        assert!(message_betas.contains(&SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+        let array_fallback = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&json!({"fallbacks": ["claude-opus-5"]})),
+            &[SERVER_SIDE_FALLBACK_ARRAY_BETA.to_string()],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(array_fallback
+            .split(',')
+            .any(|beta| beta == SERVER_SIDE_FALLBACK_ARRAY_BETA));
         let count_token_betas = build_anthropic_beta_value(
             &HeaderMap::new(),
-            None,
+            Some(&json!({"tools": [{"type": "advisor_20260301"}]})),
             &[],
             true,
             true,
@@ -2215,6 +2325,182 @@ mod tests {
     }
 
     #[test]
+    fn fallback_fields_require_the_exact_explicit_beta_for_their_shape() {
+        fn apply(fallbacks: Value, beta: Option<&'static str>) -> (Value, String) {
+            let mut headers = HeaderMap::new();
+            if let Some(beta) = beta {
+                headers.insert("anthropic-beta", axum::http::HeaderValue::from_static(beta));
+            }
+            let mut url = "https://api.anthropic.com/v1/messages".to_string();
+            let mut body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-sonnet-5",
+                    "fallbacks": fallbacks,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap(),
+            );
+            let contract =
+                apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None)
+                    .unwrap();
+            let body = serde_json::from_slice(&body).unwrap();
+            let beta = contract
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "anthropic-beta")
+                .unwrap()
+                .1
+                .clone();
+            (body, beta)
+        }
+
+        let (body, beta) = apply(
+            json!(["claude-opus-5"]),
+            Some(SERVER_SIDE_FALLBACK_ARRAY_BETA),
+        );
+        assert_eq!(body["fallbacks"], json!(["claude-opus-5"]));
+        assert!(beta
+            .split(',')
+            .any(|value| value == SERVER_SIDE_FALLBACK_ARRAY_BETA));
+        assert!(!beta.contains(SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+
+        let (body, beta) = apply(json!("default"), Some(SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+        assert_eq!(body["fallbacks"], json!("default"));
+        assert!(beta
+            .split(',')
+            .any(|value| value == SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+        assert!(!beta.contains(SERVER_SIDE_FALLBACK_ARRAY_BETA));
+
+        for (fallbacks, beta) in [
+            (
+                json!(["claude-opus-5"]),
+                Some(SERVER_SIDE_FALLBACK_DEFAULT_BETA),
+            ),
+            (json!("default"), Some(SERVER_SIDE_FALLBACK_ARRAY_BETA)),
+            (json!(["claude-opus-5"]), None),
+            (json!([]), Some(SERVER_SIDE_FALLBACK_ARRAY_BETA)),
+        ] {
+            let (body, outbound_beta) = apply(fallbacks, beta);
+            assert!(body.get("fallbacks").is_none());
+            assert!(!outbound_beta.contains(SERVER_SIDE_FALLBACK_ARRAY_BETA));
+            assert!(!outbound_beta.contains(SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+        }
+    }
+
+    #[test]
+    fn fallback_beta_can_be_explicit_in_repeated_headers_or_internal_fields() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        headers.append(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(SERVER_SIDE_FALLBACK_ARRAY_BETA),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-sonnet-5",
+                "fallbacks": ["claude-opus-5"],
+                "betas": [SERVER_SIDE_FALLBACK_ARRAY_BETA],
+                "messages": []
+            }))
+            .unwrap(),
+        );
+        let contract =
+            apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None)
+                .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let beta = contract
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "anthropic-beta")
+            .unwrap()
+            .1
+            .as_str();
+
+        assert!(body.get("betas").is_none());
+        assert!(body.get("fallbacks").is_some());
+        assert_eq!(beta.matches(SERVER_SIDE_FALLBACK_ARRAY_BETA).count(), 1);
+    }
+
+    #[test]
+    fn advisor_tool_beta_is_exact_shape_gated_and_ordered() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "tools": [{"type": "advisor_20260301"}]
+        });
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        let betas = beta.split(',').collect::<Vec<_>>();
+        let mid = betas
+            .iter()
+            .position(|beta| *beta == MID_CONVERSATION_SYSTEM_BETA)
+            .unwrap();
+        let advisor = betas
+            .iter()
+            .position(|beta| *beta == ADVISOR_TOOL_BETA)
+            .unwrap();
+        let advanced = betas
+            .iter()
+            .position(|beta| *beta == ADVANCED_TOOL_USE_BETA)
+            .unwrap();
+        assert!(mid < advisor && advisor < advanced);
+
+        let ordinary = json!({"tools": [{"type": "advisor"}]});
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&ordinary),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(!beta.contains(ADVISOR_TOOL_BETA));
+    }
+
+    #[test]
+    fn count_tokens_supports_advisor_but_strips_generation_fallback_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(SERVER_SIDE_FALLBACK_DEFAULT_BETA),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages/count_tokens".to_string();
+        let mut body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","tools":[{"type":"advisor_20260301"}],"fallbacks":"default","fallback_credit_token":"secret","messages":[]}"#,
+        );
+        let contract = apply_count_tokens_forward_contract(
+            &mut url,
+            &mut body,
+            &headers,
+            "account-123",
+            false,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let beta = contract
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "anthropic-beta")
+            .unwrap()
+            .1
+            .as_str();
+
+        assert!(body.get("fallbacks").is_none());
+        assert!(body.get("fallback_credit_token").is_none());
+        assert!(beta.contains(ADVISOR_TOOL_BETA));
+        assert!(!beta.contains(SERVER_SIDE_FALLBACK_DEFAULT_BETA));
+    }
+
+    #[test]
     fn native_beta_passthrough_drops_values_outside_the_audited_profile() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2236,6 +2522,39 @@ mod tests {
             beta,
             "claude-code-20250219,oauth-2025-04-20,structured-outputs-2025-12-15,extended-cache-ttl-2025-04-11"
         );
+    }
+
+    #[test]
+    fn native_passthrough_also_enforces_fallback_body_beta_consistency() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
+        headers.insert(
+            "user-agent",
+            axum::http::HeaderValue::from_static("claude-cli/2.1.236 (external, cli)"),
+        );
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(SERVER_SIDE_FALLBACK_ARRAY_BETA),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","fallbacks":"default","metadata":{"user_id":"user_a_account__session_abc"},"messages":[]}"#,
+        );
+        let contract =
+            apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None)
+                .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let beta = contract
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "anthropic-beta")
+            .unwrap()
+            .1
+            .as_str();
+
+        assert!(body.get("fallbacks").is_none());
+        assert!(!beta.contains(SERVER_SIDE_FALLBACK_ARRAY_BETA));
+        assert!(!beta.contains(SERVER_SIDE_FALLBACK_DEFAULT_BETA));
     }
 
     #[test]
@@ -2466,7 +2785,7 @@ mod tests {
             headers.insert(
                 "user-agent",
                 axum::http::HeaderValue::from_static(
-                    "claude-cli/2.1.234 (external, cli, linux-x64)",
+                    "claude-cli/2.1.236 (external, cli, linux-x64)",
                 ),
             );
             headers.insert(
@@ -2527,7 +2846,7 @@ mod tests {
         headers.insert(
             "user-agent",
             axum::http::HeaderValue::from_static(
-                "claude-cli/2.1.234 (external, sdk-cli, linux-x64)",
+                "claude-cli/2.1.236 (external, sdk-cli, linux-x64)",
             ),
         );
         headers.insert(
@@ -2536,7 +2855,7 @@ mod tests {
         );
         let mut url = "https://api.anthropic.com/v1/messages".to_string();
         let mut body = Bytes::from_static(
-            br#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.234; cc_entrypoint=sdk-cli;"}],"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"user","content":"hi"}]}"#,
+            br#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.236; cc_entrypoint=sdk-cli;"}],"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"user","content":"hi"}]}"#,
         );
         apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();

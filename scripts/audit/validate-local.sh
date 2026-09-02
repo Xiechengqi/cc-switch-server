@@ -3,6 +3,7 @@ set -euo pipefail
 
 cargo fmt --check
 cargo check
+node scripts/audit/audit-claude-wire-profile.mjs
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 node scripts/audit/audit-proxy-bridge-contract.mjs --check

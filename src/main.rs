@@ -46,6 +46,20 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
         installation_id,
         "server process log started"
     );
+    let claude_identity = cc_switch_server::domain::claude_cli::claude_cli_identity();
+    tracing::info!(
+        wire_profile_id = cc_switch_server::domain::claude_cli::CLAUDE_WIRE_PROFILE.id,
+        profile_cli_version = cc_switch_server::domain::claude_cli::CLAUDE_WIRE_PROFILE.claude_code_version,
+        effective_cli_version = %claude_identity.version,
+        identity_source = claude_identity.source,
+        "resolved Claude OAuth wire identity"
+    );
+    if claude_identity.override_conflict {
+        tracing::warn!(
+            identity_source = claude_identity.source,
+            "both CC_SWITCH_CLI_UA and CC_SWITCH_CLI_UA_VERSION are set; resolved source is shown above"
+        );
+    }
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_public_ip_discovery(state.clone());
     cc_switch_server::state::spawn_installation_heartbeat(state.clone());
