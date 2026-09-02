@@ -45,6 +45,14 @@
     "submitPasteCode": "Submit",
     "webPasteHint": "1. Open the link below and authorize on claude.ai.\n2. platform.claude.com will display an authorization code.\n3. Paste the code below and submit it to add the account."
   },
+  "codeBuddyOauth": {
+    "authStatus": "CodeBuddy OAuth authentication",
+    "cnSite": "China",
+    "intlSite": "International",
+    "loginSite": "Site for new login",
+    "loginWithCodeBuddy": "Sign in with CodeBuddy",
+    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors."
+  },
   "codexBankedReset": {
     "alreadyRedeemed": "This credit has already been used",
     "available": "Available resets",
@@ -535,6 +543,16 @@
     "patLabel": "Global personal token",
     "patPlaceholder": "pt-...",
     "patRail": "PAT"
+  },
+  "traeOauth": {
+    "authStatus": "Trae CN Solo authentication",
+    "callbackHint": "If the browser cannot reach the Server localhost callback, paste the complete callback URL from the address bar here.",
+    "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
+    "callbackRequired": "Paste the complete Trae callback URL.",
+    "callbackUrl": "Callback URL",
+    "loginSuccess": "Trae CN Solo account signed in.",
+    "loginWithTrae": "Sign in with Trae CN Solo",
+    "submitCallback": "Complete sign-in"
   },
   "server": {
     "auth": {

@@ -2,7 +2,7 @@
 
 > 本文件是 cc-switch-server 全部文档的**唯一索引**。新增文档必须在此登记并标注状态，否则 `scripts/static-checks.sh` 的文档检查会失败。
 >
-> 最后核对：2026-08-30。
+> 最后核对：2026-09-02。
 
 ## 状态标记
 
@@ -46,14 +46,15 @@
 | [grok-oauth.md](provider/grok-oauth.md) | 权威 | Grok OAuth 单账号反代 |
 | [kimi-code.md](provider/kimi-code.md) | 权威 | Kimi Code 单账号反代 |
 | [qoder-cosy.md](provider/qoder-cosy.md) | 权威 | Qoder COSY 单账号反代、站点/凭据 rail、动态模型 capability 与签名边界 |
-| [codebuddy-oauth.md](provider/codebuddy-oauth.md) | 规划 | CodeBuddy OAuth 单账号反代实施规划：单 ProviderType + 国内/国际站点模型、`cli-external-link` 登录、`/v3/config` 权威目录与契约落点 |
+| [codebuddy-oauth.md](provider/codebuddy-oauth.md) | 权威 | CodeBuddy OAuth 单账号反代实现合同：单 ProviderType + 国内/国际站点、固定身份 OAuth/refresh、三 Surface、严格终态与 `fixture_verified / live_pending` 边界 |
+| [trae-solo.md](provider/trae-solo.md) | 权威 | Trae CN Solo Server-native 单账号 bridge 实现合同：固定 endpoint、callback capability、三 Surface、严格终态、目录/额度与真实验收门禁 |
 | [deepseek-web.md](provider/deepseek-web.md) | 权威 | DeepSeek Web bearer、session/PoW、严格终态与单账号恢复边界 |
 | [api-key-coding-plans.md](provider/api-key-coding-plans.md) | 权威 | 20 个 region × Surface typed API Key Plan、外部证据漂移门禁与 Ollama Cloud |
 | [web-session.md](provider/web-session.md) | 权威 | Grok/Perplexity Web Session 隐藏 typed Provider、独立 Cookie rail、严格终态、作用域隔离与 live-pending 门禁 |
 | [cursor.md](provider/cursor.md) | 权威 | Cursor AgentService 验收 |
 | [code-plan-delta-2026-08-23.md](provider/code-plan-delta-2026-08-23.md) | 权威 | 2026-08-23 Code Plan 协议增量、证据边界与 live 缺口 |
 | [code-plan-enhancement-2026-08-24.md](provider/code-plan-enhancement-2026-08-24.md) | 权威 | 七类低于 9 分 Code Plan 的参考、实施、拒绝项、不变量证明与 live gates |
-| [code-plan-implementation-2026-08-30.md](provider/code-plan-implementation-2026-08-30.md) | 权威 | 新评分表中低于 9 分（排除其他 IDE Plan）的十一类循环实施计划、代码落点与整体 review gate |
+| [code-plan-implementation-2026-08-30.md](provider/code-plan-implementation-2026-08-30.md) | 权威 | 低分 Code Plan 的 15 个循环实施真值；Loop 13/14 为 CodeBuddy CN/Intl 与 Trae CN Solo，Loop 15 为 Qoder Global/CN wire 分项追平，包含代码落点、专项验收和整体 review gate |
 
 ## Share `docs/share/`
 

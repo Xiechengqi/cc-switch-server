@@ -153,9 +153,7 @@ impl QoderAccountProfile {
         if self.uid.trim().is_empty() {
             return Err("Qoder account profile is missing uid".to_string());
         }
-        if self.machine_id.trim().is_empty() {
-            return Err("Qoder account profile is missing machineId".to_string());
-        }
+        validate_qoder_machine_id(self.site, &self.machine_id)?;
         if self.site == QoderSite::Cn && self.refresh_mode != QODER_REFRESH_MODE_QODER_CN20 {
             return Err("Qoder CN accounts require qodercn20 refreshMode".to_string());
         }
@@ -431,11 +429,35 @@ pub struct QoderMachineIdentity {
 }
 
 impl QoderMachineIdentity {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.machine_id.trim().is_empty() {
-            return Err("Qoder identity is missing machine id".to_string());
+    pub fn validate(&self, site: QoderSite) -> Result<(), String> {
+        validate_qoder_machine_id(site, &self.machine_id)
+    }
+}
+
+pub fn validate_qoder_machine_id(site: QoderSite, machine_id: &str) -> Result<(), String> {
+    if machine_id.is_empty() {
+        return Err("Qoder identity is missing machine id".to_string());
+    }
+    if machine_id != machine_id.trim() {
+        return Err(format!(
+            "Qoder {} machine id must not contain surrounding whitespace",
+            site.as_str()
+        ));
+    }
+    match site {
+        QoderSite::Global
+            if machine_id.len() == 36
+                && machine_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')) =>
+        {
+            Ok(())
         }
-        Ok(())
+        QoderSite::Global => {
+            Err("Qoder global machine id must be exactly 36 lowercase hex characters".to_string())
+        }
+        QoderSite::Cn if is_qoder_uuid_nonce(machine_id) => Ok(()),
+        QoderSite::Cn => Err("Qoder CN machine id must be an RFC 4122 UUID v4".to_string()),
     }
 }
 
@@ -467,7 +489,7 @@ impl QoderCosySession {
         key: &[u8],
     ) -> Result<Self, String> {
         identity.validate()?;
-        machine.validate()?;
+        machine.validate(site)?;
         if key.len() != 16 {
             return Err("Qoder COSY AES key must be exactly 16 bytes".to_string());
         }
@@ -730,7 +752,7 @@ mod tests {
             "uid": "user-a",
             "aid": "account-a",
             "organizationId": "org-a",
-            "machineId": "machine-a",
+            "machineId": "018f47ec-51d8-4c2a-9c2b-4f859709c9e7",
             "machineType": "type-a"
         })))
         .unwrap();
@@ -744,9 +766,29 @@ mod tests {
             "site": "cn",
             "refreshMode": "cosy",
             "uid": "user-a",
-            "machineId": "machine-a"
+            "machineId": "018f47ec-51d8-4c2a-9c2b-4f859709c9e7"
         })))
         .is_err());
+        assert!(validate_qoder_machine_id(
+            QoderSite::Global,
+            "0123456789abcdef0123456789abcdef0123"
+        )
+        .is_ok());
+        assert!(
+            validate_qoder_machine_id(QoderSite::Cn, "018f47ec-51d8-4c2a-9c2b-4f859709c9e7")
+                .is_ok()
+        );
+        for (site, invalid) in [
+            (QoderSite::Global, "018f47ec-51d8-4c2a-9c2b-4f859709c9e7"),
+            (QoderSite::Global, "0123456789ABCDEF0123456789abcdef0123"),
+            (QoderSite::Global, " 0123456789abcdef0123456789abcdef0123"),
+            (QoderSite::Cn, "0123456789abcdef0123456789abcdef0123"),
+            (QoderSite::Cn, "018f47ec-51d8-3c2a-9c2b-4f859709c9e7"),
+            (QoderSite::Cn, "018f47ec-51d8-4c2a-7c2b-4f859709c9e7"),
+            (QoderSite::Cn, "018f47ec-51d8-4c2a-9c2b-4f859709c9e7 "),
+        ] {
+            assert!(validate_qoder_machine_id(site, invalid).is_err());
+        }
         assert_eq!(
             machine_token_from_raw(Some(&json!({
                 "qoderSecrets": {"machineToken": " secret-machine-token "}
@@ -797,7 +839,7 @@ mod tests {
                 refresh_token: String::new(),
             },
             QoderMachineIdentity {
-                machine_id: "machine-a".to_string(),
+                machine_id: "0123456789abcdef0123456789abcdef0123".to_string(),
                 machine_token: "machine-token-a".to_string(),
                 machine_type: "5".to_string(),
             },
@@ -826,7 +868,10 @@ mod tests {
         };
         assert!(value("authorization").starts_with("Bearer COSY."));
         assert_eq!(value("cosy-user"), "uid-a");
-        assert_eq!(value("cosy-machineid"), "machine-a");
+        assert_eq!(
+            value("cosy-machineid"),
+            "0123456789abcdef0123456789abcdef0123"
+        );
         assert_eq!(value("cosy-bodyhash"), md5_hex(body.as_bytes()));
         assert_eq!(value("cosy-bodylength"), body.len().to_string());
         assert_eq!(value("cosy-sigpath"), QODER_GENERATION_SIGNATURE_PATH);

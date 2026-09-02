@@ -434,6 +434,10 @@ async fn install_qoder_provider(
         .mutate_accounts_immediate(move |accounts| {
             let site = rail.site();
             let credential_rail = rail.credential_rail();
+            let machine_id = match site {
+                QoderSite::Global => "0123456789abcdef0123456789abcdef0123",
+                QoderSite::Cn => "018f47ec-51d8-4c2a-9c2b-4f859709c9e7",
+            };
             let (access_token, refresh_token, api_key) = match rail {
                 QoderFixtureRail::GlobalOauth => (
                     Some("global-initial-access"),
@@ -464,7 +468,7 @@ async fn install_qoder_provider(
                         "organizationId": "fixture-org",
                         "organizationName": "Fixture Org",
                         "userType": "personal_standard",
-                        "machineId": format!("fixture-machine-{}", rail.label()),
+                        "machineId": machine_id,
                         "machineType": "5"
                     },
                     "raw": {

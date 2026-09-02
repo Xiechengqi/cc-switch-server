@@ -1204,6 +1204,32 @@ pub(in crate::api) async fn test_provider_inner(
             .await;
     }
 
+    if execution.driver_is("special.codebuddy_oauth") {
+        return Box::pin(test_codebuddy_provider_inner(
+            state,
+            execution,
+            query,
+            route,
+            gemini_path,
+            model,
+            requested_stream,
+        ))
+        .await;
+    }
+
+    if execution.driver_is("special.trae_solo") {
+        return Box::pin(test_trae_provider_inner(
+            state,
+            execution,
+            query,
+            route,
+            gemini_path,
+            model,
+            requested_stream,
+        ))
+        .await;
+    }
+
     if query.network.unwrap_or(false) {
         ensure_provider_outbound_allowed(state, &execution).await?;
         if let Some((provider_type, account_id, expected_generation)) =
@@ -1494,6 +1520,496 @@ pub(in crate::api) async fn test_provider_inner(
         reconciliation,
         message,
     })
+}
+
+async fn test_codebuddy_provider_inner(
+    state: &ServerState,
+    execution: proxy::provider_ops::ProviderExecution,
+    query: &TestProviderQuery,
+    route: proxy::ProxyRoute,
+    gemini_path: Option<String>,
+    model: String,
+    requested_stream: bool,
+) -> Result<TestProviderResponse, ApiError> {
+    let stored = execution.runtime_stored_view();
+    let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
+        .capability(stored.app, stored.provider_type);
+    let base_response = |ok: bool,
+                         outcome: ProviderOperationOutcome,
+                         network_checked: bool,
+                         status: Option<u16>,
+                         latency: Option<u128>,
+                         stream_completed: Option<bool>,
+                         network_error: Option<String>,
+                         message: String| TestProviderResponse {
+        ok,
+        outcome,
+        driver_id: execution.plan.driver_id.to_string(),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_id: stored.provider.id.clone(),
+        app: stored.app,
+        provider_type: stored.provider_type,
+        provider_revision: stored.resource.revision,
+        adapter: capability.adapter,
+        support: capability.support,
+        // The managed runtime selects a fixed site endpoint from the bound
+        // Account. Provider Test must not echo that endpoint or any credential
+        // material back through the control-plane response.
+        endpoint: "[managed CodeBuddy runtime]".to_string(),
+        model: model.clone(),
+        stream: requested_stream,
+        header_names: Vec::new(),
+        network_checked,
+        network_status_code: status,
+        network_latency_ms: latency,
+        network_stream_completed: stream_completed,
+        network_error,
+        reconciliation: None,
+        message,
+    };
+    let Some((ProviderType::CodeBuddyOAuth, account_id, expected_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        let message = "CodeBuddy Provider must bind one exact codebuddy_oauth Account".to_string();
+        return Ok(base_response(
+            false,
+            ProviderOperationOutcome::InvalidConfig,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            message,
+        ));
+    };
+    let valid_account = state
+        .find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+        .await
+        .filter(|account| account.auth_identity_generation == expected_generation)
+        .filter(|account| !account.needs_relogin)
+        .filter(|account| {
+            account
+                .access_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+        .and_then(|account| {
+            crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref())
+                .ok()
+                .map(|_| account)
+        })
+        .is_some();
+    if !valid_account {
+        let message =
+            "CodeBuddy bound Account is missing, stale, invalid, or requires login".to_string();
+        return Ok(base_response(
+            false,
+            ProviderOperationOutcome::InvalidConfig,
+            false,
+            None,
+            None,
+            None,
+            Some(message.clone()),
+            message,
+        ));
+    }
+    if !query.network.unwrap_or(false) {
+        return Ok(base_response(
+            true,
+            ProviderOperationOutcome::Success,
+            false,
+            None,
+            None,
+            None,
+            None,
+            "configuration check passed; CodeBuddy fixed site identity, exact managed Account binding, and native driver are valid; no network call was executed".to_string(),
+        ));
+    }
+    ensure_provider_outbound_allowed(state, &execution).await?;
+    let body = provider_test_body(
+        stored.app,
+        &stored,
+        Some(&model),
+        query.test_prompt.as_deref().unwrap_or("ping"),
+        requested_stream,
+    );
+    let timeout = query
+        .timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let started = std::time::Instant::now();
+    let mut forward_task = tokio::spawn(proxy::forward_provider_test(
+        state.clone(),
+        route,
+        execution.clone(),
+        gemini_path,
+        HeaderMap::new(),
+        Bytes::from(body),
+    ));
+    let response = match tokio::time::timeout(timeout, &mut forward_task).await {
+        Err(_) => {
+            forward_task.abort();
+            let message =
+                "CodeBuddy Provider test timed out before response completion".to_string();
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Timeout,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Err(error)) => {
+            let message = redact_provider_test_error(&format!(
+                "CodeBuddy Provider test task failed before completion: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Err(error))) => {
+            let message = redact_provider_test_error(&error.message);
+            let outcome = provider_test_outcome(true, Some(error.status.as_u16()), Some(&message));
+            return Ok(base_response(
+                false,
+                outcome,
+                true,
+                Some(error.status.as_u16()),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Ok(response))) => response,
+    };
+    let status = response.status().as_u16();
+    let mut body_task = tokio::spawn(async move {
+        axum::body::to_bytes(
+            response.into_body(),
+            PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+    });
+    let body = match tokio::time::timeout(timeout, &mut body_task).await {
+        Err(_) => {
+            body_task.abort();
+            let message =
+                "CodeBuddy Provider test timed out while draining the response".to_string();
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Timeout,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Err(error)) => {
+            let message = redact_provider_test_error(&format!(
+                "CodeBuddy Provider test response task failed before completion: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Err(error))) => {
+            let message = redact_provider_test_error(&format!(
+                "CodeBuddy Provider test response could not be read: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Ok(body))) => body,
+    };
+    let stream_completed = requested_stream
+        .then(|| provider_test_stream_completed(stored.app, &String::from_utf8_lossy(&body)));
+    let network_error = if !(200..=299).contains(&status) {
+        Some(redact_provider_test_error(&String::from_utf8_lossy(&body)))
+    } else if body.is_empty() {
+        Some("CodeBuddy Provider test returned an empty downstream response".to_string())
+    } else if stream_completed == Some(false) {
+        Some(
+            "CodeBuddy Provider test stream ended without a successful downstream completion marker"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let outcome = provider_test_outcome(true, Some(status), network_error.as_deref());
+    let ok = outcome == ProviderOperationOutcome::Success;
+    let message = network_error.clone().unwrap_or_else(|| {
+        "CodeBuddy live catalog, strict terminal response, and bound Account generation call completed"
+            .to_string()
+    });
+    Ok(base_response(
+        ok,
+        outcome,
+        true,
+        Some(status),
+        Some(started.elapsed().as_millis()),
+        stream_completed,
+        network_error,
+        message,
+    ))
+}
+
+async fn test_trae_provider_inner(
+    state: &ServerState,
+    execution: proxy::provider_ops::ProviderExecution,
+    query: &TestProviderQuery,
+    route: proxy::ProxyRoute,
+    gemini_path: Option<String>,
+    model: String,
+    requested_stream: bool,
+) -> Result<TestProviderResponse, ApiError> {
+    let stored = execution.runtime_stored_view();
+    let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
+        .capability(stored.app, stored.provider_type);
+    let endpoint = redact_provider_endpoint(&execution.plan.endpoint);
+    let base_response = |ok: bool,
+                         outcome: ProviderOperationOutcome,
+                         network_checked: bool,
+                         status: Option<u16>,
+                         latency: Option<u128>,
+                         stream_completed: Option<bool>,
+                         network_error: Option<String>,
+                         message: String| TestProviderResponse {
+        ok,
+        outcome,
+        driver_id: execution.plan.driver_id.to_string(),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_id: stored.provider.id.clone(),
+        app: stored.app,
+        provider_type: stored.provider_type,
+        provider_revision: stored.resource.revision,
+        adapter: capability.adapter,
+        support: capability.support,
+        endpoint: endpoint.clone(),
+        model: model.clone(),
+        stream: requested_stream,
+        header_names: Vec::new(),
+        network_checked,
+        network_status_code: status,
+        network_latency_ms: latency,
+        network_stream_completed: stream_completed,
+        network_error,
+        reconciliation: None,
+        message,
+    };
+    let Some((ProviderType::TraeSolo, _, _)) = execution.managed_account_identity_target() else {
+        return Ok(base_response(
+            false,
+            ProviderOperationOutcome::InvalidConfig,
+            false,
+            None,
+            None,
+            None,
+            Some("Trae Provider must bind one exact trae_solo Account".to_string()),
+            "Trae Provider must bind one exact trae_solo Account".to_string(),
+        ));
+    };
+    if !query.network.unwrap_or(false) {
+        return Ok(base_response(
+            true,
+            ProviderOperationOutcome::Success,
+            false,
+            None,
+            None,
+            None,
+            None,
+            "configuration check passed; Trae fixed Agent/Billing origins, exact managed Account binding, and Solo driver are valid; no network call was executed".to_string(),
+        ));
+    }
+    ensure_provider_outbound_allowed(state, &execution).await?;
+    let body = provider_test_body(
+        stored.app,
+        &stored,
+        Some(&model),
+        query.test_prompt.as_deref().unwrap_or("ping"),
+        requested_stream,
+    );
+    let timeout = query
+        .timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let started = std::time::Instant::now();
+    // Provider Test is control-plane work. Run the large inference future as
+    // its own cancellable task so the HTTP handler's already-large future does
+    // not accumulate the complete proxy stack on one polling frame.
+    let mut forward_task = tokio::spawn(proxy::forward_provider_test(
+        state.clone(),
+        route,
+        execution.clone(),
+        gemini_path,
+        HeaderMap::new(),
+        Bytes::from(body),
+    ));
+    let response = tokio::time::timeout(timeout, &mut forward_task).await;
+    let response = match response {
+        Err(_) => {
+            forward_task.abort();
+            let message = "Trae Provider test timed out before response completion".to_string();
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Timeout,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Err(error)) => {
+            let message = redact_provider_test_error(&format!(
+                "Trae Provider test task failed before completion: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                None,
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Err(error))) => {
+            let message = redact_provider_test_error(&error.message);
+            let outcome = provider_test_outcome(true, Some(error.status.as_u16()), Some(&message));
+            return Ok(base_response(
+                false,
+                outcome,
+                true,
+                Some(error.status.as_u16()),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Ok(response))) => response,
+    };
+    let status = response.status().as_u16();
+    // Streaming proxy bodies carry the complete decoder/transformer state
+    // machine. Drain that body on its own cancellable task as well, so the
+    // Provider Test control-plane future does not stack the body poll chain
+    // on top of its dispatcher and inference frames.
+    let mut body_task = tokio::spawn(async move {
+        axum::body::to_bytes(
+            response.into_body(),
+            PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+    });
+    let body = match tokio::time::timeout(timeout, &mut body_task).await {
+        Err(_) => {
+            body_task.abort();
+            let message = "Trae Provider test timed out while draining the response".to_string();
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Timeout,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Err(error)) => {
+            let message = redact_provider_test_error(&format!(
+                "Trae Provider test response task failed before completion: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Err(error))) => {
+            let message = redact_provider_test_error(&format!(
+                "Trae Provider test response could not be read: {error}"
+            ));
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::Protocol,
+                true,
+                Some(status),
+                Some(started.elapsed().as_millis()),
+                requested_stream.then_some(false),
+                Some(message.clone()),
+                message,
+            ));
+        }
+        Ok(Ok(Ok(body))) => body,
+    };
+    let stream_completed = requested_stream
+        .then(|| provider_test_stream_completed(stored.app, &String::from_utf8_lossy(&body)));
+    let network_error = if !(200..=299).contains(&status) {
+        Some(redact_provider_test_error(&String::from_utf8_lossy(&body)))
+    } else if body.is_empty() {
+        Some("Trae Provider test returned an empty downstream response".to_string())
+    } else if stream_completed == Some(false) {
+        Some(
+            "Trae Provider test stream ended without a successful downstream completion marker"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let outcome = provider_test_outcome(true, Some(status), network_error.as_deref());
+    let ok = outcome == ProviderOperationOutcome::Success;
+    let message = network_error.clone().unwrap_or_else(|| {
+        "Trae Solo model detail, strict terminal stream, and bound Account generation call completed"
+            .to_string()
+    });
+    Ok(base_response(
+        ok,
+        outcome,
+        true,
+        Some(status),
+        Some(started.elapsed().as_millis()),
+        stream_completed,
+        network_error,
+        message,
+    ))
 }
 
 async fn test_cursor_provider_inner(
@@ -2647,11 +3163,11 @@ fn redact_provider_endpoint(endpoint: &str) -> String {
 
 #[derive(Debug)]
 pub(in crate::api) struct ProviderModelsFetchResult {
-    url: String,
-    models: Vec<FetchedProviderModel>,
-    source: Option<String>,
-    stale: Option<bool>,
-    fetched_at_ms: Option<i64>,
+    pub(in crate::api) url: String,
+    pub(in crate::api) models: Vec<FetchedProviderModel>,
+    pub(in crate::api) source: Option<String>,
+    pub(in crate::api) stale: Option<bool>,
+    pub(in crate::api) fetched_at_ms: Option<i64>,
 }
 
 pub(in crate::api) async fn fetch_provider_models_inner(
@@ -2664,6 +3180,30 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
+    if stored.provider_type == ProviderType::CodeBuddyOAuth
+        || execution.driver_is("special.codebuddy_oauth")
+    {
+        if stored.provider_type != ProviderType::CodeBuddyOAuth
+            || !execution.driver_is("special.codebuddy_oauth")
+        {
+            return Err(ApiError::conflict(
+                "CodeBuddy model discovery ProviderType and Driver do not match",
+            ));
+        }
+        ensure_provider_outbound_allowed(state, execution).await?;
+        return fetch_codebuddy_provider_models(state, execution, timeout_ms).await;
+    }
+    if stored.provider_type == ProviderType::TraeSolo || execution.driver_is("special.trae_solo") {
+        if stored.provider_type != ProviderType::TraeSolo
+            || !execution.driver_is("special.trae_solo")
+        {
+            return Err(ApiError::conflict(
+                "Trae model discovery ProviderType and Driver do not match",
+            ));
+        }
+        ensure_provider_outbound_allowed(state, execution).await?;
+        return fetch_trae_provider_models(state, execution, timeout_ms).await;
+    }
     if let Some(contract) = execution.plan.coding_plan.as_ref() {
         return Ok(ProviderModelsFetchResult {
             url: format!("registry://{}/models", execution.plan.profile_id),
@@ -3243,6 +3783,267 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         stale: Some(false),
         fetched_at_ms: Some(chrono::Utc::now().timestamp_millis()),
     })
+}
+
+async fn fetch_codebuddy_provider_models(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    timeout_ms: Option<u64>,
+) -> Result<ProviderModelsFetchResult, ApiError> {
+    let (ProviderType::CodeBuddyOAuth, account_id, expected_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ApiError::bad_request(
+                "CodeBuddy model discovery requires one explicit managed Account binding",
+            )
+        })?
+    else {
+        return Err(ApiError::bad_request(
+            "CodeBuddy model discovery managed Account has the wrong ProviderType",
+        ));
+    };
+    let timeout = timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let mut recovery_attempted = false;
+    let runtime = loop {
+        match state
+            .prepare_codebuddy_runtime(
+                execution.stored.app,
+                &execution.stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                account_id,
+                expected_generation,
+                timeout,
+            )
+            .await
+        {
+            Ok(runtime) => break runtime,
+            Err(error) if error.is_authentication_failure() && !recovery_attempted => {
+                recovery_attempted = true;
+                state
+                    .refresh_managed_account_now_for_generation(
+                        ProviderType::CodeBuddyOAuth,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await
+                    .map_err(map_managed_account_refresh_error)?;
+            }
+            Err(error) => return Err(codebuddy_runtime_api_error(error)),
+        }
+    };
+    let models = runtime
+        .catalog
+        .enabled_models
+        .iter()
+        .map(|id| {
+            let capability = runtime.catalog.capabilities.get(id);
+            FetchedProviderModel {
+                id: id.clone(),
+                upstream_model: id.clone(),
+                display_name: capability.and_then(|capability| capability.display_name.clone()),
+                raw: capability
+                    .map(|capability| {
+                        json!({
+                            "id": capability.id,
+                            "source": "codebuddy_live_model_catalog",
+                            "stale": runtime.catalog.stale,
+                            "capabilities": {
+                                "stream": true,
+                                "tools": capability.supports_tools,
+                                "images": false,
+                                "reasoning": capability.supports_reasoning,
+                                "reasoningEfforts": capability.reasoning_efforts,
+                                "contextWindow": capability.max_input_tokens,
+                                "maxOutputTokens": capability.max_output_tokens,
+                            }
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+            }
+        })
+        .collect();
+    Ok(ProviderModelsFetchResult {
+        url: format!(
+            "{}{}",
+            runtime.base_url.trim_end_matches('/'),
+            crate::domain::codebuddy::CODEBUDDY_CONFIG_PATH
+        ),
+        models,
+        source: Some("codebuddy_live_model_catalog".to_string()),
+        stale: Some(runtime.catalog.stale),
+        fetched_at_ms: Some(runtime.catalog.fetched_at_ms),
+    })
+}
+
+fn codebuddy_runtime_api_error(error: crate::state::CodeBuddyRuntimeError) -> ApiError {
+    match error {
+        crate::state::CodeBuddyRuntimeError::NotFound => {
+            ApiError::not_found("CodeBuddy managed Account not found")
+        }
+        crate::state::CodeBuddyRuntimeError::IdentityChanged => ApiError::conflict(
+            "CodeBuddy Provider or Account identity changed during model discovery",
+        ),
+        crate::state::CodeBuddyRuntimeError::CredentialPersistenceDegraded => {
+            ApiError::service_unavailable_code(
+                "codebuddy_credential_persistence_degraded",
+                "CodeBuddy credentials are waiting for durable persistence",
+            )
+        }
+        crate::state::CodeBuddyRuntimeError::InvalidAccount(message) => {
+            ApiError::bad_request(message)
+        }
+        crate::state::CodeBuddyRuntimeError::Refresh(error) => {
+            map_managed_account_refresh_error(error)
+        }
+        crate::state::CodeBuddyRuntimeError::Upstream {
+            status_code,
+            retryable,
+            ..
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ApiError::new(
+                if retryable && status != StatusCode::TOO_MANY_REQUESTS {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                "CodeBuddy live model discovery failed for the bound Account",
+            )
+        }
+    }
+}
+
+async fn fetch_trae_provider_models(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    timeout_ms: Option<u64>,
+) -> Result<ProviderModelsFetchResult, ApiError> {
+    let (ProviderType::TraeSolo, account_id, expected_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ApiError::bad_request(
+                "Trae model discovery requires one explicit managed Account binding",
+            )
+        })?
+    else {
+        return Err(ApiError::bad_request(
+            "Trae model discovery managed Account has the wrong ProviderType",
+        ));
+    };
+    let timeout = timeout_ms
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let mut recovery_attempted = false;
+    let runtime = loop {
+        match state
+            .prepare_trae_runtime(
+                execution.stored.app,
+                &execution.stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                account_id,
+                expected_generation,
+                timeout,
+            )
+            .await
+        {
+            Ok(runtime) => break runtime,
+            Err(error) if error.is_authentication_failure() && !recovery_attempted => {
+                recovery_attempted = true;
+                state
+                    .refresh_managed_account_now_for_generation(
+                        ProviderType::TraeSolo,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await
+                    .map_err(map_managed_account_refresh_error)?;
+            }
+            Err(error) => return Err(trae_runtime_api_error(error)),
+        }
+    };
+    let models = runtime
+        .catalog
+        .enabled_models
+        .iter()
+        .map(|id| {
+            let capability = runtime.catalog.capabilities.get(id);
+            FetchedProviderModel {
+                id: id.clone(),
+                upstream_model: id.clone(),
+                display_name: capability.map(|capability| capability.display_name.clone()),
+                raw: capability
+                    .map(|capability| {
+                        json!({
+                            "id": capability.id,
+                            "source": "trae_live_model_catalog",
+                            "stale": runtime.catalog.stale,
+                            "capabilities": {
+                                "stream": true,
+                                "tools": capability.supports_tools,
+                                "images": false,
+                                "reasoning": capability.supports_reasoning,
+                                "reasoningEfforts": capability.reasoning_efforts,
+                                "reasoningDefault": capability.reasoning_default,
+                                "maxMode": capability.max_mode,
+                                "contextWindow": capability.context_window,
+                                "contextWindowMax": capability.context_window_max,
+                                "maxOutputTokens": capability.max_output_tokens,
+                            }
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+            }
+        })
+        .collect();
+    Ok(ProviderModelsFetchResult {
+        url: format!(
+            "{}{}",
+            runtime.agent_origin.trim_end_matches('/'),
+            crate::domain::trae::TRAE_MODEL_DETAIL_PATH
+        ),
+        models,
+        source: Some("trae_live_model_catalog".to_string()),
+        stale: Some(runtime.catalog.stale),
+        fetched_at_ms: Some(runtime.catalog.fetched_at_ms),
+    })
+}
+
+fn trae_runtime_api_error(error: crate::state::TraeRuntimeError) -> ApiError {
+    match error {
+        crate::state::TraeRuntimeError::NotFound => {
+            ApiError::not_found("Trae managed Account not found")
+        }
+        crate::state::TraeRuntimeError::IdentityChanged => {
+            ApiError::conflict("Trae Provider or Account identity changed during model discovery")
+        }
+        crate::state::TraeRuntimeError::CredentialPersistenceDegraded => {
+            ApiError::service_unavailable_code(
+                "trae_credential_persistence_degraded",
+                "Trae credentials are waiting for durable persistence",
+            )
+        }
+        crate::state::TraeRuntimeError::InvalidAccount(message) => ApiError::bad_request(message),
+        crate::state::TraeRuntimeError::Refresh(error) => map_managed_account_refresh_error(error),
+        crate::state::TraeRuntimeError::Upstream {
+            status_code,
+            retryable,
+            ..
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ApiError::new(
+                if retryable && status != StatusCode::TOO_MANY_REQUESTS {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                "Trae live model discovery failed for the bound Account",
+            )
+        }
+    }
 }
 
 fn copilot_model_catalog_error_to_api_error(
@@ -3967,6 +4768,10 @@ fn s1_provider_for_profile(
         "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => {
             ("Qoder OAuth", json!({}))
         }
+        "claude.codebuddy_oauth" | "codex.codebuddy_oauth" | "gemini.codebuddy_oauth" => {
+            ("CodeBuddy OAuth", json!({}))
+        }
+        "claude.trae_solo" | "codex.trae_solo" | "gemini.trae_solo" => ("Trae CN Solo", json!({})),
         "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
         "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),
         "codex.openai_api_key" => (
@@ -4458,6 +5263,1016 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    async fn install_codebuddy_execution(
+        state: &ServerState,
+        base_url: String,
+        app: AppKind,
+    ) -> proxy::provider_ops::ProviderExecution {
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "codebuddy-discovery-account",
+                        "providerType": "codebuddy_oauth",
+                        "accessToken": "codebuddy-discovery-access",
+                        "refreshToken": "codebuddy-discovery-refresh",
+                        "tokenType": "Bearer",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "site": "intl",
+                            "domain": "www.codebuddy.ai",
+                            "uid": "codebuddy-discovery-uid",
+                            "enterpriseId": "",
+                            "name": "CodeBuddy fixture",
+                            "clientVersion": crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION,
+                            "productPlatform": crate::domain::codebuddy::CODEBUDDY_PLATFORM
+                        },
+                        "raw": {
+                            "source": "fixture",
+                            "observedAtMs": chrono::Utc::now().timestamp_millis(),
+                            "codeBuddyRefreshReceipt": {
+                                "site": "intl",
+                                "domain": "www.codebuddy.ai",
+                                "receivedAtMs": chrono::Utc::now().timestamp_millis()
+                            },
+                            "testCodeBuddyBaseUrl": base_url,
+                            "testCodeBuddyBillingBaseUrl": "http://127.0.0.1:9"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let profile_id = match app {
+            AppKind::Claude => "claude.codebuddy_oauth",
+            AppKind::Codex => "codex.codebuddy_oauth",
+            AppKind::Gemini => "gemini.codebuddy_oauth",
+        };
+        let stored = StoredProvider {
+            app,
+            provider: Provider {
+                id: "codebuddy-discovery-provider".to_string(),
+                name: "CodeBuddy discovery fixture".to_string(),
+                settings_config: json!({
+                    "modelMapping": {"mode": "single", "upstreamModel": "auto"}
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("codebuddy_oauth".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some("codebuddy_oauth".to_string()),
+                        account_id: Some("codebuddy-discovery-account".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CodeBuddyOAuth,
+            provider_type_id: "codebuddy_oauth".to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution =
+            proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    async fn serve_codebuddy_provider_api_fixture() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |headers: HeaderMap, request: axum::extract::Request| {
+                let observations = std::sync::Arc::clone(&route_observations);
+                async move {
+                    let path = request.uri().path().to_string();
+                    let body = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    observations.lock().unwrap().push(json!({
+                        "path": path.clone(),
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        "uid": headers.get("x-user-id").and_then(|value| value.to_str().ok()),
+                        "domain": headers.get("x-domain").and_then(|value| value.to_str().ok()),
+                        "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                    }));
+                    if path == crate::domain::codebuddy::CODEBUDDY_CONFIG_PATH {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "code": 0,
+                                    "data": {
+                                        "enterpriseId": "",
+                                        "models": [{
+                                            "id": "default-model",
+                                            "name": "Default fixture",
+                                            "supportsToolCall": true,
+                                            "supportsReasoning": true,
+                                            "reasoning": {"supportedEfforts": ["low", "high"]},
+                                            "maxInputTokens": 200000,
+                                            "maxOutputTokens": 8192,
+                                            "Uin": "must-not-surface"
+                                        }]
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    if path == crate::domain::codebuddy::CODEBUDDY_CHAT_PATH {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(concat!(
+                                "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\",\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
+                                "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                                "data: [DONE]\n\n"
+                            )))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), observations, server)
+    }
+
+    #[tokio::test]
+    async fn codebuddy_discovery_projects_exact_scope_live_catalog_without_sensitive_config() {
+        let (base_url, observations, server) = serve_codebuddy_provider_api_fixture().await;
+        let state = provider_api_test_state("codebuddy-live-discovery");
+        let config_dir = state.config_dir.clone();
+        let execution = install_codebuddy_execution(&state, base_url, AppKind::Codex).await;
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched.source.as_deref(),
+            Some("codebuddy_live_model_catalog")
+        );
+        assert_eq!(fetched.stale, Some(false));
+        assert!(fetched.fetched_at_ms.is_some());
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "default-model");
+        assert_eq!(
+            fetched.models[0].raw.pointer("/capabilities/tools"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            fetched.models[0]
+                .raw
+                .pointer("/capabilities/reasoningEfforts/1"),
+            Some(&json!("high"))
+        );
+        assert!(!fetched.models[0]
+            .raw
+            .to_string()
+            .contains("must-not-surface"));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["path"],
+            crate::domain::codebuddy::CODEBUDDY_CONFIG_PATH
+        );
+        assert_eq!(
+            observations[0]["authorization"],
+            "Bearer codebuddy-discovery-access"
+        );
+        assert_eq!(observations[0]["uid"], "codebuddy-discovery-uid");
+        assert_eq!(observations[0]["domain"], "www.codebuddy.ai");
+        drop(observations);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    async fn run_codebuddy_provider_test_for_app_surface(app: AppKind) {
+        let (base_url, observations, server) = serve_codebuddy_provider_api_fixture().await;
+        let state = provider_api_test_state(&format!("codebuddy-test-{}", app.as_str()));
+        let config_dir = state.config_dir.clone();
+        let execution = install_codebuddy_execution(&state, base_url, app).await;
+        let dry_run = Box::pin(test_provider_inner(
+            &state,
+            execution.clone(),
+            &TestProviderQuery {
+                app,
+                network: Some(false),
+                timeout_ms: Some(2_000),
+                model: Some("auto".to_string()),
+                test_prompt: Some("ping".to_string()),
+                stream: Some(true),
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(dry_run.ok, "{}: {}", app.as_str(), dry_run.message);
+        assert!(!dry_run.network_checked);
+        assert_eq!(dry_run.endpoint, "[managed CodeBuddy runtime]");
+        assert!(dry_run.header_names.is_empty());
+        assert!(observations.lock().unwrap().is_empty());
+
+        for requested_stream in [false, true] {
+            let response = Box::pin(test_provider_inner(
+                &state,
+                execution.clone(),
+                &TestProviderQuery {
+                    app,
+                    network: Some(true),
+                    timeout_ms: Some(2_000),
+                    model: Some("auto".to_string()),
+                    test_prompt: Some("ping".to_string()),
+                    stream: Some(requested_stream),
+                },
+            ))
+            .await
+            .unwrap();
+            assert!(
+                response.ok,
+                "{} stream={requested_stream}: {}",
+                app.as_str(),
+                response.message
+            );
+            assert!(response.network_checked);
+            assert_eq!(response.driver_id, "special.codebuddy_oauth");
+            assert_eq!(response.endpoint, "[managed CodeBuddy runtime]");
+            assert!(response.header_names.is_empty());
+            assert_eq!(response.network_status_code, Some(StatusCode::OK.as_u16()));
+            assert_eq!(
+                response.network_stream_completed,
+                requested_stream.then_some(true)
+            );
+        }
+
+        let observations = observations.lock().unwrap();
+        let generation = observations
+            .iter()
+            .filter(|value| value["path"] == crate::domain::codebuddy::CODEBUDDY_CHAT_PATH)
+            .collect::<Vec<_>>();
+        assert_eq!(generation.len(), 2);
+        for request in generation {
+            assert_eq!(
+                request["authorization"],
+                "Bearer codebuddy-discovery-access"
+            );
+            assert_eq!(request["uid"], "codebuddy-discovery-uid");
+            assert_eq!(request["domain"], "www.codebuddy.ai");
+            assert_eq!(request["body"]["model"], "default-model");
+            assert_eq!(request["body"]["stream"], true);
+            assert_eq!(request["body"]["stream_options"]["include_usage"], true);
+        }
+        drop(observations);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codebuddy_provider_test_is_local_on_dry_run_and_reaches_strict_driver_for_all_surfaces(
+    ) {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            run_codebuddy_provider_test_for_app_surface(app).await;
+        }
+    }
+
+    async fn install_trae_discovery_execution(
+        state: &ServerState,
+        agent_origin: String,
+        app: AppKind,
+    ) -> proxy::provider_ops::ProviderExecution {
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "trae-discovery-account",
+                        "providerType": "trae_solo",
+                        "accessToken": "trae-discovery-access",
+                        "refreshToken": "trae-discovery-refresh",
+                        "tokenType": "Cloud-IDE-JWT",
+                        "expiresAt": i64::MAX / 2,
+                        "profile": {
+                            "uid": "trae-discovery-uid",
+                            "enterpriseId": "",
+                            "name": "Trae fixture",
+                            "machineId": "trae-machine",
+                            "deviceId": "trae-device"
+                        },
+                        "raw": {
+                            "source": "fixture",
+                            "testTraeAgentOrigin": agent_origin.clone(),
+                            "testTraeOAuthOrigin": agent_origin,
+                            "testTraeBillingOrigin": "http://127.0.0.1:9"
+                        }
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let profile_id = match app {
+            AppKind::Claude => "claude.trae_solo",
+            AppKind::Codex => "codex.trae_solo",
+            AppKind::Gemini => "gemini.trae_solo",
+        };
+        let stored = StoredProvider {
+            app,
+            provider: Provider {
+                id: "trae-discovery-provider".to_string(),
+                name: "Trae discovery fixture".to_string(),
+                settings_config: json!({
+                    "modelMapping": {
+                        "mode": "single",
+                        "upstreamModel": "DeepSeek-V4-Pro-Official"
+                    }
+                }),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("trae_solo".to_string()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account_store".to_string()),
+                        auth_provider: Some("trae_solo".to_string()),
+                        account_id: Some("trae-discovery-account".to_string()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::TraeSolo,
+            provider_type_id: "trae_solo".to_string(),
+            resource: crate::domain::providers::store::ProviderResourceMetadata {
+                profile_id: Some(
+                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                ),
+                profile_schema_revision: Some(1),
+                revision: 1,
+                credential_generation: 1,
+                ..Default::default()
+            },
+        };
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        let execution =
+            proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        execution
+    }
+
+    #[tokio::test]
+    async fn trae_discovery_uses_only_bound_account_model_detail_and_preserves_native_case() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |headers: HeaderMap, request: axum::extract::Request| {
+                let observations = std::sync::Arc::clone(&route_observations);
+                async move {
+                    let path = request.uri().path().to_string();
+                    observations.lock().unwrap().push(json!({
+                        "path": path,
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        "uid": headers.get("x-uid").and_then(|value| value.to_str().ok()),
+                        "device": headers.get("x-device-id").and_then(|value| value.to_str().ok()),
+                    }));
+                    axum::Json(json!({
+                        "Code": 0,
+                        "config_info_list": [{
+                            "config_name": "DeepSeek-V4-Pro-Official",
+                            "context_window_tokens": {"dev": 200000, "max": 1000000},
+                            "display_config": {
+                                "display_name": "DeepSeek V4 Pro",
+                                "model_capability": "reasoning_model"
+                            },
+                            "reasoning_effort_config": {
+                                "support_thinking": true,
+                                "options": ["low", "medium", "high", "xhigh"],
+                                "default_level": "medium"
+                            }
+                        }]
+                    }))
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("trae-live-discovery");
+        let config_dir = state.config_dir.clone();
+        let execution =
+            install_trae_discovery_execution(&state, format!("http://{address}"), AppKind::Codex)
+                .await;
+
+        let fetched = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(fetched.source.as_deref(), Some("trae_live_model_catalog"));
+        assert_eq!(fetched.stale, Some(false));
+        assert_eq!(fetched.models.len(), 1);
+        assert_eq!(fetched.models[0].id, "DeepSeek-V4-Pro-Official");
+        assert_eq!(
+            fetched.models[0]
+                .raw
+                .pointer("/capabilities/reasoningEfforts/3"),
+            Some(&json!("xhigh"))
+        );
+        assert_eq!(
+            fetched.models[0].raw.pointer("/capabilities/images"),
+            Some(&json!(false))
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["path"],
+            crate::domain::trae::TRAE_MODEL_DETAIL_PATH
+        );
+        assert_eq!(
+            observations[0]["authorization"],
+            "Cloud-IDE-JWT trae-discovery-access"
+        );
+        assert_eq!(observations[0]["uid"], "trae-discovery-uid");
+        assert_eq!(observations[0]["device"], "trae-device");
+        drop(observations);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    async fn run_trae_provider_test_for_app_surface(app: AppKind) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let router = axum::Router::new().fallback(axum::routing::any(
+            move |headers: HeaderMap, request: axum::extract::Request| {
+                let observations = std::sync::Arc::clone(&route_observations);
+                async move {
+                    let path = request.uri().path().to_string();
+                    let bytes = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                    observations.lock().unwrap().push(json!({
+                        "path": path,
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        "uid": headers.get("x-uid").and_then(|value| value.to_str().ok()),
+                        "body": body,
+                    }));
+                    if path == crate::domain::trae::TRAE_MODEL_DETAIL_PATH {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "config_info_list": [{
+                                        "config_name": "DeepSeek-V4-Pro-Official",
+                                        "display_config": {"display_name": "DeepSeek V4 Pro"},
+                                        "reasoning_effort_config": {
+                                            "support_thinking": true,
+                                            "options": ["low", "medium", "high", "xhigh"],
+                                            "default_level": "medium"
+                                        }
+                                    }]
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    if path == crate::domain::trae::TRAE_CHAT_PATH {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(concat!(
+                                "event: metadata\n",
+                                "data: {\"model\":\"DeepSeek-V4-Pro-Official\"}\n\n",
+                                "event: output\n",
+                                "data: {\"response\":\"pong\"}\n\n",
+                                "event: token_usage\n",
+                                "data: {\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}\n\n",
+                                "event: done\n",
+                                "data: {\"finish_reason\":\"stop\"}\n\n"
+                            )))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let origin = format!("http://{address}");
+
+        let state = provider_api_test_state(&format!("trae-surface-{}", app.as_str()));
+        let config_dir = state.config_dir.clone();
+        let execution = install_trae_discovery_execution(&state, origin, app).await;
+        for requested_stream in [false, true] {
+            // `test_provider_inner` deliberately covers every provider
+            // branch and therefore has a large future. Keep that future off
+            // the libtest stack while this focused Surface fixture runs.
+            let response = Box::pin(test_provider_inner(
+                &state,
+                execution.clone(),
+                &TestProviderQuery {
+                    app,
+                    network: Some(true),
+                    timeout_ms: Some(2_000),
+                    model: Some("DeepSeek-V4-Pro-Official".to_string()),
+                    test_prompt: Some("ping".to_string()),
+                    stream: Some(requested_stream),
+                },
+            ))
+            .await
+            .unwrap();
+            assert!(
+                response.ok,
+                "{} stream={requested_stream}: {}",
+                app.as_str(),
+                response.message
+            );
+            assert!(response.network_checked);
+            assert_eq!(response.network_status_code, Some(StatusCode::OK.as_u16()));
+            assert_eq!(response.driver_id, "special.trae_solo");
+            assert_eq!(
+                response.network_stream_completed,
+                requested_stream.then_some(true)
+            );
+        }
+
+        let observations = observations.lock().unwrap();
+        let generation = observations
+            .iter()
+            .filter(|value| value["path"] == crate::domain::trae::TRAE_CHAT_PATH)
+            .collect::<Vec<_>>();
+        assert_eq!(generation.len(), 2);
+        for request in generation {
+            assert_eq!(
+                request["authorization"],
+                "Cloud-IDE-JWT trae-discovery-access"
+            );
+            assert_eq!(request["uid"], "trae-discovery-uid");
+            assert_eq!(
+                request["body"]["function"],
+                crate::domain::trae::TRAE_FUNCTION
+            );
+            assert_eq!(request["body"]["stream"], true);
+            assert_eq!(request["body"]["config_name"], "DeepSeek-V4-Pro-Official");
+            assert!(request["body"]["messages"].is_array());
+        }
+        drop(observations);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trae_provider_test_reaches_solo_driver_for_all_three_app_surfaces() {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            run_trae_provider_test_for_app_surface(app).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn trae_precommit_401_replays_same_account_once_and_stops_on_second_auth_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |headers: HeaderMap, request: axum::extract::Request| {
+                let observations = std::sync::Arc::clone(&route_observations);
+                async move {
+                    let path = request.uri().path().to_string();
+                    let token = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let bytes = axum::body::to_bytes(request.into_body(), 256 * 1024)
+                        .await
+                        .unwrap();
+                    let chat_attempt = {
+                        let mut observations = observations.lock().unwrap();
+                        let chat_attempt =
+                            (path == crate::domain::trae::TRAE_CHAT_PATH).then(|| {
+                                observations
+                                    .iter()
+                                    .filter(|value| {
+                                        value["path"] == crate::domain::trae::TRAE_CHAT_PATH
+                                    })
+                                    .count()
+                            });
+                        observations.push(json!({
+                            "path": path,
+                            "authorization": token,
+                            "body": serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                        }));
+                        chat_attempt
+                    };
+                    match path.as_str() {
+                        crate::domain::trae::TRAE_MODEL_DETAIL_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "config_info_list": [{
+                                        "config_name": "DeepSeek-V4-Pro-Official",
+                                        "display_config": {"display_name": "DeepSeek V4 Pro"}
+                                    }]
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        crate::domain::trae::TRAE_CHAT_PATH
+                            if chat_attempt == Some(0)
+                                || chat_attempt.is_some_and(|attempt| attempt >= 2) =>
+                        {
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header("content-type", "application/json")
+                                .body(Body::from(
+                                    json!({"code": 1001, "message": "expired"}).to_string(),
+                                ))
+                                .unwrap()
+                        }
+                        crate::domain::trae::TRAE_CHAT_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(concat!(
+                                "event: output\n",
+                                "data: {\"response\":\"recovered\"}\n\n",
+                                "event: done\n",
+                                "data: {\"finish_reason\":\"stop\"}\n\n"
+                            )))
+                            .unwrap(),
+                        crate::domain::trae::TRAE_EXCHANGE_TOKEN_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "Result": {
+                                        "Token": "trae-recovered-access",
+                                        "RefreshToken": "trae-recovered-refresh",
+                                        "TokenExpireAt": 4_102_444_800_000_i64,
+                                        "RefreshExpireAt": 4_133_980_800_000_i64
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        crate::domain::trae::TRAE_USER_INFO_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "Result": {
+                                        "UserID": "trae-discovery-uid",
+                                        "ScreenName": "Trae fixture",
+                                        "EnterpriseID": ""
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        _ => Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .unwrap(),
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("trae-same-account-recovery");
+        let config_dir = state.config_dir.clone();
+        let execution =
+            install_trae_discovery_execution(&state, format!("http://{address}"), AppKind::Codex)
+                .await;
+        let second_execution = execution.clone();
+        let response = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(true),
+                timeout_ms: Some(2_000),
+                model: Some("DeepSeek-V4-Pro-Official".to_string()),
+                test_prompt: Some("ping".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.ok, "{}", response.message);
+
+        let second = test_provider_inner(
+            &state,
+            second_execution,
+            &TestProviderQuery {
+                app: AppKind::Codex,
+                network: Some(true),
+                timeout_ms: Some(2_000),
+                model: Some("DeepSeek-V4-Pro-Official".to_string()),
+                test_prompt: Some("ping again".to_string()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!second.ok);
+        assert_eq!(second.outcome, ProviderOperationOutcome::Auth);
+        assert_eq!(
+            second.network_status_code,
+            Some(StatusCode::UNAUTHORIZED.as_u16())
+        );
+
+        {
+            let observations = observations.lock().unwrap();
+            let chat = observations
+                .iter()
+                .filter(|value| value["path"] == crate::domain::trae::TRAE_CHAT_PATH)
+                .collect::<Vec<_>>();
+            assert_eq!(chat.len(), 4);
+            assert_eq!(
+                chat[0]["authorization"],
+                "Cloud-IDE-JWT trae-discovery-access"
+            );
+            assert_eq!(
+                chat[1]["authorization"],
+                "Cloud-IDE-JWT trae-recovered-access"
+            );
+            assert_eq!(
+                chat[2]["authorization"],
+                "Cloud-IDE-JWT trae-recovered-access"
+            );
+            assert_eq!(
+                chat[3]["authorization"],
+                "Cloud-IDE-JWT trae-recovered-access"
+            );
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|value| {
+                        value["path"] == crate::domain::trae::TRAE_EXCHANGE_TOKEN_PATH
+                    })
+                    .count(),
+                2
+            );
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|value| value["path"] == crate::domain::trae::TRAE_USER_INFO_PATH)
+                    .count(),
+                2
+            );
+        }
+        let account = state
+            .find_account_for_provider(ProviderType::TraeSolo, "trae-discovery-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("trae-recovered-access")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("trae-recovered-refresh")
+        );
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trae_postcommit_stream_auth_error_never_refreshes_or_replays() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |headers: HeaderMap, request: axum::extract::Request| {
+                let observations = std::sync::Arc::clone(&route_observations);
+                async move {
+                    let path = request.uri().path().to_string();
+                    let token = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let bytes = axum::body::to_bytes(request.into_body(), 256 * 1024)
+                        .await
+                        .unwrap();
+                    observations.lock().unwrap().push(json!({
+                        "path": path,
+                        "authorization": token,
+                        "body": serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                    }));
+                    match path.as_str() {
+                        crate::domain::trae::TRAE_MODEL_DETAIL_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "config_info_list": [{
+                                        "config_name": "DeepSeek-V4-Pro-Official",
+                                        "display_config": {"display_name": "DeepSeek V4 Pro"}
+                                    }]
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        crate::domain::trae::TRAE_CHAT_PATH => {
+                            let stream = async_stream::stream! {
+                                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                                    b"event: output\ndata: {\"response\":\"committed\"}\n\n",
+                                ));
+                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                                    b"event: error\ndata: {\"code\":1001,\"message\":\"expired after commit\"}\n\n",
+                                ));
+                            };
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(Body::from_stream(stream))
+                                .unwrap()
+                        }
+                        crate::domain::trae::TRAE_EXCHANGE_TOKEN_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "Result": {
+                                        "Token": "must-not-be-used-access",
+                                        "RefreshToken": "must-not-be-used-refresh",
+                                        "TokenExpireAt": 4_102_444_800_000_i64,
+                                        "RefreshExpireAt": 4_133_980_800_000_i64
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        crate::domain::trae::TRAE_USER_INFO_PATH => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "Code": 0,
+                                    "Result": {
+                                        "UserID": "trae-discovery-uid",
+                                        "ScreenName": "Trae fixture",
+                                        "EnterpriseID": ""
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        _ => Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .unwrap(),
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = provider_api_test_state("trae-postcommit-auth-error");
+        let config_dir = state.config_dir.clone();
+        let execution =
+            install_trae_discovery_execution(&state, format!("http://{address}"), AppKind::Codex)
+                .await;
+        let before = state
+            .find_account_for_provider(ProviderType::TraeSolo, "trae-discovery-account")
+            .await
+            .unwrap();
+        let expected_token_generation = before.token_refresh_generation;
+        let stored = execution.runtime_stored_view();
+        let body = provider_test_body(
+            AppKind::Codex,
+            &stored,
+            Some("DeepSeek-V4-Pro-Official"),
+            "ping",
+            true,
+        );
+        let forward = tokio::spawn(proxy::forward_provider_test(
+            state.clone(),
+            default_test_route(AppKind::Codex),
+            execution,
+            None,
+            HeaderMap::new(),
+            Bytes::from(body),
+        ));
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), forward)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::spawn(async move {
+            axum::body::to_bytes(
+                response.into_body(),
+                PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+            )
+            .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("committed"));
+        assert!(!provider_test_stream_completed(AppKind::Codex, &body));
+
+        {
+            let observations = observations.lock().unwrap();
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|value| value["path"] == crate::domain::trae::TRAE_CHAT_PATH)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|value| {
+                        value["path"] == crate::domain::trae::TRAE_EXCHANGE_TOKEN_PATH
+                    })
+                    .count(),
+                0
+            );
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|value| value["path"] == crate::domain::trae::TRAE_USER_INFO_PATH)
+                    .count(),
+                0
+            );
+        }
+        let account = state
+            .find_account_for_provider(ProviderType::TraeSolo, "trae-discovery-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            account.access_token.as_deref(),
+            Some("trae-discovery-access")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("trae-discovery-refresh")
+        );
+        assert_eq!(account.token_refresh_generation, expected_token_generation);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     async fn install_cursor_provider_test_execution(

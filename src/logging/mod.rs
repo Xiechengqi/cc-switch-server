@@ -136,6 +136,10 @@ pub fn redact_sensitive_text(input: &str) -> String {
         "token",
         "access_token",
         "refresh_token",
+        "capability",
+        "callback_url",
+        "callbackurl",
+        "auth_callback_url",
         "cookie",
         "password",
         "secret",
@@ -357,6 +361,11 @@ mod tests {
             redact_sensitive_text("token router connected"),
             "token router connected"
         );
+        let callback = redact_sensitive_text(
+            "auth_callback_url=http://localhost/callback?flowId=f&capability=callback-secret",
+        );
+        assert!(!callback.contains("callback-secret"));
+        assert!(callback.contains("[REDACTED]"));
     }
 
     #[test]

@@ -23,16 +23,17 @@ use crate::domain::qoder::{
     QODER_QUOTA_SIGNATURE_PATH, QODER_REFRESH_MODE_COSY, QODER_REFRESH_MODE_QODER_CN20,
 };
 
-const DEVICE_POLL_PATH: &str = "/api/v1/deviceToken/poll";
-const DEVICE_REFRESH_PATH: &str = "/api/v1/deviceToken/refresh";
-const USER_INFO_PATH: &str = "/api/v1/userinfo";
+pub(crate) const DEVICE_POLL_PATH: &str = "/api/v1/deviceToken/poll";
+pub(crate) const DEVICE_REFRESH_PATH: &str = "/api/v1/deviceToken/refresh";
+pub(crate) const USER_INFO_PATH: &str = "/api/v1/userinfo";
 const ORGANIZATION_TAGS_PREFIX: &str = "/api/v1/organizations/";
-const AUTH_STATUS_ACTUAL_PATH: &str = "/algo/api/v3/user/status";
-const GLOBAL_REFRESH_PATH: &str = "/algo/api/v3/user/jobToken?Encode=1";
+pub(crate) const AUTH_STATUS_ACTUAL_PATH: &str = "/algo/api/v3/user/status";
 const QODER_APP_CODE: &str = "cosy";
 const QODER_APP_SECRET: &str = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw==";
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
-const FLOW_TTL_SECS: u64 = 10 * 60;
+pub const QODER_CLI_VERSION: &str = "1.1.32";
+pub(crate) const QODER_OPENAPI_USER_AGENT: &str = "qoder/1.1.32";
+pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 1;
+pub(crate) const FLOW_TTL_SECS: u64 = 5 * 60;
 const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -268,6 +269,7 @@ pub struct QoderClientError {
     pub status: StatusCode,
     pub upstream_status: Option<StatusCode>,
     pub terminal: bool,
+    pub outcome_unknown: bool,
     pub message: String,
 }
 
@@ -277,6 +279,7 @@ impl QoderClientError {
             status: StatusCode::BAD_REQUEST,
             upstream_status: None,
             terminal: true,
+            outcome_unknown: false,
             message: message.into(),
         }
     }
@@ -294,6 +297,7 @@ impl QoderClientError {
             },
             upstream_status: Some(status),
             terminal,
+            outcome_unknown: false,
             message: format!(
                 "Qoder {operation} failed with upstream HTTP {}: {}",
                 status.as_u16(),
@@ -307,8 +311,24 @@ impl QoderClientError {
             status: StatusCode::BAD_GATEWAY,
             upstream_status: None,
             terminal: false,
+            outcome_unknown: false,
             message: message.into(),
         }
+    }
+
+    fn refresh_outcome_unknown(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            upstream_status: None,
+            terminal: false,
+            outcome_unknown: true,
+            message: message.into(),
+        }
+    }
+
+    fn mark_outcome_unknown(mut self) -> Self {
+        self.outcome_unknown = true;
+        self
     }
 }
 
@@ -333,11 +353,7 @@ fn start_device_flow_with_endpoints(
 ) -> Result<(QoderDeviceCodeResponse, PendingQoderDeviceFlow), QoderClientError> {
     let code_verifier = random_qoder_token(32);
     let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-    let nonce = if endpoints.site == QoderSite::Cn {
-        random_qoder_hex(16)
-    } else {
-        crate::domain::qoder::random_qoder_uuid()
-    };
+    let nonce = crate::domain::qoder::random_qoder_uuid();
     let state = random_qoder_token(32);
     let device_code = random_qoder_hex(16);
     let machine = random_qoder_machine(endpoints.site);
@@ -392,16 +408,10 @@ pub async fn poll_device_flow(
             "Qoder device flow state does not match",
         ));
     }
-    let mut poll_url = endpoint_url(&flow.endpoints.openapi_base_url, DEVICE_POLL_PATH)?;
-    poll_url.query_pairs_mut().extend_pairs([
-        ("nonce", flow.nonce.as_str()),
-        ("verifier", flow.code_verifier.as_str()),
-        ("challenge_method", "S256"),
-    ]);
+    let poll_url = qoder_device_poll_url(flow)?;
     let mut response = http
         .get(poll_url)
         .header(ACCEPT, "application/json")
-        .header(USER_AGENT, qoder_openapi_user_agent(&flow.endpoints))
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
@@ -527,7 +537,7 @@ pub async fn exchange_pat_job_token(
         .post(url)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, qoder_openapi_user_agent(endpoints))
+        .header(USER_AGENT, qoder_openapi_user_agent())
         .header("cosy-version", &endpoints.client_version)
         .header("cosy-clienttype", "5")
         .json(&json!({"personal_token": pat.trim()}))
@@ -604,7 +614,9 @@ pub async fn fetch_quota_usage(
     let endpoints = QoderEndpoints::from_account(account, profile.site);
     let machine_token = machine_token_from_raw(account.raw.as_ref()).unwrap_or_default();
     let machine = profile.machine(&machine_token);
-    machine.validate().map_err(QoderClientError::bad_request)?;
+    machine
+        .validate(profile.site)
+        .map_err(QoderClientError::bad_request)?;
 
     let attempts = if profile.credential_rail == QoderCredentialRail::PatJobToken {
         2
@@ -775,33 +787,16 @@ where
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AccountRefreshFailure::bad_request("Qoder refresh token is required"))?;
-    let access_token = account
-        .access_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AccountRefreshFailure::bad_request("Qoder access token is required"))?;
     let machine_token = machine_token_from_raw(account.raw.as_ref()).unwrap_or_default();
     let machine = profile.machine(&machine_token);
     machine
-        .validate()
+        .validate(profile.site)
         .map_err(AccountRefreshFailure::bad_request)?;
     let endpoints = QoderEndpoints::from_account(account, profile.site);
 
     let token = match profile.credential_rail {
-        QoderCredentialRail::GlobalOauth => {
-            refresh_global_token(
-                http,
-                &endpoints,
-                &machine,
-                refresh_token,
-                access_token,
-                now_ms,
-            )
-            .await
-        }
-        QoderCredentialRail::CnOauth => {
-            refresh_cn_token(http, &endpoints, refresh_token, now_ms).await
+        QoderCredentialRail::GlobalOauth | QoderCredentialRail::CnOauth => {
+            refresh_device_token(http, &endpoints, refresh_token, now_ms).await
         }
         QoderCredentialRail::PatJobToken => unreachable!("PAT was rejected above"),
     }
@@ -833,6 +828,20 @@ where
     // credential receipt before any userinfo/auth-status validation.
     receipt_hook(&receipt)?;
     let mut update = complete_qoder_refresh_receipt(http, account, receipt).await?;
+    if crate::domain::accounts::store::account_refresh_replaces_auth_identity(account, &update) {
+        return Err(AccountRefreshFailure {
+            status_code: 409,
+            upstream_status: None,
+            message: "Qoder OAuth refresh returned a different subscription identity; re-login as a new account"
+                .to_string(),
+            kind: crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+            retryable: false,
+            retry_after_ms: None,
+            immediate_relogin: true,
+            outcome_unknown: true,
+            endpoint_fallback_safe: false,
+        });
+    }
     if let Some(raw) = update.raw.take() {
         update.raw = Some(crate::domain::accounts::oauth::merge_account_refresh_raw(
             account.raw.as_ref(),
@@ -900,7 +909,7 @@ pub async fn complete_qoder_refresh_receipt(
     Ok(update)
 }
 
-async fn refresh_cn_token(
+async fn refresh_device_token(
     http: &reqwest::Client,
     endpoints: &QoderEndpoints,
     refresh_token: &str,
@@ -911,95 +920,26 @@ async fn refresh_cn_token(
         .post(url)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, qoder_openapi_user_agent(endpoints))
-        .header("cosy-version", &endpoints.client_version)
-        .header("cosy-clienttype", "5")
-        .header("cosy-machineos", machine_os())
+        .header(USER_AGENT, qoder_openapi_user_agent())
         .json(&json!({"refresh_token": refresh_token}))
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder CN refresh failed: {error}"))
+            QoderClientError::refresh_outcome_unknown(format!(
+                "Qoder {} device refresh failed: {error}",
+                endpoints.site.as_str()
+            ))
         })?;
     let status = response.status();
-    let body = read_body(&mut response, "CN refresh").await?;
-    if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "CN refresh", &body));
-    }
-    parse_token_response(&body, now_ms)
-}
-
-async fn refresh_global_token(
-    http: &reqwest::Client,
-    endpoints: &QoderEndpoints,
-    machine: &QoderMachineIdentity,
-    refresh_token: &str,
-    access_token: &str,
-    now_ms: i64,
-) -> Result<QoderTokenResponse, QoderClientError> {
-    let center = endpoints.center_base_url.as_deref().ok_or_else(|| {
-        QoderClientError::bad_gateway("Qoder Global profile has no Center endpoint")
-    })?;
-    let url = endpoint_url(center, GLOBAL_REFRESH_PATH)?;
-    let inner = json!({
-        "personalToken": "",
-        "securityOauthToken": access_token,
-        "refreshToken": refresh_token,
-        "needRefresh": true,
-        "authInfo": {}
-    });
-    let outer = serde_json::to_vec(&json!({
-        "payload": serde_json::to_string(&inner)
-            .map_err(|error| QoderClientError::bad_gateway(error.to_string()))?,
-        "encodeVersion": "1"
-    }))
-    .map_err(|error| QoderClientError::bad_gateway(error.to_string()))?;
-    let date = httpdate::fmt_http_date(SystemTime::now());
-    let signature = md5_hex(format!("{QODER_APP_CODE}&{QODER_APP_SECRET}&{date}").as_bytes());
-    let mut response = http
-        .post(url)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json")
-        .header(ACCEPT_ENCODING, "identity")
-        .header(USER_AGENT, crate::domain::qoder::QODER_COSY_USER_AGENT)
-        .header("date", date)
-        .header("signature", signature)
-        .header("appcode", QODER_APP_CODE)
-        .header("login-version", "v2")
-        .header("cosy-version", &endpoints.client_version)
-        .header("cosy-clienttype", &endpoints.client_type)
-        .header("cosy-machineid", &machine.machine_id)
-        .header("cosy-machinetoken", &machine.machine_token)
-        .header("cosy-machinetype", &machine.machine_type)
-        .body(qoder_encode(&outer))
-        .timeout(REQUEST_TIMEOUT)
-        .send()
+    let operation = format!("{} device refresh", endpoints.site.as_str());
+    let body = read_body(&mut response, &operation)
         .await
-        .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder Global refresh failed: {error}"))
-        })?;
-    let status = response.status();
-    let body = read_body(&mut response, "Global refresh").await?;
+        .map_err(QoderClientError::mark_outcome_unknown)?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "Global refresh", &body));
+        return Err(QoderClientError::upstream(status, &operation, &body));
     }
-    let body = unwrap_qoder_json_response(&body)?;
-    let value: Value = serde_json::from_slice(&body).map_err(|error| {
-        QoderClientError::bad_gateway(format!("Qoder Global refresh is not valid JSON: {error}"))
-    })?;
-    let normalized = json!({
-        "access_token": string_at(&value, &["/securityOauthToken", "/access_token", "/token"]),
-        "refresh_token": string_at(&value, &["/refreshToken", "/refresh_token"]),
-        "user_id": string_at(&value, &["/id", "/userId", "/user_id"]),
-        "user_name": string_at(&value, &["/name", "/userName", "/user_name"]),
-        "expires_at": value.get("expireTime").or_else(|| value.get("expires_at")).cloned()
-    });
-    parse_token_response(
-        &serde_json::to_vec(&normalized)
-            .map_err(|error| QoderClientError::bad_gateway(error.to_string()))?,
-        now_ms,
-    )
+    parse_token_response(&body, now_ms).map_err(QoderClientError::mark_outcome_unknown)
 }
 
 fn qoder_refresh_failure(
@@ -1010,25 +950,37 @@ fn qoder_refresh_failure(
 
     let upstream_status = error.upstream_status.map(|status| status.as_u16());
     let invalid = error.terminal;
+    let rate_limited = error.upstream_status == Some(StatusCode::TOO_MANY_REQUESTS);
+    let outcome_unknown = error.outcome_unknown;
     AccountRefreshFailure {
-        status_code: error.status.as_u16(),
+        status_code: if rate_limited {
+            StatusCode::TOO_MANY_REQUESTS.as_u16()
+        } else {
+            error.status.as_u16()
+        },
         upstream_status,
         message: error.message,
-        kind: if invalid {
+        kind: if outcome_unknown {
+            OAuthErrorKind::Unknown
+        } else if invalid {
             OAuthErrorKind::InvalidGrant
+        } else if rate_limited {
+            OAuthErrorKind::RateLimited
         } else {
             OAuthErrorKind::Network
         },
-        retryable: !invalid,
+        retryable: !invalid && !outcome_unknown,
         retry_after_ms: None,
-        immediate_relogin: invalid,
-        outcome_unknown: false,
+        immediate_relogin: invalid || outcome_unknown,
+        outcome_unknown,
         endpoint_fallback_safe: false,
     }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QoderTokenResponse {
+    #[serde(default)]
+    device_token: String,
     #[serde(default)]
     token: String,
     #[serde(default)]
@@ -1049,7 +1001,11 @@ pub struct QoderTokenResponse {
 
 impl QoderTokenResponse {
     pub fn access_token(&self) -> Option<&str> {
-        first_non_empty([self.access_token.as_str(), self.token.as_str()])
+        first_non_empty([
+            self.device_token.as_str(),
+            self.token.as_str(),
+            self.access_token.as_str(),
+        ])
     }
 
     pub fn refresh_token(&self) -> Option<&str> {
@@ -1170,7 +1126,7 @@ async fn fetch_user_info(
         .get(url)
         .header(ACCEPT, "application/json")
         .header(AUTHORIZATION, format!("Bearer {}", token.trim()))
-        .header(USER_AGENT, qoder_openapi_user_agent(endpoints))
+        .header(USER_AGENT, qoder_openapi_user_agent())
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
@@ -1210,7 +1166,7 @@ async fn enrich_organization(
         .get(url)
         .header(ACCEPT, "application/json")
         .header(AUTHORIZATION, format!("Bearer {}", token.trim()))
-        .header(USER_AGENT, qoder_openapi_user_agent(endpoints))
+        .header(USER_AGENT, qoder_openapi_user_agent())
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await;
@@ -1452,12 +1408,20 @@ fn pending_result(interval: u64) -> QoderDevicePollResult {
     }
 }
 
-fn qoder_openapi_user_agent(endpoints: &QoderEndpoints) -> String {
-    if endpoints.site == QoderSite::Cn {
-        format!("Qoder CN/{}", endpoints.client_version)
-    } else {
-        format!("Qoder/{}", endpoints.client_version)
-    }
+pub(crate) fn qoder_openapi_user_agent() -> &'static str {
+    QODER_OPENAPI_USER_AGENT
+}
+
+pub(crate) fn qoder_device_poll_url(
+    flow: &PendingQoderDeviceFlow,
+) -> Result<Url, QoderClientError> {
+    let mut poll_url = endpoint_url(&flow.endpoints.openapi_base_url, DEVICE_POLL_PATH)?;
+    poll_url.query_pairs_mut().extend_pairs([
+        ("nonce", flow.nonce.as_str()),
+        ("verifier", flow.code_verifier.as_str()),
+        ("challenge_method", "S256"),
+    ]);
+    Ok(poll_url)
 }
 
 fn endpoint_url(base: &str, path: &str) -> Result<Url, QoderClientError> {
@@ -1576,6 +1540,7 @@ pub(crate) fn machine_os() -> String {
 mod tests {
     use super::*;
     use crate::domain::accounts::store::AccountStore;
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone)]
@@ -1584,6 +1549,7 @@ mod tests {
         path: String,
         query: Option<String>,
         headers: axum::http::HeaderMap,
+        body: Vec<u8>,
     }
 
     async fn serve_qoder_quota(
@@ -1604,7 +1570,8 @@ mod tests {
         let app = axum::Router::new().fallback(axum::routing::any(
             move |method: axum::http::Method,
                   uri: axum::http::Uri,
-                  headers: axum::http::HeaderMap| {
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
                 let observations = Arc::clone(&observations_for_route);
                 let exchange_count = Arc::clone(&exchange_count_for_route);
                 let quota_count = Arc::clone(&quota_count_for_route);
@@ -1614,6 +1581,7 @@ mod tests {
                         path: uri.path().to_string(),
                         query: uri.query().map(str::to_string),
                         headers,
+                        body: body.to_vec(),
                     });
                     if method == axum::http::Method::POST
                         && uri.path() == crate::domain::qoder::QODER_PAT_EXCHANGE_PATH
@@ -1676,16 +1644,267 @@ mod tests {
         (format!("http://{address}"), observations, server)
     }
 
-    fn qoder_quota_account(site: QoderSite, rail: QoderCredentialRail, base_url: &str) -> Account {
+    struct QoderLifecycleServer {
+        base_url: String,
+        observations: Arc<Mutex<Vec<QoderHttpObservation>>>,
+        refresh_status: Arc<AtomicU16>,
+        user_uid: Arc<Mutex<String>>,
+        unexpected_count: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    fn qoder_json_response(
+        status: axum::http::StatusCode,
+        body: Value,
+    ) -> axum::http::Response<axum::body::Body> {
+        axum::http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn serve_qoder_lifecycle(site: QoderSite) -> QoderLifecycleServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observations_for_route = Arc::clone(&observations);
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let poll_count_for_route = Arc::clone(&poll_count);
+        let refresh_status = Arc::new(AtomicU16::new(200));
+        let refresh_status_for_route = Arc::clone(&refresh_status);
+        let user_uid = Arc::new(Mutex::new("qoder-uid".to_string()));
+        let user_uid_for_route = Arc::clone(&user_uid);
+        let unexpected_count = Arc::new(AtomicUsize::new(0));
+        let unexpected_count_for_route = Arc::clone(&unexpected_count);
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
+                let observations = Arc::clone(&observations_for_route);
+                let poll_count = Arc::clone(&poll_count_for_route);
+                let refresh_status = Arc::clone(&refresh_status_for_route);
+                let user_uid = Arc::clone(&user_uid_for_route);
+                let unexpected_count = Arc::clone(&unexpected_count_for_route);
+                async move {
+                    observations.lock().unwrap().push(QoderHttpObservation {
+                        method: method.clone(),
+                        path: uri.path().to_string(),
+                        query: uri.query().map(str::to_string),
+                        headers,
+                        body: body.to_vec(),
+                    });
+                    if method == axum::http::Method::GET && uri.path() == DEVICE_POLL_PATH {
+                        if poll_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return axum::http::Response::builder()
+                                .status(axum::http::StatusCode::NOT_FOUND)
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
+                        return qoder_json_response(
+                            axum::http::StatusCode::OK,
+                            json!({
+                                "device_token": "poll-access",
+                                "refresh_token": "poll-refresh",
+                                "expires_at": 1_800_000_000_i64
+                            }),
+                        );
+                    }
+                    if method == axum::http::Method::POST && uri.path() == DEVICE_REFRESH_PATH {
+                        let status =
+                            axum::http::StatusCode::from_u16(refresh_status.load(Ordering::SeqCst))
+                                .unwrap();
+                        if !status.is_success() {
+                            return qoder_json_response(
+                                status,
+                                json!({"message": format!("refresh status {}", status.as_u16())}),
+                            );
+                        }
+                        return qoder_json_response(
+                            status,
+                            json!({
+                                "device_token": "rotated-access",
+                                "refresh_token": "rotated-refresh",
+                                "expires_at": 1_800_000_000_i64,
+                                "refresh_token_expires_at": 1_900_000_000_i64
+                            }),
+                        );
+                    }
+                    let uid = user_uid.lock().unwrap().clone();
+                    if method == axum::http::Method::GET && uri.path() == USER_INFO_PATH {
+                        return qoder_json_response(
+                            axum::http::StatusCode::OK,
+                            json!({
+                                "id": uid,
+                                "user_id": uid,
+                                "account_id": format!("{uid}-aid"),
+                                "name": "Qoder User",
+                                "userType": "teams",
+                                "organizationId": "qoder-org",
+                                "organizationName": "Qoder Org"
+                            }),
+                        );
+                    }
+                    if site == QoderSite::Cn
+                        && method == axum::http::Method::POST
+                        && uri.path() == AUTH_STATUS_ACTUAL_PATH
+                    {
+                        return qoder_json_response(
+                            axum::http::StatusCode::OK,
+                            json!({
+                                "id": uid,
+                                "accountId": format!("{uid}-aid"),
+                                "name": "Qoder User",
+                                "userType": "teams",
+                                "orgId": "qoder-org",
+                                "orgName": "Qoder Org"
+                            }),
+                        );
+                    }
+                    unexpected_count.fetch_add(1, Ordering::SeqCst);
+                    qoder_json_response(
+                        axum::http::StatusCode::NOT_FOUND,
+                        json!({"message": "unexpected Qoder test endpoint"}),
+                    )
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        QoderLifecycleServer {
+            base_url: format!("http://{address}"),
+            observations,
+            refresh_status,
+            user_uid,
+            unexpected_count,
+            server,
+        }
+    }
+
+    fn qoder_test_endpoints(site: QoderSite, base_url: &str) -> QoderEndpoints {
+        let mut endpoints = QoderEndpoints::for_site(site);
+        endpoints.device_authorization_url = format!("{base_url}/device/selectAccounts");
+        endpoints.openapi_base_url = base_url.to_string();
+        endpoints.center_base_url = Some(base_url.to_string());
+        endpoints.gateway_base_url = base_url.to_string();
+        endpoints.job_gateway_base_url = base_url.to_string();
+        endpoints
+    }
+
+    fn qoder_lifecycle_account(site: QoderSite, base_url: &str) -> Account {
         let endpoints = QoderEndpoints::for_site(site);
         let machine = match site {
             QoderSite::Global => QoderMachineIdentity {
-                machine_id: "qoder-machine-global".to_string(),
+                machine_id: "0123456789abcdef0123456789abcdef0123".to_string(),
                 machine_token: "qoder-machine-token".to_string(),
                 machine_type: "5".to_string(),
             },
             QoderSite::Cn => QoderMachineIdentity {
-                machine_id: "qoder-machine-cn".to_string(),
+                machine_id: "018f47ec-51d8-4c2a-9c2b-4f859709c9e8".to_string(),
+                machine_token: String::new(),
+                machine_type: String::new(),
+            },
+        };
+        let identity = QoderIdentity {
+            name: "Qoder User".to_string(),
+            aid: "qoder-uid-aid".to_string(),
+            uid: "qoder-uid".to_string(),
+            organization_id: "qoder-org".to_string(),
+            organization_name: "Qoder Org".to_string(),
+            user_type: "teams".to_string(),
+            security_oauth_token: "old-access".to_string(),
+            refresh_token: "old-refresh".to_string(),
+        };
+        let mut input = account_input(QoderAccountDraft {
+            endpoints: &endpoints,
+            rail: if site == QoderSite::Cn {
+                QoderCredentialRail::CnOauth
+            } else {
+                QoderCredentialRail::GlobalOauth
+            },
+            machine: &machine,
+            identity,
+            access_token: Some("old-access".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+            api_key: None,
+            expires_at: Some(1_700_000_000_000),
+            login_method: "test",
+            now_ms: 1,
+        })
+        .unwrap();
+        input.raw.as_mut().unwrap()["testQoderEndpoints"] = json!({
+            "openapiBaseUrl": base_url,
+            "centerBaseUrl": base_url,
+            "gatewayBaseUrl": base_url,
+            "jobGatewayBaseUrl": base_url
+        });
+        AccountStore::default().upsert(input)
+    }
+
+    fn assert_uuid_v4(value: &str, label: &str) {
+        let bytes = value.as_bytes();
+        assert_eq!(bytes.len(), 36, "{label} must be a UUID");
+        for index in [8, 13, 18, 23] {
+            assert_eq!(bytes[index], b'-', "{label} has an invalid UUID separator");
+        }
+        assert_eq!(bytes[14], b'4', "{label} must be UUID v4");
+        assert!(matches!(
+            bytes[19].to_ascii_lowercase(),
+            b'8' | b'9' | b'a' | b'b'
+        ));
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| { [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit() }));
+    }
+
+    fn qoder_oracle_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../assets/contract/qoder-cli-oracle.json"
+        ))
+        .expect("Qoder CLI oracle fixture must be valid JSON")
+    }
+
+    fn oracle_oauth_login(fixture: &Value, site: QoderSite) -> &Value {
+        &fixture["rails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rail| {
+                rail["site"].as_str() == Some(site.as_str())
+                    && rail["credentialRail"].as_str() != Some("pat_job_token")
+            })
+            .unwrap_or_else(|| panic!("Qoder oracle is missing the {} OAuth rail", site.as_str()))
+            ["login"]
+    }
+
+    fn header_value<'a>(observation: &'a QoderHttpObservation, name: &str) -> Option<&'a str> {
+        observation
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    fn assert_no_protocol_auth_headers(observation: &QoderHttpObservation) {
+        assert!(header_value(observation, "authorization").is_none());
+        assert!(observation
+            .headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("cosy-")));
+    }
+
+    fn qoder_quota_account(site: QoderSite, rail: QoderCredentialRail, base_url: &str) -> Account {
+        let endpoints = QoderEndpoints::for_site(site);
+        let machine = match site {
+            QoderSite::Global => QoderMachineIdentity {
+                machine_id: "0123456789abcdef0123456789abcdef0123".to_string(),
+                machine_token: "qoder-machine-token".to_string(),
+                machine_type: "5".to_string(),
+            },
+            QoderSite::Cn => QoderMachineIdentity {
+                machine_id: "018f47ec-51d8-4c2a-9c2b-4f859709c9e7".to_string(),
                 machine_token: String::new(),
                 machine_type: String::new(),
             },
@@ -1736,25 +1955,444 @@ mod tests {
 
     #[test]
     fn device_flow_freezes_site_machine_state_nonce_and_verifier() {
-        let (device, flow) = start_device_flow(QoderSite::Cn, 1_000).unwrap();
-        assert_eq!(device.site, QoderSite::Cn);
-        assert_eq!(device.state, flow.state);
-        assert_eq!(flow.endpoints.site, QoderSite::Cn);
-        assert_eq!(flow.nonce.len(), 32);
-        assert_eq!(flow.machine.machine_id.len(), 36);
-        assert!(!flow.code_verifier.is_empty());
-        let url = Url::parse(&device.verification_uri_complete).unwrap();
+        let oracle = qoder_oracle_fixture();
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            let endpoints = qoder_test_endpoints(site, "http://127.0.0.1:12345");
+            let (device, flow) = start_device_flow_with_endpoints(endpoints, 1_000).unwrap();
+            assert_eq!(device.site, site);
+            assert_eq!(device.state, flow.state);
+            assert_eq!(device.expires_in, 300);
+            assert_eq!(device.interval, 1);
+            assert_eq!(flow.expires_at_ms, 301_000);
+            assert_eq!(flow.interval, 1);
+            assert_eq!(flow.endpoints.site, site);
+            assert_uuid_v4(&flow.nonce, "device nonce");
+            match site {
+                QoderSite::Global => {
+                    assert_eq!(flow.machine.machine_id.len(), 36);
+                    assert!(flow
+                        .machine
+                        .machine_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit()));
+                }
+                QoderSite::Cn => assert_uuid_v4(&flow.machine.machine_id, "CN machine id"),
+            }
+            assert!(!flow.code_verifier.is_empty());
+            let url = Url::parse(&device.verification_uri_complete).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            assert_eq!(query.get("nonce"), Some(&flow.nonce));
+            assert_eq!(query.get("machine_id"), Some(&flow.machine.machine_id));
+            assert_eq!(
+                query.get("challenge_method").map(String::as_str),
+                Some("S256")
+            );
+            let expected_challenge =
+                URL_SAFE_NO_PAD.encode(Sha256::digest(flow.code_verifier.as_bytes()));
+            assert_eq!(
+                query.get("challenge").map(String::as_str),
+                Some(expected_challenge.as_str())
+            );
+
+            let poll_url = qoder_device_poll_url(&flow).unwrap();
+            let poll_query = poll_url
+                .query_pairs()
+                .map(|(name, _)| name.into_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let authorization_query = query.keys().cloned().collect::<Vec<_>>();
+            let mut expected_login = json!({
+                "authorizationPath": url.path(),
+                "authorizationQueryRequired": authorization_query,
+                "machineIdFormat": if site == QoderSite::Global { "lower_hex_36" } else { "uuid_v4" },
+                "nonceFormat": "uuid_v4",
+                "pollForbiddenHeaders": ["authorization", "cosy-*", "user-agent"],
+                "pollHeaders": {"accept": "application/json"},
+                "pollIntervalSeconds": DEFAULT_POLL_INTERVAL_SECS,
+                "pollMethod": "GET",
+                "pollOrigin": "openapi",
+                "pollPath": poll_url.path(),
+                "pollPendingHttpStatus": 404,
+                "pollQueryRequired": poll_query,
+                "pollTimeoutSeconds": FLOW_TTL_SECS,
+                "pkceMethod": query.get("challenge_method").unwrap(),
+                "refreshForbiddenHeaders": [
+                    "authorization",
+                    "cosy-*",
+                    "proxy-authorization",
+                    "x-qoder-account"
+                ],
+                "refreshHeaders": {
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "user-agent": qoder_openapi_user_agent(),
+                },
+                "refreshMethod": "POST",
+                "refreshOrigin": "openapi",
+                "refreshPath": DEVICE_REFRESH_PATH,
+                "refreshRequestBody": {"refresh_token": "<redacted>"},
+                "refreshResponseOptionalFields": ["refresh_token_expires_at"],
+                "refreshResponseRequiredFields": ["device_token", "expires_at", "refresh_token"],
+                "refreshTokenRotates": true,
+                "stateBound": true,
+                "userinfoPath": USER_INFO_PATH,
+            });
+            if site == QoderSite::Cn {
+                expected_login["authStatusPath"] =
+                    json!(format!("{AUTH_STATUS_ACTUAL_PATH}?Encode=1"));
+            }
+            assert_eq!(
+                oracle_oauth_login(&oracle, site),
+                &expected_login,
+                "{} OAuth lifecycle drifted from the frozen CLI oracle",
+                site.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn device_poll_http_contract_is_state_bound_and_site_isolated() {
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            let server = serve_qoder_lifecycle(site).await;
+            let endpoints = qoder_test_endpoints(site, &server.base_url);
+            let (device, flow) = start_device_flow_with_endpoints(endpoints, 1_000).unwrap();
+            assert_eq!(
+                flow.endpoints.oauth_client_id,
+                site.profile().oauth_client_id
+            );
+            assert_eq!(flow.endpoints.client_type, site.profile().client_type);
+
+            let error = poll_device_flow(&reqwest::Client::new(), &flow, "wrong-state", 2_000)
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(server.observations.lock().unwrap().is_empty());
+
+            let pending = poll_device_flow(&reqwest::Client::new(), &flow, &device.state, 2_000)
+                .await
+                .unwrap();
+            assert!(pending.pending);
+            assert_eq!(pending.retry_after_secs, Some(1));
+
+            let completed = poll_device_flow(&reqwest::Client::new(), &flow, &device.state, 3_000)
+                .await
+                .unwrap();
+            assert!(!completed.pending);
+            let input = completed.account_input.unwrap();
+            assert_eq!(input.provider_type, ProviderType::QoderCosy);
+            assert_eq!(input.access_token.as_deref(), Some("poll-access"));
+            assert_eq!(input.refresh_token.as_deref(), Some("poll-refresh"));
+            let profile = QoderAccountProfile::parse(input.profile.as_ref()).unwrap();
+            assert_eq!(profile.site, site);
+            assert_eq!(
+                profile.credential_rail,
+                if site == QoderSite::Cn {
+                    QoderCredentialRail::CnOauth
+                } else {
+                    QoderCredentialRail::GlobalOauth
+                }
+            );
+
+            let observations = server.observations.lock().unwrap().clone();
+            let polls = observations
+                .iter()
+                .filter(|observation| observation.path == DEVICE_POLL_PATH)
+                .collect::<Vec<_>>();
+            assert_eq!(polls.len(), 2);
+            for poll in polls {
+                assert_eq!(poll.method, axum::http::Method::GET);
+                let query = url::form_urlencoded::parse(
+                    poll.query.as_deref().unwrap_or_default().as_bytes(),
+                )
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+                assert_eq!(query.get("nonce"), Some(&flow.nonce));
+                assert_eq!(query.get("verifier"), Some(&flow.code_verifier));
+                assert_eq!(
+                    query.get("challenge_method").map(String::as_str),
+                    Some("S256")
+                );
+                assert_eq!(header_value(poll, "accept"), Some("application/json"));
+                assert!(header_value(poll, "user-agent").is_none());
+                assert_no_protocol_auth_headers(poll);
+                assert!(poll.body.is_empty());
+            }
+
+            let userinfo = observations
+                .iter()
+                .filter(|observation| observation.path == USER_INFO_PATH)
+                .collect::<Vec<_>>();
+            assert_eq!(userinfo.len(), 1);
+            assert_eq!(userinfo[0].method, axum::http::Method::GET);
+            assert_eq!(
+                header_value(userinfo[0], "authorization"),
+                Some("Bearer poll-access")
+            );
+            assert_eq!(
+                header_value(userinfo[0], "user-agent"),
+                Some(QODER_OPENAPI_USER_AGENT)
+            );
+
+            let auth_status = observations
+                .iter()
+                .filter(|observation| observation.path == AUTH_STATUS_ACTUAL_PATH)
+                .collect::<Vec<_>>();
+            if site == QoderSite::Cn {
+                assert_eq!(auth_status.len(), 1);
+                assert_eq!(auth_status[0].method, axum::http::Method::POST);
+                assert_eq!(auth_status[0].query.as_deref(), Some("Encode=1"));
+                assert_eq!(
+                    header_value(auth_status[0], "cosy-clienttype"),
+                    Some(site.profile().client_type)
+                );
+                assert!(!auth_status[0].body.is_empty());
+            } else {
+                assert!(auth_status.is_empty());
+            }
+            assert_eq!(server.unexpected_count.load(Ordering::SeqCst), 0);
+            server.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn device_refresh_http_contract_is_minimal_and_receipt_precedes_identity() {
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            let server = serve_qoder_lifecycle(site).await;
+            let account = qoder_lifecycle_account(site, &server.base_url);
+            let observations_for_hook = Arc::clone(&server.observations);
+            let mut receipt_calls = 0;
+            let mut receipt_observation_counts = Vec::new();
+            let mut receipt_access_tokens = Vec::new();
+            let mut hook = |receipt: &AccountRefreshUpdate| {
+                receipt_calls += 1;
+                receipt_observation_counts.push(observations_for_hook.lock().unwrap().len());
+                receipt_access_tokens.push(receipt.access_token.clone());
+                Ok(())
+            };
+            let update = refresh_qoder_account(
+                &reqwest::Client::new(),
+                &account,
+                1_700_000_000_000,
+                &mut hook,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(receipt_calls, 1);
+            assert_eq!(receipt_observation_counts, [1]);
+            assert_eq!(receipt_access_tokens, [Some("rotated-access".to_string())]);
+            assert_eq!(update.access_token.as_deref(), Some("rotated-access"));
+            assert_eq!(update.refresh_token.as_deref(), Some("rotated-refresh"));
+            assert_eq!(update.expires_at, Some(1_800_000_000_000));
+            assert_eq!(
+                update
+                    .raw
+                    .as_ref()
+                    .and_then(|raw| raw.pointer("/qoderRefreshReceipt/site"))
+                    .and_then(Value::as_str),
+                Some(site.as_str())
+            );
+
+            let observations = server.observations.lock().unwrap().clone();
+            assert_eq!(observations[0].method, axum::http::Method::POST);
+            assert_eq!(observations[0].path, DEVICE_REFRESH_PATH);
+            assert!(observations[0].query.is_none());
+            assert_eq!(
+                header_value(&observations[0], "content-type"),
+                Some("application/json")
+            );
+            assert_eq!(
+                header_value(&observations[0], "accept"),
+                Some("application/json")
+            );
+            assert_eq!(
+                header_value(&observations[0], "user-agent"),
+                Some(QODER_OPENAPI_USER_AGENT)
+            );
+            assert_no_protocol_auth_headers(&observations[0]);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&observations[0].body).unwrap(),
+                json!({"refresh_token": "old-refresh"})
+            );
+            assert_eq!(observations[1].path, USER_INFO_PATH);
+            assert_eq!(
+                header_value(&observations[1], "authorization"),
+                Some("Bearer rotated-access")
+            );
+            if site == QoderSite::Cn {
+                assert_eq!(observations[2].path, AUTH_STATUS_ACTUAL_PATH);
+            } else {
+                assert_eq!(observations.len(), 2);
+            }
+            assert!(observations
+                .iter()
+                .all(|observation| { observation.path != "/algo/api/v3/user/jobToken" }));
+            assert_eq!(server.unexpected_count.load(Ordering::SeqCst), 0);
+            server.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn device_refresh_identity_drift_fails_after_rotation_receipt() {
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            let server = serve_qoder_lifecycle(site).await;
+            *server.user_uid.lock().unwrap() = "different-qoder-uid".to_string();
+            let account = qoder_lifecycle_account(site, &server.base_url);
+            let observations_for_hook = Arc::clone(&server.observations);
+            let mut journaled = Vec::new();
+            let mut hook = |receipt: &AccountRefreshUpdate| {
+                journaled.push((
+                    receipt.access_token.clone(),
+                    receipt.refresh_token.clone(),
+                    observations_for_hook.lock().unwrap().len(),
+                ));
+                Ok(())
+            };
+            let failure = refresh_qoder_account(
+                &reqwest::Client::new(),
+                &account,
+                1_700_000_000_000,
+                &mut hook,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(failure.status_code, 409);
+            assert_eq!(
+                failure.kind,
+                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant
+            );
+            assert!(failure.immediate_relogin);
+            assert!(failure.outcome_unknown);
+            assert!(!failure.retryable);
+            assert_eq!(
+                journaled,
+                [(
+                    Some("rotated-access".to_string()),
+                    Some("rotated-refresh".to_string()),
+                    1
+                )]
+            );
+            let observations = server.observations.lock().unwrap().clone();
+            assert_eq!(observations[0].path, DEVICE_REFRESH_PATH);
+            assert_eq!(observations[1].path, USER_INFO_PATH);
+            if site == QoderSite::Cn {
+                assert_eq!(observations[2].path, AUTH_STATUS_ACTUAL_PATH);
+            }
+            assert_eq!(server.unexpected_count.load(Ordering::SeqCst), 0);
+            server.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn device_refresh_classifies_terminal_rate_limit_server_and_unknown_outcomes() {
+        let server = serve_qoder_lifecycle(QoderSite::Global).await;
+        let account = qoder_lifecycle_account(QoderSite::Global, &server.base_url);
+        for (status, expected_status, expected_kind, retryable, immediate_relogin) in [
+            (
+                401,
+                401,
+                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+                false,
+                true,
+            ),
+            (
+                403,
+                401,
+                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+                false,
+                true,
+            ),
+            (
+                429,
+                429,
+                crate::domain::accounts::oauth::OAuthErrorKind::RateLimited,
+                true,
+                false,
+            ),
+            (
+                500,
+                502,
+                crate::domain::accounts::oauth::OAuthErrorKind::Network,
+                true,
+                false,
+            ),
+        ] {
+            server.refresh_status.store(status, Ordering::SeqCst);
+            let mut receipt_calls = 0;
+            let mut hook = |_: &AccountRefreshUpdate| {
+                receipt_calls += 1;
+                Ok(())
+            };
+            let failure = refresh_qoder_account(
+                &reqwest::Client::new(),
+                &account,
+                1_700_000_000_000,
+                &mut hook,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(receipt_calls, 0);
+            assert_eq!(failure.status_code, expected_status);
+            assert_eq!(failure.upstream_status, Some(status));
+            assert_eq!(failure.kind, expected_kind);
+            assert_eq!(failure.retryable, retryable);
+            assert_eq!(failure.immediate_relogin, immediate_relogin);
+            assert!(!failure.outcome_unknown);
+            assert!(!failure.endpoint_fallback_safe);
+        }
+        assert_eq!(server.unexpected_count.load(Ordering::SeqCst), 0);
+        server.server.abort();
+
+        let stopped = serve_qoder_lifecycle(QoderSite::Global).await;
+        let account = qoder_lifecycle_account(QoderSite::Global, &stopped.base_url);
+        stopped.server.abort();
+        let _ = stopped.server.await;
+        let mut hook = |_: &AccountRefreshUpdate| Ok(());
+        let failure = refresh_qoder_account(
+            &reqwest::Client::new(),
+            &account,
+            1_700_000_000_000,
+            &mut hook,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
-            url.query_pairs().find(|(key, _)| key == "nonce").unwrap().1,
-            flow.nonce
+            failure.kind,
+            crate::domain::accounts::oauth::OAuthErrorKind::Unknown
         );
+        assert!(failure.outcome_unknown);
+        assert!(failure.immediate_relogin);
+        assert!(!failure.retryable);
+        assert!(!failure.endpoint_fallback_safe);
+    }
+
+    #[tokio::test]
+    async fn pat_account_never_enters_device_refresh() {
+        let server = serve_qoder_lifecycle(QoderSite::Global).await;
+        let account = qoder_quota_account(
+            QoderSite::Global,
+            QoderCredentialRail::PatJobToken,
+            &server.base_url,
+        );
+        let mut hook = |_: &AccountRefreshUpdate| Ok(());
+        let failure = refresh_qoder_account(
+            &reqwest::Client::new(),
+            &account,
+            1_700_000_000_000,
+            &mut hook,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.status_code, 400);
         assert_eq!(
-            url.query_pairs()
-                .find(|(key, _)| key == "machine_id")
-                .unwrap()
-                .1,
-            flow.machine.machine_id
+            failure.kind,
+            crate::domain::accounts::oauth::OAuthErrorKind::Unsupported
         );
+        assert!(server.observations.lock().unwrap().is_empty());
+        assert_eq!(server.unexpected_count.load(Ordering::SeqCst), 0);
+        server.server.abort();
     }
 
     #[test]
@@ -1797,13 +2435,19 @@ mod tests {
             parse_expiry_ms(&json!("2026-08-13T00:00:00Z"), &Value::Null, 0),
             Some(1_786_579_200_000)
         );
+        let token = parse_token_response(
+            br#"{"device_token":"device","token":"token","access_token":"access"}"#,
+            0,
+        )
+        .unwrap();
+        assert_eq!(token.access_token(), Some("device"));
     }
 
     #[test]
     fn account_layout_keeps_pat_and_oauth_rails_mutually_exclusive() {
         let endpoints = QoderEndpoints::for_site(QoderSite::Global);
         let machine = QoderMachineIdentity {
-            machine_id: "machine".to_string(),
+            machine_id: "0123456789abcdef0123456789abcdef0123".to_string(),
             machine_token: "machine-token".to_string(),
             machine_type: "5".to_string(),
         };

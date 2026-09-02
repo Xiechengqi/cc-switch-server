@@ -1416,6 +1416,8 @@ struct AccountAuthIdentitySnapshot {
     kiro_evidence: Option<KiroIdentityEvidence>,
     codex_workspace_id: Option<String>,
     qoder_identity: Option<QoderIdentityEvidence>,
+    codebuddy_identity: Option<CodeBuddyIdentityEvidence>,
+    trae_identity: Option<TraeIdentityEvidence>,
     fallback_email: Option<String>,
 }
 
@@ -1440,6 +1442,22 @@ struct QoderIdentityEvidence {
     aid: String,
     organization_id: String,
     machine_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeBuddyIdentityEvidence {
+    site: String,
+    domain: String,
+    uid: String,
+    enterprise_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraeIdentityEvidence {
+    uid: String,
+    enterprise_id: String,
+    machine_id: String,
+    device_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1500,6 +1518,12 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
         qoder_identity: (account.provider_type == ProviderType::QoderCosy)
             .then(|| qoder_identity_evidence(account))
             .flatten(),
+        codebuddy_identity: (account.provider_type == ProviderType::CodeBuddyOAuth)
+            .then(|| codebuddy_identity_evidence(account))
+            .flatten(),
+        trae_identity: (account.provider_type == ProviderType::TraeSolo)
+            .then(|| trae_identity_evidence(account))
+            .flatten(),
         fallback_email: normalized_identity_email(account.email.as_deref()),
     }
 }
@@ -1537,6 +1561,22 @@ fn account_auth_identity_changed(
             ),
             (Some(_), None) => true,
         };
+    }
+    if previous.provider_type == ProviderType::CodeBuddyOAuth {
+        return managed_profile_identity_changed(
+            &previous.codebuddy_identity,
+            &current.codebuddy_identity,
+            &previous.fallback_email,
+            &current.fallback_email,
+        );
+    }
+    if previous.provider_type == ProviderType::TraeSolo {
+        return managed_profile_identity_changed(
+            &previous.trae_identity,
+            &current.trae_identity,
+            &previous.fallback_email,
+            &current.fallback_email,
+        );
     }
     match (&previous.principal, &current.principal) {
         (Some(previous), Some(current)) => previous != current,
@@ -1588,6 +1628,22 @@ pub fn account_refresh_replaces_auth_identity(
             (Some(_), None) => true,
         };
     }
+    if previous.provider_type == ProviderType::CodeBuddyOAuth {
+        return managed_refresh_profile_identity_replaced(
+            &previous.codebuddy_identity,
+            &candidate.codebuddy_identity,
+            &previous.fallback_email,
+            &candidate.fallback_email,
+        );
+    }
+    if previous.provider_type == ProviderType::TraeSolo {
+        return managed_refresh_profile_identity_replaced(
+            &previous.trae_identity,
+            &candidate.trae_identity,
+            &previous.fallback_email,
+            &candidate.fallback_email,
+        );
+    }
     if identity_component_replaced(&previous.principal, &candidate.principal) {
         return true;
     }
@@ -1606,6 +1662,37 @@ fn identity_component_replaced<T: PartialEq>(previous: &Option<T>, candidate: &O
         (Some(previous), Some(candidate)) => previous != candidate,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+fn managed_profile_identity_changed<T: PartialEq>(
+    previous: &Option<T>,
+    current: &Option<T>,
+    previous_email: &Option<String>,
+    current_email: &Option<String>,
+) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => previous != current,
+        (None, None) => previous_email != current_email,
+        (None, Some(_)) => matches!(
+            (previous_email, current_email),
+            (Some(previous), Some(current)) if previous != current
+        ),
+        (Some(_), None) => true,
+    }
+}
+
+fn managed_refresh_profile_identity_replaced<T: PartialEq>(
+    previous: &Option<T>,
+    candidate: &Option<T>,
+    previous_email: &Option<String>,
+    candidate_email: &Option<String>,
+) -> bool {
+    match (previous, candidate) {
+        (Some(previous), Some(candidate)) => previous != candidate,
+        (None, None) => identity_component_replaced(previous_email, candidate_email),
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
     }
 }
 
@@ -1711,6 +1798,29 @@ fn qoder_identity_evidence(account: &Account) -> Option<QoderIdentityEvidence> {
         aid: aid.to_string(),
         organization_id: organization_id.to_string(),
         machine_id: machine_id.to_string(),
+    })
+}
+
+fn codebuddy_identity_evidence(account: &Account) -> Option<CodeBuddyIdentityEvidence> {
+    let profile =
+        crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref()).ok()?;
+    let [site, domain, uid, enterprise_id] = profile.stable_identity_components();
+    Some(CodeBuddyIdentityEvidence {
+        site: site.to_string(),
+        domain: domain.to_string(),
+        uid: uid.to_string(),
+        enterprise_id: enterprise_id.to_string(),
+    })
+}
+
+fn trae_identity_evidence(account: &Account) -> Option<TraeIdentityEvidence> {
+    let profile = crate::domain::trae::TraeAccountProfile::parse(account.profile.as_ref()).ok()?;
+    let [uid, enterprise_id, machine_id, device_id] = profile.stable_identity_components();
+    Some(TraeIdentityEvidence {
+        uid: uid.to_string(),
+        enterprise_id: enterprise_id.to_string(),
+        machine_id: machine_id.to_string(),
+        device_id: device_id.to_string(),
     })
 }
 
@@ -2722,7 +2832,7 @@ mod tests {
             "credentialRail": "global_oauth",
             "refreshMode": "cosy",
             "uid": "qoder-user",
-            "machineId": "qoder-machine"
+            "machineId": "0123456789abcdef0123456789abcdef0123"
         }));
         input.raw = Some(json!({"qoderSecrets": {"machineToken": "machine-token"}}));
         input.access_token = Some("qoder-access".to_string());
@@ -3248,7 +3358,7 @@ mod tests {
             "uid": "user-a",
             "aid": "account-a",
             "organizationId": "org-a",
-            "machineId": "machine-a",
+            "machineId": "0123456789abcdef0123456789abcdef0123",
             "machineType": "type-a"
         }));
         input.raw = Some(json!({
@@ -3276,21 +3386,21 @@ mod tests {
                 2,
                 json!({
                     "site": "global", "refreshMode": "cosy", "uid": "user-b",
-                    "aid": "account-a", "organizationId": "org-a", "machineId": "machine-a"
+                    "aid": "account-a", "organizationId": "org-a", "machineId": "0123456789abcdef0123456789abcdef0123"
                 }),
             ),
             (
                 3,
                 json!({
                     "site": "global", "refreshMode": "cosy", "uid": "user-b",
-                    "aid": "account-a", "organizationId": "org-b", "machineId": "machine-a"
+                    "aid": "account-a", "organizationId": "org-b", "machineId": "0123456789abcdef0123456789abcdef0123"
                 }),
             ),
             (
                 4,
                 json!({
                     "site": "global", "refreshMode": "cosy", "uid": "user-b",
-                    "aid": "account-a", "organizationId": "org-b", "machineId": "machine-b"
+                    "aid": "account-a", "organizationId": "org-b", "machineId": "1123456789abcdef0123456789abcdef0123"
                 }),
             ),
         ] {
@@ -3310,7 +3420,7 @@ mod tests {
         let mut cn = current.clone();
         cn.profile = Some(json!({
             "site": "cn", "refreshMode": "qodercn20", "uid": "user-b",
-            "aid": "account-a", "organizationId": "org-b", "machineId": "machine-b"
+            "aid": "account-a", "organizationId": "org-b", "machineId": "018f47ec-51d8-4c2a-9c2b-4f859709c9e7"
         }));
         assert!(account_auth_identity_changed(
             &account_auth_identity_snapshot(&current),
@@ -3490,6 +3600,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(different_email.auth_identity_generation, 2);
+    }
+
+    #[test]
+    fn codebuddy_domain_is_a_generation_scoped_identity_component() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::CodeBuddyOAuth);
+        input.id = Some("codebuddy-domain-account".to_string());
+        input.profile = Some(json!({
+            "site": "intl",
+            "domain": "www.codebuddy.ai",
+            "uid": "codebuddy-user",
+            "enterpriseId": ""
+        }));
+        let created = store.upsert(input);
+        assert_eq!(created.auth_identity_generation, 1);
+
+        let enriched = store
+            .mark_refresh_success(
+                "codebuddy-domain-account",
+                AccountRefreshUpdate {
+                    profile: Some(json!({
+                        "site": "intl",
+                        "domain": "www.codebuddy.ai",
+                        "uid": "codebuddy-user",
+                        "enterpriseId": "",
+                        "nickname": "Owner"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(enriched.auth_identity_generation, 1);
+
+        let domain_change = AccountRefreshUpdate {
+            profile: Some(json!({
+                "site": "intl",
+                "domain": "www.workbuddy.ai",
+                "uid": "codebuddy-user",
+                "enterpriseId": ""
+            })),
+            ..Default::default()
+        };
+        assert!(account_refresh_replaces_auth_identity(
+            &enriched,
+            &domain_change
+        ));
+        let replaced = store
+            .mark_refresh_success("codebuddy-domain-account", domain_change)
+            .unwrap();
+        assert_eq!(replaced.auth_identity_generation, 2);
     }
 
     #[test]

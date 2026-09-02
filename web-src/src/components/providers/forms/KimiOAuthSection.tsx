@@ -23,8 +23,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { copyText } from "@/lib/clipboard";
-import type { ManagedAuthProvider } from "@/lib/api";
+import type { CodeBuddySite, ManagedAuthProvider } from "@/lib/api";
 import {
   logoutAccountsAndClearSelection,
   removeAccountAndUpdateSelection,
@@ -40,12 +41,23 @@ interface KimiOAuthSectionProps {
   allowDefaultAccountOption?: boolean;
 }
 
-interface DeviceCodeManagedAccountSectionProps
-  extends KimiOAuthSectionProps {
+interface DeviceCodeManagedAccountSectionProps extends KimiOAuthSectionProps {
   authProvider: ManagedAuthProvider;
   authStatusLabel: string;
   loginLabel: string;
-  userCodeHint: string;
+  userCodeHint?: string;
+  loginOptions?: {
+    codeBuddySite?: CodeBuddySite | null;
+    accountId?: string | null;
+  };
+  manualCallback?: {
+    label: string;
+    hint: string;
+    placeholder: string;
+    submitLabel: string;
+    requiredMessage: string;
+    successMessage: string;
+  };
 }
 
 export const DeviceCodeManagedAccountSection: React.FC<
@@ -55,6 +67,8 @@ export const DeviceCodeManagedAccountSection: React.FC<
   authStatusLabel,
   loginLabel,
   userCodeHint,
+  loginOptions,
+  manualCallback,
   className,
   selectedAccountId,
   onAccountSelect,
@@ -64,6 +78,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
   const { t } = useTranslation();
   const [copiedCode, setCopiedCode] = React.useState(false);
   const [copiedLink, setCopiedLink] = React.useState(false);
+  const [callbackUrl, setCallbackUrl] = React.useState("");
   const {
     accounts,
     hasAnyAccount,
@@ -76,12 +91,14 @@ export const DeviceCodeManagedAccountSection: React.FC<
     isAddingAccount,
     isRemovingAccount,
     isSettingDefaultAccount,
+    isSubmittingOauthCallback,
     defaultAccountId,
-    addAccount,
+    addAccountWithMode,
     cancelAuth,
     logoutAsync,
     removeAccountAsync,
     setDefaultAccount,
+    submitOauthCallback,
     refetchStatus,
   } = useManagedAuth(authProvider);
 
@@ -90,6 +107,10 @@ export const DeviceCodeManagedAccountSection: React.FC<
       onAccountSelect?.(accounts[0].id);
     }
   }, [accounts, onAccountSelect, selectedAccountId]);
+
+  React.useEffect(() => {
+    setCallbackUrl("");
+  }, [deviceCode?.device_code]);
 
   const accountLabel = (account: (typeof accounts)[number]) =>
     account.email || account.login;
@@ -102,10 +123,33 @@ export const DeviceCodeManagedAccountSection: React.FC<
   };
 
   const copyVerificationUrl = async () => {
-    if (!deviceCode?.verification_uri) return;
-    await copyText(deviceCode.verification_uri);
+    const verificationUrl =
+      deviceCode?.verification_uri_complete || deviceCode?.verification_uri;
+    if (!verificationUrl) return;
+    await copyText(verificationUrl);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2_000);
+  };
+
+  const startLogin = () => {
+    addAccountWithMode(undefined, loginOptions);
+  };
+
+  const submitManualCallback = async () => {
+    if (!manualCallback) return;
+    const value = callbackUrl.trim();
+    if (!value) {
+      toast.error(manualCallback.requiredMessage);
+      return;
+    }
+    try {
+      const account = await submitOauthCallback(value);
+      setCallbackUrl("");
+      onAccountSelect?.(account.id);
+      toast.success(manualCallback.successMessage);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    }
   };
 
   const handleRemoveAccount = async (
@@ -264,7 +308,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
           type="button"
           variant="outline"
           className="w-full"
-          onClick={addAccount}
+          onClick={startLogin}
           disabled={isAddingAccount}
         >
           {isAddingAccount ? (
@@ -274,9 +318,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
           ) : (
             <Sparkles className="mr-2 h-4 w-4" />
           )}
-          {hasAnyAccount
-            ? t("accountAuth.addAnotherAccount")
-            : loginLabel}
+          {hasAnyAccount ? t("accountAuth.addAnotherAccount") : loginLabel}
         </Button>
       ) : null}
 
@@ -289,42 +331,53 @@ export const DeviceCodeManagedAccountSection: React.FC<
             <Loader2 className="h-4 w-4 animate-spin" />
             {t("accountAuth.waitingForBrowser")}
           </div>
-          <div className="text-center">
-            <p className="mb-1 text-xs text-muted-foreground">
-              {userCodeHint}
-            </p>
-            <div className="flex items-center justify-center gap-2">
-              <code className="rounded border bg-background px-4 py-2 font-mono text-xl font-bold">
-                {deviceCode.user_code}
-              </code>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => void copyUserCode()}
-                title={t("common.copy")}
-              >
-                {copiedCode ? (
-                  <Check className="h-4 w-4 text-green-500" />
-                ) : (
-                  <Copy className="h-4 w-4" />
-                )}
-              </Button>
+          {deviceCode.user_code ? (
+            <div className="text-center">
+              {userCodeHint ? (
+                <p className="mb-1 text-xs text-muted-foreground">
+                  {userCodeHint}
+                </p>
+              ) : null}
+              <div className="flex items-center justify-center gap-2">
+                <code className="rounded border bg-background px-4 py-2 font-mono text-xl font-bold">
+                  {deviceCode.user_code}
+                </code>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => void copyUserCode()}
+                  title={t("common.copy")}
+                >
+                  {copiedCode ? (
+                    <Check className="h-4 w-4 text-green-500" />
+                  ) : (
+                    <Copy className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
             </div>
-          </div>
+          ) : null}
           <div className="rounded-md border bg-background/80 p-3">
             <p className="mb-2 text-xs text-muted-foreground">
               {t("accountAuth.openLinkHint")}
             </p>
             <div className="flex min-w-0 items-center gap-2">
               <a
-                href={deviceCode.verification_uri}
+                href={
+                  deviceCode.verification_uri_complete ||
+                  deviceCode.verification_uri
+                }
                 target="_blank"
                 rel="noopener noreferrer"
                 className="min-w-0 flex-1 truncate text-sm text-blue-500 hover:underline"
-                title={deviceCode.verification_uri}
+                title={
+                  deviceCode.verification_uri_complete ||
+                  deviceCode.verification_uri
+                }
               >
-                {deviceCode.verification_uri}
+                {deviceCode.verification_uri_complete ||
+                  deviceCode.verification_uri}
               </a>
               <Button
                 type="button"
@@ -341,7 +394,10 @@ export const DeviceCodeManagedAccountSection: React.FC<
               </Button>
               <Button asChild type="button" variant="outline" size="icon">
                 <a
-                  href={deviceCode.verification_uri}
+                  href={
+                    deviceCode.verification_uri_complete ||
+                    deviceCode.verification_uri
+                  }
                   target="_blank"
                   rel="noopener noreferrer"
                   title={t("accountAuth.openManually")}
@@ -351,6 +407,37 @@ export const DeviceCodeManagedAccountSection: React.FC<
               </Button>
             </div>
           </div>
+          {manualCallback ? (
+            <div className="space-y-2 rounded-md border bg-background/80 p-3">
+              <Label htmlFor={`${authProvider}-callback-url`}>
+                {manualCallback.label}
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                {manualCallback.hint}
+              </p>
+              <Textarea
+                id={`${authProvider}-callback-url`}
+                value={callbackUrl}
+                onChange={(event) => setCallbackUrl(event.target.value)}
+                placeholder={manualCallback.placeholder}
+                rows={3}
+                disabled={isSubmittingOauthCallback}
+              />
+              <Button
+                type="button"
+                className="w-full"
+                onClick={() => void submitManualCallback()}
+                disabled={
+                  isSubmittingOauthCallback || callbackUrl.trim().length === 0
+                }
+              >
+                {isSubmittingOauthCallback ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : null}
+                {manualCallback.submitLabel}
+              </Button>
+            </div>
+          ) : null}
           <Button
             type="button"
             variant="outline"

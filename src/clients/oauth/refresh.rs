@@ -181,7 +181,11 @@ impl AccountRefreshFailure {
 pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
     if matches!(
         provider_type,
-        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth | ProviderType::QoderCosy
+        ProviderType::KiroOAuth
+            | ProviderType::AmazonQOAuth
+            | ProviderType::QoderCosy
+            | ProviderType::CodeBuddyOAuth
+            | ProviderType::TraeSolo
     ) {
         return true;
     }
@@ -204,7 +208,8 @@ pub fn account_needs_native_refresh(account: &Account, now_ms: i64) -> bool {
             .access_token
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
-            || token_expires_soon(account, now_ms))
+            || token_expires_soon(account, now_ms)
+            || crate::domain::codebuddy::codebuddy_session_refresh_due(account, now_ms))
 }
 
 pub async fn execute_native_account_refresh(
@@ -403,6 +408,24 @@ where
     }
     if account.provider_type == ProviderType::QoderCosy {
         return crate::clients::oauth::qoder::refresh_qoder_account(
+            http,
+            account,
+            now_ms,
+            receipt_hook,
+        )
+        .await;
+    }
+    if account.provider_type == ProviderType::CodeBuddyOAuth {
+        return crate::clients::oauth::codebuddy::refresh_codebuddy_account(
+            http,
+            account,
+            now_ms,
+            receipt_hook,
+        )
+        .await;
+    }
+    if account.provider_type == ProviderType::TraeSolo {
+        return crate::clients::oauth::trae::refresh_trae_account(
             http,
             account,
             now_ms,
@@ -674,6 +697,11 @@ pub async fn validate_native_account_refresh_receipt(
         update =
             crate::clients::oauth::qoder::complete_qoder_refresh_receipt(http, account, update)
                 .await?;
+    } else if account.provider_type == ProviderType::CodeBuddyOAuth {
+        update = crate::clients::oauth::codebuddy::complete_codebuddy_refresh_receipt(
+            http, account, update,
+        )
+        .await?;
     }
     if let Some(raw) = update.raw.take() {
         update.raw = Some(merge_account_refresh_raw(account.raw.as_ref(), raw));

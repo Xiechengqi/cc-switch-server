@@ -5,11 +5,13 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::clients::oauth::amazon_q_device::AmazonQDeviceError;
+use crate::clients::oauth::codebuddy::CodeBuddyClientError;
 use crate::clients::oauth::codex_device::CodexDeviceError;
 use crate::clients::oauth::copilot_device::CopilotDeviceError;
 use crate::clients::oauth::grok_device::GrokDeviceError;
 use crate::clients::oauth::kimi_device::KimiDeviceError;
 use crate::clients::oauth::kiro_device::KiroDeviceError;
+use crate::clients::oauth::trae::TraeClientError;
 use crate::clients::router::email_auth::EmailAuthError;
 use crate::proxy;
 
@@ -703,6 +705,20 @@ pub(crate) fn map_kimi_device_error(error: KimiDeviceError) -> ApiError {
 pub(crate) fn map_qoder_client_error(
     error: crate::clients::oauth::qoder::QoderClientError,
 ) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        super::providers::redact_provider_test_error(&error.message),
+    )
+}
+
+pub(crate) fn map_codebuddy_client_error(error: CodeBuddyClientError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        super::providers::redact_provider_test_error(&error.message),
+    )
+}
+
+pub(crate) fn map_trae_client_error(error: TraeClientError) -> ApiError {
     ApiError::new(
         StatusCode::from_u16(error.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         super::providers::redact_provider_test_error(&error.message),

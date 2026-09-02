@@ -2190,6 +2190,411 @@ pub(in crate::api) async fn cancel_qoder_device_login(
     }))
 }
 
+pub(in crate::api) async fn start_codebuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<StartCodeBuddyLoginRequest>,
+) -> Result<Json<StartCodeBuddyLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let site = crate::domain::codebuddy::CodeBuddySite::parse(&input.site)
+        .map_err(ApiError::bad_request)?;
+    let now = now_ms() as i64;
+    let (login, flow) = crate::clients::oauth::codebuddy::start_login(site, now)
+        .await
+        .map_err(map_codebuddy_client_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .insert_codebuddy_login_flow(login.flow_id.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::CodeBuddyOAuth,
+            login.flow_id.clone(),
+            principal.oauth_binding_id(),
+            login.expires_at,
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(StartCodeBuddyLoginResponse { ok: true, login }))
+}
+
+pub(in crate::api) async fn poll_codebuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollCodeBuddyLoginRequest>,
+) -> Result<Json<PollCodeBuddyLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let now = now_ms() as i64;
+    require_device_flow_owner(
+        &state,
+        ProviderType::CodeBuddyOAuth,
+        &input.flow_id,
+        &principal_id,
+        now,
+        "CodeBuddy",
+    )
+    .await?;
+    let lease = state
+        .begin_codebuddy_login_poll(&input.flow_id, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("CodeBuddy login flow is expired or unknown"))?;
+    let result = match lease {
+        crate::clients::oauth::codebuddy::CodeBuddyLoginPollLease::Ready(flow) => {
+            match crate::clients::oauth::codebuddy::poll_login(&flow, now).await {
+                Ok(result) => {
+                    let completed_at = now_ms() as i64;
+                    if !state
+                        .finish_codebuddy_login_poll(&input.flow_id, result.clone(), completed_at)
+                        .await
+                    {
+                        return Err(ApiError::unauthorized(
+                            "CodeBuddy login flow was cancelled while polling",
+                        ));
+                    }
+                    result
+                }
+                Err(error) => {
+                    let completed_at = now_ms() as i64;
+                    if error.terminal {
+                        let managed_auth_operation = state.lock_managed_auth_operations().await;
+                        state
+                            .fail_codebuddy_login_poll(&input.flow_id, true, completed_at)
+                            .await;
+                        state
+                            .remove_device_flow_for_principal_under_managed_auth_guard(
+                                &managed_auth_operation,
+                                ProviderType::CodeBuddyOAuth,
+                                &input.flow_id,
+                                &principal_id,
+                                completed_at,
+                            )
+                            .await;
+                        drop(managed_auth_operation);
+                    } else {
+                        state
+                            .fail_codebuddy_login_poll(&input.flow_id, false, completed_at)
+                            .await;
+                    }
+                    return Err(map_codebuddy_client_error(error));
+                }
+            }
+        }
+        crate::clients::oauth::codebuddy::CodeBuddyLoginPollLease::Wait(retry_after_secs) => {
+            return Ok(Json(PollCodeBuddyLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_interval_not_elapsed".to_string(),
+                retry_after_secs: Some(retry_after_secs.max(1)),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::codebuddy::CodeBuddyLoginPollLease::InProgress => {
+            return Ok(Json(PollCodeBuddyLoginResponse {
+                ok: true,
+                pending: true,
+                message: "poll_in_progress".to_string(),
+                retry_after_secs: Some(1),
+                account: None,
+            }));
+        }
+        crate::clients::oauth::codebuddy::CodeBuddyLoginPollLease::Completed(result) => *result,
+    };
+    if result.pending {
+        return Ok(Json(PollCodeBuddyLoginResponse {
+            ok: true,
+            pending: true,
+            message: result.message,
+            retry_after_secs: result.retry_after_secs,
+            account: None,
+        }));
+    }
+    let account_input = result.account_input.clone().ok_or_else(|| {
+        ApiError::bad_gateway("CodeBuddy login flow completed without an account")
+    })?;
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::CodeBuddyOAuth,
+        &input.flow_id,
+        &principal_id,
+        account_input,
+    )
+    .await?;
+    Ok(Json(PollCodeBuddyLoginResponse {
+        ok: true,
+        pending: false,
+        message: result.message,
+        retry_after_secs: None,
+        account: Some(AccountLoginAccountSummary::from_account(&account)),
+    }))
+}
+
+pub(in crate::api) async fn cancel_codebuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelCodeBuddyLoginRequest>,
+) -> Result<Json<CancelCodeBuddyLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
+            ProviderType::CodeBuddyOAuth,
+            &input.flow_id,
+            &principal.oauth_binding_id(),
+            now_ms() as i64,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(CancelCodeBuddyLoginResponse {
+        ok: true,
+        cancelled,
+    }))
+}
+
+pub(in crate::api) async fn start_trae_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<StartTraeLoginRequest>,
+) -> Result<Json<StartTraeLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let expected_account = match input
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(account_id) => Some(
+            state
+                .find_account_for_provider(ProviderType::TraeSolo, account_id)
+                .await
+                .ok_or_else(|| ApiError::not_found("Trae target account was not found"))?,
+        ),
+        None => None,
+    };
+    let callback_base_url = format!(
+        "http://localhost:{}/api/accounts/trae/login/callback",
+        state.bind_addr.port()
+    );
+    let now = now_ms() as i64;
+    let (login, flow) = crate::clients::oauth::trae::start_login(
+        &callback_base_url,
+        expected_account.as_ref(),
+        now,
+    )
+    .map_err(map_trae_client_error)?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    state
+        .insert_trae_login_flow(login.flow_id.clone(), flow, now)
+        .await;
+    state
+        .bind_device_flow_principal(
+            ProviderType::TraeSolo,
+            login.flow_id.clone(),
+            principal.oauth_binding_id(),
+            login.expires_at,
+            now,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(StartTraeLoginResponse { ok: true, login }))
+}
+
+pub(in crate::api) async fn trae_login_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<TraeLoginStatusRequest>,
+) -> Result<Json<TraeLoginStatusResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let principal_id = principal.oauth_binding_id();
+    let now = now_ms() as i64;
+    require_device_flow_owner(
+        &state,
+        ProviderType::TraeSolo,
+        &input.flow_id,
+        &principal_id,
+        now,
+        "Trae",
+    )
+    .await?;
+    let status = state
+        .trae_login_status(&input.flow_id, now)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("Trae login flow is expired or unknown"))?;
+    match status {
+        crate::clients::oauth::trae::TraeLoginStatus::Pending => {
+            Ok(Json(TraeLoginStatusResponse {
+                ok: true,
+                pending: true,
+                message: "waiting_for_authorization".to_string(),
+                account: None,
+            }))
+        }
+        crate::clients::oauth::trae::TraeLoginStatus::Completing => {
+            Ok(Json(TraeLoginStatusResponse {
+                ok: true,
+                pending: true,
+                message: "authorization_completing".to_string(),
+                account: None,
+            }))
+        }
+        crate::clients::oauth::trae::TraeLoginStatus::Completed(account_input) => {
+            let account = persist_completed_device_login(
+                &state,
+                ProviderType::TraeSolo,
+                &input.flow_id,
+                &principal_id,
+                *account_input,
+            )
+            .await?;
+            Ok(Json(TraeLoginStatusResponse {
+                ok: true,
+                pending: false,
+                message: "Trae authorization completed".to_string(),
+                account: Some(AccountLoginAccountSummary::from_account(&account)),
+            }))
+        }
+    }
+}
+
+pub(in crate::api) async fn complete_trae_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CompleteTraeLoginRequest>,
+) -> Result<Json<CompleteTraeLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let callback = crate::clients::oauth::trae::parse_callback_url(&input.callback_url)
+        .map_err(map_trae_client_error)?;
+    let principal_id = principal.oauth_binding_id();
+    let now = now_ms() as i64;
+    require_device_flow_owner(
+        &state,
+        ProviderType::TraeSolo,
+        &callback.flow_id,
+        &principal_id,
+        now,
+        "Trae",
+    )
+    .await?;
+    execute_trae_login_completion(&state, &callback).await?;
+    let status = state
+        .trae_login_status(&callback.flow_id, now_ms() as i64)
+        .await
+        .ok_or_else(|| ApiError::conflict("Trae login flow was cancelled before import"))?;
+    let crate::clients::oauth::trae::TraeLoginStatus::Completed(account_input) = status else {
+        return Err(ApiError::conflict(
+            "Trae login flow did not reach the completed state",
+        ));
+    };
+    let account = persist_completed_device_login(
+        &state,
+        ProviderType::TraeSolo,
+        &callback.flow_id,
+        &principal_id,
+        *account_input,
+    )
+    .await?;
+    Ok(Json(CompleteTraeLoginResponse {
+        ok: true,
+        account: AccountLoginAccountSummary::from_account(&account),
+    }))
+}
+
+pub(in crate::api) async fn cancel_trae_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelTraeLoginRequest>,
+) -> Result<Json<CancelTraeLoginResponse>, ApiError> {
+    let principal = require_web_admin_session(&state, &headers).await?;
+    let managed_auth_operation = state.lock_managed_auth_operations().await;
+    let cancelled = state
+        .remove_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
+            ProviderType::TraeSolo,
+            &input.flow_id,
+            &principal.oauth_binding_id(),
+            now_ms() as i64,
+        )
+        .await;
+    drop(managed_auth_operation);
+    Ok(Json(CancelTraeLoginResponse {
+        ok: true,
+        cancelled,
+    }))
+}
+
+pub(in crate::api) async fn trae_login_callback(
+    State(state): State<ServerState>,
+    RawQuery(raw_query): RawQuery,
+) -> Html<String> {
+    let Some(raw_query) = raw_query.filter(|value| !value.trim().is_empty()) else {
+        return Html(oauth_callback_html(
+            "Trae",
+            false,
+            "Trae callback query is missing",
+        ));
+    };
+    let callback_url = format!("http://localhost/api/accounts/trae/login/callback?{raw_query}");
+    let callback = match crate::clients::oauth::trae::parse_callback_url(&callback_url) {
+        Ok(callback) => callback,
+        Err(error) => {
+            return Html(oauth_callback_html(
+                "Trae",
+                false,
+                &crate::api::providers::redact_provider_test_error(&error.message),
+            ));
+        }
+    };
+    match execute_trae_login_completion(&state, &callback).await {
+        Ok(()) => Html(oauth_callback_html(
+            "Trae",
+            true,
+            "Trae authorization was accepted; return to the admin console to finish login",
+        )),
+        Err(_) => Html(oauth_callback_html(
+            "Trae",
+            false,
+            "Trae authorization could not be accepted; restart login from the admin console",
+        )),
+    }
+}
+
+async fn execute_trae_login_completion(
+    state: &ServerState,
+    callback: &crate::clients::oauth::trae::TraeCallbackPayload,
+) -> Result<(), ApiError> {
+    let now = now_ms() as i64;
+    let flow = state
+        .begin_trae_login_completion(&callback.flow_id, &callback.capability, now)
+        .await
+        .map_err(map_trae_login_flow_error)?;
+    let http = state.http_client().await;
+    let account_input =
+        match crate::clients::oauth::trae::complete_login(&http, &flow, callback, now).await {
+            Ok(account_input) => account_input,
+            Err(error) => {
+                state.fail_trae_login_completion(&callback.flow_id).await;
+                return Err(map_trae_client_error(error));
+            }
+        };
+    state
+        .finish_trae_login_completion(&callback.flow_id, account_input, now_ms() as i64)
+        .await
+        .map_err(map_trae_login_flow_error)
+}
+
+fn map_trae_login_flow_error(error: crate::clients::oauth::trae::TraeLoginFlowError) -> ApiError {
+    use crate::clients::oauth::trae::TraeLoginFlowError;
+    match error {
+        TraeLoginFlowError::NotFound => ApiError::not_found(error.to_string()),
+        TraeLoginFlowError::CapabilityMismatch => ApiError::unauthorized(error.to_string()),
+        TraeLoginFlowError::Expired
+        | TraeLoginFlowError::AlreadyConsumed
+        | TraeLoginFlowError::InvalidTransition => ApiError::conflict(error.to_string()),
+    }
+}
+
 pub(in crate::api) async fn import_qoder_pat(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -3846,6 +4251,116 @@ mod tests {
                 )
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn trae_completed_login_is_principal_bound_and_forgets_capability_flow() {
+        let state = account_api_test_state("trae-login-principal-binding");
+        let config_dir = state.config_dir.clone();
+        let now = crate::infra::time::now_ms() as i64;
+        let principal_id = "owner:admin";
+        let (start, flow) = crate::clients::oauth::trae::start_login(
+            "http://localhost:9911/api/accounts/trae/login/callback",
+            None,
+            now,
+        )
+        .unwrap();
+        let auth = url::Url::parse(&start.auth_url).unwrap();
+        let callback_url = auth
+            .query_pairs()
+            .find(|(key, _)| key == "auth_callback_url")
+            .unwrap()
+            .1
+            .to_string();
+        let mut callback_url = url::Url::parse(&callback_url).unwrap();
+        callback_url
+            .query_pairs_mut()
+            .append_pair("refreshToken", "callback-refresh");
+        let callback =
+            crate::clients::oauth::trae::parse_callback_url(callback_url.as_str()).unwrap();
+        state
+            .insert_trae_login_flow(start.flow_id.clone(), flow, now)
+            .await;
+        state
+            .bind_device_flow_principal(
+                ProviderType::TraeSolo,
+                start.flow_id.clone(),
+                principal_id.to_string(),
+                start.expires_at,
+                now,
+            )
+            .await;
+        state
+            .begin_trae_login_completion(&start.flow_id, &callback.capability, now)
+            .await
+            .unwrap();
+        let account_id = crate::domain::trae::trae_account_id("uid-1").unwrap();
+        state
+            .finish_trae_login_completion(
+                &start.flow_id,
+                serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": "trae_solo",
+                    "accessToken": "trae-access",
+                    "refreshToken": "trae-refresh",
+                    "tokenType": "Cloud-IDE-JWT",
+                    "profile": {
+                        "uid": "uid-1",
+                        "enterpriseId": "enterprise-1",
+                        "machineId": "machine-1",
+                        "deviceId": "device-1"
+                    },
+                    "raw": {"source": "trae_oauth_login"}
+                }))
+                .unwrap(),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let completed = match state.trae_login_status(&start.flow_id, now).await {
+            Some(crate::clients::oauth::trae::TraeLoginStatus::Completed(account)) => account,
+            other => panic!("expected completed Trae login, got {other:?}"),
+        };
+        let wrong_owner = persist_completed_device_login(
+            &state,
+            ProviderType::TraeSolo,
+            &start.flow_id,
+            "other:admin",
+            (*completed).clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_owner.status, StatusCode::UNAUTHORIZED);
+        assert!(state.find_account_by_id(&account_id).await.is_none());
+
+        let account = persist_completed_device_login(
+            &state,
+            ProviderType::TraeSolo,
+            &start.flow_id,
+            principal_id,
+            *completed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(account.id, account_id);
+        assert!(state
+            .trae_login_status(&start.flow_id, crate::infra::time::now_ms() as i64)
+            .await
+            .is_none());
+        assert!(
+            !state
+                .device_flow_is_owned_by(
+                    ProviderType::TraeSolo,
+                    &start.flow_id,
+                    principal_id,
+                    crate::infra::time::now_ms() as i64,
+                )
+                .await
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]

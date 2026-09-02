@@ -31,6 +31,7 @@ for (const file of [
   'assets/contract/web-session-registry.json',
   'assets/contract/web-session-registry-manifest.json',
   'assets/contract/provider-coverage.json',
+  'assets/contract/qoder-cli-oracle.json',
   'assets/contract/router-provider-channel-baseline.json',
   'assets/contract/web-runtime-contract.json',
   'SOURCE_PROVENANCE.json',
@@ -55,6 +56,7 @@ done
 
 echo "== provider audits =="
 node --test scripts/audit/*.test.mjs
+node scripts/audit/audit-qoder-cli-oracle.mjs
 node scripts/audit/audit-server-provider-contract.mjs
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check

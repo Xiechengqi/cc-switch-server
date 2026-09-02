@@ -115,12 +115,17 @@ impl From<ProxyError> for QoderSseDecodeError {
 #[derive(Debug, Default)]
 pub struct QoderSseDecoder {
     buffer: Vec<u8>,
-    terminal: bool,
+    saw_terminal: bool,
+    complete: bool,
 }
 
 impl QoderSseDecoder {
+    /// True only after upstream EOF validates the single authoritative
+    /// terminal. A finish reason or `[DONE]` alone is not enough because a
+    /// later network chunk may still contain an error, duplicate terminal, or
+    /// business data.
     pub fn is_terminal(&self) -> bool {
-        self.terminal
+        self.complete
     }
 
     pub fn push(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
@@ -129,6 +134,11 @@ impl QoderSseDecoder {
     }
 
     pub fn push_classified(&mut self, chunk: Bytes) -> Result<Bytes, QoderSseDecodeError> {
+        if self.complete && !chunk.is_empty() {
+            return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
+                "Qoder SSE emitted bytes after completion",
+            )));
+        }
         if chunk.is_empty() {
             return Ok(Bytes::new());
         }
@@ -142,13 +152,20 @@ impl QoderSseDecoder {
     }
 
     pub fn finish_classified(&mut self) -> Result<Bytes, QoderSseDecodeError> {
-        let output = self.drain(true)?;
-        if !self.terminal {
+        if self.complete {
+            return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
+                "Qoder SSE was finalized more than once",
+            )));
+        }
+        let mut output = self.drain(true)?.to_vec();
+        if !self.saw_terminal {
             return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
                 "Qoder SSE ended without an authoritative terminal event",
             )));
         }
-        Ok(output)
+        self.complete = true;
+        output.extend_from_slice(b"data: [DONE]\n\n");
+        Ok(Bytes::from(output))
     }
 
     fn drain(&mut self, finish: bool) -> Result<Bytes, QoderSseDecodeError> {
@@ -203,9 +220,9 @@ impl QoderSseDecoder {
         }
         let data = data_lines[0];
         if data == "[DONE]" {
-            return self.emit_done(output);
+            return self.mark_terminal();
         }
-        if self.terminal {
+        if self.saw_terminal {
             return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
                 "Qoder SSE emitted data after its terminal event",
             )));
@@ -234,7 +251,7 @@ impl QoderSseDecoder {
             return Ok(());
         }
         if inner == "[DONE]" {
-            return self.emit_done(output);
+            return self.mark_terminal();
         }
         let value = serde_json::from_str::<Value>(inner)
             .map_err(|error| ProxyError::bad_gateway(format!("invalid Qoder SSE body: {error}")))?;
@@ -244,17 +261,18 @@ impl QoderSseDecoder {
         output.extend_from_slice(&canonical);
         output.extend_from_slice(b"\n\n");
         if qoder_inner_is_terminal(&value) {
-            self.emit_done(output)?;
+            self.mark_terminal()?;
         }
         Ok(())
     }
 
-    fn emit_done(&mut self, output: &mut Vec<u8>) -> Result<(), QoderSseDecodeError> {
-        if self.terminal {
-            return Ok(());
+    fn mark_terminal(&mut self) -> Result<(), QoderSseDecodeError> {
+        if self.saw_terminal {
+            return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
+                "Qoder SSE emitted a second terminal event",
+            )));
         }
-        self.terminal = true;
-        output.extend_from_slice(b"data: [DONE]\n\n");
+        self.saw_terminal = true;
         Ok(())
     }
 }
@@ -727,6 +745,144 @@ pub fn qoder_error_json(error: &QoderUpstreamError) -> Bytes {
 mod tests {
     use super::*;
 
+    fn wrapped_qoder_event(status: u16, body: &str) -> Bytes {
+        Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"statusCodeValue": status, "body": body})
+        ))
+    }
+
+    fn qoder_business_chunk(content: &str, finish_reason: Option<&str>) -> String {
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason,
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn frozen_qoder_cli_oracle_terminal_contract_drives_the_native_decoder() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/contract/qoder-cli-oracle.json"))
+                .expect("Qoder CLI oracle fixture must be valid JSON");
+        let contract = &fixture["terminalContract"];
+        assert_eq!(
+            contract["successRequires"],
+            json!([
+                "valid_inner_chunk",
+                "authoritative_finish_reason",
+                "upstream_eof",
+                "exactly_one_downstream_done"
+            ])
+        );
+
+        let mut decoder = QoderSseDecoder::default();
+        let first = decoder
+            .push(wrapped_qoder_event(
+                200,
+                &qoder_business_chunk("hello", None),
+            ))
+            .unwrap();
+        assert!(!first.is_empty(), "valid_inner_chunk must be projected");
+        let authoritative = decoder
+            .push(wrapped_qoder_event(
+                200,
+                &qoder_business_chunk("", Some("stop")),
+            ))
+            .unwrap();
+        assert!(
+            !authoritative.is_empty(),
+            "authoritative_finish_reason must remain visible downstream"
+        );
+        assert!(
+            !decoder.is_terminal(),
+            "terminal must wait for upstream EOF"
+        );
+        let eof = decoder.finish().unwrap();
+        assert!(decoder.is_terminal());
+        let downstream = String::from_utf8([first, authoritative, eof].concat()).unwrap();
+        assert_eq!(downstream.matches("data: [DONE]").count(), 1);
+
+        assert_eq!(
+            contract["rejects"],
+            json!([
+                "missing_terminal",
+                "malformed_json",
+                "second_terminal",
+                "business_data_after_terminal",
+                "auth_error_after_commit"
+            ])
+        );
+        for rejection in contract["rejects"].as_array().unwrap() {
+            let rejection = rejection.as_str().unwrap();
+            match rejection {
+                "missing_terminal" => {
+                    let mut decoder = QoderSseDecoder::default();
+                    decoder
+                        .push(wrapped_qoder_event(
+                            200,
+                            &qoder_business_chunk("partial", None),
+                        ))
+                        .unwrap();
+                    assert!(decoder.finish().is_err());
+                }
+                "malformed_json" => {
+                    let mut decoder = QoderSseDecoder::default();
+                    assert!(decoder
+                        .push(Bytes::from_static(b"data: {not-json}\n\n"))
+                        .is_err());
+                }
+                "second_terminal" => {
+                    let mut decoder = QoderSseDecoder::default();
+                    decoder
+                        .push(wrapped_qoder_event(
+                            200,
+                            &qoder_business_chunk("", Some("stop")),
+                        ))
+                        .unwrap();
+                    assert!(decoder
+                        .push(Bytes::from_static(b"data: [DONE]\n\n"))
+                        .is_err());
+                }
+                "business_data_after_terminal" => {
+                    let mut decoder = QoderSseDecoder::default();
+                    decoder
+                        .push(Bytes::from_static(b"data: [DONE]\n\n"))
+                        .unwrap();
+                    assert!(decoder
+                        .push(wrapped_qoder_event(
+                            200,
+                            &qoder_business_chunk("late", None),
+                        ))
+                        .is_err());
+                }
+                "auth_error_after_commit" => {
+                    let mut decoder = QoderSseDecoder::default();
+                    let committed = decoder
+                        .push(wrapped_qoder_event(
+                            200,
+                            &qoder_business_chunk("committed", None),
+                        ))
+                        .unwrap();
+                    assert!(!committed.is_empty());
+                    let error = decoder
+                        .push_classified(wrapped_qoder_event(
+                            401,
+                            r#"{"message":"expired after commit"}"#,
+                        ))
+                        .unwrap_err();
+                    assert!(error
+                        .upstream()
+                        .is_some_and(QoderUpstreamError::is_authentication_failure));
+                }
+                other => panic!("unexercised Qoder terminal rejection {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn qoder_error_taxonomy_distinguishes_entitlement_limit_and_auth() {
         let entitlement = QoderUpstreamError::from_status_body(
@@ -755,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn qoder_sse_decoder_unwraps_chunks_and_closes_on_terminal_before_eof() {
+    fn qoder_sse_decoder_unwraps_chunks_and_commits_terminal_only_at_eof() {
         let mut decoder = QoderSseDecoder::default();
         let first = concat!(
             r#"data: {"statusCodeValue":200,"body":"{\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}"}"#,
@@ -777,8 +933,13 @@ mod tests {
             .unwrap();
         let output = String::from_utf8(output.to_vec()).unwrap();
         assert!(output.contains("hello"));
-        assert!(output.ends_with("data: [DONE]\n\n"));
-        assert!(decoder.finish().unwrap().is_empty());
+        assert!(!output.contains("data: [DONE]"));
+        assert!(!decoder.is_terminal());
+        assert_eq!(
+            decoder.finish().unwrap(),
+            Bytes::from_static(b"data: [DONE]\n\n")
+        );
+        assert!(decoder.is_terminal());
     }
 
     #[test]

@@ -2467,6 +2467,8 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::KiroOAuth => "kiro_oauth",
         ProviderType::AmazonQOAuth => "amazon_q_oauth",
         ProviderType::QoderCosy => "qoder_cosy",
+        ProviderType::CodeBuddyOAuth => "codebuddy_oauth",
+        ProviderType::TraeSolo => "trae_solo",
         ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
     }
@@ -2563,6 +2565,14 @@ mod managed_auth_provider_label_tests {
         assert_eq!(
             managed_auth_provider_label(ProviderType::QoderCosy),
             "qoder_cosy"
+        );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::CodeBuddyOAuth),
+            "codebuddy_oauth"
+        );
+        assert_eq!(
+            managed_auth_provider_label(ProviderType::TraeSolo),
+            "trae_solo"
         );
         assert_eq!(
             web_parse_auth_provider_type("kimi_code").unwrap(),
@@ -3000,6 +3010,56 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 "site": response.device.site,
             }))
         }
+        ProviderType::CodeBuddyOAuth => {
+            let site = crate::domain::codebuddy::CodeBuddySite::parse(
+                web_optional_string_any(
+                    args,
+                    &["codeBuddySite", "codebuddySite", "codebuddy_site", "site"],
+                )
+                .as_deref()
+                .unwrap_or("intl"),
+            )
+            .map_err(ApiError::bad_request)?;
+            let response = start_codebuddy_login(
+                State(state),
+                headers,
+                Json(StartCodeBuddyLoginRequest {
+                    site: site.as_str().to_string(),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!({
+                "flow": "browser",
+                "provider": provider_label,
+                "device_code": response.login.flow_id,
+                "user_code": "",
+                "verification_uri": response.login.auth_url,
+                "expires_in": response.login.expires_in,
+                "interval": response.login.interval,
+                "site": response.login.site,
+            }))
+        }
+        ProviderType::TraeSolo => {
+            let response = start_trae_login(
+                State(state),
+                headers,
+                Json(StartTraeLoginRequest {
+                    account_id: web_optional_string_any(args, &["accountId", "account_id"]),
+                }),
+            )
+            .await?
+            .0;
+            Ok(json!({
+                "flow": "browser",
+                "provider": provider_label,
+                "device_code": response.login.flow_id,
+                "user_code": "",
+                "verification_uri": response.login.auth_url,
+                "expires_in": response.login.expires_in,
+                "interval": 2,
+            }))
+        }
         ProviderType::CodexOAuth if !managed_auth_is_cli_oauth_flow(oauth_flow_mode_ref) => {
             let response = start_codex_device_login(
                 State(state),
@@ -3173,6 +3233,48 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
+        ProviderType::CodeBuddyOAuth => {
+            let response = poll_codebuddy_login(
+                State(state.clone()),
+                headers,
+                Json(PollCodeBuddyLoginRequest {
+                    flow_id: device_code,
+                }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway("CodeBuddy login completed without account")
+                })?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
+        ProviderType::TraeSolo => {
+            let response = trae_login_status(
+                State(state.clone()),
+                headers,
+                Json(TraeLoginStatusRequest {
+                    flow_id: device_code,
+                }),
+            )
+            .await?
+            .0;
+            if response.pending {
+                return Ok(Value::Null);
+            }
+            let account_id = response
+                .account
+                .as_ref()
+                .map(|account| account.id.as_str())
+                .ok_or_else(|| ApiError::bad_gateway("Trae login completed without account"))?;
+            web_managed_auth_account_by_id(&state, account_id, provider_label).await
+        }
         ProviderType::CodexOAuth
             if !device_code.starts_with("cli:") && !device_code.starts_with("manual:") =>
         {
@@ -3291,6 +3393,30 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
             State(state),
             headers,
             Json(CancelQoderDeviceLoginRequest { device_code }),
+        )
+        .await?
+        .0;
+        return Ok(json!(response));
+    }
+    if provider_type == ProviderType::CodeBuddyOAuth {
+        let response = cancel_codebuddy_login(
+            State(state),
+            headers,
+            Json(CancelCodeBuddyLoginRequest {
+                flow_id: device_code,
+            }),
+        )
+        .await?
+        .0;
+        return Ok(json!(response));
+    }
+    if provider_type == ProviderType::TraeSolo {
+        let response = cancel_trae_login(
+            State(state),
+            headers,
+            Json(CancelTraeLoginRequest {
+                flow_id: device_code,
+            }),
         )
         .await?
         .0;

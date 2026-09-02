@@ -42,10 +42,11 @@ pub use control::{
 pub(in crate::api) use debug::*;
 pub use error::ApiError;
 pub(crate) use error::{
-    map_account_write_error, map_amazon_q_device_error, map_codex_active_account_selection_error,
-    map_codex_device_error, map_codex_workspace_rebind_error, map_copilot_device_error,
-    map_email_auth_error, map_grok_device_error, map_kimi_device_error, map_kiro_device_error,
-    map_qoder_client_error, map_share_patch_error, map_subscription_binding_error,
+    map_account_write_error, map_amazon_q_device_error, map_codebuddy_client_error,
+    map_codex_active_account_selection_error, map_codex_device_error,
+    map_codex_workspace_rebind_error, map_copilot_device_error, map_email_auth_error,
+    map_grok_device_error, map_kimi_device_error, map_kiro_device_error, map_qoder_client_error,
+    map_share_patch_error, map_subscription_binding_error, map_trae_client_error,
     map_web_auth_error, ErrorResponse, InferenceApiError, InferenceSurface,
 };
 pub(in crate::api) use events::*;
@@ -71,9 +72,9 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Path;
-use axum::extract::Query;
 use axum::extract::Request;
 use axum::extract::State;
+use axum::extract::{Query, RawQuery};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -510,6 +511,29 @@ pub fn app_router(state: ServerState) -> Router {
         .route(
             "/api/accounts/qoder/device/cancel",
             post(cancel_qoder_device_login),
+        )
+        .route(
+            "/api/accounts/codebuddy/login/start",
+            post(start_codebuddy_login),
+        )
+        .route(
+            "/api/accounts/codebuddy/login/poll",
+            post(poll_codebuddy_login),
+        )
+        .route(
+            "/api/accounts/codebuddy/login/cancel",
+            post(cancel_codebuddy_login),
+        )
+        .route("/api/accounts/trae/login/start", post(start_trae_login))
+        .route("/api/accounts/trae/login/status", post(trae_login_status))
+        .route(
+            "/api/accounts/trae/login/complete",
+            post(complete_trae_login),
+        )
+        .route("/api/accounts/trae/login/cancel", post(cancel_trae_login))
+        .route(
+            "/api/accounts/trae/login/callback",
+            get(trae_login_callback),
         )
         .route("/api/accounts/qoder/pat/import", post(import_qoder_pat))
         .route("/api/accounts/:id", delete(delete_account))
@@ -1389,6 +1413,7 @@ async fn proxy_models_for_selection(
     let claude_catalog = resolve_claude_catalog_provider(&providers, app, provider_id)
         .map(|_| crate::clients::oauth::claude_models::static_claude_model_catalog());
     let kimi_catalog = append_kimi_models(state, &providers, app, provider_id, &mut data).await;
+    let trae_catalog = append_trae_models(state, &providers, app, provider_id, &mut data).await?;
     let qoder_catalog = append_qoder_models(state, &providers, app, provider_id, &mut data).await?;
     let cursor_catalog =
         append_cursor_api_key_models(state, &providers, app, provider_id, &mut data).await;
@@ -1552,6 +1577,7 @@ async fn proxy_models_for_selection(
         source: grok_catalog
             .as_ref()
             .map(|catalog| catalog.source.to_string())
+            .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.source.clone()))
             .or_else(|| {
                 qoder_catalog
                     .as_ref()
@@ -1585,6 +1611,7 @@ async fn proxy_models_for_selection(
         stale: grok_catalog
             .as_ref()
             .map(|catalog| catalog.stale)
+            .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| qoder_catalog.as_ref().map(|_| false))
             .or_else(|| kimi_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| kiro_catalog.as_ref().map(|catalog| catalog.stale))
@@ -1593,6 +1620,7 @@ async fn proxy_models_for_selection(
             .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
         fetched_at_ms: grok_catalog
             .and_then(|catalog| catalog.fetched_at_ms)
+            .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| qoder_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| {
                 kimi_catalog.as_ref().and_then(|catalog| {
@@ -1603,6 +1631,76 @@ async fn proxy_models_for_selection(
             .or_else(|| amazon_q_catalog.and_then(|catalog| catalog.fetched_at_ms))
             .or_else(|| claude_catalog.map(|catalog| catalog.fetched_at_ms))
             .or_else(|| cursor_catalog.map(|catalog| catalog.fetched_at_ms)),
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct TraeCatalogUse {
+    source: String,
+    stale: bool,
+    fetched_at_ms: i64,
+}
+
+async fn append_trae_models(
+    state: &ServerState,
+    providers: &ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+    data: &mut Vec<OpenAiModel>,
+) -> Result<Option<TraeCatalogUse>, ApiError> {
+    let Some(provider) = resolve_trae_catalog_provider(providers, app, provider_id) else {
+        return Ok(None);
+    };
+    data.clear();
+    let execution = proxy::provider_ops::ProviderExecution::from_store_for_operation(
+        providers,
+        provider.clone(),
+    )
+    .map_err(ApiError::proxy)?;
+    let timeout_ms = execution.plan.transport_policy.timeout_ms.max(1);
+    let fetched =
+        crate::api::providers::fetch_provider_models_inner(state, &execution, Some(timeout_ms))
+            .await?;
+    let owner = model_owner(provider);
+    for model in fetched.models {
+        let reasoning_efforts = model
+            .raw
+            .pointer("/capabilities/reasoningEfforts")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty());
+        let context_window = model
+            .raw
+            .pointer("/capabilities/contextWindowMax")
+            .or_else(|| model.raw.pointer("/capabilities/contextWindow"))
+            .and_then(Value::as_u64);
+        let supports_tools = model
+            .raw
+            .pointer("/capabilities/tools")
+            .and_then(Value::as_bool);
+        data.push(OpenAiModel {
+            id: model.id,
+            object: "model",
+            owned_by: owner.clone(),
+            reasoning_efforts,
+            input_modalities: Some(vec!["text".to_string()]),
+            context_window,
+            supports_tools,
+        });
+    }
+    data.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(Some(TraeCatalogUse {
+        source: fetched
+            .source
+            .unwrap_or_else(|| "trae_live_model_catalog".to_string()),
+        stale: fetched.stale.unwrap_or(false),
+        fetched_at_ms: fetched.fetched_at_ms.unwrap_or_default(),
     }))
 }
 
@@ -2299,6 +2397,21 @@ fn resolve_qoder_catalog_provider<'a>(
     let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
     let mut matches = providers.providers.iter().filter(|provider| {
         provider.provider_type == ProviderType::QoderCosy
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
+fn resolve_trae_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::TraeSolo
             && provider.provider.id == provider_id
             && app.is_none_or(|app| provider.app == app)
     });
@@ -4534,7 +4647,7 @@ mod grok_catalog_provider_tests {
         let origin_for_store = origin.to_string();
         state
             .mutate_accounts_immediate(move |store| {
-                for (id, uid) in accounts {
+                for (index, (id, uid)) in accounts.into_iter().enumerate() {
                     let rail = match site {
                         crate::domain::qoder::QoderSite::Global => "global_oauth",
                         crate::domain::qoder::QoderSite::Cn => "cn_oauth",
@@ -4542,6 +4655,14 @@ mod grok_catalog_provider_tests {
                     let refresh_mode = match site {
                         crate::domain::qoder::QoderSite::Global => "cosy",
                         crate::domain::qoder::QoderSite::Cn => "qodercn20",
+                    };
+                    let machine_id = match site {
+                        crate::domain::qoder::QoderSite::Global => {
+                            format!("{:036x}", index + 1)
+                        }
+                        crate::domain::qoder::QoderSite::Cn => {
+                            format!("00000000-0000-4000-8000-{:012x}", index + 1)
+                        }
                     };
                     store.upsert(
                         serde_json::from_value(json!({
@@ -4558,7 +4679,7 @@ mod grok_catalog_provider_tests {
                                 "aid": format!("aid-{uid}"),
                                 "name": "Qoder Catalog Fixture",
                                 "userType": "personal_standard",
-                                "machineId": format!("machine-{uid}"),
+                                "machineId": machine_id,
                                 "machineType": "5"
                             },
                             "raw": {
@@ -5323,20 +5444,15 @@ mod grok_catalog_provider_tests {
                 }),
             )
             .route(
-                "/algo/api/v3/user/jobToken",
+                "/api/v1/deviceToken/refresh",
                 post(move || {
                     let requests = std::sync::Arc::clone(&refresh_requests_for_route);
                     async move {
                         requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Json(json!({
-                            "statusCodeValue": 200,
-                            "body": json!({
-                                "securityOauthToken": "qoder-refreshed-access-bound-user",
-                                "refreshToken": "qoder-refreshed-refresh-bound-user",
-                                "id": "bound-user",
-                                "name": "Qoder Catalog Fixture",
-                                "expireTime": chrono::Utc::now().timestamp_millis() + 3_600_000
-                            }).to_string()
+                            "device_token": "qoder-refreshed-access-bound-user",
+                            "refresh_token": "qoder-refreshed-refresh-bound-user",
+                            "expires_at": chrono::Utc::now().timestamp() + 3_600
                         }))
                     }
                 }),

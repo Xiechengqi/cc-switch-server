@@ -6,6 +6,7 @@ import type {
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
   QoderSite,
+  CodeBuddySite,
 } from "@/lib/api";
 import { oauthQuotaRootKey } from "@/lib/query/oauthQuotaKeys";
 
@@ -16,6 +17,8 @@ interface ManagedAuthStartParams {
   oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device";
   kiroLoginProvider?: "google" | "github" | null;
   qoderSite?: QoderSite | null;
+  codeBuddySite?: CodeBuddySite | null;
+  accountId?: string | null;
 }
 
 interface ManagedAuthCallbackParams {
@@ -123,6 +126,8 @@ export function useManagedAuth(
         params.oauthFlowMode,
         params.kiroLoginProvider,
         params.qoderSite,
+        params.codeBuddySite,
+        params.accountId,
       ),
     onSuccess: async (response, params) => {
       const generation = params.operationGeneration;
@@ -345,6 +350,8 @@ export function useManagedAuth(
       options?: {
         kiroLoginProvider?: "google" | "github" | null;
         qoderSite?: QoderSite | null;
+        codeBuddySite?: CodeBuddySite | null;
+        accountId?: string | null;
       },
     ) => {
       const activeDeviceCode = deviceCode?.device_code;
@@ -361,6 +368,8 @@ export function useManagedAuth(
         oauthFlowMode,
         kiroLoginProvider: options?.kiroLoginProvider,
         qoderSite: options?.qoderSite,
+        codeBuddySite: options?.codeBuddySite,
+        accountId: options?.accountId,
       });
     },
     [

@@ -698,6 +698,8 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
+        | ProviderType::CodeBuddyOAuth
+        | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
@@ -723,6 +725,12 @@ fn validate_required_account_credential(
     }
     if input.provider_type == ProviderType::QoderCosy {
         validate_qoder_account_input(input)?;
+    }
+    if input.provider_type == ProviderType::CodeBuddyOAuth {
+        validate_codebuddy_account_input(input)?;
+    }
+    if input.provider_type == ProviderType::TraeSolo {
+        validate_trae_account_input(input)?;
     }
     Ok(())
 }
@@ -888,6 +896,92 @@ fn validate_qoder_account_input(input: &UpsertAccountInput) -> Result<(), Accoun
     Ok(())
 }
 
+fn validate_codebuddy_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
+    crate::domain::codebuddy::CodeBuddyAccountProfile::parse(input.profile.as_ref()).map_err(
+        |error| {
+            AccountManagerError::CredentialUnavailable(format!(
+                "invalid CodeBuddy account: {error}"
+            ))
+        },
+    )?;
+    validate_fixed_oauth_token_pair(input, "CodeBuddy")?;
+    if input
+        .extra_headers
+        .as_ref()
+        .is_some_and(|headers| !headers.is_empty())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "CodeBuddy accounts forbid imported extraHeaders because outbound identity is Server-owned"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trae_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
+    crate::domain::trae::TraeAccountProfile::parse(input.profile.as_ref()).map_err(|error| {
+        AccountManagerError::CredentialUnavailable(format!("invalid Trae account: {error}"))
+    })?;
+    validate_fixed_oauth_token_pair(input, "Trae")?;
+    if input
+        .extra_headers
+        .as_ref()
+        .is_some_and(|headers| !headers.is_empty())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "Trae accounts forbid imported extraHeaders because outbound identity is Server-owned"
+                .to_string(),
+        ));
+    }
+    if crate::domain::trae::contains_untrusted_host_field(input.profile.as_ref())
+        || crate::domain::trae::contains_untrusted_host_field(input.raw.as_ref())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "Trae account imports cannot contain api_host/base_url overrides".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fixed_oauth_token_pair(
+    input: &UpsertAccountInput,
+    label: &str,
+) -> Result<(), AccountManagerError> {
+    const MAX_TOKEN_BYTES: usize = 64 * 1024;
+    for (field, value) in [
+        ("accessToken", input.access_token.as_deref()),
+        ("refreshToken", input.refresh_token.as_deref()),
+    ] {
+        let value = value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AccountManagerError::CredentialUnavailable(format!(
+                    "{label} requires a non-empty {field}"
+                ))
+            })?;
+        if value.len() > MAX_TOKEN_BYTES || value.chars().any(char::is_control) {
+            return Err(AccountManagerError::CredentialUnavailable(format!(
+                "{label} {field} is invalid"
+            )));
+        }
+    }
+    if input
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || input
+            .id_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(AccountManagerError::CredentialUnavailable(format!(
+            "{label} forbids apiKey and idToken credentials"
+        )));
+    }
+    Ok(())
+}
+
 pub fn registered_account_managers() -> Vec<AccountManagerRegistration> {
     account_provider_types()
         .into_iter()
@@ -909,7 +1003,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 18] {
+fn account_provider_types() -> [ProviderType; 20] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -921,6 +1015,8 @@ fn account_provider_types() -> [ProviderType; 18] {
         ProviderType::AmazonQOAuth,
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
+        ProviderType::CodeBuddyOAuth,
+        ProviderType::TraeSolo,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -968,6 +1064,8 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::KiroOAuth
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
+            | ProviderType::CodeBuddyOAuth
+            | ProviderType::TraeSolo
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -1045,6 +1143,8 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::AmazonQOAuth
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
+        | ProviderType::CodeBuddyOAuth
+        | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
@@ -1063,6 +1163,22 @@ pub(crate) fn account_credential_ownership(
 
 fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapability> {
     let mut flows = Vec::new();
+    if provider_type == ProviderType::CodeBuddyOAuth {
+        flows.push(AccountLoginFlowCapability {
+            kind: AccountLoginFlowKind::BrowserOAuth,
+            supports_callback: false,
+            supports_poll: true,
+            supports_cancel: true,
+        });
+    }
+    if provider_type == ProviderType::TraeSolo {
+        flows.push(AccountLoginFlowCapability {
+            kind: AccountLoginFlowKind::BrowserOAuth,
+            supports_callback: true,
+            supports_poll: true,
+            supports_cancel: true,
+        });
+    }
     if provider_login_request_shape_available(provider_type) {
         flows.push(AccountLoginFlowCapability {
             kind: AccountLoginFlowKind::BrowserOAuth,
@@ -1677,6 +1793,18 @@ mod tests {
                 true,
             ),
             (
+                ProviderType::CodeBuddyOAuth,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::TraeSolo,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
                 ProviderType::CursorOAuth,
                 OAuthRefreshCapability::OAuthRequest,
                 OAuthQuotaCapability::ImportedSnapshot,
@@ -1796,7 +1924,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            12
+            14
         );
         assert_eq!(
             registrations

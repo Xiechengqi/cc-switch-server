@@ -716,6 +716,108 @@ pub(in crate::api) struct CancelQoderDeviceLoginResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartCodeBuddyLoginRequest {
+    pub(in crate::api) site: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartCodeBuddyLoginResponse {
+    pub(in crate::api) ok: bool,
+    #[serde(flatten)]
+    pub(in crate::api) login: crate::clients::oauth::codebuddy::CodeBuddyLoginStart,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollCodeBuddyLoginRequest {
+    pub(in crate::api) flow_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct PollCodeBuddyLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelCodeBuddyLoginRequest {
+    pub(in crate::api) flow_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelCodeBuddyLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartTraeLoginRequest {
+    #[serde(default)]
+    pub(in crate::api) account_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct StartTraeLoginResponse {
+    pub(in crate::api) ok: bool,
+    #[serde(flatten)]
+    pub(in crate::api) login: crate::clients::oauth::trae::TraeLoginStart,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct TraeLoginStatusRequest {
+    pub(in crate::api) flow_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct TraeLoginStatusResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) pending: bool,
+    pub(in crate::api) message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) account: Option<AccountLoginAccountSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CompleteTraeLoginRequest {
+    pub(in crate::api) callback_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CompleteTraeLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) account: AccountLoginAccountSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelTraeLoginRequest {
+    pub(in crate::api) flow_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CancelTraeLoginResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ImportQoderPatRequest {
     pub(in crate::api) personal_token: String,
 }

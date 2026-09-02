@@ -3,7 +3,7 @@
   "authority": "cc-switch-server-product-requirements",
   "providerTypeSource": {
     "path": "src/domain/providers/model.rs",
-    "sha256": "2d84b959ed370d994fa1ef9f29a56edd84181184c0ab5c7e7bde6ac9eddad2a1"
+    "sha256": "8510657b97389e787b822d9f0e44871aa874dd05caf2b55e0a74e537f2fff55b"
   },
   "providerTypes": [
     { "variant": "Claude", "id": "claude", "label": "Anthropic official / API key", "apps": ["claude"], "coverageClass": "core" },
@@ -20,6 +20,8 @@
     { "variant": "AmazonQOAuth", "id": "amazon_q_oauth", "label": "Amazon Q Developer", "apps": ["claude", "codex"], "coverageClass": "server_extension" },
     { "variant": "KimiCode", "id": "kimi_code", "label": "Kimi OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
     { "variant": "QoderCosy", "id": "qoder_cosy", "label": "Qoder OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
+    { "variant": "CodeBuddyOAuth", "id": "codebuddy_oauth", "label": "CodeBuddy OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
+    { "variant": "TraeSolo", "id": "trae_solo", "label": "Trae CN Solo", "apps": ["claude", "codex", "gemini"], "coverageClass": "server_extension" },
     { "variant": "CursorOAuth", "id": "cursor_oauth", "label": "Cursor OAuth", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
     { "variant": "CursorApiKey", "id": "cursor_apikey", "label": "Cursor API key", "apps": ["claude", "codex", "gemini"], "coverageClass": "core" },
     { "variant": "AntigravityOAuth", "id": "antigravity_oauth", "label": "Antigravity OAuth", "apps": ["claude", "gemini"], "coverageClass": "core" },

@@ -1096,7 +1096,11 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::qoder::{QoderIdentity, QoderMachineIdentity};
+    use crate::domain::qoder::{
+        qoder_decode, qoder_encode, sign_qoder_request, QoderIdentity, QoderMachineIdentity,
+        QODER_GENERATION_PATH, QODER_GENERATION_SIGNATURE_PATH, QODER_MODEL_LIST_PATH,
+        QODER_MODEL_LIST_SIGNATURE_PATH, QODER_QUOTA_PATH, QODER_QUOTA_SIGNATURE_PATH,
+    };
 
     fn scope(
         token_generation: u64,
@@ -1131,7 +1135,7 @@ mod tests {
                 refresh_token: String::new(),
             },
             QoderMachineIdentity {
-                machine_id: "machine-a".to_string(),
+                machine_id: "0123456789abcdef0123456789abcdef0123".to_string(),
                 machine_token: "machine-token-a".to_string(),
                 machine_type: "5".to_string(),
             },
@@ -1458,5 +1462,336 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    fn qoder_oracle_fixture() -> Value {
+        serde_json::from_str(include_str!("../../assets/contract/qoder-cli-oracle.json"))
+            .expect("Qoder CLI oracle fixture must be valid JSON")
+    }
+
+    fn fixture_site(value: &str) -> QoderSite {
+        match value {
+            "global" => QoderSite::Global,
+            "cn" => QoderSite::Cn,
+            other => panic!("unexpected Qoder oracle site {other:?}"),
+        }
+    }
+
+    fn assert_uuid_v4(value: &str, label: &str) {
+        let bytes = value.as_bytes();
+        assert_eq!(bytes.len(), 36, "{label} must be a UUID");
+        for index in [8, 13, 18, 23] {
+            assert_eq!(bytes[index], b'-', "{label} has an invalid UUID separator");
+        }
+        assert_eq!(bytes[14], b'4', "{label} must be UUID v4");
+        assert!(
+            matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
+            "{label} must use an RFC 4122 variant"
+        );
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| { [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit() }));
+    }
+
+    fn session_for_site(site: QoderSite) -> QoderCosySession {
+        let machine_id = match site {
+            QoderSite::Global => "0123456789abcdef0123456789abcdef0123",
+            QoderSite::Cn => "018f47ec-51d8-4c2a-9c2b-4f859709c9e7",
+        };
+        QoderCosySession::new_with_key(
+            site,
+            QoderIdentity {
+                name: "Oracle User".to_string(),
+                aid: "oracle-aid".to_string(),
+                uid: "oracle-uid".to_string(),
+                organization_id: "oracle-org".to_string(),
+                organization_name: "Oracle Org".to_string(),
+                user_type: "personal_standard".to_string(),
+                security_oauth_token: "synthetic-access".to_string(),
+                refresh_token: "synthetic-refresh".to_string(),
+            },
+            QoderMachineIdentity {
+                machine_id: machine_id.to_string(),
+                machine_token: "synthetic-machine".to_string(),
+                machine_type: "5".to_string(),
+            },
+            b"0123456789abcdef",
+        )
+        .unwrap()
+    }
+
+    fn origin(value: &str) -> String {
+        let parsed = url::Url::parse(value).unwrap();
+        parsed.origin().ascii_serialization()
+    }
+
+    #[test]
+    fn frozen_qoder_cli_oracle_matches_native_payload_headers_and_catalog() {
+        let fixture = qoder_oracle_fixture();
+        assert_eq!(fixture["schemaVersion"], 2);
+        assert_eq!(fixture["providerType"], "qoder_cosy");
+        assert_eq!(fixture["scope"], "single_bound_account_only");
+        assert_eq!(fixture["liveState"], "live_pending");
+
+        let case = &fixture["canonicalCase"];
+        let request = &case["request"];
+        let model_config = &case["modelConfig"];
+        let model_key = case["modelKey"].as_str().unwrap();
+        let session_id = case["sessionId"].as_str().unwrap();
+        let user_type = case["userType"].as_str().unwrap();
+        let now_ms = case["nowMs"].as_i64().unwrap();
+        let projection = case["serverProjection"].as_object().unwrap();
+
+        for site_name in case["siteCases"].as_array().unwrap() {
+            let site = fixture_site(site_name.as_str().unwrap());
+            let prepared = build_qoder_payload(
+                request,
+                model_config,
+                site,
+                model_key,
+                session_id,
+                user_type,
+                now_ms,
+            )
+            .unwrap();
+            for (pointer, expected) in projection {
+                if expected.as_str() == Some("<absent>") {
+                    assert!(
+                        prepared.body.pointer(pointer).is_none(),
+                        "{site:?} unexpectedly emitted {pointer}"
+                    );
+                } else {
+                    assert_eq!(
+                        prepared.body.pointer(pointer),
+                        Some(expected),
+                        "{site:?} projection drift at {pointer}"
+                    );
+                }
+            }
+            assert_eq!(prepared.body["business"]["begin_at"], now_ms);
+            assert_eq!(prepared.body["chat_record_id"], prepared.body["request_id"]);
+            assert_eq!(prepared.body["session_id"], session_id);
+            for (pointer, kind) in case["randomFieldSchema"].as_object().unwrap() {
+                match kind.as_str().unwrap() {
+                    "uuid_v4" => assert_uuid_v4(
+                        prepared.body.pointer(pointer).unwrap().as_str().unwrap(),
+                        pointer,
+                    ),
+                    "same_as_request_id" => assert_eq!(
+                        prepared.body.pointer(pointer),
+                        prepared.body.pointer("/request_id"),
+                        "{pointer} must remain tied to request_id"
+                    ),
+                    other => panic!("unknown Qoder oracle random field kind {other:?}"),
+                }
+            }
+            let mut normalized = prepared.body.clone();
+            for (pointer, placeholder) in [
+                ("/request_id", "<request_id_uuid_v4>"),
+                ("/request_set_id", "<request_set_id_uuid_v4>"),
+                ("/chat_record_id", "<request_id_uuid_v4>"),
+                ("/business/id", "<business_id_uuid_v4>"),
+            ] {
+                *normalized
+                    .pointer_mut(pointer)
+                    .unwrap_or_else(|| panic!("{site:?} is missing normalized field {pointer}")) =
+                    Value::String(placeholder.to_string());
+            }
+            assert_eq!(
+                normalized, case["normalizedServerBody"],
+                "{site:?} full normalized Qoder payload drifted"
+            );
+        }
+
+        for vector in fixture["encodingVectors"].as_array().unwrap() {
+            let plain = vector["plainUtf8"].as_str().unwrap();
+            let encoded = vector["encoded"].as_str().unwrap();
+            assert_eq!(qoder_encode(plain.as_bytes()), encoded);
+            assert_eq!(qoder_decode(encoded).unwrap(), plain.as_bytes());
+        }
+        let signature = &fixture["signatureVector"];
+        assert_eq!(
+            sign_qoder_request(
+                signature["payloadBase64"].as_str().unwrap(),
+                signature["cosyKey"].as_str().unwrap(),
+                signature["unixSeconds"].as_str().unwrap(),
+                signature["encodedBody"].as_str().unwrap(),
+                signature["signaturePath"].as_str().unwrap(),
+            ),
+            signature["signatureMd5"].as_str().unwrap()
+        );
+
+        for rail in fixture["rails"].as_array().unwrap() {
+            let site = fixture_site(rail["site"].as_str().unwrap());
+            let profile = site.profile();
+            let origins = rail["origins"].as_object().unwrap();
+            assert_eq!(origins["device"], origin(profile.device_authorization_url));
+            assert_eq!(origins["openapi"], origin(profile.openapi_base_url));
+            assert_eq!(origins["generation"], origin(profile.gateway_base_url));
+            assert_eq!(
+                origins["jobGeneration"],
+                origin(profile.job_gateway_base_url)
+            );
+            match profile.center_base_url {
+                Some(center) => assert_eq!(origins["center"], origin(center)),
+                None => assert!(origins.get("center").is_none()),
+            }
+            let login = &rail["login"];
+            if rail["credentialRail"] == "pat_job_token" {
+                assert_eq!(
+                    login["patExchangePath"],
+                    crate::domain::qoder::QODER_PAT_EXCHANGE_PATH
+                );
+                assert_eq!(login["persistentJobToken"], false);
+            }
+            assert_eq!(rail["wire"]["actualPath"], QODER_GENERATION_PATH);
+            assert_eq!(
+                rail["wire"]["signaturePath"],
+                QODER_GENERATION_SIGNATURE_PATH
+            );
+            assert_eq!(rail["catalog"]["actualPath"], QODER_MODEL_LIST_PATH);
+            assert_eq!(
+                rail["catalog"]["signaturePath"],
+                QODER_MODEL_LIST_SIGNATURE_PATH
+            );
+            assert_eq!(rail["quota"]["actualPath"], QODER_QUOTA_PATH);
+            assert_eq!(rail["quota"]["signaturePath"], QODER_QUOTA_SIGNATURE_PATH);
+            assert_eq!(rail["wire"]["clientVersion"], profile.client_version);
+            assert_eq!(rail["wire"]["clientType"], profile.client_type);
+            assert_eq!(rail["wire"]["dataPolicy"], profile.data_policy);
+
+            let encoded = qoder_encode(br#"{"messages":[]}"#);
+            let signing_time = chrono::Utc::now().timestamp();
+            let headers = session_for_site(site)
+                .signed_headers(
+                    encoded.as_bytes(),
+                    QODER_GENERATION_SIGNATURE_PATH,
+                    signing_time,
+                    "018f47ec-51d8-4c2a-9c2b-4f859709c9e7",
+                    "x86_64_linux",
+                    "127.0.0.1",
+                )
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let required_headers = rail["wire"]["requiredHeaders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap().to_string())
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual_headers = headers
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                actual_headers, required_headers,
+                "{} full signed-header set drifted",
+                rail["id"]
+            );
+            for name in rail["wire"]["forbiddenHeaders"].as_array().unwrap() {
+                assert!(
+                    !headers.contains_key(name.as_str().unwrap()),
+                    "{} emitted forbidden header {}",
+                    rail["id"],
+                    name
+                );
+            }
+            let value = |name: &str| headers.get(name).map(String::as_str).unwrap();
+            assert_eq!(value("accept"), "text/event-stream");
+            assert_eq!(value("accept-encoding"), "identity");
+            assert!(value("authorization").starts_with("Bearer COSY."));
+            assert_eq!(value("cache-control"), "no-cache");
+            assert_eq!(value("content-type"), "application/json");
+            assert_eq!(value("cosy-bodyhash"), "facac0076db526320e15300687844aa2");
+            assert_eq!(value("cosy-bodylength"), "20");
+            assert_eq!(value("cosy-clienttype"), profile.client_type);
+            assert_eq!(value("cosy-data-policy"), profile.data_policy);
+            assert_eq!(value("cosy-date"), signing_time.to_string());
+            assert!(!value("cosy-key").is_empty());
+            assert_eq!(value("cosy-machineos"), "x86_64_linux");
+            assert_eq!(value("cosy-organization-id"), "oracle-org");
+            assert_eq!(value("cosy-sigpath"), QODER_GENERATION_SIGNATURE_PATH);
+            assert_eq!(value("cosy-user"), "oracle-uid");
+            assert_eq!(value("cosy-version"), profile.client_version);
+            assert_eq!(value("login-version"), "v2");
+            assert_eq!(
+                value("x-request-id"),
+                "018f47ec-51d8-4c2a-9c2b-4f859709c9e7"
+            );
+            match site {
+                QoderSite::Global => {
+                    assert_eq!(
+                        value("cosy-machineid"),
+                        "0123456789abcdef0123456789abcdef0123"
+                    );
+                    assert_eq!(
+                        value("cosy-clientip"),
+                        "0123456789abcdef0123456789abcdef0123"
+                    );
+                    assert_eq!(value("cosy-machinetoken"), "synthetic-machine");
+                    assert_eq!(value("cosy-machinetype"), "5");
+                    assert_eq!(value("cosy-organization-tags"), "Normal");
+                    assert_eq!(value("cosy-scene"), "assistant");
+                    assert_eq!(value("cosy-business-product"), "cli");
+                    assert_eq!(value("cosy-business-type"), "agent");
+                }
+                QoderSite::Cn => {
+                    assert_eq!(
+                        value("cosy-machineid"),
+                        "018f47ec-51d8-4c2a-9c2b-4f859709c9e7"
+                    );
+                    assert_eq!(value("cosy-clientip"), "127.0.0.1");
+                    assert_eq!(value("cosy-machinecode"), "");
+                    assert_eq!(value("cosy-machinetoken"), "");
+                    assert_eq!(value("cosy-machinetype"), "");
+                    assert_eq!(value("cosy-organization-tags"), "");
+                }
+            }
+        }
+
+        let catalog_case = &fixture["catalogCase"];
+        let fetched = parse_qoder_model_catalog(
+            &catalog_case["input"],
+            fixture_site(catalog_case["site"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.enabled_models,
+            catalog_case["enabledModelKeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(fetched.raw_configs.contains_key("hidden"));
+        let public = QoderModelCatalog {
+            enabled_models: fetched.enabled_models,
+            raw_configs: fetched.raw_configs,
+            capabilities: fetched.capabilities,
+            fetched_at_ms: 1,
+            expires_at_ms: 2,
+        }
+        .public_models(QoderSite::Global)
+        .into_iter()
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            public,
+            catalog_case["publicModelIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            parse_qoder_model_catalog(&json!({"chat": []}), QoderSite::Global)
+                .unwrap()
+                .enabled_models
+                .is_empty()
+        );
     }
 }

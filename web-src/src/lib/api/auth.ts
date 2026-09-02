@@ -12,9 +12,12 @@ export type ManagedAuthProvider =
   | "kiro_oauth"
   | "amazon_q_oauth"
   | "kimi_code"
-  | "qoder_cosy";
+  | "qoder_cosy"
+  | "codebuddy_oauth"
+  | "trae_solo";
 
 export type QoderSite = "global" | "cn";
+export type CodeBuddySite = "intl" | "cn";
 export type QoderCredentialRail = "global_oauth" | "cn_oauth" | "pat_job_token";
 
 export interface DeepSeekAccount {
@@ -112,7 +115,7 @@ export interface ManagedAuthDeviceCodeResponse {
   interval: number;
   state?: string | null;
   verification_uri_complete?: string | null;
-  site?: QoderSite | null;
+  site?: QoderSite | CodeBuddySite | null;
 }
 
 export interface ImportGrokAuthJsonResponse {
@@ -296,6 +299,8 @@ export async function authStartLogin(
   oauthFlowMode?: "web_paste" | "localhost" | "cli" | "cli_manual" | "device",
   kiroLoginProvider?: "google" | "github" | null,
   qoderSite?: QoderSite | null,
+  codeBuddySite?: CodeBuddySite | null,
+  accountId?: string | null,
 ): Promise<ManagedAuthDeviceCodeResponse> {
   if (shouldBlockLocalCallbackAuthInClientWeb(authProvider)) {
     throw new Error(localCallbackAuthBlockedMessage());
@@ -306,6 +311,8 @@ export async function authStartLogin(
     oauthFlowMode: oauthFlowMode || null,
     kiroLoginProvider: kiroLoginProvider || null,
     qoderSite: qoderSite || null,
+    ...(codeBuddySite ? { codeBuddySite } : {}),
+    ...(accountId ? { accountId } : {}),
   });
 }
 

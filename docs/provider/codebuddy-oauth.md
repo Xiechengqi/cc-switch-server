@@ -1,6 +1,6 @@
-# CodeBuddy OAuth 单账号反代（实施规划）
+# CodeBuddy OAuth 单账号反代（实现合同）
 
-> **状态：规划，未实现。** 仓库中尚不存在 `codebuddy_oauth` ProviderType、driver、profile 或账号域模型。本文中的"必须/固定/不允许"是**实现约束**，不是既有行为描述，不能据此认为已有验收结论。
+> **状态：本地实现完成，`fixture_verified / live_pending`。** 当前实现包含 `codebuddy_oauth` ProviderType、双站点账号域模型、OAuth/refresh、三 Surface driver、严格流终态、同账号恢复、目录、额度、管理 API 与 Web 入口。本文是这些本地实现的权威合同；后文保留的“新增/实现时”措辞记录设计落点，不表示对应代码仍缺失。仓库尚无 Intl/CN 两站真实订阅的脱敏 receipt，因此不得写成 `live_verified` 或发布级真站兼容。
 >
 > 本文只写**已证实**的部分。所有未决项、以及它们各自的判定标准与抓包方法，见 workbuddy-cliproxy 仓库的 `codebuddy-open-questions.md`，编号 `U1`–`U15` 在两份文档间通用。
 >
@@ -451,7 +451,7 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
   }
   ```
   `capabilities.images` 先置 `false`；国际版目录含图像/视频模型，但在 U5/U11 确认 wire 形态前不开。
-- `profiles` +3：`claude.codebuddy_oauth` / `codex.codebuddy_oauth` / `gemini.codebuddy_oauth`，`formComposition: "managed_account"`、`endpointPolicy: "fixed"`、`credentialPolicy: { mode: "managed_account", accountProviderType: "codebuddy_oauth" }`、`modelPolicy: "single"`、`allowedModelPolicies: ["single","passthrough"]`、`maturity: "experimental"`、`defaultUpstreamModel: ""`（理由见 §6.3）
+- `profiles` +3：`claude.codebuddy_oauth` / `codex.codebuddy_oauth` / `gemini.codebuddy_oauth`，`formComposition: "managed_account"`、`endpointPolicy: "fixed"`、`credentialPolicy: { mode: "managed_account", accountProviderType: "codebuddy_oauth" }`、`modelPolicy: "single"`、`allowedModelPolicies: ["single","passthrough"]`、`maturity: "experimental"`、`defaultUpstreamModel: "auto"`。`auto` 只是表单必需的站点中立 sentinel，运行时必须按绑定 Account 的 site 解析，绝不能直接发往上游。
 - `conformance` +1：初始 `forward: "live_pending"`、`test: "live_pending"`、`discovery: "live_pending"`
 
 ### 7.2 注册表不变量

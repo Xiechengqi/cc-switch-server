@@ -11,6 +11,7 @@ vi.mock("@/lib/runtime", () => ({
 import {
   authPollForAccount,
   authStartLogin,
+  authSubmitOauthCallback,
   deepseekAccountAdd,
   importQoderPat,
   isOpenAiCliOAuthOriginAllowed,
@@ -119,6 +120,51 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
         deviceCode: "device-code",
         githubDomain: null,
         flowState: "flow-state",
+      },
+    );
+  });
+
+  it("keeps CodeBuddy site selection in the managed auth contract", async () => {
+    runtimeMocks.invokeCommand.mockResolvedValue(null);
+
+    await authStartLogin(
+      "codebuddy_oauth",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "cn",
+    );
+
+    expect(runtimeMocks.invokeCommand).toHaveBeenCalledWith(
+      "auth_start_login",
+      {
+        authProvider: "codebuddy_oauth",
+        githubDomain: null,
+        oauthFlowMode: null,
+        kiroLoginProvider: null,
+        qoderSite: null,
+        codeBuddySite: "cn",
+      },
+    );
+  });
+
+  it("submits a complete Trae callback against the active flow", async () => {
+    runtimeMocks.invokeCommand.mockResolvedValue({ id: "trae-account" });
+
+    await authSubmitOauthCallback(
+      "trae_solo",
+      "trae-flow",
+      "http://localhost:15721/api/accounts/trae/login/callback?code=x",
+    );
+
+    expect(runtimeMocks.invokeCommand).toHaveBeenCalledWith(
+      "auth_submit_oauth_code",
+      {
+        authProvider: "trae_solo",
+        deviceCode: "trae-flow",
+        callbackUrl:
+          "http://localhost:15721/api/accounts/trae/login/callback?code=x",
       },
     );
   });

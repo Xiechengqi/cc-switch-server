@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -269,6 +269,13 @@ pub async fn refresh_account_quota(
         ProviderType::QoderCosy => {
             refresh_qoder_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
+        ProviderType::CodeBuddyOAuth => {
+            refresh_codebuddy_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
+                .await?
+        }
+        ProviderType::TraeSolo => {
+            refresh_trae_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
+        }
         ProviderType::CursorOAuth => {
             refresh_cursor_dashboard_quota(
                 http,
@@ -304,6 +311,663 @@ pub async fn refresh_account_quota(
     Ok(QuotaRefreshResult::Updated {
         update,
         message: "quota refreshed from upstream provider".to_string(),
+    })
+}
+
+async fn refresh_codebuddy_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let body =
+        crate::clients::oauth::codebuddy::fetch_billing_resource(http, account, request_timeout)
+            .await
+            .map_err(|error| codebuddy_quota_failure(error, now_ms))?;
+    parse_codebuddy_quota_update(account, &body, now_ms, success_cooldown_ms)
+}
+
+fn codebuddy_quota_failure(
+    error: crate::clients::oauth::codebuddy::CodeBuddyClientError,
+    now_ms: i64,
+) -> QuotaRefreshFailure {
+    let upstream_status = error.upstream_status.map(|status| status.as_u16());
+    let retryable = error.is_transient();
+    QuotaRefreshFailure {
+        status_code: error.status.as_u16(),
+        upstream_status,
+        message: crate::logging::redact_sensitive_text(&error.message),
+        retryable,
+        next_refresh_at: retryable.then_some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        partial_update: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodeBuddyQuotaPackage {
+    package_name: Option<String>,
+    sub_product_code: Option<String>,
+    capacity_size: f64,
+    capacity_remain: f64,
+    capacity_unit: String,
+    cycle_end_time: String,
+    expires_at_ms: i64,
+}
+
+fn parse_codebuddy_quota_update(
+    account: &Account,
+    body: &Value,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let data = body.pointer("/data/Response/Data").ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::CodeBuddyOAuth,
+            "response contains no data.Response.Data billing envelope",
+            now_ms,
+        )
+    })?;
+    let object = data.as_object().ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::CodeBuddyOAuth,
+            "data.Response.Data must be an object",
+            now_ms,
+        )
+    })?;
+    let total_count =
+        codebuddy_required_nonnegative_integer(object.get("TotalCount"), "TotalCount").map_err(
+            |message| QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms),
+        )?;
+    let total_dosage =
+        codebuddy_required_nonnegative_number(object.get("TotalDosage"), "TotalDosage").map_err(
+            |message| QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms),
+        )?;
+    let accounts = object
+        .get("Accounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::CodeBuddyOAuth,
+                "data.Response.Data.Accounts must be an array",
+                now_ms,
+            )
+        })?;
+    if accounts.is_empty() {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::CodeBuddyOAuth,
+            "billing resource package list is empty; availability is unknown",
+            now_ms,
+        ));
+    }
+    if total_count != accounts.len() as u64 {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::CodeBuddyOAuth,
+            format!(
+                "billing TotalCount {total_count} does not match the complete Accounts page of {} packages",
+                accounts.len()
+            ),
+            now_ms,
+        ));
+    }
+
+    let mut packages = Vec::with_capacity(accounts.len());
+    for (index, value) in accounts.iter().enumerate() {
+        let package = value.as_object().ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::CodeBuddyOAuth,
+                format!("billing resource package {index} must be an object"),
+                now_ms,
+            )
+        })?;
+        let package_name =
+            codebuddy_optional_bounded_string(package.get("PackageName"), "PackageName").map_err(
+                |message| QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms),
+            )?;
+        let sub_product_code =
+            codebuddy_optional_bounded_string(package.get("SubProductCode"), "SubProductCode")
+                .map_err(|message| {
+                    QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+                })?;
+        if package_name.is_none() && sub_product_code.is_none() {
+            return Err(QuotaRefreshFailure::parse(
+                ProviderType::CodeBuddyOAuth,
+                format!(
+                    "billing resource package {index} has neither PackageName nor SubProductCode"
+                ),
+                now_ms,
+            ));
+        }
+        let capacity_size =
+            codebuddy_required_nonnegative_number(package.get("CapacitySize"), "CapacitySize")
+                .map_err(|message| {
+                    QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+                })?;
+        let capacity_remain =
+            codebuddy_required_nonnegative_number(package.get("CapacityRemain"), "CapacityRemain")
+                .map_err(|message| {
+                    QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+                })?;
+        if capacity_remain > capacity_size {
+            return Err(QuotaRefreshFailure::parse(
+                ProviderType::CodeBuddyOAuth,
+                format!("billing resource package {index} CapacityRemain exceeds CapacitySize"),
+                now_ms,
+            ));
+        }
+        let capacity_unit =
+            codebuddy_optional_bounded_string(package.get("CapacityUnit"), "CapacityUnit")
+                .map_err(|message| {
+                    QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+                })?
+                .ok_or_else(|| {
+                    QuotaRefreshFailure::parse(
+                        ProviderType::CodeBuddyOAuth,
+                        format!("billing resource package {index} is missing CapacityUnit"),
+                        now_ms,
+                    )
+                })?;
+        let capacity_unit = match capacity_unit.to_ascii_lowercase().as_str() {
+            "credit" | "credits" => "credits".to_string(),
+            _ => {
+                return Err(QuotaRefreshFailure::parse(
+                    ProviderType::CodeBuddyOAuth,
+                    format!("billing resource package {index} has unsupported CapacityUnit"),
+                    now_ms,
+                ))
+            }
+        };
+        let cycle_end_time =
+            codebuddy_optional_bounded_string(package.get("CycleEndTime"), "CycleEndTime")
+                .map_err(|message| {
+                    QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+                })?
+                .ok_or_else(|| {
+                    QuotaRefreshFailure::parse(
+                        ProviderType::CodeBuddyOAuth,
+                        format!("billing resource package {index} is missing CycleEndTime"),
+                        now_ms,
+                    )
+                })?;
+        let expires_at_ms = codebuddy_billing_timestamp_ms(&cycle_end_time).ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::CodeBuddyOAuth,
+                format!("billing resource package {index} has invalid CycleEndTime"),
+                now_ms,
+            )
+        })?;
+        packages.push(CodeBuddyQuotaPackage {
+            package_name,
+            sub_product_code,
+            capacity_size,
+            capacity_remain,
+            capacity_unit,
+            cycle_end_time,
+            expires_at_ms,
+        });
+    }
+    packages.sort_by(|left, right| {
+        left.expires_at_ms
+            .cmp(&right.expires_at_ms)
+            .then_with(|| left.package_name.cmp(&right.package_name))
+            .then_with(|| left.sub_product_code.cmp(&right.sub_product_code))
+    });
+    if !packages.iter().any(|package| package.capacity_size > 0.0) {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::CodeBuddyOAuth,
+            "billing resource packages contain no positive authoritative capacity; availability is unknown",
+            now_ms,
+        ));
+    }
+
+    let mut tiers = Vec::with_capacity(packages.len());
+    let mut projections = Vec::with_capacity(packages.len());
+    for (index, package) in packages.iter().enumerate() {
+        let used = (package.capacity_size - package.capacity_remain).max(0.0);
+        let utilization =
+            (package.capacity_size > 0.0).then_some((used / package.capacity_size).clamp(0.0, 1.0));
+        let label = package
+            .package_name
+            .clone()
+            .or_else(|| package.sub_product_code.clone());
+        tiers.push(AccountQuotaTier {
+            name: format!("codebuddy_package_{}", index + 1),
+            label: label.clone(),
+            utilization,
+            used: Some(used),
+            limit: Some(package.capacity_size),
+            unit: Some(package.capacity_unit.clone()),
+            resets_at: Some(package.expires_at_ms),
+            source: Some("codebuddy_billing_resource".to_string()),
+            ..Default::default()
+        });
+        // Deliberate whitelist: never preserve Tencent billing account IDs,
+        // deal/resource IDs, payer UINs, or future vendor fields.
+        projections.push(json!({
+            "packageName": package.package_name,
+            "subProductCode": package.sub_product_code,
+            "capacitySize": package.capacity_size,
+            "capacityRemain": package.capacity_remain,
+            "capacityUnit": package.capacity_unit,
+            "cycleEndTime": package.cycle_end_time,
+            "expiresAt": package.expires_at_ms,
+        }));
+    }
+    let availability = if packages.iter().any(|package| package.capacity_remain > 0.0) {
+        "available"
+    } else {
+        "exhausted"
+    };
+    let subscription_level = packages
+        .first()
+        .and_then(|package| {
+            package
+                .package_name
+                .clone()
+                .or_else(|| package.sub_product_code.clone())
+        })
+        .or_else(|| account.subscription_level.clone())
+        .or_else(|| Some("CodeBuddy".to_string()));
+    let quota = AccountQuota {
+        success: true,
+        credential_message: subscription_level.clone(),
+        tiers,
+        extra_usage: Some(json!({
+            "source": "codebuddy_billing_resource",
+            "codeBuddyBilling": {
+                "availability": availability,
+                "totalCount": total_count,
+                "totalDosage": total_dosage,
+                "packages": projections,
+            }
+        })),
+    };
+    let mut update =
+        update_from_quota(quota, subscription_level, None, now_ms, success_cooldown_ms);
+    update.entitlement_status = Some(availability.to_string());
+    // This quota is display/control-plane evidence only. It must never create
+    // a routing cooldown or participate in account selection.
+    update.rate_limited_until = None;
+    update.clear_rate_limited_until_if = None;
+    Ok(update)
+}
+
+fn codebuddy_required_nonnegative_integer(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("CodeBuddy billing response is missing {field}"))?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+        .ok_or_else(|| format!("CodeBuddy billing {field} must be a non-negative integer"))
+}
+
+fn codebuddy_required_nonnegative_number(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<f64, String> {
+    let value = value.ok_or_else(|| format!("CodeBuddy billing response is missing {field}"))?;
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| format!("CodeBuddy billing {field} must be a finite non-negative number"))
+}
+
+fn codebuddy_optional_bounded_string(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("CodeBuddy billing {field} must be a string"))?
+        .trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(format!(
+            "CodeBuddy billing {field} exceeds its safe display bounds"
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn codebuddy_billing_timestamp_ms(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|value| value.timestamp_millis())
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|value| value.and_utc().timestamp_millis())
+        })
+}
+
+async fn refresh_trae_quota(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let body = crate::clients::oauth::trae::fetch_entitlement_usage(http, account, request_timeout)
+        .await
+        .map_err(|error| trae_quota_failure(error, now_ms))?;
+    parse_trae_quota_update(account, &body, now_ms, success_cooldown_ms)
+}
+
+fn trae_quota_failure(
+    error: crate::clients::oauth::trae::TraeClientError,
+    now_ms: i64,
+) -> QuotaRefreshFailure {
+    let upstream_status = error.upstream_status.map(|status| status.as_u16());
+    let retryable = error.is_transient();
+    QuotaRefreshFailure {
+        status_code: error.status.as_u16(),
+        upstream_status,
+        message: crate::logging::redact_sensitive_text(&error.message),
+        retryable,
+        next_refresh_at: retryable.then_some(now_ms.saturating_add(QUOTA_FAILURE_COOLDOWN_MS)),
+        partial_update: None,
+    }
+}
+
+fn parse_trae_quota_update(
+    account: &Account,
+    body: &Value,
+    now_ms: i64,
+    success_cooldown_ms: i64,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let packs = trae_entitlement_packs(body).ok_or_else(|| {
+        QuotaRefreshFailure::parse(
+            ProviderType::TraeSolo,
+            "response contains no user_entitlement_pack_list",
+            now_ms,
+        )
+    })?;
+    if packs.is_empty() {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::TraeSolo,
+            "entitlement pack list is explicitly empty; availability is unknown",
+            now_ms,
+        ));
+    }
+
+    let mut tiers = Vec::new();
+    let mut projections = Vec::with_capacity(packs.len());
+    let mut total_limit = 0.0;
+    let mut total_used = 0.0;
+    let mut plan = None;
+    let mut latest_expiry: Option<i64> = None;
+    for (index, pack) in packs.iter().enumerate() {
+        let object = pack.as_object().ok_or_else(|| {
+            QuotaRefreshFailure::parse(
+                ProviderType::TraeSolo,
+                format!("entitlement pack {index} must be an object"),
+                now_ms,
+            )
+        })?;
+        let pack_plan = trae_first_string(
+            pack,
+            &[
+                &["entitlement_base_info", "plan_name"],
+                &["entitlement_base_info", "display_name"],
+                &["entitlement_base_info", "entitlement_name"],
+                &["plan_name"],
+                &["display_name"],
+                &["name"],
+            ],
+        );
+        if plan.is_none() {
+            plan = pack_plan.clone();
+        }
+        let status = trae_first_string(
+            pack,
+            &[
+                &["entitlement_base_info", "status"],
+                &["entitlement_base_info", "entitlement_status"],
+                &["status"],
+            ],
+        );
+        let period = trae_first_string(
+            pack,
+            &[
+                &["entitlement_base_info", "period"],
+                &["quota", "period"],
+                &["period"],
+            ],
+        );
+        let period_start = trae_first_timestamp(
+            pack,
+            &[
+                &["entitlement_base_info", "period_start"],
+                &["entitlement_base_info", "start_time"],
+                &["quota", "start_time"],
+                &["start_time"],
+                &["start_at"],
+            ],
+        );
+        let expires_at = trae_first_timestamp(
+            pack,
+            &[
+                &["entitlement_base_info", "period_end"],
+                &["entitlement_base_info", "end_time"],
+                &["entitlement_base_info", "expire_time"],
+                &["quota", "end_time"],
+                &["end_time"],
+                &["expire_time"],
+                &["expires_at"],
+            ],
+        );
+        latest_expiry = match (latest_expiry, expires_at) {
+            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+            (None, candidate) => candidate,
+            (current, None) => current,
+        };
+        let limit = trae_first_nonnegative_number(
+            pack,
+            &[
+                &["entitlement_base_info", "quota", "credits_limit"],
+                &["quota", "credits_limit"],
+            ],
+        )?;
+        let used = trae_first_nonnegative_number(
+            pack,
+            &[
+                &["usage", "credits_amount"],
+                &["usage", "credits_used"],
+                &["credits_used"],
+            ],
+        )?;
+        let (remaining, utilization) = match (limit, used) {
+            (Some(limit), Some(used)) if limit > 0.0 && used <= limit => (
+                Some((limit - used).max(0.0)),
+                Some((used / limit).clamp(0.0, 1.0)),
+            ),
+            (Some(limit), None) if limit > 0.0 => {
+                return Err(QuotaRefreshFailure::parse(
+                    ProviderType::TraeSolo,
+                    format!(
+                        "entitlement pack {index} has a positive credit limit but no authoritative usage; availability is unknown"
+                    ),
+                    now_ms,
+                ));
+            }
+            (Some(limit), Some(used)) if used > limit => {
+                return Err(QuotaRefreshFailure::parse(
+                    ProviderType::TraeSolo,
+                    format!("entitlement pack {index} usage exceeds its credit limit"),
+                    now_ms,
+                ));
+            }
+            _ => (None, None),
+        };
+        if let Some(limit) = limit.filter(|value| *value > 0.0) {
+            let used = used.expect("positive Trae credit limits require authoritative usage");
+            total_limit += limit;
+            total_used += used;
+            tiers.push(AccountQuotaTier {
+                name: format!("trae_entitlement_{}", index + 1),
+                label: pack_plan
+                    .clone()
+                    .or_else(|| Some(format!("Trae entitlement pack {}", index + 1))),
+                utilization,
+                used: Some(used),
+                limit: Some(limit),
+                unit: Some("entitlement_pack".to_string()),
+                resets_at: expires_at,
+                ..Default::default()
+            });
+        }
+        // This is deliberately a whitelist projection. Never retain the raw
+        // pack because vendor payloads may grow UID/device/token fields.
+        projections.push(json!({
+            "plan": pack_plan,
+            "status": status,
+            "period": period,
+            "periodStart": period_start,
+            "expiresAt": expires_at,
+            "credits": {
+                "limit": limit,
+                "used": used,
+                "remaining": remaining,
+                "utilization": utilization,
+                "unit": "entitlement_pack",
+            }
+        }));
+        let _ = object;
+    }
+    if tiers.is_empty() || total_limit <= 0.0 {
+        return Err(QuotaRefreshFailure::parse(
+            ProviderType::TraeSolo,
+            "entitlement packs contain no positive credit limit; availability is unknown",
+            now_ms,
+        ));
+    }
+
+    let utilization = (total_used / total_limit).clamp(0.0, 1.0);
+    let remaining = (total_limit - total_used).max(0.0);
+    let availability = if remaining > 0.0 {
+        "available"
+    } else {
+        "exhausted"
+    };
+    let plan = plan
+        .or_else(|| account.subscription_level.clone())
+        .or_else(|| Some("Trae CN Solo".to_string()));
+    let quota = AccountQuota {
+        success: true,
+        credential_message: plan.clone(),
+        tiers,
+        extra_usage: Some(json!({
+            "source": "trae_entitlement_usage",
+            "traeEntitlement": {
+                "availability": availability,
+                "totalCredits": total_limit,
+                "usedCredits": total_used,
+                "remainingCredits": remaining,
+                "utilization": utilization,
+                "expiresAt": latest_expiry,
+                "packs": projections,
+            }
+        })),
+    };
+    let mut update = update_from_quota(quota, plan, None, now_ms, success_cooldown_ms);
+    update.entitlement_status = Some(availability.to_string());
+    update.quota_percent = Some(utilization * 100.0);
+    // Quota observation is informational for this single-account rail. It
+    // must not install a cooldown that could participate in account routing.
+    update.rate_limited_until = None;
+    update.clear_rate_limited_until_if = None;
+    Ok(update)
+}
+
+fn trae_entitlement_packs(value: &Value) -> Option<&[Value]> {
+    match value {
+        Value::Array(values) => Some(values.as_slice()),
+        Value::Object(object) => {
+            if let Some(value) = trae_object_value(object, "user_entitlement_pack_list") {
+                return value.as_array().map(Vec::as_slice);
+            }
+            ["data", "Result", "result"]
+                .iter()
+                .find_map(|key| trae_object_value(object, key).and_then(trae_entitlement_packs))
+        }
+        _ => None,
+    }
+}
+
+fn trae_object_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    object.get(key).or_else(|| {
+        object
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
+}
+
+fn trae_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = trae_object_value(current.as_object()?, key)?;
+    }
+    Some(current)
+}
+
+fn trae_first_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        trae_path(value, path)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate(value, 256))
+    })
+}
+
+fn trae_first_nonnegative_number(
+    value: &Value,
+    paths: &[&[&str]],
+) -> Result<Option<f64>, QuotaRefreshFailure> {
+    for path in paths {
+        let Some(value) = trae_path(value, path).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let number = value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+            .filter(|value: &f64| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                QuotaRefreshFailure::bad_request(
+                    "Trae entitlement credits must be finite non-negative numbers",
+                )
+            })?;
+        return Ok(Some(number));
+    }
+    Ok(None)
+}
+
+fn trae_first_timestamp(value: &Value, paths: &[&[&str]]) -> Option<i64> {
+    paths.iter().find_map(|path| {
+        let value = trae_path(value, path)?;
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+            .and_then(timestamp_number_to_unix_ms)
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+                    .map(|value| value.timestamp_millis())
+            })
     })
 }
 
@@ -6632,6 +7296,318 @@ mod tests {
         assert!(failure.message.contains("[REDACTED]"));
         assert_eq!(failure.upstream_status, Some(502));
         assert!(failure.partial_update.is_none());
+    }
+
+    #[test]
+    fn trae_quota_projects_only_entitlement_usage_and_never_installs_routing_cooldown() {
+        let now_ms = 1_700_000_000_000;
+        let expires_at = now_ms + 86_400_000;
+        let account = imported_account(ProviderType::TraeSolo, json!({}));
+        let update = parse_trae_quota_update(
+            &account,
+            &json!({
+                "Result": {
+                    "user_entitlement_pack_list": [{
+                        "uid": "must-not-be-projected",
+                        "device_id": "must-not-be-projected",
+                        "access_token": "must-not-be-projected",
+                        "entitlement_base_info": {
+                            "plan_name": "Trae Solo Pro",
+                            "status": "active",
+                            "period": "monthly",
+                            "period_start": now_ms,
+                            "period_end": expires_at,
+                            "quota": {"credits_limit": 2_000}
+                        },
+                        "usage": {"credits_amount": 500}
+                    }]
+                }
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(update.subscription_level.as_deref(), Some("Trae Solo Pro"));
+        assert_eq!(update.entitlement_status.as_deref(), Some("available"));
+        assert_eq!(update.quota_percent, Some(25.0));
+        assert!(update.rate_limited_until.is_none());
+        assert!(update.clear_rate_limited_until_if.is_none());
+        let quota = update.quota.unwrap();
+        assert_eq!(quota.tiers.len(), 1);
+        assert_eq!(quota.tiers[0].used, Some(500.0));
+        assert_eq!(quota.tiers[0].limit, Some(2_000.0));
+        assert_eq!(quota.tiers[0].resets_at, Some(expires_at));
+        let projection = quota.extra_usage.unwrap().to_string();
+        assert!(projection.contains("Trae Solo Pro"));
+        assert!(projection.contains("1500"));
+        assert!(!projection.contains("must-not-be-projected"));
+        assert!(!projection.contains("access_token"));
+        assert!(!projection.contains("device_id"));
+    }
+
+    #[test]
+    fn trae_quota_empty_or_non_authoritative_packs_are_unknown_errors_not_exhaustion() {
+        let account = imported_account(ProviderType::TraeSolo, json!({}));
+        for value in [
+            json!({"data": {"user_entitlement_pack_list": []}}),
+            json!({"user_entitlement_pack_list": [{
+                "entitlement_base_info": {"quota": {"credits_limit": 0}},
+                "usage": {"credits_amount": 0}
+            }]}),
+            json!({"user_entitlement_pack_list": [{
+                "entitlement_base_info": {"quota": {"credits_limit": 100}}
+            }]}),
+            json!({"result": {}}),
+        ] {
+            let error = parse_trae_quota_update(&account, &value, 1_000, 300_000).unwrap_err();
+            assert_eq!(error.status_code, 502);
+            assert!(error.partial_update.is_none());
+            assert!(!error.message.contains("exhausted"));
+        }
+    }
+
+    #[test]
+    fn codebuddy_quota_sorts_packages_normalizes_units_and_projects_only_safe_fields() {
+        let now_ms = 1_700_000_000_000;
+        let account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
+        let update = parse_codebuddy_quota_update(
+            &account,
+            &json!({
+                "code": 0,
+                "data": {"Response": {"Data": {
+                    "TotalCount": 2,
+                    "TotalDosage": 350,
+                    "Accounts": [
+                        {
+                            "PackageName": "Bonus Pack",
+                            "SubProductCode": "bonus",
+                            "CapacitySize": "250",
+                            "CapacityRemain": 200,
+                            "CapacityUnit": "credits",
+                            "CycleEndTime": "2026-09-14 14:15:28",
+                            "Uin": "sensitive-uin",
+                            "AppId": "sensitive-app",
+                            "AccountId": "sensitive-account",
+                            "DealName": "sensitive-deal",
+                            "ResourceId": "sensitive-resource",
+                            "AccountAttributes": [{"payerUin": "sensitive-payer"}]
+                        },
+                        {
+                            "PackageName": "Free Plan Subscription",
+                            "SubProductCode": "free",
+                            "CapacitySize": 100,
+                            "CapacityRemain": 100,
+                            "CapacityUnit": "credit",
+                            "CycleEndTime": "2026-08-31 23:59:59"
+                        }
+                    ]
+                }}}
+            }),
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(
+            update.subscription_level.as_deref(),
+            Some("Free Plan Subscription")
+        );
+        assert_eq!(update.entitlement_status.as_deref(), Some("available"));
+        assert!(update.rate_limited_until.is_none());
+        assert!(update.clear_rate_limited_until_if.is_none());
+        let quota = update.quota.unwrap();
+        assert_eq!(quota.tiers.len(), 2);
+        assert_eq!(
+            quota.tiers[0].label.as_deref(),
+            Some("Free Plan Subscription")
+        );
+        assert_eq!(quota.tiers[0].unit.as_deref(), Some("credits"));
+        assert_eq!(quota.tiers[0].used, Some(0.0));
+        assert_eq!(quota.tiers[0].limit, Some(100.0));
+        assert_eq!(quota.tiers[1].used, Some(50.0));
+        assert_eq!(quota.tiers[1].limit, Some(250.0));
+        assert!(quota.tiers[0].resets_at < quota.tiers[1].resets_at);
+        let projection = quota.extra_usage.unwrap().to_string();
+        assert!(projection.contains("\"totalDosage\":350.0"));
+        assert!(projection.contains("Free Plan Subscription"));
+        for forbidden in [
+            "sensitive-uin",
+            "sensitive-app",
+            "sensitive-account",
+            "sensitive-deal",
+            "sensitive-resource",
+            "sensitive-payer",
+            "payerUin",
+            "ResourceId",
+        ] {
+            assert!(!projection.contains(forbidden), "{forbidden}: {projection}");
+        }
+    }
+
+    #[test]
+    fn codebuddy_quota_missing_or_inconsistent_authority_is_unknown_not_exhausted() {
+        let account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
+        for value in [
+            json!({"data":{"Response":{"Data":{"TotalCount":0,"TotalDosage":0,"Accounts":[]}}}}),
+            json!({"data":{"Response":{"Data":{"TotalCount":2,"TotalDosage":100,"Accounts":[{
+                "PackageName":"Plan","CapacitySize":100,"CapacityRemain":100,"CapacityUnit":"credit","CycleEndTime":"2026-01-01 00:00:00"
+            }]}}}}),
+            json!({"data":{"Response":{"Data":{"TotalCount":1,"TotalDosage":100,"Accounts":[{
+                "PackageName":"Plan","CapacitySize":100,"CapacityRemain":101,"CapacityUnit":"credit","CycleEndTime":"2026-01-01 00:00:00"
+            }]}}}}),
+            json!({"data":{"Response":{"Data":{"TotalCount":1,"TotalDosage":100,"Accounts":[{
+                "PackageName":"Plan","CapacitySize":100,"CapacityRemain":50,"CapacityUnit":"points","CycleEndTime":"2026-01-01 00:00:00"
+            }]}}}}),
+            json!({"data":{"Response":{"Data":{"TotalCount":1,"TotalDosage":0,"Accounts":[{
+                "PackageName":"Plan","CapacitySize":0,"CapacityRemain":0,"CapacityUnit":"credits","CycleEndTime":"2026-01-01 00:00:00"
+            }]}}}}),
+            json!({"data":{"Response":{"Data":{"TotalCount":1,"Accounts":[]}}}}),
+        ] {
+            let error = parse_codebuddy_quota_update(&account, &value, 1_000, 300_000).unwrap_err();
+            assert_eq!(error.status_code, 502);
+            assert!(error.partial_update.is_none());
+            assert!(!error.message.contains("exhausted"));
+        }
+    }
+
+    #[tokio::test]
+    async fn codebuddy_quota_dispatch_uses_only_the_fixed_billing_override_and_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let route_observations = std::sync::Arc::clone(&observations);
+        let app = axum::Router::new().route(
+            crate::domain::codebuddy::CODEBUDDY_RESOURCE_PATH,
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                    let observations = std::sync::Arc::clone(&route_observations);
+                    async move {
+                        observations.lock().unwrap().push(json!({
+                            "authorization": headers.get("authorization").and_then(|value| value.to_str().ok()),
+                            "uid": headers.get("x-user-id").and_then(|value| value.to_str().ok()),
+                            "domain": headers.get("x-domain").and_then(|value| value.to_str().ok()),
+                            "body": serde_json::from_slice::<Value>(&body).unwrap(),
+                        }));
+                        axum::Json(json!({
+                            "code": 0,
+                            "data": {"Response": {"Data": {
+                                "TotalCount": 1,
+                                "TotalDosage": 100,
+                                "Accounts": [{
+                                    "PackageName": "Intl Plan",
+                                    "SubProductCode": "intl",
+                                    "CapacitySize": 100,
+                                    "CapacityRemain": 75,
+                                    "CapacityUnit": "credit",
+                                    "CycleEndTime": "2027-01-01 00:00:00"
+                                }]
+                            }}}
+                        }))
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut account = imported_account(
+            ProviderType::CodeBuddyOAuth,
+            json!({
+                "testCodeBuddyBaseUrl": "http://127.0.0.1:1",
+                "testCodeBuddyBillingBaseUrl": format!("http://{address}")
+            }),
+        );
+        account.access_token = Some("codebuddy-billing-access".to_string());
+        account.refresh_token = Some("codebuddy-billing-refresh".to_string());
+        account.profile = Some(json!({
+            "site": "intl",
+            "domain": "www.codebuddy.ai",
+            "uid": "billing-user",
+            "enterpriseId": "",
+            "clientVersion": crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION,
+            "productPlatform": crate::domain::codebuddy::CODEBUDDY_PLATFORM
+        }));
+        let result = refresh_account_quota(
+            &reqwest::Client::new(),
+            &account,
+            1_700_000_000_000,
+            true,
+            300_000,
+            2_000,
+        )
+        .await
+        .unwrap();
+        let QuotaRefreshResult::Updated { update, .. } = result else {
+            panic!("forced CodeBuddy quota refresh must execute")
+        };
+        assert_eq!(update.entitlement_status.as_deref(), Some("available"));
+        assert_eq!(update.quota_percent, Some(25.0));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["authorization"],
+            "Bearer codebuddy-billing-access"
+        );
+        assert_eq!(observations[0]["uid"], "billing-user");
+        assert_eq!(observations[0]["domain"], "www.codebuddy.ai");
+        assert_eq!(observations[0]["body"]["ProductCode"], "p_tcaca");
+        assert_eq!(observations[0]["body"]["Status"], json!([0, 3]));
+        assert_eq!(observations[0]["body"]["PageSize"], 100);
+        drop(observations);
+        server.abort();
+    }
+
+    #[test]
+    fn frozen_qoder_cli_oracle_quota_case_drives_the_native_parser() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../assets/contract/qoder-cli-oracle.json"
+        ))
+        .expect("Qoder CLI oracle fixture must be valid JSON");
+        let quota_case = &fixture["quotaCase"];
+        let now_ms = 1_700_000_000_000;
+        let account = imported_account(ProviderType::QoderCosy, json!({}));
+        let update =
+            parse_qoder_quota_update(&account, &quota_case["input"], now_ms, 300_000).unwrap();
+        let quota = update.quota.as_ref().unwrap();
+        let mut bucket_ids = quota
+            .tiers
+            .iter()
+            .map(|tier| tier.name.as_str())
+            .collect::<Vec<_>>();
+        bucket_ids.sort_unstable();
+        assert_eq!(
+            bucket_ids,
+            quota_case["expectedBucketIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<Vec<_>>()
+        );
+        let projection = quota.extra_usage.as_ref().unwrap();
+        assert_eq!(projection["qoderQuota"]["availability"], "available");
+        assert_eq!(projection["qoderQuota"]["exhausted"], false);
+        if quota_case["informationalOnly"] == true {
+            assert_eq!(update.rate_limited_until, None);
+            assert_eq!(update.clear_rate_limited_until_if, None);
+        }
+
+        let mut missing_balance = quota_case["input"].clone();
+        for field in ["userQuota", "addOnQuota"] {
+            let bucket = missing_balance[field].as_object_mut().unwrap();
+            bucket.remove("used");
+            bucket.remove("remaining");
+        }
+        let missing = parse_qoder_quota_update(&account, &missing_balance, now_ms, 300_000)
+            .unwrap()
+            .quota
+            .unwrap()
+            .extra_usage
+            .unwrap();
+        assert_eq!(
+            missing["qoderQuota"]["availability"],
+            quota_case["missingBalanceState"]
+        );
+        assert_eq!(missing["qoderQuota"]["exhausted"], false);
     }
 
     #[test]

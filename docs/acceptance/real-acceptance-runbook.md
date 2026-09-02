@@ -62,6 +62,9 @@ RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/router-share-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 scripts/smoke/oauth-readiness-check.sh
 node scripts/smoke/grok-oauth-real.mjs
+CC_SWITCH_QODER_REAL_RAIL=global_oauth QODER_REAL_RECEIPT_FILE=/tmp/qoder-global-oauth-receipt.json node scripts/smoke/qoder-real.mjs
+CC_SWITCH_QODER_REAL_RAIL=global_pat QODER_REAL_RECEIPT_FILE=/tmp/qoder-global-pat-receipt.json node scripts/smoke/qoder-real.mjs
+CC_SWITCH_QODER_REAL_RAIL=cn_oauth QODER_REAL_RECEIPT_FILE=/tmp/qoder-cn-oauth-receipt.json node scripts/smoke/qoder-real.mjs
 CC_SWITCH_CODEX_IMAGES_SMOKE=1 node scripts/smoke/codex-images-real.mjs
 RUN_REAL=1 scripts/release-readiness.sh
 ```
@@ -172,6 +175,13 @@ credential.
 | `GROK_OAUTH_TEST_ACCOUNT` | Grok/xAI OAuth 测试账号 | 记录脱敏 email |
 | `CURSOR_OAUTH_TEST_ACCOUNT` | Cursor OAuth 测试账号 | 记录脱敏 email |
 | `ANTIGRAVITY_OAUTH_TEST_ACCOUNT` | Antigravity/Agy OAuth 测试账号 | 记录脱敏 email |
+| `CC_SWITCH_QODER_REAL_RAIL` | 单次 Qoder 验收 rail：`global_oauth`、`global_pat` 或 `cn_oauth` | 可完整记录 |
+| `QODER_REAL_RECEIPT_FILE` | 本次 Qoder 脱敏 receipt 的仓库外绝对路径；文件必须尚不存在 | 只记录路径类别，不提交文件 |
+| `QODER_GLOBAL_OAUTH_TEST_ACCOUNT` | Qoder Global Device OAuth Account ID 或唯一 selector | receipt 只记录稳定摘要 |
+| `QODER_GLOBAL_PAT_TEST_ACCOUNT` | Qoder Global PAT Account ID 或唯一 selector | receipt 只记录稳定摘要 |
+| `QODER_CN_OAUTH_TEST_ACCOUNT` | Qoder CN Device OAuth Account ID 或唯一 selector | receipt 只记录稳定摘要 |
+| `CC_SWITCH_QODER_<RAIL>_{CLAUDE,CODEX,GEMINI}_PROVIDER_ID` | 对应 rail 的三个显式 Provider ID；必须固定同一 Account generation | receipt 只记录整体 binding 摘要 |
+| `CC_SWITCH_QODER_<RAIL>_MODEL` | 可选的三 Surface 共同 live catalog 模型；缺省时取目录交集 | 可完整记录 |
 | `CODEX_OAUTH_REFRESH_TOKEN_FIXTURE` | Codex OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE` | Claude OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE` | Gemini OAuth/CLI 手动导入 refresh token fixture | 不记录明文 |
@@ -289,6 +299,17 @@ Grok OAuth 单账号专项补充：
 13. Quota 抓包同时覆盖 user、weekly、monthly、task usage 和 subscriptions。`currentPeriod.end`、`billingPeriodEnd`、token expiry 及 inactive subscription 不能成为订阅到期日；仅 active subscription 的明确 expiry 或账号手工 next-payment 值可进入 UI，且不影响凭据有效性和路由。
 14. 运行 `node scripts/smoke/grok-oauth-real.mjs`，通过同一个 `CC_SWITCH_SHARE_URL` 验收 models metadata、Responses JSON 和完整 SSE terminal。只有显式设置 `CC_SWITCH_GROK_MEDIA_SMOKE=1` 才运行图片；缺少 Share URL/Router token 或仍为占位符时的 `SKIP` 只能记录为 blocked-inputs，不能记录为真实通过。
 15. 检查 `/metrics` 中 Provider outcome、forward retry、WS fallback、CLI version gate、model catalog、账号 in-flight/max、warm refresh 和 persistence degraded 指标；labels 和 evidence 只含有界分类、Provider id、模型和脱敏账号，不得包含 access/refresh/ID token 或 raw OAuth/upstream body。
+
+Qoder 三条单账号 rail 专项补充：
+
+1. Global Device OAuth、Global PAT、CN Device OAuth 必须分三次独立运行，`CC_SWITCH_QODER_REAL_RAIL` 分别设为 `global_oauth`、`global_pat`、`cn_oauth`。每次只配置该 rail 的 Account selector 和 Claude/Codex/Gemini 三个 Provider ID；三个 Provider 必须为 `special.qoder_cosy` / `ready`，固定同一 `qoder_cosy` Account 和同一 `authIdentityGeneration`。另一账号、另一 rail、另一 site 与 decoy Provider 不得参与。
+2. OAuth Account 必须只有 access + refresh token presence，PAT Account 必须只有 PAT presence；Global/CN 由稳定 Account ID site 前缀及 Provider binding 双重核对。脚本只读取 `has*`、generation 和状态字段，不读取或输出 credential、profile、raw OAuth body、callback URL或 refresh error 原文。
+3. 三个 Surface 分别调用带显式 `app` + `providerId` 的 `/v1/models`，只接受 `source=qoder_live_model_catalog`、`stale=false`、有效 `fetchedAtMs` 和非空目录。显式 model 必须同时存在于三份目录；未指定时只从交集选择，成功空目录不能用静态目录、另一个 Account 或另一个 site 补齐。
+4. Quota 只刷新本次选中的 Account，必须返回 `qoderQuota.availability=available|exhausted|unknown` 的诚实投影。它是本次 receipt 的观测字段，不授权账号选择、权重、跨账号 fallback 或跨站恢复。
+5. 用同一 Share URL 对 Claude Messages、Codex Responses、Gemini generateContent 分别执行 non-stream 与 stream 短请求。每条 stream 必须读到上游 EOF 后恰有一个协议终态；缺终态、重复终态、终态后业务数据、坏 JSON 或提交后认证错误均失败，不能改用其他 Provider/Account/site。
+6. `QODER_REAL_RECEIPT_FILE` 必须是仓库外、父目录已存在、目标文件尚不存在的绝对路径。receipt 只保存 commit、site/rail、model、catalog/quota 状态、两个 generation、Account/Provider binding/path-header 的 SHA-256 摘要、Surface/terminal 状态、敏感扫描摘要和三个 decoy 计数零值；禁止保存 token、PAT、prompt、callback、raw request/response/body 或可逆 Account/Provider ID。
+7. 缺 `RUN_REAL=1`、Server/Share 鉴权、Account selector、任一 Provider ID 或 receipt path 时，脚本以成功退出码输出 `verificationState=blocked_inputs`、`liveState=live_pending`，不发网络请求且绝不输出 `live_verified`。三个 rail 的 receipt 缺一不可互相代替；只有对应真实账号的完整运行可以改变该 rail 的 live 状态。
+8. 本地运行 `node --test scripts/audit/qoder-real.test.mjs` 会以 loopback mock 分别覆盖三条 rail、binding fail-closed、blocked inputs 与泄漏扫描；其 receipt 固定为 `contract_verified/live_pending`，只证明 harness 合同。真实 Device Flow/PAT、refresh rotation、catalog、quota、三 Surface 与故障注入 receipt 未齐前，Registry/文档继续保持 `fixture_verified` / `live_pending`。
 
 GitHub Copilot 单账号三 Surface 专项补充：
 

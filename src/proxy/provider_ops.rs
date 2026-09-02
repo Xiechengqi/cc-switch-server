@@ -172,7 +172,11 @@ impl ProviderExecution {
             UpstreamProtocol::OpenAiResponses => Some("openai_responses"),
             UpstreamProtocol::GeminiNative => Some("gemini_native"),
             UpstreamProtocol::Special => match self.plan.driver_id.as_str() {
-                "special.cursor" | "special.copilot" | "special.qoder_cosy" => Some("openai_chat"),
+                "special.cursor"
+                | "special.copilot"
+                | "special.qoder_cosy"
+                | "special.codebuddy_oauth"
+                | "special.trae_solo" => Some("openai_chat"),
                 "special.grok_web_session" | "special.perplexity_web_session" => {
                     Some(match self.plan.provider_key.app {
                         AppKind::Claude => "anthropic",
@@ -1057,6 +1061,8 @@ fn managed_auth_is_protocol_owned(execution: &ProviderExecution) -> bool {
         "special.cursor"
             | "special.kiro"
             | "special.qoder_cosy"
+            | "special.codebuddy_oauth"
+            | "special.trae_solo"
             | "special.deepseek_account"
             | "special.copilot"
     )

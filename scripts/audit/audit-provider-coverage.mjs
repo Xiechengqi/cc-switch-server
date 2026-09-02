@@ -6,6 +6,11 @@ import process from "node:process";
 import {
   assertRequiredProviderCoverage,
 } from "./provider-profile-coverage.mjs";
+import {
+  auditQoderCliOracle,
+  loadQoderCliOracle,
+  oraclePath as qoderOraclePath,
+} from "./audit-qoder-cli-oracle.mjs";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const checkMode = process.argv.includes("--check");
@@ -30,6 +35,14 @@ const providerRegistryPath = path.join(
 const providerRegistry = JSON.parse(
   fs.readFileSync(providerRegistryPath, "utf8"),
 );
+const qoderOracle = loadQoderCliOracle();
+auditQoderCliOracle(qoderOracle);
+const qoderVerification = qoderOracle.verification;
+for (const [name, count] of Object.entries(qoderVerification)) {
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    throw new Error(`Qoder verification count ${name} must be a positive integer`);
+  }
+}
 
 const providerTypeMetadata = new Map(
   requirements.providerTypes.map((entry) => [entry.id, entry]),
@@ -62,6 +75,10 @@ function buildCoverage() {
       requirements: path.relative(repoRoot, requirementsPath),
       legacyCompatibility: path.relative(repoRoot, legacyCompatibilityPath),
       serverProviderTypes: requirements.providerTypeSource,
+      qoderOracle: path.relative(repoRoot, qoderOraclePath),
+    },
+    verification: {
+      qoder: qoderVerification,
     },
     providerTypes,
     presets: Object.fromEntries(
@@ -227,11 +244,11 @@ function toMarkdown(coverage) {
     );
   }
   lines.push("");
-  lines.push(...serverEvidenceNotes());
+  lines.push(...serverEvidenceNotes(coverage.verification.qoder));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function serverEvidenceNotes() {
+function serverEvidenceNotes(qoderVerification) {
   return [
     "## Server implementation notes",
     "",
@@ -264,7 +281,7 @@ function serverEvidenceNotes() {
     "",
     "### Provider-owned API-key Coding Plans",
     "",
-    "- The Registry contains 76 Profiles, including 20 typed `codingPlan` Profiles across Claude and Codex. Each contract fixes origin, upstream protocol, credential slot/auth scheme, route, reviewed model catalog, quota adapter, cache-token semantics, stream terminal, error envelope, and same-credential retry policy. These are Provider-owned credentials and never participate in Account pooling, rotation, quota selection, or cross-Provider fallback.",
+    `- The Registry contains ${providerRegistry.profiles.length} Profiles, including 20 typed \`codingPlan\` Profiles across Claude and Codex. Each contract fixes origin, upstream protocol, credential slot/auth scheme, route, reviewed model catalog, quota adapter, cache-token semantics, stream terminal, error envelope, and same-credential retry policy. These are Provider-owned credentials and never participate in Account pooling, rotation, quota selection, or cross-Provider fallback.`,
     "- `assets/contract/coding-plan-source-baseline.json` pins the reviewed OmniRoute and 9router commits plus every evidence-file SHA-256. `scripts/audit/audit-coding-plan-registry.mjs` derives a checked-in manifest and fails on any unreviewed Family, missing Claude/Codex surface, non-HTTPS/fixed route, credential-policy mismatch, model/quota/terminal drift, retry expansion, or stale generated output. `--check-sources` additionally verifies the available external repositories byte-for-byte. The manifest exposes region, maturity, `fixture_verified`/`live_pending`, model modality/context, and quota provenance; tools remain `not_inferred_without_explicit_model_evidence`.",
     "- Alibaba Coding Plan is split into China and Global/Singapore Families. Claude uses `x-api-key` against `/apps/anthropic/v1/messages`; Codex uses Bearer against `/v1/chat/completions`. Both regions have fixed DashScope Coding origins and reviewed catalogs. No stable official quota endpoint was evidenced, so the quota adapter is explicitly `unavailable` rather than inferred from console cookies or a different Alibaba Token Plan.",
     "- Within the Provider-owned Zhipu Coding Plan, `glm-5.3` is advertised only by the China and Global Codex Profiles. The reviewed 9router live receipt covers the OpenAI-compatible Coding endpoint and `reasoning_content`; it does not establish an Anthropic Messages rail, so the two Claude Profiles deliberately stop at their separately evidenced catalogs. Qoder independently maps a same-named model under the separate Qoder entitlement and never supplies Zhipu credentials.",
@@ -424,7 +441,7 @@ function serverEvidenceNotes() {
     "- Global/CN aliases project only currently enabled live routes. `/v1/models` publishes route-backed reasoning efforts, text modality, context window, and tool support; an unknown live route remains visible under its exact id but does not inherit guessed reasoning or context. Fixed-context routes set only `model_config.max_input_tokens`; runtime-selectable routes additionally set both COSY context override fields.",
     "- Claude Messages, OpenAI Responses/Chat, and Gemini inputs canonicalize into the Qoder conversation contract, while streamed/non-streamed outputs return the caller's protocol lifecycle. Text and declared tools are fixture-verified; image support remains unadvertised. Conversation identity is scoped to Share, signed user, Provider runtime, Account generations, and model rather than a global session id.",
     "- Quota exposes only reviewed COSY credit/usage evidence and keeps unavailable, unknown, stale, and supported states distinct. The public Account view exposes non-secret `site` and `credentialRail` only; PAT, access/job tokens, signing material, raw model config, and session secrets remain redacted.",
-    "- Forty-eight offline Qoder tests cover API/Web, signing clock/nonce bounds, dynamic model capability, three credential rails across three Surfaces, session/generation fencing, strict terminal handling, and a consecutive-401 proof that refreshes/re-exchanges only the bound Account once. Real device/PAT login, token exchange, model discovery, inference, tools, quota, expiry, and recovery remain `live_pending`; no live Qoder success is claimed. See `docs/provider/qoder-cosy.md`.",
+    `- ${qoderVerification.rustQoderTests} offline Rust Qoder tests cover API/Web, signing clock/nonce bounds, dynamic model capability, three credential rails across three Surfaces, session/generation fencing, strict terminal handling, and a consecutive-401 proof that refreshes/re-exchanges only the bound Account once. The independently frozen CLI oracle adds ${qoderVerification.nodeOracleMutationTests} mutation tests, and the loopback real-harness contract adds ${qoderVerification.nodeRealHarnessFixtureTests} fixture tests. Real device/PAT login, token exchange, model discovery, inference, tools, quota, expiry, and recovery remain \`live_pending\`; no live Qoder success is claimed. See \`docs/provider/qoder-cosy.md\`.`,
     "",
     "### `cursor_oauth` / `cursor_apikey` (Cursor AgentService)",
     "",

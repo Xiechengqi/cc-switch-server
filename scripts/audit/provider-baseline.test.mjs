@@ -77,7 +77,7 @@ test("Provider registry matches the shared runtime inventory expectations", () =
 test("first-class Server Profiles are committed additions, not candidates", () => {
   const compatibility = contract("provider-legacy-compatibility.json");
   const registry = contract("provider-registry.json");
-  assert.equal(compatibility.firstClassProfileAdditions.length, 35);
+  assert.equal(compatibility.firstClassProfileAdditions.length, 41);
   assert.deepEqual(compatibility.customRecipeAdditions, [
     "claude.anthropic_bearer_relay",
   ]);
@@ -103,7 +103,7 @@ test("first-class Server Profiles are committed additions, not candidates", () =
 
 test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 46);
+  assert.equal(requiredProviderProfilePairs().length, 52);
   assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);
@@ -128,7 +128,7 @@ test("every required Provider type/app pair has a creatable Profile or recipe", 
 test("requirements reject omitted and duplicate Provider types", () => {
   const omitted = contracts();
   omitted.requirements.providerTypes.pop();
-  assert.throws(() => validate(omitted), /must contain 23 types/);
+  assert.throws(() => validate(omitted), /must contain 25 types/);
 
   const duplicate = contracts();
   duplicate.requirements.providerTypes[1].id =

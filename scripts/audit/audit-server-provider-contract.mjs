@@ -144,8 +144,8 @@ export function validateServerProviderContracts(
     throw new Error("invalid Server Provider requirements contract");
   }
   const providerTypes = requirements.providerTypes;
-  if (!Array.isArray(providerTypes) || providerTypes.length !== 23) {
-    throw new Error(`Server Provider requirements must contain 23 types`);
+  if (!Array.isArray(providerTypes) || providerTypes.length !== 25) {
+    throw new Error(`Server Provider requirements must contain 25 types`);
   }
   assertUnique(providerTypes, "variant", "Server Provider requirements");
   assertUnique(providerTypes, "id", "Server Provider requirements");

@@ -21,6 +21,10 @@ use crate::clients::coding_plan_quota::{
     build_coding_plan_quota_client, fetch_coding_plan_quota, CodingPlanQuotaCredentials,
 };
 use crate::clients::oauth::amazon_q_device::{AmazonQDeviceFlowStore, PendingAmazonQDeviceFlow};
+use crate::clients::oauth::codebuddy::{
+    CodeBuddyLoginFlowStore, CodeBuddyLoginPollLease, CodeBuddyLoginPollResult,
+    PendingCodeBuddyLoginFlow,
+};
 use crate::clients::oauth::codex_device::{
     CodexDeviceFlowStore, CodexDevicePollLease, CodexDevicePollResult, PendingCodexDeviceFlow,
 };
@@ -51,6 +55,7 @@ use crate::clients::oauth::refresh::{
     provider_native_refresh_available, record_refresh_flight_failure,
     validate_native_account_refresh_receipt, AccountRefreshFailure,
 };
+use crate::clients::oauth::trae::{PendingTraeLoginFlow, TraeLoginFlowStore, TraeLoginStatus};
 use crate::clients::ollama_cloud::{OllamaCloudClient, OllamaCloudFetchError};
 use crate::clients::router::client::{
     self, ActivateTunnelPayload, NamespaceLeasePayload, NamespaceLeaseResponse,
@@ -77,6 +82,7 @@ use crate::domain::accounts::store::{
     active_account_capacity_pool_limit, active_account_usage_block, effective_codex_workspace_id,
     gemini_v1internal_project_id, native_refresh_snapshot_matches, Account,
     AccountCapacityPoolLimit, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
+    UpsertAccountInput,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
@@ -758,6 +764,8 @@ pub struct ServerStateInner {
     amazon_q_device_flows: RwLock<AmazonQDeviceFlowStore>,
     kimi_device_flows: RwLock<KimiDeviceFlowStore>,
     qoder_device_flows: RwLock<QoderDeviceFlowStore>,
+    codebuddy_login_flows: RwLock<CodeBuddyLoginFlowStore>,
+    trae_login_flows: RwLock<TraeLoginFlowStore>,
     codex_device_flows: RwLock<CodexDeviceFlowStore>,
     device_flow_principals: RwLock<DeviceFlowPrincipalStore>,
     pub cursor_sessions: CursorSessionManager,
@@ -769,6 +777,8 @@ pub struct ServerStateInner {
     pub(crate) kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache,
     pub(crate) kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache,
     pub(crate) qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache,
+    pub(crate) codebuddy_runtime: crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache,
+    pub(crate) trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache,
     pub(crate) deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache,
     web_session_runtime: RwLock<crate::domain::providers::web_session::WebSessionRuntimeStore>,
     web_session_http_client: RwLock<reqwest::Client>,
@@ -944,6 +954,28 @@ fn qoder_client_runtime_error(
         status_code,
         message: error.message,
         retryable: status_code == 429 || status_code >= 500,
+    }
+}
+
+fn codebuddy_client_runtime_error(
+    error: crate::clients::oauth::codebuddy::CodeBuddyClientError,
+) -> CodeBuddyRuntimeError {
+    let status_code = error.upstream_status.unwrap_or(error.status).as_u16();
+    CodeBuddyRuntimeError::Upstream {
+        status_code,
+        retryable: error.is_transient(),
+        message: error.message,
+    }
+}
+
+fn trae_client_runtime_error(
+    error: crate::clients::oauth::trae::TraeClientError,
+) -> TraeRuntimeError {
+    let status_code = error.upstream_status.unwrap_or(error.status).as_u16();
+    TraeRuntimeError::Upstream {
+        status_code,
+        retryable: error.is_transient(),
+        message: error.message,
     }
 }
 
@@ -1386,6 +1418,64 @@ impl QoderRuntimeError {
                 status_code: 400 | 401 | 403,
                 ..
             })
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CodeBuddyRuntimeError {
+    NotFound,
+    IdentityChanged,
+    CredentialPersistenceDegraded,
+    InvalidAccount(String),
+    Refresh(ManagedAccountRefreshError),
+    Upstream {
+        status_code: u16,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl CodeBuddyRuntimeError {
+    pub(crate) fn is_authentication_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream {
+                status_code: 401,
+                ..
+            }
+        ) || matches!(
+            self,
+            Self::Refresh(ManagedAccountRefreshError::Refresh {
+                status_code: 400 | 401 | 403,
+                ..
+            })
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TraeRuntimeError {
+    NotFound,
+    IdentityChanged,
+    CredentialPersistenceDegraded,
+    InvalidAccount(String),
+    Refresh(ManagedAccountRefreshError),
+    Upstream {
+        status_code: u16,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl TraeRuntimeError {
+    pub(crate) fn is_authentication_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Upstream {
+                status_code: 401,
+                ..
+            }
         )
     }
 }
@@ -6415,6 +6505,8 @@ impl ServerStateInner {
             amazon_q_device_flows: RwLock::new(AmazonQDeviceFlowStore::default()),
             kimi_device_flows: RwLock::new(KimiDeviceFlowStore::default()),
             qoder_device_flows: RwLock::new(QoderDeviceFlowStore::default()),
+            codebuddy_login_flows: RwLock::new(CodeBuddyLoginFlowStore::default()),
+            trae_login_flows: RwLock::new(TraeLoginFlowStore::default()),
             codex_device_flows: RwLock::new(CodexDeviceFlowStore::default()),
             device_flow_principals: RwLock::new(DeviceFlowPrincipalStore::default()),
             cursor_sessions: CursorSessionManager::default(),
@@ -6429,6 +6521,8 @@ impl ServerStateInner {
             kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache::default(),
             kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache::default(),
             qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache::default(),
+            codebuddy_runtime: crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache::default(),
+            trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache::default(),
             deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache::default(),
             web_session_runtime: RwLock::new(
                 crate::domain::providers::web_session::WebSessionRuntimeStore::default(),
@@ -14464,6 +14558,12 @@ impl ServerStateInner {
             ProviderType::QoderCosy => {
                 self.cancel_qoder_device_flow(device_code).await;
             }
+            ProviderType::CodeBuddyOAuth => {
+                self.cancel_codebuddy_login_flow(device_code).await;
+            }
+            ProviderType::TraeSolo => {
+                self.cancel_trae_login_flow(device_code).await;
+            }
             _ => {}
         }
         true
@@ -14501,6 +14601,12 @@ impl ServerStateInner {
                 }
                 ProviderType::QoderCosy => {
                     self.cancel_qoder_device_flow(device_code).await;
+                }
+                ProviderType::CodeBuddyOAuth => {
+                    self.cancel_codebuddy_login_flow(device_code).await;
+                }
+                ProviderType::TraeSolo => {
+                    self.cancel_trae_login_flow(device_code).await;
                 }
                 _ => {}
             }
@@ -14749,6 +14855,100 @@ impl ServerStateInner {
 
     pub async fn cancel_qoder_device_flow(&self, device_code: &str) -> bool {
         self.qoder_device_flows.write().await.cancel(device_code)
+    }
+
+    pub async fn insert_codebuddy_login_flow(
+        &self,
+        flow_id: String,
+        flow: PendingCodeBuddyLoginFlow,
+        now_ms: i64,
+    ) {
+        self.codebuddy_login_flows
+            .write()
+            .await
+            .insert(flow_id, flow, now_ms);
+    }
+
+    pub async fn begin_codebuddy_login_poll(
+        &self,
+        flow_id: &str,
+        now_ms: i64,
+    ) -> Option<CodeBuddyLoginPollLease> {
+        self.codebuddy_login_flows
+            .write()
+            .await
+            .begin_poll(flow_id, now_ms)
+    }
+
+    pub async fn finish_codebuddy_login_poll(
+        &self,
+        flow_id: &str,
+        result: CodeBuddyLoginPollResult,
+        now_ms: i64,
+    ) -> bool {
+        self.codebuddy_login_flows
+            .write()
+            .await
+            .finish_poll(flow_id, result, now_ms)
+    }
+
+    pub async fn fail_codebuddy_login_poll(&self, flow_id: &str, terminal: bool, now_ms: i64) {
+        self.codebuddy_login_flows
+            .write()
+            .await
+            .fail_poll(flow_id, terminal, now_ms);
+    }
+
+    pub async fn cancel_codebuddy_login_flow(&self, flow_id: &str) -> bool {
+        self.codebuddy_login_flows.write().await.cancel(flow_id)
+    }
+
+    pub async fn insert_trae_login_flow(
+        &self,
+        flow_id: String,
+        flow: PendingTraeLoginFlow,
+        now_ms: i64,
+    ) {
+        self.trae_login_flows
+            .write()
+            .await
+            .insert(flow_id, flow, now_ms);
+    }
+
+    pub async fn begin_trae_login_completion(
+        &self,
+        flow_id: &str,
+        capability: &str,
+        now_ms: i64,
+    ) -> Result<PendingTraeLoginFlow, crate::clients::oauth::trae::TraeLoginFlowError> {
+        self.trae_login_flows
+            .write()
+            .await
+            .begin_completion(flow_id, capability, now_ms)
+    }
+
+    pub async fn finish_trae_login_completion(
+        &self,
+        flow_id: &str,
+        account_input: UpsertAccountInput,
+        now_ms: i64,
+    ) -> Result<(), crate::clients::oauth::trae::TraeLoginFlowError> {
+        self.trae_login_flows
+            .write()
+            .await
+            .finish_completion(flow_id, account_input, now_ms)
+    }
+
+    pub async fn fail_trae_login_completion(&self, flow_id: &str) -> bool {
+        self.trae_login_flows.write().await.fail_completion(flow_id)
+    }
+
+    pub async fn trae_login_status(&self, flow_id: &str, now_ms: i64) -> Option<TraeLoginStatus> {
+        self.trae_login_flows.write().await.status(flow_id, now_ms)
+    }
+
+    pub async fn cancel_trae_login_flow(&self, flow_id: &str) -> bool {
+        self.trae_login_flows.write().await.cancel(flow_id)
     }
 
     pub async fn insert_codex_device_flow(
@@ -15661,7 +15861,7 @@ impl ServerStateInner {
                     machine_token_from_raw(account.raw.as_ref()).unwrap_or_default();
                 let machine = profile.machine(&machine_token);
                 machine
-                    .validate()
+                    .validate(profile.site)
                     .map_err(QoderRuntimeError::InvalidAccount)?;
                 let (access_token, refresh_token, expires_at_ms, gateway_base_url) =
                     if profile.credential_rail == QoderCredentialRail::PatJobToken {
@@ -15920,6 +16120,581 @@ impl ServerStateInner {
             return false;
         }
         self.find_account_for_provider(ProviderType::QoderCosy, account_id)
+            .await
+            .is_some_and(|account| {
+                account.auth_identity_generation == auth_identity_generation
+                    && account.token_refresh_generation == token_refresh_generation
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_codebuddy_runtime(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        request_timeout: Duration,
+    ) -> Result<crate::proxy::codebuddy_runtime::PreparedCodeBuddyRuntime, CodeBuddyRuntimeError>
+    {
+        use crate::domain::codebuddy::CodeBuddyAccountProfile;
+        use crate::proxy::codebuddy_runtime::{
+            parse_codebuddy_model_catalog, CodeBuddyRuntimeScope, PreparedCodeBuddyRuntime,
+        };
+
+        if self.credential_persistence_degraded() {
+            return Err(CodeBuddyRuntimeError::CredentialPersistenceDegraded);
+        }
+        if !self
+            .codebuddy_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return Err(CodeBuddyRuntimeError::IdentityChanged);
+        }
+
+        self.refresh_managed_account_if_needed_for_generation(
+            ProviderType::CodeBuddyOAuth,
+            account_id,
+            expected_auth_identity_generation,
+        )
+        .await
+        .map_err(CodeBuddyRuntimeError::Refresh)?;
+        let account = self
+            .find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+            .await
+            .ok_or(CodeBuddyRuntimeError::NotFound)?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return Err(CodeBuddyRuntimeError::IdentityChanged);
+        }
+        if account.needs_relogin {
+            return Err(CodeBuddyRuntimeError::Upstream {
+                status_code: 401,
+                message: "CodeBuddy account requires login".to_string(),
+                retryable: false,
+            });
+        }
+        let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
+            .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
+        let access_token = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CodeBuddyRuntimeError::InvalidAccount(
+                    "CodeBuddy OAuth account is missing an access token".to_string(),
+                )
+            })?
+            .to_string();
+        let base_url = crate::clients::oauth::codebuddy::runtime_base_url(&account)
+            .map_err(codebuddy_client_runtime_error)?;
+        let scope = CodeBuddyRuntimeScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            profile.site,
+            &profile.domain,
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        )
+        .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
+
+        let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let catalog = if let Some(catalog) = self.codebuddy_runtime.catalog(&scope, now_ms).await {
+            catalog
+        } else {
+            let _catalog_guard = self.codebuddy_runtime.catalog_lock(&scope).await;
+            now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(catalog) = self.codebuddy_runtime.catalog(&scope, now_ms).await {
+                catalog
+            } else {
+                if !self
+                    .codebuddy_runtime_snapshot_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        &account,
+                    )
+                    .await
+                {
+                    return Err(CodeBuddyRuntimeError::IdentityChanged);
+                }
+                let fetched = crate::clients::oauth::codebuddy::fetch_model_config(
+                    &self.http_client().await,
+                    &account,
+                    request_timeout,
+                )
+                .await;
+                match fetched {
+                    Ok((value, _)) => {
+                        let parsed = parse_codebuddy_model_catalog(&value, profile.site).map_err(
+                            |message| CodeBuddyRuntimeError::Upstream {
+                                status_code: 502,
+                                message,
+                                retryable: false,
+                            },
+                        )?;
+                        if !self
+                            .codebuddy_runtime_snapshot_matches(
+                                app,
+                                provider_id,
+                                provider_revision,
+                                runtime_fingerprint,
+                                &account,
+                            )
+                            .await
+                        {
+                            return Err(CodeBuddyRuntimeError::IdentityChanged);
+                        }
+                        self.codebuddy_runtime
+                            .insert_catalog(scope.clone(), parsed, now_ms)
+                            .await
+                    }
+                    Err(error) => {
+                        let auth_failure = error.is_authentication_failure();
+                        let transient = error.is_transient();
+                        let runtime_error = codebuddy_client_runtime_error(error);
+                        if auth_failure {
+                            self.invalidate_codebuddy_runtime_scope(&scope).await;
+                        }
+                        if transient {
+                            if let Some(stale) =
+                                self.codebuddy_runtime.stale_catalog(&scope, now_ms).await
+                            {
+                                stale
+                            } else {
+                                return Err(runtime_error);
+                            }
+                        } else {
+                            return Err(runtime_error);
+                        }
+                    }
+                }
+            }
+        };
+
+        if !self
+            .codebuddy_runtime_snapshot_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &account,
+            )
+            .await
+        {
+            return Err(CodeBuddyRuntimeError::IdentityChanged);
+        }
+        Ok(PreparedCodeBuddyRuntime {
+            scope,
+            profile,
+            access_token: Arc::<str>::from(access_token),
+            base_url,
+            catalog,
+            account_id: account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn codebuddy_runtime_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::CodeBuddyOAuth
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        stored.resource.revision == plan.provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && plan.driver_id.as_str() == "special.codebuddy_oauth"
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: bound_account_id,
+                    expected_provider_type: ProviderType::CodeBuddyOAuth,
+                    auth_identity_generation,
+                } if bound_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
+    }
+
+    async fn codebuddy_runtime_snapshot_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        expected: &Account,
+    ) -> bool {
+        if !self
+            .codebuddy_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &expected.id,
+                expected.auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::CodeBuddyOAuth, &expected.id)
+            .await
+            .is_some_and(|current| {
+                current.auth_identity_generation == expected.auth_identity_generation
+                    && current.token_refresh_generation == expected.token_refresh_generation
+            })
+    }
+
+    pub(crate) async fn invalidate_codebuddy_runtime_scope(
+        &self,
+        scope: &crate::proxy::codebuddy_runtime::CodeBuddyRuntimeScope,
+    ) {
+        self.codebuddy_runtime.invalidate_scope(scope).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn codebuddy_runtime_generation_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        auth_identity_generation: u64,
+        token_refresh_generation: u64,
+    ) -> bool {
+        if !self
+            .codebuddy_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+            .await
+            .is_some_and(|account| {
+                account.auth_identity_generation == auth_identity_generation
+                    && account.token_refresh_generation == token_refresh_generation
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_trae_runtime(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        request_timeout: Duration,
+    ) -> Result<crate::proxy::trae_runtime::PreparedTraeRuntime, TraeRuntimeError> {
+        use crate::domain::trae::TraeAccountProfile;
+        use crate::proxy::trae_runtime::{
+            parse_trae_model_catalog, PreparedTraeRuntime, TraeRuntimeScope,
+        };
+
+        if self.credential_persistence_degraded() {
+            return Err(TraeRuntimeError::CredentialPersistenceDegraded);
+        }
+        if !self
+            .trae_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return Err(TraeRuntimeError::IdentityChanged);
+        }
+
+        self.refresh_managed_account_if_needed_for_generation(
+            ProviderType::TraeSolo,
+            account_id,
+            expected_auth_identity_generation,
+        )
+        .await
+        .map_err(TraeRuntimeError::Refresh)?;
+        let account = self
+            .find_account_for_provider(ProviderType::TraeSolo, account_id)
+            .await
+            .ok_or(TraeRuntimeError::NotFound)?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return Err(TraeRuntimeError::IdentityChanged);
+        }
+        if account.needs_relogin {
+            return Err(TraeRuntimeError::Upstream {
+                status_code: 401,
+                message: "Trae account requires login".to_string(),
+                retryable: false,
+            });
+        }
+        let profile = TraeAccountProfile::parse(account.profile.as_ref())
+            .map_err(TraeRuntimeError::InvalidAccount)?;
+        let access_token = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                TraeRuntimeError::InvalidAccount(
+                    "Trae OAuth account is missing an access token".to_string(),
+                )
+            })?
+            .to_string();
+        let (agent_origin, billing_origin) = crate::clients::oauth::trae::runtime_origins(&account)
+            .map_err(trae_client_runtime_error)?;
+        let scope = TraeRuntimeScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            &profile,
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+        )
+        .map_err(TraeRuntimeError::InvalidAccount)?;
+
+        let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let catalog = if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
+            catalog
+        } else {
+            let _catalog_guard = self.trae_runtime.catalog_lock(&scope).await;
+            now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
+                catalog
+            } else {
+                if !self
+                    .trae_runtime_snapshot_matches(
+                        app,
+                        provider_id,
+                        provider_revision,
+                        runtime_fingerprint,
+                        &account,
+                    )
+                    .await
+                {
+                    return Err(TraeRuntimeError::IdentityChanged);
+                }
+                let fetched = crate::clients::oauth::trae::fetch_model_detail(
+                    &self.http_client().await,
+                    &account,
+                    request_timeout,
+                )
+                .await;
+                match fetched {
+                    Ok(value) => {
+                        let parsed = parse_trae_model_catalog(&value).map_err(|message| {
+                            TraeRuntimeError::Upstream {
+                                status_code: 502,
+                                message,
+                                retryable: false,
+                            }
+                        })?;
+                        if !self
+                            .trae_runtime_snapshot_matches(
+                                app,
+                                provider_id,
+                                provider_revision,
+                                runtime_fingerprint,
+                                &account,
+                            )
+                            .await
+                        {
+                            return Err(TraeRuntimeError::IdentityChanged);
+                        }
+                        self.trae_runtime
+                            .insert_catalog(scope.clone(), parsed, now_ms)
+                            .await
+                    }
+                    Err(error) => {
+                        let auth_failure = error.is_authentication_failure();
+                        let transient = error.is_transient();
+                        let runtime_error = trae_client_runtime_error(error);
+                        if auth_failure {
+                            self.invalidate_trae_runtime_scope(&scope).await;
+                        }
+                        if transient {
+                            if let Some(stale) =
+                                self.trae_runtime.stale_catalog(&scope, now_ms).await
+                            {
+                                stale
+                            } else {
+                                return Err(runtime_error);
+                            }
+                        } else {
+                            return Err(runtime_error);
+                        }
+                    }
+                }
+            }
+        };
+
+        if !self
+            .trae_runtime_snapshot_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &account,
+            )
+            .await
+        {
+            return Err(TraeRuntimeError::IdentityChanged);
+        }
+        Ok(PreparedTraeRuntime {
+            scope,
+            profile,
+            access_token: Arc::<str>::from(access_token),
+            agent_origin,
+            billing_origin,
+            catalog,
+            account_id: account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn trae_runtime_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> bool {
+        let providers = self.providers.read().await;
+        let Some(stored) = providers.providers.iter().find(|stored| {
+            stored.app == app
+                && stored.provider.id == provider_id
+                && stored.provider_type == ProviderType::TraeSolo
+                && stored.resource.revision == provider_revision
+        }) else {
+            return false;
+        };
+        let Some(plan) = providers.runtime_plan(app, provider_id) else {
+            return false;
+        };
+        stored.resource.revision == plan.provider_revision
+            && plan.runtime_fingerprint == runtime_fingerprint
+            && plan.configuration_state
+                != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            && plan.driver_id.as_str() == "special.trae_solo"
+            && matches!(
+                &plan.auth_ref,
+                crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
+                    account_id: bound_account_id,
+                    expected_provider_type: ProviderType::TraeSolo,
+                    auth_identity_generation,
+                } if bound_account_id == account_id
+                    && *auth_identity_generation == expected_auth_identity_generation
+            )
+    }
+
+    async fn trae_runtime_snapshot_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        expected: &Account,
+    ) -> bool {
+        if !self
+            .trae_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &expected.id,
+                expected.auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::TraeSolo, &expected.id)
+            .await
+            .is_some_and(|current| {
+                current.auth_identity_generation == expected.auth_identity_generation
+                    && current.token_refresh_generation == expected.token_refresh_generation
+            })
+    }
+
+    pub(crate) async fn invalidate_trae_runtime_scope(
+        &self,
+        scope: &crate::proxy::trae_runtime::TraeRuntimeScope,
+    ) {
+        self.trae_runtime.invalidate_scope(scope).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn trae_runtime_generation_matches(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        auth_identity_generation: u64,
+        token_refresh_generation: u64,
+    ) -> bool {
+        if !self
+            .trae_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                auth_identity_generation,
+            )
+            .await
+        {
+            return false;
+        }
+        self.find_account_for_provider(ProviderType::TraeSolo, account_id)
             .await
             .is_some_and(|account| {
                 account.auth_identity_generation == auth_identity_generation
@@ -18591,6 +19366,7 @@ fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -
         | ProviderType::CursorApiKey
         | ProviderType::GrokOAuth
         | ProviderType::QoderCosy
+        | ProviderType::CodeBuddyOAuth
         | ProviderType::OllamaCloud => {
             account
                 .access_token

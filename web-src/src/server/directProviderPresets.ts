@@ -144,6 +144,36 @@ export const serverProviderPresets: Readonly<
     "category": "official",
     "icon": "qoder"
   },
+  "claude.codebuddy_oauth": {
+    "name": "CodeBuddy OAuth",
+    "websiteUrl": "https://www.codebuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "ANTHROPIC_MODEL": "auto"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      }
+    },
+    "category": "official"
+  },
+  "claude.trae_solo": {
+    "name": "Trae CN Solo",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "ANTHROPIC_MODEL": "glm-5.2"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "glm-5.2"
+      }
+    },
+    "category": "official"
+  },
   "claude.kiro_oauth": {
     "name": "Kiro OAuth",
     "websiteUrl": "https://kiro.dev",
@@ -612,6 +642,40 @@ export const serverProviderPresets: Readonly<
     },
     "category": "official",
     "icon": "qoder"
+  },
+  "codex.codebuddy_oauth": {
+    "name": "CodeBuddy OAuth",
+    "websiteUrl": "https://www.codebuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "auth": {},
+      "config": "",
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      },
+      "env": {
+        "OPENAI_MODEL": "auto"
+      }
+    },
+    "category": "official"
+  },
+  "codex.trae_solo": {
+    "name": "Trae CN Solo",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "",
+    "settingsConfig": {
+      "auth": {},
+      "config": "",
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "glm-5.2"
+      },
+      "env": {
+        "OPENAI_MODEL": "glm-5.2"
+      }
+    },
+    "category": "official"
   },
   "codex.kiro_oauth": {
     "name": "Kiro OAuth",
@@ -1089,6 +1153,36 @@ export const serverProviderPresets: Readonly<
     },
     "category": "official",
     "icon": "qoder"
+  },
+  "gemini.codebuddy_oauth": {
+    "name": "CodeBuddy OAuth",
+    "websiteUrl": "https://www.codebuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "GEMINI_MODEL": "auto"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      }
+    },
+    "category": "official"
+  },
+  "gemini.trae_solo": {
+    "name": "Trae CN Solo",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "GEMINI_MODEL": "glm-5.2"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "glm-5.2"
+      }
+    },
+    "category": "official"
   },
   "gemini.cursor_api_key": {
     "name": "Cursor API Key",

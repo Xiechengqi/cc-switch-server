@@ -52,9 +52,10 @@ use crate::logging::{
     classify_network_error, error_fingerprint, opaque_ref, AuditEvent, AuditRequestDetails,
 };
 use crate::state::{
-    AccountInFlightGuard, AccountInFlightSnapshot, CopilotUpstreamAuthError, DeepSeekUpstreamError,
-    GrokMediaTaskBinding, GrokMediaTaskCommitError, GrokMediaTaskKind, GrokVideoPlane,
-    ManagedAccountRefreshError, QoderRuntimeError, ServerState, ShareInFlightGuard,
+    AccountInFlightGuard, AccountInFlightSnapshot, CodeBuddyRuntimeError, CopilotUpstreamAuthError,
+    DeepSeekUpstreamError, GrokMediaTaskBinding, GrokMediaTaskCommitError, GrokMediaTaskKind,
+    GrokVideoPlane, ManagedAccountRefreshError, QoderRuntimeError, ServerState, ShareInFlightGuard,
+    TraeRuntimeError,
 };
 
 #[cfg(test)]
@@ -159,6 +160,10 @@ struct ImageTransportMetrics {
     max_silence: Duration,
     emitted: bool,
 }
+
+#[cfg(test)]
+#[path = "forwarder/codebuddy_http_tests.rs"]
+mod codebuddy_http_tests;
 
 #[cfg(test)]
 #[path = "forwarder/qoder_http_tests.rs"]
@@ -1648,6 +1653,58 @@ async fn forward_with_attempt(
                 ));
             }
             return forward_qoder(QoderForwardOptions {
+                state,
+                execution,
+                stored,
+                adapter,
+                adapter_request,
+                route,
+                request_context,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            })
+            .await;
+        }
+        if execution.driver_is("special.codebuddy_oauth") {
+            if !matches!(
+                route,
+                ProxyRoute::ClaudeMessages
+                    | ProxyRoute::CodexChatCompletions
+                    | ProxyRoute::CodexResponses
+                    | ProxyRoute::Gemini
+            ) {
+                return Err(ProxyError::bad_request(
+                    "CodeBuddy supports Messages, Chat Completions, Responses, and Gemini generation routes only",
+                ));
+            }
+            return forward_codebuddy(CodeBuddyForwardOptions {
+                state,
+                execution,
+                stored,
+                adapter,
+                adapter_request,
+                route,
+                request_context,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            })
+            .await;
+        }
+        if execution.driver_is("special.trae_solo") {
+            if !matches!(
+                route,
+                ProxyRoute::ClaudeMessages
+                    | ProxyRoute::CodexChatCompletions
+                    | ProxyRoute::CodexResponses
+                    | ProxyRoute::Gemini
+            ) {
+                return Err(ProxyError::bad_request(
+                    "Trae Solo supports Messages, Chat Completions, Responses, and Gemini generation routes only",
+                ));
+            }
+            return forward_trae(TraeForwardOptions {
                 state,
                 execution,
                 stored,
@@ -14368,6 +14425,1794 @@ async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Respon
     Ok(response)
 }
 
+struct CodeBuddyForwardOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    adapter: adapters::GenericForwardingAdapter,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+struct ProviderStreamTaskAbortGuard {
+    abort_handle: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl Drop for ProviderStreamTaskAbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort_handle.abort();
+        }
+    }
+}
+
+async fn await_provider_stream_task(
+    mut task: tokio::task::JoinHandle<Result<Response, ProxyError>>,
+    provider: &'static str,
+) -> Result<Response, ProxyError> {
+    let mut abort_guard = ProviderStreamTaskAbortGuard {
+        abort_handle: task.abort_handle(),
+        armed: true,
+    };
+    let result = (&mut task).await;
+    abort_guard.armed = false;
+    result.map_err(|error| {
+        ProxyError::bad_gateway(format!(
+            "{provider} stream forwarding task ended before producing a response: {error}"
+        ))
+    })?
+}
+
+struct PreparedCodeBuddyWireResponse {
+    inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    decoder: super::codebuddy::CodeBuddySseDecoder,
+    first_canonical: Bytes,
+}
+
+enum CodeBuddyForwardAttemptError {
+    Upstream(super::codebuddy::CodeBuddyUpstreamError),
+    Proxy(ProxyError),
+}
+
+async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response, ProxyError> {
+    let CodeBuddyForwardOptions {
+        state,
+        execution,
+        stored,
+        adapter,
+        mut adapter_request,
+        route,
+        request_context,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let (ProviderType::CodeBuddyOAuth, account_id, expected_identity_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ProxyError::bad_request(
+                "CodeBuddy Provider must bind one explicit codebuddy_oauth managed account",
+            )
+        })?
+    else {
+        return Err(ProxyError::bad_request(
+            "CodeBuddy Provider account type does not match its runtime contract",
+        ));
+    };
+    let requested_model = adapter_request
+        .actual_model
+        .clone()
+        .or_else(|| adapter_request.model.clone())
+        .or_else(|| chat_model_from_canonical(&adapter_request.body))
+        .ok_or_else(|| ProxyError::bad_request("CodeBuddy request is missing a model"))?;
+    let canonical_chat_request =
+        serde_json::from_slice::<Value>(&adapter_request.body).map_err(|error| {
+            ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
+        })?;
+
+    let mut auth_recovery_attempted = false;
+    loop {
+        let runtime = match state
+            .prepare_codebuddy_runtime(
+                stored.app,
+                &stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                account_id,
+                expected_identity_generation,
+                execution.request_timeout(),
+            )
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
+                auth_recovery_attempted = true;
+                recover_codebuddy_auth(&state, &execution, None).await?;
+                continue;
+            }
+            Err(error) => {
+                let error = codebuddy_runtime_error_to_proxy_error(error);
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let model_id = super::codebuddy_runtime::resolve_codebuddy_model_id(
+            runtime.profile.site,
+            &requested_model,
+        )
+        .map_err(ProxyError::bad_request)?;
+        if !runtime
+            .catalog
+            .enabled_models
+            .iter()
+            .any(|enabled| enabled == &model_id)
+        {
+            let error = ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: format!(
+                    "CodeBuddy model {model_id} is not enabled in the bound account's live catalog"
+                ),
+            };
+            record_qoder_nonstream_failure(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+        let capability = runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
+            ProxyError::bad_gateway(format!(
+                "CodeBuddy live catalog has no capability record for enabled model {model_id}"
+            ))
+        })?;
+        let has_tools = canonical_chat_request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if has_tools && !capability.supports_tools {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_request(format!(
+                    "CodeBuddy model {model_id} does not advertise tool support"
+                )),
+            )
+            .await;
+        }
+        let requests_reasoning = canonical_chat_request.get("reasoning").is_some()
+            || canonical_chat_request.get("reasoning_effort").is_some();
+        if requests_reasoning && !capability.supports_reasoning {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_request(format!(
+                    "CodeBuddy model {model_id} does not advertise reasoning support"
+                )),
+            )
+            .await;
+        }
+        let payload =
+            super::codebuddy_runtime::build_codebuddy_payload(&canonical_chat_request, &model_id)
+                .map_err(ProxyError::bad_request)?;
+
+        adapter_request.actual_model = Some(model_id.clone());
+        adapter_request.actual_model_source = Some("codebuddy_live_catalog".to_string());
+        if let Err(error) = ensure_share_model_available(
+            &state,
+            &execution,
+            request_context.share_id.as_deref(),
+            Some(&model_id),
+        )
+        .await
+        {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+
+        let wire = match send_codebuddy_generation(&state, &execution, &runtime, &payload).await {
+            Ok(wire) => wire,
+            Err(CodeBuddyForwardAttemptError::Upstream(error))
+                if error.is_authentication_failure() && !auth_recovery_attempted =>
+            {
+                auth_recovery_attempted = true;
+                recover_codebuddy_auth(&state, &execution, Some(&runtime)).await?;
+                continue;
+            }
+            Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(CodeBuddyForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+
+        if adapter_request.stream_requested {
+            let task = tokio::spawn(forward_codebuddy_stream(CodeBuddyStreamOptions {
+                state,
+                execution,
+                runtime,
+                stored,
+                adapter_request,
+                route,
+                request_context,
+                wire,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            }));
+            return await_provider_stream_task(task, "CodeBuddy").await;
+        }
+
+        match aggregate_codebuddy_nonstream(&state, &execution, &runtime, wire, &model_id).await {
+            Ok(canonical) => {
+                return finish_qoder_nonstream(QoderNonstreamFinishOptions {
+                    state,
+                    stored,
+                    adapter,
+                    adapter_request,
+                    route,
+                    request_context,
+                    canonical,
+                    account_in_flight_guard,
+                    share_invocation_guard,
+                    started,
+                })
+                .await;
+            }
+            Err(CodeBuddyForwardAttemptError::Upstream(error))
+                if error.is_authentication_failure() && !auth_recovery_attempted =>
+            {
+                auth_recovery_attempted = true;
+                recover_codebuddy_auth(&state, &execution, Some(&runtime)).await?;
+                continue;
+            }
+            Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(CodeBuddyForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn chat_model_from_canonical(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn send_codebuddy_generation(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
+    payload: &Value,
+) -> Result<PreparedCodeBuddyWireResponse, CodeBuddyForwardAttemptError> {
+    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+        return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+            "CodeBuddy Provider or bound account changed before inference",
+        )));
+    }
+    let body = serde_json::to_vec(payload).map_err(|error| {
+        CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
+            "encode CodeBuddy generation payload: {error}"
+        )))
+    })?;
+    let request_id = super::codebuddy::random_codebuddy_request_id();
+    let profile = &runtime.profile;
+    let mut target_headers = vec![
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "authorization".to_string(),
+            format!("Bearer {}", runtime.access_token),
+        ),
+        ("x-user-id".to_string(), profile.uid.clone()),
+        ("x-domain".to_string(), profile.domain.clone()),
+        ("x-product".to_string(), "SaaS".to_string()),
+        ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
+        ("x-request-id".to_string(), request_id.clone()),
+        ("x-conversation-id".to_string(), request_id.clone()),
+        ("x-conversation-request-id".to_string(), request_id.clone()),
+        ("x-conversation-message-id".to_string(), request_id.clone()),
+        ("x-root-request-id".to_string(), request_id.clone()),
+        ("x-agent-intent".to_string(), "craft".to_string()),
+        ("x-agent-purpose".to_string(), "conversation".to_string()),
+        ("x-agent-type".to_string(), "main".to_string()),
+        ("x-private-data".to_string(), "false".to_string()),
+        ("x-codebuddy-request".to_string(), "1".to_string()),
+        (
+            "user-agent".to_string(),
+            format!(
+                "CLI/{0} CodeBuddy/{0}",
+                crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION
+            ),
+        ),
+    ];
+    if profile.enterprise_id.trim().is_empty() {
+        target_headers.push(("x-no-enterprise-id".to_string(), "true".to_string()));
+    } else {
+        target_headers.push(("x-enterprise-id".to_string(), profile.enterprise_id.clone()));
+    }
+    if profile.site == crate::domain::codebuddy::CodeBuddySite::Cn {
+        let origin = profile.site.profile().browser_origin.to_string();
+        target_headers.push(("origin".to_string(), origin.clone()));
+        target_headers.push(("referer".to_string(), format!("{origin}/")));
+    }
+    let mut headers = HeaderMap::new();
+    super::outbound_request::insert_target_headers(&mut headers, &target_headers)
+        .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+    let url = super::join_url(
+        &runtime.base_url,
+        crate::domain::codebuddy::CODEBUDDY_CHAT_PATH,
+    );
+    let request = state
+        .http_client()
+        .await
+        .post(url)
+        .headers(headers)
+        .body(body);
+    let response = match execution.stream_first_byte_timeout() {
+        Some(timeout) => tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| {
+                CodeBuddyForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "CodeBuddy generation response-header timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?
+            .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+        None => request
+            .send()
+            .await
+            .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+    };
+    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+        return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+            "CodeBuddy Provider or bound account changed while inference was starting",
+        )));
+    }
+    let mut response = response;
+    let status = response.status();
+    if !status.is_success() {
+        let body = crate::infra::http::read_response_body_limited(
+            &mut response,
+            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+        return Err(CodeBuddyForwardAttemptError::Upstream(
+            super::codebuddy::CodeBuddyUpstreamError::from_status_body(status.as_u16(), &body),
+        ));
+    }
+
+    let mut inner = response.bytes_stream().boxed();
+    let mut decoder = super::codebuddy::CodeBuddySseDecoder::default();
+    let mut received_chunk = false;
+    loop {
+        let timeout = if received_chunk {
+            execution.stream_idle_timeout()
+        } else {
+            execution.stream_first_byte_timeout()
+        };
+        let next = codebuddy_next_wire_chunk(&mut inner, timeout).await?;
+        let Some(chunk) = next else {
+            let tail = decoder.finish_classified().map_err(|error| match error {
+                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
+                    CodeBuddyForwardAttemptError::Upstream(error)
+                }
+                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
+                    CodeBuddyForwardAttemptError::Proxy(error)
+                }
+            })?;
+            return Ok(PreparedCodeBuddyWireResponse {
+                inner,
+                decoder,
+                first_canonical: tail,
+            });
+        };
+        received_chunk = true;
+        let canonical = decoder
+            .push_classified(chunk)
+            .map_err(|error| match error {
+                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
+                    CodeBuddyForwardAttemptError::Upstream(error)
+                }
+                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
+                    CodeBuddyForwardAttemptError::Proxy(error)
+                }
+            })?;
+        if !canonical.is_empty() || decoder.is_terminal() {
+            if !codebuddy_runtime_is_current(state, execution, runtime).await {
+                return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+                    "CodeBuddy Provider or bound account changed before response commit",
+                )));
+            }
+            return Ok(PreparedCodeBuddyWireResponse {
+                inner,
+                decoder,
+                first_canonical: canonical,
+            });
+        }
+    }
+}
+
+async fn codebuddy_next_wire_chunk(
+    inner: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    timeout: Option<Duration>,
+) -> Result<Option<Bytes>, CodeBuddyForwardAttemptError> {
+    let next = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, inner.try_next())
+            .await
+            .map_err(|_| {
+                CodeBuddyForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "CodeBuddy generation stream timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?,
+        None => inner.try_next().await,
+    };
+    next.map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))
+}
+
+async fn codebuddy_runtime_is_current(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
+) -> bool {
+    state
+        .codebuddy_runtime_generation_matches(
+            execution.stored.app,
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            &runtime.account_id,
+            runtime.auth_identity_generation,
+            runtime.token_refresh_generation,
+        )
+        .await
+}
+
+async fn recover_codebuddy_auth(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: Option<&super::codebuddy_runtime::PreparedCodeBuddyRuntime>,
+) -> Result<(), ProxyError> {
+    let (provider_type, account_id, expected_generation) = execution
+        .managed_account_identity_target()
+        .ok_or_else(|| ProxyError::bad_request("CodeBuddy managed account binding is missing"))?;
+    if provider_type != ProviderType::CodeBuddyOAuth {
+        return Err(ProxyError::bad_request(
+            "CodeBuddy managed account binding has the wrong provider type",
+        ));
+    }
+    if let Some(runtime) = runtime {
+        state
+            .invalidate_codebuddy_runtime_scope(&runtime.scope)
+            .await;
+    }
+    state
+        .refresh_managed_account_now_for_generation(
+            ProviderType::CodeBuddyOAuth,
+            account_id,
+            expected_generation,
+        )
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
+}
+
+fn codebuddy_runtime_error_to_proxy_error(error: CodeBuddyRuntimeError) -> ProxyError {
+    match error {
+        CodeBuddyRuntimeError::NotFound => {
+            ProxyError::not_found("CodeBuddy managed account not found")
+        }
+        CodeBuddyRuntimeError::IdentityChanged => ProxyError::conflict(
+            "CodeBuddy Provider or bound account identity changed during runtime preparation",
+        ),
+        CodeBuddyRuntimeError::CredentialPersistenceDegraded => {
+            managed_credential_persistence_error()
+        }
+        CodeBuddyRuntimeError::InvalidAccount(message) => ProxyError::bad_request(message),
+        CodeBuddyRuntimeError::Refresh(error) => {
+            managed_account_refresh_error_to_proxy_error(error)
+        }
+        CodeBuddyRuntimeError::Upstream {
+            status_code,
+            message,
+            retryable,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ProxyError {
+                status: if retryable
+                    && status.is_client_error()
+                    && status != StatusCode::TOO_MANY_REQUESTS
+                {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                message,
+            }
+        }
+    }
+}
+
+async fn aggregate_codebuddy_nonstream(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
+    mut wire: PreparedCodeBuddyWireResponse,
+    model_id: &str,
+) -> Result<Value, CodeBuddyForwardAttemptError> {
+    let mut aggregator = super::codebuddy::CodeBuddyChatSseAggregator::default();
+    aggregator
+        .push(wire.first_canonical)
+        .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+    while !wire.decoder.is_terminal() {
+        let chunk =
+            match codebuddy_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await
+            {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    let tail = wire
+                        .decoder
+                        .finish_classified()
+                        .map_err(|error| match error {
+                            super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
+                                CodeBuddyForwardAttemptError::Upstream(error)
+                            }
+                            super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
+                                CodeBuddyForwardAttemptError::Proxy(error)
+                            }
+                        })?;
+                    aggregator
+                        .push(tail)
+                        .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+        let canonical = wire
+            .decoder
+            .push_classified(chunk)
+            .map_err(|error| match error {
+                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
+                    CodeBuddyForwardAttemptError::Upstream(error)
+                }
+                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
+                    CodeBuddyForwardAttemptError::Proxy(error)
+                }
+            })?;
+        if !codebuddy_runtime_is_current(state, execution, runtime).await {
+            return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+                "CodeBuddy Provider or bound account changed during inference",
+            )));
+        }
+        aggregator
+            .push(canonical)
+            .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+    }
+    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+        return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+            "CodeBuddy Provider or bound account changed before response commit",
+        )));
+    }
+    aggregator
+        .finish(model_id, chrono::Utc::now().timestamp())
+        .map_err(CodeBuddyForwardAttemptError::Proxy)
+}
+
+struct CodeBuddyStreamOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    runtime: super::codebuddy_runtime::PreparedCodeBuddyRuntime,
+    stored: StoredProvider,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    wire: PreparedCodeBuddyWireResponse,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Response, ProxyError> {
+    let CodeBuddyStreamOptions {
+        state,
+        execution,
+        runtime,
+        stored,
+        adapter_request,
+        route,
+        request_context,
+        mut wire,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let first_canonical = wire.first_canonical;
+    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
+        &stored,
+        route,
+        adapter_request.responses_tool_context.clone(),
+    );
+    let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+    };
+    if wire.decoder.is_terminal() {
+        let tail = match stream_transform.finish() {
+            Ok(tail) => tail,
+            Err(error) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error,
+                )
+                .await;
+            }
+        };
+        first_transformed = join_bytes(first_transformed, tail);
+    }
+    let request_id = log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(&adapter_request),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            usage_state: Some(UsageState::Pending),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
+    let stream = async_stream::stream! {
+        let _account_in_flight_guard = account_in_flight_guard;
+        let _share_invocation_guard = share_invocation_guard;
+        let mut interrupt_guard = ShareStreamInterruptGuard {
+            armed: true,
+            state: state.clone(),
+            stored: stored.clone(),
+            request_id: request_id.clone(),
+            status_code: StatusCode::OK.as_u16(),
+            share_id: share_id.clone(),
+            user_email: user_email.clone(),
+            started,
+            first_token_ms: None,
+            usage: StreamUsageAccumulator::default(),
+        };
+        let mut first_token_ms = None;
+        if !first_canonical.is_empty() {
+            interrupt_guard.usage.push(&first_canonical);
+        }
+        if !first_transformed.is_empty() {
+            first_token_ms = Some(started.elapsed().as_millis());
+            interrupt_guard.first_token_ms = first_token_ms;
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                StatusCode::OK.as_u16(),
+                started.elapsed().as_millis(),
+                first_token_ms,
+                TokenUsage::default(),
+                Some("streaming"),
+            ).await;
+            yield Ok::<Bytes, std::io::Error>(first_transformed);
+        }
+        if wire.decoder.is_terminal() {
+            finish_qoder_stream_success(&mut interrupt_guard).await;
+            return;
+        }
+        loop {
+            let chunk = match codebuddy_next_wire_chunk(
+                &mut wire.inner,
+                execution.stream_idle_timeout(),
+            ).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    let canonical = match wire.decoder.finish_classified() {
+                        Ok(canonical) => canonical,
+                        Err(error) => {
+                            let error = error.into_proxy_error();
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    };
+                    if !codebuddy_runtime_is_current(&state, &execution, &runtime).await {
+                        let error = ProxyError::conflict(
+                            "CodeBuddy Provider or bound account changed before response commit",
+                        );
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                    if !canonical.is_empty() {
+                        interrupt_guard.usage.push(&canonical);
+                    }
+                    let mut transformed = match stream_transform.push(canonical) {
+                        Ok(transformed) => transformed,
+                        Err(error) => {
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    };
+                    match stream_transform.finish() {
+                        Ok(tail) => transformed = join_bytes(transformed, tail),
+                        Err(error) => {
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    }
+                    if !transformed.is_empty() {
+                        if first_token_ms.is_none() {
+                            first_token_ms = Some(started.elapsed().as_millis());
+                            interrupt_guard.first_token_ms = first_token_ms;
+                            update_stream_usage(
+                                &state,
+                                &stored,
+                                &request_id,
+                                StatusCode::OK.as_u16(),
+                                started.elapsed().as_millis(),
+                                first_token_ms,
+                                TokenUsage::default(),
+                                Some("streaming"),
+                            ).await;
+                        }
+                        yield Ok(transformed);
+                    }
+                    finish_qoder_stream_success(&mut interrupt_guard).await;
+                    return;
+                }
+                Err(CodeBuddyForwardAttemptError::Proxy(error)) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            let canonical = match wire.decoder.push_classified(chunk) {
+                Ok(canonical) => canonical,
+                Err(super::codebuddy::CodeBuddySseDecodeError::Upstream(error)) => {
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(super::codebuddy::CodeBuddySseDecodeError::Protocol(error)) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if !codebuddy_runtime_is_current(&state, &execution, &runtime).await {
+                let error = ProxyError::conflict(
+                    "CodeBuddy Provider or bound account changed during inference",
+                );
+                if let Some(frame) = finish_qoder_stream_failure(
+                    &mut interrupt_guard,
+                    route,
+                    &error,
+                ).await {
+                    yield Ok(frame);
+                }
+                return;
+            }
+            if !canonical.is_empty() {
+                interrupt_guard.usage.push(&canonical);
+            }
+            let mut transformed = match stream_transform.push(canonical) {
+                Ok(transformed) => transformed,
+                Err(error) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if wire.decoder.is_terminal() {
+                match stream_transform.finish() {
+                    Ok(tail) => transformed = join_bytes(transformed, tail),
+                    Err(error) => {
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                }
+            }
+            if !transformed.is_empty() {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(started.elapsed().as_millis());
+                    interrupt_guard.first_token_ms = first_token_ms;
+                    update_stream_usage(
+                        &state,
+                        &stored,
+                        &request_id,
+                        StatusCode::OK.as_u16(),
+                        started.elapsed().as_millis(),
+                        first_token_ms,
+                        TokenUsage::default(),
+                        Some("streaming"),
+                    ).await;
+                }
+                yield Ok(transformed);
+            }
+            if wire.decoder.is_terminal() {
+                finish_qoder_stream_success(&mut interrupt_guard).await;
+                return;
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(response)
+}
+
+struct TraeForwardOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    adapter: adapters::GenericForwardingAdapter,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+struct PreparedTraeWireResponse {
+    inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    decoder: super::trae::TraeSseDecoder,
+    first_canonical: Bytes,
+}
+
+enum TraeForwardAttemptError {
+    Upstream(super::trae::TraeUpstreamError),
+    Proxy(ProxyError),
+}
+
+async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyError> {
+    let TraeForwardOptions {
+        state,
+        execution,
+        stored,
+        adapter,
+        mut adapter_request,
+        route,
+        request_context,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let (ProviderType::TraeSolo, account_id, expected_identity_generation) =
+        execution.managed_account_identity_target().ok_or_else(|| {
+            ProxyError::bad_request(
+                "Trae Provider must bind one explicit trae_solo managed account",
+            )
+        })?
+    else {
+        return Err(ProxyError::bad_request(
+            "Trae Provider account type does not match its runtime contract",
+        ));
+    };
+    let requested_model = adapter_request
+        .actual_model
+        .clone()
+        .or_else(|| adapter_request.model.clone())
+        .or_else(|| chat_model_from_canonical(&adapter_request.body))
+        .ok_or_else(|| ProxyError::bad_request("Trae request is missing a model"))?;
+    let canonical_chat_request = serde_json::from_slice::<Value>(&adapter_request.body)
+        .map_err(|error| ProxyError::bad_request(format!("invalid Trae Chat request: {error}")))?;
+
+    let mut auth_recovery_attempted = false;
+    loop {
+        let runtime = match state
+            .prepare_trae_runtime(
+                stored.app,
+                &stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                account_id,
+                expected_identity_generation,
+                execution.request_timeout(),
+            )
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
+                auth_recovery_attempted = true;
+                recover_trae_auth(&state, &execution, None).await?;
+                continue;
+            }
+            Err(error) => {
+                let error = trae_runtime_error_to_proxy_error(error);
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let model_id = runtime
+            .catalog
+            .resolve_model(&requested_model)
+            .map_err(ProxyError::bad_request)?;
+        let capability = runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
+            ProxyError::bad_gateway(format!(
+                "Trae live catalog has no capability record for enabled model {model_id}"
+            ))
+        })?;
+        let has_tools = canonical_chat_request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if has_tools && !capability.supports_tools {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                ProxyError::bad_request(format!(
+                    "Trae model {model_id} does not advertise tool support"
+                )),
+            )
+            .await;
+        }
+        let payload =
+            match super::trae::build_trae_payload(&canonical_chat_request, &model_id, capability) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return qoder_fail_before_commit(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        ProxyError::bad_request(error),
+                    )
+                    .await;
+                }
+            };
+        adapter_request.actual_model = Some(model_id.clone());
+        adapter_request.actual_model_source = Some("trae_live_catalog".to_string());
+        if let Err(error) = ensure_share_model_available(
+            &state,
+            &execution,
+            request_context.share_id.as_deref(),
+            Some(&model_id),
+        )
+        .await
+        {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+
+        let wire =
+            match send_trae_generation(&state, &execution, &runtime, &payload, &model_id).await {
+                Ok(wire) => wire,
+                Err(TraeForwardAttemptError::Upstream(error))
+                    if error.is_authentication_failure() && !auth_recovery_attempted =>
+                {
+                    auth_recovery_attempted = true;
+                    recover_trae_auth(&state, &execution, Some(&runtime)).await?;
+                    continue;
+                }
+                Err(TraeForwardAttemptError::Upstream(error)) => {
+                    let error = error.into_proxy_error();
+                    record_qoder_nonstream_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Err(TraeForwardAttemptError::Proxy(error)) => {
+                    record_qoder_nonstream_failure(
+                        &state,
+                        &stored,
+                        &adapter_request,
+                        &request_context,
+                        started,
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+
+        if adapter_request.stream_requested {
+            let task = tokio::spawn(forward_trae_stream(TraeStreamOptions {
+                state,
+                execution,
+                runtime,
+                stored,
+                adapter_request,
+                route,
+                request_context,
+                wire,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+            }));
+            return await_provider_stream_task(task, "Trae").await;
+        }
+
+        match aggregate_trae_nonstream(&state, &execution, &runtime, wire).await {
+            Ok(canonical) => {
+                return finish_qoder_nonstream(QoderNonstreamFinishOptions {
+                    state,
+                    stored,
+                    adapter,
+                    adapter_request,
+                    route,
+                    request_context,
+                    canonical,
+                    account_in_flight_guard,
+                    share_invocation_guard,
+                    started,
+                })
+                .await;
+            }
+            Err(TraeForwardAttemptError::Upstream(error))
+                if error.is_authentication_failure() && !auth_recovery_attempted =>
+            {
+                auth_recovery_attempted = true;
+                recover_trae_auth(&state, &execution, Some(&runtime)).await?;
+            }
+            Err(TraeForwardAttemptError::Upstream(error)) => {
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(TraeForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn send_trae_generation(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::trae_runtime::PreparedTraeRuntime,
+    payload: &Value,
+    model_id: &str,
+) -> Result<PreparedTraeWireResponse, TraeForwardAttemptError> {
+    if !trae_runtime_is_current(state, execution, runtime).await {
+        return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+            "Trae Provider or bound account changed before inference",
+        )));
+    }
+    let body = serde_json::to_vec(payload).map_err(|error| {
+        TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
+            "encode Trae generation payload: {error}"
+        )))
+    })?;
+    let profile = &runtime.profile;
+    let target_headers = vec![
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "user-agent".to_string(),
+            format!("Trae/{}", crate::domain::trae::TRAE_IDE_VERSION),
+        ),
+        (
+            "authorization".to_string(),
+            format!("Cloud-IDE-JWT {}", runtime.access_token),
+        ),
+        (
+            "x-cloudide-token".to_string(),
+            runtime.access_token.to_string(),
+        ),
+        ("x-ide-token".to_string(), runtime.access_token.to_string()),
+        ("x-uid".to_string(), profile.uid.clone()),
+        (
+            "x-app-id".to_string(),
+            crate::domain::trae::TRAE_APP_ID.to_string(),
+        ),
+        ("x-app-version".to_string(), "default".to_string()),
+        (
+            "x-ide-version".to_string(),
+            crate::domain::trae::TRAE_IDE_VERSION.to_string(),
+        ),
+        (
+            "x-ide-version-code".to_string(),
+            crate::domain::trae::TRAE_IDE_VERSION_CODE.to_string(),
+        ),
+        (
+            "x-app-version-code".to_string(),
+            crate::domain::trae::TRAE_IDE_VERSION_CODE.to_string(),
+        ),
+        ("x-ide-version-type".to_string(), "stable".to_string()),
+        ("x-device-type".to_string(), "windows".to_string()),
+        (
+            "x-os-version".to_string(),
+            crate::domain::trae::TRAE_OS_VERSION.to_string(),
+        ),
+        (
+            "x-device-brand".to_string(),
+            crate::domain::trae::TRAE_DEVICE_BRAND.to_string(),
+        ),
+        ("request-traffic-type".to_string(), "prod".to_string()),
+        ("x-machine-id".to_string(), profile.machine_id.clone()),
+        ("x-device-id".to_string(), profile.device_id.clone()),
+    ];
+    let mut headers = HeaderMap::new();
+    super::outbound_request::insert_target_headers(&mut headers, &target_headers)
+        .map_err(TraeForwardAttemptError::Proxy)?;
+    let url = super::join_url(&runtime.agent_origin, crate::domain::trae::TRAE_CHAT_PATH);
+    let request = state
+        .http_client()
+        .await
+        .post(url)
+        .headers(headers)
+        .body(body);
+    let response = match execution.stream_first_byte_timeout() {
+        Some(timeout) => tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| {
+                TraeForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Trae generation response-header timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?
+            .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+        None => request
+            .send()
+            .await
+            .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+    };
+    if !trae_runtime_is_current(state, execution, runtime).await {
+        return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+            "Trae Provider or bound account changed while inference was starting",
+        )));
+    }
+    let mut response = response;
+    let status = response.status();
+    if !status.is_success() {
+        let body = crate::infra::http::read_response_body_limited(
+            &mut response,
+            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        )
+        .await
+        .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+        return Err(TraeForwardAttemptError::Upstream(
+            super::trae::TraeUpstreamError::from_status_body(status.as_u16(), &body),
+        ));
+    }
+
+    let mut inner = response.bytes_stream().boxed();
+    let mut decoder = super::trae::TraeSseDecoder::new(model_id);
+    let mut received_chunk = false;
+    loop {
+        let timeout = if received_chunk {
+            execution.stream_idle_timeout()
+        } else {
+            execution.stream_first_byte_timeout()
+        };
+        let next = trae_next_wire_chunk(&mut inner, timeout).await?;
+        let Some(chunk) = next else {
+            let tail = decoder.finish_classified().map_err(map_trae_decode_error)?;
+            if !trae_runtime_is_current(state, execution, runtime).await {
+                return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+                    "Trae Provider or bound account changed before response commit",
+                )));
+            }
+            return Ok(PreparedTraeWireResponse {
+                inner,
+                decoder,
+                first_canonical: tail,
+            });
+        };
+        received_chunk = true;
+        let canonical = decoder
+            .push_classified(chunk)
+            .map_err(map_trae_decode_error)?;
+        if !canonical.is_empty() {
+            if !trae_runtime_is_current(state, execution, runtime).await {
+                return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+                    "Trae Provider or bound account changed before response commit",
+                )));
+            }
+            return Ok(PreparedTraeWireResponse {
+                inner,
+                decoder,
+                first_canonical: canonical,
+            });
+        }
+    }
+}
+
+fn map_trae_decode_error(error: super::trae::TraeSseDecodeError) -> TraeForwardAttemptError {
+    match error {
+        super::trae::TraeSseDecodeError::Upstream(error) => {
+            TraeForwardAttemptError::Upstream(error)
+        }
+        super::trae::TraeSseDecodeError::Protocol(error) => TraeForwardAttemptError::Proxy(error),
+    }
+}
+
+async fn trae_next_wire_chunk(
+    inner: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    timeout: Option<Duration>,
+) -> Result<Option<Bytes>, TraeForwardAttemptError> {
+    let next = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, inner.try_next())
+            .await
+            .map_err(|_| {
+                TraeForwardAttemptError::Proxy(ProxyError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "Trae generation stream timeout after {}ms",
+                        timeout.as_millis()
+                    ),
+                })
+            })?,
+        None => inner.try_next().await,
+    };
+    next.map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))
+}
+
+async fn trae_runtime_is_current(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::trae_runtime::PreparedTraeRuntime,
+) -> bool {
+    state
+        .trae_runtime_generation_matches(
+            execution.stored.app,
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            &runtime.account_id,
+            runtime.auth_identity_generation,
+            runtime.token_refresh_generation,
+        )
+        .await
+}
+
+async fn recover_trae_auth(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: Option<&super::trae_runtime::PreparedTraeRuntime>,
+) -> Result<(), ProxyError> {
+    let (provider_type, account_id, expected_generation) = execution
+        .managed_account_identity_target()
+        .ok_or_else(|| ProxyError::bad_request("Trae managed account binding is missing"))?;
+    if provider_type != ProviderType::TraeSolo {
+        return Err(ProxyError::bad_request(
+            "Trae managed account binding has the wrong provider type",
+        ));
+    }
+    if let Some(runtime) = runtime {
+        state.invalidate_trae_runtime_scope(&runtime.scope).await;
+    }
+    state
+        .refresh_managed_account_now_for_generation(
+            ProviderType::TraeSolo,
+            account_id,
+            expected_generation,
+        )
+        .await
+        .map_err(managed_account_refresh_error_to_proxy_error)
+}
+
+fn trae_runtime_error_to_proxy_error(error: TraeRuntimeError) -> ProxyError {
+    match error {
+        TraeRuntimeError::NotFound => ProxyError::not_found("Trae managed account not found"),
+        TraeRuntimeError::IdentityChanged => ProxyError::conflict(
+            "Trae Provider or bound account identity changed during runtime preparation",
+        ),
+        TraeRuntimeError::CredentialPersistenceDegraded => managed_credential_persistence_error(),
+        TraeRuntimeError::InvalidAccount(message) => ProxyError::bad_request(message),
+        TraeRuntimeError::Refresh(error) => managed_account_refresh_error_to_proxy_error(error),
+        TraeRuntimeError::Upstream {
+            status_code,
+            message,
+            retryable,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            ProxyError {
+                status: if retryable
+                    && status.is_client_error()
+                    && status != StatusCode::TOO_MANY_REQUESTS
+                {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                },
+                message,
+            }
+        }
+    }
+}
+
+async fn aggregate_trae_nonstream(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    runtime: &super::trae_runtime::PreparedTraeRuntime,
+    mut wire: PreparedTraeWireResponse,
+) -> Result<Value, TraeForwardAttemptError> {
+    loop {
+        let chunk =
+            match trae_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    wire.decoder
+                        .finish_classified()
+                        .map_err(map_trae_decode_error)?;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+        wire.decoder
+            .push_classified(chunk)
+            .map_err(map_trae_decode_error)?;
+        if !trae_runtime_is_current(state, execution, runtime).await {
+            return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+                "Trae Provider or bound account changed during inference",
+            )));
+        }
+    }
+    if !trae_runtime_is_current(state, execution, runtime).await {
+        return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+            "Trae Provider or bound account changed before response commit",
+        )));
+    }
+    wire.decoder
+        .into_chat_completion()
+        .map_err(TraeForwardAttemptError::Proxy)
+}
+
+struct TraeStreamOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    runtime: super::trae_runtime::PreparedTraeRuntime,
+    stored: StoredProvider,
+    adapter_request: adapters::AdapterRequest,
+    route: ProxyRoute,
+    request_context: UsageLogContext,
+    wire: PreparedTraeWireResponse,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+}
+
+async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, ProxyError> {
+    let TraeStreamOptions {
+        state,
+        execution,
+        runtime,
+        stored,
+        adapter_request,
+        route,
+        request_context,
+        mut wire,
+        account_in_flight_guard,
+        share_invocation_guard,
+        started,
+    } = options;
+    let first_canonical = wire.first_canonical;
+    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
+        &stored,
+        route,
+        adapter_request.responses_tool_context.clone(),
+    );
+    let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error,
+            )
+            .await;
+        }
+    };
+    if wire.decoder.is_terminal() {
+        let tail = match stream_transform.finish() {
+            Ok(tail) => tail,
+            Err(error) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error,
+                )
+                .await;
+            }
+        };
+        first_transformed = join_bytes(first_transformed, tail);
+    }
+    let request_id = log_usage(
+        &state,
+        &stored,
+        StatusCode::OK.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(&adapter_request),
+        TokenUsage::default(),
+        UsageLogContext {
+            is_streaming: true,
+            stream_status: Some("pending".to_string()),
+            usage_state: Some(UsageState::Pending),
+            ..request_context.clone()
+        },
+    )
+    .await;
+    let share_id = request_context.share_id.clone();
+    let user_email = request_context.user_email.clone();
+    let stream = async_stream::stream! {
+        let _account_in_flight_guard = account_in_flight_guard;
+        let _share_invocation_guard = share_invocation_guard;
+        let mut interrupt_guard = ShareStreamInterruptGuard {
+            armed: true,
+            state: state.clone(),
+            stored: stored.clone(),
+            request_id: request_id.clone(),
+            status_code: StatusCode::OK.as_u16(),
+            share_id: share_id.clone(),
+            user_email: user_email.clone(),
+            started,
+            first_token_ms: None,
+            usage: StreamUsageAccumulator::default(),
+        };
+        let mut first_token_ms = None;
+        if !first_canonical.is_empty() {
+            interrupt_guard.usage.push(&first_canonical);
+        }
+        if !first_transformed.is_empty() {
+            first_token_ms = Some(started.elapsed().as_millis());
+            interrupt_guard.first_token_ms = first_token_ms;
+            update_stream_usage(
+                &state,
+                &stored,
+                &request_id,
+                StatusCode::OK.as_u16(),
+                started.elapsed().as_millis(),
+                first_token_ms,
+                TokenUsage::default(),
+                Some("streaming"),
+            ).await;
+            yield Ok::<Bytes, std::io::Error>(first_transformed);
+        }
+        if wire.decoder.is_terminal() {
+            finish_qoder_stream_success(&mut interrupt_guard).await;
+            return;
+        }
+        loop {
+            let next = trae_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await;
+            let canonical = match next {
+                Ok(Some(chunk)) => match wire.decoder.push_classified(chunk) {
+                    Ok(canonical) => canonical,
+                    Err(error) => {
+                        let error = error.into_proxy_error();
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                },
+                Ok(None) => match wire.decoder.finish_classified() {
+                    Ok(canonical) => canonical,
+                    Err(error) => {
+                        let error = error.into_proxy_error();
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                },
+                Err(TraeForwardAttemptError::Proxy(error)) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+                Err(TraeForwardAttemptError::Upstream(error)) => {
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if !trae_runtime_is_current(&state, &execution, &runtime).await {
+                let error = ProxyError::conflict(
+                    "Trae Provider or bound account changed during inference",
+                );
+                if let Some(frame) = finish_qoder_stream_failure(
+                    &mut interrupt_guard,
+                    route,
+                    &error,
+                ).await {
+                    yield Ok(frame);
+                }
+                return;
+            }
+            if !canonical.is_empty() {
+                interrupt_guard.usage.push(&canonical);
+            }
+            let mut transformed = match stream_transform.push(canonical) {
+                Ok(transformed) => transformed,
+                Err(error) => {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                    ).await {
+                        yield Ok(frame);
+                    }
+                    return;
+                }
+            };
+            if wire.decoder.is_terminal() {
+                match stream_transform.finish() {
+                    Ok(tail) => transformed = join_bytes(transformed, tail),
+                    Err(error) => {
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
+                    }
+                }
+            }
+            if !transformed.is_empty() {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(started.elapsed().as_millis());
+                    interrupt_guard.first_token_ms = first_token_ms;
+                    update_stream_usage(
+                        &state,
+                        &stored,
+                        &request_id,
+                        StatusCode::OK.as_u16(),
+                        started.elapsed().as_millis(),
+                        first_token_ms,
+                        TokenUsage::default(),
+                        Some("streaming"),
+                    ).await;
+                }
+                yield Ok(transformed);
+            }
+            if wire.decoder.is_terminal() {
+                finish_qoder_stream_success(&mut interrupt_guard).await;
+                return;
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    Ok(response)
+}
+
 struct QoderForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -15403,16 +17248,91 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             let chunk = match qoder_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => {
-                    let error = wire.decoder.finish_classified().err().map(
-                        super::qoder::QoderSseDecodeError::into_proxy_error,
-                    ).unwrap_or_else(|| ProxyError::bad_gateway("Qoder stream ended unexpectedly"));
-                    if let Some(frame) = finish_qoder_stream_failure(
-                        &mut interrupt_guard,
-                        route,
-                        &error,
-                    ).await {
-                        yield Ok(frame);
+                    let canonical = match wire.decoder.finish_classified() {
+                        Ok(canonical) => canonical,
+                        Err(super::qoder::QoderSseDecodeError::Upstream(error)) => {
+                            record_qoder_limit_if_needed(&state, &execution, &error).await;
+                            let error = error.into_proxy_error();
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                        Err(super::qoder::QoderSseDecodeError::Protocol(error)) => {
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    };
+                    if !qoder_runtime_is_current(&state, &execution, &runtime).await {
+                        let error = ProxyError::conflict(
+                            "Qoder Provider or bound account changed before response commit",
+                        );
+                        if let Some(frame) = finish_qoder_stream_failure(
+                            &mut interrupt_guard,
+                            route,
+                            &error,
+                        ).await {
+                            yield Ok(frame);
+                        }
+                        return;
                     }
+                    if !canonical.is_empty() {
+                        interrupt_guard.usage.push(&canonical);
+                    }
+                    let mut transformed = match stream_transform.push(canonical) {
+                        Ok(transformed) => transformed,
+                        Err(error) => {
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    };
+                    match stream_transform.finish() {
+                        Ok(tail) => transformed = join_bytes(transformed, tail),
+                        Err(error) => {
+                            if let Some(frame) = finish_qoder_stream_failure(
+                                &mut interrupt_guard,
+                                route,
+                                &error,
+                            ).await {
+                                yield Ok(frame);
+                            }
+                            return;
+                        }
+                    }
+                    if !transformed.is_empty() {
+                        if first_token_ms.is_none() {
+                            first_token_ms = Some(started.elapsed().as_millis());
+                            interrupt_guard.first_token_ms = first_token_ms;
+                            update_stream_usage(
+                                &state,
+                                &stored,
+                                &request_id,
+                                StatusCode::OK.as_u16(),
+                                started.elapsed().as_millis(),
+                                first_token_ms,
+                                TokenUsage::default(),
+                                Some("streaming"),
+                            ).await;
+                        }
+                        yield Ok(transformed);
+                    }
+                    finish_qoder_stream_success(&mut interrupt_guard).await;
                     return;
                 }
                 Err(QoderForwardAttemptError::Proxy(error)) => {
@@ -18355,7 +20275,10 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::CodexOAuth
         | ProviderType::OllamaCloud
         | ProviderType::GrokOAuth => AppKind::Codex,
-        ProviderType::KimiCode | ProviderType::QoderCosy => AppKind::Codex,
+        ProviderType::KimiCode
+        | ProviderType::QoderCosy
+        | ProviderType::CodeBuddyOAuth
+        | ProviderType::TraeSolo => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {

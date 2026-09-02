@@ -1247,6 +1247,26 @@ async fn web_invoke_dispatch(
         "auth_submit_oauth_code" => {
             let provider_type = web_auth_provider_type(&args)?;
             let provider_label = managed_auth_provider_label(provider_type);
+            if provider_type == ProviderType::TraeSolo {
+                let callback_url = web_arg_string_any(
+                    &args,
+                    &["callbackUrl", "callback_url", "code"],
+                )?;
+                let response = complete_trae_login(
+                    State(state.clone()),
+                    headers.clone(),
+                    Json(CompleteTraeLoginRequest { callback_url }),
+                )
+                .await?
+                .0;
+                let account = web_managed_auth_account_by_id(
+                    state,
+                    &response.account.id,
+                    provider_label,
+                )
+                .await?;
+                return Ok(account);
+            }
             let session_id = web_optional_string_any(&args, &["sessionId", "session_id"]);
             let state_arg = web_optional_string_any(&args, &["state"]).or_else(|| {
                 session_id

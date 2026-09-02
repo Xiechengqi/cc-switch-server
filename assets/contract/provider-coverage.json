@@ -4,7 +4,15 @@
     "legacyCompatibility": "assets/contract/provider-legacy-compatibility.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "2d84b959ed370d994fa1ef9f29a56edd84181184c0ab5c7e7bde6ac9eddad2a1"
+      "sha256": "8510657b97389e787b822d9f0e44871aa874dd05caf2b55e0a74e537f2fff55b"
+    },
+    "qoderOracle": "assets/contract/qoder-cli-oracle.json"
+  },
+  "verification": {
+    "qoder": {
+      "rustQoderTests": 56,
+      "nodeOracleMutationTests": 8,
+      "nodeRealHarnessFixtureTests": 7
     }
   },
   "providerTypes": [
@@ -178,6 +186,34 @@
       "variant": "QoderCosy",
       "id": "qoder_cosy",
       "label": "Qoder OAuth",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "coverageClass": "server_extension",
+      "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "CodeBuddyOAuth",
+      "id": "codebuddy_oauth",
+      "label": "CodeBuddy OAuth",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "coverageClass": "server_extension",
+      "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "TraeSolo",
+      "id": "trae_solo",
+      "label": "Trae CN Solo",
       "apps": [
         "claude",
         "codex",

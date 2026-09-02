@@ -45,6 +45,14 @@
     "submitPasteCode": "提交",
     "webPasteHint": "1. 點擊下方連結，在瀏覽器中完成 claude.ai 授權。\n2. 授權後 platform.claude.com 會顯示一段授權碼。\n3. 複製授權碼並貼到下方輸入框，點擊「提交」完成新增帳號。"
   },
+  "codeBuddyOauth": {
+    "authStatus": "CodeBuddy OAuth 驗證",
+    "cnSite": "中國站",
+    "intlSite": "國際站",
+    "loginSite": "新登入帳號站點",
+    "loginWithCodeBuddy": "使用 CodeBuddy 登入",
+    "siteHint": "所選站點會永久綁定到匯入帳號，反向代理錯誤不會觸發切站。"
+  },
   "codexBankedReset": {
     "alreadyRedeemed": "該 credit 已被使用",
     "available": "可用重置",
@@ -535,6 +543,16 @@
     "patLabel": "國際站個人權杖",
     "patPlaceholder": "pt-...",
     "patRail": "PAT"
+  },
+  "traeOauth": {
+    "authStatus": "Trae 中國區 Solo 驗證",
+    "callbackHint": "若瀏覽器無法存取 Server 的 localhost 回呼，請從網址列複製完整回呼 URL 並貼到此處。",
+    "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
+    "callbackRequired": "請貼上完整的 Trae 回呼 URL。",
+    "callbackUrl": "回呼 URL",
+    "loginSuccess": "Trae 中國區 Solo 帳號已登入。",
+    "loginWithTrae": "使用 Trae 中國區 Solo 登入",
+    "submitCallback": "完成登入"
   },
   "server": {
     "auth": {

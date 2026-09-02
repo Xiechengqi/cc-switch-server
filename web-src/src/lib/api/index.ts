@@ -75,6 +75,7 @@ export type {
   ImportQoderPatResponse,
   QoderCredentialRail,
   QoderSite,
+  CodeBuddySite,
   DeepSeekAccount,
   DeepSeekAccountStatus,
 } from "./auth";

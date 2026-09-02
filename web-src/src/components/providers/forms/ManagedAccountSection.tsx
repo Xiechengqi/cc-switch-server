@@ -11,6 +11,7 @@ import { AntigravityOAuthSection } from "./AntigravityOAuthSection";
 import { AmazonQOAuthSection } from "./AmazonQOAuthSection";
 import { ClaudeOAuthSection } from "./ClaudeOAuthSection";
 import { CodexOAuthSection } from "./CodexOAuthSection";
+import { CodeBuddyOAuthSection } from "./CodeBuddyOAuthSection";
 import { CopilotAuthSection } from "./CopilotAuthSection";
 import { CursorOAuthSection } from "./CursorOAuthSection";
 import { DeepSeekAccountSection } from "./DeepSeekAccountSection";
@@ -19,6 +20,7 @@ import { GrokOAuthSection } from "./GrokOAuthSection";
 import { KiroOAuthSection } from "./KiroOAuthSection";
 import { KimiOAuthSection } from "./KimiOAuthSection";
 import { QoderOAuthSection } from "./QoderOAuthSection";
+import { TraeOAuthSection } from "./TraeOAuthSection";
 
 export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "claude_oauth",
@@ -33,6 +35,8 @@ export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "amazon_q_oauth",
   "kimi_code",
   "qoder_cosy",
+  "codebuddy_oauth",
+  "trae_solo",
   "deepseek_account",
 ] as const;
 
@@ -157,6 +161,10 @@ export function ManagedAccountSection({
       return <KimiOAuthSection {...common} />;
     case "qoder_cosy":
       return <QoderOAuthSection {...common} />;
+    case "codebuddy_oauth":
+      return <CodeBuddyOAuthSection {...common} />;
+    case "trae_solo":
+      return <TraeOAuthSection {...common} />;
     case "deepseek_account":
       return <DeepSeekAccountSection {...common} />;
   }

@@ -45,6 +45,14 @@
     "submitPasteCode": "提交",
     "webPasteHint": "1. 点击下方链接在浏览器中完成 claude.ai 授权。\n2. 授权后会跳到 platform.claude.com 显示一段授权码。\n3. 复制该授权码并粘贴到下面的输入框，点击“提交”完成添加账号。"
   },
+  "codeBuddyOauth": {
+    "authStatus": "CodeBuddy OAuth 认证",
+    "cnSite": "中国站",
+    "intlSite": "国际站",
+    "loginSite": "新登录账号站点",
+    "loginWithCodeBuddy": "使用 CodeBuddy 登录",
+    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。"
+  },
   "codexBankedReset": {
     "alreadyRedeemed": "该 credit 已被使用",
     "available": "可用重置",
@@ -535,6 +543,16 @@
     "patLabel": "国际站个人令牌",
     "patPlaceholder": "pt-...",
     "patRail": "PAT"
+  },
+  "traeOauth": {
+    "authStatus": "Trae 中国区 Solo 认证",
+    "callbackHint": "若浏览器无法访问 Server 的 localhost 回调，请从地址栏复制完整回调 URL 并粘贴到此处。",
+    "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
+    "callbackRequired": "请粘贴完整的 Trae 回调 URL。",
+    "callbackUrl": "回调 URL",
+    "loginSuccess": "Trae 中国区 Solo 账号已登录。",
+    "loginWithTrae": "使用 Trae 中国区 Solo 登录",
+    "submitCallback": "完成登录"
   },
   "server": {
     "auth": {

@@ -45,6 +45,14 @@
     "submitPasteCode": "送信",
     "webPasteHint": "1. 下のリンクを開き、claude.ai で認証します。\n2. platform.claude.com に認証コードが表示されます。\n3. コードを下の入力欄に貼り付けて送信すると、アカウントが追加されます。"
   },
+  "codeBuddyOauth": {
+    "authStatus": "CodeBuddy OAuth 認証",
+    "cnSite": "中国",
+    "intlSite": "国際",
+    "loginSite": "新規ログインのサイト",
+    "loginWithCodeBuddy": "CodeBuddy でログイン",
+    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。"
+  },
   "codexBankedReset": {
     "alreadyRedeemed": "この credit は既に使用済みです",
     "available": "利用可能なリセット",
@@ -535,6 +543,16 @@
     "patLabel": "グローバル個人トークン",
     "patPlaceholder": "pt-...",
     "patRail": "PAT"
+  },
+  "traeOauth": {
+    "authStatus": "Trae CN Solo 認証",
+    "callbackHint": "ブラウザーが Server の localhost コールバックに到達できない場合は、アドレスバーの完全なコールバック URL をここに貼り付けてください。",
+    "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
+    "callbackRequired": "Trae の完全なコールバック URL を貼り付けてください。",
+    "callbackUrl": "コールバック URL",
+    "loginSuccess": "Trae CN Solo アカウントでログインしました。",
+    "loginWithTrae": "Trae CN Solo でログイン",
+    "submitCallback": "ログインを完了"
   },
   "server": {
     "auth": {

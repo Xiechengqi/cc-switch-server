@@ -113,6 +113,17 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
                 crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
             );
         }
+        ManagedIdentityFamily::Codebuddy => set_user_agent(
+            headers,
+            format!(
+                "CLI/{0} CodeBuddy/{0}",
+                crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION
+            ),
+        ),
+        ManagedIdentityFamily::Trae => set_user_agent(
+            headers,
+            format!("Trae/{}", crate::domain::trae::TRAE_IDE_VERSION),
+        ),
         ManagedIdentityFamily::Kiro => {
             set_user_agent(headers, "aws-sdk-js/1.0.34 KiroIDE-2.3.0".to_string())
         }

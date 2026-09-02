@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod claude_cli;
+pub mod codebuddy;
 pub mod grok_cli;
 pub mod health;
 pub mod kimi_cli;
@@ -10,5 +11,6 @@ pub mod settings;
 pub mod sharing;
 pub mod stream_check;
 pub mod subdomain_suggest;
+pub mod trae;
 pub mod usage;
 pub mod web_auth;

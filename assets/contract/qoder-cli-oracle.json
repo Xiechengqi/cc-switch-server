@@ -1,0 +1,909 @@
+{
+  "schemaVersion": 2,
+  "providerType": "qoder_cosy",
+  "capturedAt": "2026-09-02",
+  "offlineState": "fixture_verified",
+  "liveState": "live_pending",
+  "scope": "single_bound_account_only",
+  "verification": {
+    "rustQoderTests": 56,
+    "nodeOracleMutationTests": 8,
+    "nodeRealHarnessFixtureTests": 7
+  },
+  "source": {
+    "referenceRepository": {
+      "name": "cli2api",
+      "commit": "9b18f2de06c53f12bf2c5112c7a71e3e64755b97",
+      "files": {
+        "worker/src/compat.mjs": "6c004d1bfb88cd2c1522588725d651be5de48e9c148c5c9f0c263c35b77b8dc8",
+        "worker/src/daemon.mjs": "86dc7b9f77bf8ada68ec1e7ba0d744e09bfdcd0d7d9e7cf3f8fd35df0ed9064c",
+        "worker/src/plaintext.mjs": "1f25273ac8b8b7b156ea70945bcbedcca38007cc5fea55d7360fa2d4ca85a413"
+      },
+      "role": "read_only_capture_and_plaintext_projection"
+    },
+    "packages": [
+      {
+        "site": "global",
+        "name": "@qoder-ai/qodercli",
+        "version": "1.1.32",
+        "npmIntegrity": "sha512-wzFOvUC8mP1TKfmcoP5pFQ5X2L5zNbqIVr0X8313cJt9u0iGbFZBeh+NTGc1nKljL6EOagHLt4PvDWNyddgx5w==",
+        "npmShasum": "04620839405c5a3f05915f03925bc0949688e66c",
+        "bundleSha256": "24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf",
+        "captureHooks": [
+          "createWasmContext",
+          "modelCatalog",
+          "prepareInferRequest",
+          "quotaApi",
+          "skipMain"
+        ]
+      },
+      {
+        "site": "cn",
+        "name": "@qodercn-ai/qoderclicn",
+        "version": "1.1.32",
+        "npmIntegrity": "sha512-xLt0mlunz6KhEqMJ/UQN97vQvfpzqaRi/B4vGWdYtg6AUrQ4LnqMZSAEuSZbU/2eV4ETQvzp4e/WENFpwdYJ4A==",
+        "npmShasum": "4be70c9095247cb96e59b6a52b51f5096bf61bc9",
+        "bundleSha256": "5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b",
+        "captureHooks": [
+          "createWasmContext",
+          "modelCatalog",
+          "prepareInferRequest",
+          "quotaApi",
+          "skipMain"
+        ]
+      }
+    ]
+  },
+  "rails": [
+    {
+      "id": "global_oauth",
+      "site": "global",
+      "credentialRail": "global_oauth",
+      "packageSite": "global",
+      "origins": {
+        "device": "https://qoder.com",
+        "openapi": "https://openapi.qoder.sh",
+        "center": "https://center.qoder.sh",
+        "generation": "https://api1.qoder.sh",
+        "jobGeneration": "https://api2.qoder.sh"
+      },
+      "login": {
+        "authorizationPath": "/device/selectAccounts",
+        "authorizationQueryRequired": [
+          "challenge",
+          "challenge_method",
+          "client_id",
+          "machine_id",
+          "nonce"
+        ],
+        "machineIdFormat": "lower_hex_36",
+        "nonceFormat": "uuid_v4",
+        "pollForbiddenHeaders": [
+          "authorization",
+          "cosy-*",
+          "user-agent"
+        ],
+        "pollHeaders": {
+          "accept": "application/json"
+        },
+        "pollIntervalSeconds": 1,
+        "pollMethod": "GET",
+        "pollOrigin": "openapi",
+        "pollPath": "/api/v1/deviceToken/poll",
+        "pollPendingHttpStatus": 404,
+        "pollQueryRequired": [
+          "challenge_method",
+          "nonce",
+          "verifier"
+        ],
+        "pollTimeoutSeconds": 300,
+        "pkceMethod": "S256",
+        "refreshForbiddenHeaders": [
+          "authorization",
+          "cosy-*",
+          "proxy-authorization",
+          "x-qoder-account"
+        ],
+        "refreshHeaders": {
+          "accept": "application/json",
+          "content-type": "application/json",
+          "user-agent": "qoder/1.1.32"
+        },
+        "refreshMethod": "POST",
+        "refreshOrigin": "openapi",
+        "refreshPath": "/api/v1/deviceToken/refresh",
+        "refreshRequestBody": {
+          "refresh_token": "<redacted>"
+        },
+        "refreshResponseOptionalFields": [
+          "refresh_token_expires_at"
+        ],
+        "refreshResponseRequiredFields": [
+          "device_token",
+          "expires_at",
+          "refresh_token"
+        ],
+        "refreshTokenRotates": true,
+        "stateBound": true,
+        "userinfoPath": "/api/v1/userinfo"
+      },
+      "wire": {
+        "actualPath": "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
+        "signaturePath": "/api/v2/service/pro/sse/agent_chat_generation",
+        "clientVersion": "1.24.2",
+        "clientType": "5",
+        "dataPolicy": "disagree",
+        "requiredHeaders": [
+          "accept",
+          "accept-encoding",
+          "authorization",
+          "cache-control",
+          "content-type",
+          "cosy-bodyhash",
+          "cosy-bodylength",
+          "cosy-business-product",
+          "cosy-business-type",
+          "cosy-clientip",
+          "cosy-clienttype",
+          "cosy-data-policy",
+          "cosy-date",
+          "cosy-key",
+          "cosy-machineid",
+          "cosy-machineos",
+          "cosy-machinetoken",
+          "cosy-machinetype",
+          "cosy-organization-id",
+          "cosy-organization-tags",
+          "cosy-scene",
+          "cosy-sigpath",
+          "cosy-user",
+          "cosy-version",
+          "login-version",
+          "x-request-id"
+        ],
+        "forbiddenHeaders": [
+          "cosy-machinecode",
+          "proxy-authorization",
+          "x-qoder-account"
+        ]
+      },
+      "catalog": {
+        "actualPath": "/algo/api/v2/model/list",
+        "signaturePath": "/api/v2/model/list"
+      },
+      "quota": {
+        "actualPath": "/algo/api/v2/quota/usage",
+        "signaturePath": "/api/v2/quota/usage",
+        "organizationQuery": false
+      }
+    },
+    {
+      "id": "global_pat",
+      "site": "global",
+      "credentialRail": "pat_job_token",
+      "packageSite": "global",
+      "origins": {
+        "device": "https://qoder.com",
+        "openapi": "https://openapi.qoder.sh",
+        "center": "https://center.qoder.sh",
+        "generation": "https://api1.qoder.sh",
+        "jobGeneration": "https://api2.qoder.sh"
+      },
+      "login": {
+        "patExchangePath": "/api/v1/jobToken/exchange",
+        "patPrefixSchema": "pt-<redacted>",
+        "persistentJobToken": false
+      },
+      "wire": {
+        "actualPath": "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
+        "signaturePath": "/api/v2/service/pro/sse/agent_chat_generation",
+        "clientVersion": "1.24.2",
+        "clientType": "5",
+        "dataPolicy": "disagree",
+        "requiredHeaders": [
+          "accept",
+          "accept-encoding",
+          "authorization",
+          "cache-control",
+          "content-type",
+          "cosy-bodyhash",
+          "cosy-bodylength",
+          "cosy-business-product",
+          "cosy-business-type",
+          "cosy-clientip",
+          "cosy-clienttype",
+          "cosy-data-policy",
+          "cosy-date",
+          "cosy-key",
+          "cosy-machineid",
+          "cosy-machineos",
+          "cosy-machinetoken",
+          "cosy-machinetype",
+          "cosy-organization-id",
+          "cosy-organization-tags",
+          "cosy-scene",
+          "cosy-sigpath",
+          "cosy-user",
+          "cosy-version",
+          "login-version",
+          "x-request-id"
+        ],
+        "forbiddenHeaders": [
+          "cosy-machinecode",
+          "proxy-authorization",
+          "x-qoder-account"
+        ]
+      },
+      "catalog": {
+        "actualPath": "/algo/api/v2/model/list",
+        "signaturePath": "/api/v2/model/list"
+      },
+      "quota": {
+        "actualPath": "/algo/api/v2/quota/usage",
+        "signaturePath": "/api/v2/quota/usage",
+        "organizationQuery": false
+      }
+    },
+    {
+      "id": "cn_oauth",
+      "site": "cn",
+      "credentialRail": "cn_oauth",
+      "packageSite": "cn",
+      "origins": {
+        "device": "https://qoder.com.cn",
+        "openapi": "https://openapi.qoder.com.cn",
+        "generation": "https://gateway.qoder.com.cn",
+        "jobGeneration": "https://gateway.qoder.com.cn"
+      },
+      "login": {
+        "authorizationPath": "/device/selectAccounts",
+        "authorizationQueryRequired": [
+          "challenge",
+          "challenge_method",
+          "client_id",
+          "machine_id",
+          "nonce"
+        ],
+        "authStatusPath": "/algo/api/v3/user/status?Encode=1",
+        "machineIdFormat": "uuid_v4",
+        "nonceFormat": "uuid_v4",
+        "pollForbiddenHeaders": [
+          "authorization",
+          "cosy-*",
+          "user-agent"
+        ],
+        "pollHeaders": {
+          "accept": "application/json"
+        },
+        "pollIntervalSeconds": 1,
+        "pollMethod": "GET",
+        "pollOrigin": "openapi",
+        "pollPath": "/api/v1/deviceToken/poll",
+        "pollPendingHttpStatus": 404,
+        "pollQueryRequired": [
+          "challenge_method",
+          "nonce",
+          "verifier"
+        ],
+        "pollTimeoutSeconds": 300,
+        "pkceMethod": "S256",
+        "refreshForbiddenHeaders": [
+          "authorization",
+          "cosy-*",
+          "proxy-authorization",
+          "x-qoder-account"
+        ],
+        "refreshHeaders": {
+          "accept": "application/json",
+          "content-type": "application/json",
+          "user-agent": "qoder/1.1.32"
+        },
+        "refreshMethod": "POST",
+        "refreshOrigin": "openapi",
+        "refreshPath": "/api/v1/deviceToken/refresh",
+        "refreshRequestBody": {
+          "refresh_token": "<redacted>"
+        },
+        "refreshResponseOptionalFields": [
+          "refresh_token_expires_at"
+        ],
+        "refreshResponseRequiredFields": [
+          "device_token",
+          "expires_at",
+          "refresh_token"
+        ],
+        "refreshTokenRotates": true,
+        "stateBound": true,
+        "userinfoPath": "/api/v1/userinfo"
+      },
+      "wire": {
+        "actualPath": "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
+        "signaturePath": "/api/v2/service/pro/sse/agent_chat_generation",
+        "clientVersion": "1.24.2",
+        "clientType": "0",
+        "dataPolicy": "DISAGREE",
+        "requiredHeaders": [
+          "accept",
+          "accept-encoding",
+          "authorization",
+          "cache-control",
+          "content-type",
+          "cosy-bodyhash",
+          "cosy-bodylength",
+          "cosy-clientip",
+          "cosy-clienttype",
+          "cosy-data-policy",
+          "cosy-date",
+          "cosy-key",
+          "cosy-machinecode",
+          "cosy-machineid",
+          "cosy-machineos",
+          "cosy-machinetoken",
+          "cosy-machinetype",
+          "cosy-organization-id",
+          "cosy-organization-tags",
+          "cosy-sigpath",
+          "cosy-user",
+          "cosy-version",
+          "login-version",
+          "x-request-id"
+        ],
+        "forbiddenHeaders": [
+          "cosy-business-product",
+          "cosy-business-type",
+          "cosy-scene",
+          "proxy-authorization",
+          "x-qoder-account"
+        ]
+      },
+      "catalog": {
+        "actualPath": "/algo/api/v2/model/list",
+        "signaturePath": "/api/v2/model/list"
+      },
+      "quota": {
+        "actualPath": "/algo/api/v2/quota/usage",
+        "signaturePath": "/api/v2/quota/usage",
+        "organizationQuery": true
+      }
+    }
+  ],
+  "canonicalCase": {
+    "modelKey": "gmodel",
+    "siteCases": [
+      "global",
+      "cn"
+    ],
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "userType": "personal_standard",
+    "nowMs": 1700000000000,
+    "request": {
+      "model": "glm-5.3",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are precise."
+        },
+        {
+          "role": "user",
+          "content": "Use lookup for alpha."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_lookup",
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "arguments": "{\"key\":\"alpha\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_lookup",
+          "name": "lookup",
+          "content": "{\"value\":1}"
+        },
+        {
+          "role": "user",
+          "content": "Summarize."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key"
+              ]
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "reasoning_effort": "high",
+      "max_completion_tokens": 512
+    },
+    "modelConfig": {
+      "key": "gmodel",
+      "display_name": "GLM-5.3",
+      "source": "fixture-source",
+      "enable": true,
+      "is_reasoning": true,
+      "max_input_tokens": 1000000,
+      "max_output_tokens": 4096
+    },
+    "cli2apiProjection": {
+      "/stream": true,
+      "/chat_task": "FREE_INPUT",
+      "/source": "cli",
+      "/version": "1.0",
+      "/session_type": "assistant",
+      "/is_reply": false,
+      "/is_retry": false,
+      "/model_config/key": "gmodel",
+      "/model_config/source": "fixture-source",
+      "/model_config/is_reasoning": true,
+      "/model_config/reasoning_effort": "<absent>",
+      "/model_config/max_input_tokens": 1000000,
+      "/parameters/max_tokens": 512,
+      "/parameters/reasoning_effort": "high",
+      "/parameters/enable_thinking": true,
+      "/parameters/context_length": 1000000,
+      "/parameters/tool_choice": "auto",
+      "/business/product": "cli",
+      "/business/version": "1.1.32",
+      "/business/type": "agent",
+      "/business/stage": "start",
+      "/messages/0/role": "system",
+      "/messages/1/content": "Use lookup for alpha.",
+      "/messages/2/tool_calls/0/id": "call_lookup",
+      "/messages/3/tool_call_id": "call_lookup",
+      "/tools/0/function/name": "lookup"
+    },
+    "serverProjection": {
+      "/stream": true,
+      "/chat_task": "FREE_INPUT",
+      "/source": 1,
+      "/version": "3",
+      "/session_type": "qodercli",
+      "/is_reply": true,
+      "/is_retry": false,
+      "/model_config/key": "gmodel",
+      "/model_config/source": "fixture-source",
+      "/model_config/is_reasoning": true,
+      "/model_config/reasoning_effort": "high",
+      "/model_config/max_input_tokens": 1000000,
+      "/parameters/max_tokens": 512,
+      "/parameters/reasoning_effort": "<absent>",
+      "/parameters/enable_thinking": "<absent>",
+      "/parameters/context_length": 1000000,
+      "/parameters/tool_choice": "<absent>",
+      "/business/product": "cli",
+      "/business/version": "1.24.2",
+      "/business/type": "agent",
+      "/business/stage": "init",
+      "/messages/0/role": "system",
+      "/messages/1/contents/0/text": "Use lookup for alpha.",
+      "/messages/2/tool_calls/0/id": "call_lookup",
+      "/messages/3/tool_call_id": "call_lookup",
+      "/tools/0/function/name": "lookup"
+    },
+    "acceptedDifferences": [
+      {
+        "pointer": "/source",
+        "reason": "cc follows the frozen native COSY payload contract using numeric source=1"
+      },
+      {
+        "pointer": "/version",
+        "reason": "cc native payload version and cli2api plaintext wrapper version are different version spaces"
+      },
+      {
+        "pointer": "/session_type",
+        "reason": "cc identifies the native qodercli session explicitly"
+      },
+      {
+        "pointer": "/is_reply",
+        "reason": "cc preserves the audited native conversation continuation flag"
+      },
+      {
+        "pointer": "/model_config/reasoning_effort",
+        "reason": "cc projects reviewed reasoning capability into live model_config before encoding"
+      },
+      {
+        "pointer": "/parameters/reasoning_effort",
+        "reason": "cli2api retains client effort in parameters while cc places the normalized value in model_config"
+      },
+      {
+        "pointer": "/parameters/enable_thinking",
+        "reason": "cc represents thinking through model_config is_reasoning and reasoning_effort"
+      },
+      {
+        "pointer": "/parameters/tool_choice",
+        "reason": "cc canonicalizes tools and does not forward an unverified Qoder tool_choice field"
+      },
+      {
+        "pointer": "/business/version",
+        "reason": "official npm package 1.1.32 and COSY wire client 1.24.2 are separate audited version spaces"
+      },
+      {
+        "pointer": "/business/stage",
+        "reason": "cc uses the audited native stage=init contract"
+      },
+      {
+        "pointer": "/messages/1/content",
+        "reason": "cc stores user text in structured contents while keeping the legacy content field empty"
+      },
+      {
+        "pointer": "/messages/1/contents/0/text",
+        "reason": "cli2api plaintext projection has no structured contents block; cc native payload requires it"
+      }
+    ],
+    "randomFieldSchema": {
+      "/request_id": "uuid_v4",
+      "/request_set_id": "uuid_v4",
+      "/chat_record_id": "same_as_request_id",
+      "/business/id": "uuid_v4"
+    },
+    "normalizedServerBody": {
+      "request_id": "<request_id_uuid_v4>",
+      "request_set_id": "<request_set_id_uuid_v4>",
+      "chat_record_id": "<request_id_uuid_v4>",
+      "stream": true,
+      "chat_task": "FREE_INPUT",
+      "image_urls": null,
+      "is_reply": true,
+      "is_retry": false,
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "code_language": "",
+      "source": 1,
+      "version": "3",
+      "chat_prompt": "",
+      "parameters": {
+        "max_tokens": 512,
+        "context_length": 1000000
+      },
+      "aliyun_user_type": "personal_standard",
+      "session_type": "qodercli",
+      "agent_id": "agent_common",
+      "task_id": "common",
+      "chat_context": {
+        "chatPrompt": "",
+        "features": [],
+        "imageUrls": null,
+        "text": {
+          "type": "text",
+          "text": "Summarize."
+        },
+        "extra": {
+          "context": [],
+          "modelConfig": {
+            "key": "gmodel",
+            "source": "fixture-source",
+            "is_reasoning": true,
+            "reasoning_effort": "high",
+            "max_input_tokens": 1000000
+          },
+          "originalContent": {
+            "type": "text",
+            "text": "Summarize."
+          },
+          "ideModelConfigOverride": {
+            "max_input_tokens": 1000000
+          }
+        }
+      },
+      "model_config": {
+        "key": "gmodel",
+        "display_name": "GLM-5.3",
+        "source": "fixture-source",
+        "enable": true,
+        "is_reasoning": true,
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 4096,
+        "reasoning_effort": "high"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are precise.",
+          "contents": [
+            {
+              "type": "text",
+              "text": "You are precise."
+            }
+          ],
+          "reasoning_content_signature": "",
+          "response_meta": {
+            "id": "",
+            "usage": {
+              "prompt_tokens": 0,
+              "completion_tokens": 0,
+              "total_tokens": 0,
+              "completion_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        },
+        {
+          "role": "user",
+          "content": "",
+          "contents": [
+            {
+              "type": "text",
+              "text": "Use lookup for alpha."
+            }
+          ],
+          "reasoning_content_signature": "",
+          "response_meta": {
+            "id": "",
+            "usage": {
+              "prompt_tokens": 0,
+              "completion_tokens": 0,
+              "total_tokens": 0,
+              "completion_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "contents": [],
+          "reasoning_content_signature": "",
+          "response_meta": {
+            "id": "",
+            "usage": {
+              "prompt_tokens": 0,
+              "completion_tokens": 0,
+              "total_tokens": 0,
+              "completion_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          "tool_calls": [
+            {
+              "id": "call_lookup",
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "arguments": "{\"key\":\"alpha\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "{\"value\":1}",
+          "contents": [
+            {
+              "type": "text",
+              "text": "{\"value\":1}"
+            }
+          ],
+          "reasoning_content_signature": "",
+          "response_meta": {
+            "id": "",
+            "usage": {
+              "prompt_tokens": 0,
+              "completion_tokens": 0,
+              "total_tokens": 0,
+              "completion_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          "tool_call_id": "call_lookup",
+          "tool_call_call_id": "call_lookup",
+          "name": "lookup"
+        },
+        {
+          "role": "user",
+          "content": "",
+          "contents": [
+            {
+              "type": "text",
+              "text": "Summarize.",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ],
+          "reasoning_content_signature": "",
+          "response_meta": {
+            "id": "",
+            "usage": {
+              "prompt_tokens": 0,
+              "completion_tokens": 0,
+              "total_tokens": 0,
+              "completion_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "description": "Look up a value",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key"
+              ]
+            }
+          }
+        }
+      ],
+      "business": {
+        "product": "cli",
+        "version": "1.24.2",
+        "type": "agent",
+        "stage": "init",
+        "id": "<business_id_uuid_v4>",
+        "name": "Summarize.",
+        "begin_at": 1700000000000
+      }
+    }
+  },
+  "encodingVectors": [
+    {
+      "plainUtf8": "hello",
+      "encoded": "q$FruHPH"
+    },
+    {
+      "plainUtf8": "{\"model\":\"qmodel\"}",
+      "encoded": "u(CLuoKWuoByBEgtmYKtu(CL"
+    },
+    {
+      "plainUtf8": "{\"messages\":[]}",
+      "encoded": "ByS..Wj^#SJLNYmYKtDx"
+    }
+  ],
+  "signatureVector": {
+    "payloadBase64": "payload",
+    "cosyKey": "cosy-key",
+    "unixSeconds": "1700000000",
+    "encodedBody": "ByS..Wj^#SJLNYmYKtDx",
+    "signaturePath": "/api/v2/service/pro/sse/agent_chat_generation",
+    "signatureMd5": "b334d288a995778f0eb534a67b882250"
+  },
+  "catalogCase": {
+    "site": "global",
+    "input": {
+      "chat": [
+        {
+          "key": "gmodel",
+          "display_name": "GLM-5.3",
+          "enable": true,
+          "max_input_tokens": 1000000
+        },
+        {
+          "key": "hidden",
+          "display_name": "Hidden",
+          "enable": false
+        }
+      ]
+    },
+    "enabledModelKeys": [
+      "gmodel"
+    ],
+    "publicModelIds": [
+      "glm-5.3"
+    ],
+    "authoritativeEmpty": true
+  },
+  "quotaCase": {
+    "input": {
+      "userType": "teams",
+      "isQuotaExceeded": false,
+      "userQuota": {
+        "total": 100,
+        "used": 20,
+        "remaining": 80
+      },
+      "addOnQuota": {
+        "total": 10,
+        "used": 2,
+        "remaining": 8
+      }
+    },
+    "expectedBucketIds": [
+      "qoder_add_on",
+      "qoder_user"
+    ],
+    "missingBalanceState": "unknown",
+    "informationalOnly": true
+  },
+  "terminalContract": {
+    "successRequires": [
+      "valid_inner_chunk",
+      "authoritative_finish_reason",
+      "upstream_eof",
+      "exactly_one_downstream_done"
+    ],
+    "rejects": [
+      "missing_terminal",
+      "malformed_json",
+      "second_terminal",
+      "business_data_after_terminal",
+      "auth_error_after_commit"
+    ]
+  },
+  "receiptSchema": {
+    "requiredFields": [
+      "accountIdentityDigest",
+      "authIdentityGeneration",
+      "catalogSource",
+      "catalogStale",
+      "commit",
+      "credentialRail",
+      "model",
+      "otherAccountRequests",
+      "otherProviderRequests",
+      "otherSiteRequests",
+      "pathHeaderSchemaDigest",
+      "providerBindingDigest",
+      "quotaState",
+      "sensitiveScan",
+      "site",
+      "surfaceChecks",
+      "terminalChecks",
+      "timestamp",
+      "tokenRefreshGeneration"
+    ],
+    "forbiddenFields": [
+      "accessToken",
+      "apiKey",
+      "authorization",
+      "cosyKey",
+      "prompt",
+      "rawRequest",
+      "rawResponse",
+      "refreshToken"
+    ],
+    "successRequiresZero": [
+      "otherAccountRequests",
+      "otherProviderRequests",
+      "otherSiteRequests"
+    ]
+  }
+}

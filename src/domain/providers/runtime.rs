@@ -1437,6 +1437,8 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::AmazonQOAuth => Some("https://q.us-east-1.amazonaws.com"),
         ProviderType::KimiCode => Some("https://api.kimi.com/coding/v1"),
         ProviderType::QoderCosy => Some("https://api1.qoder.sh"),
+        ProviderType::CodeBuddyOAuth => Some("https://www.codebuddy.ai"),
+        ProviderType::TraeSolo => Some("https://trae-api-cn.mchost.guru"),
         ProviderType::CursorOAuth => Some("https://api2.cursor.sh"),
         ProviderType::CursorApiKey => Some("https://api.cursor.com"),
         ProviderType::OllamaCloud => Some("https://ollama.com"),
@@ -1455,6 +1457,8 @@ fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
             | ProviderType::GrokOAuth
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
+            | ProviderType::CodeBuddyOAuth
+            | ProviderType::TraeSolo
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
     )
@@ -1621,6 +1625,8 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::AmazonQOAuth => "special.amazon_q",
         ProviderType::KimiCode => "oauth.kimi_code",
         ProviderType::QoderCosy => "special.qoder_cosy",
+        ProviderType::CodeBuddyOAuth => "special.codebuddy_oauth",
+        ProviderType::TraeSolo => "special.trae_solo",
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => "special.cursor",
         ProviderType::AntigravityOAuth => "special.antigravity",
         ProviderType::AgyOAuth => "special.agy",
