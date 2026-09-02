@@ -397,12 +397,18 @@ pub fn record_claude_response_decoding(surface: &'static str, result: &'static s
 fn set_claude_wire_profile_info() {
     let profile = crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
     let identity = crate::domain::claude_cli::claude_cli_identity();
+    let stale_override_rejected = if identity.stale_override_rejected {
+        "true"
+    } else {
+        "false"
+    };
     metrics::gauge!(
         "cc_switch_claude_wire_profile_info",
         "profile_id" => profile.id,
         "claude_code_version" => profile.claude_code_version,
         "effective_claude_code_version" => identity.version,
         "identity_source" => identity.source,
+        "stale_override_rejected" => stale_override_rejected,
         "stainless_version" => profile.stainless_package_version,
         "node_version" => profile.node_version,
         "axios_version" => profile.axios_version

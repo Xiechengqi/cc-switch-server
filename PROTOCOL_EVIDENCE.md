@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-02 Claude Code 2.1.258 OAuth wire profile freeze
+
+`claude_oauth` 的当前 wire profile 来自对官方 npm `@anthropic-ai/claude-code@2.1.258` native binary 的一次性静态审计，以及只连接本地 loopback、使用假凭据的出站请求捕获；审计过程没有访问 Anthropic，也没有保存或使用真实 access/refresh token。审计当日 npm `latest` / `next` 为 `2.1.258`，`stable` 仍为 `2.1.236`。发布漂移检查以 `latest` 为目标，同时只记录 `stable`；Server 构建和运行时都不访问 npm。
+
+证据确认 Claude Code、Stainless、Node 与 Axios 的公开版本分别为 `2.1.258`、`0.112.1`、`v26.3.0` 与 `1.15.2`，并确认 `claude-fable-5-1` canonical model、mid-conversation system 能力、保留的 CCH 流程以及 prompt-derived billing suffix。billing suffix 以 salt `59cf53e54c78`、原始请求第一条 user text 的 JavaScript UTF-16 code unit 索引 4/7/20（缺位补 `0`）和有效 CLI version 计算 SHA-256，取前三位 hex；`ping` / `2.1.258` 的固定结果为 `1e2`。billing block 本身不带 `cache_control`，CCH 仍在所有 body rewrite 后生成。profile、算法常量和脱敏 golden 位于 `assets/contract/claude-oauth-wire-profile.json`，生产实现不读取外部二进制。
+
+`sub2api` commit `34b8bf1a6` 只作为 Fable 5.1 目录和 billing fingerprint 概念的交叉证据；其 Go 实现按 UTF-8 byte 取索引，不能覆盖官方 JavaScript UTF-16 语义。审计时 TokenRouter/sub2api 仍广告 Claude Code `2.1.220`、Stainless `0.94.0`，且二者关于取消 CCH 的判断与当前官方 binary 不符，因此都没有作为版本、identity、CCH 或 beta 的实现来源。吸收范围不含其多账号号池、账号切换或 fallback 设计。
+
+离线证据只能支持 `fixture_verified`。真实 Max 5x/20x inference、Fable 5.1 entitlement、streaming、限流和版本门禁仍为 `live_pending`，必须使用已轮换且不进入日志/命令历史的私密凭据按 acceptance runbook 验证后才能升级结论。
+
 ## 2026-09-02 Qoder CLI oracle freeze
 
 `qoder_cosy` 的 native Rust 实现以一次性、只读的官方 CLI 审计作为漂移 oracle，不在构建或运行时加载 CLI。证据冻结于 `assets/contract/qoder-cli-oracle.json`：Global `@qoder-ai/qodercli@1.1.32` bundle SHA-256 为 `24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf`，CN `@qodercn-ai/qoderclicn@1.1.32` bundle SHA-256 为 `5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b`。`cli2api` commit `9b18f2de06c53f12bf2c5112c7a71e3e64755b97` 仅提供带文件摘要的 capture/plaintext projection 交叉样本，不是依赖、同步源或生产 executor。

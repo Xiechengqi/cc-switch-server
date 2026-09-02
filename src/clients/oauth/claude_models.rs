@@ -5,6 +5,7 @@ use crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
 
 pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_788_307_200_000;
 pub const CLAUDE_MODEL_IDS: &[&str] = &[
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-5",
     "claude-opus-4-8",
@@ -56,6 +57,7 @@ mod tests {
         assert_eq!(
             catalog.models,
             vec![
+                "claude-fable-5-1",
                 "claude-fable-5",
                 "claude-opus-5",
                 "claude-opus-4-8",
@@ -103,6 +105,15 @@ mod tests {
             profile["cch"]["seedHex"],
             format!("{:016x}", CLAUDE_WIRE_PROFILE.cch_seed)
         );
+        assert_eq!(
+            profile["billing"]["versionStrategy"],
+            CLAUDE_WIRE_PROFILE.billing_version_strategy
+        );
+        assert_eq!(
+            profile["billing"]["promptFingerprint"]["salt"],
+            CLAUDE_WIRE_PROFILE.billing_prompt_fingerprint_salt
+        );
+        assert_eq!(profile["billing"]["billingBlockCacheControl"], false);
         assert_eq!(models.as_slice(), CLAUDE_MODEL_IDS);
         assert_eq!(
             profile["modelCatalog"]["source"],
@@ -115,7 +126,11 @@ mod tests {
     #[test]
     fn fable_family_matching_is_strict() {
         assert!(is_claude_fable_5_model("claude-fable-5"));
+        assert!(is_claude_fable_5_model("claude-fable-5-1"));
         assert!(is_claude_fable_5_model("claude-fable-5-thinking"));
+        assert!(is_claude_fable_5_model("claude-fable-5-1-thinking"));
+        assert!(!is_claude_fable_5_model("claude-fable-5-preview"));
+        assert!(!is_claude_fable_5_model("claude-fable-5-1-preview"));
         assert!(!is_claude_fable_5_model("claude-fable-50"));
         assert!(!is_claude_fable_5_model("vendor/claude-fable-5"));
         assert!(!is_claude_fable_5_model("claude-opus-5"));

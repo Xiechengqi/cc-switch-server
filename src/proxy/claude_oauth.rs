@@ -9,10 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use twox_hash::XxHash64;
 
+#[cfg(test)]
+use crate::domain::claude_cli::claude_billing_header_text;
 use crate::domain::claude_cli::{
-    claude_billing_header_text, claude_cch_seed, claude_cli_user_agent, claude_stainless_arch,
-    claude_stainless_os, claude_stainless_package_version, claude_stainless_runtime,
-    claude_stainless_runtime_version, CLAUDE_CODE_IDENTITY_TEXT,
+    claude_billing_header_text_for_prompt, claude_cch_seed, claude_cli_user_agent,
+    claude_stainless_arch, claude_stainless_os, claude_stainless_package_version,
+    claude_stainless_runtime, claude_stainless_runtime_version, CLAUDE_CODE_IDENTITY_TEXT,
 };
 
 use super::anthropic_cache_control::{
@@ -31,6 +33,7 @@ const EFFORT_BETA: &str = "effort-2025-11-24";
 const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const TOKEN_COUNTING_BETA: &str = "token-counting-2024-11-01";
 const REDACT_THINKING_BETA: &str = "redact-thinking-2026-02-12";
+const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
 const THINKING_TOKEN_COUNT_BETA: &str = "thinking-token-count-2026-05-13";
 const PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
 const MID_CONVERSATION_SYSTEM_BETA: &str = "mid-conversation-system-2026-04-07";
@@ -202,6 +205,9 @@ fn apply_forward_contract_inner(
                 "claude oauth request body must be valid json: {error}"
             ))
         })?;
+        let billing_header = claude_billing_header_text_for_prompt(
+            first_user_text_for_billing(&value).unwrap_or_default(),
+        );
         client_class = detect_claude_client(client_headers, &value, is_count_tokens);
         if !feature_enabled(CLAUDE_NATIVE_PASSTHROUGH_ENV, true) {
             client_class = ClaudeClientClass::ThirdPartyAnthropic;
@@ -213,7 +219,7 @@ fn apply_forward_contract_inner(
             if let Some(session_id) = session_id.as_deref() {
                 ensure_claude_metadata_user_id(&mut value, identity_seed, session_id);
             }
-            value = normalize_claude_code_identity(value);
+            value = normalize_claude_code_identity(value, &billing_header);
         }
         let tool_alias_seed = (!client_class.is_confirmed_native() && custom_tool_alias_enabled())
             .then_some(client_session_id.as_deref())
@@ -793,6 +799,7 @@ fn sign_claude_oauth_messages_body(mut body: Value) -> Value {
 }
 
 fn finalize_claude_cch(mut body: Value) -> Value {
+    remove_billing_cache_control(&mut body);
     if std::env::var(CLAUDE_CCH_POLICY_ENV)
         .ok()
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("disabled"))
@@ -806,6 +813,21 @@ fn finalize_claude_cch(mut body: Value) -> Value {
     }
     ensure_cch_placeholder_in_billing(&mut body);
     sign_claude_oauth_messages_body(body)
+}
+
+fn remove_billing_cache_control(body: &mut Value) {
+    let Some(block) = body.pointer_mut("/system/0") else {
+        return;
+    };
+    let is_billing = block
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.starts_with(BILLING_PREFIX));
+    if is_billing {
+        if let Some(object) = block.as_object_mut() {
+            object.remove("cache_control");
+        }
+    }
 }
 
 fn remove_cch_member(text: &str) -> String {
@@ -874,15 +896,8 @@ fn normalize_claude_cch_hash_value(value: &mut Value) {
     }
 }
 
-fn normalize_claude_code_identity(mut body: Value) -> Value {
-    if body
-        .get("system")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|b| b.get("text"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| t.starts_with(BILLING_PREFIX))
-    {
+fn normalize_claude_code_identity(mut body: Value, billing_header: &str) -> Value {
+    if replace_leading_billing_block(&mut body, billing_header) {
         ensure_claude_tools_array(&mut body);
         ensure_claude_defaults(&mut body);
         return body;
@@ -901,7 +916,7 @@ fn normalize_claude_code_identity(mut body: Value) -> Value {
     }
 
     let mut blocks = Vec::new();
-    blocks.push(claude_billing_block());
+    blocks.push(claude_billing_block(billing_header));
     if is_claude_code_system {
         if let Some(existing) = body
             .as_object_mut()
@@ -919,10 +934,35 @@ fn normalize_claude_code_identity(mut body: Value) -> Value {
     body
 }
 
+fn replace_leading_billing_block(body: &mut Value, billing_header: &str) -> bool {
+    let Some(block) = body.pointer_mut("/system/0") else {
+        return false;
+    };
+    if !block
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.starts_with(BILLING_PREFIX))
+    {
+        return false;
+    }
+    let Some(object) = block.as_object_mut() else {
+        return false;
+    };
+    object.insert(
+        "text".to_string(),
+        Value::String(billing_header.to_string()),
+    );
+    object.remove("cache_control");
+    true
+}
+
 fn ensure_claude_code_identity(body: Value) -> Value {
-    let mut body = normalize_claude_code_identity(body);
+    let billing_header = claude_billing_header_text_for_prompt(
+        first_user_text_for_billing(&body).unwrap_or_default(),
+    );
+    let mut body = normalize_claude_code_identity(body, &billing_header);
     normalize_claude_sampling(&mut body);
-    sign_claude_oauth_messages_body(body)
+    finalize_claude_cch(body)
 }
 
 fn ensure_claude_oauth_billing_header_system(body: Value) -> Value {
@@ -931,7 +971,7 @@ fn ensure_claude_oauth_billing_header_system(body: Value) -> Value {
 
 fn apply_body_retry_stage(mut body: Value, stage: ClaudeBodyRetryStage) -> Value {
     apply_body_retry_stage_unsigned(&mut body, stage);
-    sign_claude_oauth_messages_body(body)
+    finalize_claude_cch(body)
 }
 
 fn apply_body_retry_stage_unsigned(body: &mut Value, stage: ClaudeBodyRetryStage) {
@@ -1012,11 +1052,10 @@ fn claude_cache_control_for_ttl(ttl: Option<&str>) -> Value {
     }
 }
 
-fn claude_billing_block() -> Value {
+fn claude_billing_block(billing_header: &str) -> Value {
     serde_json::json!({
         "type": "text",
-        "text": claude_billing_header_text(),
-        "cache_control": claude_cache_control()
+        "text": billing_header
     })
 }
 
@@ -1359,7 +1398,9 @@ fn build_anthropic_beta_value_for_class(
     match operation {
         ClaudeBetaOperation::Messages => {
             push_beta(&mut betas, INTERLEAVED_THINKING_BETA);
-            if !body.is_some_and(body_has_thinking_display) {
+            if body.is_some_and(body_has_thinking_display_updates) {
+                push_beta(&mut betas, THINKING_DISPLAY_UPDATES_BETA);
+            } else if !body.is_some_and(body_has_thinking_display) {
                 push_beta(&mut betas, REDACT_THINKING_BETA);
             }
             push_beta(&mut betas, THINKING_TOKEN_COUNT_BETA);
@@ -1371,7 +1412,7 @@ fn build_anthropic_beta_value_for_class(
             if body.is_some_and(body_has_advisor_tool) {
                 push_beta(&mut betas, ADVISOR_TOOL_BETA);
             }
-            if body.is_some_and(body_has_tools) {
+            if body.is_some_and(body_has_advanced_tool_use) {
                 push_beta(&mut betas, ADVANCED_TOOL_USE_BETA);
             }
             push_beta(&mut betas, EFFORT_BETA);
@@ -1465,13 +1506,16 @@ fn native_passthrough_betas(
 ) -> String {
     let mut betas = Vec::new();
     for beta in requested_anthropic_betas(headers, internal_betas) {
-        let fallback_shape_matches = match beta.as_str() {
+        let shape_matches = match beta.as_str() {
             SERVER_SIDE_FALLBACK_ARRAY_BETA | SERVER_SIDE_FALLBACK_DEFAULT_BETA => body
                 .and_then(body_server_side_fallback_beta)
                 .is_some_and(|required| required == beta),
+            ADVANCED_TOOL_USE_BETA => body.is_some_and(body_has_advanced_tool_use),
+            THINKING_DISPLAY_UPDATES_BETA => body.is_some_and(body_has_thinking_display_updates),
+            REDACT_THINKING_BETA => !body.is_some_and(body_has_thinking_display),
             _ => true,
         };
-        if native_beta_allowed(&beta, operation) && fallback_shape_matches {
+        if native_beta_allowed(&beta, operation) && shape_matches {
             push_beta(&mut betas, &beta);
         } else {
             crate::metrics::record_claude_beta_decision(operation.as_str(), "dropped_unknown");
@@ -1511,6 +1555,7 @@ fn native_beta_allowed(beta: &str, operation: ClaudeBetaOperation) -> bool {
             EFFORT_BETA
                 | EXTENDED_CACHE_TTL_BETA
                 | REDACT_THINKING_BETA
+                | THINKING_DISPLAY_UPDATES_BETA
                 | THINKING_TOKEN_COUNT_BETA
                 | PROMPT_CACHING_SCOPE_BETA
                 | MID_CONVERSATION_SYSTEM_BETA
@@ -1624,10 +1669,25 @@ fn body_has_thinking_display(body: &Value) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn body_has_tools(body: &Value) -> bool {
+fn body_has_thinking_display_updates(body: &Value) -> bool {
+    body.pointer("/thinking/display").and_then(Value::as_str) == Some("updates")
+}
+
+fn body_has_advanced_tool_use(body: &Value) -> bool {
     body.get("tools")
         .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("tool_search_tool_regex_20251119" | "tool_search_tool_bm25_20251119")
+                ) || tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+                    || tool
+                        .pointer("/custom/defer_loading")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        })
 }
 
 fn body_has_advisor_tool(body: &Value) -> bool {
@@ -1646,7 +1706,11 @@ fn body_model_supports_mid_conversation_system(body: &Value) -> bool {
     };
     matches!(
         model.trim_end_matches("[1m]"),
-        "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-5" | "claude-fable-5"
+        "claude-opus-4-8"
+            | "claude-opus-5"
+            | "claude-sonnet-5"
+            | "claude-fable-5"
+            | "claude-fable-5-1"
     )
 }
 
@@ -1816,6 +1880,26 @@ fn synth_session_id(identity_seed: &str, body: &Value) -> String {
     stable_uuid(&format!("{identity_seed}:{day_bucket}"))
 }
 
+fn first_user_text_for_billing(body: &Value) -> Option<&str> {
+    body.get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .find_map(|message| {
+            let content = message.get("content")?;
+            match content {
+                Value::String(text) => (!text.is_empty()).then_some(text.as_str()),
+                Value::Array(blocks) => blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(Value::as_str))
+                        .flatten()
+                        .filter(|text| !text.is_empty())
+                }),
+                _ => None,
+            }
+        })
+}
+
 fn first_user_text_for_session_seed(body: &Value) -> Option<String> {
     let messages = body.get("messages").and_then(Value::as_array)?;
     messages
@@ -1980,6 +2064,8 @@ mod tests {
             system[1]["text"].as_str().unwrap_or(""),
             CLAUDE_CODE_IDENTITY_TEXT
         );
+        assert!(system[0].get("cache_control").is_none());
+        assert!(system[1].get("cache_control").is_some());
         assert_eq!(result["tools"], json!([]));
     }
 
@@ -2067,6 +2153,37 @@ mod tests {
     }
 
     #[test]
+    fn billing_fingerprint_uses_original_user_text_before_system_migration() {
+        let body = json!({
+            "model": "x",
+            "max_tokens": 1,
+            "system": "This migrated system prompt must not become billing input.",
+            "messages": [{"role": "user", "content": "abcdefghijklmnopqrstuvwxyz"}]
+        });
+        let result = ensure_claude_oauth_billing_header_system(body);
+        let billing = result["system"][0]["text"].as_str().unwrap();
+
+        assert!(billing.contains("cc_version=2.1.258.d3d;"));
+        assert_eq!(
+            result["messages"][0]["content"],
+            json!("This migrated system prompt must not become billing input.")
+        );
+        assert!(result["system"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn billing_text_extraction_skips_non_text_user_content() {
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": "ignore"},
+                {"role": "user", "content": [{"type": "tool_result", "content": "ignore"}]},
+                {"role": "user", "content": [{"type": "text", "text": "ping"}]}
+            ]
+        });
+        assert_eq!(first_user_text_for_billing(&body), Some("ping"));
+    }
+
+    #[test]
     fn haiku_non_cc_client_still_gets_full_mimicry() {
         let result = ensure_claude_oauth_billing_header_system(json!({
             "model": "claude-haiku-4-5-20251001",
@@ -2123,8 +2240,11 @@ mod tests {
         let system = result["system"].as_array().expect("system must be array");
         assert_eq!(system.len(), 1);
         let text = system[0]["text"].as_str().unwrap_or("");
-        assert!(text.starts_with("x-anthropic-billing-header: cc_version=2.1; cch="));
+        assert!(text.starts_with(
+            "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli; cch="
+        ));
         assert!(!text.contains("cch=abcde;"));
+        assert!(system[0].get("cache_control").is_none());
     }
 
     #[test]
@@ -2171,9 +2291,9 @@ mod tests {
         let maximal_messages_body = json!({
             "model": "claude-sonnet-5",
             "stream": true,
-            "thinking": {"type": "adaptive"},
+            "thinking": {"type": "adaptive", "display": "updates"},
             "tools": [
-                {"type": "computer_use_20250124"},
+                {"name": "deferred", "defer_loading": true},
                 {"type": "advisor_20260301"}
             ],
             "fallbacks": "default",
@@ -2195,13 +2315,38 @@ mod tests {
         let message_betas = message_betas.split(',').collect::<Vec<_>>();
         for beta in strings(&messages["always"])
             .into_iter()
+            .filter(|beta| *beta != REDACT_THINKING_BETA)
             .chain(strings(&messages["shapeGated"]))
         {
             assert!(message_betas.contains(&beta), "missing message beta {beta}");
         }
+        assert!(!message_betas.contains(&REDACT_THINKING_BETA));
         assert_eq!(
             strings(&messages["auditedClientCompatibility"]),
             MESSAGES_CLIENT_BETAS
+        );
+        assert_eq!(
+            messages["shapeRules"]["thinkingDisplayUpdates"]["equals"],
+            "updates"
+        );
+        assert_eq!(
+            messages["shapeRules"]["thinkingDisplayUpdates"]["excludes"],
+            REDACT_THINKING_BETA
+        );
+        assert_eq!(
+            strings(&messages["shapeRules"]["advancedToolUse"]["toolTypes"]),
+            [
+                "tool_search_tool_regex_20251119",
+                "tool_search_tool_bm25_20251119"
+            ]
+        );
+        assert_eq!(
+            strings(&messages["shapeRules"]["advancedToolUse"]["booleanPaths"]),
+            ["defer_loading", "custom.defer_loading"]
+        );
+        assert_eq!(
+            messages["shapeRules"]["advancedToolUse"]["ordinaryToolsEnable"],
+            false
         );
         assert_eq!(
             messages["explicitShapePaired"]["fallbackArray"],
@@ -2429,7 +2574,7 @@ mod tests {
     fn advisor_tool_beta_is_exact_shape_gated_and_ordered() {
         let body = json!({
             "model": "claude-sonnet-5",
-            "tools": [{"type": "advisor_20260301"}]
+            "tools": [{"type": "advisor_20260301", "defer_loading": true}]
         });
         let beta = build_anthropic_beta_value(
             &HeaderMap::new(),
@@ -2464,6 +2609,68 @@ mod tests {
             ClaudeBetaOperation::Messages,
         );
         assert!(!beta.contains(ADVISOR_TOOL_BETA));
+    }
+
+    #[test]
+    fn advanced_tool_beta_requires_an_audited_deferred_or_search_shape() {
+        for ordinary in [
+            json!({"tools": [{"name": "Read", "input_schema": {"type": "object"}}]}),
+            json!({"tools": [{"name": "computer", "type": "computer_use_20250124"}]}),
+            json!({"tools": [{"name": "bad", "defer_loading": "true"}]}),
+        ] {
+            let beta = build_anthropic_beta_value(
+                &HeaderMap::new(),
+                Some(&ordinary),
+                &[],
+                false,
+                true,
+                ClaudeBetaOperation::Messages,
+            );
+            assert!(!beta.contains(ADVANCED_TOOL_USE_BETA));
+        }
+
+        for advanced in [
+            json!({"tools": [{"name": "deferred", "defer_loading": true}]}),
+            json!({"tools": [{"name": "deferred", "custom": {"defer_loading": true}}]}),
+            json!({"tools": [{"type": "tool_search_tool_regex_20251119"}]}),
+            json!({"tools": [{"type": "tool_search_tool_bm25_20251119"}]}),
+        ] {
+            let beta = build_anthropic_beta_value(
+                &HeaderMap::new(),
+                Some(&advanced),
+                &[],
+                false,
+                true,
+                ClaudeBetaOperation::Messages,
+            );
+            assert!(beta.contains(ADVANCED_TOOL_USE_BETA));
+        }
+    }
+
+    #[test]
+    fn thinking_display_updates_beta_is_exact_and_excludes_redaction() {
+        let updates = json!({"thinking": {"type": "adaptive", "display": "updates"}});
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&updates),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(beta.contains(THINKING_DISPLAY_UPDATES_BETA));
+        assert!(!beta.contains(REDACT_THINKING_BETA));
+
+        let other = json!({"thinking": {"type": "adaptive", "display": "summary"}});
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&other),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(!beta.contains(THINKING_DISPLAY_UPDATES_BETA));
     }
 
     #[test]
@@ -2525,12 +2732,56 @@ mod tests {
     }
 
     #[test]
+    fn native_passthrough_enforces_new_advanced_and_display_shapes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(
+                "advanced-tool-use-2025-11-20,thinking-display-updates-2026-08-18,redact-thinking-2026-02-12",
+            ),
+        );
+        let ordinary = json!({
+            "thinking": {"type": "adaptive"},
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        let beta = build_anthropic_beta_value_for_class(
+            &headers,
+            Some(&ordinary),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+            ClaudeClientClass::NativeCli,
+        );
+        assert!(!beta.contains(ADVANCED_TOOL_USE_BETA));
+        assert!(!beta.contains(THINKING_DISPLAY_UPDATES_BETA));
+        assert!(beta.contains(REDACT_THINKING_BETA));
+
+        let matching = json!({
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "tools": [{"name": "Read", "defer_loading": true}]
+        });
+        let beta = build_anthropic_beta_value_for_class(
+            &headers,
+            Some(&matching),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+            ClaudeClientClass::NativeCli,
+        );
+        assert!(beta.contains(ADVANCED_TOOL_USE_BETA));
+        assert!(beta.contains(THINKING_DISPLAY_UPDATES_BETA));
+        assert!(!beta.contains(REDACT_THINKING_BETA));
+    }
+
+    #[test]
     fn native_passthrough_also_enforces_fallback_body_beta_consistency() {
         let mut headers = HeaderMap::new();
         headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
         headers.insert(
             "user-agent",
-            axum::http::HeaderValue::from_static("claude-cli/2.1.236 (external, cli)"),
+            axum::http::HeaderValue::from_static("claude-cli/2.1.258 (external, cli)"),
         );
         headers.insert(
             "anthropic-beta",
@@ -2774,6 +3025,11 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .starts_with(BILLING_PREFIX));
+        assert!(value["system"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cc_version=2.1.258.1e2;"));
+        assert!(value["system"][0].get("cache_control").is_none());
         assert_eq!(value["tools"], json!([]));
     }
 
@@ -2785,7 +3041,7 @@ mod tests {
             headers.insert(
                 "user-agent",
                 axum::http::HeaderValue::from_static(
-                    "claude-cli/2.1.236 (external, cli, linux-x64)",
+                    "claude-cli/2.1.258 (external, cli, linux-x64)",
                 ),
             );
             headers.insert(
@@ -2846,7 +3102,7 @@ mod tests {
         headers.insert(
             "user-agent",
             axum::http::HeaderValue::from_static(
-                "claude-cli/2.1.236 (external, sdk-cli, linux-x64)",
+                "claude-cli/2.1.258 (external, sdk-cli, linux-x64)",
             ),
         );
         headers.insert(
@@ -2855,7 +3111,7 @@ mod tests {
         );
         let mut url = "https://api.anthropic.com/v1/messages".to_string();
         let mut body = Bytes::from_static(
-            br#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.236; cc_entrypoint=sdk-cli;"}],"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"user","content":"hi"}]}"#,
+            br#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli;"}],"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"user","content":"hi"}]}"#,
         );
         apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -3164,7 +3420,7 @@ mod tests {
         );
 
         assert!(beta.contains(INTERLEAVED_THINKING_BETA));
-        assert!(beta.contains(ADVANCED_TOOL_USE_BETA));
+        assert!(!beta.contains(ADVANCED_TOOL_USE_BETA));
         assert!(!beta.contains("fine-grained-tool-streaming"));
         assert!(!beta.contains("computer-use"));
     }
@@ -3188,37 +3444,31 @@ mod tests {
 
     #[test]
     fn cch_matches_current_claude_code_golden_vector() {
-        let body = json!({
-            "model": "model-a",
-            "messages": [{"role":"user","content":[{"type":"text","text":"x"}]}],
-            "system": [
-                {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.test; cc_entrypoint=sdk-cli; cch=00000;"},
-                {"type":"text","text":"system-x"}
-            ],
-            "tools": [],
-            "metadata": {"user_id":"meta-x"},
-            "max_tokens": 1,
-            "thinking": {"type":"adaptive","display":"omitted"},
-            "context_management": {"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},
-            "output_config": {"effort":"high"},
-            "stream": true
-        });
+        let profile: Value = serde_json::from_str(WIRE_PROFILE_JSON).unwrap();
+        let vector = &profile["cch"]["goldenVectors"][0];
+        assert_eq!(vector["signature"], "8d393");
+        assert_eq!(
+            vector["syntheticBody"]["messages"][0]["content"][0]["text"],
+            "ping"
+        );
+        let body = vector["syntheticBody"].clone();
+        let expected_signature = vector["signature"].as_str().unwrap();
+        let unsigned_billing = body["system"][0]["text"].as_str().unwrap().to_string();
         let signed = sign_claude_oauth_messages_body(body);
-        assert!(signed["system"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("cch=7ee87;"));
+        let signed_billing = signed["system"][0]["text"].as_str().unwrap();
+        assert!(
+            signed_billing.contains(&format!("cch={expected_signature};")),
+            "unexpected signed billing block: {signed_billing}"
+        );
 
         let mut model_changed = signed.clone();
         model_changed["model"] = json!("model-b");
-        model_changed["system"][0]["text"] = json!(
-            "x-anthropic-billing-header: cc_version=2.1.220.test; cc_entrypoint=sdk-cli; cch=00000;"
-        );
+        model_changed["system"][0]["text"] = json!(unsigned_billing);
         assert!(
             sign_claude_oauth_messages_body(model_changed)["system"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("cch=7ee87;")
+                .contains(&format!("cch={expected_signature};"))
         );
     }
 }

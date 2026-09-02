@@ -10,25 +10,26 @@ pub struct ClaudeWireProfile {
     pub cch_seed: u64,
     pub cch_excluded_keys: &'static [&'static str],
     pub billing_version_strategy: &'static str,
+    pub billing_prompt_fingerprint_salt: &'static str,
 }
 
 pub const CLAUDE_WIRE_PROFILE: ClaudeWireProfile = ClaudeWireProfile {
-    id: "claude-code-2.1.236-audited-2026-09-02",
-    claude_code_version: "2.1.236",
+    id: "claude-code-2.1.258-audited-2026-09-02",
+    claude_code_version: "2.1.258",
     stainless_package_version: "0.112.1",
     node_version: "v26.3.0",
     axios_version: "1.15.2",
     cch_seed: 0x4D659218E32A3268,
     cch_excluded_keys: &["max_tokens", "fallbacks", "fallback_credit_token"],
-    // The installed binary exposes the public version but the wire profile does
-    // not invent a private build suffix.
-    billing_version_strategy: "public_cli_version_without_guessed_build_suffix",
+    billing_version_strategy: "public_cli_version_plus_prompt_fingerprint",
+    billing_prompt_fingerprint_salt: "59cf53e54c78",
 };
 
 pub const DEFAULT_CLAUDE_CC_ENTRYPOINT: &str = "cli";
 pub const DEFAULT_STAINLESS_RUNTIME: &str = "node";
 pub const CLAUDE_CODE_IDENTITY_TEXT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+pub const CLAUDE_BILLING_FINGERPRINT_UTF16_INDICES: [usize; 3] = [4, 7, 20];
 
 const CCH_SEED_BY_VERSION_PREFIX: &[(&str, u64)] = &[("2.1.", CLAUDE_WIRE_PROFILE.cch_seed)];
 const STAINLESS_IDENTITY_PROFILES: &[(&str, &str)] = &[
@@ -44,6 +45,7 @@ pub struct ClaudeCliIdentity {
     pub user_agent: String,
     pub source: &'static str,
     pub override_conflict: bool,
+    pub stale_override_rejected: bool,
 }
 
 pub fn claude_cli_identity() -> ClaudeCliIdentity {
@@ -51,31 +53,46 @@ pub fn claude_cli_identity() -> ClaudeCliIdentity {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let version_override = std::env::var("CC_SWITCH_CLI_UA_VERSION")
+    let version_override_raw = std::env::var("CC_SWITCH_CLI_UA_VERSION")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| valid_public_cli_version(value));
-    let override_conflict = user_agent_override.is_some()
-        && std::env::var("CC_SWITCH_CLI_UA_VERSION")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty());
+        .filter(|value| !value.is_empty());
+    let override_conflict = user_agent_override.is_some() && version_override_raw.is_some();
+    let user_agent_candidate = user_agent_override.as_ref().and_then(|user_agent| {
+        claude_cli_version_from_user_agent(user_agent)
+            .map(|version| (user_agent.to_string(), version))
+    });
+    let version_candidate = version_override_raw
+        .as_deref()
+        .filter(|value| valid_public_cli_version(value))
+        .map(str::to_string);
+    let stale_override_rejected = user_agent_candidate
+        .as_ref()
+        .is_some_and(|(_, version)| !public_cli_version_at_least_profile(version))
+        || version_candidate
+            .as_deref()
+            .is_some_and(|version| !public_cli_version_at_least_profile(version));
 
-    if let Some((user_agent, version)) = user_agent_override.and_then(|user_agent| {
-        claude_cli_version_from_user_agent(&user_agent).map(|version| (user_agent, version))
-    }) {
+    if let Some((user_agent, version)) =
+        user_agent_candidate.filter(|(_, version)| public_cli_version_at_least_profile(version))
+    {
         return ClaudeCliIdentity {
             version,
             user_agent,
             source: "user_agent_override",
             override_conflict,
+            stale_override_rejected,
         };
     }
-    if let Some(version) = version_override {
+    if let Some(version) =
+        version_candidate.filter(|version| public_cli_version_at_least_profile(version))
+    {
         return ClaudeCliIdentity {
             user_agent: format!("claude-cli/{version} (external, cli)"),
             version,
             source: "version_override",
             override_conflict,
+            stale_override_rejected,
         };
     }
     ClaudeCliIdentity {
@@ -86,6 +103,7 @@ pub fn claude_cli_identity() -> ClaudeCliIdentity {
         ),
         source: "wire_profile",
         override_conflict,
+        stale_override_rejected,
     }
 }
 
@@ -133,11 +151,36 @@ pub fn claude_cc_entrypoint() -> String {
 }
 
 pub fn claude_billing_header_text() -> String {
+    claude_billing_header_text_for_prompt("")
+}
+
+pub fn claude_billing_header_text_for_prompt(prompt: &str) -> String {
+    let version = claude_cch_version();
+    let fingerprint = claude_billing_prompt_fingerprint(prompt, &version);
     format!(
-        "x-anthropic-billing-header: cc_version={}; cc_entrypoint={}; cch=00000;",
-        claude_cch_version(),
+        "x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint={}; cch=00000;",
         claude_cc_entrypoint()
     )
+}
+
+pub fn claude_billing_prompt_fingerprint(prompt: &str, version: &str) -> String {
+    let selected = CLAUDE_BILLING_FINGERPRINT_UTF16_INDICES
+        .map(|index| prompt.encode_utf16().nth(index).unwrap_or(u16::from(b'0')));
+    // JavaScript indexes strings by UTF-16 code unit. Converting the selected
+    // units together also reproduces Node's replacement behavior for an
+    // isolated surrogate before the SHA-256 input is UTF-8 encoded.
+    let fingerprint_chars = String::from_utf16_lossy(&selected);
+    let digest = Sha256::digest(
+        format!(
+            "{}{fingerprint_chars}{version}",
+            CLAUDE_WIRE_PROFILE.billing_prompt_fingerprint_salt
+        )
+        .as_bytes(),
+    );
+    format!("{:02x}{:02x}", digest[0], digest[1])
+        .chars()
+        .take(3)
+        .collect()
 }
 
 pub fn claude_stainless_os(identity_seed: Option<&str>) -> String {
@@ -193,16 +236,31 @@ fn claude_cli_version_from_user_agent(user_agent: &str) -> Option<String> {
 }
 
 fn valid_public_cli_version(value: &str) -> bool {
+    public_cli_version_parts(value).is_some()
+}
+
+fn public_cli_version_at_least_profile(value: &str) -> bool {
+    public_cli_version_parts(value)
+        .zip(public_cli_version_parts(
+            CLAUDE_WIRE_PROFILE.claude_code_version,
+        ))
+        .is_some_and(|(candidate, minimum)| candidate >= minimum)
+}
+
+fn public_cli_version_parts(value: &str) -> Option<[u32; 3]> {
     let mut parts = value.split('.');
-    let valid_part = |part: Option<&str>| {
-        part.is_some_and(|part| {
-            !part.is_empty() && part.len() <= 6 && part.chars().all(|ch| ch.is_ascii_digit())
-        })
+    let parse_part = |part: Option<&str>| {
+        let part = part?;
+        (!part.is_empty() && part.len() <= 6 && part.chars().all(|ch| ch.is_ascii_digit()))
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
     };
-    valid_part(parts.next())
-        && valid_part(parts.next())
-        && valid_part(parts.next())
-        && parts.next().is_none()
+    let parsed = [
+        parse_part(parts.next())?,
+        parse_part(parts.next())?,
+        parse_part(parts.next())?,
+    ];
+    parts.next().is_none().then_some(parsed)
 }
 
 fn claude_cch_seed_for_version(version: &str) -> u64 {
@@ -316,15 +374,16 @@ mod tests {
     fn resolved_identity_keeps_all_version_surfaces_coherent() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _ua = EnvGuard::unset("CC_SWITCH_CLI_UA");
-        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.240");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.260");
 
         let identity = claude_cli_identity();
-        assert_eq!(identity.version, "2.1.240");
-        assert_eq!(identity.user_agent, "claude-cli/2.1.240 (external, cli)");
+        assert_eq!(identity.version, "2.1.260");
+        assert_eq!(identity.user_agent, "claude-cli/2.1.260 (external, cli)");
         assert_eq!(identity.source, "version_override");
         assert!(!identity.override_conflict);
-        assert_eq!(claude_code_user_agent(), "claude-code/2.1.240");
-        assert!(claude_billing_header_text().contains("cc_version=2.1.240;"));
+        assert!(!identity.stale_override_rejected);
+        assert_eq!(claude_code_user_agent(), "claude-code/2.1.260");
+        assert!(claude_billing_header_text().contains("cc_version=2.1.260."));
     }
 
     #[test]
@@ -332,14 +391,15 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _ua = EnvGuard::set(
             "CC_SWITCH_CLI_UA",
-            "claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)",
+            "claude-cli/2.1.261 (external, claude-vscode, agent-sdk/0.3.261)",
         );
-        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.240");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.260");
 
         let identity = claude_cli_identity();
-        assert_eq!(identity.version, "2.1.241");
+        assert_eq!(identity.version, "2.1.261");
         assert_eq!(identity.source, "user_agent_override");
         assert!(identity.override_conflict);
+        assert!(!identity.stale_override_rejected);
     }
 
     #[test]
@@ -352,6 +412,59 @@ mod tests {
         assert_eq!(identity.version, CLAUDE_WIRE_PROFILE.claude_code_version);
         assert_eq!(identity.source, "wire_profile");
         assert!(identity.override_conflict);
+        assert!(!identity.stale_override_rejected);
+    }
+
+    #[test]
+    fn stale_overrides_are_rejected_instead_of_downgrading_the_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _ua = EnvGuard::set("CC_SWITCH_CLI_UA", "claude-cli/2.1.236 (external, cli)");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.220");
+
+        let identity = claude_cli_identity();
+        assert_eq!(identity.version, CLAUDE_WIRE_PROFILE.claude_code_version);
+        assert_eq!(identity.source, "wire_profile");
+        assert!(identity.override_conflict);
+        assert!(identity.stale_override_rejected);
+    }
+
+    #[test]
+    fn a_fresh_version_override_survives_a_stale_full_user_agent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _ua = EnvGuard::set("CC_SWITCH_CLI_UA", "claude-cli/2.1.236 (external, cli)");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.2.0");
+
+        let identity = claude_cli_identity();
+        assert_eq!(identity.version, "2.2.0");
+        assert_eq!(identity.source, "version_override");
+        assert!(identity.override_conflict);
+        assert!(identity.stale_override_rejected);
+    }
+
+    #[test]
+    fn billing_prompt_fingerprint_matches_official_utf16_vectors() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _ua = EnvGuard::unset("CC_SWITCH_CLI_UA");
+        let _version = EnvGuard::unset("CC_SWITCH_CLI_UA_VERSION");
+        assert_eq!(claude_billing_prompt_fingerprint("ping", "2.1.258"), "1e2");
+        assert_eq!(
+            claude_billing_prompt_fingerprint("abcdefghijklmnopqrstuvwxyz", "2.1.258"),
+            "d3d"
+        );
+        assert_eq!(
+            claude_billing_prompt_fingerprint("abcd😀ghijklmnopqrstuvwxyz", "2.1.258"),
+            "a15"
+        );
+        assert!(claude_billing_header_text_for_prompt("ping").contains("cc_version=2.1.258.1e2;"));
+    }
+
+    #[test]
+    fn public_version_comparison_is_numeric() {
+        assert!(public_cli_version_at_least_profile("2.1.258"));
+        assert!(public_cli_version_at_least_profile("2.2.0"));
+        assert!(public_cli_version_at_least_profile("3.0.0"));
+        assert!(!public_cli_version_at_least_profile("2.1.99"));
+        assert!(!public_cli_version_at_least_profile("1.999999.999999"));
     }
 
     #[test]

@@ -17,13 +17,19 @@ pub enum ClaudeFableEligibility {
 }
 
 pub const CLAUDE_FABLE_MODEL_FAMILY: &str = "claude-fable-5";
+pub const CLAUDE_FABLE_5_1_MODEL: &str = "claude-fable-5-1";
 
 pub fn is_claude_fable_5_model(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
-    normalized == CLAUDE_FABLE_MODEL_FAMILY
-        || normalized
-            .strip_prefix(CLAUDE_FABLE_MODEL_FAMILY)
-            .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with(':'))
+    matches!(
+        normalized.as_str(),
+        CLAUDE_FABLE_MODEL_FAMILY
+            | CLAUDE_FABLE_5_1_MODEL
+            | "claude-fable-5-thinking"
+            | "claude-fable-5:thinking"
+            | "claude-fable-5-1-thinking"
+            | "claude-fable-5-1:thinking"
+    )
 }
 
 impl ClaudeSubscriptionPlan {
@@ -481,5 +487,27 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(stale.fable_eligibility(), ClaudeFableEligibility::Unknown);
+    }
+
+    #[test]
+    fn fable_model_family_accepts_only_audited_five_and_five_one_ids() {
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-fable-5:thinking",
+            "claude-fable-5-1",
+            "claude-fable-5-1-thinking",
+            "claude-fable-5-1:thinking",
+        ] {
+            assert!(is_claude_fable_5_model(model), "missing {model}");
+        }
+        for model in [
+            "claude-fable-5-preview",
+            "claude-fable-5-1-preview",
+            "claude-fable-50",
+            "vendor/claude-fable-5-1",
+        ] {
+            assert!(!is_claude_fable_5_model(model), "overmatched {model}");
+        }
     }
 }

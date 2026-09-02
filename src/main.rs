@@ -52,12 +52,20 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
         profile_cli_version = cc_switch_server::domain::claude_cli::CLAUDE_WIRE_PROFILE.claude_code_version,
         effective_cli_version = %claude_identity.version,
         identity_source = claude_identity.source,
+        stale_override_rejected = claude_identity.stale_override_rejected,
         "resolved Claude OAuth wire identity"
     );
     if claude_identity.override_conflict {
         tracing::warn!(
             identity_source = claude_identity.source,
             "both CC_SWITCH_CLI_UA and CC_SWITCH_CLI_UA_VERSION are set; resolved source is shown above"
+        );
+    }
+    if claude_identity.stale_override_rejected {
+        tracing::warn!(
+            profile_cli_version = cc_switch_server::domain::claude_cli::CLAUDE_WIRE_PROFILE.claude_code_version,
+            effective_cli_version = %claude_identity.version,
+            "ignored a Claude CLI identity override older than the audited wire profile"
         );
     }
     cc_switch_server::state::restore_tunnels(state.clone()).await;

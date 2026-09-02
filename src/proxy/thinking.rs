@@ -293,6 +293,8 @@ mod tests {
     fn adaptive_model_capabilities_match_current_anthropic_contract() {
         assert!(adaptive_thinking_is_default("anthropic.claude-sonnet-5"));
         assert!(thinking_cannot_be_disabled("claude-fable-5"));
+        assert!(thinking_cannot_be_disabled("claude-fable-5-1"));
+        assert!(uses_adaptive_thinking("claude-fable-5-1"));
         assert!(!thinking_cannot_be_disabled("claude-sonnet-5"));
         assert!(!adaptive_thinking_is_default("claude-opus-4-8"));
     }

@@ -60,11 +60,11 @@ OAuth endpoint fallback 只用于明确的 connect-stage 网络失败（请求�
 
 ## Wire profile、控制面与模型目录
 
-Claude OAuth wire 身份固定在脱敏合同 `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 `claude-code-2.1.236-audited-2026-09-02`：Claude Code `2.1.236`、Stainless `0.112.1`、Node `v26.3.0` 和 Axios `1.15.2`。该版本来自 2026-09-02 官方 npm stable native binary 的静态审计；与 `2.1.234` 比较后，静态 identity、beta、model、Stainless 和 CCH token 集合无实质变化。合同没有保存 token、账号标识或真实请求正文，真实订阅账号验证仍为 pending。usage 使用 `claude-code/2.1.236`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity。默认身份可用 `CC_SWITCH_CLI_UA_VERSION` 或完整 `CC_SWITCH_CLI_UA` 紧急覆盖；合法完整 UA 优先，无效候选会被忽略，没有合法覆盖时 fail closed 到固定 profile，启动日志与 profile gauge 会显示最终版本及来源。
+Claude OAuth wire 身份固定在脱敏合同 `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 `claude-code-2.1.258-audited-2026-09-02`：Claude Code `2.1.258`、Stainless `0.112.1`、Node `v26.3.0` 和 Axios `1.15.2`。该版本来自 2026-09-02 官方 npm latest/next native binary 的静态审计与本地假凭据 loopback 捕获；当日 npm stable 仍为 `2.1.236`。审计没有访问 Anthropic，合同没有保存 token、账号标识或原始请求正文，真实订阅账号验证仍为 pending。usage 使用 `claude-code/2.1.258`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity。默认身份可用 `CC_SWITCH_CLI_UA_VERSION` 或完整 `CC_SWITCH_CLI_UA` 紧急覆盖；候选版本必须不低于内建 profile，合法完整 UA 优先，旧值或无效值会被拒绝并 fail closed 到固定 profile。启动日志与 profile gauge 会显示最终版本、来源和是否拒绝了旧覆盖。
 
-`node scripts/audit/audit-claude-wire-profile.mjs` 默认离线校验合同、Rust 常量和 `.env.example` 的一致性；scheduled/人工升级审计可显式运行 `node scripts/audit/audit-claude-wire-profile.mjs --check-npm` 对比 npm `stable` dist-tag。Server 运行时不会访问 npm，也不会因审计网络不可用影响反代。
+`node scripts/audit/audit-claude-wire-profile.mjs` 默认离线校验合同、Rust 常量和 `.env.example` 的一致性；scheduled/人工升级审计可显式运行 `node scripts/audit/audit-claude-wire-profile.mjs --check-npm` 对比 npm `latest` dist-tag并记录 `stable`。Server 运行时不会访问 npm，也不会因审计网络不可用影响反代。`.env.example` 故意将两个 identity override 留空，避免旧部署配置永久压过更新后的内建 profile。
 
-CCH 仍按当前官方二进制中的 `cch=00000` 占位行为生成，seed 为 `0x4D659218E32A3268`。签名在日期、工具、thinking、cache-control 等 body rewrite 全部完成后计算；所有 `model` 字符串递归置空，并递归排除 `max_tokens`、`fallbacks`、`fallback_credit_token`。golden vector 固化了当前 seed、字段保序和排除规则。紧急回滚可设置 `CC_SWITCH_CLAUDE_CCH_POLICY=disabled`，此时 billing block 中的 CCH 成员会被移除，不会回退到旧 seed。
+2.1.258 billing 的 `cc_version` 使用 `<公开版本>.<三位 prompt fingerprint>`。fingerprint 在任何 system→message 迁移前从原始请求第一条真实 user text 取样，按 JavaScript UTF-16 code unit 索引 4、7、20（缺位补 `0`），拼接 salt `59cf53e54c78` 和有效 CLI version 后计算 SHA-256，取前三位 hex；`ping` 的 golden 是 `1e2`。billing block 不带 `cache_control`，后续 identity/prompt block继续承担缓存断点。CCH 仍按官方 `cch=00000` 占位行为生成，seed 为 `0x4D659218E32A3268`；签名在日期、工具、thinking、cache-control 等 body rewrite 全部完成后计算，所有 `model` 字符串递归置空，并递归排除 `max_tokens`、`fallbacks`、`fallback_credit_token`。2.1.258 golden CCH 为 `8d393`。紧急回滚可设置 `CC_SWITCH_CLAUDE_CCH_POLICY=disabled`，此时 billing block 中的 CCH 成员会被移除，不会回退到旧 seed。
 
 quota refresh 并行获取 usage、profile、bootstrap 和 `/api/oauth/claude_cli/roles`。四路 enrichment 都有超时和有界响应读取；roles/profile/bootstrap 失败只影响辅助证据，不覆盖已经成功的 token 或 usage quota，也不在日志、指标或公开 API 中暴露原始 OAuth body。
 
@@ -75,6 +75,7 @@ Claude OAuth 模型发现不调用 Anthropic，也不会为了列模型刷新 to
 - `claude-opus-4-6`
 - `claude-sonnet-4-6`
 - `claude-haiku-4-5-20251001`
+- `claude-fable-5-1`
 - `claude-fable-5`
 - `claude-opus-5`
 - `claude-opus-4-8`
@@ -86,7 +87,7 @@ Share 响应同时公开 `source=claude_code_wire_profile`、`stale=false` 和 c
 
 客户端分类采用 fail-closed 多信号：精确 Claude CLI User-Agent、`x-app=cli`、metadata/session 关系和 beta/body profile 必须共同成立，才进入 Native CLI、SDK CLI、VSCode 或 helper 最小修改路径。UA 或 billing 单信号不能伪装成 native；不确定请求按第三方 Anthropic 客户端处理。确认的 native/helper 请求不会被补入 `tools: []`、默认 `max_tokens`、thinking 或 identity block，只保留 credential-scoped OAuth/extended-cache beta 与最终 CCH。可用 `CC_SWITCH_CLAUDE_NATIVE_PASSTHROUGH=disabled` 强制回到第三方规范化路径。
 
-Messages beta 由确定顺序的 capability engine 生成，未知客户端 beta 不透传。当前固定集合包含 Claude Code、OAuth、interleaved/redacted thinking、thinking-token-count、context-management、prompt-caching-scope、effort、fallback-credit 与 extended-cache；1M context、mid-system、Advisor tool、advanced tools、structured output、fast mode 和 diagnostics 只在相应 model/body shape 满足时加入。Advisor 只识别精确的 `tools[].type=advisor_20260301`，排序固定在 mid-system 之后、advanced tools 之前，Messages 与 `count_tokens` 均支持。服务端不会根据正文主动开启 model fallback：非空模型数组只在客户端显式请求 `server-side-fallback-2026-06-01` 时保留，`fallbacks="default"` 只在显式请求 `server-side-fallback-2026-07-01` 时保留；缺 beta、错配、畸形值以及 `count_tokens` 中的 fallback 字段都会在最终 CCH 前移除。`thinking.display` 与 redact beta 互斥。fine-grained tool streaming 已不再是 beta，旧 computer-use beta 也不自动注入。`count_tokens` 使用独立小集合，不继承 generation-only beta。模型 fixture 逐模型固化目前唯一有审计证据的 `midConversationSystem` 能力；其余规则明确标记为 shape-driven，未知模型不乐观注入 model-gated beta。可用 `CC_SWITCH_CLAUDE_BETA_PROFILE=minimal` 回退到只含 Claude Code/OAuth（以及 `count_tokens` 所需 token-counting）的最小服务端 profile，不改变账号绑定。
+Messages beta 由确定顺序的 capability engine 生成，未知客户端 beta 不透传。当前固定集合包含 Claude Code、OAuth、interleaved/redacted thinking、thinking-token-count、context-management、prompt-caching-scope、effort、fallback-credit 与 extended-cache；1M context、thinking display updates、mid-system、Advisor tool、advanced tools、structured output、fast mode 和 diagnostics 只在相应 model/body shape 满足时加入。`thinking-display-updates-2026-08-18` 只在 `thinking.display="updates"` 时加入并与 redact beta 互斥。普通工具数组不再触发 advanced-tool-use；只有审计过的 regex/BM25 tool-search 类型或 `defer_loading=true`（含 `custom.defer_loading`）才加入。Advisor 只识别精确的 `tools[].type=advisor_20260301`，排序固定在 mid-system 之后、advanced tools 之前，Messages 与 `count_tokens` 均支持。服务端不会根据正文主动开启 model fallback：非空模型数组只在客户端显式请求 `server-side-fallback-2026-06-01` 时保留，`fallbacks="default"` 只在显式请求 `server-side-fallback-2026-07-01` 时保留；缺 beta、错配、畸形值以及 `count_tokens` 中的 fallback 字段都会在最终 CCH 前移除。fine-grained tool streaming 已不再是 beta，旧 computer-use beta 也不自动注入。`count_tokens` 使用独立小集合，不继承 generation-only beta。Fable 5 与 Fable 5.1 共享既有 Max 5x/20x entitlement 和 Fable 周容量池，不产生模型 fallback。模型 fixture 逐模型固化目前唯一有审计证据的 `midConversationSystem` 能力；其余规则明确标记为 shape-driven，未知模型不乐观注入 model-gated beta。可用 `CC_SWITCH_CLAUDE_BETA_PROFILE=minimal` 回退到只含 Claude Code/OAuth（以及 `count_tokens` 所需 token-counting）的最小服务端 profile，不改变账号绑定。
 
 cache-control pass 在 CCH 前全局扫描 tools、system 和 messages，规范化 TTL/order、最多保留 4 个 breakpoint，并优先保留最后 tool、最后 system 和最近 message marker；重复执行幂等。forced `tool_choice` 会同步移除不兼容的 thinking/context-management。可用 `CC_SWITCH_CLAUDE_CACHE_REWRITE=disabled` 关闭该 pass。
 
@@ -150,7 +151,7 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 - `cc_switch_account_inflight{provider_type}`：按有限 Provider 类型聚合的当前账号请求数。
 - `cc_switch_provider_outcome_total{app,provider_type,outcome}`：按有限 app、Provider 类型和结果聚合的上游终态。
 - `cc_switch_claude_roles_total`、`cc_switch_claude_ttfb_seconds`、`cc_switch_claude_stream_duration_seconds`、`cc_switch_claude_semantic_failure_total`：roles enrichment 和流语义时延/终态。
-- `cc_switch_claude_wire_profile_info`：固定 wire profile、effective Claude Code version 与身份来源。
+- `cc_switch_claude_wire_profile_info`：固定 wire profile、effective Claude Code version、身份来源与有界 `stale_override_rejected` 标签。
 - `cc_switch_claude_client_class_total`：按有界客户端分类和请求类型计数。
 - `cc_switch_claude_rate_limit_scope_total`：按 request、Share+model、account unified 作用域计数。
 - `cc_switch_claude_optional_rewrite_total`：只记录有界 rewrite 类型，不记录日期或工具名。
@@ -162,7 +163,7 @@ Prometheus 标签禁止包含账号 ID、Provider ID 或 request ID；这些实�
 
 ## 真实账号验收
 
-脚本包含三个互相独立的 external gate：Share 推理、Max 5x 计划解析和 Max 20x 计划解析。完整运行示例：
+脚本每次运行包含三个互相独立的 external gate：当前模型的 Share 推理、Max 5x 计划解析和 Max 20x 计划解析。完整运行示例：
 
 ```bash
 SERVER_URL='https://server.example.com' \
@@ -182,7 +183,9 @@ node scripts/smoke/claude-oauth-real.mjs
 
 Share gate 通过同一个 Share URL 检查 count_tokens、非流式 Messages 和完整 SSE lifecycle。两个 Max 变量分别按 Claude OAuth 账号 ID 或 email 精确匹配 `GET /api/accounts`，再调用 `GET /api/accounts/:id/quota?refresh=true&force=true`，检查账号/配额显示名、canonical `planType` / `planLabel` 以及 source/stale/conflict evidence 的一致性。脚本不输出账号选择器或完整 email。
 
-三个 gate 单独判断输入：Share 缺 URL/token、某个 Max 等级缺账号选择器，或 Max gate 缺 Server URL/token 时，都为对应 gate 明确输出 `[SKIP]`，不阻止其他已配置 gate 运行，也绝不能把 SKIP 记为真实通过。
+Fable 5.1 必须作为额外的独立 Share gate：先完成上面的普通模型运行，再把 `CC_SWITCH_SHARE_URL` 指向明确绑定 Max 20x 账号的 Share，设置 `CC_SWITCH_CLAUDE_MODEL=claude-fable-5-1` 后再次运行脚本。第二次运行的 count_tokens、非流式 Messages 和 SSE 结果单独记录，不得由普通模型或 Max 20x 计划解析结果替代。
+
+每次运行的三个 gate 都单独判断输入：Share 缺 URL/token、某个 Max 等级缺账号选择器，或 Max gate 缺 Server URL/token 时，都为对应 gate 明确输出 `[SKIP]`，不阻止其他已配置 gate 运行。汇总时应分别记录普通 Share、Max 5x、Max 20x 和 Fable 5.1 四项，也绝不能把 SKIP 记为真实通过。
 
 ## 非目标与剩余外部风险
 

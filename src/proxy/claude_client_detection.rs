@@ -176,7 +176,7 @@ mod tests {
         headers.insert("x-app", HeaderValue::from_static("cli"));
         headers.insert(
             "user-agent",
-            HeaderValue::from_str(&format!("claude-cli/2.1.236 (external, {entrypoint})")).unwrap(),
+            HeaderValue::from_str(&format!("claude-cli/2.1.258 (external, {entrypoint})")).unwrap(),
         );
         headers.insert("anthropic-beta", HeaderValue::from_static(beta));
         headers

@@ -1,22 +1,22 @@
 {
   "format": "cc-switch-claude-oauth-wire-profile",
-  "schemaVersion": 2,
-  "profileId": "claude-code-2.1.236-audited-2026-09-02",
+  "schemaVersion": 3,
+  "profileId": "claude-code-2.1.258-audited-2026-09-02",
   "capturedAt": "2026-09-02T00:00:00Z",
   "versions": {
-    "claudeCode": "2.1.236",
+    "claudeCode": "2.1.258",
     "stainlessSdk": "0.112.1",
     "node": "v26.3.0",
     "axios": "1.15.2"
   },
   "endpointIdentities": {
-    "usage": "claude-code/2.1.236",
-    "bootstrap": "claude-cli/2.1.236 (external, cli)",
+    "usage": "claude-code/2.1.258",
+    "bootstrap": "claude-cli/2.1.258 (external, cli)",
     "profile": "axios/1.15.2",
     "roles": "axios/1.15.2",
     "token": "axios/1.15.2",
     "inference": {
-      "userAgent": "claude-cli/2.1.236 (external, cli)",
+      "userAgent": "claude-cli/2.1.258 (external, cli)",
       "xStainlessPackageVersion": "0.112.1",
       "xStainlessRuntime": "node",
       "xStainlessRuntimeVersion": "v26.3.0"
@@ -28,15 +28,48 @@
   ],
   "billing": {
     "ccEntrypoint": "cli",
-    "versionStrategy": "public_cli_version_without_guessed_build_suffix",
-    "privateBuildSuffixInvented": false
+    "versionStrategy": "public_cli_version_plus_prompt_fingerprint",
+    "privateBuildSuffixInvented": false,
+    "billingBlockCacheControl": false,
+    "promptFingerprint": {
+      "algorithm": "sha256_salted_selected_utf16_code_units",
+      "salt": "59cf53e54c78",
+      "utf16CodeUnitIndices": [4, 7, 20],
+      "missingCodeUnit": "0",
+      "digestHexCharacters": 3,
+      "promptSource": "first_user_text_before_system_migration",
+      "goldenVectors": [
+        {"prompt": "ping", "version": "2.1.258", "fingerprint": "1e2"}
+      ]
+    }
   },
   "cch": {
     "algorithm": "xxhash64_seeded_canonical_body",
     "seedHex": "4d659218e32a3268",
     "signedAfterBodyNormalization": true,
     "modelValuesBlanked": true,
-    "excludedKeys": ["max_tokens", "fallbacks", "fallback_credit_token"]
+    "excludedKeys": ["max_tokens", "fallbacks", "fallback_credit_token"],
+    "goldenVectors": [
+      {
+        "profile": "2.1.258-prompt-ping",
+        "signature": "8d393",
+        "syntheticBody": {
+          "model": "model-a",
+          "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+          "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;"},
+            {"type": "text", "text": "system-x"}
+          ],
+          "tools": [],
+          "metadata": {"user_id": "meta-x"},
+          "max_tokens": 1,
+          "thinking": {"type": "adaptive", "display": "omitted"},
+          "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+          "output_config": {"effort": "high"},
+          "stream": true
+        }
+      }
+    ]
   },
   "runtimeControls": {
     "cchPolicy": {
@@ -96,6 +129,7 @@
       ],
       "shapeGated": [
         "context-1m-2025-08-07",
+        "thinking-display-updates-2026-08-18",
         "mid-conversation-system-2026-04-07",
         "advisor-tool-2026-03-01",
         "advanced-tool-use-2025-11-20",
@@ -103,6 +137,21 @@
         "fast-mode-2026-02-01",
         "cache-diagnosis-2026-04-07"
       ],
+      "shapeRules": {
+        "thinkingDisplayUpdates": {
+          "path": "thinking.display",
+          "equals": "updates",
+          "excludes": "redact-thinking-2026-02-12"
+        },
+        "advancedToolUse": {
+          "toolTypes": [
+            "tool_search_tool_regex_20251119",
+            "tool_search_tool_bm25_20251119"
+          ],
+          "booleanPaths": ["defer_loading", "custom.defer_loading"],
+          "ordinaryToolsEnable": false
+        }
+      },
       "explicitShapePaired": {
         "fallbackArray": "server-side-fallback-2026-06-01",
         "fallbackDefault": "server-side-fallback-2026-07-01",
@@ -135,6 +184,7 @@
     "capabilityPolicy": {
       "unknownModel": "shape_only_no_model_beta",
       "shapeDrivenCapabilities": [
+        "thinking_display_updates",
         "advanced_tool_use",
         "advisor_tool",
         "structured_outputs",
@@ -145,6 +195,7 @@
       "modelGatedCapabilities": ["mid_conversation_system"]
     },
     "capabilitiesByModel": {
+      "claude-fable-5-1": {"midConversationSystem": true},
       "claude-fable-5": {"midConversationSystem": true},
       "claude-opus-5": {"midConversationSystem": true},
       "claude-opus-4-8": {"midConversationSystem": true},
@@ -154,6 +205,7 @@
       "claude-haiku-4-5-20251001": {"midConversationSystem": false}
     },
     "models": [
+      "claude-fable-5-1",
       "claude-fable-5",
       "claude-opus-5",
       "claude-opus-4-8",
@@ -164,9 +216,9 @@
     ]
   },
   "provenance": {
-    "kind": "sanitized_npm_stable_native_binary_static_audit",
+    "kind": "sanitized_npm_latest_native_binary_static_and_loopback_audit",
     "containsSecrets": false,
     "realAccountVerification": "pending",
-    "notes": "Audited from the official npm stable Claude Code 2.1.236 native binary on 2026-09-02 and compared with the prior 2.1.234 profile; the static identity, beta, model, Stainless, and CCH token sets had no material delta. Values retain only public endpoint, version, header-family, beta-policy, model capability, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, request bodies, response bodies, and private build metadata are excluded. Real subscription-account verification remains pending."
+    "notes": "Audited from the official npm latest/next Claude Code 2.1.258 native binary on 2026-09-02 while npm stable remained 2.1.236. Static inspection plus a loopback capture using fake local credentials confirmed the public identity versions, prompt-derived billing fingerprint, retained CCH, beta gates, and the claude-fable-5-1 catalog entry without contacting Anthropic. Values retain only public endpoint, version, header-family, beta-policy, model capability, fingerprint, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, raw request bodies, raw response bodies, and private build metadata are excluded. Real subscription-account verification remains pending."
   }
 }

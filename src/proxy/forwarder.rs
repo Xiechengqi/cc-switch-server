@@ -5153,8 +5153,9 @@ async fn ensure_share_model_available(
                 if eligibility == ClaudeFableEligibility::Ineligible {
                     return Err(ProxyError {
                         status: StatusCode::FORBIDDEN,
-                        message: "claude-fable-5 requires a Claude Max 5x or Max 20x subscription"
-                            .to_string(),
+                        message:
+                            "Claude Fable 5/5.1 requires a Claude Max 5x or Max 20x subscription"
+                                .to_string(),
                     });
                 }
             }

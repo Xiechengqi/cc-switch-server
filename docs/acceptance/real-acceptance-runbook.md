@@ -355,15 +355,15 @@ Claude OAuth 专项补充：
 
 1. 同一 `claude_oauth` 账号并发触发多次 refresh 时，上游 token endpoint 不应收到重复风暴；失败后短窗口内应进入 per-token backoff。
 2. 新建 Claude 授权 URL 必须包含 `prompt=login`，避免多账号浏览器会话抢占。
-3. Claude proxy 请求应携带 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。
-4. `anthropic-beta` 应按请求形状出现：基础请求只带 Claude Code/OAuth beta；含 `thinking`、streaming tools 或 computer-use tool 时才追加对应 beta；messages 与 profile/usage 请求的 Claude CLI UA 应保持同一版本，CCH `cc_entrypoint` 默认应为 `cli`。
+3. Claude proxy 请求应携带 2.1.258 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。billing 应在 system 迁移前从同一原始 user text 计算 UTF-16 prompt fingerprint；`ping` 必须产生 `cc_version=2.1.258.1e2`，billing block 不得带 `cache_control`。
+4. `anthropic-beta` 应按请求形状出现：普通工具数组不能触发 advanced-tool-use，只有审计过的 tool-search/deferred tool 才能触发；`thinking.display="updates"` 应加入 thinking-display-updates 且不加入 redact-thinking；Fable 5.1 应加入 mid-conversation-system。messages 与 profile/usage 请求的 Claude CLI UA 应保持同一版本，CCH `cc_entrypoint` 默认应为 `cli`。
 5. 上游 429 时应记录 Share 所绑定 Provider 的 rate-limited outcome，并原样保留审计过的 rate-limit 响应头。Claude Messages/count_tokens 请求不得切换 Provider 或账号；绑定账号的 429 直接返回。
 6. Claude SSE 中出现 `event:error` 且类型为 `rate_limit_error`、`overloaded_error` 或 `api_error` 时，应记录 Share 绑定 Provider failure；无论 error 位于下游 commit 前后都不得透明重放或切换账号，已开始输出的流以 Anthropic 终止错误帧结束。
-7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并重算 CCH。
+7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并在移除 billing cache marker 后重算 CCH；2.1.258 golden fixture 应得到 `cch=8d393`。
 8. 上游 400 signature/thinking 错误应触发反应式降级重试：thinking block 降为 text；工具签名错误时 tool_use/tool_result 降为 text；web_search 历史块错误时剥离历史 server_tool_use/web_search_tool_result。
 9. `CC_SWITCH_CCH_SALT_HEX`、`CC_SWITCH_CLI_STAINLESS_OS`、`CC_SWITCH_CLI_STAINLESS_ARCH`、`CC_SWITCH_CLI_STAINLESS_RUNTIME_VERSION` 覆盖应只用于灰度/抓包追热；默认路径应按账号 seed 稳定选择 stainless OS/arch，stream 请求 `x-stainless-timeout=600`，非 stream 请求为 `60`。
 10. 长闲置 Claude OAuth 账号应由后台 60s 维护循环提前 warm-refresh；真实回归可把 access token 置空或调短 `expiresAt`，确认首个 proxy 请求前账号已恢复可用或只触发一次 singleflight refresh。
-11. 若上游返回 Claude Code CLI 版本过期提示，响应体应替换为面向 cc-switch-server admin 的 `CC_SWITCH_CLI_UA_VERSION` / `CC_SWITCH_CLI_UA` 调整提示，并记录 error 日志。
+11. 若上游返回 Claude Code CLI 版本过期提示，响应体应替换为面向 cc-switch-server admin 的 `CC_SWITCH_CLI_UA_VERSION` / `CC_SWITCH_CLI_UA` 调整提示，并记录 error 日志。启动前应确认两个 override 默认为空；任何低于 2.1.258 的遗留值必须被拒绝，并在日志/`cc_switch_claude_wire_profile_info` 中显示 `stale_override_rejected=true`。
 12. Claude OAuth 出站 JSON 不应被 key 字母序化；抓包时至少确认原始 `model` / `max_tokens` / `messages` 相对顺序被保留，缺省工具请求应补 `tools: []`。
 13. 上游响应含 `x-request-id` 时，下游客户端应能拿到同名 header，便于 Anthropic support 联合排查。
 14. Claude OAuth 客户端 header 中加入未知 beta（例如 `prompt-caching-scope-2026-01-05`）时，上游不得收到该 token；已审计的 `prompt-caching-2024-07-31` 与 `token-efficient-tools-2025-02-19` 应保留，server debug 日志应能定位被过滤事件但不得记录 token/account 身份。
@@ -376,10 +376,10 @@ Claude OAuth 专项补充：
 21. profile refresh 后 `organization.billing_type` 应进入 `profile.billingSource`；Apple/Stripe 不应改变 plan 或生成订阅到期日，未知 billing type 应原样保留。
 22. 连续 `invalid_grant` 达到 `CC_SWITCH_REFRESH_FAILURES_BEFORE_RELOGIN` 阈值后，账号应显示 `relogin` 并退出其固定 Provider 内的账号调度；网络错误、限流和普通 quota 错误不得累计该计数，手工 refresh 成功后状态应清零。
 23. `GET /metrics` 应能看到账号 inflight/max、Claude retry、Provider outcome、warm-refresh、CLI version-gate、beta decision、count_tokens outcome 与 stream protocol error 指标；labels 必须保持固定枚举。该端点默认无鉴权，公网部署必须由反向代理或网络策略限制抓取来源。
-24. 分别使用真实 `CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT` 与 `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` 完成 OAuth 登录；变量值使用账号 ID 或 email。设置 `SERVER_URL`、`CC_SWITCH_SERVER_TOKEN`、`CC_SWITCH_SHARE_URL` 和 `ROUTER_API_TOKEN` 后运行 `node scripts/smoke/claude-oauth-real.mjs`。脚本通过公开账号 API 强制刷新两个账号 quota，并独立验收普通 Share count_tokens、Messages JSON 与完整 SSE terminal。Auth Center 账号行、Provider 账号选择器和订阅 quota 应分别稳定显示 `Claude Max 5x` / `Claude Max 20x`，后端 subscription `planType` 应分别为 `claude_max_5x` / `claude_max_20x`。不得提交 `accounts.json`、token、完整 profile/bootstrap/roles/usage body 或未脱敏 email。
+24. 分别使用真实 `CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT` 与 `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` 完成 OAuth 登录；变量值使用账号 ID 或 email。设置 `SERVER_URL`、`CC_SWITCH_SERVER_TOKEN`、`CC_SWITCH_SHARE_URL` 和 `ROUTER_API_TOKEN` 后运行 `node scripts/smoke/claude-oauth-real.mjs`。脚本通过公开账号 API 强制刷新两个账号 quota，并验收当前 `CC_SWITCH_CLAUDE_MODEL` 的 Share count_tokens、Messages JSON 与完整 SSE terminal。先以普通模型运行一次；再将 `CC_SWITCH_SHARE_URL` 指向明确绑定该 Max 20x 账号的 Share，设置 `CC_SWITCH_CLAUDE_MODEL=claude-fable-5-1` 后独立运行一次，把第二次的 non-stream/SSE 结果单独记为 Fable 5.1 gate。所有凭据必须已轮换且只通过私密环境注入。Auth Center 账号行、Provider 账号选择器和订阅 quota 应分别稳定显示 `Claude Max 5x` / `Claude Max 20x`，后端 subscription `planType` 应分别为 `claude_max_5x` / `claude_max_20x`。不得提交 `accounts.json`、token、完整 profile/bootstrap/roles/usage body、shell 历史或未脱敏 email。
 25. 对每个真实等级只记录脱敏账号、`planType`、`planLabel`、evidence `source` / `stale` / `conflict`、HTTP 状态与时间。全新登录应优先由实时 usage/bootstrap/profile 证据解析且 `stale=false`；只有实时证据仅给通用 Max、兼容旧倍率被采用时才允许 `stale=true`。实时 5x 与 20x 相互冲突时必须出现 `claude_plan_conflict`，不能静默覆盖。
 26. 20x 已有本地 `default_claude_max_20x` fixture 证据，但仍需真实账号确认当前 Anthropic 响应。5x 当前只有同形 `..._5x` 解析规则，没有 checked-in 真实 fixture；在 5x 账号和脱敏响应证据齐备前，release evidence 必须写 `blocked-inputs` 或 `SKIP`，不得写 live passed。
-27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x 三个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入。
+27. 真实专项账号缺少任一个时，脚本会为对应等级输出独立 `[SKIP]`；只运行本地 resolver/API/UI 测试并将该等级标为未验收。不得用手工编辑 `subscriptionLevel`、伪造 bootstrap 或另一个等级账号替代真实通过。Share、5x、20x、Fable 5.1 四个 gate 的 SKIP/FAIL/PASS 必须分别记录，不能用其中一个 PASS 覆盖其他 gate 的缺失输入；本地 fixture 通过不得写成 live passed。
 
 Grok 与 Amazon Q 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
 
