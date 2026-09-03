@@ -2232,8 +2232,7 @@ pub(in crate::api) async fn start_codebuddy_login(
             principal.oauth_binding_id(),
             login.expires_at,
             now,
-            4,
-            256,
+            crate::state::DeviceFlowPrincipalLimits::new(4, 256),
         )
         .await
     {

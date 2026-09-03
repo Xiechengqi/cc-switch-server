@@ -812,6 +812,13 @@ pub(crate) async fn fetch_billing_resources(
         .map_err(CodeBuddyClientError::bad_request)?;
     profile_access_token(account)?;
     let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    let billing = CodeBuddyBillingClient {
+        http,
+        account,
+        profile: &profile,
+        endpoints: &endpoints,
+        request_timeout,
+    };
     let now = match profile.site {
         CodeBuddySite::Intl => chrono::Utc::now().with_timezone(&chrono_tz::UTC),
         CodeBuddySite::Cn => chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai),
@@ -824,21 +831,12 @@ pub(crate) async fn fetch_billing_resources(
         .and_hms_opt(23, 59, 59)
         .ok_or_else(|| CodeBuddyClientError::bad_gateway("CodeBuddy billing day end is invalid"))?;
     let modern = tokio::join!(
-        fetch_billing_path(
-            http,
-            account,
-            &profile,
-            &endpoints,
+        billing.fetch(
             CODEBUDDY_RESOURCE_SUMMARY_PATH,
             json!({}),
-            request_timeout,
             "billing resource summary",
         ),
-        fetch_billing_path(
-            http,
-            account,
-            &profile,
-            &endpoints,
+        billing.fetch(
             CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH,
             json!({
                 "PageNumber": 1,
@@ -847,14 +845,9 @@ pub(crate) async fn fetch_billing_resources(
                 "PackageCodes": CODEBUDDY_PAID_PACKAGE_CODES,
                 "NeedRenewInfo": true,
             }),
-            request_timeout,
             "billing paid packages",
         ),
-        fetch_billing_path(
-            http,
-            account,
-            &profile,
-            &endpoints,
+        billing.fetch(
             CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH,
             json!({
                 "PageNumber": 1,
@@ -864,7 +857,6 @@ pub(crate) async fn fetch_billing_resources(
                 "SlicePeriodEndTime": day_end.format("%Y-%m-%d %H:%M:%S").to_string(),
                 "PackageCodes": CODEBUDDY_FREE_PACKAGE_CODES,
             }),
-            request_timeout,
             "billing free packages",
         ),
     );
@@ -911,17 +903,9 @@ pub(crate) async fn fetch_billing_resources(
         "PackageEndTimeRangeBegin": now.format("%Y-%m-%d %H:%M:%S").to_string(),
         "PackageEndTimeRangeEnd": range_end.format("%Y-%m-%d %H:%M:%S").to_string(),
     });
-    let value = fetch_billing_path(
-        http,
-        account,
-        &profile,
-        &endpoints,
-        CODEBUDDY_RESOURCE_PATH,
-        body,
-        request_timeout,
-        "billing resource",
-    )
-    .await?;
+    let value = billing
+        .fetch(CODEBUDDY_RESOURCE_PATH, body, "billing resource")
+        .await?;
     Ok(CodeBuddyBillingResources::Legacy(value))
 }
 
@@ -941,84 +925,78 @@ fn modern_billing_array_present(value: &Value, field: &str) -> bool {
     })
 }
 
-async fn fetch_billing_path(
-    http: &reqwest::Client,
-    account: &Account,
-    profile: &CodeBuddyAccountProfile,
-    endpoints: &CodeBuddyBillingEndpoints,
-    path: &str,
-    body: Value,
+struct CodeBuddyBillingClient<'a> {
+    http: &'a reqwest::Client,
+    account: &'a Account,
+    profile: &'a CodeBuddyAccountProfile,
+    endpoints: &'a CodeBuddyBillingEndpoints,
     request_timeout: Duration,
-    operation: &str,
-) -> Result<Value, CodeBuddyClientError> {
-    fetch_billing_path_with_limit(
-        http,
-        account,
-        profile,
-        endpoints,
-        path,
-        body,
-        request_timeout,
-        operation,
-        MAX_RESPONSE_BODY_BYTES,
-    )
-    .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn fetch_billing_path_with_limit(
-    http: &reqwest::Client,
-    account: &Account,
-    profile: &CodeBuddyAccountProfile,
-    endpoints: &CodeBuddyBillingEndpoints,
-    path: &str,
-    body: Value,
-    request_timeout: Duration,
-    operation: &str,
-    response_body_limit: usize,
-) -> Result<Value, CodeBuddyClientError> {
-    let url = endpoints.url(path)?;
-    let body = serde_json::to_vec(&body).map_err(|error| {
-        CodeBuddyClientError::bad_gateway(format!("encode CodeBuddy {operation} request: {error}"))
-    })?;
-    let request = authenticated_request(
-        http.post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .header("X-Client-Platform", "web")
-            .body(body),
-        profile_access_token(account)?,
-        &profile.uid,
-        Some(&profile.enterprise_id),
-        &profile.domain,
-    );
-    let (status, body) = execute_bounded_with_timeout_and_limit(
-        request,
-        operation,
-        request_timeout.min(REQUEST_TIMEOUT),
-        response_body_limit,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(CodeBuddyClientError::upstream(status, operation, &body));
+impl CodeBuddyBillingClient<'_> {
+    async fn fetch(
+        &self,
+        path: &str,
+        body: Value,
+        operation: &str,
+    ) -> Result<Value, CodeBuddyClientError> {
+        self.fetch_with_limit(path, body, operation, MAX_RESPONSE_BODY_BYTES)
+            .await
     }
-    let value: Value = serde_json::from_slice(&body).map_err(|error| {
-        CodeBuddyClientError::protocol(format!(
-            "CodeBuddy {operation} response is not valid JSON: {error}"
-        ))
-    })?;
-    let root_code = i64_at(&value, &["/code"]);
-    let business_code = match root_code {
-        Some(0 | 200) | None => recursive_business_code(&value, 0),
-        Some(code) => Some(code),
-    };
-    if let Some(code) = business_code {
-        if !matches!(code, 0 | 200) {
-            let message =
-                string_at(&value, &["/msg", "/message", "/error/message"]).unwrap_or_default();
-            return Err(CodeBuddyClientError::business(operation, code, &message));
+
+    async fn fetch_with_limit(
+        &self,
+        path: &str,
+        body: Value,
+        operation: &str,
+        response_body_limit: usize,
+    ) -> Result<Value, CodeBuddyClientError> {
+        let url = self.endpoints.url(path)?;
+        let body = serde_json::to_vec(&body).map_err(|error| {
+            CodeBuddyClientError::bad_gateway(format!(
+                "encode CodeBuddy {operation} request: {error}"
+            ))
+        })?;
+        let request = authenticated_request(
+            self.http
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-Client-Platform", "web")
+                .body(body),
+            profile_access_token(self.account)?,
+            &self.profile.uid,
+            Some(&self.profile.enterprise_id),
+            &self.profile.domain,
+        );
+        let (status, body) = execute_bounded_with_timeout_and_limit(
+            request,
+            operation,
+            self.request_timeout.min(REQUEST_TIMEOUT),
+            response_body_limit,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(CodeBuddyClientError::upstream(status, operation, &body));
         }
+        let value: Value = serde_json::from_slice(&body).map_err(|error| {
+            CodeBuddyClientError::protocol(format!(
+                "CodeBuddy {operation} response is not valid JSON: {error}"
+            ))
+        })?;
+        let root_code = i64_at(&value, &["/code"]);
+        let business_code = match root_code {
+            Some(0 | 200) | None => recursive_business_code(&value, 0),
+            Some(code) => Some(code),
+        };
+        if let Some(code) = business_code {
+            if !matches!(code, 0 | 200) {
+                let message =
+                    string_at(&value, &["/msg", "/message", "/error/message"]).unwrap_or_default();
+                return Err(CodeBuddyClientError::business(operation, code, &message));
+            }
+        }
+        Ok(value)
     }
-    Ok(value)
 }
 
 fn profile_access_token(account: &Account) -> Result<&str, CodeBuddyClientError> {
@@ -1038,6 +1016,13 @@ pub(crate) async fn fetch_official_usage(
     let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
         .map_err(CodeBuddyClientError::bad_request)?;
     let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    let billing = CodeBuddyBillingClient {
+        http,
+        account,
+        profile: &profile,
+        endpoints: &endpoints,
+        request_timeout,
+    };
     let timezone = match profile.site {
         CodeBuddySite::Intl => chrono_tz::UTC,
         CodeBuddySite::Cn => chrono_tz::Asia::Shanghai,
@@ -1062,23 +1047,19 @@ pub(crate) async fn fetch_official_usage(
     let mut details = Vec::new();
 
     loop {
-        let response = fetch_billing_path_with_limit(
-            http,
-            account,
-            &profile,
-            &endpoints,
-            CODEBUDDY_USAGE_PATH,
-            json!({
-                "startTime": format!("{range_start} 00:00:00"),
-                "endTime": format!("{today} 23:59:59"),
-                "pageNum": page_number,
-                "pageSize": CODEBUDDY_USAGE_PAGE_SIZE,
-            }),
-            request_timeout,
-            "official request usage",
-            MAX_USAGE_RESPONSE_BODY_BYTES,
-        )
-        .await?;
+        let response = billing
+            .fetch_with_limit(
+                CODEBUDDY_USAGE_PATH,
+                json!({
+                    "startTime": format!("{range_start} 00:00:00"),
+                    "endTime": format!("{today} 23:59:59"),
+                    "pageNum": page_number,
+                    "pageSize": CODEBUDDY_USAGE_PAGE_SIZE,
+                }),
+                "official request usage",
+                MAX_USAGE_RESPONSE_BODY_BYTES,
+            )
+            .await?;
         let data = response
             .pointer("/data")
             .and_then(Value::as_object)

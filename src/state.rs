@@ -751,6 +751,21 @@ struct DeviceFlowPrincipalBinding {
     expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeviceFlowPrincipalLimits {
+    max_for_principal: usize,
+    max_total: usize,
+}
+
+impl DeviceFlowPrincipalLimits {
+    pub(crate) const fn new(max_for_principal: usize, max_total: usize) -> Self {
+        Self {
+            max_for_principal,
+            max_total,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct DeviceFlowPrincipalStore {
     bindings: BTreeMap<(String, String), DeviceFlowPrincipalBinding>,
@@ -764,8 +779,7 @@ impl DeviceFlowPrincipalStore {
         principal_id: String,
         expires_at_ms: i64,
         now_ms: i64,
-        max_for_principal: usize,
-        max_total: usize,
+        limits: DeviceFlowPrincipalLimits,
     ) -> bool {
         self.cleanup(now_ms);
         let provider = provider_type.as_str();
@@ -776,7 +790,7 @@ impl DeviceFlowPrincipalStore {
                 candidate_provider == provider && binding.principal_id == principal_id
             })
             .count();
-        if principal_count >= max_for_principal || self.bindings.len() >= max_total {
+        if principal_count >= limits.max_for_principal || self.bindings.len() >= limits.max_total {
             return false;
         }
         self.bindings.insert(
@@ -14266,13 +14280,11 @@ impl ServerStateInner {
     ) {
         let Some((account, before_visual, after_visual)) = self
             .mutate_accounts(|accounts| {
-                let Some(account) = accounts.accounts.iter_mut().find(|account| {
+                let account = accounts.accounts.iter_mut().find(|account| {
                     account.id == event_key.account_id
                         && account.provider_type == ProviderType::ClaudeOAuth
                         && account.auth_identity_generation == event_key.auth_identity_generation
-                }) else {
-                    return None;
-                };
+                })?;
                 let before = account.clone();
                 let before_visual = claude_quota_visual_fingerprint(
                     &before,
@@ -14982,15 +14994,14 @@ impl ServerStateInner {
         );
     }
 
-    pub async fn try_bind_device_flow_principal_bounded(
+    pub(crate) async fn try_bind_device_flow_principal_bounded(
         &self,
         provider_type: ProviderType,
         device_code: String,
         principal_id: String,
         expires_at_ms: i64,
         now_ms: i64,
-        max_for_principal: usize,
-        max_total: usize,
+        limits: DeviceFlowPrincipalLimits,
     ) -> bool {
         self.device_flow_principals
             .write()
@@ -15001,8 +15012,7 @@ impl ServerStateInner {
                 principal_id,
                 expires_at_ms,
                 now_ms,
-                max_for_principal,
-                max_total,
+                limits,
             )
     }
 
@@ -33236,8 +33246,7 @@ mod tests {
                 "alice:admin".to_string(),
                 2_000,
                 1_000,
-                4,
-                5,
+                DeviceFlowPrincipalLimits::new(4, 5),
             ));
         }
         assert!(!store.try_insert_bounded(
@@ -33246,8 +33255,7 @@ mod tests {
             "alice:admin".to_string(),
             2_000,
             1_000,
-            4,
-            5,
+            DeviceFlowPrincipalLimits::new(4, 5),
         ));
         assert!(store.try_insert_bounded(
             ProviderType::CodeBuddyOAuth,
@@ -33255,8 +33263,7 @@ mod tests {
             "bob:admin".to_string(),
             2_000,
             1_000,
-            4,
-            5,
+            DeviceFlowPrincipalLimits::new(4, 5),
         ));
         assert!(!store.try_insert_bounded(
             ProviderType::CodeBuddyOAuth,
@@ -33264,8 +33271,7 @@ mod tests {
             "carol:admin".to_string(),
             2_000,
             1_000,
-            4,
-            5,
+            DeviceFlowPrincipalLimits::new(4, 5),
         ));
         assert!(store.try_insert_bounded(
             ProviderType::CodeBuddyOAuth,
@@ -33273,8 +33279,7 @@ mod tests {
             "carol:admin".to_string(),
             3_000,
             2_000,
-            4,
-            5,
+            DeviceFlowPrincipalLimits::new(4, 5),
         ));
     }
 
