@@ -322,6 +322,30 @@ pub fn record_grok_model_catalog(source: &'static str) {
     .increment(1);
 }
 
+pub fn record_qoder_client_ip_source(source: &'static str) {
+    metrics::counter!(
+        "cc_switch_qoder_client_ip_total",
+        "source" => source
+    )
+    .increment(1);
+}
+
+pub fn record_qoder_compatibility(kind: &'static str) {
+    metrics::counter!(
+        "cc_switch_qoder_compatibility_total",
+        "kind" => kind
+    )
+    .increment(1);
+}
+
+pub fn record_qoder_error(kind: &'static str) {
+    metrics::counter!(
+        "cc_switch_qoder_error_total",
+        "kind" => kind
+    )
+    .increment(1);
+}
+
 pub fn record_claude_bootstrap(result: &str) {
     metrics::counter!(
         "cc_switch_claude_bootstrap_total",
@@ -358,6 +382,14 @@ pub fn record_claude_client_class(class: &'static str, operation: &'static str) 
 
 pub fn record_claude_rate_limit_scope(scope: &'static str) {
     metrics::counter!("cc_switch_claude_rate_limit_scope_total", "scope" => scope).increment(1);
+}
+
+pub fn record_claude_quota_header_observation(outcome: &'static str) {
+    metrics::counter!(
+        "cc_switch_claude_quota_header_observation_total",
+        "outcome" => outcome
+    )
+    .increment(1);
 }
 
 pub fn record_claude_optional_rewrite(kind: &'static str) {
@@ -580,6 +612,18 @@ fn describe() {
         "Grok model catalog responses by bounded source classification"
     );
     metrics::describe_counter!(
+        "cc_switch_qoder_client_ip_total",
+        "Qoder CN client IP resolutions by bounded source classification"
+    );
+    metrics::describe_counter!(
+        "cc_switch_qoder_compatibility_total",
+        "Qoder request and response compatibility normalizations by bounded kind"
+    );
+    metrics::describe_counter!(
+        "cc_switch_qoder_error_total",
+        "Qoder upstream failures by bounded protocol classification"
+    );
+    metrics::describe_counter!(
         "cc_switch_claude_bootstrap_total",
         "Best-effort Claude CLI bootstrap enrichment results"
     );
@@ -598,6 +642,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_claude_rate_limit_scope_total",
         "Claude OAuth 429 responses by bounded local cooldown scope"
+    );
+    metrics::describe_counter!(
+        "cc_switch_claude_quota_header_observation_total",
+        "Claude OAuth response-header quota observations by bounded commit outcome"
     );
     metrics::describe_counter!(
         "cc_switch_claude_optional_rewrite_total",

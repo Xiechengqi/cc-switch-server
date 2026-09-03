@@ -71,6 +71,10 @@ use crate::domain::accounts::capability_evidence::{
     GEMINI_QUOTA_FAMILY_DIMENSION, GPT_QUOTA_FAMILY_DIMENSION, MODEL_CAPACITY_DIMENSION,
     MODEL_CATALOG_DIMENSION,
 };
+use crate::domain::accounts::claude_quota::{
+    claude_quota_visual_change_is_urgent, claude_quota_visual_fingerprint,
+    ClaudeQuotaVisualFingerprint,
+};
 use crate::domain::accounts::login::OAuthLoginStore;
 use crate::domain::accounts::managers::{
     account_credential_ownership, AccountCredentialOwnership, AccountRefreshFlightFailure,
@@ -79,10 +83,12 @@ use crate::domain::accounts::managers::{
 };
 use crate::domain::accounts::oauth::oauth_quota_auth_provider_label;
 use crate::domain::accounts::store::{
-    active_account_capacity_pool_limit, active_account_usage_block, effective_codex_workspace_id,
-    gemini_v1internal_project_id, native_refresh_snapshot_matches, Account,
-    AccountCapacityPoolLimit, AccountRefreshUpdate, AccountStore, ManualSubscriptionExpiryError,
-    UpsertAccountInput,
+    account_quota_window_observation_expires_at_ms, active_account_capacity_pool_limit,
+    active_account_quota_window_observation, active_account_usage_block,
+    effective_codex_workspace_id, gemini_v1internal_project_id, native_refresh_snapshot_matches,
+    Account, AccountCapacityPoolLimit, AccountQuotaWindowObservationDraft, AccountRefreshUpdate,
+    AccountStore, ManualSubscriptionExpiryError, UpsertAccountInput, CLAUDE_FABLE_QUOTA_TIER,
+    CLAUDE_FIVE_HOUR_QUOTA_TIER, CLAUDE_SEVEN_DAY_QUOTA_TIER,
 };
 use crate::domain::accounts::subscription_expiry::SubscriptionExpiryRuleDraft;
 use crate::domain::providers::bundle::{
@@ -175,12 +181,138 @@ const CODEX_WORKSPACE_REBIND_TRANSACTION_SCHEMA: u32 = 1;
 const CODEX_WORKSPACE_REBIND_TRANSACTION_FILE: &str = ".codex-workspace-rebind-transaction.json";
 const CODEX_WORKSPACE_REBIND_STAGE_DIRECTORY: &str = ".codex-workspace-rebind-stage";
 const CODEX_BANKED_RESET_LOCK_DIRECTORY: &str = ".codex-banked-reset-locks";
+const CLAUDE_QUOTA_EVENT_MIN_INTERVAL_MS: i64 = 30_000;
+const CLAUDE_QUOTA_EVENT_TRACKER_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ShareModelCooldownKey {
     share_id: String,
     runtime_fingerprint: String,
     model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeQuotaEventKey {
+    account_id: String,
+    auth_identity_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeQuotaExpiryKey {
+    event: ClaudeQuotaEventKey,
+    tier_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeQuotaEventAction {
+    None,
+    EmitNow,
+    ScheduleAt(i64),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ClaudeQuotaEventState {
+    last_emitted_at_ms: Option<i64>,
+    pending: bool,
+    touched_at_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeQuotaEventTracker {
+    events: BTreeMap<ClaudeQuotaEventKey, ClaudeQuotaEventState>,
+    expiries: BTreeMap<ClaudeQuotaExpiryKey, i64>,
+}
+
+impl ClaudeQuotaEventTracker {
+    fn register_change(
+        &mut self,
+        key: ClaudeQuotaEventKey,
+        now_ms: i64,
+        urgent: bool,
+    ) -> ClaudeQuotaEventAction {
+        self.cleanup(now_ms);
+        let state = self.events.entry(key).or_default();
+        state.touched_at_ms = now_ms;
+        let next_at = state
+            .last_emitted_at_ms
+            .map(|last| last.saturating_add(CLAUDE_QUOTA_EVENT_MIN_INTERVAL_MS));
+        if urgent || next_at.is_none_or(|next_at| next_at <= now_ms) {
+            state.last_emitted_at_ms = Some(now_ms);
+            state.pending = false;
+            return ClaudeQuotaEventAction::EmitNow;
+        }
+        if state.pending {
+            return ClaudeQuotaEventAction::None;
+        }
+        state.pending = true;
+        ClaudeQuotaEventAction::ScheduleAt(next_at.expect("a throttled event has a deadline"))
+    }
+
+    fn take_scheduled_change(
+        &mut self,
+        key: &ClaudeQuotaEventKey,
+        scheduled_at_ms: i64,
+        now_ms: i64,
+    ) -> bool {
+        let Some(state) = self.events.get_mut(key) else {
+            return false;
+        };
+        let expected_at = state
+            .last_emitted_at_ms
+            .map(|last| last.saturating_add(CLAUDE_QUOTA_EVENT_MIN_INTERVAL_MS));
+        if !state.pending || expected_at != Some(scheduled_at_ms) || now_ms < scheduled_at_ms {
+            return false;
+        }
+        state.pending = false;
+        state.last_emitted_at_ms = Some(now_ms);
+        state.touched_at_ms = now_ms;
+        true
+    }
+
+    fn register_expiry(&mut self, key: ClaudeQuotaExpiryKey, expires_at_ms: i64) -> bool {
+        if self.expiries.get(&key).copied() == Some(expires_at_ms) {
+            return false;
+        }
+        self.expiries.insert(key, expires_at_ms);
+        true
+    }
+
+    fn take_expiry(&mut self, key: &ClaudeQuotaExpiryKey, expires_at_ms: i64) -> bool {
+        if self.expiries.get(key).copied() != Some(expires_at_ms) {
+            return false;
+        }
+        self.expiries.remove(key);
+        true
+    }
+
+    fn remove_expired_for_event(&mut self, event: &ClaudeQuotaEventKey, now_ms: i64) {
+        self.expiries
+            .retain(|key, expires_at_ms| &key.event != event || *expires_at_ms > now_ms);
+    }
+
+    fn cleanup(&mut self, now_ms: i64) {
+        self.events.retain(|_, state| {
+            state.pending
+                || now_ms.saturating_sub(state.touched_at_ms) <= CLAUDE_QUOTA_EVENT_TRACKER_TTL_MS
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeQuotaObservationCommit {
+    StaleIdentity,
+    Unchanged,
+    Updated,
+}
+
+impl ClaudeQuotaObservationCommit {
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::StaleIdentity => "stale_identity",
+            Self::Unchanged => "unchanged",
+            Self::Updated => "updated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -625,6 +757,38 @@ struct DeviceFlowPrincipalStore {
 }
 
 impl DeviceFlowPrincipalStore {
+    fn try_insert_bounded(
+        &mut self,
+        provider_type: ProviderType,
+        device_code: String,
+        principal_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+        max_for_principal: usize,
+        max_total: usize,
+    ) -> bool {
+        self.cleanup(now_ms);
+        let provider = provider_type.as_str();
+        let principal_count = self
+            .bindings
+            .iter()
+            .filter(|((candidate_provider, _), binding)| {
+                candidate_provider == provider && binding.principal_id == principal_id
+            })
+            .count();
+        if principal_count >= max_for_principal || self.bindings.len() >= max_total {
+            return false;
+        }
+        self.bindings.insert(
+            (provider.to_string(), device_code),
+            DeviceFlowPrincipalBinding {
+                principal_id,
+                expires_at_ms,
+            },
+        );
+        true
+    }
+
     fn insert(
         &mut self,
         provider_type: ProviderType,
@@ -697,6 +861,32 @@ impl DeviceFlowPrincipalStore {
                 .remove(&(provider_type.to_string(), device_code.clone()));
         }
         device_codes
+    }
+
+    fn remove_codes(&mut self, provider_type: ProviderType, device_codes: &[String], now_ms: i64) {
+        self.cleanup(now_ms);
+        let provider = provider_type.as_str().to_string();
+        for device_code in device_codes {
+            self.bindings
+                .remove(&(provider.clone(), device_code.clone()));
+        }
+    }
+
+    fn retain_provider_codes(
+        &mut self,
+        provider_type: ProviderType,
+        active_codes: &[String],
+        now_ms: i64,
+    ) {
+        self.cleanup(now_ms);
+        let provider = provider_type.as_str();
+        let active = active_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        self.bindings.retain(|(candidate_provider, code), _| {
+            candidate_provider != provider || active.contains(code.as_str())
+        });
     }
 
     fn cleanup(&mut self, now_ms: i64) {
@@ -791,6 +981,7 @@ pub struct ServerStateInner {
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
     share_model_cooldowns: Mutex<ShareModelCooldownTracker>,
+    claude_quota_events: Mutex<ClaudeQuotaEventTracker>,
     previous_response_cache: Mutex<PreviousResponseCache>,
     pub control_nonces: Arc<ControlNonceCache>,
     router_ingress_replays: Mutex<crate::clients::router::ingress::IngressReplayCache>,
@@ -949,7 +1140,11 @@ fn kimi_refresh_error_is_retryable(error: &ManagedAccountRefreshError) -> bool {
 fn qoder_client_runtime_error(
     error: crate::clients::oauth::qoder::QoderClientError,
 ) -> QoderRuntimeError {
-    let status_code = error.upstream_status.unwrap_or(error.status).as_u16();
+    // Runtime recovery follows Qoder's classified downstream status. The raw
+    // upstream status remains in the public diagnostic message, but a 400 with
+    // explicit invalid_grant evidence must behave as authentication while a
+    // classified 403 permission failure must not.
+    let status_code = error.status.as_u16();
     QoderRuntimeError::Upstream {
         status_code,
         message: error.message,
@@ -1409,13 +1604,13 @@ impl QoderRuntimeError {
         matches!(
             self,
             Self::Upstream {
-                status_code: 401 | 403,
+                status_code: 401,
                 ..
             }
         ) || matches!(
             self,
             Self::Refresh(ManagedAccountRefreshError::Refresh {
-                status_code: 400 | 401 | 403,
+                status_code: 401,
                 ..
             })
         )
@@ -3894,6 +4089,17 @@ fn save_accounts_debounced(state: &ServerState) {
 
 fn save_shares_debounced(state: &ServerState) {
     schedule_debounced_save(state.clone(), DebouncedStoreKind::Shares);
+}
+
+async fn sleep_until_wall_clock_ms(deadline_ms: i64) -> i64 {
+    loop {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if now_ms >= deadline_ms {
+            return now_ms;
+        }
+        let delay_ms = u64::try_from(deadline_ms.saturating_sub(now_ms)).unwrap_or(u64::MAX);
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
 fn schedule_debounced_save(state: ServerState, kind: DebouncedStoreKind) {
@@ -6539,6 +6745,7 @@ impl ServerStateInner {
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
             share_model_cooldowns: Mutex::new(ShareModelCooldownTracker::default()),
+            claude_quota_events: Mutex::new(ClaudeQuotaEventTracker::default()),
             previous_response_cache: Mutex::new(PreviousResponseCache::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_ingress_replays: Mutex::new(
@@ -13837,6 +14044,285 @@ impl ServerStateInner {
         });
     }
 
+    pub(crate) async fn record_claude_quota_window_observations_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        observations: Vec<AccountQuotaWindowObservationDraft>,
+        now_ms: i64,
+    ) -> ClaudeQuotaObservationCommit {
+        if provider_type != ProviderType::ClaudeOAuth || observations.is_empty() {
+            return ClaudeQuotaObservationCommit::Unchanged;
+        }
+
+        let (commit, account, before_visual, after_visual, expiries) = self
+            .mutate_accounts(|accounts| {
+                let Some(before) = accounts
+                    .find_for_provider(provider_type, Some(account_id))
+                    .filter(|account| account.auth_identity_generation == auth_identity_generation)
+                    .cloned()
+                else {
+                    return (
+                        ClaudeQuotaObservationCommit::StaleIdentity,
+                        None,
+                        ClaudeQuotaVisualFingerprint::default(),
+                        ClaudeQuotaVisualFingerprint::default(),
+                        Vec::new(),
+                    );
+                };
+                let before_visual =
+                    claude_quota_visual_fingerprint(&before, before.quota.as_ref(), now_ms);
+                let Some((after, changed)) = accounts.record_quota_window_observations(
+                    account_id,
+                    provider_type,
+                    auth_identity_generation,
+                    observations,
+                    now_ms,
+                ) else {
+                    return (
+                        ClaudeQuotaObservationCommit::StaleIdentity,
+                        None,
+                        before_visual,
+                        ClaudeQuotaVisualFingerprint::default(),
+                        Vec::new(),
+                    );
+                };
+                let after_visual =
+                    claude_quota_visual_fingerprint(&after, after.quota.as_ref(), now_ms);
+                let expiries = [
+                    CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                    CLAUDE_SEVEN_DAY_QUOTA_TIER,
+                    CLAUDE_FABLE_QUOTA_TIER,
+                ]
+                .into_iter()
+                .filter_map(|tier_name| {
+                    let observation =
+                        active_account_quota_window_observation(&after, tier_name, now_ms)?;
+                    Some((
+                        tier_name.to_string(),
+                        account_quota_window_observation_expires_at_ms(observation),
+                    ))
+                })
+                .collect::<Vec<_>>();
+                (
+                    if changed {
+                        ClaudeQuotaObservationCommit::Updated
+                    } else {
+                        ClaudeQuotaObservationCommit::Unchanged
+                    },
+                    Some(after),
+                    before_visual,
+                    after_visual,
+                    expiries,
+                )
+            })
+            .await;
+
+        let Some(account) = account else {
+            return commit;
+        };
+        if commit == ClaudeQuotaObservationCommit::Updated {
+            save_accounts_debounced(self);
+        }
+
+        let event_key = ClaudeQuotaEventKey {
+            account_id: account.id.clone(),
+            auth_identity_generation,
+        };
+        for (tier_name, expires_at_ms) in expiries {
+            self.schedule_claude_quota_observation_expiry(
+                ClaudeQuotaExpiryKey {
+                    event: event_key.clone(),
+                    tier_name,
+                },
+                expires_at_ms,
+            );
+        }
+
+        if before_visual != after_visual {
+            self.register_claude_quota_visual_change(
+                account,
+                now_ms,
+                claude_quota_visual_change_is_urgent(&before_visual, &after_visual),
+            );
+        }
+        commit
+    }
+
+    async fn schedule_loaded_claude_quota_observation_expiries(self: &Arc<Self>) {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let accounts = self.accounts_snapshot().await;
+        for account in accounts
+            .accounts
+            .iter()
+            .filter(|account| account.provider_type == ProviderType::ClaudeOAuth)
+        {
+            let event = ClaudeQuotaEventKey {
+                account_id: account.id.clone(),
+                auth_identity_generation: account.auth_identity_generation,
+            };
+            for tier_name in [
+                CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                CLAUDE_SEVEN_DAY_QUOTA_TIER,
+                CLAUDE_FABLE_QUOTA_TIER,
+            ] {
+                let Some(observation) =
+                    active_account_quota_window_observation(account, tier_name, now_ms)
+                else {
+                    continue;
+                };
+                self.schedule_claude_quota_observation_expiry(
+                    ClaudeQuotaExpiryKey {
+                        event: event.clone(),
+                        tier_name: tier_name.to_string(),
+                    },
+                    account_quota_window_observation_expires_at_ms(observation),
+                );
+            }
+        }
+    }
+
+    fn register_claude_quota_visual_change(
+        self: &Arc<Self>,
+        account: Account,
+        now_ms: i64,
+        urgent: bool,
+    ) {
+        let key = ClaudeQuotaEventKey {
+            account_id: account.id.clone(),
+            auth_identity_generation: account.auth_identity_generation,
+        };
+        let action = self
+            .claude_quota_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register_change(key.clone(), now_ms, urgent);
+        match action {
+            ClaudeQuotaEventAction::None => {}
+            ClaudeQuotaEventAction::EmitNow => {
+                self.publish_claude_quota_projection_change(account);
+            }
+            ClaudeQuotaEventAction::ScheduleAt(scheduled_at_ms) => {
+                let state = Arc::clone(self);
+                tokio::spawn(async move {
+                    let now_ms = sleep_until_wall_clock_ms(scheduled_at_ms).await;
+                    let should_emit = state
+                        .claude_quota_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_scheduled_change(&key, scheduled_at_ms, now_ms);
+                    if !should_emit {
+                        return;
+                    }
+                    let Some(account) = state.find_account_by_id(&key.account_id).await else {
+                        return;
+                    };
+                    if account.provider_type != ProviderType::ClaudeOAuth
+                        || account.auth_identity_generation != key.auth_identity_generation
+                    {
+                        return;
+                    }
+                    state.publish_claude_quota_projection_change(account);
+                });
+            }
+        }
+    }
+
+    fn schedule_claude_quota_observation_expiry(
+        self: &Arc<Self>,
+        key: ClaudeQuotaExpiryKey,
+        expires_at_ms: i64,
+    ) {
+        let registered = self
+            .claude_quota_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register_expiry(key.clone(), expires_at_ms);
+        if !registered {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let now_ms = sleep_until_wall_clock_ms(expires_at_ms).await;
+            let should_expire = state
+                .claude_quota_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take_expiry(&key, expires_at_ms);
+            if should_expire {
+                state
+                    .expire_claude_quota_observations(&key.event, expires_at_ms, now_ms)
+                    .await;
+            }
+        });
+    }
+
+    async fn expire_claude_quota_observations(
+        self: &Arc<Self>,
+        event_key: &ClaudeQuotaEventKey,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) {
+        let Some((account, before_visual, after_visual)) = self
+            .mutate_accounts(|accounts| {
+                let Some(account) = accounts.accounts.iter_mut().find(|account| {
+                    account.id == event_key.account_id
+                        && account.provider_type == ProviderType::ClaudeOAuth
+                        && account.auth_identity_generation == event_key.auth_identity_generation
+                }) else {
+                    return None;
+                };
+                let before = account.clone();
+                let before_visual = claude_quota_visual_fingerprint(
+                    &before,
+                    before.quota.as_ref(),
+                    expires_at_ms.saturating_sub(1),
+                );
+                let previous_len = account.quota_window_observations.len();
+                account.quota_window_observations.retain(|_, observation| {
+                    observation.auth_identity_generation != event_key.auth_identity_generation
+                        || account_quota_window_observation_expires_at_ms(observation) > now_ms
+                });
+                if account.quota_window_observations.len() == previous_len {
+                    return None;
+                }
+                let after = account.clone();
+                let after_visual =
+                    claude_quota_visual_fingerprint(&after, after.quota.as_ref(), now_ms);
+                Some((after, before_visual, after_visual))
+            })
+            .await
+        else {
+            return;
+        };
+        self.claude_quota_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_expired_for_event(event_key, now_ms);
+        save_accounts_debounced(self);
+        if before_visual != after_visual {
+            self.register_claude_quota_visual_change(account, now_ms, true);
+        }
+    }
+
+    fn publish_claude_quota_projection_change(self: &Arc<Self>, account: Account) {
+        self.emit_oauth_quota_updated_event(&account, true);
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = state
+                .refresh_account_subscription_metadata(ProviderType::ClaudeOAuth, Some(&account.id))
+                .await
+            {
+                tracing::warn!(
+                    account_id = account.id,
+                    %error,
+                    "Claude quota Share descriptor sync remains pending"
+                );
+            }
+        });
+    }
+
     pub async fn mark_account_rate_limited_until(
         self: &Arc<Self>,
         account_id: &str,
@@ -14496,6 +14982,30 @@ impl ServerStateInner {
         );
     }
 
+    pub async fn try_bind_device_flow_principal_bounded(
+        &self,
+        provider_type: ProviderType,
+        device_code: String,
+        principal_id: String,
+        expires_at_ms: i64,
+        now_ms: i64,
+        max_for_principal: usize,
+        max_total: usize,
+    ) -> bool {
+        self.device_flow_principals
+            .write()
+            .await
+            .try_insert_bounded(
+                provider_type,
+                device_code,
+                principal_id,
+                expires_at_ms,
+                now_ms,
+                max_for_principal,
+                max_total,
+            )
+    }
+
     pub async fn device_flow_is_owned_by(
         &self,
         provider_type: ProviderType,
@@ -14799,16 +15309,36 @@ impl ServerStateInner {
         self.kimi_device_flows.write().await.cancel(device_code)
     }
 
-    pub async fn insert_qoder_device_flow(
+    pub(crate) async fn replace_qoder_device_flow_for_principal_under_managed_auth_guard(
         &self,
+        _operation: &tokio::sync::MutexGuard<'_, ()>,
         device_code: String,
         flow: PendingQoderDeviceFlow,
+        principal_id: String,
+        expires_at_ms: i64,
         now_ms: i64,
     ) {
-        self.qoder_device_flows
-            .write()
-            .await
-            .insert(device_code, flow, now_ms);
+        // Follow ServerState field order (Qoder flows before principal
+        // bindings) while the managed-auth guard makes the two-store replace
+        // one control-plane operation.
+        let mut flows = self.qoder_device_flows.write().await;
+        let mut principals = self.device_flow_principals.write().await;
+        let old_codes =
+            principals.remove_all_for_principal(ProviderType::QoderCosy, &principal_id, now_ms);
+        for old_code in &old_codes {
+            flows.cancel(old_code);
+        }
+        let evicted = flows.insert(device_code.clone(), flow, now_ms);
+        let active_codes = flows.active_codes(now_ms);
+        principals.remove_codes(ProviderType::QoderCosy, &evicted, now_ms);
+        principals.retain_provider_codes(ProviderType::QoderCosy, &active_codes, now_ms);
+        principals.insert(
+            ProviderType::QoderCosy,
+            device_code,
+            principal_id,
+            expires_at_ms,
+            now_ms,
+        );
     }
 
     pub async fn begin_qoder_device_poll(
@@ -14816,10 +15346,14 @@ impl ServerStateInner {
         device_code: &str,
         now_ms: i64,
     ) -> Option<QoderDevicePollLease> {
-        self.qoder_device_flows
+        let mut flows = self.qoder_device_flows.write().await;
+        let lease = flows.begin_poll(device_code, now_ms);
+        let active_codes = flows.active_codes(now_ms);
+        self.device_flow_principals
             .write()
             .await
-            .begin_poll(device_code, now_ms)
+            .retain_provider_codes(ProviderType::QoderCosy, &active_codes, now_ms);
+        lease
     }
 
     pub async fn qoder_device_flow_state_matches(
@@ -14828,10 +15362,14 @@ impl ServerStateInner {
         state: &str,
         now_ms: i64,
     ) -> bool {
-        self.qoder_device_flows
+        let mut flows = self.qoder_device_flows.write().await;
+        let matches = flows.state_matches(device_code, state, now_ms);
+        let active_codes = flows.active_codes(now_ms);
+        self.device_flow_principals
             .write()
             .await
-            .state_matches(device_code, state, now_ms)
+            .retain_provider_codes(ProviderType::QoderCosy, &active_codes, now_ms);
+        matches
     }
 
     pub async fn finish_qoder_device_poll(
@@ -14862,11 +15400,11 @@ impl ServerStateInner {
         flow_id: String,
         flow: PendingCodeBuddyLoginFlow,
         now_ms: i64,
-    ) {
+    ) -> bool {
         self.codebuddy_login_flows
             .write()
             .await
-            .insert(flow_id, flow, now_ms);
+            .insert(flow_id, flow, now_ms)
     }
 
     pub async fn begin_codebuddy_login_poll(
@@ -19056,6 +19594,9 @@ pub fn spawn_share_edit_event_listener(state: ServerState) {
 pub fn spawn_account_quota_refresh(state: ServerState) {
     tokio::spawn(async move {
         let mut previous_expiry_scan_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        state
+            .schedule_loaded_claude_quota_observation_expiries()
+            .await;
         if let Err(error) = state
             .reconcile_recurring_subscription_metadata(None, previous_expiry_scan_ms)
             .await
@@ -22602,6 +23143,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            quota_window_observations: Default::default(),
         }
     }
 
@@ -23170,6 +23712,38 @@ mod tests {
 
         oauth.api_key = None;
         assert!(!account_quota_refresh_candidate(&accounts, &oauth));
+
+        assert!(QoderRuntimeError::Upstream {
+            status_code: 401,
+            message: "expired".to_string(),
+            retryable: false,
+        }
+        .is_authentication_failure());
+        assert!(!QoderRuntimeError::Upstream {
+            status_code: 403,
+            message: "permission denied".to_string(),
+            retryable: false,
+        }
+        .is_authentication_failure());
+        assert!(
+            !QoderRuntimeError::Refresh(ManagedAccountRefreshError::Refresh {
+                status_code: 403,
+                message: "permission denied".to_string(),
+                retry_after_ms: None,
+            })
+            .is_authentication_failure()
+        );
+        let classified_invalid_grant =
+            qoder_client_runtime_error(crate::clients::oauth::qoder::QoderClientError {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                upstream_status: Some(reqwest::StatusCode::BAD_REQUEST),
+                kind: crate::clients::oauth::qoder::QoderErrorKind::InvalidGrant,
+                terminal: true,
+                outcome_unknown: false,
+                retry_after_ms: None,
+                message: "invalid grant".to_string(),
+            });
+        assert!(classified_invalid_grant.is_authentication_failure());
     }
 
     #[test]
@@ -32504,8 +33078,8 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn device_flow_principal_store_enforces_owner_and_expiry() {
+    #[tokio::test]
+    async fn device_flow_principal_store_enforces_owner_and_expiry() {
         let mut store = DeviceFlowPrincipalStore::default();
         store.insert(
             ProviderType::CodexOAuth,
@@ -32561,6 +33135,310 @@ mod tests {
         );
         assert!(store.is_owned_by(ProviderType::GitHubCopilot, "device-5", "bob:admin", 3_000));
         assert!(store.is_owned_by(ProviderType::KiroOAuth, "device-6", "alice:admin", 3_000));
+
+        store.insert(
+            ProviderType::QoderCosy,
+            "qoder-active".to_string(),
+            "alice:admin".to_string(),
+            5_000,
+            3_000,
+        );
+        store.insert(
+            ProviderType::QoderCosy,
+            "qoder-expired-store-entry".to_string(),
+            "bob:admin".to_string(),
+            5_000,
+            3_000,
+        );
+        store.retain_provider_codes(
+            ProviderType::QoderCosy,
+            &["qoder-active".to_string()],
+            3_000,
+        );
+        assert!(store.is_owned_by(
+            ProviderType::QoderCosy,
+            "qoder-active",
+            "alice:admin",
+            3_000
+        ));
+        assert!(!store.is_owned_by(
+            ProviderType::QoderCosy,
+            "qoder-expired-store-entry",
+            "bob:admin",
+            3_000
+        ));
+
+        let state = test_state();
+        let now_ms = 10_000;
+        let (device, flow) = crate::clients::oauth::qoder::start_device_flow(
+            crate::domain::qoder::QoderSite::Global,
+            now_ms,
+        )
+        .unwrap();
+        let device_code = device.device_code.clone();
+        let flow_state = device.state.clone();
+        let principal_id = "qoder-owner:admin".to_string();
+        let operation = state.lock_managed_auth_operations().await;
+        state
+            .replace_qoder_device_flow_for_principal_under_managed_auth_guard(
+                &operation,
+                device_code.clone(),
+                flow,
+                principal_id.clone(),
+                now_ms.saturating_add(5 * 60 * 1_000),
+                now_ms,
+            )
+            .await;
+        drop(operation);
+        assert!(matches!(
+            state.begin_qoder_device_poll(&device_code, now_ms).await,
+            Some(QoderDevicePollLease::Ready(_))
+        ));
+        assert!(
+            state
+                .finish_qoder_device_poll(
+                    &device_code,
+                    QoderDevicePollResult {
+                        pending: false,
+                        message: "completed".to_string(),
+                        retry_after_secs: None,
+                        account_input: None,
+                    },
+                    now_ms,
+                )
+                .await
+        );
+        let completed_expired_at = now_ms.saturating_add(60 * 1_000 + 1);
+        assert!(
+            !state
+                .qoder_device_flow_state_matches(&device_code, &flow_state, completed_expired_at)
+                .await
+        );
+        assert!(
+            !state
+                .device_flow_is_owned_by(
+                    ProviderType::QoderCosy,
+                    &device_code,
+                    &principal_id,
+                    completed_expired_at,
+                )
+                .await
+        );
+    }
+
+    #[test]
+    fn device_flow_principal_store_enforces_bounded_codebuddy_admission() {
+        let mut store = DeviceFlowPrincipalStore::default();
+        for index in 0..4 {
+            assert!(store.try_insert_bounded(
+                ProviderType::CodeBuddyOAuth,
+                format!("alice-{index}"),
+                "alice:admin".to_string(),
+                2_000,
+                1_000,
+                4,
+                5,
+            ));
+        }
+        assert!(!store.try_insert_bounded(
+            ProviderType::CodeBuddyOAuth,
+            "alice-overflow".to_string(),
+            "alice:admin".to_string(),
+            2_000,
+            1_000,
+            4,
+            5,
+        ));
+        assert!(store.try_insert_bounded(
+            ProviderType::CodeBuddyOAuth,
+            "bob-0".to_string(),
+            "bob:admin".to_string(),
+            2_000,
+            1_000,
+            4,
+            5,
+        ));
+        assert!(!store.try_insert_bounded(
+            ProviderType::CodeBuddyOAuth,
+            "carol-global-overflow".to_string(),
+            "carol:admin".to_string(),
+            2_000,
+            1_000,
+            4,
+            5,
+        ));
+        assert!(store.try_insert_bounded(
+            ProviderType::CodeBuddyOAuth,
+            "after-expiry".to_string(),
+            "carol:admin".to_string(),
+            3_000,
+            2_000,
+            4,
+            5,
+        ));
+    }
+
+    #[test]
+    fn claude_quota_event_tracker_throttles_percent_changes_but_not_urgent_changes() {
+        let key = ClaudeQuotaEventKey {
+            account_id: "claude-account".to_string(),
+            auth_identity_generation: 7,
+        };
+        let mut tracker = ClaudeQuotaEventTracker::default();
+        assert_eq!(
+            tracker.register_change(key.clone(), 1_000, false),
+            ClaudeQuotaEventAction::EmitNow
+        );
+        assert_eq!(
+            tracker.register_change(key.clone(), 2_000, false),
+            ClaudeQuotaEventAction::ScheduleAt(31_000)
+        );
+        assert_eq!(
+            tracker.register_change(key.clone(), 3_000, false),
+            ClaudeQuotaEventAction::None
+        );
+        assert_eq!(
+            tracker.register_change(key.clone(), 4_000, true),
+            ClaudeQuotaEventAction::EmitNow
+        );
+        assert!(!tracker.take_scheduled_change(&key, 31_000, 31_000));
+        assert_eq!(
+            tracker.register_change(key.clone(), 5_000, false),
+            ClaudeQuotaEventAction::ScheduleAt(34_000)
+        );
+        assert!(tracker.take_scheduled_change(&key, 34_000, 34_000));
+    }
+
+    #[test]
+    fn claude_quota_event_tracker_replaces_stale_expiry_tasks() {
+        let event = ClaudeQuotaEventKey {
+            account_id: "claude-account".to_string(),
+            auth_identity_generation: 7,
+        };
+        let key = ClaudeQuotaExpiryKey {
+            event,
+            tier_name: CLAUDE_FABLE_QUOTA_TIER.to_string(),
+        };
+        let mut tracker = ClaudeQuotaEventTracker::default();
+        assert!(tracker.register_expiry(key.clone(), 10_000));
+        assert!(!tracker.register_expiry(key.clone(), 10_000));
+        assert!(tracker.register_expiry(key.clone(), 20_000));
+        assert!(!tracker.take_expiry(&key, 10_000));
+        assert!(tracker.take_expiry(&key, 20_000));
+    }
+
+    #[tokio::test]
+    async fn claude_quota_observation_commit_emits_and_expires_for_the_bound_generation() {
+        let state = test_state();
+        let account = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "claude-quota-state-account",
+                        "providerType": "claude_oauth",
+                        "email": "first@example.com",
+                        "accessToken": "access-1",
+                        "subscriptionLevel": "claude_max_20x",
+                        "quota": {
+                            "success": true,
+                            "credentialMessage": "Claude Max 20x",
+                            "tiers": [
+                                {"name": "five_hour", "utilization": 0.03},
+                                {"name": "seven_day", "utilization": 0.24}
+                            ],
+                            "extraUsage": {
+                                "subscription": {
+                                    "planType": "claude_max_20x",
+                                    "planLabel": "Claude Max 20x",
+                                    "planStale": false
+                                },
+                                "subscriptionEvidence": {"conflict": false}
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let generation = account.auth_identity_generation;
+        let mut events = state.subscribe_events();
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+
+        assert_eq!(
+            state
+                .record_claude_quota_window_observations_if_current(
+                    &account.id,
+                    ProviderType::ClaudeOAuth,
+                    generation,
+                    vec![AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_FABLE_QUOTA_TIER,
+                        utilization: Some(0.41),
+                        resets_at_ms: Some(now_ms + 100),
+                        observed_at_ms: now_ms,
+                        fable_entitlement_evidence: Some(
+                            crate::domain::accounts::store::ClaudeFableEntitlementEvidence::SuccessfulFableRequest,
+                        ),
+                    }],
+                    now_ms,
+                )
+                .await,
+            ClaudeQuotaObservationCommit::Updated
+        );
+        let added = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(added.event_type, "oauth-quota-updated");
+        assert_eq!(added.account_id.as_deref(), Some(account.id.as_str()));
+        assert_eq!(added.auth_identity_generation, Some(generation));
+
+        let expired = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.event_type, "oauth-quota-updated");
+        assert_eq!(expired.auth_identity_generation, Some(generation));
+        assert!(state
+            .find_account_by_id(&account.id)
+            .await
+            .unwrap()
+            .quota_window_observations
+            .is_empty());
+
+        let replacement = state
+            .mutate_accounts_immediate(|accounts| {
+                let mut input: UpsertAccountInput = serde_json::from_value(json!({
+                    "id": "claude-quota-state-account",
+                    "providerType": "claude_oauth",
+                    "email": "second@example.com",
+                    "accessToken": "access-2"
+                }))
+                .unwrap();
+                input.subscription_level = Some("claude_max_20x".to_string());
+                accounts.upsert(input)
+            })
+            .await
+            .unwrap();
+        assert!(replacement.auth_identity_generation > generation);
+        assert_eq!(
+            state
+                .record_claude_quota_window_observations_if_current(
+                    &account.id,
+                    ProviderType::ClaudeOAuth,
+                    generation,
+                    vec![AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_FABLE_QUOTA_TIER,
+                        utilization: Some(0.50),
+                        resets_at_ms: None,
+                        observed_at_ms: now_ms + 200,
+                        fable_entitlement_evidence: None,
+                    }],
+                    now_ms + 200,
+                )
+                .await,
+            ClaudeQuotaObservationCommit::StaleIdentity
+        );
     }
 
     #[test]

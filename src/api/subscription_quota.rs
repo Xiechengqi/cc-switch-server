@@ -262,6 +262,11 @@ fn subscription_quota_from_parts(
             .map(subscription_tier_from_account_tier)
             .collect::<Vec<_>>(),
         "extraUsage": extra_usage_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
+        "providerUsage": quota
+            .and_then(|quota| quota.extra_usage.as_ref())
+            .and_then(|extra| extra.get("codeBuddyOfficialUsage"))
+            .cloned()
+            .unwrap_or(Value::Null),
         "bankedReset": banked_reset_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
         "error": error,
         "queriedAt": queried_at,
@@ -497,6 +502,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            quota_window_observations: Default::default(),
         }
     }
 
@@ -561,6 +567,40 @@ mod tests {
         assert_eq!(quota["bankedReset"]["availableCount"], 2);
         assert_eq!(quota["bankedReset"]["detailsAvailable"], true);
         assert_eq!(quota["bankedReset"]["credits"][0]["id"], "credit-a");
+    }
+
+    #[test]
+    fn subscription_quota_exposes_codebuddy_official_usage_in_a_dedicated_field() {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("CodeBuddy".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "codebuddy".to_string(),
+                utilization: Some(0.25),
+                ..Default::default()
+            }],
+            extra_usage: Some(json!({
+                "codeBuddyOfficialUsage": {
+                    "status":"complete",
+                    "usageToday":1.25,
+                    "usage7Days":4.5,
+                    "usageThisMonth":9.75,
+                    "requestCount":3,
+                    "requests":[{"requestId":"safe-id","credit":1.25}]
+                }
+            })),
+        });
+        account.provider_type = ProviderType::CodeBuddyOAuth;
+
+        let quota = subscription_quota_from_account(&account, "codebuddy_oauth");
+        assert_eq!(quota["providerUsage"]["status"], "complete");
+        assert_eq!(quota["providerUsage"]["usageToday"], 1.25);
+        assert_eq!(quota["providerUsage"]["requestCount"], 3);
+        assert_eq!(
+            quota["providerUsage"]["requests"][0]["requestId"],
+            "safe-id"
+        );
+        assert_eq!(quota["extraUsage"], Value::Null);
     }
 
     #[test]

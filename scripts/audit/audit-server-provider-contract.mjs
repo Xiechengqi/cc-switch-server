@@ -131,6 +131,45 @@ function assertPresetInventory(compatibility) {
   }
 }
 
+function assertCodeBuddyEvidenceFreeze(registry) {
+  const source = fs.readFileSync(
+    path.join(repoRoot, "src/domain/codebuddy.rs"),
+    "utf8",
+  );
+  const version = source.match(
+    /CODEBUDDY_CLIENT_VERSION:\s*&str\s*=\s*"([^"]+)"/,
+  )?.[1];
+  if (!version) {
+    throw new Error("unable to extract CodeBuddy client version");
+  }
+  for (const relativePath of [
+    "PROTOCOL_EVIDENCE.md",
+    "docs/provider/codebuddy-oauth.md",
+  ]) {
+    const document = fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
+    if (!document.includes(version)) {
+      throw new Error(`${relativePath} does not cite CodeBuddy client ${version}`);
+    }
+  }
+  const profiles = registry.profiles.filter(
+    (profile) => profile.compatibilityProviderType === "codebuddy_oauth",
+  );
+  if (profiles.length !== 3 || profiles.some((profile) => profile.maturity !== "experimental")) {
+    throw new Error("CodeBuddy profiles must remain experimental on all three surfaces");
+  }
+  const conformance = registry.conformance?.find(
+    (entry) => entry.driverId === "special.codebuddy_oauth",
+  );
+  if (
+    !conformance ||
+    ["forward", "test", "discovery"].some(
+      (operation) => conformance[operation] !== "live_pending",
+    )
+  ) {
+    throw new Error("CodeBuddy conformance must remain live_pending before real acceptance");
+  }
+}
+
 export function validateServerProviderContracts(
   requirements,
   compatibility,
@@ -220,6 +259,7 @@ function main() {
     compatibilityWindow,
     registry,
   );
+  assertCodeBuddyEvidenceFreeze(registry);
   console.log(
     `Server Provider contracts ok: ${requirements.providerTypes.length} types, ${Object.values(compatibility.counts).join("/")} legacy fixtures`,
   );

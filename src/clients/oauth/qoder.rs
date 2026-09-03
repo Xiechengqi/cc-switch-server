@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,8 +21,9 @@ use crate::domain::qoder::{
     machine_token_from_raw, qoder_account_id, qoder_decode, qoder_encode, random_qoder_hex,
     random_qoder_machine, random_qoder_token, QoderAccountProfile, QoderCosySession,
     QoderCredentialRail, QoderIdentity, QoderMachineIdentity, QoderSite, QoderSiteProfile,
-    QODER_MODEL_LIST_PATH, QODER_MODEL_LIST_SIGNATURE_PATH, QODER_QUOTA_PATH,
-    QODER_QUOTA_SIGNATURE_PATH, QODER_REFRESH_MODE_COSY, QODER_REFRESH_MODE_QODER_CN20,
+    QODER_CN_CLIENT_IP_ENV, QODER_MODEL_LIST_PATH, QODER_MODEL_LIST_SIGNATURE_PATH,
+    QODER_QUOTA_PATH, QODER_QUOTA_SIGNATURE_PATH, QODER_REFRESH_MODE_COSY,
+    QODER_REFRESH_MODE_QODER_CN20,
 };
 
 pub(crate) const DEVICE_POLL_PATH: &str = "/api/v1/deviceToken/poll";
@@ -34,6 +37,8 @@ pub const QODER_CLI_VERSION: &str = "1.1.32";
 pub(crate) const QODER_OPENAPI_USER_AGENT: &str = "qoder/1.1.32";
 pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 1;
 pub(crate) const FLOW_TTL_SECS: u64 = 5 * 60;
+const MAX_QODER_DEVICE_FLOWS: usize = 64;
+const COMPLETED_QODER_DEVICE_FLOW_TTL_MS: i64 = 60 * 1_000;
 const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -147,14 +152,20 @@ pub struct QoderDevicePollResult {
 #[derive(Debug, Clone)]
 struct QoderDeviceFlowEntry {
     flow: PendingQoderDeviceFlow,
+    created_at_ms: i64,
     state: QoderDeviceFlowState,
 }
 
 #[derive(Debug, Clone)]
 enum QoderDeviceFlowState {
-    Pending { next_poll_at_ms: i64 },
+    Pending {
+        next_poll_at_ms: i64,
+    },
     Polling,
-    Completed(Box<QoderDevicePollResult>),
+    Completed {
+        result: Box<QoderDevicePollResult>,
+        expires_at_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -171,17 +182,37 @@ pub struct QoderDeviceFlowStore {
 }
 
 impl QoderDeviceFlowStore {
-    pub fn insert(&mut self, device_code: String, flow: PendingQoderDeviceFlow, now_ms: i64) {
+    pub fn insert(
+        &mut self,
+        device_code: String,
+        flow: PendingQoderDeviceFlow,
+        now_ms: i64,
+    ) -> Vec<String> {
         self.cleanup(now_ms);
+        let mut evicted = Vec::new();
+        while self.pending.len() >= MAX_QODER_DEVICE_FLOWS {
+            let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at_ms)
+                .map(|(code, _)| code.clone())
+            else {
+                break;
+            };
+            self.pending.remove(&oldest);
+            evicted.push(oldest);
+        }
         self.pending.insert(
             device_code,
             QoderDeviceFlowEntry {
                 flow,
+                created_at_ms: now_ms,
                 state: QoderDeviceFlowState::Pending {
                     next_poll_at_ms: now_ms,
                 },
             },
         );
+        evicted
     }
 
     pub fn begin_poll(&mut self, device_code: &str, now_ms: i64) -> Option<QoderDevicePollLease> {
@@ -201,7 +232,7 @@ impl QoderDeviceFlowStore {
                 Some(QoderDevicePollLease::Ready(Box::new(entry.flow.clone())))
             }
             QoderDeviceFlowState::Polling => Some(QoderDevicePollLease::InProgress),
-            QoderDeviceFlowState::Completed(result) => {
+            QoderDeviceFlowState::Completed { result, .. } => {
                 Some(QoderDevicePollLease::Completed(result.clone()))
             }
         }
@@ -238,7 +269,10 @@ impl QoderDeviceFlowStore {
                 next_poll_at_ms: now_ms.saturating_add((delay as i64).saturating_mul(1_000)),
             }
         } else {
-            QoderDeviceFlowState::Completed(Box::new(result))
+            QoderDeviceFlowState::Completed {
+                result: Box::new(result),
+                expires_at_ms: now_ms.saturating_add(COMPLETED_QODER_DEVICE_FLOW_TTL_MS),
+            }
         };
         true
     }
@@ -258,9 +292,39 @@ impl QoderDeviceFlowStore {
         self.pending.remove(device_code).is_some()
     }
 
+    pub fn active_codes(&mut self, now_ms: i64) -> Vec<String> {
+        self.cleanup(now_ms);
+        self.pending.keys().cloned().collect()
+    }
+
     fn cleanup(&mut self, now_ms: i64) {
-        self.pending
-            .retain(|_, entry| entry.flow.expires_at_ms > now_ms);
+        self.pending.retain(|_, entry| match &entry.state {
+            QoderDeviceFlowState::Completed { expires_at_ms, .. } => *expires_at_ms > now_ms,
+            _ => entry.flow.expires_at_ms > now_ms,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QoderErrorKind {
+    InvalidGrant,
+    Authentication,
+    Permission,
+    RateLimited,
+    Temporary,
+    Protocol,
+}
+
+impl QoderErrorKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidGrant => "invalid_grant",
+            Self::Authentication => "authentication",
+            Self::Permission => "permission",
+            Self::RateLimited => "rate_limited",
+            Self::Temporary => "temporary",
+            Self::Protocol => "protocol",
+        }
     }
 }
 
@@ -268,8 +332,10 @@ impl QoderDeviceFlowStore {
 pub struct QoderClientError {
     pub status: StatusCode,
     pub upstream_status: Option<StatusCode>,
+    pub kind: QoderErrorKind,
     pub terminal: bool,
     pub outcome_unknown: bool,
+    pub retry_after_ms: Option<i64>,
     pub message: String,
 }
 
@@ -278,50 +344,88 @@ impl QoderClientError {
         Self {
             status: StatusCode::BAD_REQUEST,
             upstream_status: None,
+            kind: QoderErrorKind::Protocol,
             terminal: true,
             outcome_unknown: false,
+            retry_after_ms: None,
             message: message.into(),
         }
     }
 
-    fn upstream(status: StatusCode, operation: &str, body: &[u8]) -> Self {
+    fn upstream(
+        status: StatusCode,
+        headers: Option<&HeaderMap>,
+        operation: &str,
+        body: &[u8],
+    ) -> Self {
+        let kind = classify_qoder_upstream_error(status, body);
         let terminal = matches!(
-            status,
-            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            kind,
+            QoderErrorKind::InvalidGrant
+                | QoderErrorKind::Authentication
+                | QoderErrorKind::Permission
+                | QoderErrorKind::Protocol
         );
-        Self {
-            status: if terminal {
+        let downstream_status = match kind {
+            QoderErrorKind::InvalidGrant | QoderErrorKind::Authentication => {
                 StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
+            }
+            QoderErrorKind::Permission => StatusCode::FORBIDDEN,
+            QoderErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            QoderErrorKind::Temporary | QoderErrorKind::Protocol => StatusCode::BAD_GATEWAY,
+        };
+        let error = Self {
+            status: downstream_status,
             upstream_status: Some(status),
+            kind,
             terminal,
             outcome_unknown: false,
+            retry_after_ms: headers.and_then(parse_retry_after_ms),
             message: format!(
                 "Qoder {operation} failed with upstream HTTP {}: {}",
                 status.as_u16(),
                 public_error_body(body)
             ),
-        }
+        };
+        crate::metrics::record_qoder_error(error.kind.as_str());
+        error
     }
 
     fn bad_gateway(message: impl Into<String>) -> Self {
+        crate::metrics::record_qoder_error("protocol");
         Self {
             status: StatusCode::BAD_GATEWAY,
             upstream_status: None,
+            kind: QoderErrorKind::Protocol,
             terminal: false,
             outcome_unknown: false,
+            retry_after_ms: None,
+            message: message.into(),
+        }
+    }
+
+    fn temporary(message: impl Into<String>) -> Self {
+        crate::metrics::record_qoder_error("temporary");
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            upstream_status: None,
+            kind: QoderErrorKind::Temporary,
+            terminal: false,
+            outcome_unknown: false,
+            retry_after_ms: None,
             message: message.into(),
         }
     }
 
     fn refresh_outcome_unknown(message: impl Into<String>) -> Self {
+        crate::metrics::record_qoder_error("outcome_unknown");
         Self {
             status: StatusCode::BAD_GATEWAY,
             upstream_status: None,
+            kind: QoderErrorKind::Temporary,
             terminal: false,
             outcome_unknown: true,
+            retry_after_ms: None,
             message: message.into(),
         }
     }
@@ -416,15 +520,21 @@ pub async fn poll_device_flow(
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder device poll failed: {error}"))
+            QoderClientError::temporary(format!("Qoder device poll failed: {error}"))
         })?;
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(pending_result(flow.interval));
     }
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "device poll").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "device poll", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "device poll",
+            &body,
+        ));
     }
     let token = parse_token_response(&body, now_ms)?;
     let Some(access_token) = token.access_token() else {
@@ -545,12 +655,18 @@ pub async fn exchange_pat_job_token(
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder PAT exchange failed: {error}"))
+            QoderClientError::temporary(format!("Qoder PAT exchange failed: {error}"))
         })?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "PAT exchange").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "PAT exchange", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "PAT exchange",
+            &body,
+        ));
     }
     parse_token_response(&body, now_ms)
 }
@@ -562,6 +678,7 @@ pub async fn fetch_model_catalog(
     timeout: Duration,
 ) -> Result<Value, QoderClientError> {
     let url = endpoint_url(gateway_base_url, QODER_MODEL_LIST_PATH)?;
+    let client_ip = qoder_client_ip(session.site, &url).await?;
     let request_id = crate::domain::qoder::random_qoder_uuid();
     let headers = session
         .signed_headers(
@@ -570,7 +687,7 @@ pub async fn fetch_model_catalog(
             chrono::Utc::now().timestamp(),
             &request_id,
             &crate::domain::qoder::qoder_machine_os(),
-            "",
+            &client_ip,
         )
         .map_err(QoderClientError::bad_gateway)?;
     let mut request = http.get(url).timeout(timeout);
@@ -585,12 +702,18 @@ pub async fn fetch_model_catalog(
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder model catalog failed: {error}"))
+            QoderClientError::temporary(format!("Qoder model catalog failed: {error}"))
         })?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "model catalog").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "model catalog", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "model catalog",
+            &body,
+        ));
     }
     let body = unwrap_qoder_json_response(&body)?;
     serde_json::from_slice(&body).map_err(|error| {
@@ -713,6 +836,7 @@ async fn fetch_signed_quota_usage(
             .append_pair("orgId", session.identity.organization_id.trim());
     }
     let request_id = crate::domain::qoder::random_qoder_uuid();
+    let client_ip = qoder_client_ip(session.site, &url).await?;
     let headers = session
         .signed_headers(
             &[],
@@ -720,7 +844,7 @@ async fn fetch_signed_quota_usage(
             chrono::Utc::now().timestamp(),
             &request_id,
             &crate::domain::qoder::qoder_machine_os(),
-            "",
+            &client_ip,
         )
         .map_err(QoderClientError::bad_gateway)?;
     let http_date = httpdate::fmt_http_date(SystemTime::now());
@@ -742,12 +866,18 @@ async fn fetch_signed_quota_usage(
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder quota request failed: {error}"))
+            QoderClientError::temporary(format!("Qoder quota request failed: {error}"))
         })?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "quota").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "quota", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "quota",
+            &body,
+        ));
     }
     let body = unwrap_qoder_json_response(&body)?;
     serde_json::from_slice(&body).map_err(|error| {
@@ -932,12 +1062,18 @@ async fn refresh_device_token(
             ))
         })?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let operation = format!("{} device refresh", endpoints.site.as_str());
     let body = read_body(&mut response, &operation)
         .await
         .map_err(QoderClientError::mark_outcome_unknown)?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, &operation, &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            &operation,
+            &body,
+        ));
     }
     parse_token_response(&body, now_ms).map_err(QoderClientError::mark_outcome_unknown)
 }
@@ -949,8 +1085,11 @@ fn qoder_refresh_failure(
     use crate::domain::accounts::oauth::OAuthErrorKind;
 
     let upstream_status = error.upstream_status.map(|status| status.as_u16());
-    let invalid = error.terminal;
-    let rate_limited = error.upstream_status == Some(StatusCode::TOO_MANY_REQUESTS);
+    let invalid = matches!(
+        error.kind,
+        QoderErrorKind::InvalidGrant | QoderErrorKind::Authentication
+    );
+    let rate_limited = matches!(error.kind, QoderErrorKind::RateLimited);
     let outcome_unknown = error.outcome_unknown;
     AccountRefreshFailure {
         status_code: if rate_limited {
@@ -960,17 +1099,22 @@ fn qoder_refresh_failure(
         },
         upstream_status,
         message: error.message,
-        kind: if outcome_unknown {
-            OAuthErrorKind::Unknown
-        } else if invalid {
-            OAuthErrorKind::InvalidGrant
-        } else if rate_limited {
-            OAuthErrorKind::RateLimited
-        } else {
-            OAuthErrorKind::Network
+        kind: match (&error.kind, outcome_unknown) {
+            (_, true) => OAuthErrorKind::Unknown,
+            (QoderErrorKind::InvalidGrant | QoderErrorKind::Authentication, false) => {
+                OAuthErrorKind::InvalidGrant
+            }
+            (QoderErrorKind::Permission | QoderErrorKind::Protocol, false) => {
+                OAuthErrorKind::ProviderRejected
+            }
+            (QoderErrorKind::RateLimited, false) => OAuthErrorKind::RateLimited,
+            (QoderErrorKind::Temporary, false) => OAuthErrorKind::Network,
         },
-        retryable: !invalid && !outcome_unknown,
-        retry_after_ms: None,
+        retryable: matches!(
+            error.kind,
+            QoderErrorKind::RateLimited | QoderErrorKind::Temporary
+        ) && !outcome_unknown,
+        retry_after_ms: error.retry_after_ms,
         immediate_relogin: invalid || outcome_unknown,
         outcome_unknown,
         endpoint_fallback_safe: false,
@@ -1130,13 +1274,17 @@ async fn fetch_user_info(
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
-        .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder userinfo failed: {error}"))
-        })?;
+        .map_err(|error| QoderClientError::temporary(format!("Qoder userinfo failed: {error}")))?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "userinfo").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "userinfo", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "userinfo",
+            &body,
+        ));
     }
     serde_json::from_slice(&body).map_err(|error| {
         QoderClientError::bad_gateway(format!("Qoder userinfo is not valid JSON: {error}"))
@@ -1218,6 +1366,7 @@ async fn complete_cn_auth_status(
     let encoded = qoder_encode(&envelope);
     let mut url = endpoint_url(&endpoints.gateway_base_url, AUTH_STATUS_ACTUAL_PATH)?;
     url.query_pairs_mut().append_pair("Encode", "1");
+    let client_ip = qoder_client_ip(QoderSite::Cn, &url).await?;
     let date = httpdate::fmt_http_date(SystemTime::now());
     let signature = md5_hex(format!("{QODER_APP_CODE}&{QODER_APP_SECRET}&{date}").as_bytes());
     let mut response = http
@@ -1232,7 +1381,7 @@ async fn complete_cn_auth_status(
         .header("login-version", "v2")
         .header("cosy-version", &endpoints.client_version)
         .header("cosy-clienttype", &endpoints.client_type)
-        .header("cosy-clientip", "")
+        .header("cosy-clientip", client_ip)
         .header("cosy-machineos", machine_os())
         .header("cosy-machineid", &machine.machine_id)
         .header("cosy-machinetype", "")
@@ -1243,12 +1392,18 @@ async fn complete_cn_auth_status(
         .send()
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!("Qoder CN auth status failed: {error}"))
+            QoderClientError::temporary(format!("Qoder CN auth status failed: {error}"))
         })?;
     let status = response.status();
+    let response_headers = response.headers().clone();
     let body = read_body(&mut response, "CN auth status").await?;
     if !status.is_success() {
-        return Err(QoderClientError::upstream(status, "CN auth status", &body));
+        return Err(QoderClientError::upstream(
+            status,
+            Some(&response_headers),
+            "CN auth status",
+            &body,
+        ));
     }
     let body = unwrap_qoder_json_response(&body)?;
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
@@ -1431,6 +1586,23 @@ fn endpoint_url(base: &str, path: &str) -> Result<Url, QoderClientError> {
         .map_err(|error| QoderClientError::bad_gateway(format!("invalid Qoder endpoint: {error}")))
 }
 
+async fn qoder_client_ip(site: QoderSite, target: &Url) -> Result<String, QoderClientError> {
+    if site != QoderSite::Cn {
+        return Ok(String::new());
+    }
+    let configured = std::env::var(QODER_CN_CLIENT_IP_ENV).ok();
+    let resolved =
+        crate::infra::network_identity::resolve_outbound_ipv4(target, configured.as_deref())
+            .await
+            .map_err(|error| {
+                QoderClientError::bad_gateway(format!(
+            "resolve Qoder CN client IP (set {QODER_CN_CLIENT_IP_ENV} to override): {error}"
+        ))
+            })?;
+    crate::metrics::record_qoder_client_ip_source(resolved.source);
+    Ok(resolved.address.to_string())
+}
+
 async fn read_body(
     response: &mut reqwest::Response,
     operation: &str,
@@ -1438,9 +1610,7 @@ async fn read_body(
     crate::infra::http::read_response_body_limited(response, MAX_RESPONSE_BODY_BYTES)
         .await
         .map_err(|error| {
-            QoderClientError::bad_gateway(format!(
-                "Qoder {operation} response read failed: {error}"
-            ))
+            QoderClientError::temporary(format!("Qoder {operation} response read failed: {error}"))
         })
 }
 
@@ -1490,6 +1660,7 @@ pub(crate) fn unwrap_qoder_json_response(body: &[u8]) -> Result<Vec<u8>, QoderCl
     if status >= 400 {
         return Err(QoderClientError::upstream(
             StatusCode::from_u16(status as u16).unwrap_or(StatusCode::BAD_GATEWAY),
+            None,
             "gateway request",
             &bytes,
         ));
@@ -1508,6 +1679,59 @@ fn public_error_body(body: &[u8]) -> String {
         .chars()
         .take(320)
         .collect()
+}
+
+fn classify_qoder_upstream_error(status: StatusCode, body: &[u8]) -> QoderErrorKind {
+    let evidence = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let invalid_grant = [
+        "invalid_grant",
+        "expired_token",
+        "invalid refresh token",
+        "refresh token is invalid",
+        "refresh_token is invalid",
+        "refresh token expired",
+        "refresh_token expired",
+    ]
+    .iter()
+    .any(|marker| evidence.contains(marker));
+    if invalid_grant {
+        return QoderErrorKind::InvalidGrant;
+    }
+    match status {
+        StatusCode::UNAUTHORIZED => QoderErrorKind::Authentication,
+        StatusCode::FORBIDDEN => QoderErrorKind::Permission,
+        StatusCode::TOO_MANY_REQUESTS => QoderErrorKind::RateLimited,
+        StatusCode::REQUEST_TIMEOUT
+        | StatusCode::TOO_EARLY
+        | StatusCode::INTERNAL_SERVER_ERROR
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => QoderErrorKind::Temporary,
+        _ => QoderErrorKind::Protocol,
+    }
+}
+
+fn parse_retry_after_ms(headers: &HeaderMap) -> Option<i64> {
+    const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+    if let Some(value) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        return Some(value.clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds.saturating_mul(1_000).clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+            .as_millis()
+            .min(MAX_RETRY_AFTER_MS as u128) as i64,
+    )
 }
 
 fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -2291,6 +2515,13 @@ mod tests {
         let account = qoder_lifecycle_account(QoderSite::Global, &server.base_url);
         for (status, expected_status, expected_kind, retryable, immediate_relogin) in [
             (
+                400,
+                502,
+                crate::domain::accounts::oauth::OAuthErrorKind::ProviderRejected,
+                false,
+                false,
+            ),
+            (
                 401,
                 401,
                 crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
@@ -2299,10 +2530,10 @@ mod tests {
             ),
             (
                 403,
-                401,
-                crate::domain::accounts::oauth::OAuthErrorKind::InvalidGrant,
+                403,
+                crate::domain::accounts::oauth::OAuthErrorKind::ProviderRejected,
                 false,
-                true,
+                false,
             ),
             (
                 429,
@@ -2399,7 +2630,7 @@ mod tests {
     fn flow_store_serializes_poll_and_keeps_completed_result() {
         let (_, flow) = start_device_flow(QoderSite::Global, 0).unwrap();
         let mut store = QoderDeviceFlowStore::default();
-        store.insert("device".to_string(), flow, 0);
+        assert!(store.insert("device".to_string(), flow, 0).is_empty());
         assert!(matches!(
             store.begin_poll("device", 0),
             Some(QoderDevicePollLease::Ready(_))
@@ -2418,6 +2649,25 @@ mod tests {
         assert!(matches!(
             store.begin_poll("device", 2),
             Some(QoderDevicePollLease::Completed(_))
+        ));
+        assert!(store.begin_poll("device", 60_002).is_none());
+    }
+
+    #[test]
+    fn flow_store_evicts_oldest_entry_at_global_capacity() {
+        let (_, flow) = start_device_flow(QoderSite::Global, 0).unwrap();
+        let mut store = QoderDeviceFlowStore::default();
+        for index in 0..MAX_QODER_DEVICE_FLOWS {
+            assert!(store
+                .insert(format!("device-{index}"), flow.clone(), index as i64)
+                .is_empty());
+        }
+        let evicted = store.insert("device-new".to_string(), flow, 100);
+        assert_eq!(evicted, ["device-0"]);
+        assert!(store.begin_poll("device-0", 100).is_none());
+        assert!(matches!(
+            store.begin_poll("device-new", 100),
+            Some(QoderDevicePollLease::Ready(_))
         ));
     }
 
@@ -2441,6 +2691,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(token.access_token(), Some("device"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", "2500".parse().unwrap());
+        let limited = QoderClientError::upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(&headers),
+            "test",
+            br#"{"message":"slow down"}"#,
+        );
+        assert_eq!(limited.kind, QoderErrorKind::RateLimited);
+        assert_eq!(limited.retry_after_ms, Some(2_500));
+        let plain_bad_request = QoderClientError::upstream(
+            StatusCode::BAD_REQUEST,
+            None,
+            "test",
+            br#"{"message":"invalid parameter"}"#,
+        );
+        assert_eq!(plain_bad_request.kind, QoderErrorKind::Protocol);
+        assert!(plain_bad_request.terminal);
+        let invalid_grant = QoderClientError::upstream(
+            StatusCode::BAD_REQUEST,
+            None,
+            "test",
+            br#"{"error":"invalid_grant"}"#,
+        );
+        assert_eq!(invalid_grant.kind, QoderErrorKind::InvalidGrant);
+        assert!(invalid_grant.terminal);
     }
 
     #[test]

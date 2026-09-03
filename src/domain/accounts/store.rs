@@ -119,12 +119,53 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capacity_pool_limits: BTreeMap<String, AccountCapacityPoolLimit>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quota_window_observations: BTreeMap<String, AccountQuotaWindowObservation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capability_observations: BTreeMap<String, AccountCapabilityObservation>,
 }
 
+pub const CLAUDE_FIVE_HOUR_QUOTA_TIER: &str = "five_hour";
+pub const CLAUDE_SEVEN_DAY_QUOTA_TIER: &str = "seven_day";
 pub const CLAUDE_FABLE_CAPACITY_POOL: &str = "claude_fable_7d_oi";
 pub const CLAUDE_FABLE_QUOTA_TIER: &str = "seven_day_fable";
 pub const CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY: f64 = 0.5;
+pub const CLAUDE_RATELIMIT_5H_SOURCE: &str = "anthropic_ratelimit_5h";
+pub const CLAUDE_RATELIMIT_7D_SOURCE: &str = "anthropic_ratelimit_7d";
+pub const CLAUDE_RATELIMIT_7D_OI_SOURCE: &str = "anthropic_ratelimit_7d_oi";
+pub const CLAUDE_QUOTA_OBSERVATION_NO_RESET_TTL_MS: i64 = 60 * 60 * 1000;
+pub const CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+pub const CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS: i64 = 6 * 60 * 60 * 1000;
+pub const CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS: i64 = 8 * 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeFableEntitlementEvidence {
+    SuccessfulFableRequest,
+    FableOnlyRateLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaWindowObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
+    pub observed_at_ms: i64,
+    pub auth_identity_generation: u64,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable_entitlement_evidence: Option<ClaudeFableEntitlementEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountQuotaWindowObservationDraft {
+    pub tier_name: &'static str,
+    pub utilization: Option<f64>,
+    pub resets_at_ms: Option<i64>,
+    pub observed_at_ms: i64,
+    pub fable_entitlement_evidence: Option<ClaudeFableEntitlementEvidence>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -190,6 +231,75 @@ pub fn active_account_capacity_pool_limit<'a>(
         .filter(|limit| {
             limit.auth_identity_generation == account.auth_identity_generation
                 && limit.until_ms > now_ms
+        })
+}
+
+pub fn claude_quota_observation_source(tier_name: &str) -> Option<&'static str> {
+    match tier_name {
+        CLAUDE_FIVE_HOUR_QUOTA_TIER => Some(CLAUDE_RATELIMIT_5H_SOURCE),
+        CLAUDE_SEVEN_DAY_QUOTA_TIER => Some(CLAUDE_RATELIMIT_7D_SOURCE),
+        CLAUDE_FABLE_QUOTA_TIER => Some(CLAUDE_RATELIMIT_7D_OI_SOURCE),
+        _ => None,
+    }
+}
+
+pub fn account_quota_window_observation_expires_at_ms(
+    observation: &AccountQuotaWindowObservation,
+) -> i64 {
+    observation.resets_at_ms.unwrap_or_else(|| {
+        observation
+            .observed_at_ms
+            .saturating_add(CLAUDE_QUOTA_OBSERVATION_NO_RESET_TTL_MS)
+    })
+}
+
+pub fn active_account_quota_window_observation<'a>(
+    account: &'a Account,
+    tier_name: &str,
+    now_ms: i64,
+) -> Option<&'a AccountQuotaWindowObservation> {
+    let observation = account.quota_window_observations.get(tier_name)?;
+    claude_quota_window_observation_is_active(
+        tier_name,
+        observation,
+        account.auth_identity_generation,
+        now_ms,
+    )
+    .then_some(observation)
+}
+
+fn claude_quota_window_observation_is_active(
+    tier_name: &str,
+    observation: &AccountQuotaWindowObservation,
+    auth_identity_generation: u64,
+    now_ms: i64,
+) -> bool {
+    let Some(expected_source) = claude_quota_observation_source(tier_name) else {
+        return false;
+    };
+    let max_future_ms = match tier_name {
+        CLAUDE_FIVE_HOUR_QUOTA_TIER => CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
+        CLAUDE_SEVEN_DAY_QUOTA_TIER | CLAUDE_FABLE_QUOTA_TIER => {
+            CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS
+        }
+        _ => return false,
+    };
+    observation.auth_identity_generation == auth_identity_generation
+        && observation.source == expected_source
+        && observation.observed_at_ms > 0
+        && observation.observed_at_ms
+            <= now_ms.saturating_add(CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS)
+        && observation
+            .utilization
+            .is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        && account_quota_window_observation_expires_at_ms(observation) > now_ms
+        && observation.resets_at_ms.is_none_or(|reset| {
+            reset > observation.observed_at_ms
+                && reset
+                    <= observation
+                        .observed_at_ms
+                        .saturating_add(max_future_ms)
+                        .saturating_add(CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS)
         })
 }
 
@@ -821,6 +931,7 @@ impl AccountStore {
             refresh_consecutive_failures: 0,
             needs_relogin: false,
             capacity_pool_limits: BTreeMap::new(),
+            quota_window_observations: BTreeMap::new(),
             capability_observations: BTreeMap::new(),
         };
 
@@ -844,6 +955,7 @@ impl AccountStore {
             }
             if account.provider_type == existing.provider_type {
                 account.capacity_pool_limits = existing.capacity_pool_limits.clone();
+                account.quota_window_observations = existing.quota_window_observations.clone();
                 account.capability_observations = existing.capability_observations.clone();
             }
             if account.provider_type == ProviderType::CodexOAuth {
@@ -958,6 +1070,34 @@ impl AccountStore {
                         .and_then(|profile| profile.pointer("/verifiedOpenAiClaims/subject"))
                         .and_then(Value::as_str)
                         .is_some_and(|candidate| candidate.trim() == subject)
+            })
+            .map(|account| account.id.as_str())
+    }
+
+    pub fn codebuddy_account_id_for_stable_identity(
+        &self,
+        site: crate::domain::codebuddy::CodeBuddySite,
+        uid: &str,
+        enterprise_id: &str,
+    ) -> Option<&str> {
+        let uid = uid.trim();
+        let enterprise_id = enterprise_id.trim();
+        if uid.is_empty() {
+            return None;
+        }
+        self.accounts
+            .iter()
+            .find(|account| {
+                if account.provider_type != ProviderType::CodeBuddyOAuth {
+                    return false;
+                }
+                crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref())
+                    .ok()
+                    .is_some_and(|profile| {
+                        profile.site == site
+                            && profile.uid.trim() == uid
+                            && profile.enterprise_id.trim() == enterprise_id
+                    })
             })
             .map(|account| account.id.as_str())
     }
@@ -1217,6 +1357,134 @@ impl AccountStore {
         Some(account.clone())
     }
 
+    pub fn record_quota_window_observations(
+        &mut self,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        observations: impl IntoIterator<Item = AccountQuotaWindowObservationDraft>,
+        now_ms: i64,
+    ) -> Option<(Account, bool)> {
+        if provider_type != ProviderType::ClaudeOAuth {
+            return None;
+        }
+        let account = self.accounts.iter_mut().find(|account| {
+            account.id == account_id
+                && account.provider_type == provider_type
+                && account.auth_identity_generation == auth_identity_generation
+        })?;
+
+        let previous_len = account.quota_window_observations.len();
+        account
+            .quota_window_observations
+            .retain(|tier_name, observation| {
+                claude_quota_window_observation_is_active(
+                    tier_name,
+                    observation,
+                    auth_identity_generation,
+                    now_ms,
+                )
+            });
+        let mut changed = account.quota_window_observations.len() != previous_len;
+
+        for draft in observations {
+            let Some(source) = claude_quota_observation_source(draft.tier_name) else {
+                continue;
+            };
+            if draft.observed_at_ms <= 0
+                || draft.observed_at_ms
+                    > now_ms.saturating_add(CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS)
+                || draft
+                    .utilization
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            {
+                continue;
+            }
+            let max_future_ms = match draft.tier_name {
+                CLAUDE_FIVE_HOUR_QUOTA_TIER => CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
+                CLAUDE_SEVEN_DAY_QUOTA_TIER | CLAUDE_FABLE_QUOTA_TIER => {
+                    CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS
+                }
+                _ => continue,
+            };
+            let resets_at_ms = draft.resets_at_ms.filter(|reset| {
+                *reset > now_ms.max(draft.observed_at_ms)
+                    && *reset
+                        <= draft
+                            .observed_at_ms
+                            .saturating_add(max_future_ms)
+                            .saturating_add(CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS)
+            });
+            if draft.utilization.is_none() && resets_at_ms.is_none() {
+                continue;
+            }
+
+            let current = account
+                .quota_window_observations
+                .get(draft.tier_name)
+                .cloned();
+            if current
+                .as_ref()
+                .is_some_and(|current| draft.observed_at_ms < current.observed_at_ms)
+            {
+                continue;
+            }
+            let retained_reset = resets_at_ms.or_else(|| {
+                current
+                    .as_ref()
+                    .and_then(|current| current.resets_at_ms)
+                    .filter(|reset| *reset > now_ms)
+            });
+            let same_window = current
+                .as_ref()
+                .is_some_and(|current| current.resets_at_ms == retained_reset);
+            let utilization = draft.utilization.or_else(|| {
+                same_window
+                    .then(|| current.as_ref().and_then(|current| current.utilization))
+                    .flatten()
+            });
+            let fable_entitlement_evidence = draft.fable_entitlement_evidence.or_else(|| {
+                same_window
+                    .then(|| {
+                        current
+                            .as_ref()
+                            .and_then(|current| current.fable_entitlement_evidence)
+                    })
+                    .flatten()
+            });
+            let observation = AccountQuotaWindowObservation {
+                utilization,
+                resets_at_ms: retained_reset,
+                observed_at_ms: draft.observed_at_ms,
+                auth_identity_generation,
+                source: source.to_string(),
+                fable_entitlement_evidence,
+            };
+            let semantic_match = current.as_ref().is_some_and(|current| {
+                current.utilization == observation.utilization
+                    && current.resets_at_ms == observation.resets_at_ms
+                    && current.auth_identity_generation == observation.auth_identity_generation
+                    && current.source == observation.source
+                    && current.fable_entitlement_evidence == observation.fable_entitlement_evidence
+            });
+            let renew_without_reset = semantic_match
+                && observation.resets_at_ms.is_none()
+                && current.as_ref().is_some_and(|current| {
+                    draft.observed_at_ms.saturating_sub(current.observed_at_ms)
+                        >= CLAUDE_QUOTA_OBSERVATION_NO_RESET_TTL_MS / 2
+                });
+            if semantic_match && !renew_without_reset {
+                continue;
+            }
+            account
+                .quota_window_observations
+                .insert(draft.tier_name.to_string(), observation);
+            changed = true;
+        }
+
+        Some((account.clone(), changed))
+    }
+
     pub fn update_entitlement_snapshot(
         &mut self,
         account_id: &str,
@@ -1447,7 +1715,6 @@ struct QoderIdentityEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodeBuddyIdentityEvidence {
     site: String,
-    domain: String,
     uid: String,
     enterprise_id: String,
 }
@@ -1499,6 +1766,7 @@ fn advance_account_generations(previous: &Account, current: &mut Account) {
     if account_auth_identity_changed(&previous_identity, &current_identity) {
         current.auth_identity_generation = current.auth_identity_generation.saturating_add(1);
         current.capacity_pool_limits.clear();
+        current.quota_window_observations.clear();
     }
     if previous_token != current_token {
         current.token_refresh_generation = current.token_refresh_generation.saturating_add(1);
@@ -1804,10 +2072,9 @@ fn qoder_identity_evidence(account: &Account) -> Option<QoderIdentityEvidence> {
 fn codebuddy_identity_evidence(account: &Account) -> Option<CodeBuddyIdentityEvidence> {
     let profile =
         crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref()).ok()?;
-    let [site, domain, uid, enterprise_id] = profile.stable_identity_components();
+    let [site, uid, enterprise_id] = profile.stable_identity_components();
     Some(CodeBuddyIdentityEvidence {
         site: site.to_string(),
-        domain: domain.to_string(),
         uid: uid.to_string(),
         enterprise_id: enterprise_id.to_string(),
     })
@@ -2823,6 +3090,241 @@ mod tests {
     }
 
     #[test]
+    fn claude_quota_observations_merge_by_window_and_follow_identity_generation() {
+        let now_ms = 1_000_000;
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-quota-observation".to_string());
+        input.email = Some("first@example.com".to_string());
+        input.access_token = Some("access-1".to_string());
+        input.subscription_level = Some("claude_max_20x".to_string());
+        let account = store.upsert(input.clone());
+        let generation = account.auth_identity_generation;
+
+        let (_, changed) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [
+                    AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                        utilization: Some(0.10),
+                        resets_at_ms: Some(now_ms + 60_000),
+                        observed_at_ms: now_ms,
+                        fable_entitlement_evidence: None,
+                    },
+                    AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_FABLE_QUOTA_TIER,
+                        utilization: Some(0.40),
+                        resets_at_ms: Some(now_ms + 120_000),
+                        observed_at_ms: now_ms,
+                        fable_entitlement_evidence: None,
+                    },
+                ],
+                now_ms,
+            )
+            .unwrap();
+        assert!(changed);
+
+        let (same_timestamp_updated, changed) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [AccountQuotaWindowObservationDraft {
+                    tier_name: CLAUDE_FABLE_QUOTA_TIER,
+                    utilization: Some(0.40),
+                    resets_at_ms: Some(now_ms + 120_000),
+                    observed_at_ms: now_ms,
+                    fable_entitlement_evidence: Some(
+                        ClaudeFableEntitlementEvidence::SuccessfulFableRequest,
+                    ),
+                }],
+                now_ms,
+            )
+            .unwrap();
+        assert!(changed, "same-millisecond evidence must merge");
+        assert_eq!(
+            same_timestamp_updated.quota_window_observations[CLAUDE_FABLE_QUOTA_TIER]
+                .fable_entitlement_evidence,
+            Some(ClaudeFableEntitlementEvidence::SuccessfulFableRequest)
+        );
+
+        let (_, changed) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [AccountQuotaWindowObservationDraft {
+                    tier_name: CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                    utilization: Some(0.05),
+                    resets_at_ms: Some(now_ms + 60_000),
+                    observed_at_ms: now_ms - 1,
+                    fable_entitlement_evidence: None,
+                }],
+                now_ms,
+            )
+            .unwrap();
+        assert!(
+            !changed,
+            "an older observation must not overwrite a newer one"
+        );
+
+        let (partially_updated, changed) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [AccountQuotaWindowObservationDraft {
+                    tier_name: CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                    utilization: Some(0.20),
+                    resets_at_ms: Some(now_ms + 60_000),
+                    observed_at_ms: now_ms + 1,
+                    fable_entitlement_evidence: None,
+                }],
+                now_ms + 1,
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            partially_updated.quota_window_observations[CLAUDE_FIVE_HOUR_QUOTA_TIER].utilization,
+            Some(0.20)
+        );
+        assert_eq!(
+            partially_updated.quota_window_observations[CLAUDE_FABLE_QUOTA_TIER].utilization,
+            Some(0.40),
+            "a partial response must preserve an unmentioned quota window"
+        );
+
+        let token_refreshed = store
+            .mark_refresh_success(
+                &account.id,
+                AccountRefreshUpdate {
+                    access_token: Some("access-2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(token_refreshed.auth_identity_generation, generation);
+        assert_eq!(token_refreshed.quota_window_observations.len(), 2);
+
+        input.email = Some("second@example.com".to_string());
+        input.access_token = Some("access-3".to_string());
+        let replaced_identity = store.upsert(input);
+        assert!(replaced_identity.auth_identity_generation > generation);
+        assert!(replaced_identity.quota_window_observations.is_empty());
+    }
+
+    #[test]
+    fn claude_quota_observation_lifetime_uses_reset_or_bounded_ttl() {
+        let now_ms = 1_000_000;
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-quota-lifetime".to_string());
+        let account = store.upsert(input);
+        let generation = account.auth_identity_generation;
+        let (account, _) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [
+                    AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_FIVE_HOUR_QUOTA_TIER,
+                        utilization: Some(0.25),
+                        resets_at_ms: Some(now_ms + 5_000),
+                        observed_at_ms: now_ms,
+                        fable_entitlement_evidence: None,
+                    },
+                    AccountQuotaWindowObservationDraft {
+                        tier_name: CLAUDE_SEVEN_DAY_QUOTA_TIER,
+                        utilization: Some(0.50),
+                        resets_at_ms: None,
+                        observed_at_ms: now_ms,
+                        fable_entitlement_evidence: None,
+                    },
+                ],
+                now_ms,
+            )
+            .unwrap();
+
+        assert!(active_account_quota_window_observation(
+            &account,
+            CLAUDE_FIVE_HOUR_QUOTA_TIER,
+            now_ms + 4_999,
+        )
+        .is_some());
+        assert!(active_account_quota_window_observation(
+            &account,
+            CLAUDE_FIVE_HOUR_QUOTA_TIER,
+            now_ms + 5_000,
+        )
+        .is_none());
+        assert!(active_account_quota_window_observation(
+            &account,
+            CLAUDE_SEVEN_DAY_QUOTA_TIER,
+            now_ms + CLAUDE_QUOTA_OBSERVATION_NO_RESET_TTL_MS - 1,
+        )
+        .is_some());
+        assert!(active_account_quota_window_observation(
+            &account,
+            CLAUDE_SEVEN_DAY_QUOTA_TIER,
+            now_ms + CLAUDE_QUOTA_OBSERVATION_NO_RESET_TTL_MS,
+        )
+        .is_none());
+
+        let stored = store
+            .accounts
+            .iter_mut()
+            .find(|stored| stored.id == account.id)
+            .unwrap();
+        stored.quota_window_observations.insert(
+            CLAUDE_FABLE_QUOTA_TIER.to_string(),
+            AccountQuotaWindowObservation {
+                utilization: Some(0.40),
+                resets_at_ms: Some(
+                    now_ms
+                        + CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS
+                        + CLAUDE_QUOTA_OBSERVATION_CLOCK_SKEW_MS
+                        + 1,
+                ),
+                observed_at_ms: now_ms,
+                auth_identity_generation: generation,
+                source: CLAUDE_RATELIMIT_7D_OI_SOURCE.to_string(),
+                fable_entitlement_evidence: None,
+            },
+        );
+        assert!(
+            active_account_quota_window_observation(stored, CLAUDE_FABLE_QUOTA_TIER, now_ms,)
+                .is_none()
+        );
+
+        let (recovered, changed) = store
+            .record_quota_window_observations(
+                &account.id,
+                ProviderType::ClaudeOAuth,
+                generation,
+                [AccountQuotaWindowObservationDraft {
+                    tier_name: CLAUDE_FABLE_QUOTA_TIER,
+                    utilization: Some(0.41),
+                    resets_at_ms: Some(now_ms + 60_000),
+                    observed_at_ms: now_ms + 1,
+                    fable_entitlement_evidence: None,
+                }],
+                now_ms + 1,
+            )
+            .unwrap();
+        assert!(changed);
+        assert!(active_account_quota_window_observation(
+            &recovered,
+            CLAUDE_FABLE_QUOTA_TIER,
+            now_ms + 1,
+        )
+        .is_some());
+    }
+
+    #[test]
     fn quota_refresh_only_clears_the_rate_limit_reset_it_observed() {
         let mut store = AccountStore::default();
         let mut input = fixture_input(ProviderType::QoderCosy);
@@ -3603,7 +4105,7 @@ mod tests {
     }
 
     #[test]
-    fn codebuddy_domain_is_a_generation_scoped_identity_component() {
+    fn codebuddy_domain_is_a_mutable_site_scoped_routing_attribute() {
         let mut store = AccountStore::default();
         let mut input = fixture_input(ProviderType::CodeBuddyOAuth);
         input.id = Some("codebuddy-domain-account".to_string());
@@ -3615,6 +4117,14 @@ mod tests {
         }));
         let created = store.upsert(input);
         assert_eq!(created.auth_identity_generation, 1);
+        assert_eq!(
+            store.codebuddy_account_id_for_stable_identity(
+                crate::domain::codebuddy::CodeBuddySite::Intl,
+                "codebuddy-user",
+                ""
+            ),
+            Some("codebuddy-domain-account")
+        );
 
         let enriched = store
             .mark_refresh_success(
@@ -3642,14 +4152,22 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert!(account_refresh_replaces_auth_identity(
+        assert!(!account_refresh_replaces_auth_identity(
             &enriched,
             &domain_change
         ));
         let replaced = store
             .mark_refresh_success("codebuddy-domain-account", domain_change)
             .unwrap();
-        assert_eq!(replaced.auth_identity_generation, 2);
+        assert_eq!(replaced.auth_identity_generation, 1);
+        assert_eq!(
+            store.codebuddy_account_id_for_stable_identity(
+                crate::domain::codebuddy::CodeBuddySite::Intl,
+                "codebuddy-user",
+                ""
+            ),
+            Some("codebuddy-domain-account")
+        );
     }
 
     #[test]

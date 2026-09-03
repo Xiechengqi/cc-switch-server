@@ -25,6 +25,15 @@ describe("provider quota source", () => {
     ).toBe("antigravity_oauth");
   });
 
+  it("routes CodeBuddy OAuth to its managed quota source", () => {
+    const codeBuddy = provider("codebuddy_oauth");
+
+    expect(getProviderQuotaSource(codeBuddy, "claude")).toBe(
+      "codebuddy_oauth",
+    );
+    expect(isManagedOauthProvider(codeBuddy, "claude")).toBe(true);
+  });
+
   it("preserves a server-native gemini_cli account binding", () => {
     const googleProvider: Pick<Provider, "category" | "meta"> = {
       category: "official",

@@ -6,8 +6,8 @@
   "liveState": "live_pending",
   "scope": "single_bound_account_only",
   "verification": {
-    "rustQoderTests": 56,
-    "nodeOracleMutationTests": 8,
+    "rustQoderTests": 63,
+    "nodeOracleMutationTests": 9,
     "nodeRealHarnessFixtureTests": 7
   },
   "source": {
@@ -852,6 +852,83 @@
     ],
     "missingBalanceState": "unknown",
     "informationalOnly": true
+  },
+  "compatibilityPolicy": {
+    "provenance": [
+      {
+        "name": "TokenRouter",
+        "commit": "5f94cbcf2d1f4e74badf449c192c1431dc4e5c8e",
+        "files": {
+          "backend/internal/service/gateway_forward_as_chat_completions.go": "25fe31a1ca48f74a49da43a3178cfd33ae34525a560a60b5239782240491af6b",
+          "backend/internal/service/qoder_gateway_service.go": "1fd0f4b37b96c04927a6c3e9dc7a6711ed0bd3422eec1f7e100ab42f103b7d22"
+        },
+        "role": "read_only_response_and_tool_compatibility_evidence"
+      },
+      {
+        "name": "cli2api",
+        "commit": "b67278960df9c160d45a7520ee3110b5ccb84126",
+        "files": {
+          "worker/src/errors.mjs": "d22ed21e6cbc1fe3e807de662760cb218e6f8943c7806c4118a8e76eb1d47650",
+          "worker/src/plaintext.mjs": "1f25273ac8b8b7b156ea70945bcbedcca38007cc5fea55d7360fa2d4ca85a413",
+          "worker/src/sse.mjs": "a3620d3bcf49674136c55b536a41d6f161ae2bc5513ff29fab2452d5462686a6"
+        },
+        "role": "read_only_history_retry_and_sse_compatibility_evidence"
+      }
+    ],
+    "cnClientIp": {
+      "required": true,
+      "format": "canonical_unicast_ipv4",
+      "acceptedSources": [
+        "configured",
+        "default_route",
+        "target_route"
+      ],
+      "trustsDownstreamForwardedHeaders": false
+    },
+    "responseEnvelopes": [
+      "choices.delta",
+      "choices.message",
+      "content_block_delta",
+      "content_block_start",
+      "content_block_stop",
+      "message_delta",
+      "message_start",
+      "message_stop",
+      "ping",
+      "tool_call_delta",
+      "tool_use_delta",
+      "tool_use_start"
+    ],
+    "toolHistory": {
+      "duplicateIds": "deterministic_batch_local_repair",
+      "missingCallIds": "deterministic_repair",
+      "missingResultIds": "infer_only_when_unique",
+      "orphanResults": "drop",
+      "parallelResults": "sort_by_call_order",
+      "unknownHistoricalTools": "drop_call_and_result"
+    },
+    "errorHandling": {
+      "classes": [
+        "authentication",
+        "invalid_grant",
+        "permission",
+        "protocol",
+        "rate_limited",
+        "temporary"
+      ],
+      "retryAfterMaxMs": 86400000,
+      "structuredRecursiveRedaction": true
+    },
+    "deviceFlow": {
+      "completedResultTtlSeconds": 60,
+      "globalCapacity": 64,
+      "maxActivePerPrincipal": 1
+    },
+    "safety": {
+      "crossAccountFallback": false,
+      "crossSiteFallback": false,
+      "strictEofTerminalUnchanged": true
+    }
   },
   "terminalContract": {
     "successRequires": [

@@ -962,6 +962,7 @@ mod tests {
                 needs_relogin: false,
                 capacity_pool_limits: Default::default(),
                 capability_observations: Default::default(),
+                quota_window_observations: Default::default(),
             }],
             ..Default::default()
         }

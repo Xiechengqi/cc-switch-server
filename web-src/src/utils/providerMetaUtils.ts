@@ -80,6 +80,7 @@ export function isManagedOauthProvider(
     isAntigravityFamily ||
     isCursorOauthWithManagedAuth(provider) ||
     provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH ||
+    provider.meta?.providerType === PROVIDER_TYPES.CODEBUDDY_OAUTH ||
     provider.meta?.providerType === PROVIDER_TYPES.KIMI_CODE ||
     provider.meta?.providerType === PROVIDER_TYPES.DEEPSEEK_ACCOUNT ||
     (appId === "codex" && isCodexOfficialWithManagedAuth(provider)) ||
@@ -170,6 +171,7 @@ export type ProviderQuotaSource =
   | "cursor_oauth"
   | "cursor_apikey"
   | "kiro_oauth"
+  | "codebuddy_oauth"
   | "ollama_cloud"
   | "official"
   | "none";
@@ -219,6 +221,10 @@ export function getProviderQuotaSource(
 
   if (provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH) {
     return "kiro_oauth";
+  }
+
+  if (provider.meta?.providerType === PROVIDER_TYPES.CODEBUDDY_OAUTH) {
+    return "codebuddy_oauth";
   }
 
   if (provider.meta?.providerType === PROVIDER_TYPES.OLLAMA_CLOUD) {

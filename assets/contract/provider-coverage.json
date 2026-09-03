@@ -10,8 +10,8 @@
   },
   "verification": {
     "qoder": {
-      "rustQoderTests": 56,
-      "nodeOracleMutationTests": 8,
+      "rustQoderTests": 63,
+      "nodeOracleMutationTests": 9,
       "nodeRealHarnessFixtureTests": 7
     }
   },

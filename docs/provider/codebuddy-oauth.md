@@ -120,6 +120,10 @@ account_id = "codebuddy-" + hex12( sha256( site_str ‖ 0x00 ‖ uid ‖ 0x00 �
 
 `enterprise_id` 为空串时照常参与摘要（不做 skip），保证个人账号与"企业 id 恰好为空"的账号派生一致且稳定。
 
+`domain` **不是 principal**，而是同一 site 内可轮换的路由属性。refresh 返回 `codebuddy.ai ↔ workbuddy.ai` 或 `codebuddy.cn ↔ workbuddy.cn` 时更新 Profile，但不推进 `auth_identity_generation`；跨 Intl/CN 的 domain 仍立即拒绝。历史账号不批量改 ID，重新登录时按 `site + uid + enterprise_id` 查找并复用原本地 ID；只有找不到历史账号的新登录才生成 domain-free v2 ID，避免打断既有 Provider binding。
+
+本实现只接受个人订阅 rail。新 OAuth 登录闭合 `/v3/config` 身份后若 `enterpriseId` 非空即 fail closed，不创建账号；既有企业 fixture 只保留可读兼容，不构成企业反代承诺。
+
 账号 identity generation 变化后，旧 Provider 绑定返回冲突，必须由管理员显式重新绑定 —— 与 `kimi_code`、`qoder_cosy` 一致。
 
 ---
@@ -188,6 +192,7 @@ X-No-Department-Info: true
 - **不可把 11217 / 12151 当作失败** —— 它们是轮询继续信号。终态授权错误另有一组码，见 §8。
 - login flow TTL **10 分钟**【C】。
 - 每个 state 只允许一个 poll lease；并发 poll 返回 in-progress，不并行消费授权结果（与 `kimi_code` device flow 同口径）。
+- 容量有界：同一管理员 principal 最多 4 个 CodeBuddy flow，CodeBuddy flow store 全局最多 64 个，通用 device-flow principal binding 全局最多 256 个；满载返回 429，过期项先清理，部分写入失败会回滚 principal binding。
 - Server 必须对轮询间隔、最大轮询时长、单次请求超时（30s）与响应体上限（256 KiB）做有界归一。
 - 登录完成必须同时拿到 access token、refresh token，以及 `login/account` 中稳定的 `uid`。三者缺一即失败，不落库。
 
@@ -299,6 +304,8 @@ POST {endpoint}/v2/chat/completions
 ```
 
 - `reasoning_effort` 是**顶层字符串**（非 `reasoning:{effort}` 对象）。
+- 下游 canonical `reasoning.effort` 会归一为顶层 `reasoning_effort`；同时出现且值冲突、类型错误、或 effort 不在实时目录的 `supportedEfforts` 时，本地 400。仅在下游明确请求 reasoning 且未指定 effort 时采用目录 `defaultEffort`，不会无请求自动开启推理。
+- OpenAI named `tool_choice` 会先确认目标函数存在，再把 `tools` 缩减到该函数并映射为上游支持的 `"required"`；缺失/未知函数或畸形类型在发网前失败。
 - `stream_options.include_usage=true` 是末帧 usage 的来源；实现若需用量统计必须带上。
 - 回填轮的 assistant / tool 消息带非标准 `messageId`、`model`、`requestModelId`、`requestModelName`、`traceId`、`conversationRequestId`、`agent`。这些**不是必需的**，反代可不透传。
 
@@ -307,6 +314,8 @@ POST {endpoint}/v2/chat/completions
 > **关键不对称【D】**：推理内容在响应里叫 **`delta.reasoning_content`**，但下一轮请求的 assistant 消息里叫 **`reasoning`**。做多轮工具循环的实现必须完成这层改名，否则思维链在回填时丢失。
 
 `tool_calls` 为标准增量（首帧 `id`+`name`，后续帧只递增 `arguments`）；**首帧的 `index` 是否存在随模型而变**，按 `index` 归并的实现须容忍首帧缺失。终帧 `finish_reason` ∈ `{tool_calls, stop, length}`，随后独立一帧携带 `usage`，最后 `data: [DONE]`。**U10 已关闭。**
+
+SSE 解码接受 CRLF/LF/单 CR event boundary、多条 `data:`（按规范用换行拼接）、comment、`event:`、`id:` 与 `retry:` 心跳字段；仍要求唯一 `[DONE]` 后到达 EOF 才提交终态，`[DONE]` 后数据、重复 terminal、缺 terminal 或超限 event 全部失败。
 
 ### 5.7 usage 字段
 
@@ -377,6 +386,7 @@ supportsToolCall, tags[], temperature, top_p, vendor
 - 认证错误、超限响应、坏 JSON、未知成功结构、身份 scope 漂移，以及"上游非空但全部模型均不在 reviewed allowlist"，一律 fail closed 并清理当前 scope。
 - **运行时不存在静态 entitlement fallback** —— 与 `kimi_code` 条款一致。`product.json` 内嵌目录只作为**字段补全的元数据源**（`mergeModelsById` 的 local 侧），不作为 entitlement 来源。这个区分是本 Provider 能通过该条款的原因。
 - `/v1/models` 只在当前 Share 选中的 CodeBuddy Provider 范围内，公开上游目录与 reviewed allowlist 的交集，不参与 Provider 或账号选择。
+- live catalog 出现启用但未 reviewed 的模型时只输出不含凭据/请求内容的结构化漂移告警（site、模型计数、固定 client version），不会自动放行新模型。
 
 ### 6.3 站点模型集差异
 
@@ -404,13 +414,13 @@ alias 表按 site 集中维护，但只有对应 site 下 live-enabled 的 route
 
 > **对实现的结论**：`/v3/config` 是**目录**而非**权限**。reviewed alias 表应以「目录 ∩ CLI 白名单 ∩ 实测放行」为准，并把 `11102` / `11133` 映射为"模型不可用"而非通用 400 —— 否则用户会在一个目录里可见、实际调不通的模型上反复失败。同时这也意味着**目录内容随账号而变**，不能硬编码。
 
-### 6.4 企业目录（可选，本期不实现）
+### 6.4 企业目录（本期明确不实现）
 
 ```
 GET {endpoint}/console/enterprises/{enterpriseId}/config/models
 ```
 
-`ModelsProductProvider`【A】。`enterpriseId` 缺失时直接跳过 —— **个人账号永远不触发**。5 分钟缓存，失败退避 30s–300s。仅当后续要支持企业账号时实现。
+`ModelsProductProvider`【A】。`enterpriseId` 缺失时直接跳过 —— **个人账号永远不触发**。当前登录入口对非空 `enterpriseId` 明确拒绝，不会误把企业账号送入个人订阅 rail；只有未来单独立项并取得企业真实证据后才可实现该目录。
 
 ### 6.5 站点条件能力（可能影响目录投影）
 
@@ -580,7 +590,7 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 
 ### 验收边界
 
-离线：站点 parse 与非法站点拒绝、identity 含 site 且跨站不碰撞、`X-No-*` 头齐备、cookie jar 复用、轮询 lease 串行化、flow TTL 与过期清理、refresh 身份冲突拒绝、header 最终覆盖、强制流式注入、目录权威/空/stale/协议漂移、alias 按 site 投影、未知模型 400、单次 401 恢复与二次 401 终态、Provider/Account/token 三代际漂移。
+离线：站点 parse 与非法站点拒绝、identity 含 site 且跨站不碰撞、同站 domain 轮换不改 identity 与旧 ID 惰性复用、个人 rail 拒绝企业 identity、`X-No-*` 头齐备、cookie jar 复用、轮询 lease/容量/TTL/过期清理、refresh 身份冲突拒绝、header 最终覆盖、强制流式注入、named tool choice 与 reasoning effort 校验、SSE 多行/心跳/唯一终态、目录权威/空/stale/协议漂移、alias 按 site 投影、modern billing 合并与旧接口回退、官方用量分页/去重/prompt 不落盘、未知模型 400、单次 401 恢复与二次 401 终态、Provider/Account/token 三代际漂移。
 
 真实验收需要**国内与国际各一份**脱敏 receipt，覆盖：登录、refresh 轮换、`/v3/config` 目录、三 Surface 的非流与流式、tools、首个 401、第二个 401、429、中途断流、未知模型拒绝，以及日志/控制面/持久化文件不泄露 token。
 
@@ -600,15 +610,22 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 
 | 用途 | 方法 | 路径 |
 |---|---|---|
-| 订阅额度与到期 | `POST` | `{endpoint}/v2/billing/meter/get-user-resource` |
-| 逐请求用量 | `POST` | `{endpoint}/billing/meter/get-user-request-usage` |
-| 签到状态（**不实现**） | `POST` | `{endpoint}/v2/billing/meter/checkin-status` |
+| 资源摘要 | `POST` | `{billing-origin}/billing/meter/get-user-resource-summary` |
+| 付费资源包 | `POST` | `{billing-origin}/billing/meter/get-user-resource-paid-packages` |
+| 免费资源包 | `POST` | `{billing-origin}/billing/meter/get-user-resource-free-packages` |
+| 旧订阅额度回退 | `POST` | `{billing-origin}/v2/billing/meter/get-user-resource` |
+| 逐请求用量 | `POST` | `{billing-origin}/billing/meter/get-user-request-usage` |
+| 签到状态（**不实现**） | `POST` | `{billing-origin}/v2/billing/meter/checkin-status` |
 
 用量接口**没有 `/v2` 前缀**，加上会 404（`{"error_msg":"404 Route Not Found"}`）。鉴权仅需 `Authorization: Bearer {access_token}`，与数据面同一 token，无额外 scope。
 
+`billing-origin` 不接受账号提供的任意 URL，而由 `site + domain` 在受控表内选择：Intl 的 `codebuddy.ai` / `workbuddy.ai` 分别落到对应 `www` origin；CN 的 `workbuddy.cn` 落到 `www.workbuddy.cn`，`codebuddy.cn` 与 `copilot.tencent.com` 落到 `www.codebuddy.cn`。所有请求携带 `X-Client-Platform: web`；CN 自然日使用 `Asia/Shanghai`，Intl 使用 UTC。
+
 ### 10.2 订阅信息投影
 
-请求：
+实现优先并行请求 summary / paid / free。任一路给出权威数组即可形成 modern partial result，detail 包按 package code 覆盖 summary 重复项；若三路都没有可识别资源结构，才回退旧 `/v2/...get-user-resource`。任一路 401 不得被兄弟请求的成功掩盖，而是交给统一控制面做至多一次 refresh + 全查询重放。
+
+旧接口请求：
 
 ```json
 {"PageNumber":1,"PageSize":100,"ProductCode":"p_tcaca","Status":[0,3],
@@ -642,13 +659,14 @@ requestId, credit, model, client, requestTime, inputTrunc, input, agentPurpose
 ```
 
 - **`input` / `inputTrunc` 是 prompt 正文**（CLI 请求实测为空，但字段存在）。消费方必须白名单裁剪，只取 `model` / `credit` / `requestTime` / `requestId`，**原文不得落盘、不得进日志、不得进 receipt**。
-- 分页按 `total` 推进，需按 `requestId` 去重。
+- 分页按 `total` 推进，按 `(requestId, requestTime)` 去重；空页但尚未达到权威 `total`、超过 100 页或响应超过 8 MiB 均视为不完整，不能误报成功。
 - 观测到 `codewise-model-a9` 等**后端真实模型 id**，与 CLI 别名不同，可用于交叉验证 §6 目录。
 - 失败请求也可能计费：`gpt-5.6-terra` 返回 `11133` 拒绝，用量表仍记 0.02 credit。重试策略须据此设上限。
 
 ### 10.4 实现约束
 
-- 归入**控制面只读查询**，不进数据面热路径；结果缓存，不得每次打开节点就打上游。
+- 归入**控制面只读查询**，不进数据面热路径；结果随加密 accounts quota snapshot 缓存，成功缓存 30 分钟、失败缓存 5 分钟，手动强制刷新绕过缓存。
+- 只保存最近 31 个自然日的聚合、按模型计数/credit 和最多 100 条安全明细；`input` / `inputTrunc` / prompt 永不复制。套餐成功但明细失败时保留套餐结果，并将 `providerUsage.status` 标为 `unavailable`。
 - 401 时走一次 refresh 重试再判终态，与 §4 同一策略。
 - 敏感字段：`Accounts[].Uin` / `AppId` / `AccountId` / `DealName` / `ResourceId`、`AccountAttributes[].payerUin` 是真实腾讯云账号标识，**一律脱敏**。
 - 签到（`checkin-*` / `daily-checkin`）属运营行为，且天然诱导多账号轮换，**本 Provider 不实现**，仅在此登记接口形态。
@@ -668,7 +686,7 @@ requestId, credit, model, client, requestTime, inputTrunc, input, agentPurpose
 | 配置 | `pluginConfig { PromptRewrite, ModelManifest }`，无 site 字段 | site 属于账号 Profile，不是插件配置 |
 | `forceMaxThinking` | 按 `hy3` 前缀硬编码 | 按 site × model 的 reviewed capability 表（§6.2） |
 
-可以直接复用的：`cli-external-link` 时序、`X-No-*` 头集合、cookie 亲和的 login client、10 分钟 flow TTL、5 分钟 refresh 提前量、强制流式、`sanitizeBlockedTemplates` 的思路。
+可以直接复用的：`cli-external-link` 时序、`X-No-*` 头集合、cookie 亲和的 login client、10 分钟 flow TTL、5 分钟 refresh 提前量与强制流式。`sanitizeBlockedTemplates` 这类 prompt 内容改写不采纳；本实现只为满足上游硬约束，在缺失时前置最小 system message，不扫描或改写用户正文。
 
 ## 附二：`workbuddy-switch` 作为第二参照实现
 

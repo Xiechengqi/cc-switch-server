@@ -106,8 +106,8 @@ const requiredHooks = Object.freeze([
 ]);
 
 const expectedVerification = Object.freeze({
-  rustQoderTests: 56,
-  nodeOracleMutationTests: 8,
+  rustQoderTests: 63,
+  nodeOracleMutationTests: 9,
   nodeRealHarnessFixtureTests: 7,
 });
 
@@ -155,6 +155,9 @@ const expectedVectorDigests = Object.freeze({
   signatureVector:
     "03e3bc3def69e5842e8374bff0f03c5903c4c342951cf083fcf03fa8953c69cf",
 });
+
+const expectedCompatibilityPolicyDigest =
+  "a65172223d49ed4f60a99d43f4fcd1f38b7ee23cfcda3be39c6be527c27e327f";
 
 function fail(message) {
   throw new Error(`Qoder CLI oracle contract: ${message}`);
@@ -562,6 +565,36 @@ function auditQuotaAndTerminalCases(document) {
   );
 }
 
+function auditCompatibilityPolicy(policy) {
+  assert(policy && typeof policy === "object", "compatibilityPolicy is required");
+  assertFrozenDigest(
+    policy,
+    expectedCompatibilityPolicyDigest,
+    "bounded compatibility policy",
+  );
+  assert(
+    policy.cnClientIp?.trustsDownstreamForwardedHeaders === false,
+    "CN client IP must not trust downstream forwarded headers",
+  );
+  assert(
+    policy.toolHistory?.missingResultIds === "infer_only_when_unique",
+    "ambiguous tool results must not be guessed",
+  );
+  assert(
+    policy.safety?.crossAccountFallback === false &&
+      policy.safety?.crossSiteFallback === false &&
+      policy.safety?.strictEofTerminalUnchanged === true,
+    "compatibility must preserve the single-account strict-terminal boundary",
+  );
+  for (const source of policy.provenance || []) {
+    assertDigest(source.commit, 40, `${source.name} compatibility commit`);
+    for (const [name, digest] of Object.entries(source.files || {})) {
+      assert(!path.isAbsolute(name) && !name.includes(".."), `${source.name} file is unsafe`);
+      assertDigest(digest, 64, `${source.name} compatibility file ${name}`);
+    }
+  }
+}
+
 export function auditQoderCliOracle(document) {
   assert(document && typeof document === "object" && !Array.isArray(document), "root must be an object");
   assert(document.schemaVersion === 2, "schemaVersion must be 2");
@@ -577,6 +610,7 @@ export function auditQoderCliOracle(document) {
   auditDifferential(document.canonicalCase);
   auditReceipt(document.receiptSchema);
   auditQuotaAndTerminalCases(document);
+  auditCompatibilityPolicy(document.compatibilityPolicy);
   assert(Array.isArray(document.encodingVectors) && document.encodingVectors.length === 3, "three encoding vectors are required");
   assertFrozenDigest(
     document.encodingVectors,

@@ -156,3 +156,26 @@ test("oracle rejects authorization and COSY headers on lifecycle calls", () => {
   ] = "0";
   assert.throws(() => auditQoderCliOracle(refresh), /login drifted/);
 });
+
+test("oracle freezes bounded compatibility without weakening account or terminal safety", () => {
+  const forwarded = fixture();
+  forwarded.compatibilityPolicy.cnClientIp.trustsDownstreamForwardedHeaders = true;
+  assert.throws(
+    () => auditQoderCliOracle(forwarded),
+    /bounded compatibility policy drifted/,
+  );
+
+  const ambiguous = fixture();
+  ambiguous.compatibilityPolicy.toolHistory.missingResultIds = "first_match";
+  assert.throws(
+    () => auditQoderCliOracle(ambiguous),
+    /bounded compatibility policy drifted/,
+  );
+
+  const fallback = fixture();
+  fallback.compatibilityPolicy.safety.crossAccountFallback = true;
+  assert.throws(
+    () => auditQoderCliOracle(fallback),
+    /bounded compatibility policy drifted/,
+  );
+});

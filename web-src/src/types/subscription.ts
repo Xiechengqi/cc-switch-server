@@ -89,6 +89,16 @@ export interface SubscriptionQuota {
   staleTierNames?: string[];
   tiers: QuotaTier[];
   extraUsage: ExtraUsage | null;
+  providerUsage?: {
+    status?: "complete" | "unavailable";
+    usageToday?: number;
+    usage7Days?: number;
+    usageThisMonth?: number;
+    requestCount?: number;
+    detailTruncated?: boolean;
+    collectedAt?: number;
+    error?: string;
+  } | null;
   bankedReset?: CodexBankedResetQuotaSummary | null;
   error: string | null;
   queriedAt: number | null;

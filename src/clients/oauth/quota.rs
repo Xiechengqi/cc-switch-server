@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -42,6 +43,8 @@ use crate::domain::providers::model::ProviderType;
 
 pub const QUOTA_FAILURE_COOLDOWN_MS: i64 = 2 * 60 * 1000;
 const MAX_QUOTA_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+const CODEBUDDY_OFFICIAL_USAGE_CACHE_MS: i64 = 30 * 60 * 1000;
+const CODEBUDDY_OFFICIAL_USAGE_FAILURE_CACHE_MS: i64 = 5 * 60 * 1000;
 
 fn quota_request_timeout(timeout_ms: i64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(1_000, 120_000) as u64)
@@ -270,8 +273,15 @@ pub async fn refresh_account_quota(
             refresh_qoder_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
         ProviderType::CodeBuddyOAuth => {
-            refresh_codebuddy_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
-                .await?
+            refresh_codebuddy_quota(
+                http,
+                account,
+                now_ms,
+                force,
+                success_cooldown_ms,
+                request_timeout,
+            )
+            .await?
         }
         ProviderType::TraeSolo => {
             refresh_trae_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
@@ -318,21 +328,73 @@ async fn refresh_codebuddy_quota(
     http: &reqwest::Client,
     account: &Account,
     now_ms: i64,
+    force: bool,
     success_cooldown_ms: i64,
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let body =
-        crate::clients::oauth::codebuddy::fetch_billing_resource(http, account, request_timeout)
+        crate::clients::oauth::codebuddy::fetch_billing_resources(http, account, request_timeout)
             .await
             .map_err(|error| codebuddy_quota_failure(error, now_ms))?;
-    parse_codebuddy_quota_update(account, &body, now_ms, success_cooldown_ms)
+    let mut update = parse_codebuddy_quota_update(account, &body, now_ms, success_cooldown_ms)?;
+    let usage = if !force {
+        cached_codebuddy_official_usage(account, now_ms)
+    } else {
+        None
+    };
+    let usage = match usage {
+        Some(usage) => usage,
+        None => match crate::clients::oauth::codebuddy::fetch_official_usage(
+            http,
+            account,
+            request_timeout,
+        )
+        .await
+        {
+            Ok(usage) => usage,
+            Err(error) => json!({
+                "status": "unavailable",
+                "error": crate::logging::redact_sensitive_text(&error.message),
+                "collectedAt": now_ms,
+            }),
+        },
+    };
+    if let Some(extra_usage) = update
+        .quota
+        .as_mut()
+        .and_then(|quota| quota.extra_usage.as_mut())
+        .and_then(Value::as_object_mut)
+    {
+        extra_usage.insert("codeBuddyOfficialUsage".to_string(), usage);
+    }
+    Ok(update)
+}
+
+fn cached_codebuddy_official_usage(account: &Account, now_ms: i64) -> Option<Value> {
+    let usage = account
+        .quota
+        .as_ref()?
+        .extra_usage
+        .as_ref()?
+        .get("codeBuddyOfficialUsage")?;
+    let collected_at = usage.get("collectedAt")?.as_i64()?;
+    let max_age = match usage.get("status").and_then(Value::as_str) {
+        Some("complete") => CODEBUDDY_OFFICIAL_USAGE_CACHE_MS,
+        Some("unavailable") => CODEBUDDY_OFFICIAL_USAGE_FAILURE_CACHE_MS,
+        _ => return None,
+    };
+    let age = now_ms.checked_sub(collected_at)?;
+    (age >= 0 && age <= max_age).then(|| usage.clone())
 }
 
 fn codebuddy_quota_failure(
     error: crate::clients::oauth::codebuddy::CodeBuddyClientError,
     now_ms: i64,
 ) -> QuotaRefreshFailure {
-    let upstream_status = error.upstream_status.map(|status| status.as_u16());
+    let upstream_status = error
+        .upstream_status
+        .map(|status| status.as_u16())
+        .or_else(|| error.is_authentication_failure().then_some(401));
     let retryable = error.is_transient();
     QuotaRefreshFailure {
         status_code: error.status.as_u16(),
@@ -351,16 +413,37 @@ struct CodeBuddyQuotaPackage {
     capacity_size: f64,
     capacity_remain: f64,
     capacity_unit: String,
-    cycle_end_time: String,
-    expires_at_ms: i64,
+    cycle_end_time: Option<String>,
+    expires_at_ms: Option<i64>,
 }
 
 fn parse_codebuddy_quota_update(
     account: &Account,
-    body: &Value,
+    resources: &crate::clients::oauth::codebuddy::CodeBuddyBillingResources,
     now_ms: i64,
     success_cooldown_ms: i64,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let (body, source) = match resources {
+        crate::clients::oauth::codebuddy::CodeBuddyBillingResources::Legacy(body) => {
+            (body.clone(), "codebuddy_billing_resource")
+        }
+        crate::clients::oauth::codebuddy::CodeBuddyBillingResources::Modern {
+            summary,
+            paid,
+            free,
+        } => (
+            codebuddy_modern_billing_envelope(
+                summary.as_ref(),
+                paid.as_ref(),
+                free.as_ref(),
+                now_ms,
+            )
+            .map_err(|message| {
+                QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
+            })?,
+            "codebuddy_billing_resource_v2",
+        ),
+    };
     let data = body.pointer("/data/Response/Data").ok_or_else(|| {
         QuotaRefreshFailure::parse(
             ProviderType::CodeBuddyOAuth,
@@ -481,21 +564,17 @@ fn parse_codebuddy_quota_update(
             codebuddy_optional_bounded_string(package.get("CycleEndTime"), "CycleEndTime")
                 .map_err(|message| {
                     QuotaRefreshFailure::parse(ProviderType::CodeBuddyOAuth, message, now_ms)
-                })?
-                .ok_or_else(|| {
-                    QuotaRefreshFailure::parse(
-                        ProviderType::CodeBuddyOAuth,
-                        format!("billing resource package {index} is missing CycleEndTime"),
-                        now_ms,
-                    )
                 })?;
-        let expires_at_ms = codebuddy_billing_timestamp_ms(&cycle_end_time).ok_or_else(|| {
-            QuotaRefreshFailure::parse(
-                ProviderType::CodeBuddyOAuth,
-                format!("billing resource package {index} has invalid CycleEndTime"),
-                now_ms,
-            )
-        })?;
+        let expires_at_ms = match cycle_end_time.as_deref() {
+            Some(value) => Some(codebuddy_billing_timestamp_ms(value).ok_or_else(|| {
+                QuotaRefreshFailure::parse(
+                    ProviderType::CodeBuddyOAuth,
+                    format!("billing resource package {index} has invalid CycleEndTime"),
+                    now_ms,
+                )
+            })?),
+            None => None,
+        };
         packages.push(CodeBuddyQuotaPackage {
             package_name,
             sub_product_code,
@@ -508,7 +587,8 @@ fn parse_codebuddy_quota_update(
     }
     packages.sort_by(|left, right| {
         left.expires_at_ms
-            .cmp(&right.expires_at_ms)
+            .unwrap_or(i64::MAX)
+            .cmp(&right.expires_at_ms.unwrap_or(i64::MAX))
             .then_with(|| left.package_name.cmp(&right.package_name))
             .then_with(|| left.sub_product_code.cmp(&right.sub_product_code))
     });
@@ -537,8 +617,8 @@ fn parse_codebuddy_quota_update(
             used: Some(used),
             limit: Some(package.capacity_size),
             unit: Some(package.capacity_unit.clone()),
-            resets_at: Some(package.expires_at_ms),
-            source: Some("codebuddy_billing_resource".to_string()),
+            resets_at: package.expires_at_ms,
+            source: Some(source.to_string()),
             ..Default::default()
         });
         // Deliberate whitelist: never preserve Tencent billing account IDs,
@@ -573,7 +653,7 @@ fn parse_codebuddy_quota_update(
         credential_message: subscription_level.clone(),
         tiers,
         extra_usage: Some(json!({
-            "source": "codebuddy_billing_resource",
+            "source": source,
             "codeBuddyBilling": {
                 "availability": availability,
                 "totalCount": total_count,
@@ -590,6 +670,243 @@ fn parse_codebuddy_quota_update(
     update.rate_limited_until = None;
     update.clear_rate_limited_until_if = None;
     Ok(update)
+}
+
+fn codebuddy_modern_billing_envelope(
+    summary: Option<&Value>,
+    paid: Option<&Value>,
+    free: Option<&Value>,
+    now_ms: i64,
+) -> Result<Value, String> {
+    let mut detail_packages = Vec::new();
+    for response in [paid, free].into_iter().flatten() {
+        if let Some(items) = codebuddy_billing_array(response, "Accounts") {
+            for item in items {
+                detail_packages.push(codebuddy_normalize_modern_package(item, now_ms)?);
+            }
+        }
+    }
+    let detail_codes = detail_packages
+        .iter()
+        .filter_map(|item| item.get("SubProductCode").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut packages = detail_packages;
+    if let Some(items) = summary.and_then(|value| codebuddy_billing_array(value, "Packages")) {
+        for item in items {
+            let normalized = codebuddy_normalize_modern_package(item, now_ms)?;
+            let duplicated = normalized
+                .get("SubProductCode")
+                .and_then(Value::as_str)
+                .is_some_and(|code| detail_codes.contains(code));
+            if !duplicated {
+                packages.push(normalized);
+            }
+        }
+    }
+    if packages.is_empty() {
+        return Err(
+            "CodeBuddy modern billing endpoints returned no resource packages; availability is unknown"
+                .to_string(),
+        );
+    }
+    let total_dosage = packages
+        .iter()
+        .filter_map(|item| {
+            let total = item.get("CapacitySize")?.as_f64()?;
+            let remaining = item.get("CapacityRemain")?.as_f64()?;
+            Some((total - remaining).max(0.0))
+        })
+        .sum::<f64>();
+    Ok(json!({
+        "data": {"Response": {"Data": {
+            "TotalCount": packages.len(),
+            "TotalDosage": total_dosage,
+            "Accounts": packages,
+        }}}
+    }))
+}
+
+fn codebuddy_billing_array<'a>(value: &'a Value, field: &str) -> Option<&'a Vec<Value>> {
+    [
+        format!("/data/{field}"),
+        format!("/data/data/{field}"),
+        format!("/data/Response/Data/{field}"),
+        format!("/data/data/Response/Data/{field}"),
+    ]
+    .iter()
+    .find_map(|path| value.pointer(path).and_then(Value::as_array))
+}
+
+fn codebuddy_normalize_modern_package(value: &Value, now_ms: i64) -> Result<Value, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "CodeBuddy modern billing package must be an object".to_string())?;
+    let slice = ["SlicePeriodUsageDetails", "slicePeriodUsageDetails"]
+        .iter()
+        .find_map(|key| object.get(*key))
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_object);
+    let number = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(codebuddy_optional_number))
+            .or_else(|| {
+                slice.and_then(|slice| {
+                    keys.iter()
+                        .find_map(|key| slice.get(*key).and_then(codebuddy_optional_number))
+                })
+            })
+    };
+    let total_keys = [
+        "CycleCapacitySizePrecise",
+        "CycleCapacitySize",
+        "CycleTotalCapacity",
+        "CapacitySizePrecise",
+        "CapacitySize",
+        "SlicePeriodCapacitySizePrecise",
+        "SlicePeriodCapacitySize",
+    ];
+    let remaining_keys = [
+        "CycleCapacityRemainPrecise",
+        "CycleCapacityRemain",
+        "CycleRemainCapacity",
+        "CapacityRemainPrecise",
+        "CapacityRemain",
+        "SlicePeriodCapacityRemainPrecise",
+        "SlicePeriodCapacityRemain",
+    ];
+    let used_keys = [
+        "CycleCapacityUsedPrecise",
+        "CycleCapacityUsed",
+        "CycleUsedCapacity",
+        "CapacityUsedPrecise",
+        "CapacityUsed",
+        "SlicePeriodCapacityUsedPrecise",
+        "SlicePeriodCapacityUsed",
+    ];
+    let raw_total = number(&total_keys);
+    let raw_remaining = number(&remaining_keys);
+    let raw_used = number(&used_keys);
+    let total = raw_total
+        .or_else(|| {
+            raw_remaining
+                .zip(raw_used)
+                .map(|(remaining, used)| remaining + used)
+        })
+        .ok_or_else(|| "CodeBuddy modern billing package has no capacity evidence".to_string())?;
+    let remaining = raw_remaining
+        .or_else(|| raw_used.map(|used| (total - used).max(0.0)))
+        .ok_or_else(|| {
+            "CodeBuddy modern billing package has no remaining or used capacity evidence"
+                .to_string()
+        })?;
+    if !total.is_finite()
+        || !remaining.is_finite()
+        || total < 0.0
+        || remaining < 0.0
+        || remaining > total
+    {
+        return Err("CodeBuddy modern billing package capacity is inconsistent".to_string());
+    }
+    let package_name = codebuddy_first_bounded_string(object, &["PackageName", "packageName"])?;
+    let package_code = codebuddy_first_bounded_string(
+        object,
+        &[
+            "PackageCode",
+            "packageCode",
+            "SubProductCode",
+            "subProductCode",
+        ],
+    )?;
+    if package_name.is_none() && package_code.is_none() {
+        return Err(
+            "CodeBuddy modern billing package has neither package name nor package code"
+                .to_string(),
+        );
+    }
+    let unit = codebuddy_first_bounded_string(object, &["CapacityUnit", "capacityUnit"])?
+        .unwrap_or_else(|| "credits".to_string());
+    if !matches!(unit.to_ascii_lowercase().as_str(), "credit" | "credits") {
+        return Err("CodeBuddy modern billing package has unsupported capacity unit".to_string());
+    }
+    let end = codebuddy_first_scalar_string(
+        object,
+        &[
+            "DeductionEndTime",
+            "deductionEndTime",
+            "ExpiredTime",
+            "expiredTime",
+            "CycleEndTime",
+            "cycleEndTime",
+        ],
+    )?;
+    if let Some(end) = end.as_deref() {
+        codebuddy_billing_timestamp_ms(end).ok_or_else(|| {
+            "CodeBuddy modern billing package has an invalid expiry timestamp".to_string()
+        })?;
+    }
+    let display_name = package_name
+        .clone()
+        .or_else(|| package_code.clone())
+        .unwrap_or_else(|| format!("CodeBuddy resource {now_ms}"));
+    Ok(json!({
+        "PackageName": display_name,
+        "SubProductCode": package_code,
+        "CapacitySize": total,
+        "CapacityRemain": remaining,
+        "CapacityUnit": "credits",
+        "CycleEndTime": end,
+    }))
+}
+
+fn codebuddy_optional_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn codebuddy_first_bounded_string(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    for key in keys {
+        if object.contains_key(*key) {
+            return codebuddy_optional_bounded_string(object.get(*key), key);
+        }
+    }
+    Ok(None)
+}
+
+fn codebuddy_first_scalar_string(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let text = match value {
+            Value::String(value) => value.trim().to_string(),
+            Value::Number(value) => value.to_string(),
+            Value::Null => continue,
+            _ => {
+                return Err(format!(
+                    "CodeBuddy billing {key} must be a scalar timestamp"
+                ))
+            }
+        };
+        if text.len() > 256 || text.chars().any(char::is_control) {
+            return Err(format!(
+                "CodeBuddy billing {key} exceeds its safe display bounds"
+            ));
+        }
+        if !text.is_empty() {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
 }
 
 fn codebuddy_required_nonnegative_integer(
@@ -623,6 +940,9 @@ fn codebuddy_optional_bounded_string(
     let Some(value) = value else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let value = value
         .as_str()
         .ok_or_else(|| format!("CodeBuddy billing {field} must be a string"))?
@@ -639,11 +959,19 @@ fn codebuddy_optional_bounded_string(
 }
 
 fn codebuddy_billing_timestamp_ms(value: &str) -> Option<i64> {
-    DateTime::parse_from_rfc3339(value.trim())
+    let value = value.trim();
+    if let Ok(number) = value.parse::<i64>() {
+        return Some(if number.abs() < 10_000_000_000 {
+            number.saturating_mul(1_000)
+        } else {
+            number
+        });
+    }
+    DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|value| value.timestamp_millis())
         .or_else(|| {
-            NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S")
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
                 .ok()
                 .map(|value| value.and_utc().timestamp_millis())
         })
@@ -7372,7 +7700,7 @@ mod tests {
         let account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
         let update = parse_codebuddy_quota_update(
             &account,
-            &json!({
+            &crate::clients::oauth::codebuddy::CodeBuddyBillingResources::Legacy(json!({
                 "code": 0,
                 "data": {"Response": {"Data": {
                     "TotalCount": 2,
@@ -7402,7 +7730,7 @@ mod tests {
                         }
                     ]
                 }}}
-            }),
+            })),
             now_ms,
             300_000,
         )
@@ -7444,6 +7772,107 @@ mod tests {
     }
 
     #[test]
+    fn codebuddy_modern_quota_merges_details_and_summary_without_double_counting() {
+        let now_ms = 1_700_000_000_000;
+        let account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
+        let update = parse_codebuddy_quota_update(
+            &account,
+            &crate::clients::oauth::codebuddy::CodeBuddyBillingResources::Modern {
+                summary: Some(json!({"code":0,"data":{"Packages":[
+                    {
+                        "PackageCode":"paid",
+                        "PackageName":"Summary duplicate",
+                        "CycleTotalCapacity":"100",
+                        "CycleRemainCapacity":"90"
+                    },
+                    {
+                        "PackageCode":"summary-only",
+                        "CycleTotalCapacity":20,
+                        "CycleUsedCapacity":5
+                    }
+                ]}})),
+                paid: Some(json!({"code":0,"data":{"Accounts":[{
+                    "PackageCode":"paid",
+                    "PackageName":"Paid detail",
+                    "CycleCapacitySizePrecise":"100",
+                    "CycleCapacityRemainPrecise":"70",
+                    "CapacityUnit":"credits"
+                }]}})),
+                free: Some(json!({"code":0,"data":{"Accounts":[{
+                    "PackageCode":"free",
+                    "PackageName":"Daily gift",
+                    "SlicePeriodUsageDetails":[{
+                        "SlicePeriodCapacitySizePrecise":"10",
+                        "SlicePeriodCapacityUsedPrecise":"2"
+                    }]
+                }]}})),
+            },
+            now_ms,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(update.entitlement_status.as_deref(), Some("available"));
+        let quota = update.quota.unwrap();
+        assert_eq!(quota.tiers.len(), 3);
+        assert_eq!(
+            quota
+                .tiers
+                .iter()
+                .map(|tier| tier.used.unwrap())
+                .sum::<f64>(),
+            37.0
+        );
+        assert!(quota
+            .tiers
+            .iter()
+            .any(|tier| tier.label.as_deref() == Some("Paid detail") && tier.used == Some(30.0)));
+        assert!(!quota
+            .tiers
+            .iter()
+            .any(|tier| tier.label.as_deref() == Some("Summary duplicate")));
+        assert_eq!(
+            quota.extra_usage.as_ref().unwrap()["source"],
+            "codebuddy_billing_resource_v2"
+        );
+    }
+
+    #[test]
+    fn codebuddy_official_usage_cache_has_separate_success_and_failure_ttls() {
+        let now_ms = 1_700_000_000_000;
+        let mut account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
+        account.quota = Some(AccountQuota {
+            extra_usage: Some(json!({
+                "codeBuddyOfficialUsage": {
+                    "status":"complete",
+                    "collectedAt":now_ms - CODEBUDDY_OFFICIAL_USAGE_CACHE_MS
+                }
+            })),
+            ..Default::default()
+        });
+        assert!(cached_codebuddy_official_usage(&account, now_ms).is_some());
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["codeBuddyOfficialUsage"]["collectedAt"] =
+            json!(now_ms - CODEBUDDY_OFFICIAL_USAGE_CACHE_MS - 1);
+        assert!(cached_codebuddy_official_usage(&account, now_ms).is_none());
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["codeBuddyOfficialUsage"] = json!({
+            "status":"unavailable",
+            "collectedAt":now_ms - CODEBUDDY_OFFICIAL_USAGE_FAILURE_CACHE_MS
+        });
+        assert!(cached_codebuddy_official_usage(&account, now_ms).is_some());
+    }
+
+    #[test]
     fn codebuddy_quota_missing_or_inconsistent_authority_is_unknown_not_exhausted() {
         let account = imported_account(ProviderType::CodeBuddyOAuth, json!({}));
         for value in [
@@ -7462,7 +7891,13 @@ mod tests {
             }]}}}}),
             json!({"data":{"Response":{"Data":{"TotalCount":1,"Accounts":[]}}}}),
         ] {
-            let error = parse_codebuddy_quota_update(&account, &value, 1_000, 300_000).unwrap_err();
+            let error = parse_codebuddy_quota_update(
+                &account,
+                &crate::clients::oauth::codebuddy::CodeBuddyBillingResources::Legacy(value),
+                1_000,
+                300_000,
+            )
+            .unwrap_err();
             assert_eq!(error.status_code, 502);
             assert!(error.partial_update.is_none());
             assert!(!error.message.contains("exhausted"));
@@ -7470,7 +7905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codebuddy_quota_dispatch_uses_only_the_fixed_billing_override_and_identity() {
+    async fn codebuddy_quota_dispatch_uses_separate_billing_override_and_identity() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -10803,6 +11238,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            quota_window_observations: Default::default(),
         }
     }
 }

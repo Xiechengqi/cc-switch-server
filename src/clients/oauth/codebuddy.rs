@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use chrono::Datelike;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -18,16 +19,49 @@ use crate::domain::codebuddy::{
     codebuddy_access_token_subject, codebuddy_account_id, CodeBuddyAccountProfile, CodeBuddySite,
     CODEBUDDY_ACCOUNTS_PATH, CODEBUDDY_AUTH_STATE_PATH, CODEBUDDY_AUTH_TOKEN_PATH,
     CODEBUDDY_CLIENT_VERSION, CODEBUDDY_CONFIG_PATH, CODEBUDDY_LOGIN_ACCOUNT_PATH,
-    CODEBUDDY_PLATFORM, CODEBUDDY_REFRESH_PATH, CODEBUDDY_RESOURCE_PATH,
+    CODEBUDDY_PLATFORM, CODEBUDDY_REFRESH_PATH, CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH,
+    CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH, CODEBUDDY_RESOURCE_PATH,
+    CODEBUDDY_RESOURCE_SUMMARY_PATH, CODEBUDDY_USAGE_PATH,
 };
 use crate::domain::providers::model::ProviderType;
 
 const FLOW_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const MAX_USAGE_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_PENDING_CODE: i64 = 11_217;
 const ACCOUNT_PENDING_CODE: i64 = 12_151;
+const MAX_CODEBUDDY_LOGIN_FLOWS: usize = 64;
+const CODEBUDDY_USAGE_PAGE_SIZE: usize = 3_000;
+const CODEBUDDY_USAGE_MAX_PAGES: usize = 100;
+const CODEBUDDY_USAGE_DETAIL_LIMIT: usize = 100;
+const CODEBUDDY_PRODUCT_CODE: &str = "p_tcaca";
+const CODEBUDDY_PAID_PACKAGE_CODES: &[&str] = &[
+    "TCACA_code_002_AkiJS3ZHF5",
+    "TCACA_code_023_4xbGhMrE6q",
+    "TCACA_code_026_BaESVICNoi",
+    "TCACA_code_027_0FCGVA6vSa",
+    "TCACA_code_009_0XmEQc2xOf",
+    "TCACA_code_038_OhvqZtiPKr",
+];
+const CODEBUDDY_FREE_PACKAGE_CODES: &[&str] = &[
+    "TCACA_code_008_cfWoLwvjU4",
+    "TCACA_code_007_nzdH5h4Nl0",
+    "TCACA_code_028_NtpWi0jzXs",
+    "TCACA_code_029_6wCGEWquYy",
+    "TCACA_code_030_BjSt89qTvr",
+];
+
+#[derive(Debug, Clone)]
+pub(crate) enum CodeBuddyBillingResources {
+    Modern {
+        summary: Option<Value>,
+        paid: Option<Value>,
+        free: Option<Value>,
+    },
+    Legacy(Value),
+}
 
 #[derive(Debug, Clone)]
 pub struct CodeBuddyEndpoints {
@@ -97,8 +131,16 @@ struct CodeBuddyBillingEndpoints {
 }
 
 impl CodeBuddyBillingEndpoints {
-    fn for_site(site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        let base_url = Url::parse(site.profile().billing_endpoint).map_err(|error| {
+    fn for_profile(profile: &CodeBuddyAccountProfile) -> Result<Self, CodeBuddyClientError> {
+        let endpoint = profile
+            .site
+            .billing_endpoint_for_domain(&profile.domain)
+            .ok_or_else(|| {
+                CodeBuddyClientError::bad_request(
+                    "CodeBuddy account domain has no reviewed billing origin",
+                )
+            })?;
+        let base_url = Url::parse(endpoint).map_err(|error| {
             CodeBuddyClientError::bad_gateway(format!(
                 "invalid reviewed CodeBuddy billing endpoint: {error}"
             ))
@@ -107,13 +149,19 @@ impl CodeBuddyBillingEndpoints {
     }
 
     #[cfg(not(test))]
-    fn for_account(_account: &Account, site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        Self::for_site(site)
+    fn for_account(
+        _account: &Account,
+        profile: &CodeBuddyAccountProfile,
+    ) -> Result<Self, CodeBuddyClientError> {
+        Self::for_profile(profile)
     }
 
     #[cfg(test)]
-    fn for_account(account: &Account, site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        let mut endpoints = Self::for_site(site)?;
+    fn for_account(
+        account: &Account,
+        profile: &CodeBuddyAccountProfile,
+    ) -> Result<Self, CodeBuddyClientError> {
+        let mut endpoints = Self::for_profile(profile)?;
         // Billing is a separate authority for CN. Its loopback override must
         // never inherit the config/chat override implicitly.
         if let Some(base_url) = account
@@ -213,8 +261,16 @@ pub struct CodeBuddyLoginFlowStore {
 }
 
 impl CodeBuddyLoginFlowStore {
-    pub fn insert(&mut self, flow_id: String, flow: PendingCodeBuddyLoginFlow, now_ms: i64) {
+    pub fn insert(
+        &mut self,
+        flow_id: String,
+        flow: PendingCodeBuddyLoginFlow,
+        now_ms: i64,
+    ) -> bool {
         self.cleanup(now_ms);
+        if self.pending.len() >= MAX_CODEBUDDY_LOGIN_FLOWS {
+            return false;
+        }
         self.pending.insert(
             flow_id,
             CodeBuddyLoginFlowEntry {
@@ -224,6 +280,7 @@ impl CodeBuddyLoginFlowStore {
                 },
             },
         );
+        true
     }
 
     pub fn begin_poll(&mut self, flow_id: &str, now_ms: i64) -> Option<CodeBuddyLoginPollLease> {
@@ -508,13 +565,13 @@ pub async fn poll_login(
         ));
     };
     let enterprise_id = fetch_enterprise_identity(flow, &token, &identity.uid).await?;
-    let account_id = codebuddy_account_id(
-        flow.endpoints.site,
-        &token.domain,
-        &identity.uid,
-        &enterprise_id,
-    )
-    .map_err(CodeBuddyClientError::protocol)?;
+    if !enterprise_id.trim().is_empty() {
+        return Err(CodeBuddyClientError::protocol(
+            "CodeBuddy enterprise subscriptions are not supported by the personal-account rail",
+        ));
+    }
+    let account_id = codebuddy_account_id(flow.endpoints.site, &identity.uid, &enterprise_id)
+        .map_err(CodeBuddyClientError::protocol)?;
     let profile = json!({
         "site": flow.endpoints.site,
         "domain": token.domain,
@@ -698,12 +755,7 @@ pub(crate) async fn fetch_model_config(
     }
     let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
         .map_err(CodeBuddyClientError::bad_request)?;
-    let access_token = account
-        .access_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CodeBuddyClientError::bad_request("CodeBuddy access token is required"))?;
+    let access_token = profile_access_token(account)?;
     let endpoints = CodeBuddyEndpoints::for_account(account, profile.site)?;
     let url = endpoints.url(CODEBUDDY_CONFIG_PATH)?;
     let request = authenticated_request(
@@ -745,11 +797,11 @@ pub(crate) async fn fetch_model_config(
     Ok((value, endpoints.base_url()))
 }
 
-pub(crate) async fn fetch_billing_resource(
+pub(crate) async fn fetch_billing_resources(
     http: &reqwest::Client,
     account: &Account,
     request_timeout: Duration,
-) -> Result<Value, CodeBuddyClientError> {
+) -> Result<CodeBuddyBillingResources, CodeBuddyClientError> {
     if account.provider_type != ProviderType::CodeBuddyOAuth {
         return Err(CodeBuddyClientError::bad_request(format!(
             "expected codebuddy_oauth account, got {}",
@@ -758,72 +810,458 @@ pub(crate) async fn fetch_billing_resource(
     }
     let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
         .map_err(CodeBuddyClientError::bad_request)?;
-    let access_token = account
-        .access_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CodeBuddyClientError::bad_request("CodeBuddy access token is required"))?;
-    let endpoints = CodeBuddyBillingEndpoints::for_account(account, profile.site)?;
-    let url = endpoints.url(CODEBUDDY_RESOURCE_PATH)?;
-    let now = chrono::Utc::now();
+    profile_access_token(account)?;
+    let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    let now = match profile.site {
+        CodeBuddySite::Intl => chrono::Utc::now().with_timezone(&chrono_tz::UTC),
+        CodeBuddySite::Cn => chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai),
+    };
+    let day_start = now.date_naive().and_hms_opt(0, 0, 0).ok_or_else(|| {
+        CodeBuddyClientError::bad_gateway("CodeBuddy billing day start is invalid")
+    })?;
+    let day_end = now
+        .date_naive()
+        .and_hms_opt(23, 59, 59)
+        .ok_or_else(|| CodeBuddyClientError::bad_gateway("CodeBuddy billing day end is invalid"))?;
+    let modern = tokio::join!(
+        fetch_billing_path(
+            http,
+            account,
+            &profile,
+            &endpoints,
+            CODEBUDDY_RESOURCE_SUMMARY_PATH,
+            json!({}),
+            request_timeout,
+            "billing resource summary",
+        ),
+        fetch_billing_path(
+            http,
+            account,
+            &profile,
+            &endpoints,
+            CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH,
+            json!({
+                "PageNumber": 1,
+                "PageSize": 200,
+                "Status": [0, 3],
+                "PackageCodes": CODEBUDDY_PAID_PACKAGE_CODES,
+                "NeedRenewInfo": true,
+            }),
+            request_timeout,
+            "billing paid packages",
+        ),
+        fetch_billing_path(
+            http,
+            account,
+            &profile,
+            &endpoints,
+            CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH,
+            json!({
+                "PageNumber": 1,
+                "PageSize": 200,
+                "Status": [0, 3],
+                "SlicePeriodStartTime": day_start.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "SlicePeriodEndTime": day_end.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "PackageCodes": CODEBUDDY_FREE_PACKAGE_CODES,
+            }),
+            request_timeout,
+            "billing free packages",
+        ),
+    );
+    for result in [&modern.0, &modern.1, &modern.2] {
+        if let Err(error) = result {
+            // The state-layer quota orchestration owns the single OAuth
+            // refresh/replay. Do not let a successful sibling response hide
+            // an authentication failure from another modern endpoint.
+            if error.is_authentication_failure() {
+                return Err(error.clone());
+            }
+        }
+    }
+    let summary = modern.0.ok();
+    let paid = modern.1.ok();
+    let free = modern.2.ok();
+    if summary
+        .as_ref()
+        .is_some_and(|value| modern_billing_array_present(value, "Packages"))
+        || paid
+            .as_ref()
+            .is_some_and(|value| modern_billing_array_present(value, "Accounts"))
+        || free
+            .as_ref()
+            .is_some_and(|value| modern_billing_array_present(value, "Accounts"))
+    {
+        return Ok(CodeBuddyBillingResources::Modern {
+            summary,
+            paid,
+            free,
+        });
+    }
+
     let range_end = now
         .checked_add_signed(chrono::Duration::days(365 * 100))
         .ok_or_else(|| {
             CodeBuddyClientError::bad_gateway("CodeBuddy billing time range overflow")
         })?;
-    let body = serde_json::to_vec(&json!({
+    let body = json!({
         "PageNumber": 1,
         "PageSize": 100,
-        "ProductCode": "p_tcaca",
+        "ProductCode": CODEBUDDY_PRODUCT_CODE,
         "Status": [0, 3],
         "PackageEndTimeRangeBegin": now.format("%Y-%m-%d %H:%M:%S").to_string(),
         "PackageEndTimeRangeEnd": range_end.format("%Y-%m-%d %H:%M:%S").to_string(),
-    }))
-    .map_err(|error| {
-        CodeBuddyClientError::bad_gateway(format!(
-            "encode CodeBuddy billing resource request: {error}"
-        ))
+    });
+    let value = fetch_billing_path(
+        http,
+        account,
+        &profile,
+        &endpoints,
+        CODEBUDDY_RESOURCE_PATH,
+        body,
+        request_timeout,
+        "billing resource",
+    )
+    .await?;
+    Ok(CodeBuddyBillingResources::Legacy(value))
+}
+
+fn modern_billing_array_present(value: &Value, field: &str) -> bool {
+    [
+        format!("/data/{field}"),
+        format!("/data/data/{field}"),
+        format!("/data/Response/Data/{field}"),
+        format!("/data/data/Response/Data/{field}"),
+    ]
+    .iter()
+    .any(|path| {
+        value
+            .pointer(path)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
+async fn fetch_billing_path(
+    http: &reqwest::Client,
+    account: &Account,
+    profile: &CodeBuddyAccountProfile,
+    endpoints: &CodeBuddyBillingEndpoints,
+    path: &str,
+    body: Value,
+    request_timeout: Duration,
+    operation: &str,
+) -> Result<Value, CodeBuddyClientError> {
+    fetch_billing_path_with_limit(
+        http,
+        account,
+        profile,
+        endpoints,
+        path,
+        body,
+        request_timeout,
+        operation,
+        MAX_RESPONSE_BODY_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_billing_path_with_limit(
+    http: &reqwest::Client,
+    account: &Account,
+    profile: &CodeBuddyAccountProfile,
+    endpoints: &CodeBuddyBillingEndpoints,
+    path: &str,
+    body: Value,
+    request_timeout: Duration,
+    operation: &str,
+    response_body_limit: usize,
+) -> Result<Value, CodeBuddyClientError> {
+    let url = endpoints.url(path)?;
+    let body = serde_json::to_vec(&body).map_err(|error| {
+        CodeBuddyClientError::bad_gateway(format!("encode CodeBuddy {operation} request: {error}"))
     })?;
     let request = authenticated_request(
         http.post(url)
             .header(CONTENT_TYPE, "application/json")
+            .header("X-Client-Platform", "web")
             .body(body),
-        access_token,
+        profile_access_token(account)?,
         &profile.uid,
         Some(&profile.enterprise_id),
         &profile.domain,
     );
-    let (status, body) = execute_bounded_with_timeout(
+    let (status, body) = execute_bounded_with_timeout_and_limit(
         request,
-        "billing resource",
+        operation,
         request_timeout.min(REQUEST_TIMEOUT),
+        response_body_limit,
     )
     .await?;
     if !status.is_success() {
-        return Err(CodeBuddyClientError::upstream(
-            status,
-            "billing resource",
-            &body,
-        ));
+        return Err(CodeBuddyClientError::upstream(status, operation, &body));
     }
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
         CodeBuddyClientError::protocol(format!(
-            "CodeBuddy billing resource response is not valid JSON: {error}"
+            "CodeBuddy {operation} response is not valid JSON: {error}"
         ))
     })?;
-    if let Some(code) = recursive_business_code(&value, 0) {
-        if code != 0 {
+    let root_code = i64_at(&value, &["/code"]);
+    let business_code = match root_code {
+        Some(0 | 200) | None => recursive_business_code(&value, 0),
+        Some(code) => Some(code),
+    };
+    if let Some(code) = business_code {
+        if !matches!(code, 0 | 200) {
             let message =
                 string_at(&value, &["/msg", "/message", "/error/message"]).unwrap_or_default();
-            return Err(CodeBuddyClientError::business(
-                "billing resource",
-                code,
-                &message,
-            ));
+            return Err(CodeBuddyClientError::business(operation, code, &message));
         }
     }
     Ok(value)
+}
+
+fn profile_access_token(account: &Account) -> Result<&str, CodeBuddyClientError> {
+    account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CodeBuddyClientError::bad_request("CodeBuddy access token is required"))
+}
+
+pub(crate) async fn fetch_official_usage(
+    http: &reqwest::Client,
+    account: &Account,
+    request_timeout: Duration,
+) -> Result<Value, CodeBuddyClientError> {
+    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
+        .map_err(CodeBuddyClientError::bad_request)?;
+    let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    let timezone = match profile.site {
+        CodeBuddySite::Intl => chrono_tz::UTC,
+        CodeBuddySite::Cn => chrono_tz::Asia::Shanghai,
+    };
+    let today = chrono::Utc::now().with_timezone(&timezone).date_naive();
+    let range_start = today
+        .checked_sub_signed(chrono::Duration::days(30))
+        .ok_or_else(|| CodeBuddyClientError::bad_gateway("CodeBuddy usage range underflow"))?;
+    let mut page_number = 1_usize;
+    let mut fetched_raw = 0_usize;
+    let mut reported_total = 0_usize;
+    let mut seen = BTreeSet::new();
+    let mut credit_total = 0_f64;
+    let mut credit_today = 0_f64;
+    let mut credit_seven_days = 0_f64;
+    let mut credit_month = 0_f64;
+    let week_start = today
+        .checked_sub_signed(chrono::Duration::days(6))
+        .unwrap_or(today);
+    let month_start = today.with_day(1).unwrap_or(today);
+    let mut models = BTreeMap::<String, (usize, f64)>::new();
+    let mut details = Vec::new();
+
+    loop {
+        let response = fetch_billing_path_with_limit(
+            http,
+            account,
+            &profile,
+            &endpoints,
+            CODEBUDDY_USAGE_PATH,
+            json!({
+                "startTime": format!("{range_start} 00:00:00"),
+                "endTime": format!("{today} 23:59:59"),
+                "pageNum": page_number,
+                "pageSize": CODEBUDDY_USAGE_PAGE_SIZE,
+            }),
+            request_timeout,
+            "official request usage",
+            MAX_USAGE_RESPONSE_BODY_BYTES,
+        )
+        .await?;
+        let data = response
+            .pointer("/data")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                CodeBuddyClientError::protocol(
+                    "CodeBuddy official usage response is missing data object",
+                )
+            })?;
+        let rows = data.get("data").and_then(Value::as_array).ok_or_else(|| {
+            CodeBuddyClientError::protocol(
+                "CodeBuddy official usage response is missing data.data array",
+            )
+        })?;
+        let page_total = data
+            .get("total")
+            .and_then(codebuddy_usize)
+            .unwrap_or(rows.len());
+        reported_total = reported_total.max(page_total);
+        fetched_raw = fetched_raw.saturating_add(rows.len());
+        for row in rows {
+            let Some(projected) = codebuddy_usage_row(row, timezone)? else {
+                continue;
+            };
+            let date = projected["requestDate"]
+                .as_str()
+                .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
+            if !date.is_some_and(|date| date >= range_start && date <= today) {
+                continue;
+            }
+            let request_id = projected["requestId"].as_str().unwrap_or_default();
+            let request_time = projected["requestTime"].as_str().unwrap_or_default();
+            if !seen.insert((request_id.to_string(), request_time.to_string())) {
+                continue;
+            }
+            let credit = projected["credit"].as_f64().unwrap_or(0.0);
+            credit_total += credit;
+            if date == Some(today) {
+                credit_today += credit;
+            }
+            if date.is_some_and(|date| date >= week_start && date <= today) {
+                credit_seven_days += credit;
+            }
+            if date.is_some_and(|date| date >= month_start && date <= today) {
+                credit_month += credit;
+            }
+            let model = projected["model"].as_str().unwrap_or("unknown").to_string();
+            let model_entry = models.entry(model).or_default();
+            model_entry.0 = model_entry.0.saturating_add(1);
+            model_entry.1 += credit;
+            if details.len() < CODEBUDDY_USAGE_DETAIL_LIMIT {
+                let mut safe = projected;
+                safe.as_object_mut()
+                    .map(|object| object.remove("requestDate"));
+                details.push(safe);
+            }
+        }
+        if fetched_raw >= reported_total {
+            break;
+        }
+        if rows.is_empty() {
+            return Err(CodeBuddyClientError::protocol(
+                "CodeBuddy official usage pagination ended before the reported total",
+            ));
+        }
+        if page_number >= CODEBUDDY_USAGE_MAX_PAGES {
+            return Err(CodeBuddyClientError::protocol(
+                "CodeBuddy official usage pagination exceeded its safety limit",
+            ));
+        }
+        page_number = page_number.saturating_add(1);
+    }
+    let models = models
+        .into_iter()
+        .map(|(model, (request_count, credit))| {
+            json!({"model": model, "requestCount": request_count, "credit": credit})
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "status": "complete",
+        "rangeStart": range_start.to_string(),
+        "rangeEnd": today.to_string(),
+        "reportedTotal": reported_total,
+        "fetchedCount": fetched_raw,
+        "requestCount": seen.len(),
+        "detailTruncated": seen.len() > CODEBUDDY_USAGE_DETAIL_LIMIT,
+        "usageToday": credit_today,
+        "usage7Days": credit_seven_days,
+        "usageThisMonth": credit_month,
+        "usageTotal": credit_total,
+        "models": models,
+        "requests": details,
+        "collectedAt": chrono::Utc::now().timestamp_millis(),
+    }))
+}
+
+fn codebuddy_usize(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+        .map(|value| value.min(usize::MAX as u64) as usize)
+}
+
+fn codebuddy_usage_row(
+    value: &Value,
+    timezone: chrono_tz::Tz,
+) -> Result<Option<Value>, CodeBuddyClientError> {
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let credit = object
+        .get("credit")
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+        })
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let Some(credit) = credit else {
+        return Ok(None);
+    };
+    let Some((request_time, request_date)) = object
+        .get("requestTime")
+        .or_else(|| object.get("request_time"))
+        .and_then(|value| codebuddy_usage_time(value, timezone))
+    else {
+        return Ok(None);
+    };
+    let bounded = |keys: &[&str], fallback: &str| -> Result<String, CodeBuddyClientError> {
+        let value = keys
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback);
+        if value.len() > 256 || value.chars().any(char::is_control) {
+            return Err(CodeBuddyClientError::protocol(
+                "CodeBuddy official usage contains an unsafe display field",
+            ));
+        }
+        Ok(value.to_string())
+    };
+    Ok(Some(json!({
+        "requestId": bounded(&["requestId", "request_id"], "unknown")?,
+        "credit": credit,
+        "model": bounded(&["model"], "unknown")?,
+        "client": bounded(&["client"], "unknown")?,
+        "requestTime": request_time,
+        "requestDate": request_date.to_string(),
+    })))
+}
+
+fn codebuddy_usage_time(
+    value: &Value,
+    timezone: chrono_tz::Tz,
+) -> Option<(String, chrono::NaiveDate)> {
+    use chrono::TimeZone;
+
+    if let Some(number) = value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+    {
+        let millis = if number.abs() < 10_000_000_000 {
+            number.saturating_mul(1_000)
+        } else {
+            number
+        };
+        let date = timezone.timestamp_millis_opt(millis).single()?;
+        return Some((millis.to_string(), date.date_naive()));
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some((
+            text.to_string(),
+            parsed.with_timezone(&timezone).date_naive(),
+        ));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            let date = timezone.from_local_datetime(&parsed).single()?.date_naive();
+            return Some((text.to_string(), date));
+        }
+    }
+    None
 }
 
 pub(crate) fn runtime_base_url(account: &Account) -> Result<String, CodeBuddyClientError> {
@@ -839,7 +1277,7 @@ pub async fn complete_codebuddy_refresh_receipt(
 ) -> Result<AccountRefreshUpdate, crate::clients::oauth::refresh::AccountRefreshFailure> {
     use crate::clients::oauth::refresh::AccountRefreshFailure;
 
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
+    let mut profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
         .map_err(AccountRefreshFailure::parse)?;
     let access_token = update
         .access_token
@@ -861,12 +1299,10 @@ pub async fn complete_codebuddy_refresh_receipt(
                 profile.site.as_str()
             ))
         })?;
-        if domain != profile.domain {
-            return Err(codebuddy_refresh_identity_failure(
-                "CodeBuddy OAuth refresh returned a different domain identity; re-login as a new account"
-                    .to_string(),
-            ));
-        }
+        // Domain is a site-scoped routing attribute, not an account principal.
+        // A rotated token may move between the reviewed CodeBuddy/WorkBuddy
+        // brand hosts without changing the subscription identity.
+        profile.domain = domain;
     }
     // A JWT payload is unverified metadata and cannot close account identity on
     // its own. Always re-read both the stable account UID and /v3/config's
@@ -1359,25 +1795,34 @@ async fn execute_bounded_with_timeout(
     operation: &str,
     timeout: Duration,
 ) -> Result<(StatusCode, Vec<u8>), CodeBuddyClientError> {
+    execute_bounded_with_timeout_and_limit(request, operation, timeout, MAX_RESPONSE_BODY_BYTES)
+        .await
+}
+
+async fn execute_bounded_with_timeout_and_limit(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+    timeout: Duration,
+    response_body_limit: usize,
+) -> Result<(StatusCode, Vec<u8>), CodeBuddyClientError> {
     let mut response = request.timeout(timeout).send().await.map_err(|error| {
         CodeBuddyClientError::bad_gateway(format!("CodeBuddy {operation} request failed: {error}"))
     })?;
     let status = response.status();
-    let body =
-        crate::infra::http::read_response_body_limited(&mut response, MAX_RESPONSE_BODY_BYTES)
-            .await
-            .map_err(|error| match error {
-                crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
-                    CodeBuddyClientError::protocol(format!(
-                        "CodeBuddy {operation} response exceeds {MAX_RESPONSE_BODY_BYTES} bytes"
-                    ))
-                }
-                crate::infra::http::BoundedResponseBodyError::Request(error) => {
-                    CodeBuddyClientError::bad_gateway(format!(
-                        "CodeBuddy {operation} response read failed: {error}"
-                    ))
-                }
-            })?;
+    let body = crate::infra::http::read_response_body_limited(&mut response, response_body_limit)
+        .await
+        .map_err(|error| match error {
+            crate::infra::http::BoundedResponseBodyError::TooLarge { .. } => {
+                CodeBuddyClientError::protocol(format!(
+                    "CodeBuddy {operation} response exceeds {response_body_limit} bytes"
+                ))
+            }
+            crate::infra::http::BoundedResponseBodyError::Request(error) => {
+                CodeBuddyClientError::bad_gateway(format!(
+                    "CodeBuddy {operation} response read failed: {error}"
+                ))
+            }
+        })?;
     Ok((status, body.to_vec()))
 }
 
@@ -1571,7 +2016,9 @@ mod tests {
         headers: HeaderMap,
     }
 
-    async fn serve_login_fixture() -> (
+    async fn serve_login_fixture(
+        enterprise_id: &str,
+    ) -> (
         String,
         Arc<Mutex<Vec<Observation>>>,
         Arc<std::sync::atomic::AtomicUsize>,
@@ -1587,12 +2034,14 @@ mod tests {
         let token_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let token_polls_for_route = Arc::clone(&token_polls);
         let auth_url = format!("{base_url}/browser/authorize");
+        let enterprise_id = enterprise_id.to_string();
         let app = axum::Router::new().fallback(axum::routing::any(
             move |uri: axum::http::Uri, headers: HeaderMap| {
                 let observations = Arc::clone(&observations_for_route);
                 let account_polls = Arc::clone(&account_polls_for_route);
                 let token_polls = Arc::clone(&token_polls_for_route);
                 let auth_url = auth_url.clone();
+                let enterprise_id = enterprise_id.clone();
                 async move {
                     observations.lock().unwrap().push(Observation {
                         path: uri.path().to_string(),
@@ -1653,7 +2102,7 @@ mod tests {
                             }
                         }
                         "/v3/config" => json_response(json!({
-                            "data": {"enterpriseId": "", "models": []}
+                            "data": {"enterpriseId": enterprise_id, "models": []}
                         })),
                         _ => Response::builder()
                             .status(StatusCode::NOT_FOUND)
@@ -1681,7 +2130,7 @@ mod tests {
             token: None,
         };
         let mut store = CodeBuddyLoginFlowStore::default();
-        store.insert("flow".to_string(), flow, 0);
+        assert!(store.insert("flow".to_string(), flow, 0));
         assert!(matches!(
             store.begin_poll("flow", 0),
             Some(CodeBuddyLoginPollLease::Ready(_))
@@ -1698,9 +2147,28 @@ mod tests {
         assert!(store.begin_poll("flow", 10).is_none());
     }
 
+    #[test]
+    fn flow_store_enforces_global_capacity_after_expiry_cleanup() {
+        let endpoints = CodeBuddyEndpoints::for_site(CodeBuddySite::Intl).unwrap();
+        let prototype = PendingCodeBuddyLoginFlow {
+            expires_at_ms: 10,
+            interval: 2,
+            upstream_state: "state".to_string(),
+            endpoints,
+            client: reqwest::Client::new(),
+            token: None,
+        };
+        let mut store = CodeBuddyLoginFlowStore::default();
+        for index in 0..MAX_CODEBUDDY_LOGIN_FLOWS {
+            assert!(store.insert(format!("flow-{index}"), prototype.clone(), 0));
+        }
+        assert!(!store.insert("overflow".to_string(), prototype.clone(), 0));
+        assert!(store.insert("after-expiry".to_string(), prototype, 10));
+    }
+
     #[tokio::test]
     async fn login_reuses_cookie_jar_preserves_token_phase_and_closes_enterprise_identity() {
-        let (base_url, observations, token_polls, server) = serve_login_fixture().await;
+        let (base_url, observations, token_polls, server) = serve_login_fixture("").await;
         let endpoints = CodeBuddyEndpoints::for_test(CodeBuddySite::Intl, &base_url);
         let (start, flow) = start_login_with_endpoints(endpoints, 1_000).await.unwrap();
         assert_ne!(start.flow_id, flow.upstream_state);
@@ -1758,6 +2226,23 @@ mod tests {
         assert_eq!(config.headers["authorization"], "Bearer access-secret");
         assert_eq!(config.headers["x-user-id"], "uid-1");
         assert_eq!(config.headers["x-domain"], "www.codebuddy.ai");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn login_rejects_enterprise_subscription_before_account_persistence() {
+        let (base_url, _, _, server) = serve_login_fixture("enterprise-1").await;
+        let endpoints = CodeBuddyEndpoints::for_test(CodeBuddySite::Intl, &base_url);
+        let (_, flow) = start_login_with_endpoints(endpoints, 1_000).await.unwrap();
+        let first = poll_login(&flow, 1_000).await.unwrap();
+        assert!(first.pending);
+        let mut resumed = flow;
+        resumed.token = first.token;
+        let error = poll_login(&resumed, 3_001).await.unwrap_err();
+        assert!(error.terminal);
+        assert!(error
+            .message
+            .contains("enterprise subscriptions are not supported"));
         server.abort();
     }
 
@@ -1964,14 +2449,67 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn refresh_accepts_same_site_brand_domain_rotation() {
+        let (base_url, _, server) = serve_refresh_fixture(
+            StatusCode::OK,
+            json!({
+                "accessToken": jwt_for_subject("uid-1"),
+                "refreshToken": "refresh-rotated",
+                "domain": "www.workbuddy.ai"
+            }),
+            "uid-1",
+            "enterprise-1",
+        )
+        .await;
+        let account = refresh_account(&base_url, "uid-1");
+        let mut hook = |_: &AccountRefreshUpdate| Ok(());
+        let update = refresh_codebuddy_account(&reqwest::Client::new(), &account, 1_000, &mut hook)
+            .await
+            .unwrap();
+        assert_eq!(
+            update.profile.as_ref().unwrap()["domain"],
+            "www.workbuddy.ai"
+        );
+        assert!(
+            !crate::domain::accounts::store::account_refresh_replaces_auth_identity(
+                &account, &update
+            )
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_cross_site_domain_rotation() {
+        let (base_url, _, server) = serve_refresh_fixture(
+            StatusCode::OK,
+            json!({
+                "accessToken": jwt_for_subject("uid-1"),
+                "refreshToken": "refresh-rotated",
+                "domain": "www.codebuddy.cn"
+            }),
+            "uid-1",
+            "enterprise-1",
+        )
+        .await;
+        let account = refresh_account(&base_url, "uid-1");
+        let mut hook = |_: &AccountRefreshUpdate| Ok(());
+        let error = refresh_codebuddy_account(&reqwest::Client::new(), &account, 1_000, &mut hook)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status_code, StatusCode::CONFLICT.as_u16());
+        assert!(error.message.contains("outside the bound intl site"));
+        server.abort();
+    }
+
     #[test]
     fn billing_endpoint_override_is_independent_from_config_and_chat() {
         let mut account = refresh_account("http://127.0.0.1:3210", "uid-1");
         account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
             json!("http://127.0.0.1:6543");
         let runtime = CodeBuddyEndpoints::for_account(&account, CodeBuddySite::Intl).unwrap();
-        let billing =
-            CodeBuddyBillingEndpoints::for_account(&account, CodeBuddySite::Intl).unwrap();
+        let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref()).unwrap();
+        let billing = CodeBuddyBillingEndpoints::for_account(&account, &profile).unwrap();
         assert_eq!(runtime.base_url.as_str(), "http://127.0.0.1:3210/");
         assert_eq!(billing.base_url.as_str(), "http://127.0.0.1:6543/");
 
@@ -1982,8 +2520,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("testCodeBuddyBillingBaseUrl");
-        let billing =
-            CodeBuddyBillingEndpoints::for_account(&account, CodeBuddySite::Intl).unwrap();
+        let billing = CodeBuddyBillingEndpoints::for_account(&account, &profile).unwrap();
         assert_eq!(
             billing.base_url.as_str(),
             CodeBuddySite::Intl.profile().billing_endpoint.to_string() + "/"
@@ -1992,6 +2529,107 @@ mod tests {
             CodeBuddySite::Cn.profile().endpoint,
             CodeBuddySite::Cn.profile().billing_endpoint
         );
+    }
+
+    #[tokio::test]
+    async fn modern_billing_auth_failure_is_not_hidden_by_a_successful_sibling() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app =
+            axum::Router::new().fallback(axum::routing::post(|uri: axum::http::Uri| async move {
+                if uri.path() == CODEBUDDY_RESOURCE_SUMMARY_PATH {
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::from(r#"{"message":"expired"}"#))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"code":0,"data":{"Accounts":[{
+                            "PackageCode":"fixture",
+                            "CycleTotalCapacity":100,
+                            "CycleRemainCapacity":50
+                        }]}})
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut account = refresh_account("http://127.0.0.1:1", "uid-1");
+        account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+            json!(format!("http://{address}"));
+        let error =
+            fetch_billing_resources(&reqwest::Client::new(), &account, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+        assert_eq!(error.upstream_status, Some(StatusCode::UNAUTHORIZED));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn official_usage_deduplicates_and_never_projects_prompt_fields() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let app = axum::Router::new().route(
+            CODEBUDDY_USAGE_PATH,
+            axum::routing::post(move || {
+                let today = today.clone();
+                async move {
+                    axum::Json(json!({
+                        "code": 0,
+                        "data": {
+                            "total": 2,
+                            "data": [
+                                {
+                                    "requestId":"request-1",
+                                    "credit": "1.25",
+                                    "model":"model-1",
+                                    "client":"CLI",
+                                    "requestTime":format!("{today} 12:00:00"),
+                                    "input":"prompt-must-not-persist",
+                                    "inputTrunc":"prompt-must-not-persist-either"
+                                },
+                                {
+                                    "requestId":"request-1",
+                                    "credit": 1.25,
+                                    "model":"model-1",
+                                    "client":"CLI",
+                                    "requestTime":format!("{today} 12:00:00"),
+                                    "input":"duplicate-prompt"
+                                }
+                            ]
+                        }
+                    }))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut account = refresh_account("http://127.0.0.1:1", "uid-1");
+        account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+            json!(format!("http://{address}"));
+        let usage = fetch_official_usage(&reqwest::Client::new(), &account, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(usage["requestCount"], 1);
+        assert_eq!(usage["usageToday"], 1.25);
+        assert_eq!(usage["requests"].as_array().unwrap().len(), 1);
+        let serialized = usage.to_string();
+        for forbidden in [
+            "prompt-must-not-persist",
+            "prompt-must-not-persist-either",
+            "duplicate-prompt",
+            "inputTrunc",
+        ] {
+            assert!(!serialized.contains(forbidden), "{forbidden}: {serialized}");
+        }
+        server.abort();
     }
 
     #[tokio::test]

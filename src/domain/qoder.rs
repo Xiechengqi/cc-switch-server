@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const QODER_COSY_USER_AGENT: &str = "Go-http-client/2.0";
+pub const QODER_CN_CLIENT_IP_ENV: &str = "CC_SWITCH_QODER_CN_CLIENT_IP";
 const QODER_MAX_SIGNING_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
 const STANDARD_ALPHABET: &[u8; 64] =
@@ -564,6 +565,7 @@ impl QoderCosySession {
             self.machine.machine_type.as_str()
         };
         let effective_client_ip = if self.site == QoderSite::Cn {
+            validate_qoder_cn_client_ip(client_ip)?;
             client_ip
         } else {
             self.machine.machine_id.as_str()
@@ -630,6 +632,25 @@ impl QoderCosySession {
         }
         Ok(headers)
     }
+}
+
+pub fn validate_qoder_cn_client_ip(value: &str) -> Result<std::net::Ipv4Addr, String> {
+    if value != value.trim() || value.is_empty() {
+        return Err("Qoder CN client IP must be a non-empty canonical IPv4 address".to_string());
+    }
+    let address = value
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "Qoder CN client IP must be a canonical IPv4 address".to_string())?;
+    if address.to_string() != value
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_broadcast()
+    {
+        return Err(
+            "Qoder CN client IP must be a usable canonical unicast IPv4 address".to_string(),
+        );
+    }
+    Ok(address)
 }
 
 fn is_qoder_uuid_nonce(value: &str) -> bool {

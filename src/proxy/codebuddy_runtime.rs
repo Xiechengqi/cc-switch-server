@@ -112,6 +112,7 @@ pub struct CodeBuddyModelCapability {
     pub id: String,
     pub display_name: Option<String>,
     pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
     pub max_input_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
@@ -299,6 +300,7 @@ pub fn parse_codebuddy_model_catalog(
     let mut enabled_models = Vec::new();
     let mut raw_configs = BTreeMap::new();
     let mut capabilities = BTreeMap::new();
+    let mut unreviewed_enabled = 0_usize;
     for (index, entry) in entries.iter().enumerate() {
         let object = entry
             .as_object()
@@ -320,7 +322,11 @@ pub fn parse_codebuddy_model_catalog(
         }
         let disabled = bool_field(object, "disabled")?.unwrap_or(false)
             || bool_field(object, "enable")?.is_some_and(|enabled| !enabled);
-        if disabled || !reviewed.contains(&id.as_str()) {
+        if disabled {
+            continue;
+        }
+        if !reviewed.contains(&id.as_str()) {
+            unreviewed_enabled = unreviewed_enabled.saturating_add(1);
             continue;
         }
         let capability = codebuddy_model_capability(&id, object)?;
@@ -340,6 +346,16 @@ pub fn parse_codebuddy_model_catalog(
     if !entries.is_empty() && enabled_models.is_empty() {
         return Err(
             "CodeBuddy upstream catalog is non-empty but has no reviewed text model".to_string(),
+        );
+    }
+    if unreviewed_enabled > 0 {
+        tracing::warn!(
+            site = site.as_str(),
+            upstream_model_count = entries.len(),
+            unreviewed_enabled,
+            reviewed_enabled = enabled_models.len(),
+            client_version = crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION,
+            "CodeBuddy live catalog contains enabled models outside the reviewed allowlist"
         );
     }
     enabled_models.sort();
@@ -385,6 +401,18 @@ fn codebuddy_model_capability(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let default_reasoning_effort = object
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| {
+            reasoning
+                .get("defaultEffort")
+                .or_else(|| reasoning.get("effort"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .map(str::to_string);
     Ok(CodeBuddyModelCapability {
         id: id.to_string(),
         display_name: object
@@ -395,6 +423,7 @@ fn codebuddy_model_capability(
             .filter(|value| !value.is_empty() && value.len() <= MAX_MODEL_ID_BYTES)
             .map(str::to_string),
         reasoning_efforts,
+        default_reasoning_effort,
         max_input_tokens: positive_u64(object.get("maxInputTokens")),
         max_output_tokens: positive_u64(object.get("maxOutputTokens")),
         // Missing capability evidence cannot authorize a tool-bearing request.
@@ -451,6 +480,7 @@ pub fn resolve_codebuddy_model_id(site: CodeBuddySite, requested: &str) -> Resul
 pub fn build_codebuddy_payload(
     canonical_chat_request: &Value,
     model_id: &str,
+    capability: &CodeBuddyModelCapability,
 ) -> Result<Value, String> {
     let mut request = canonical_chat_request
         .as_object()
@@ -492,25 +522,122 @@ pub fn build_codebuddy_payload(
             }
         }
     }
+    normalize_codebuddy_tool_choice(&mut request)?;
     request.insert("model".to_string(), Value::String(model_id.to_string()));
     request.insert("stream".to_string(), Value::Bool(true));
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
-    if !request.contains_key("reasoning_effort") {
-        if let Some(reasoning) = request.remove("reasoning") {
-            if let Some(effort) = reasoning
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                request.insert(
-                    "reasoning_effort".to_string(),
-                    Value::String(effort.to_string()),
-                );
-            }
+    let explicit_effort = match request.get("reasoning_effort") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(Value::String(_)) => None,
+        Some(_) => {
+            return Err("CodeBuddy reasoning_effort must be a string".to_string());
+        }
+    };
+    let canonical_reasoning = request.remove("reasoning");
+    let (canonical_requested, canonical_effort) = match canonical_reasoning {
+        None | Some(Value::Null) => (false, None),
+        Some(Value::Object(reasoning)) => {
+            let effort = match reasoning.get("effort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if !value.trim().is_empty() => {
+                    Some(value.trim().to_string())
+                }
+                Some(Value::String(_)) => None,
+                Some(_) => return Err("CodeBuddy reasoning.effort must be a string".to_string()),
+            };
+            (true, effort)
+        }
+        Some(_) => return Err("CodeBuddy reasoning must be an object".to_string()),
+    };
+    if let (Some(explicit), Some(canonical)) = (&explicit_effort, &canonical_effort) {
+        if !explicit.eq_ignore_ascii_case(canonical) {
+            return Err(
+                "CodeBuddy request contains conflicting reasoning effort values".to_string(),
+            );
         }
     }
+    let effort = explicit_effort.or(canonical_effort).or_else(|| {
+        canonical_requested
+            .then(|| capability.default_reasoning_effort.clone())
+            .flatten()
+    });
+    request.remove("reasoning_effort");
+    if let Some(mut effort) = effort {
+        if !capability.supports_reasoning {
+            return Err(format!(
+                "CodeBuddy model {model_id} does not advertise reasoning support"
+            ));
+        }
+        if !capability.reasoning_efforts.is_empty() {
+            let Some(supported) = capability
+                .reasoning_efforts
+                .iter()
+                .find(|supported| supported.eq_ignore_ascii_case(&effort))
+            else {
+                return Err(format!(
+                    "CodeBuddy model {model_id} does not support reasoning effort {effort:?}"
+                ));
+            };
+            effort = supported.clone();
+        }
+        request.insert("reasoning_effort".to_string(), Value::String(effort));
+    }
     Ok(Value::Object(request))
+}
+
+fn normalize_codebuddy_tool_choice(
+    request: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(choice) = request.get("tool_choice").cloned() else {
+        return Ok(());
+    };
+    let Some(choice) = choice.as_object() else {
+        return Ok(());
+    };
+    if choice.get("type").and_then(Value::as_str) != Some("function") {
+        return Err("CodeBuddy named tool_choice type must be function".to_string());
+    }
+    let name = choice
+        .get("function")
+        .and_then(Value::as_object)
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "CodeBuddy named tool_choice is missing function.name".to_string())?;
+    if name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("CodeBuddy named tool_choice function.name is unsafe".to_string());
+    }
+    let tools = request
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "CodeBuddy named tool_choice requires a tools array".to_string())?;
+    let selected = tools
+        .iter()
+        .find(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("function")
+                && tool
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|candidate| candidate == name)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!("CodeBuddy named tool_choice references unknown function {name:?}")
+        })?;
+    *tools = vec![selected];
+    request.insert(
+        "tool_choice".to_string(),
+        Value::String("required".to_string()),
+    );
+    Ok(())
 }
 
 fn contains_image_content(value: &Value) -> bool {
@@ -529,6 +656,19 @@ fn contains_image_content(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_capability() -> CodeBuddyModelCapability {
+        CodeBuddyModelCapability {
+            id: "default-model".to_string(),
+            display_name: Some("Default".to_string()),
+            reasoning_efforts: vec!["low".to_string(), "high".to_string()],
+            default_reasoning_effort: Some("high".to_string()),
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(24_000),
+            supports_tools: true,
+            supports_reasoning: true,
+        }
+    }
 
     fn scope(site: CodeBuddySite, domain: &str, token_generation: u64) -> CodeBuddyRuntimeScope {
         CodeBuddyRuntimeScope::derive(
@@ -650,6 +790,7 @@ mod tests {
                 "stream":false
             }),
             "default-model",
+            &text_capability(),
         )
         .unwrap();
         assert_eq!(payload["messages"][0]["role"], "system");
@@ -673,8 +814,102 @@ mod tests {
         );
         assert!(build_codebuddy_payload(
             &json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}]}]}),
-            "default-model"
+            "default-model",
+            &text_capability(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn payload_normalizes_named_tool_choice_and_validates_reasoning_effort() {
+        let payload = build_codebuddy_payload(
+            &json!({
+                "messages":[{"role":"user","content":"run"}],
+                "tools":[
+                    {"type":"function","function":{"name":"read","parameters":{}}},
+                    {"type":"function","function":{"name":"shell","parameters":{}}}
+                ],
+                "tool_choice":{"type":"function","function":{"name":"shell"}},
+                "reasoning_effort":"low"
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(payload["tool_choice"], "required");
+        assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["tools"][0]["function"]["name"], "shell");
+        assert_eq!(payload["reasoning_effort"], "low");
+        assert!(payload.get("reasoning").is_none());
+
+        let canonicalized = build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"HIGH"}),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(canonicalized["reasoning_effort"], "high");
+
+        let equivalent_dual_form = build_codebuddy_payload(
+            &json!({
+                "messages":[{"role":"user","content":"x"}],
+                "reasoning_effort":"LOW",
+                "reasoning":{"effort":"low"}
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(equivalent_dual_form["reasoning_effort"], "low");
+
+        let defaulted = build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":"x"}],"reasoning":{}}),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(defaulted["reasoning_effort"], "high");
+
+        assert!(build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"medium"}),
+            "default-model",
+            &text_capability(),
+        )
+        .is_err());
+        assert!(build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"low","reasoning":{"effort":"high"}}),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap_err()
+        .contains("conflicting"));
+        assert!(build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":3}),
+            "default-model",
+            &text_capability(),
+        )
+        .is_err());
+        assert!(build_codebuddy_payload(
+            &json!({
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"known"}}],
+                "tool_choice":{"type":"function","function":{"name":"unknown"}}
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap_err()
+        .contains("unknown function"));
+        assert!(build_codebuddy_payload(
+            &json!({
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"unsafe name"}}],
+                "tool_choice":{"type":"function","function":{"name":"unsafe name"}}
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap_err()
+        .contains("unsafe"));
     }
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::claude_quota::{project_account_quota, projected_quota_queried_at};
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
@@ -1499,6 +1500,7 @@ fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
 }
 
 fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<ShareUpstreamQuota> {
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     let subscription_period_end = account_subscription_expires_at(account);
     let block = current_account_usage_block(account, share);
     let availability = block
@@ -1511,7 +1513,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         .and_then(|block| unix_ms_to_rfc3339(block.until_ms));
     let blocked_reason = block.as_ref().map(|block| block.reason.to_string());
     let blocked_scope = block.as_ref().map(|block| block.scope.to_string());
-    let Some(quota) = account.quota.as_ref() else {
+    let Some(quota) = project_account_quota(account, account.quota.as_ref(), now_ms) else {
         if subscription_period_end.is_none() && block.is_none() {
             return None;
         }
@@ -1556,7 +1558,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         },
         plan,
         activity_cost: None,
-        queried_at: account.quota_refreshed_at,
+        queried_at: projected_quota_queried_at(&quota, account.quota_refreshed_at),
         subscription_period_end,
         availability: Some(availability),
         blocked_until,
@@ -1868,7 +1870,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::accounts::store::{AccountQuota, AccountQuotaTier, AccountStore};
+    use crate::domain::accounts::store::{
+        AccountQuota, AccountQuotaTier, AccountQuotaWindowObservation, AccountStore,
+        ClaudeFableEntitlementEvidence,
+    };
     use crate::domain::health::{ProviderHealthObservation, ProviderHealthStatus};
     use crate::domain::providers::model::{
         AppKind, AuthBinding, Provider, ProviderMeta, ProviderType,
@@ -2484,6 +2489,59 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_projects_claude_fable_header_observation_for_router_share_card() {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let share = test_share(ProviderType::ClaudeOAuth, Some(41.0));
+        let mut account = test_account(ProviderType::ClaudeOAuth);
+        account.subscription_level = Some("claude_max_20x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            credential_message: Some("Claude Max 20x".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(0.24),
+                ..Default::default()
+            }],
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_20x",
+                    "planLabel": "Claude Max 20x",
+                    "planStale": false
+                },
+                "subscriptionEvidence": {"conflict": false},
+                "queriedAt": now_ms - 1_000
+            })),
+        });
+        account.quota_window_observations.insert(
+            "seven_day_fable".to_string(),
+            AccountQuotaWindowObservation {
+                utilization: Some(0.41),
+                resets_at_ms: Some(now_ms + 60_000),
+                observed_at_ms: now_ms,
+                auth_identity_generation: account.auth_identity_generation,
+                source: "anthropic_ratelimit_7d_oi".to_string(),
+                fable_entitlement_evidence: Some(
+                    ClaudeFableEntitlementEvidence::SuccessfulFableRequest,
+                ),
+            },
+        );
+        let quota = upstream_quota_from_account(&account, &share).expect("quota payload");
+        let fable = quota
+            .tiers
+            .iter()
+            .find(|tier| tier.label == "Fable 7d")
+            .expect("Fable quota tier");
+
+        assert_eq!(quota.queried_at, Some(now_ms));
+        assert_eq!(fable.utilization, 41.0);
+        assert_eq!(fable.scope.as_deref(), Some("model_family"));
+        assert_eq!(fable.capacity_pool.as_deref(), Some("claude_fable_7d_oi"));
+        assert_eq!(fable.model_family.as_deref(), Some("claude-fable-5"));
+        assert_eq!(fable.relative_weekly_capacity, Some(0.5));
+        assert_eq!(fable.source.as_deref(), Some("anthropic_ratelimit_7d_oi"));
+    }
+
+    #[test]
     fn descriptor_maps_confirmed_provider_failure_to_availability() {
         let share = test_share(ProviderType::Codex, Some(42.0));
         let provider = test_provider(ProviderType::Codex);
@@ -2971,6 +3029,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            quota_window_observations: Default::default(),
         }
     }
 }

@@ -102,9 +102,21 @@ Claude 凭据显式区分 `refreshable_oauth` 与 `access_only_setup_token`。OA
 
 没有上游拒绝证据，因此 TLS ClientHello/header-order 模拟仍不实现；当前继续使用 rustls transport。
 
+## 响应头容量窗口
+
+Anthropic 的主动 `/api/oauth/usage` 响应不保证包含 Fable 独立周窗口。Server 因此在 managed Claude OAuth 的 Messages 共用响应头边界采样固定白名单：`anthropic-ratelimit-unified-{5h,7d,7d_oi}-{utilization,reset,status}`。该入口位于 JSON、SSE 和 429 分支之前；同一个上游响应只采样一次，采样或持久化失败不会改变代理响应。
+
+- utilization 只接受有限数值 `0..1.05`，轻微超限归一为 `1`；负数、NaN、无穷和明显异常值丢弃。精确 `status=rejected` 且没有 utilization 时可合成 `100%`。
+- reset 支持相对秒、epoch 秒/毫秒、RFC3339 和 HTTP-date；5h 与周窗口分别限制在 6 小时和 8 天的合理未来范围。缺 reset 的样本最多保留 1 小时。
+- 样本绑定请求实际使用的 Account ID 和 `authIdentityGeneration`，按窗口单调、部分合并；旧响应、旧身份和过期样本不能覆盖当前状态。token-only refresh 保留样本，重新登录/主体变化清空样本。
+- 主动 usage 中的同名 tier 始终优先；被动样本只补缺，不覆盖主动值。投影使用最新贡献样本更新 `queriedAt`。
+- `7d_oi` 映射为 `seven_day_fable`，并公开 `scope=model_family`、`capacityPool=claude_fable_7d_oi`、`modelFamily=claude-fable-5`、`relativeWeeklyCapacity=0.5` 与 `source=anthropic_ratelimit_7d_oi`。新鲜且无冲突的 Max 5x/20x 计划可以展示；计划为 stale/generic Max 时还必须有成功 Fable 请求或明确 Fable-only 429 的直接证据；明确 Free/Pro/Team/Enterprise 永不展示。
+
+普通样本保存在独立 quota observation 中，不写入代表“已耗尽并阻断”的 `capacity_pool_limits`。UI 继续复用 generation-aware `oauth-quota-updated`；首次出现、tier/reset 变化和跨入 100% 立即通知，普通百分比变化最多 30 秒通知一次。reset/TTL 到期会移除样本并通知 UI/Share 投影。所有行为只针对一个明确绑定账号，不引入账号池、选号或 fallback。
+
 ## 429 与响应编码
 
-Claude 429 不再默认升级为账号 cooldown：明确 unified 5h/7d `rejected` 会通过 AccountStore CAS 写当前账号 cooldown；只有 Fable 请求同时满足 `7d_oi=rejected` 且 5h/7d 均为 `allowed` 或 `allowed_warning`，才归为 Fable-only 并只写当前 Share+model cooldown。`unified=rejected` 或 `7d_oi=rejected` 但共享窗口缺失/不明确时保守归为账号 cooldown。普通 `Retry-After` 和未知 429 只写当前 Share+model cooldown；Fast credits/entitlement refusal 不写任何 cooldown。解析支持 RFC3339、epoch seconds、epoch milliseconds 和 HTTP-date，并对异常未来时间应用全局上限。429 不 replay、不换账号、不换 Provider、不换模型。
+Claude 429 不再默认升级为账号 cooldown：明确 unified 5h/7d `rejected` 会通过 AccountStore CAS 写当前账号 cooldown；只有 Fable 请求同时满足 `7d_oi=rejected` 且 5h/7d 均为 `allowed` 或 `allowed_warning`，才归为 Fable-only，并写入只阻断 Fable family 的账号 `claude_fable_7d_oi` capacity-pool marker；存在 Share 时同时写当前 Share+model cooldown。它不会阻断同账号的 Sonnet/Opus 等共享窗口模型。`unified=rejected` 或 `7d_oi=rejected` 但共享窗口缺失/不明确时保守归为账号 cooldown。普通 `Retry-After` 和未知 429 只写当前 Share+model cooldown；Fast credits/entitlement refusal 不写任何 cooldown。解析支持 RFC3339、epoch seconds、epoch milliseconds 和 HTTP-date，并对异常未来时间应用全局上限。429 不 replay、不换账号、不换 Provider、不换模型。
 
 统一响应解码支持 gzip/x-gzip、deflate、brotli 和 zstd，支持逗号分隔或重复 `Content-Encoding` 的最多 4 层堆叠；无 header 时只对强 gzip/zstd magic 做 sniff。每层和最终 body 均受累计大小限制。成功、错误、SSE 和 `count_tokens` 共用该治理入口；解码后失效的 `Content-Encoding`/`Content-Length` 不会继续透传。普通无压缩 SSE 只预读足够判断 magic 的最多 4 字节后继续增量转发，因此仍保留首事件、idle timeout 和客户端取消语义；只有明确压缩或强 magic 命中的 SSE 才在 64 MiB 上限内缓冲解码，截断、未知编码或解压超限返回不含上游正文的 `502`，不会透明重放。可用 `CC_SWITCH_RESPONSE_EXTENDED_DECODING=disabled` 关闭 br/zstd/magic 扩展，gzip/x-gzip/deflate 的既有显式编码解码仍保留。
 
@@ -154,6 +166,7 @@ Messages 的建连重放只发生在请求尚未到达可产生计费副作用�
 - `cc_switch_claude_wire_profile_info`：固定 wire profile、effective Claude Code version、身份来源与有界 `stale_override_rejected` 标签。
 - `cc_switch_claude_client_class_total`：按有界客户端分类和请求类型计数。
 - `cc_switch_claude_rate_limit_scope_total`：按 request、Share+model、account unified 作用域计数。
+- `cc_switch_claude_quota_header_observation_total{outcome}`：Messages 响应头 quota 样本的 absent/unmanaged/updated/unchanged/stale_identity 有界结果，不记录账号或 header 原值。
 - `cc_switch_claude_optional_rewrite_total`：只记录有界 rewrite 类型，不记录日期或工具名。
 - `cc_switch_claude_response_decoding_total{surface,result}`：按 `json`、`error`、`sse`、`count_tokens` 与有界解码结果计数，不记录编码正文或客户端值。
 

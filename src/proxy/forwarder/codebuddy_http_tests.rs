@@ -117,7 +117,7 @@ async fn codebuddy_config(
                         "name": "Fixture model",
                         "supportsToolCall": true,
                         "supportsReasoning": true,
-                        "reasoning": {"supportedEfforts": ["low", "high"]},
+                        "reasoning": {"defaultEffort":"high", "supportedEfforts": ["low", "medium", "high"]},
                         "maxInputTokens": 200000,
                         "maxOutputTokens": 8192
                     }]

@@ -126,6 +126,10 @@ export interface UseKiroOauthQuotaOptions {
   autoQuery?: boolean;
 }
 
+export interface UseCodeBuddyOauthQuotaOptions {
+  enabled?: boolean;
+}
+
 export function resolveCodexQuotaAuthProvider(): string {
   return PROVIDER_TYPES.CODEX_OAUTH;
 }
@@ -285,6 +289,38 @@ export function useKiroOauthQuota(
         "kiro_oauth",
         identity!.accountId,
         undefined,
+        undefined,
+        undefined,
+        identity!.authIdentityGeneration,
+      ),
+    enabled: enabled && identity != null,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+export function useCodeBuddyOauthQuota(
+  meta: ProviderMeta | undefined,
+  options: UseCodeBuddyOauthQuotaOptions = {},
+) {
+  const { enabled = true } = options;
+  const identity = resolveManagedAccountIdentity(
+    meta,
+    PROVIDER_TYPES.CODEBUDDY_OAUTH,
+  );
+  return useQuery({
+    queryKey: oauthQuotaAccountKey(
+      PROVIDER_TYPES.CODEBUDDY_OAUTH,
+      identity?.accountId,
+      identity?.authIdentityGeneration,
+    ),
+    queryFn: async () =>
+      fetchOauthQuotaWithFallback(
+        PROVIDER_TYPES.CODEBUDDY_OAUTH,
+        identity!.accountId,
+        meta?.providerType,
         undefined,
         undefined,
         identity!.authIdentityGeneration,

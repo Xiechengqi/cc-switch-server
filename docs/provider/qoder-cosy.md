@@ -11,9 +11,13 @@
 
 Device lifecycle 由官方 Global/CN `1.1.32` bundle 的固定摘要与 `assets/contract/qoder-cli-oracle.json` 共同冻结。两站都使用 UUID v4 nonce、S256 PKCE、1 秒 poll、300 秒 flow TTL，`GET /api/v1/deviceToken/poll` 的 404 表示 pending。Global machine ID 是 36 位小写 hex；CN machine ID 是 UUID v4，这两个格式不能互换。
 
+Device Flow 是控制面短生命周期状态，不是账号池：同一管理员 principal 对 `qoder_cosy` 同时只保留一个 active flow，新建时在 managed-auth guard 内原子替换旧 flow 与 owner binding；全局最多 64 条，超限按创建时间淘汰最旧项。成功结果只保留 60 秒用于幂等轮询，之后删除；poll lease 仍保证同一 code 不会并发兑换。
+
 账号 profile 读取、refresh/quota 与 session 创建共用同一个 site-aware machine-ID validator：Global 必须恰好 36 位且只能是小写 hex，CN 必须是 RFC 4122 variant 的 UUID v4；前后空白、错站格式、Global 大写 hex、错误 UUID version/variant 都在发网前拒绝。生成器仍分别生成对应格式，持久化数据不能借 `trim()` 或另一站格式蒙混通过。
 
 两站 Device OAuth refresh 都固定为 OpenAPI `POST /api/v1/deviceToken/refresh`，body 只有 `refresh_token`，header 只有 JSON Accept/Content-Type 与 `User-Agent: qoder/1.1.32`，不得携带 Authorization、COSY identity、Proxy Authorization 或路由账号头。响应主字段是 `device_token`、轮换后的 `refresh_token` 与 `expires_at`；旧 Global center `/algo/api/v3/user/jobToken` 不是 fallback。轮换 receipt 必须先 durable commit，随后才允许 userinfo/CN auth-status 完成 identity closure；失败结果未知或 identity drift 时 fail closed。
+
+CN 的 catalog、quota、auth-status 与 generation 都必须发送非空规范单播 IPv4 `cosy-clientip`。默认按目标路由询问内核选择本机出站 IPv4；remote-DNS proxy 令目标解析不可用时，仅用 UDP connect 的默认路由探测兜底（不发送数据报）；`CC_SWITCH_QODER_CN_CLIENT_IP` 可显式覆盖。Server 永不采信下游 `Forwarded`/`X-Forwarded-For`。Global 继续使用原 machine identity 规则，不进入 CN resolver。
 
 ## 动态模型目录与 capability
 
@@ -34,12 +38,15 @@ Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发�
 - oracle schema v2 独立冻结三 rail 的精确 origin/path/profile、完整 required/forbidden signed-header 集、encoding/signature vectors、cli2api/server projection 与 accepted-difference 原因。canonical synthetic Chat 保存去随机 UUID 后的完整 server body；Global/CN 都由生产 builder 生成后做整棵 JSON exact equality，任意额外、缺失、改型或移位字段都会失败。
 - session single-flight 创建并按完整 runtime/account/generation scope 缓存。conversation id 还包含 Share、签名用户与模型，复用的外部 session id 不能跨 scope 命中。
 - Claude Messages、OpenAI Responses/Chat 和 Gemini 三类输入归一到同一 COSY conversation contract，再按原 Surface 输出。声明工具、reasoning、usage 和 terminal 事件使用同一个 model capability 与严格 SSE 状态机。
+- bounded response compatibility 接受 OpenAI `choices[].delta/message`、content block 数组、reasoning/usage 别名，以及 `content_block_delta`、`tool_use_start/delta`、`tool_call_delta`、`message_delta/stop` envelope，再统一成 Chat chunk。空 placeholder tool call 会丢弃；非字符串 arguments 规范编码为 JSON。该兼容面来自 TokenRouter `5f94cbcf2d1f4e74badf449c192c1431dc4e5c8e` 与 cli2api `b67278960df9c160d45a7520ee3110b5ccb84126` 的只读交叉证据，不改变官方 wire/header/terminal oracle。
+- 历史工具调用只在当前 assistant batch 内关联：missing/duplicate call id 确定性修复，未知历史工具及其结果成对过滤，orphan/重复 result 丢弃，parallel result 按调用顺序输出；result 缺 id 时仅在唯一未消费 call 场景推断，多义输入直接 400，不猜测也不跨 batch 绑定。
 - authoritative finish reason 或上游 `[DONE]` 只标记候选终态。decoder 必须继续读取到上游 EOF，期间第二个 terminal、任何业务数据或 auth error 都失败；只有 EOF 验证通过后才向下游输出唯一一次完成事件。
 - 下游业务输出提交前的 401 可按上述一次预算恢复；提交后的 401、断流、重复或畸形 terminal 只能结束当前流，不能重放。
+- OAuth 与数据面错误区分 invalid grant、authentication、permission、rate limit、temporary 与 protocol。只有明确 invalid-grant 证据或 401 触发重新登录；普通 400 与默认 403 不伪装成凭据失效。`retry-after-ms`、`Retry-After` 秒数/HTTP-date 统一解析并限制在 24 小时。上游 JSON 错误按深度/节点上限递归脱敏 token、Authorization/Cookie、COSY key、machine token、uid/aid/org id，日志和指标只记录有限分类，不记录敏感值或 IP。
 
 ## 验收边界
 
-oracle `verification` 是验证计数单源：56 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、session/provider/account generation fencing、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；8 项 Node mutation 固定 coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 56/8/7，不再维护手写副本。
+oracle `verification` 是验证计数单源：63 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、响应 envelope、工具历史、Device Flow 容量、session/provider/account generation fencing、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；9 项 Node mutation 还冻结 bounded compatibility、安全边界、coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 63/9/7，不再维护手写副本。
 
 `scripts/smoke/qoder-real.mjs` 按 `global_oauth`、`global_pat`、`cn_oauth` 一次只运行一条 rail。它先核对三个 Surface Provider 固定同一 Account generation，再验收 fresh catalog、quota、三 Surface non-stream/stream/tool/usage/唯一终态，并把 commit、site/rail、generation、摘要与三个 decoy 零计数写入仓库外 0600 receipt。`scripts/audit/qoder-real.test.mjs` 的 loopback 结果固定为 `contract_verified/live_pending`，不能替代真实 receipt。
 

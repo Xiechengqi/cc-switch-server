@@ -16,6 +16,7 @@ import type {
 
 import AntigravityOauthQuotaFooter from "@/components/AntigravityOauthQuotaFooter";
 import ClaudeOauthQuotaFooter from "@/components/ClaudeOauthQuotaFooter";
+import CodeBuddyOauthQuotaFooter from "@/components/CodeBuddyOauthQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CursorOauthQuotaFooter from "@/components/CursorOauthQuotaFooter";
@@ -83,6 +84,9 @@ function BundleQuotaSummary({
   }
   if (quotaSource === "claude_oauth") {
     return <ClaudeOauthQuotaFooter meta={provider.meta} inline />;
+  }
+  if (quotaSource === "codebuddy_oauth") {
+    return <CodeBuddyOauthQuotaFooter meta={provider.meta} inline />;
   }
   if (quotaSource === "google_gemini_oauth") {
     return <GeminiOauthQuotaFooter meta={provider.meta} inline />;

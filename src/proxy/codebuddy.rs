@@ -217,26 +217,26 @@ impl CodeBuddySseDecoder {
     ) -> Result<(), CodeBuddySseDecodeError> {
         let text = std::str::from_utf8(event)
             .map_err(|_| ProxyError::bad_gateway("CodeBuddy SSE event is not UTF-8"))?;
-        let mut data = None;
-        for line in text.lines() {
+        let mut data_lines = Vec::new();
+        for line in text.split(['\n', '\r']) {
             let line = line.trim_end_matches('\r');
             if let Some(value) = line.strip_prefix("data:") {
-                if data.is_some() {
-                    return Err(ProxyError::bad_gateway(
-                        "CodeBuddy SSE event contains multiple data lines",
-                    )
-                    .into());
-                }
-                data = Some(value.trim_start());
-            } else if !line.is_empty() && !line.starts_with(':') && !line.starts_with("event:") {
+                data_lines.push(value.trim_start());
+            } else if !line.is_empty()
+                && !line.starts_with(':')
+                && !line.starts_with("event:")
+                && !line.starts_with("id:")
+                && !line.starts_with("retry:")
+            {
                 return Err(
                     ProxyError::bad_gateway("CodeBuddy SSE contains an unsupported field").into(),
                 );
             }
         }
-        let Some(data) = data else {
+        if data_lines.is_empty() {
             return Ok(());
-        };
+        }
+        let data = data_lines.join("\n");
         if data == "[DONE]" {
             if self.saw_done {
                 return Err(
@@ -249,7 +249,7 @@ impl CodeBuddySseDecoder {
         if self.saw_done {
             return Err(ProxyError::bad_gateway("CodeBuddy SSE emitted data after [DONE]").into());
         }
-        let value = serde_json::from_str::<Value>(data).map_err(|error| {
+        let value = serde_json::from_str::<Value>(&data).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid CodeBuddy SSE chunk: {error}"))
         })?;
         if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
@@ -691,13 +691,11 @@ fn recursive_business_code(value: &Value, depth: usize) -> Option<i64> {
 fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
     let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
+    let cr = buffer.windows(2).position(|window| window == b"\r\r");
+    [(lf, 2), (crlf, 4), (cr, 2)]
+        .into_iter()
+        .filter_map(|(position, delimiter)| position.map(|position| (position, delimiter)))
+        .min_by_key(|(position, _)| *position)
 }
 
 fn integer_value(value: &Value) -> Option<i64> {
@@ -761,6 +759,21 @@ mod tests {
         assert!(decoder
             .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
             .is_err());
+    }
+
+    #[test]
+    fn decoder_accepts_standard_multiline_data_single_cr_and_liveness_fields() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        let output = decoder
+            .push_classified(Bytes::from_static(
+                b": keepalive\rid: 1\revent: message\rdata: {\rdata: \"choices\":[]}\r\rdata: [DONE]\r\r",
+            ))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("\"choices\":[]"));
+        assert_eq!(
+            decoder.finish_classified().unwrap(),
+            Bytes::from_static(b"data: [DONE]\n\n")
+        );
     }
 
     #[test]

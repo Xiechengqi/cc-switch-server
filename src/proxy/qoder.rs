@@ -17,6 +17,7 @@ pub struct QoderUpstreamError {
     pub code: Option<String>,
     pub message: String,
     pub agent_limit_reset_at_ms: Option<i64>,
+    pub retry_after_ms: Option<i64>,
 }
 
 impl QoderUpstreamError {
@@ -41,12 +42,31 @@ impl QoderUpstreamError {
             .or_else(|| value.pointer("/data/agentLimitResetTime"))
             .and_then(integer_value)
             .filter(|value| *value > 0);
-        Self {
+        let error = Self {
             status,
             code,
             message,
             agent_limit_reset_at_ms,
-        }
+            retry_after_ms: None,
+        };
+        crate::metrics::record_qoder_error(if error.is_agent_limited() {
+            "rate_limited"
+        } else if error.is_entitlement_denied() {
+            "permission"
+        } else if error.is_authentication_failure() {
+            "authentication"
+        } else if status >= 500 {
+            "temporary"
+        } else {
+            "upstream_protocol"
+        });
+        error
+    }
+
+    pub fn from_response(status: u16, headers: &axum::http::HeaderMap, body: &[u8]) -> Self {
+        let mut error = Self::from_status_body(status, body);
+        error.retry_after_ms = parse_qoder_retry_after_ms(headers);
+        error
     }
 
     pub fn downstream_status(&self) -> axum::http::StatusCode {
@@ -62,7 +82,7 @@ impl QoderUpstreamError {
     }
 
     pub fn is_authentication_failure(&self) -> bool {
-        matches!(self.status, 401 | 403) && !matches!(self.code.as_deref(), Some("112" | "115"))
+        self.status == 401 && !matches!(self.code.as_deref(), Some("112" | "115"))
     }
 
     pub fn is_entitlement_denied(&self) -> bool {
@@ -74,12 +94,28 @@ impl QoderUpstreamError {
     }
 
     pub fn into_proxy_error(self) -> ProxyError {
+        let downstream_status = self.downstream_status();
+        let rate_limited = self.is_agent_limited() || downstream_status.as_u16() == 429;
+        let message = match self.code.as_deref() {
+            Some(code) => format!("Qoder upstream error {code}: {}", self.message),
+            None => self.message,
+        };
+        if rate_limited {
+            let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            let retry_after_ms = self.retry_after_ms.or_else(|| {
+                self.agent_limit_reset_at_ms
+                    .map(|reset| reset.saturating_sub(now_ms))
+            });
+            let seconds = retry_after_ms
+                .unwrap_or(1_000)
+                .clamp(1_000, 24 * 60 * 60 * 1_000)
+                .saturating_add(999) as u64
+                / 1_000;
+            return ProxyError::rate_limited(message, seconds.max(1));
+        }
         ProxyError {
-            status: self.downstream_status(),
-            message: match self.code.as_deref() {
-                Some(code) => format!("Qoder upstream error {code}: {}", self.message),
-                None => self.message,
-            },
+            status: downstream_status,
+            message,
         }
     }
 }
@@ -159,6 +195,7 @@ impl QoderSseDecoder {
         }
         let mut output = self.drain(true)?.to_vec();
         if !self.saw_terminal {
+            crate::metrics::record_qoder_error("terminal_missing");
             return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
                 "Qoder SSE ended without an authoritative terminal event",
             )));
@@ -223,6 +260,7 @@ impl QoderSseDecoder {
             return self.mark_terminal();
         }
         if self.saw_terminal {
+            crate::metrics::record_qoder_error("data_after_terminal");
             return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
                 "Qoder SSE emitted data after its terminal event",
             )));
@@ -255,11 +293,14 @@ impl QoderSseDecoder {
         }
         let value = serde_json::from_str::<Value>(inner)
             .map_err(|error| ProxyError::bad_gateway(format!("invalid Qoder SSE body: {error}")))?;
-        let canonical = serde_json::to_vec(&value)
-            .map_err(|error| ProxyError::bad_gateway(format!("encode Qoder SSE body: {error}")))?;
-        output.extend_from_slice(b"data: ");
-        output.extend_from_slice(&canonical);
-        output.extend_from_slice(b"\n\n");
+        for canonical in canonicalize_qoder_inner(&value)? {
+            let canonical = serde_json::to_vec(&canonical).map_err(|error| {
+                ProxyError::bad_gateway(format!("encode Qoder SSE body: {error}"))
+            })?;
+            output.extend_from_slice(b"data: ");
+            output.extend_from_slice(&canonical);
+            output.extend_from_slice(b"\n\n");
+        }
         if qoder_inner_is_terminal(&value) {
             self.mark_terminal()?;
         }
@@ -268,6 +309,7 @@ impl QoderSseDecoder {
 
     fn mark_terminal(&mut self) -> Result<(), QoderSseDecodeError> {
         if self.saw_terminal {
+            crate::metrics::record_qoder_error("terminal_duplicate");
             return Err(QoderSseDecodeError::Protocol(ProxyError::bad_gateway(
                 "Qoder SSE emitted a second terminal event",
             )));
@@ -275,6 +317,404 @@ impl QoderSseDecoder {
         self.saw_terminal = true;
         Ok(())
     }
+}
+
+fn canonicalize_qoder_inner(value: &Value) -> Result<Vec<Value>, ProxyError> {
+    if value.get("choices").is_some() {
+        return Ok(vec![canonicalize_openai_chat_chunk(value)?]);
+    }
+    let event = value
+        .get("event")
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let data = value
+        .get("data")
+        .or_else(|| value.get("delta"))
+        .unwrap_or(&Value::Null);
+    let index = value.get("index").and_then(integer_value).unwrap_or(0);
+    let chunk = match event {
+        "content_block_delta" => {
+            let kind = data.get("type").and_then(Value::as_str).unwrap_or_default();
+            if kind == "input_json_delta" {
+                let Some(call) = canonical_qoder_tool_call(data, index.max(0) as usize)? else {
+                    return Ok(Vec::new());
+                };
+                crate::metrics::record_qoder_compatibility("tool_use_delta");
+                return Ok(vec![qoder_chat_chunk(
+                    value,
+                    json!([{"index":0,"delta":{"tool_calls":[call]},"finish_reason":null}]),
+                    None,
+                )]);
+            }
+            let text = data.get("text").and_then(Value::as_str).unwrap_or_default();
+            if text.is_empty() {
+                return Ok(Vec::new());
+            }
+            crate::metrics::record_qoder_compatibility("content_block_delta");
+            let delta = if kind == "thinking_delta" {
+                json!({"reasoning_content": text})
+            } else {
+                json!({"content": text})
+            };
+            qoder_chat_chunk(
+                value,
+                json!([{"index":0,"delta":delta,"finish_reason":null}]),
+                None,
+            )
+        }
+        "content_block_start" | "tool_use_start" | "tool_use_delta" | "tool_call_delta" => {
+            let tool = value
+                .get("content_block")
+                .or_else(|| value.get("data"))
+                .or_else(|| value.get("delta"))
+                .unwrap_or(&Value::Null);
+            if event == "content_block_start"
+                && tool.get("type").and_then(Value::as_str) != Some("tool_use")
+            {
+                return Ok(Vec::new());
+            }
+            let Some(call) = canonical_qoder_tool_call(tool, index.max(0) as usize)? else {
+                return Ok(Vec::new());
+            };
+            crate::metrics::record_qoder_compatibility(if event == "tool_use_start" {
+                "tool_use_start"
+            } else if event == "content_block_start" {
+                "content_block_start"
+            } else {
+                "tool_use_delta"
+            });
+            qoder_chat_chunk(
+                value,
+                json!([{"index":0,"delta":{"tool_calls":[call]},"finish_reason":null}]),
+                None,
+            )
+        }
+        "message_delta" => {
+            let usage = canonical_qoder_usage(value.get("usage").or_else(|| data.get("usage")));
+            let finish_reason = data
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .and_then(qoder_finish_reason);
+            if usage.is_none() && finish_reason.is_none() {
+                return Ok(Vec::new());
+            }
+            crate::metrics::record_qoder_compatibility("message_delta_usage");
+            let choices = finish_reason.map_or_else(
+                || json!([]),
+                |reason| json!([{"index":0,"delta":{},"finish_reason":reason}]),
+            );
+            qoder_chat_chunk(value, choices, usage)
+        }
+        "message_start" => {
+            let usage = canonical_qoder_usage(
+                value
+                    .pointer("/message/usage")
+                    .or_else(|| data.get("usage")),
+            );
+            if usage.is_none() {
+                return Ok(Vec::new());
+            }
+            crate::metrics::record_qoder_compatibility("message_start_usage");
+            qoder_chat_chunk(value, json!([]), usage)
+        }
+        "message_stop" => {
+            crate::metrics::record_qoder_compatibility("message_stop");
+            qoder_chat_chunk(value, json!([]), None)
+        }
+        "content_block_stop" | "ping" => {
+            crate::metrics::record_qoder_compatibility("control_event_dropped");
+            return Ok(Vec::new());
+        }
+        _ if value.get("usage").is_some() => {
+            qoder_chat_chunk(value, json!([]), canonical_qoder_usage(value.get("usage")))
+        }
+        _ => value.clone(),
+    };
+    Ok(vec![chunk])
+}
+
+fn canonicalize_openai_chat_chunk(value: &Value) -> Result<Value, ProxyError> {
+    let mut output = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat chunk must be an object"))?;
+    let choices = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat choices must be an array"))?;
+    let mut normalized = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let object = choice
+            .as_object()
+            .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat choice must be an object"))?;
+        let index = object.get("index").and_then(integer_value).unwrap_or(0);
+        let source = object
+            .get("delta")
+            .or_else(|| object.get("message"))
+            .unwrap_or(&Value::Null);
+        let delta = canonical_qoder_message_delta(source)?;
+        let mut target = object.clone();
+        target.insert("index".to_string(), Value::Number(index.into()));
+        target.insert("delta".to_string(), delta);
+        target.remove("message");
+        normalized.push(Value::Object(target));
+    }
+    output.insert("choices".to_string(), Value::Array(normalized));
+    if let Some(usage) = canonical_qoder_usage(value.get("usage")) {
+        output.insert("usage".to_string(), usage);
+    }
+    Ok(Value::Object(output))
+}
+
+fn canonical_qoder_message_delta(value: &Value) -> Result<Value, ProxyError> {
+    if value.is_null() {
+        return Ok(json!({}));
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat delta/message must be an object"))?;
+    let mut delta = object.clone();
+    if let Some(content) = canonical_qoder_content(object.get("content"))? {
+        delta.insert("content".to_string(), Value::String(content));
+    }
+    if let Some(reasoning) = object
+        .get("reasoning_content")
+        .or_else(|| object.get("reasoning_text"))
+        .or_else(|| object.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        delta.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning.to_string()),
+        );
+    }
+    if let Some(calls) = object.get("tool_calls") {
+        let calls = calls
+            .as_array()
+            .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat tool_calls must be an array"))?;
+        let mut normalized = Vec::new();
+        for (position, call) in calls.iter().enumerate() {
+            let index = call
+                .get("index")
+                .and_then(integer_value)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(position);
+            if let Some(call) = canonical_qoder_tool_call(call, index)? {
+                normalized.push(call);
+            }
+        }
+        delta.insert("tool_calls".to_string(), Value::Array(normalized));
+    }
+    Ok(Value::Object(delta))
+}
+
+fn canonical_qoder_content(value: Option<&Value>) -> Result<Option<String>, ProxyError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Array(parts)) => {
+            let mut text = Vec::new();
+            for part in parts {
+                let object = part.as_object().ok_or_else(|| {
+                    ProxyError::bad_gateway("Qoder Chat content block must be an object")
+                })?;
+                if object.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(value) = object.get("text").and_then(Value::as_str) {
+                        text.push(value);
+                    }
+                }
+            }
+            crate::metrics::record_qoder_compatibility("message_content_blocks");
+            Ok(Some(text.join("\n")))
+        }
+        Some(_) => Err(ProxyError::bad_gateway(
+            "Qoder Chat content must be text, blocks, or null",
+        )),
+    }
+}
+
+fn canonical_qoder_tool_call(value: &Value, index: usize) -> Result<Option<Value>, ProxyError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProxyError::bad_gateway("Qoder Chat tool call must be an object"))?;
+    let function = object.get("function").and_then(Value::as_object);
+    let id = first_qoder_string(object, &["id", "tool_call_id", "call_id"]);
+    let name = function
+        .and_then(|function| first_qoder_string(function, &["name"]))
+        .or_else(|| first_qoder_string(object, &["name", "tool_name"]));
+    let argument_value = function
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| object.get("arguments"))
+        .or_else(|| object.get("input"))
+        .or_else(|| object.get("parameters"))
+        .or_else(|| object.get("partial_json"));
+    let empty_tool_use_start = object.get("type").and_then(Value::as_str) == Some("tool_use")
+        && argument_value
+            .is_some_and(|value| value.as_object().is_some_and(|value| value.is_empty()));
+    let arguments = if empty_tool_use_start {
+        None
+    } else {
+        argument_value.map(qoder_argument_fragment).transpose()?
+    };
+    if id.is_none() && name.is_none() && arguments.as_deref().is_none_or(str::is_empty) {
+        crate::metrics::record_qoder_compatibility("placeholder_tool_call_dropped");
+        return Ok(None);
+    }
+    let call_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|value| match value {
+            "" | "tool_use" | "tool_call" | "input_json_delta" => "function",
+            value => value,
+        })
+        .unwrap_or("function");
+    let mut call = json!({
+        "index": index,
+        "type": call_type,
+        "function": {
+            "name": name.unwrap_or_default(),
+            "arguments": arguments.unwrap_or_default()
+        }
+    });
+    if let Some(id) = id {
+        call["id"] = Value::String(id.to_string());
+    }
+    Ok(Some(call))
+}
+
+fn qoder_argument_fragment(value: &Value) -> Result<String, ProxyError> {
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::String(value) => Ok(value.clone()),
+        value => serde_json::to_string(value)
+            .map_err(|error| ProxyError::bad_gateway(format!("encode Qoder tool input: {error}"))),
+    }
+}
+
+fn qoder_finish_reason(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "end_turn" | "stop_sequence" | "stop" => Some("stop"),
+        "tool_use" | "tool_calls" => Some("tool_calls"),
+        "max_tokens" | "length" => Some("length"),
+        _ => None,
+    }
+}
+
+fn first_qoder_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn canonical_qoder_usage(value: Option<&Value>) -> Option<Value> {
+    let object = value?.as_object()?;
+    let prompt = qoder_token_value(object, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
+    let completion =
+        qoder_token_value(object, &["completion_tokens", "output_tokens"]).unwrap_or(0);
+    let total = qoder_token_value(object, &["total_tokens"])
+        .unwrap_or_else(|| prompt.saturating_add(completion));
+    let mut usage = json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total
+    });
+    for key in ["prompt_tokens_details", "completion_tokens_details"] {
+        if let Some(details) = object.get(key).filter(|value| value.is_object()) {
+            usage[key] = details.clone();
+        }
+    }
+    Some(usage)
+}
+
+fn merge_qoder_usage(current: Option<Value>, incoming: &Value) -> Value {
+    let Some(current) = current else {
+        return incoming.clone();
+    };
+    let prompt = current
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            incoming
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    let completion = current
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            incoming
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    let total = current
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            incoming
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+        .max(prompt.saturating_add(completion));
+    let mut merged = incoming.as_object().cloned().unwrap_or_default();
+    merged.insert("prompt_tokens".to_string(), Value::Number(prompt.into()));
+    merged.insert(
+        "completion_tokens".to_string(),
+        Value::Number(completion.into()),
+    );
+    merged.insert("total_tokens".to_string(), Value::Number(total.into()));
+    Value::Object(merged)
+}
+
+fn qoder_token_value(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| match object.get(*key)? {
+        Value::Number(value) => value.as_u64().or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| *value >= 0.0)
+                .map(|value| value as u64)
+        }),
+        Value::String(value) => value.trim().parse::<u64>().ok().or_else(|| {
+            value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| *value >= 0.0)
+                .map(|value| value as u64)
+        }),
+        _ => None,
+    })
+}
+
+fn qoder_chat_chunk(value: &Value, choices: Value, usage: Option<Value>) -> Value {
+    let mut chunk = serde_json::Map::new();
+    for key in ["id", "created", "model"] {
+        if let Some(field) = value.get(key) {
+            chunk.insert(key.to_string(), field.clone());
+        }
+    }
+    chunk.insert(
+        "object".to_string(),
+        Value::String("chat.completion.chunk".to_string()),
+    );
+    chunk.insert("choices".to_string(), choices);
+    if let Some(usage) = usage {
+        chunk.insert("usage".to_string(), usage);
+    }
+    Value::Object(chunk)
 }
 
 #[derive(Debug, Default)]
@@ -471,7 +911,7 @@ impl QoderChatSseAggregator {
                     "Qoder Chat SSE usage must be an object",
                 ));
             }
-            self.usage = Some(usage.clone());
+            self.usage = Some(merge_qoder_usage(self.usage.take(), usage));
         }
         let choices = object
             .get("choices")
@@ -685,28 +1125,111 @@ fn integer_value(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
+fn parse_qoder_retry_after_ms(headers: &axum::http::HeaderMap) -> Option<i64> {
+    const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+    if let Some(value) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        return Some(value.clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let value = headers
+        .get(axum::http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Some(seconds.saturating_mul(1_000).clamp(0, MAX_RETRY_AFTER_MS));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+            .as_millis()
+            .min(MAX_RETRY_AFTER_MS as u128) as i64,
+    )
+}
+
 fn sanitize_error_message(value: &str) -> String {
-    let mut message = value
+    let mut nodes = 0usize;
+    let structured = serde_json::from_str::<Value>(value).ok().map(|mut value| {
+        redact_qoder_error_value(&mut value, 0, &mut nodes);
+        match value {
+            Value::String(value) => value,
+            value => serde_json::to_string(&value).unwrap_or_default(),
+        }
+    });
+    let message = structured.unwrap_or_else(|| value.to_string());
+    crate::logging::redact_sensitive_text(&message)
         .chars()
         .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
         .take(MAX_QODER_ERROR_MESSAGE_BYTES)
-        .collect::<String>();
-    for marker in [
-        "Bearer ",
-        "security_oauth_token",
-        "refresh_token",
-        "personal_token",
-    ] {
-        if let Some(position) = message
-            .to_ascii_lowercase()
-            .find(&marker.to_ascii_lowercase())
-        {
-            message.truncate(position);
-            message.push_str("[redacted]");
-            break;
-        }
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn redact_qoder_error_value(value: &mut Value, depth: usize, nodes: &mut usize) {
+    const MAX_DEPTH: usize = 8;
+    const MAX_NODES: usize = 256;
+    *nodes = nodes.saturating_add(1);
+    if depth >= MAX_DEPTH || *nodes > MAX_NODES {
+        *value = Value::String("[REDACTED_TRUNCATED]".to_string());
+        return;
     }
-    message.trim().to_string()
+    match value {
+        Value::Object(object) => {
+            for (key, item) in object {
+                let normalized = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if matches!(
+                    normalized.as_str(),
+                    "authorization"
+                        | "cookie"
+                        | "setcookie"
+                        | "cosykey"
+                        | "securityoauthtoken"
+                        | "token"
+                        | "accesstoken"
+                        | "devicetoken"
+                        | "refreshtoken"
+                        | "jobtoken"
+                        | "personaltoken"
+                        | "machinetoken"
+                        | "uid"
+                        | "aid"
+                        | "orgid"
+                        | "organizationid"
+                ) {
+                    *item = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_qoder_error_value(item, depth + 1, nodes);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for item in values {
+                redact_qoder_error_value(item, depth + 1, nodes);
+            }
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if let Ok(mut nested) = serde_json::from_str::<Value>(trimmed) {
+                    redact_qoder_error_value(&mut nested, depth + 1, nodes);
+                    *text = serde_json::to_string(&nested).unwrap_or_default();
+                    return;
+                }
+            }
+            *text = crate::logging::redact_sensitive_text(text);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 fn qoder_status_name(value: &str) -> Option<u16> {
@@ -908,6 +1431,37 @@ mod tests {
 
         let auth = QoderUpstreamError::from_status_body(401, br#"{"message":"login expired"}"#);
         assert!(auth.is_authentication_failure());
+        let permission = QoderUpstreamError::from_status_body(403, br#"{"message":"denied"}"#);
+        assert!(!permission.is_authentication_failure());
+        assert_eq!(
+            permission.downstream_status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn qoder_error_retry_after_and_recursive_redaction_are_bounded() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("retry-after-ms", "2500".parse().unwrap());
+        let limited =
+            QoderUpstreamError::from_response(429, &headers, br#"{"message":"slow down"}"#);
+        assert_eq!(limited.retry_after_ms, Some(2_500));
+
+        let secret = r#"{"message":"safe","securityOauthToken":"oauth-secret","nested":{"refresh_token":"refresh-secret","uid":"user-secret","body":"{\"cosy-key\":\"cosy-secret\",\"organizationId\":\"org-secret\"}"},"headers":{"Authorization":"Bearer bearer-secret","Set-Cookie":"session=cookie-secret"}}"#;
+        let sanitized = sanitize_error_message(secret);
+        for leaked in [
+            "oauth-secret",
+            "refresh-secret",
+            "user-secret",
+            "cosy-secret",
+            "org-secret",
+            "bearer-secret",
+            "cookie-secret",
+        ] {
+            assert!(!sanitized.contains(leaked), "leaked {leaked}");
+        }
+        assert!(sanitized.contains("safe"));
+        assert!(sanitized.contains("REDACTED"));
     }
 
     #[test]
@@ -1066,5 +1620,126 @@ mod tests {
             ))
             .unwrap();
         assert!(invalid.finish("model", 1).is_err());
+    }
+
+    #[test]
+    fn qoder_decoder_normalizes_anthropic_style_envelopes_without_weakening_eof() {
+        let events = [
+            json!({"event":"content_block_delta","data":{"type":"thinking_delta","text":"plan "}}),
+            json!({"event":"content_block_delta","data":{"type":"text_delta","text":"hello"}}),
+            json!({"event":"tool_use_start","index":0,"data":{"id":"call_1","name":"lookup","type":"tool_use"}}),
+            json!({"event":"tool_use_delta","index":0,"data":{"arguments":{"q":"x"}}}),
+            json!({"event":"message_delta","data":{"usage":{"input_tokens":"3","output_tokens":4.9}}}),
+            json!({"event":"message_stop"}),
+        ];
+        let mut decoder = QoderSseDecoder::default();
+        let mut aggregator = QoderChatSseAggregator::default();
+        for event in events {
+            let output = decoder
+                .push(wrapped_qoder_event(200, &event.to_string()))
+                .unwrap();
+            aggregator.push(output).unwrap();
+        }
+        assert!(!decoder.is_terminal());
+        aggregator.push(decoder.finish().unwrap()).unwrap();
+        let response = aggregator.finish("fallback", 9).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            "plan "
+        );
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"x\"}"
+        );
+        assert_eq!(response["usage"]["prompt_tokens"], 3);
+        assert_eq!(response["usage"]["completion_tokens"], 4);
+        assert_eq!(response["usage"]["total_tokens"], 7);
+
+        let standard = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_2","name":"lookup","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"y\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"world"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut decoder = QoderSseDecoder::default();
+        let mut aggregator = QoderChatSseAggregator::default();
+        for event in standard {
+            aggregator
+                .push(
+                    decoder
+                        .push(wrapped_qoder_event(200, &event.to_string()))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        aggregator.push(decoder.finish().unwrap()).unwrap();
+        let response = aggregator.finish("fallback", 9).unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "world");
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_2"
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"y\"}"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(response["usage"]["prompt_tokens"], 3);
+        assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn qoder_decoder_normalizes_final_messages_aliases_and_placeholders() {
+        let inner = json!({
+            "id":"chat-final",
+            "choices":[{
+                "index":"0",
+                "message":{
+                    "content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],
+                    "reasoning_text":"reason",
+                    "tool_calls":[
+                        {"tool_call_id":"call-a","tool_name":"run","input":{"x":1}},
+                        {"type":"function"}
+                    ]
+                },
+                "finish_reason":"tool_calls"
+            }],
+            "usage":{"input_tokens":"2.0","output_tokens":"3","total_tokens":"5"}
+        });
+        let mut decoder = QoderSseDecoder::default();
+        let canonical = decoder
+            .push(wrapped_qoder_event(200, &inner.to_string()))
+            .unwrap();
+        let text = String::from_utf8(canonical.to_vec()).unwrap();
+        assert!(
+            text.contains("\\\"content\\\":\\\"a\\\\nb\\\"")
+                || text.contains("\"content\":\"a\\nb\"")
+        );
+        let mut aggregator = QoderChatSseAggregator::default();
+        aggregator.push(Bytes::from(text)).unwrap();
+        aggregator.push(decoder.finish().unwrap()).unwrap();
+        let response = aggregator.finish("fallback", 9).unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "a\nb");
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            "reason"
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(response["usage"]["total_tokens"], 5);
     }
 }

@@ -32,7 +32,8 @@ use crate::domain::accounts::claude_subscription::{
 };
 use crate::domain::accounts::store::{
     effective_codex_workspace_id, grok_account_capability_enabled, AccountStore,
-    GrokAccountCapability, CLAUDE_FABLE_CAPACITY_POOL,
+    GrokAccountCapability, CLAUDE_FABLE_CAPACITY_POOL, CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
+    CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
 };
 use crate::domain::health::ProviderRequestOutcome as ProviderOutcome;
 use crate::domain::providers::bundle::surface_enabled;
@@ -66,6 +67,10 @@ use super::anthropic_semantics::{
     self, AnthropicJsonObservation, AnthropicObservation, AnthropicSseInspector, AnthropicTerminal,
 };
 use super::claude_oauth::ClaudeBodyRetryStage;
+use super::claude_quota_headers::{
+    claude_fable_only_rejected, header_lower, parse_anthropic_reset_header,
+    parse_claude_quota_headers,
+};
 use super::cursor;
 use super::deepseek;
 use super::kimi_runtime::{
@@ -113,6 +118,8 @@ use super::usage::{
     update_websocket_stream_usage,
 };
 use super::{setting, ProxyConcurrencyScope, ProxyError};
+#[cfg(test)]
+use crate::domain::accounts::store::{active_account_capacity_pool_limit, CLAUDE_FABLE_QUOTA_TIER};
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
@@ -2041,6 +2048,15 @@ async fn forward_with_attempt(
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
+        maybe_record_claude_quota_response_headers(
+            &state,
+            &execution,
+            route,
+            status,
+            &response_headers,
+            final_model.as_deref(),
+        )
+        .await;
         if matches!(
             status,
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
@@ -2148,6 +2164,15 @@ async fn forward_with_attempt(
                             status_code = status.as_u16();
                             response_headers = upstream.headers().clone();
                             strip_hop_by_hop_response_headers(&mut response_headers);
+                            maybe_record_claude_quota_response_headers(
+                                &state,
+                                &execution,
+                                route,
+                                status,
+                                &response_headers,
+                                final_model.as_deref(),
+                            )
+                            .await;
                             maybe_update_grok_entitlement(&state, &execution, &response_headers)
                                 .await;
                             maybe_mark_grok_cooldown(&state, &execution, status, &response_headers)
@@ -13364,6 +13389,51 @@ fn websocket_proxy_error_body(error: &ProxyError) -> String {
     .to_string()
 }
 
+async fn maybe_record_claude_quota_response_headers(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    route: ProxyRoute,
+    status: StatusCode,
+    headers: &HeaderMap,
+    model: Option<&str>,
+) {
+    if route != ProxyRoute::ClaudeMessages
+        || execution.stored.provider_type != ProviderType::ClaudeOAuth
+    {
+        return;
+    }
+    let Some((provider_type, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        crate::metrics::record_claude_quota_header_observation("unmanaged");
+        return;
+    };
+    if provider_type != ProviderType::ClaudeOAuth {
+        return;
+    }
+    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let observations = parse_claude_quota_headers(
+        headers,
+        status,
+        model.is_some_and(is_claude_fable_5_model),
+        now_ms,
+    );
+    if observations.is_empty() {
+        crate::metrics::record_claude_quota_header_observation("absent");
+        return;
+    }
+    let commit = state
+        .record_claude_quota_window_observations_if_current(
+            account_id,
+            provider_type,
+            auth_identity_generation,
+            observations,
+            now_ms,
+        )
+        .await;
+    crate::metrics::record_claude_quota_header_observation(commit.metric_label());
+}
+
 async fn maybe_mark_upstream_rate_limited(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -13556,23 +13626,34 @@ fn classify_claude_rate_limit(
     let status_7d_oi = header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status");
     let account_window_rejected =
         status_5h.as_deref() == Some("rejected") || status_7d.as_deref() == Some("rejected");
-    let fable_only_rejected = fable_request
-        && status_7d_oi.as_deref() == Some("rejected")
-        && claude_shared_window_allowed(status_5h.as_deref())
-        && claude_shared_window_allowed(status_7d.as_deref());
+    let fable_only_rejected = claude_fable_only_rejected(headers, fable_request);
     let account_rejected = account_window_rejected
         || (status_7d_oi.as_deref() == Some("rejected") && !fable_only_rejected)
         || (unified.as_deref() == Some("rejected") && !fable_only_rejected);
     let mut effects = ClaudeRateLimitEffects::default();
     if account_rejected {
         let until = [
-            "anthropic-ratelimit-unified-reset",
-            "anthropic-ratelimit-unified-5h-reset",
-            "anthropic-ratelimit-unified-7d-reset",
-            "anthropic-ratelimit-unified-7d_oi-reset",
+            (
+                "anthropic-ratelimit-unified-reset",
+                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset",
+                CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset",
+                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            ),
+            (
+                "anthropic-ratelimit-unified-7d_oi-reset",
+                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            ),
         ]
         .into_iter()
-        .filter_map(|name| parse_anthropic_reset_header(headers, name, now))
+        .filter_map(|(name, max_future_ms)| {
+            parse_anthropic_reset_header(headers, name, now, max_future_ms)
+        })
         .chain(super::grok::retry_after_until_ms(headers, now))
         .max()
         .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
@@ -13580,10 +13661,14 @@ fn classify_claude_rate_limit(
     }
 
     if fable_only_rejected {
-        let until =
-            parse_anthropic_reset_header(headers, "anthropic-ratelimit-unified-7d_oi-reset", now)
-                .or_else(|| super::grok::retry_after_until_ms(headers, now))
-                .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
+        let until = parse_anthropic_reset_header(
+            headers,
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            now,
+            CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+        )
+        .or_else(|| super::grok::retry_after_until_ms(headers, now))
+        .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
         effects.fable_pool_until = Some(super::bounded_upstream_rate_limit_until(now, until));
     }
 
@@ -13603,53 +13688,6 @@ fn classify_claude_rate_limit(
         ));
     }
     effects
-}
-
-fn claude_shared_window_allowed(status: Option<&str>) -> bool {
-    matches!(status, Some("allowed" | "allowed_warning"))
-}
-
-fn header_lower(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase)
-}
-
-fn parse_anthropic_reset_header(headers: &HeaderMap, name: &str, now: i64) -> Option<i64> {
-    let value = headers.get(name)?.to_str().ok()?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Ok(number) = value.parse::<f64>() {
-        if !number.is_finite() || number <= 0.0 {
-            return None;
-        }
-        let timestamp = if number < 10_000_000.0 {
-            now.saturating_add((number * 1_000.0).min(i64::MAX as f64) as i64)
-        } else if number > 10_000_000_000.0 {
-            number.min(i64::MAX as f64) as i64
-        } else {
-            (number * 1_000.0).min(i64::MAX as f64) as i64
-        };
-        if timestamp > now {
-            return Some(timestamp);
-        }
-    }
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| value.timestamp_millis())
-        .or_else(|| {
-            httpdate::parse_http_date(value).ok().and_then(|value| {
-                value
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-            })
-        })
-        .filter(|until| *until > now)
 }
 
 fn claude_fast_credit_refusal(body: &[u8]) -> bool {
@@ -14615,9 +14653,12 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             )
             .await;
         }
-        let payload =
-            super::codebuddy_runtime::build_codebuddy_payload(&canonical_chat_request, &model_id)
-                .map_err(ProxyError::bad_request)?;
+        let payload = super::codebuddy_runtime::build_codebuddy_payload(
+            &canonical_chat_request,
+            &model_id,
+            capability,
+        )
+        .map_err(ProxyError::bad_request)?;
 
         adapter_request.actual_model = Some(model_id.clone());
         adapter_request.actual_model_source = Some("codebuddy_live_catalog".to_string());
@@ -16628,6 +16669,31 @@ async fn send_qoder_generation(
         )))
     })?;
     let encoded_body = Bytes::from(crate::domain::qoder::qoder_encode(&plain_body));
+    let url = super::join_url(
+        &runtime.session.gateway_base_url,
+        crate::domain::qoder::QODER_GENERATION_PATH,
+    );
+    let client_ip = if runtime.session.session.site == crate::domain::qoder::QoderSite::Cn {
+        let target = url::Url::parse(&url).map_err(|error| {
+            QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
+                "invalid Qoder generation endpoint: {error}"
+            )))
+        })?;
+        let configured = std::env::var(crate::domain::qoder::QODER_CN_CLIENT_IP_ENV).ok();
+        let resolved =
+            crate::infra::network_identity::resolve_outbound_ipv4(&target, configured.as_deref())
+                .await
+                .map_err(|error| {
+                    QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
+                        "resolve Qoder CN client IP (set {} to override): {error}",
+                        crate::domain::qoder::QODER_CN_CLIENT_IP_ENV
+                    )))
+                })?;
+        crate::metrics::record_qoder_client_ip_source(resolved.source);
+        resolved.address.to_string()
+    } else {
+        String::new()
+    };
     let mut target_headers = runtime
         .session
         .session
@@ -16637,7 +16703,7 @@ async fn send_qoder_generation(
             chrono::Utc::now().timestamp(),
             &payload.request_id,
             &crate::domain::qoder::qoder_machine_os(),
-            "",
+            &client_ip,
         )
         .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
     target_headers.extend([
@@ -16660,10 +16726,6 @@ async fn send_qoder_generation(
     let mut headers = HeaderMap::new();
     super::outbound_request::insert_target_headers(&mut headers, &target_headers)
         .map_err(QoderForwardAttemptError::Proxy)?;
-    let url = super::join_url(
-        &runtime.session.gateway_base_url,
-        crate::domain::qoder::QODER_GENERATION_PATH,
-    );
     let request = state
         .http_client()
         .await
@@ -16696,6 +16758,7 @@ async fn send_qoder_generation(
     let mut response = response;
     let status = response.status();
     if !status.is_success() {
+        let response_headers = response.headers().clone();
         let body = crate::infra::http::read_response_body_limited(
             &mut response,
             PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
@@ -16703,7 +16766,11 @@ async fn send_qoder_generation(
         .await
         .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
         return Err(QoderForwardAttemptError::Upstream(
-            super::qoder::QoderUpstreamError::from_status_body(status.as_u16(), &body),
+            super::qoder::QoderUpstreamError::from_response(
+                status.as_u16(),
+                &response_headers,
+                &body,
+            ),
         ));
     }
 
@@ -16903,7 +16970,7 @@ async fn record_qoder_limit_if_needed(
     execution: &ProviderExecution,
     error: &super::qoder::QoderUpstreamError,
 ) {
-    if !error.is_agent_limited() {
+    if !error.is_agent_limited() && error.downstream_status() != StatusCode::TOO_MANY_REQUESTS {
         return;
     }
     let Some((ProviderType::QoderCosy, account_id, auth_identity_generation)) =
@@ -16916,6 +16983,11 @@ async fn record_qoder_limit_if_needed(
         now_ms,
         error
             .agent_limit_reset_at_ms
+            .or_else(|| {
+                error
+                    .retry_after_ms
+                    .map(|delay| now_ms.saturating_add(delay))
+            })
             .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
     );
     state
@@ -16924,7 +16996,7 @@ async fn record_qoder_limit_if_needed(
             ProviderType::QoderCosy,
             auth_identity_generation,
             until_ms,
-            Some(format!("Qoder agent limit is active until {until_ms}")),
+            Some(format!("Qoder rate limit is active until {until_ms}")),
         )
         .await;
 }
@@ -24074,7 +24146,12 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert("x-reset", HeaderValue::from_str(value).unwrap());
             assert_eq!(
-                parse_anthropic_reset_header(&headers, "x-reset", now),
+                parse_anthropic_reset_header(
+                    &headers,
+                    "x-reset",
+                    now,
+                    CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+                ),
                 Some(1_700_003_600_000),
                 "{value}"
             );
@@ -24085,7 +24162,12 @@ mod tests {
             HeaderValue::from_static("Tue, 14 Nov 2023 23:13:20 GMT"),
         );
         assert_eq!(
-            parse_anthropic_reset_header(&headers, "x-reset", now),
+            parse_anthropic_reset_header(
+                &headers,
+                "x-reset",
+                now,
+                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            ),
             Some(1_700_003_600_000)
         );
     }
@@ -26848,6 +26930,210 @@ mod tests {
         );
         assert_eq!(message_requests.load(Ordering::SeqCst), 2);
         assert_eq!(count_requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_response_headers_update_one_quota_store_for_json_sse_and_429() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("anthropic-ratelimit-unified-7d_oi-utilization", "0.21")
+                            .header("anthropic-ratelimit-unified-7d_oi-reset", "3600")
+                            .body(Body::from(
+                                json!({
+                                    "id": "msg_fable_json",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": "claude-fable-5-1",
+                                    "content": [{"type": "text", "text": "json"}],
+                                    "stop_reason": "end_turn",
+                                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        1 => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/event-stream")
+                            .header("anthropic-ratelimit-unified-7d_oi-utilization", "0.31")
+                            .header("anthropic-ratelimit-unified-7d_oi-reset", "3600")
+                            .body(Body::from(claude_success_sse()))
+                            .unwrap(),
+                        2 => Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("anthropic-ratelimit-unified-5h-status", "allowed")
+                            .header("anthropic-ratelimit-unified-7d-status", "allowed")
+                            .header("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+                            .header("anthropic-ratelimit-unified-7d_oi-reset", "3600")
+                            .body(Body::from(
+                                json!({
+                                    "type": "error",
+                                    "error": {
+                                        "type": "rate_limit_error",
+                                        "message": "Fable weekly capacity exhausted"
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        _ => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "id": "msg_shared_pool",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": "claude-sonnet-4-6",
+                                    "content": [{"type": "text", "text": "still available"}],
+                                    "stop_reason": "end_turn",
+                                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("claude-quota-header-integration");
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-quota-header",
+            format!("http://{address}"),
+        )
+        .await;
+        let headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers
+        };
+        let body = |model: &'static str, stream: bool| {
+            Bytes::from(
+                json!({
+                    "model": model,
+                    "max_tokens": 16,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "ping"}]
+                })
+                .to_string(),
+            )
+        };
+
+        let json_response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            headers(),
+            body("claude-fable-5-1", false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(json_response.status(), StatusCode::OK);
+        let account_id = "claude-quota-header-account";
+        assert_eq!(
+            state
+                .find_account_by_id(account_id)
+                .await
+                .unwrap()
+                .quota_window_observations[CLAUDE_FABLE_QUOTA_TIER]
+                .utilization,
+            Some(0.21)
+        );
+
+        let sse_response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            headers(),
+            body("claude-fable-5-1", true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sse_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(sse_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .find_account_by_id(account_id)
+                .await
+                .unwrap()
+                .quota_window_observations[CLAUDE_FABLE_QUOTA_TIER]
+                .utilization,
+            Some(0.31)
+        );
+
+        let limited = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            headers(),
+            body("claude-fable-5-1", false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let account = state.find_account_by_id(account_id).await.unwrap();
+        let fable_observation = &account.quota_window_observations[CLAUDE_FABLE_QUOTA_TIER];
+        assert_eq!(fable_observation.utilization, Some(1.0));
+        assert_eq!(
+            fable_observation.fable_entitlement_evidence,
+            Some(
+                crate::domain::accounts::store::ClaudeFableEntitlementEvidence::FableOnlyRateLimit
+            )
+        );
+        assert!(account.rate_limited_until.is_none());
+        assert!(active_account_capacity_pool_limit(
+            &account,
+            CLAUDE_FABLE_CAPACITY_POOL,
+            test_now_ms(),
+        )
+        .is_some());
+
+        let ordinary = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            headers(),
+            body("claude-sonnet-4-6", false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+        let blocked = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers(),
+            body("claude-fable-5-1", false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
         server.abort();
     }
 

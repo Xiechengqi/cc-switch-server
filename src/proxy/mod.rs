@@ -9,6 +9,7 @@ mod antigravity_retry;
 mod cache_injector;
 mod claude_client_detection;
 pub(crate) mod claude_oauth;
+mod claude_quota_headers;
 pub(crate) mod codebuddy;
 pub(crate) mod codebuddy_runtime;
 mod codex_compaction;

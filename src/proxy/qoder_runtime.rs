@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -538,12 +538,15 @@ pub fn build_qoder_payload(
         ));
     }
 
-    let (system, mut messages, last_user_text) = normalize_chat_messages(request.get("messages"))?;
+    let tools = normalized_tools(request)?;
+    let normalized_history = normalize_tool_history(request.get("messages"), &tools)?;
+    let normalized_history = Value::Array(normalized_history);
+    let (system, mut messages, last_user_text) =
+        normalize_chat_messages(Some(&normalized_history))?;
     if !system.is_empty() {
         messages.insert(0, qoder_message("system", &system, None, None));
     }
     add_ephemeral_cache_control(&mut messages);
-    let tools = normalized_tools(request)?;
     let max_tokens = qoder_max_tokens(request, &model_config);
     let reasoning = qoder_reasoning_directive(request);
     apply_reasoning_directive(site, model_key, reasoning, &mut model_config);
@@ -638,6 +641,175 @@ pub fn build_qoder_payload(
         session_id: session_id.to_string(),
         model_key: model_key.to_string(),
     })
+}
+
+fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<Value>, String> {
+    let messages = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Qoder canonical Chat request must contain messages".to_string())?;
+    let defined_names = tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>();
+    let mut used_ids = HashSet::new();
+    let mut batch_source_ids = HashMap::<String, Vec<String>>::new();
+    let mut current_batch = Vec::<String>::new();
+    let mut consumed = HashSet::<String>::new();
+    let mut pending_results = Vec::<(usize, Value)>::new();
+    let mut output = Vec::with_capacity(messages.len());
+
+    fn flush_results(output: &mut Vec<Value>, pending: &mut Vec<(usize, Value)>) {
+        pending.sort_by_key(|(order, _)| *order);
+        output.extend(pending.drain(..).map(|(_, message)| message));
+    }
+
+    for (message_index, message) in messages.iter().enumerate() {
+        let object = message
+            .as_object()
+            .ok_or_else(|| "Qoder Chat message must be an object".to_string())?;
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("user");
+        if role == "assistant" {
+            flush_results(&mut output, &mut pending_results);
+            consumed.clear();
+            current_batch.clear();
+            batch_source_ids.clear();
+            let mut normalized = object.clone();
+            if let Some(calls) = object.get("tool_calls") {
+                let calls = calls
+                    .as_array()
+                    .ok_or_else(|| "Qoder tool_calls must be an array".to_string())?;
+                let mut retained = Vec::new();
+                for (call_index, call) in calls.iter().enumerate() {
+                    let call = call
+                        .as_object()
+                        .ok_or_else(|| "Qoder tool call must be an object".to_string())?;
+                    let function = call.get("function").and_then(Value::as_object);
+                    let name = function
+                        .and_then(|function| function.get("name"))
+                        .or_else(|| call.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| "Qoder tool call function is missing name".to_string())?;
+                    if !defined_names.contains(name) {
+                        crate::metrics::record_qoder_compatibility("unknown_history_tool_dropped");
+                        continue;
+                    }
+                    let source_id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let mut id = source_id.to_string();
+                    if id.is_empty() || used_ids.contains(&id) {
+                        id = format!("qoder_call_{message_index}_{call_index}");
+                        while used_ids.contains(&id) {
+                            id.push_str("_retry");
+                        }
+                        crate::metrics::record_qoder_compatibility(if source_id.is_empty() {
+                            "missing_tool_id_repaired"
+                        } else {
+                            "duplicate_tool_id_repaired"
+                        });
+                    }
+                    used_ids.insert(id.clone());
+                    if !source_id.is_empty() {
+                        batch_source_ids
+                            .entry(source_id.to_string())
+                            .or_default()
+                            .push(id.clone());
+                    }
+                    current_batch.push(id.clone());
+                    let arguments = function
+                        .and_then(|function| function.get("arguments"))
+                        .or_else(|| call.get("arguments"));
+                    let arguments = match arguments {
+                        None | Some(Value::Null) => "{}".to_string(),
+                        Some(Value::String(value)) if value.trim().is_empty() => "{}".to_string(),
+                        Some(Value::String(value)) => value.clone(),
+                        Some(value) => serde_json::to_string(value)
+                            .map_err(|error| format!("encode Qoder tool arguments: {error}"))?,
+                    };
+                    let call_type = call
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("function");
+                    retained.push(json!({
+                        "id": id,
+                        "type": call_type,
+                        "function": {"name": name, "arguments": arguments}
+                    }));
+                }
+                if retained.is_empty() {
+                    normalized.remove("tool_calls");
+                } else {
+                    normalized.insert("tool_calls".to_string(), Value::Array(retained));
+                }
+            }
+            output.push(Value::Object(normalized));
+            continue;
+        }
+        if role == "tool" {
+            let requested = object
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            let normalized_id = if requested.is_empty() {
+                let mut available = current_batch.iter().filter(|id| !consumed.contains(*id));
+                let first = available.next().map(String::as_str).unwrap_or_default();
+                if !first.is_empty() && available.next().is_some() {
+                    return Err(
+                        "Qoder tool result without tool_call_id is ambiguous for parallel calls"
+                            .to_string(),
+                    );
+                }
+                first
+            } else {
+                batch_source_ids
+                    .get(requested)
+                    .and_then(|ids| ids.iter().find(|id| !consumed.contains(*id)))
+                    .map(String::as_str)
+                    .or_else(|| {
+                        current_batch
+                            .iter()
+                            .find(|id| id.as_str() == requested && !consumed.contains(*id))
+                            .map(String::as_str)
+                    })
+                    .unwrap_or_default()
+            };
+            if normalized_id.is_empty() || consumed.contains(normalized_id) {
+                crate::metrics::record_qoder_compatibility("orphan_tool_result_dropped");
+                continue;
+            }
+            let Some(order) = current_batch.iter().position(|id| id == normalized_id) else {
+                crate::metrics::record_qoder_compatibility("orphan_tool_result_dropped");
+                continue;
+            };
+            consumed.insert(normalized_id.to_string());
+            let mut normalized = object.clone();
+            normalized.insert(
+                "tool_call_id".to_string(),
+                Value::String(normalized_id.to_string()),
+            );
+            pending_results.push((order, Value::Object(normalized)));
+            continue;
+        }
+        flush_results(&mut output, &mut pending_results);
+        current_batch.clear();
+        consumed.clear();
+        batch_source_ids.clear();
+        output.push(message.clone());
+    }
+    flush_results(&mut output, &mut pending_results);
+    Ok(output)
 }
 
 fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>, String), String> {
@@ -1303,6 +1475,77 @@ mod tests {
             1_000_000
         );
         assert_eq!(prepared.body["stream"], true);
+    }
+
+    #[test]
+    fn tool_history_repairs_missing_and_duplicate_ids_and_orders_parallel_results() {
+        let tools = vec![json!({"type":"function","function":{"name":"shell"}})];
+        let messages = json!([
+            {"role":"assistant","tool_calls":[
+                {"function":{"name":"shell","arguments":null}},
+                {"id":"same","function":{"name":"shell","arguments":{"cmd":"two"}}},
+                {"id":"same","function":{"name":"shell","arguments":""}}
+            ]},
+            {"role":"tool","tool_call_id":"same","content":"second"},
+            {"role":"tool","tool_call_id":"same","content":"third"},
+            {"role":"tool","tool_call_id":"qoder_call_0_0","content":"first"}
+        ]);
+        let normalized = normalize_tool_history(Some(&messages), &tools).unwrap();
+        let calls = normalized[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["id"], "qoder_call_0_0");
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["id"], "same");
+        assert_eq!(calls[1]["function"]["arguments"], r#"{"cmd":"two"}"#);
+        assert_eq!(calls[2]["id"], "qoder_call_0_2");
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(normalized[1]["content"], "first");
+        assert_eq!(normalized[2]["content"], "second");
+        assert_eq!(normalized[3]["content"], "third");
+        assert_eq!(normalized[3]["tool_call_id"], "qoder_call_0_2");
+    }
+
+    #[test]
+    fn tool_history_filters_unknown_and_orphan_pairs_without_cross_batch_binding() {
+        let tools = vec![json!({"type":"function","function":{"name":"known"}})];
+        let messages = json!([
+            {"role":"assistant","tool_calls":[
+                {"id":"unknown-id","function":{"name":"unknown","arguments":"{}"}},
+                {"id":"known-id","function":{"name":"known","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"unknown-id","content":"secret-unknown"},
+            {"role":"tool","tool_call_id":"known-id","content":"kept"},
+            {"role":"user","content":"next"},
+            {"role":"tool","tool_call_id":"known-id","content":"late-orphan"}
+        ]);
+        let normalized = normalize_tool_history(Some(&messages), &tools).unwrap();
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(normalized[1]["content"], "kept");
+        assert_eq!(normalized[2]["content"], "next");
+        let encoded = serde_json::to_string(&normalized).unwrap();
+        assert!(!encoded.contains("secret-unknown"));
+        assert!(!encoded.contains("late-orphan"));
+    }
+
+    #[test]
+    fn tool_history_only_inferrs_a_missing_result_id_when_unambiguous() {
+        let tools = vec![json!({"type":"function","function":{"name":"known"}})];
+        let one = json!([
+            {"role":"assistant","tool_calls":[{"function":{"name":"known"}}]},
+            {"role":"tool","content":"ok"}
+        ]);
+        let normalized = normalize_tool_history(Some(&one), &tools).unwrap();
+        assert_eq!(normalized[1]["tool_call_id"], "qoder_call_0_0");
+
+        let ambiguous = json!([
+            {"role":"assistant","tool_calls":[
+                {"function":{"name":"known"}}, {"function":{"name":"known"}}
+            ]},
+            {"role":"tool","content":"must-not-be-guessed"}
+        ]);
+        assert!(normalize_tool_history(Some(&ambiguous), &tools)
+            .unwrap_err()
+            .contains("ambiguous"));
     }
 
     #[test]

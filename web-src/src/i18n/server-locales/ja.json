@@ -306,6 +306,8 @@
   "provider": {
     "apiKeyAccountDisplay": "API キーアカウント：{{account}}",
     "apiKeyAccountResolving": "API キーアカウント",
+    "codeBuddyUsageSummary": "公式使用量：今日 {{today}} · 7 日間 {{week}} · 今月 {{month}} credits（{{count}} 件）",
+    "codeBuddyUsageUnavailable": "公式のリクエスト別使用量は一時的に利用できません",
     "codingPlanQuota": {
       "fiveHour": "5 時間",
       "loading": "クォータを読み込み中",

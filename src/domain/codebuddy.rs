@@ -16,6 +16,11 @@ pub const CODEBUDDY_REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
 pub const CODEBUDDY_CHAT_PATH: &str = "/v2/chat/completions";
 pub const CODEBUDDY_CONFIG_PATH: &str = "/v3/config";
 pub const CODEBUDDY_RESOURCE_PATH: &str = "/v2/billing/meter/get-user-resource";
+pub const CODEBUDDY_RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
+pub const CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH: &str =
+    "/billing/meter/get-user-resource-paid-packages";
+pub const CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH: &str =
+    "/billing/meter/get-user-resource-free-packages";
 pub const CODEBUDDY_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
 pub const CODEBUDDY_SESSION_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const CODEBUDDY_SESSION_REFRESH_JITTER_MS: i64 = 30 * 60 * 1_000;
@@ -95,6 +100,22 @@ impl CodeBuddySite {
 
     pub fn canonical_token_domain(self, domain: &str) -> Option<String> {
         domain_host(domain).filter(|host| self.allows_browser_auth_host(host))
+    }
+
+    /// Billing routes are relative to the authenticated brand origin. Keep the
+    /// mapping closed over reviewed hosts instead of accepting an account-
+    /// supplied URL.
+    pub fn billing_endpoint_for_domain(self, domain: &str) -> Option<&'static str> {
+        let domain = self.canonical_token_domain(domain)?;
+        match (self, domain.as_str()) {
+            (Self::Intl, "workbuddy.ai" | "www.workbuddy.ai") => Some("https://www.workbuddy.ai"),
+            (Self::Intl, "codebuddy.ai" | "www.codebuddy.ai") => Some("https://www.codebuddy.ai"),
+            (Self::Cn, "workbuddy.cn" | "www.workbuddy.cn") => Some("https://www.workbuddy.cn"),
+            (Self::Cn, "codebuddy.cn" | "www.codebuddy.cn" | "copilot.tencent.com") => {
+                Some("https://www.codebuddy.cn")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -217,10 +238,9 @@ impl CodeBuddyAccountProfile {
         Ok(())
     }
 
-    pub fn stable_identity_components(&self) -> [&str; 4] {
+    pub fn stable_identity_components(&self) -> [&str; 3] {
         [
             self.site.as_str(),
-            self.domain.trim(),
             self.uid.trim(),
             self.enterprise_id.trim(),
         ]
@@ -229,26 +249,17 @@ impl CodeBuddyAccountProfile {
 
 pub fn codebuddy_account_id(
     site: CodeBuddySite,
-    domain: &str,
     uid: &str,
     enterprise_id: &str,
 ) -> Result<String, String> {
-    let domain = site.canonical_token_domain(domain).ok_or_else(|| {
-        format!(
-            "CodeBuddy account id domain is outside the bound {} site",
-            site.as_str()
-        )
-    })?;
     let uid = uid.trim();
     if uid.is_empty() {
         return Err("CodeBuddy account id requires uid".to_string());
     }
     let mut digest = Sha256::new();
-    digest.update(b"cc-switch/codebuddy/account-id/v1");
+    digest.update(b"cc-switch/codebuddy/account-id/v2");
     digest.update([0]);
     digest.update(site.as_str().as_bytes());
-    digest.update([0]);
-    digest.update(domain.as_bytes());
     digest.update([0]);
     digest.update(uid.as_bytes());
     digest.update([0]);
@@ -353,17 +364,14 @@ mod tests {
 
     #[test]
     fn account_identity_is_site_and_enterprise_scoped() {
-        let intl =
-            codebuddy_account_id(CodeBuddySite::Intl, "www.codebuddy.ai", "uid-1", "").unwrap();
-        let intl_alias =
-            codebuddy_account_id(CodeBuddySite::Intl, "www.workbuddy.ai", "uid-1", "").unwrap();
-        let cn =
-            codebuddy_account_id(CodeBuddySite::Cn, "copilot.tencent.com", "uid-1", "").unwrap();
-        let enterprise =
-            codebuddy_account_id(CodeBuddySite::Intl, "www.codebuddy.ai", "uid-1", "ent-1")
-                .unwrap();
+        let intl = codebuddy_account_id(CodeBuddySite::Intl, "uid-1", "").unwrap();
+        // Domain is intentionally absent from the v2 identity digest: brand
+        // host rotation inside one site must retain the local account ID.
+        let intl_alias = codebuddy_account_id(CodeBuddySite::Intl, "uid-1", "").unwrap();
+        let cn = codebuddy_account_id(CodeBuddySite::Cn, "uid-1", "").unwrap();
+        let enterprise = codebuddy_account_id(CodeBuddySite::Intl, "uid-1", "ent-1").unwrap();
         assert_ne!(intl, cn);
-        assert_ne!(intl, intl_alias);
+        assert_eq!(intl, intl_alias);
         assert_ne!(intl, enterprise);
     }
 
@@ -425,6 +433,26 @@ mod tests {
         assert_ne!(
             CodeBuddySite::Cn.profile().billing_endpoint,
             CodeBuddySite::Cn.profile().endpoint
+        );
+        assert_eq!(
+            CodeBuddySite::Intl.billing_endpoint_for_domain("www.codebuddy.ai"),
+            Some("https://www.codebuddy.ai")
+        );
+        assert_eq!(
+            CodeBuddySite::Intl.billing_endpoint_for_domain("workbuddy.ai"),
+            Some("https://www.workbuddy.ai")
+        );
+        assert_eq!(
+            CodeBuddySite::Cn.billing_endpoint_for_domain("www.workbuddy.cn"),
+            Some("https://www.workbuddy.cn")
+        );
+        assert_eq!(
+            CodeBuddySite::Cn.billing_endpoint_for_domain("copilot.tencent.com"),
+            Some("https://www.codebuddy.cn")
+        );
+        assert_eq!(
+            CodeBuddySite::Intl.billing_endpoint_for_domain("www.codebuddy.cn"),
+            None
         );
     }
 

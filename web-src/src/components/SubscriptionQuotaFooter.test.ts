@@ -68,4 +68,45 @@ describe("SubscriptionQuotaFooter summaries", () => {
     expect(summary).toContain("Monthly 50% 3d0h");
     expect(quota.bankedReset).toBeUndefined();
   });
+
+  it("includes the Claude Fable model-family pool beside the shared windows", () => {
+    const now = Date.parse("2026-09-03T00:00:00Z");
+    const quota: SubscriptionQuota = {
+      tool: "claude_oauth",
+      credentialStatus: "valid",
+      credentialMessage: "Claude Max 20x",
+      success: true,
+      tiers: [
+        {
+          name: "five_hour",
+          utilization: 3,
+          resetsAt: "2026-09-03T04:22:00Z",
+        },
+        {
+          name: "seven_day",
+          utilization: 24,
+          resetsAt: "2026-09-08T09:00:00Z",
+        },
+        {
+          name: "seven_day_fable",
+          utilization: 41,
+          resetsAt: "2026-09-08T09:00:00Z",
+          scope: "model_family",
+          capacityPool: "claude_fable_7d_oi",
+          modelFamily: "claude-fable-5",
+          relativeWeeklyCapacity: 0.5,
+          source: "anthropic_ratelimit_7d_oi",
+        },
+      ],
+      extraUsage: null,
+      error: null,
+      queriedAt: now,
+    };
+
+    const summary = formatQuotaSummary(quota, quota.tiers, undefined, now);
+
+    expect(summary).toContain("5h 3% 4h22m");
+    expect(summary).toContain("7d 24% 5d9h");
+    expect(summary).toContain("Fable 7d 41% 5d9h");
+  });
 });

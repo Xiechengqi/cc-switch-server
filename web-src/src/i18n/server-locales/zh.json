@@ -306,6 +306,8 @@
   "provider": {
     "apiKeyAccountDisplay": "API Key 账号：{{account}}",
     "apiKeyAccountResolving": "API Key 账号",
+    "codeBuddyUsageSummary": "官方用量：今日 {{today}} · 7 日 {{week}} · 本月 {{month}} credits（{{count}} 次）",
+    "codeBuddyUsageUnavailable": "官方逐请求用量暂不可用",
     "codingPlanQuota": {
       "fiveHour": "5 小时",
       "loading": "正在加载额度",

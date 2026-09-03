@@ -1,6 +1,7 @@
 use crate::domain::accounts::capability_evidence::{
     account_capability_projections, AccountCapabilityProjection,
 };
+use crate::domain::accounts::claude_quota::project_account_quota;
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::login::{OAuthLoginCancellation, OAuthLoginFinish, OAuthLoginStart};
 use crate::domain::accounts::oauth::{
@@ -154,7 +155,11 @@ pub(in crate::api) fn account_quota_public_view(
     account: &Account,
     quota: Option<&AccountQuota>,
 ) -> Option<AccountQuota> {
-    let mut quota = quota.cloned()?;
+    let mut quota = project_account_quota(
+        account,
+        quota,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    )?;
     if account.provider_type == ProviderType::GrokOAuth {
         normalize_grok_quota_public_plan(&mut quota);
     }
@@ -1168,6 +1173,60 @@ mod tests {
             value["quota"]["extraUsage"]["user"]["subscriptionTier"],
             "GrokPro"
         );
+    }
+
+    #[test]
+    fn claude_account_public_view_projects_fable_header_observation_metadata() {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let account: Account = serde_json::from_value(json!({
+            "id": "acct-claude-fable",
+            "providerType": "claude_oauth",
+            "authIdentityGeneration": 3,
+            "subscriptionLevel": "claude_max_20x",
+            "quota": {
+                "success": true,
+                "credentialMessage": "Claude Max 20x",
+                "tiers": [
+                    {"name": "five_hour", "utilization": 0.03},
+                    {"name": "seven_day", "utilization": 0.24}
+                ],
+                "extraUsage": {
+                    "subscription": {
+                        "planType": "claude_max_20x",
+                        "planLabel": "Claude Max 20x",
+                        "planStale": false
+                    },
+                    "subscriptionEvidence": {"conflict": false},
+                    "queriedAt": now_ms - 1_000
+                }
+            },
+            "quotaWindowObservations": {
+                "seven_day_fable": {
+                    "utilization": 0.41,
+                    "resetsAtMs": now_ms + 60_000,
+                    "observedAtMs": now_ms,
+                    "authIdentityGeneration": 3,
+                    "source": "anthropic_ratelimit_7d_oi",
+                    "fableEntitlementEvidence": "successful_fable_request"
+                }
+            }
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+        let fable = value["quota"]["tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tier| tier["name"] == "seven_day_fable")
+            .unwrap();
+        assert_eq!(fable["utilization"], 0.41);
+        assert_eq!(fable["scope"], "model_family");
+        assert_eq!(fable["capacityPool"], "claude_fable_7d_oi");
+        assert_eq!(fable["modelFamily"], "claude-fable-5");
+        assert_eq!(fable["relativeWeeklyCapacity"], 0.5);
+        assert_eq!(fable["source"], "anthropic_ratelimit_7d_oi");
+        assert_eq!(value["quota"]["extraUsage"]["queriedAt"], now_ms);
     }
 
     #[test]

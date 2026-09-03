@@ -50,6 +50,9 @@ pub(in crate::api) async fn upsert_account(
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
+            if input.provider_type == ProviderType::CodeBuddyOAuth {
+                reuse_existing_codebuddy_identity_account(store, &mut input);
+            }
             let manager = manager_for(input.provider_type);
             manager
                 .finish_login(store, input)
@@ -873,6 +876,24 @@ fn reuse_existing_codex_subject_account(
     subject: &str,
 ) {
     if let Some(account_id) = store.codex_account_id_for_verified_subject(subject) {
+        input.id = Some(account_id.to_string());
+    }
+}
+
+fn reuse_existing_codebuddy_identity_account(
+    store: &crate::domain::accounts::store::AccountStore,
+    input: &mut UpsertAccountInput,
+) {
+    let Ok(profile) =
+        crate::domain::codebuddy::CodeBuddyAccountProfile::parse(input.profile.as_ref())
+    else {
+        return;
+    };
+    if let Some(account_id) = store.codebuddy_account_id_for_stable_identity(
+        profile.site,
+        &profile.uid,
+        &profile.enterprise_id,
+    ) {
         input.id = Some(account_id.to_string());
     }
 }
@@ -1760,6 +1781,9 @@ async fn persist_completed_device_login(
             if let Some(subject) = verified_codex_subject.as_deref() {
                 reuse_existing_codex_subject_account(store, &mut account_input, subject);
             }
+            if provider_type == ProviderType::CodeBuddyOAuth {
+                reuse_existing_codebuddy_identity_account(store, &mut account_input);
+            }
             manager_for(provider_type)
                 .finish_login(store, account_input)
                 .map_err(ApiError::bad_request)
@@ -2024,12 +2048,10 @@ pub(in crate::api) async fn start_qoder_device_login(
         .map_err(map_qoder_client_error)?;
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     state
-        .insert_qoder_device_flow(device.device_code.clone(), flow, now)
-        .await;
-    state
-        .bind_device_flow_principal(
-            ProviderType::QoderCosy,
+        .replace_qoder_device_flow_for_principal_under_managed_auth_guard(
+            &managed_auth_operation,
             device.device_code.clone(),
+            flow,
             principal.oauth_binding_id(),
             device_flow_expires_at(now, device.expires_in),
             now,
@@ -2203,18 +2225,40 @@ pub(in crate::api) async fn start_codebuddy_login(
         .await
         .map_err(map_codebuddy_client_error)?;
     let managed_auth_operation = state.lock_managed_auth_operations().await;
-    state
-        .insert_codebuddy_login_flow(login.flow_id.clone(), flow, now)
-        .await;
-    state
-        .bind_device_flow_principal(
+    if !state
+        .try_bind_device_flow_principal_bounded(
             ProviderType::CodeBuddyOAuth,
             login.flow_id.clone(),
             principal.oauth_binding_id(),
             login.expires_at,
             now,
+            4,
+            256,
         )
-        .await;
+        .await
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many active CodeBuddy login flows; cancel or finish an existing flow",
+        ));
+    }
+    if !state
+        .insert_codebuddy_login_flow(login.flow_id.clone(), flow, now)
+        .await
+    {
+        state
+            .remove_device_flow_principal(
+                ProviderType::CodeBuddyOAuth,
+                &login.flow_id,
+                &principal.oauth_binding_id(),
+                now,
+            )
+            .await;
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "CodeBuddy login flow capacity is exhausted; retry after existing flows expire",
+        ));
+    }
     drop(managed_auth_operation);
     Ok(Json(StartCodeBuddyLoginResponse { ok: true, login }))
 }
@@ -5644,5 +5688,39 @@ mod tests {
         reuse_existing_codex_subject_account(&store, &mut login, "user-legacy");
 
         assert_eq!(login.id.as_deref(), Some("legacy-workspace-id"));
+    }
+
+    #[test]
+    fn managed_codebuddy_login_reuses_legacy_id_across_same_site_domain_change() {
+        let mut store = crate::domain::accounts::store::AccountStore::default();
+        let existing: UpsertAccountInput = serde_json::from_value(json!({
+            "id":"legacy-domain-bearing-id",
+            "providerType":"codebuddy_oauth",
+            "accessToken":"old-access-token",
+            "profile":{
+                "site":"intl",
+                "domain":"www.codebuddy.ai",
+                "uid":"stable-user",
+                "enterpriseId":""
+            }
+        }))
+        .unwrap();
+        store.upsert(existing);
+        let mut login: UpsertAccountInput = serde_json::from_value(json!({
+            "id":"codebuddy-v2-generated-id",
+            "providerType":"codebuddy_oauth",
+            "accessToken":"new-access-token",
+            "profile":{
+                "site":"intl",
+                "domain":"www.workbuddy.ai",
+                "uid":"stable-user",
+                "enterpriseId":""
+            }
+        }))
+        .unwrap();
+
+        reuse_existing_codebuddy_identity_account(&store, &mut login);
+
+        assert_eq!(login.id.as_deref(), Some("legacy-domain-bearing-id"));
     }
 }

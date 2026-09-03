@@ -306,6 +306,8 @@
   "provider": {
     "apiKeyAccountDisplay": "API key account: {{account}}",
     "apiKeyAccountResolving": "API key account",
+    "codeBuddyUsageSummary": "Official usage: today {{today}} · 7 days {{week}} · this month {{month}} credits ({{count}} requests)",
+    "codeBuddyUsageUnavailable": "Official per-request usage is temporarily unavailable",
     "codingPlanQuota": {
       "fiveHour": "5h",
       "loading": "Loading quota",
