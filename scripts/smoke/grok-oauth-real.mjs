@@ -3,6 +3,8 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { runProbe } from "./stream-probe.mjs";
+
 const shareUrl = (process.env.CC_SWITCH_SHARE_URL || "").trim().replace(/\/+$/, "");
 const routerToken = (process.env.ROUTER_API_TOKEN || "").trim();
 const routerTokenHeader = (process.env.ROUTER_API_TOKEN_HEADER || "Authorization").trim();
@@ -20,6 +22,8 @@ const checks = {
   models: "not-run",
   json: "not-run",
   stream: "not-run",
+  chatJson: "not-run",
+  chatStream: "not-run",
   media: mediaSmoke ? "not-run" : "disabled",
 };
 
@@ -76,6 +80,8 @@ function writeEvidence(status, notes = "") {
       GROK_MODELS_STATUS: checks.models,
       GROK_JSON_STATUS: checks.json,
       GROK_STREAM_STATUS: checks.stream,
+      GROK_CHAT_JSON_STATUS: checks.chatJson,
+      GROK_CHAT_STREAM_STATUS: checks.chatStream,
       GROK_MEDIA_STATUS: checks.media,
     },
   });
@@ -169,6 +175,10 @@ function isNonNegativeInteger(value) {
   return Number.isInteger(value) && value >= 0;
 }
 
+function isPositiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 function validateModels(catalog) {
   if (catalog?.object !== "list" || !Array.isArray(catalog.data)) {
     fail("models response does not satisfy the OpenAI list contract");
@@ -207,6 +217,39 @@ function validateJsonResponse(response) {
   for (const key of ["input_tokens", "output_tokens", "total_tokens"]) {
     if (response.usage?.[key] !== undefined && !isNonNegativeInteger(response.usage[key])) {
       fail(`non-stream Responses usage.${key} is invalid`);
+    }
+  }
+}
+
+function validateChatJsonResponse(response) {
+  if (
+    response?.object !== "chat.completion" ||
+    typeof response.id !== "string" ||
+    response.id.trim() === "" ||
+    typeof response.model !== "string" ||
+    response.model.trim() === "" ||
+    !isPositiveInteger(response.created) ||
+    !Array.isArray(response.choices) ||
+    response.choices.length === 0
+  ) {
+    fail("non-stream Chat result does not satisfy the completion envelope contract");
+  }
+  for (const choice of response.choices) {
+    if (
+      !choice ||
+      !Number.isInteger(choice.index) ||
+      choice.index < 0 ||
+      !choice.message ||
+      typeof choice.message !== "object" ||
+      typeof choice.finish_reason !== "string" ||
+      choice.finish_reason.length === 0
+    ) {
+      fail("non-stream Chat result contains an invalid choice");
+    }
+  }
+  for (const key of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
+    if (response.usage?.[key] !== undefined && !isNonNegativeInteger(response.usage[key])) {
+      fail(`non-stream Chat usage.${key} is invalid`);
     }
   }
 }
@@ -326,6 +369,31 @@ async function validateStream() {
   }
 }
 
+async function validateChatStream() {
+  const summary = await runProbe({
+    url: `${shareUrl}/v1/chat/completions`,
+    headers: commonHeaders({ inference: true }),
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: "Reply with exactly: grok-oauth-chat-stream-ok" }],
+      max_tokens: 32,
+      stream: true,
+      stream_options: { include_usage: true },
+    }),
+    timeoutMs,
+    maxBytes: 8 * 1024 * 1024,
+    requireDone: true,
+    requireUsage: true,
+    protocol: "openai-chat",
+  });
+  if (!summary.ok) {
+    fail(
+      `streaming Chat contract failed: status=${summary.status} chunks=${summary.chatChunks} done=${summary.doneCount} createdValid=${summary.createdValid} createdStable=${summary.createdStable} error=${safePreview(summary.error || "none", 300)}`,
+    );
+  }
+  return summary;
+}
+
 async function validateMedia() {
   const image = await requireJson(
     "/v1/images/generations",
@@ -385,9 +453,33 @@ async function main() {
   checks.json = "pass";
   console.log("[PASS] non-stream Responses contract");
 
+  const chatResult = await requireJson(
+    "/v1/chat/completions",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with exactly: grok-oauth-chat-json-ok" }],
+        max_tokens: 32,
+        stream: false,
+      }),
+    },
+    "non-stream Chat Completions",
+    { inference: true },
+  );
+  validateChatJsonResponse(chatResult);
+  checks.chatJson = "pass";
+  console.log("[PASS] non-stream Chat Completions created contract");
+
   await validateStream();
   checks.stream = "pass";
   console.log("[PASS] Responses SSE lifecycle and terminal contract");
+
+  const chatSummary = await validateChatStream();
+  checks.chatStream = "pass";
+  console.log(
+    `[PASS] Chat SSE created/finish/usage/DONE contract (chunks=${chatSummary.chatChunks})`,
+  );
 
   if (mediaSmoke) {
     await validateMedia();
@@ -397,7 +489,10 @@ async function main() {
     console.log("[SKIP] Grok media smoke is disabled (CC_SWITCH_GROK_MEDIA_SMOKE=0)");
   }
 
-  writeEvidence("pass", "real xAI normal-path smoke completed");
+  writeEvidence(
+    "pass",
+    "real xAI Responses and OpenAI Chat normal-path smoke completed",
+  );
   console.log(`[PASS] Grok OAuth real-account gate complete (model=${model})`);
 }
 

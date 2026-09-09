@@ -1451,7 +1451,7 @@ pub fn openai_responses_response_to_chat(input: &Value) -> Result<Value, Transfo
     Ok(json!({
         "id": chat_id_from_response_id(input.get("id").and_then(Value::as_str)),
         "object": "chat.completion",
-        "created": input.get("created_at").or_else(|| input.get("created")).cloned().unwrap_or(Value::Null),
+        "created": super::openai_chat_compat::preferred_created(input),
         "model": input.get("model").and_then(Value::as_str).unwrap_or_default(),
         "choices": [{
             "index": 0,
@@ -1698,6 +1698,7 @@ pub fn anthropic_response_to_openai_chat(input: &Value) -> Result<Value, Transfo
     Ok(json!({
         "id": input.get("id").and_then(Value::as_str).unwrap_or("chatcmpl"),
         "object": "chat.completion",
+        "created": super::openai_chat_compat::preferred_created(input),
         "model": input.get("model").and_then(Value::as_str).unwrap_or_default(),
         "choices": [{
             "index": 0,
@@ -3954,6 +3955,7 @@ fn openai_chat_stream_chunk(
     let mut chunk = json!({
         "id": chat_id_from_response_id(id),
         "object": "chat.completion.chunk",
+        "created": super::openai_chat_compat::unix_timestamp_seconds(),
         "model": model.unwrap_or_default(),
         "choices": [{
             "index": 0,
@@ -7514,6 +7516,8 @@ mod tests {
 
         let output = openai_responses_response_to_chat(&input).unwrap();
 
+        assert_eq!(output.get("created").and_then(Value::as_i64), Some(123));
+
         assert_eq!(
             output
                 .pointer("/choices/0/message/content")
@@ -7562,6 +7566,11 @@ mod tests {
 
         let output = openai_responses_response_to_chat(&input).unwrap();
 
+        assert!(output
+            .get("created")
+            .and_then(Value::as_i64)
+            .is_some_and(|created| created > 0));
+
         assert_eq!(
             output
                 .pointer("/choices/0/finish_reason")
@@ -7589,6 +7598,10 @@ mod tests {
             });
 
             let chat = anthropic_response_to_openai_chat(&input).unwrap();
+            assert!(chat
+                .get("created")
+                .and_then(Value::as_i64)
+                .is_some_and(|created| created > 0));
             assert_eq!(
                 chat.pointer("/choices/0/finish_reason")
                     .and_then(Value::as_str),
@@ -9041,11 +9054,16 @@ mod tests {
             "type": "response.output_text.delta",
             "delta": "hi"
         }));
+        let direct_created = frame_json(&direct_chat_frames[0])["created"]
+            .as_i64()
+            .unwrap();
+        assert!(direct_created > 0);
         assert_eq!(
             direct_chat_frames,
             vec![StreamFrame::json(json!({
                 "id": "chatcmpl_ccswitch",
                 "object": "chat.completion.chunk",
+                "created": direct_created,
                 "model": "",
                 "choices": [{
                     "index": 0,
@@ -9065,12 +9083,17 @@ mod tests {
                 "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
             }
         }));
+        let done_created = frame_json(&direct_done_frames[0])["created"]
+            .as_i64()
+            .unwrap();
+        assert!(done_created > 0);
         assert_eq!(
             direct_done_frames,
             vec![
                 StreamFrame::json(json!({
                     "id": "chatcmpl_1",
                     "object": "chat.completion.chunk",
+                    "created": done_created,
                     "model": "gpt-5.5",
                     "choices": [{
                         "index": 0,
@@ -9846,11 +9869,16 @@ mod tests {
                 "output": [{"type": "function_call", "call_id": "call_1", "name": "lookup"}]
             }
         }));
+        let created = frame_json(&responses_to_chat[0])["created"]
+            .as_i64()
+            .unwrap();
+        assert!(created > 0);
         assert_eq!(
             responses_to_chat[0],
             StreamFrame::json(json!({
                 "id": "chatcmpl_tool",
                 "object": "chat.completion.chunk",
+                "created": created,
                 "model": "gpt-5.5",
                 "choices": [{
                     "index": 0,

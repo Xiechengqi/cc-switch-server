@@ -268,6 +268,7 @@ pub struct AgentSseWriter {
     model: String,
     format: CursorResponseFormat,
     msg_id: String,
+    created: i64,
     // Anthropic block bookkeeping
     next_block_idx: u32,
     text_block: Option<u32>,
@@ -309,6 +310,7 @@ impl AgentSseWriter {
             model,
             format,
             msg_id,
+            created: super::super::openai_chat_compat::unix_timestamp_seconds(),
             next_block_idx: 0,
             text_block: None,
             thinking_block: None,
@@ -664,6 +666,7 @@ impl AgentSseWriter {
         out.push(chat_chunk(
             &self.msg_id,
             &self.model,
+            self.created,
             json!({}),
             Some(finish_reason),
         ));
@@ -671,6 +674,7 @@ impl AgentSseWriter {
         out.push(chat_chunk_usage(
             &self.msg_id,
             &self.model,
+            self.created,
             self.input_tokens,
             self.output_tokens,
         ));
@@ -747,7 +751,7 @@ impl AgentSseWriter {
                 json!({
                     "id": self.msg_id,
                     "object": "chat.completion",
-                    "created": chrono::Utc::now().timestamp(),
+                    "created": self.created,
                     "model": self.model,
                     "choices": [{
                         "index": 0,
@@ -806,6 +810,7 @@ impl AgentSseWriter {
                 vec![chat_chunk(
                     &self.msg_id,
                     &self.model,
+                    self.created,
                     json!({}),
                     Some("error"),
                 )]
@@ -896,6 +901,7 @@ impl AgentSseWriter {
                 out.push(chat_chunk(
                     &self.msg_id,
                     &self.model,
+                    self.created,
                     json!({ "content": text, "role": "assistant" }),
                     None,
                 ));
@@ -988,6 +994,7 @@ impl AgentSseWriter {
                 out.push(chat_chunk(
                     &self.msg_id,
                     &self.model,
+                    self.created,
                     json!({ "reasoning_content": text }),
                     None,
                 ));
@@ -1215,6 +1222,7 @@ impl AgentSseWriter {
                 out.push(chat_chunk(
                     &self.msg_id,
                     &self.model,
+                    self.created,
                     json!({
                         "role": "assistant",
                         "tool_calls": [{
@@ -1359,12 +1367,12 @@ fn event(event_name: &str, data: Value) -> String {
     format!("event: {event_name}\ndata: {}\n\n", data)
 }
 
-fn chat_chunk(id: &str, model: &str, delta: Value, finish: Option<&str>) -> String {
+fn chat_chunk(id: &str, model: &str, created: i64, delta: Value, finish: Option<&str>) -> String {
     let body = json!({
         "id": id,
         "object": "chat.completion.chunk",
         "model": model,
-        "created": chrono::Utc::now().timestamp(),
+        "created": created,
         "choices": [{
             "index": 0,
             "delta": delta,
@@ -1374,12 +1382,12 @@ fn chat_chunk(id: &str, model: &str, delta: Value, finish: Option<&str>) -> Stri
     format!("data: {}\n\n", body)
 }
 
-fn chat_chunk_usage(id: &str, model: &str, input: u32, output: u32) -> String {
+fn chat_chunk_usage(id: &str, model: &str, created: i64, input: u32, output: u32) -> String {
     let body = json!({
         "id": id,
         "object": "chat.completion.chunk",
         "model": model,
-        "created": chrono::Utc::now().timestamp(),
+        "created": created,
         "choices": [],
         "usage": {
             "prompt_tokens": input,
@@ -1590,6 +1598,37 @@ mod tests {
         let joined = events.join("");
         assert!(joined.contains("finish_reason\":\"tool_calls"));
         assert!(joined.contains("[DONE]"));
+    }
+
+    #[test]
+    fn chat_chunks_share_writer_created_timestamp() {
+        let mut writer = AgentSseWriter::new(
+            "gpt-5".to_string(),
+            CursorResponseFormat::OpenAiChatCompletions,
+            3,
+        );
+        let expected = writer.created;
+        let mut events = writer.event(&AgentEvent::Thinking("plan".to_string()));
+        events.extend(writer.event(&AgentEvent::Text("answer".to_string())));
+        events.extend(writer.event(&AgentEvent::ToolCall(CapturedToolCall {
+            id: "call_1".to_string(),
+            name: "lookup".to_string(),
+            arguments_json: "{}".to_string(),
+        })));
+        events.extend(writer.done_events());
+
+        let chunks = events
+            .iter()
+            .filter_map(|event| {
+                let payload = event.trim().strip_prefix("data: ")?;
+                (payload != "[DONE]").then(|| serde_json::from_str::<Value>(payload).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert!(chunks.len() >= 5);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.get("created").and_then(Value::as_i64) == Some(expected)));
+        assert_eq!(writer.json_response()["created"], expected);
     }
 
     #[test]

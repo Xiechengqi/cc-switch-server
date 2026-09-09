@@ -3,6 +3,7 @@
   "policy": {
     "realPrompts": "Use fixed low-cost ping prompts only. Do not run load tests from this matrix.",
     "streamEvidence": "Store only stream summaries from scripts/smoke/stream-probe.mjs, never full provider streams.",
+    "openAiChatCreated": "Every successful non-stream Chat completion and every streamed chat.completion.chunk must contain a positive integer Unix-seconds created value; all chunks in one stream must use the same value.",
     "secretPolicy": "No provider tokens, OAuth raw responses, or response bodies are stored in evidence.",
     "evidenceStates": {
       "contract_verified": "Local tests and fixtures passed; no real upstream success is implied.",
@@ -246,6 +247,7 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
+        "grok_oauth",
         "deepseek_account",
         "grok_web_session",
         "perplexity_web_session"
@@ -269,6 +271,7 @@
           "deepseek_api",
           "kiro_oauth",
           "github_copilot",
+          "grok_oauth",
           "deepseek_account"
         ],
         "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
@@ -307,6 +310,7 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
+        "grok_oauth",
         "grok_web_session",
         "perplexity_web_session"
       ],
@@ -328,7 +332,8 @@
           "nvidia",
           "deepseek_api",
           "kiro_oauth",
-          "github_copilot"
+          "github_copilot",
+          "grok_oauth"
         ],
         "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
         "plannedFamilies": ["aws_bedrock"],
@@ -366,6 +371,7 @@
         "deepseek_api",
         "github_copilot",
         "kiro_oauth",
+        "grok_oauth",
         "grok_web_session",
         "perplexity_web_session"
       ],
@@ -387,7 +393,8 @@
           "nvidia",
           "deepseek_api",
           "kiro_oauth",
-          "github_copilot"
+          "github_copilot",
+          "grok_oauth"
         ],
         "experimentalFamilies": ["cursor_oauth", "cursor_apikey", "grok_web_session", "perplexity_web_session"],
         "plannedFamilies": ["aws_bedrock"],
@@ -424,7 +431,8 @@
         "nvidia",
         "deepseek_api",
         "github_copilot",
-        "kiro_oauth"
+        "kiro_oauth",
+        "grok_oauth"
       ],
       "staticCoverage": {
         "nativeFamilies": [
@@ -443,7 +451,8 @@
           "github_copilot",
           "ollama_cloud",
           "nvidia",
-          "deepseek_api"
+          "deepseek_api",
+          "grok_oauth"
         ],
         "experimentalFamilies": ["cursor_oauth", "cursor_apikey"],
         "plannedFamilies": ["aws_bedrock"],

@@ -192,7 +192,7 @@ node scripts/smoke/grok-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。
 
-脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON 和 Responses SSE，并对两个 Responses 请求携带固定 session id 与合法 `x-grok-turn-idx`。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
+脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON/SSE，以及 OpenAI Chat 非流式/流式。Chat 检查严格要求非流式 `created` 为正整数，并要求所有流式 chunk 的 `created` 合法且流内一致，同时观察 `finish_reason`、usage 信息和唯一 `[DONE]`。四个推理请求都携带固定 session id 与合法 `x-grok-turn-idx`。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/acceptance/real-acceptance-runbook.md` 单独留证。
 

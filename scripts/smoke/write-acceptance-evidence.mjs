@@ -273,6 +273,8 @@ const evidence = {
     grokModelsStatus: env("GROK_MODELS_STATUS"),
     grokJsonStatus: env("GROK_JSON_STATUS"),
     grokStreamStatus: env("GROK_STREAM_STATUS"),
+    grokChatJsonStatus: env("GROK_CHAT_JSON_STATUS"),
+    grokChatStreamStatus: env("GROK_CHAT_STREAM_STATUS"),
     grokMediaStatus: env("GROK_MEDIA_STATUS"),
     cursorGateStatus: env("CURSOR_GATE_STATUS"),
     qoderGlobalOauthGateStatus: env("QODER_GLOBAL_OAUTH_GATE_STATUS"),

@@ -464,6 +464,15 @@ pub fn record_stream_transform_protocol_error(kind: &'static str) {
     .increment(1);
 }
 
+pub fn record_openai_chat_compat(action: &'static str, path: &'static str) {
+    metrics::counter!(
+        "cc_switch_openai_chat_compat_total",
+        "action" => action,
+        "path" => path
+    )
+    .increment(1);
+}
+
 pub fn record_stream_client_cancelled(app: &str) {
     metrics::counter!(
         "cc_switch_stream_client_cancelled_total",
@@ -674,6 +683,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_stream_transform_protocol_error_total",
         "Bounded cross-protocol stream transform errors"
+    );
+    metrics::describe_counter!(
+        "cc_switch_openai_chat_compat_total",
+        "OpenAI Chat success envelopes preserved or normalized by bounded action and path"
     );
     metrics::describe_counter!(
         "cc_switch_stream_client_cancelled_total",

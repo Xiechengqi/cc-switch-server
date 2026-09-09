@@ -1199,10 +1199,14 @@ fn transform_response_for_downstream(
     route: ProxyRoute,
     responses_tool_context: &transforms::ResponsesToolContext,
 ) -> Result<Bytes, ProxyError> {
-    let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
-        return Ok(body);
-    };
     let downstream_format = downstream_format_for_route(route);
+    let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
+        return if downstream_format == UpstreamFormat::OpenAiChat {
+            super::openai_chat_compat::normalize_chat_completion_bytes(body, "passthrough")
+        } else {
+            Ok(body)
+        };
+    };
     let unwrap_v1internal = is_gemini_v1internal_provider_type(stored.provider_type);
     let cross_protocol = upstream_format != downstream_format;
     let restore_grok_tools = stored.provider_type == ProviderType::GrokOAuth
@@ -1210,7 +1214,11 @@ fn transform_response_for_downstream(
         && downstream_format == UpstreamFormat::OpenAiResponses
         && responses_tool_context.requires_grok_emulation();
     if upstream_format == downstream_format && !unwrap_v1internal && !restore_grok_tools {
-        return Ok(body);
+        return if downstream_format == UpstreamFormat::OpenAiChat {
+            super::openai_chat_compat::normalize_chat_completion_bytes(body, "passthrough")
+        } else {
+            Ok(body)
+        };
     }
     let mut input = match serde_json::from_slice::<Value>(&body) {
         Ok(input) => input,
@@ -1312,14 +1320,18 @@ fn transform_response_for_downstream(
         _ => Ok(input),
     };
 
-    match transformed.and_then(|value| {
-        serde_json::to_vec(&value)
-            .map_err(|error| transforms::TransformError::new(error.to_string()))
-    }) {
-        Ok(bytes) => Ok(Bytes::from(bytes)),
-        Err(error) => Err(ProxyError::bad_gateway(format!(
-            "cross-protocol response bridge failed: {error}"
-        ))),
+    let value = transformed.map_err(|error| {
+        ProxyError::bad_gateway(format!("cross-protocol response bridge failed: {error}"))
+    })?;
+    let bytes = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| {
+            ProxyError::bad_gateway(format!("cross-protocol response bridge failed: {error}"))
+        })?;
+    if downstream_format == UpstreamFormat::OpenAiChat {
+        super::openai_chat_compat::normalize_chat_completion_bytes(bytes, "synthesized")
+    } else {
+        Ok(bytes)
     }
 }
 
@@ -7384,6 +7396,107 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(4)
         );
+        assert!(value
+            .get("created")
+            .and_then(Value::as_i64)
+            .is_some_and(|created| created > 0));
+    }
+
+    #[test]
+    fn chat_non_stream_output_normalizes_created_for_synthesized_and_native_paths() {
+        let responses = stored_provider(
+            AppKind::Codex,
+            ProviderType::CodexOAuth,
+            json!({"env": {"OPENAI_API_KEY": "oauth-token"}}),
+        );
+        let responses_adapter = adapter_for(AppKind::Codex, ProviderType::CodexOAuth);
+        for created_at in [json!(null), json!("73"), json!(1.5), json!(0), json!(-1)] {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "id": "resp_invalid_created",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "created_at": created_at,
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]
+                }))
+                .unwrap(),
+            );
+            let output = responses_adapter
+                .transform_response(body, &responses, ProxyRoute::CodexChatCompletions)
+                .unwrap();
+            let value: Value = serde_json::from_slice(&output).unwrap();
+            assert!(value
+                .get("created")
+                .and_then(Value::as_i64)
+                .is_some_and(|created| created > 0));
+        }
+
+        let preserved = responses_adapter
+            .transform_response(
+                Bytes::from_static(
+                    br#"{"id":"resp_valid_created","object":"response","status":"completed","model":"gpt-5.5","created_at":73,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}"#,
+                ),
+                &responses,
+                ProxyRoute::CodexChatCompletions,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&preserved).unwrap()["created"],
+            73
+        );
+
+        let native = stored_provider(
+            AppKind::Codex,
+            ProviderType::OpenRouter,
+            json!({"env": {"OPENAI_API_KEY": "secret"}}),
+        );
+        let native_adapter = adapter_for(AppKind::Codex, ProviderType::OpenRouter);
+        for input in [
+            br#"{"id":"chat_1","object":"chat.completion","choices":[]}"#.as_slice(),
+            br#"{"id":"chat_1","object":"chat.completion","created":null,"choices":[]}"#.as_slice(),
+            br#"{"id":"chat_1","object":"chat.completion","created":"73","choices":[]}"#.as_slice(),
+        ] {
+            let output = native_adapter
+                .transform_response(
+                    Bytes::copy_from_slice(input),
+                    &native,
+                    ProxyRoute::CodexChatCompletions,
+                )
+                .unwrap();
+            let value: Value = serde_json::from_slice(&output).unwrap();
+            assert!(value
+                .get("created")
+                .and_then(Value::as_i64)
+                .is_some_and(|created| created > 0));
+        }
+    }
+
+    #[test]
+    fn chat_non_stream_output_preserves_success_and_error_bytes_when_already_valid() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::OpenRouter,
+            json!({"env": {"OPENAI_API_KEY": "secret"}}),
+        );
+        let adapter = adapter_for(AppKind::Codex, ProviderType::OpenRouter);
+        for body in [
+            Bytes::from_static(
+                br#"{"id":"chat_1", "object":"chat.completion", "created":73, "choices":[]}"#,
+            ),
+            Bytes::from_static(br#"{"error":{"message":"upstream failed"}}"#),
+        ] {
+            assert_eq!(
+                adapter
+                    .transform_response(body.clone(), &stored, ProxyRoute::CodexChatCompletions)
+                    .unwrap(),
+                body
+            );
+        }
     }
 
     #[test]

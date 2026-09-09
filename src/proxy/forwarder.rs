@@ -15118,7 +15118,10 @@ async fn aggregate_codebuddy_nonstream(
         )));
     }
     aggregator
-        .finish(model_id, chrono::Utc::now().timestamp())
+        .finish(
+            model_id,
+            super::openai_chat_compat::unix_timestamp_seconds(),
+        )
         .map_err(CodeBuddyForwardAttemptError::Proxy)
 }
 
@@ -17111,7 +17114,10 @@ async fn aggregate_qoder_nonstream(
         )));
     }
     aggregator
-        .finish(model_key, chrono::Utc::now().timestamp())
+        .finish(
+            model_key,
+            super::openai_chat_compat::unix_timestamp_seconds(),
+        )
         .map_err(QoderForwardAttemptError::Proxy)
 }
 

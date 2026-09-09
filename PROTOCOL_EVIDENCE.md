@@ -19,6 +19,20 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-09 OpenAI Chat `created` compatibility freeze
+
+OpenAI Chat Completions 的流式 `chat.completion.chunk.created` 是 Unix 秒级整数，且同一 completion 流中的所有 chunk 使用同一个时间戳。Server 将此视为所有 `/v1/chat/completions` Provider 出口的协议不变量，而不是 `grok_oauth` 的专用修补：跨协议 Responses/Anthropic/Gemini 合成必须从源头生成合法且流内稳定的 `created`，原生 OpenAI Chat 透传和专用 canonical emitter 还必须经过同一出口合同。非流式 `chat.completion` 同样不得缺失、输出 `null` 或输出非正整数 `created`。官方协议依据为 <https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events#chat.completion.chunk>。
+
+本次一次性、只读差异研究冻结在 `/data/projects/proxy/Grok/grok2api` commit `8913b53fe92307a6f111b2885ab298a43c74a9ba`。只吸收以下协议事实，不复制实现，也不把该仓库加入构建、测试、发布、运行时或日常同步输入：conversation stream converter 在构造时生成一次 fallback `created`，Chat 的 role/content/reasoning/tool/finish/usage chunk 全部复用；上游存在有效 `created_at` 时优先保留首个值；Responses compatibility state 在首次确定后拒绝后续时间漂移；非流式时间为零时回退当前 Unix 秒。冻结文件为：
+
+- `backend/internal/infra/provider/conversation/stream.go`：`82245c33dcb82fb6fc9184b5108fa3021781cae6df534fe7464e0987f062c224`
+- `backend/internal/infra/provider/conversation/chat_stream.go`：`1390f7db068879527ab669816dfb159d475f7ff84fd0de8eb00a9718620b4533`
+- `backend/internal/infra/provider/conversation/response.go`：`5cfa7396be4fa0d2c399538a95943f528824703bb9a1c37856c07ba42672175c`
+- `backend/internal/infra/provider/conversation/chat_response.go`：`9786567cfa5f4338294498a1c140ae0ed467878e6963ab8b850755a6b13f712f`
+- `backend/internal/transport/http/inference/responses_compat.go`：`a7b76f018f76c204a5137539a5821dedbb96f52c41997c933bcb4ace3da36037`
+
+明确不采用 `backend/internal/infra/provider/web/chat.go` 的流式 Chat 时间设计：该文件在多个 chunk 分支分别调用 `time.Now().Unix()`，跨秒时会产生同流时间漂移。Server 独立实现采用流级 fallback、首个有效上游值和首次下游 Chat chunk 后冻结的状态机；只对成功 Chat envelope 补正字段，错误 envelope、SSE 控制字段和 `[DONE]` 不被伪装成成功响应。离线 fixture 只能证明兼容合同，真实 Grok OAuth/Grok CLI 仍保持 `live_pending`，直到按 acceptance runbook 留存脱敏 receipt。
+
 ## 2026-09-02 Claude Code 2.1.258 OAuth wire profile freeze
 
 `claude_oauth` 的当前 wire profile 来自对官方 npm `@anthropic-ai/claude-code@2.1.258` native binary 的一次性静态审计，以及只连接本地 loopback、使用假凭据的出站请求捕获；审计过程没有访问 Anthropic，也没有保存或使用真实 access/refresh token。审计当日 npm `latest` / `next` 为 `2.1.258`，`stable` 仍为 `2.1.236`。发布漂移检查以 `latest` 为目标，同时只记录 `stable`；Server 构建和运行时都不访问 npm。

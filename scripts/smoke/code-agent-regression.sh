@@ -130,6 +130,9 @@ stream_probe() {
   shift 3
   local args
   args=(--url "$url" --body "$body" --require-done)
+  if [[ "${url%%\?*}" == */v1/chat/completions ]]; then
+    args+=(--protocol openai-chat)
+  fi
   if [[ "$REQUIRE_STREAM_USAGE" == "1" ]]; then
     args+=(--require-usage)
   fi

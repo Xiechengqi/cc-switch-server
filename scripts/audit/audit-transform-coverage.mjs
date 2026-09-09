@@ -7,6 +7,7 @@ const serverFiles = [
   "src/proxy/streaming.rs",
   "src/proxy/adapters.rs",
   "src/proxy/stream_transforms.rs",
+  "src/proxy/openai_chat_compat.rs",
 ];
 
 const minimumTests = Number(process.env.CC_SWITCH_TRANSFORM_MIN_TESTS || 216);

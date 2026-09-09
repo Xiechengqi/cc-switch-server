@@ -558,7 +558,7 @@ impl TraeSseDecoder {
             buffer: Vec::new(),
             aggregate_bytes: 0,
             id: format!("chatcmpl-trae-{}", random_trae_request_id()),
-            created: chrono::Utc::now().timestamp(),
+            created: super::openai_chat_compat::unix_timestamp_seconds(),
             fallback_model: fallback_model.into(),
             reported_model: None,
             content: String::new(),
@@ -1290,11 +1290,26 @@ mod tests {
         assert!(!decoder.is_terminal());
 
         let tail = decoder.finish_classified().unwrap();
-        assert!(String::from_utf8(tail.to_vec())
-            .unwrap()
-            .ends_with("data: [DONE]\n\n"));
+        let tail_text = String::from_utf8(tail.to_vec()).unwrap();
+        assert!(tail_text.ends_with("data: [DONE]\n\n"));
         assert!(decoder.is_terminal());
+        let created_values = format!("{first_text}{tail_text}")
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| {
+                serde_json::from_str::<Value>(payload).unwrap()["created"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!created_values.is_empty());
+        assert!(created_values[0] > 0);
+        assert!(created_values
+            .iter()
+            .all(|created| *created == created_values[0]));
         let response = decoder.into_chat_completion().unwrap();
+        assert_eq!(response["created"].as_i64(), Some(created_values[0]));
         assert_eq!(
             response.pointer("/choices/0/message/content"),
             Some(&json!("hello"))

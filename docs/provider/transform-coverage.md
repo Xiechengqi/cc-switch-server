@@ -1,6 +1,6 @@
 # Transform/Streaming Coverage Tracker
 
-> Status: **authoritative**. Last verified: 2026-08-20.
+> Status: **authoritative**. Last verified: 2026-09-09.
 >
 > This tracker records the Server-owned transform and streaming regression surface. The numbers below
 > are a *floor*, not a snapshot — run the audit for live counts.
@@ -11,11 +11,23 @@
 | --- | --- |
 | Server minimum | 216 tests across the owned transform, streaming, adapter, and stream-transform modules (override with `CC_SWITCH_TRANSFORM_MIN_TESTS`) |
 | Gate | `node scripts/audit/audit-transform-coverage.mjs --check` from `scripts/static-checks.sh` |
-| Counted modules | `src/proxy/transforms.rs`, `src/proxy/streaming.rs`, `src/proxy/adapters.rs`, `src/proxy/stream_transforms.rs` |
+| Counted modules | `src/proxy/transforms.rs`, `src/proxy/streaming.rs`, `src/proxy/adapters.rs`, `src/proxy/stream_transforms.rs`, `src/proxy/openai_chat_compat.rs` |
 
-Observed on 2026-08-20 (`node scripts/audit/audit-transform-coverage.mjs`): 394 tests total —
-transforms 97, streaming 128, adapters 104, stream_transforms 65. Re-run the audit rather than
-trusting this line; it is a dated observation, not a contract.
+Observed on 2026-09-09 (`node scripts/audit/audit-transform-coverage.mjs`): 435 tests total —
+transforms 99, streaming 133, adapters 116, stream_transforms 77, openai_chat_compat 10. Re-run the
+audit rather than trusting this line; it is a dated observation, not a contract.
+
+## OpenAI Chat `created` contract
+
+| Area | Status | Server evidence |
+| --- | --- | --- |
+| Responses/Anthropic/Gemini stream synthesis | Covered | `responses_chat_created_*`, `anthropic_chat_created_*`, `gemini_chat_created_*` |
+| Native Chat passthrough normalization | Covered | `canonicalizer_*created*`, strict chunk-schema fixtures |
+| Stream-wide timestamp freeze | Covered | `canonicalizer_freezes_first_valid_created`, `canonicalizer_fallback_is_stable_across_all_chunk_kinds` |
+| SSE framing and byte preservation | Covered | `canonicalizer_handles_every_split_and_line_ending`, `canonicalizer_preserves_untouched_events_byte_for_byte` |
+| Non-stream success normalization | Covered | `normalizes_nonstream_chat_created_without_touching_errors` |
+| Cursor dedicated Chat emitter | Covered | `chat_chunks_share_writer_created_timestamp` |
+| Real Grok OAuth/Grok CLI | Live pending | `scripts/smoke/grok-oauth-real.mjs`; no live success is claimed without private inputs |
 
 ## First Batch Covered
 

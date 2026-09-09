@@ -56,6 +56,7 @@ done
 
 echo "== provider audits =="
 node --test scripts/audit/*.test.mjs
+node --test scripts/smoke/*.test.mjs
 node scripts/audit/audit-qoder-cli-oracle.mjs
 node scripts/audit/audit-server-provider-contract.mjs
 node scripts/audit/audit-provider-phase0-contracts.mjs --check

@@ -2,6 +2,8 @@
 
 本矩阵对应 Z3/Z8。真实 provider/token 不存在时，只能执行本地 contract 和 mock 回归；真实账号回归不得伪标完成。
 
+`/v1/chat/completions` 另有全 Provider 出口合同：非流式成功对象和每个流式 `chat.completion.chunk` 都必须包含正整数 Unix 秒 `created`，且同一流的 role/text/reasoning/tool/finish/usage-only chunk 必须保持同一个值。严格本地 fixture 覆盖 Responses/Anthropic/Gemini 合成、原生 Chat 透传及专用 emitter；真实 Grok OAuth/Grok CLI 在缺少私密输入时继续保持 `live_pending`。权威 JSON 已把 `grok_oauth` 补入 Claude、Codex Responses/Chat 与 Gemini 的对应 Provider family 矩阵，不据此伪报 live success。
+
 AD3 已将本页矩阵固化为 `docs/provider/regression-matrix.json`。`scripts/smoke/code-agent-regression.sh` 会先运行 `scripts/smoke/code-agent-matrix-summary.mjs`，输出：
 
 - `matrixTotal`：矩阵组合总数。
@@ -118,7 +120,7 @@ MATRIX_LIVE_EVIDENCE_FILE=/private/code-agent-live-evidence.json REQUIRE_STREAM_
 
 无真实 provider/token 时，`scripts/smoke/code-agent-regression.sh` 会运行 proxy、account domain、OAuth client、Web UI 和协议审计合同，以及可用的本地 server capability 检查；Share/Gateway/real provider 请求会输出 skipped 或 warning，不标记真实成功。每个 Rust 过滤器会先执行 `--list` 并强制要求至少命中一条测试。
 
-stream 分支统一使用 `scripts/smoke/stream-probe.mjs`，只保存状态码、首块耗时、chunk/byte 计数、done/usage 标记和最多 2KB preview，不保存完整 stream 响应。默认要求看到结束事件；`REQUIRE_STREAM_USAGE=1` 时才把 usage 标记作为硬通过条件。
+stream 分支统一使用 `scripts/smoke/stream-probe.mjs`，只保存协议、状态码、首块耗时、network chunk/SSE event/byte 计数、done/usage 标记和最多 2KB preview，不保存完整 stream 响应。默认要求看到结束事件；`REQUIRE_STREAM_USAGE=1` 时才把 usage 标记作为通用协议的硬通过条件。`/v1/chat/completions` 会自动启用严格 `openai-chat` 模式，额外验证每个 chunk 的 envelope、正整数且流内一致的 `created`、终态 `finish_reason` 和唯一 `[DONE]`；usage 仍仅在请求方要求时作为硬门禁。
 
 ## 记录模板
 

@@ -26,6 +26,7 @@ pub(super) struct StreamEventTransformer {
     buffer: Vec<u8>,
     responses_tool_context: transforms::ResponsesToolContext,
     bridge: Option<StreamBridgeState>,
+    chat_compat: Option<super::openai_chat_compat::OpenAiChatStreamCanonicalizer>,
     unwrap_v1internal: bool,
     gemini_terminal: Option<GeminiStreamTerminalState>,
 }
@@ -102,43 +103,71 @@ impl StreamEventTransformer {
             }
             _ => None,
         };
+        let chat_compat_path =
+            if bridge.is_some() || upstream.is_some_and(|upstream| upstream != downstream) {
+                "synthesized"
+            } else {
+                "passthrough"
+            };
+        let chat_compat = (downstream == UpstreamFormat::OpenAiChat).then(|| {
+            super::openai_chat_compat::OpenAiChatStreamCanonicalizer::new(chat_compat_path)
+        });
         Self {
             upstream,
             downstream,
             buffer: Vec::new(),
             responses_tool_context,
             bridge,
+            chat_compat,
             unwrap_v1internal,
             gemini_terminal,
         }
     }
 
     pub(super) fn push(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
-        let Some(upstream) = self.upstream else {
-            return Ok(chunk);
+        let output = match self.upstream {
+            None => chunk,
+            Some(upstream)
+                if upstream == self.downstream
+                    && !self.unwrap_v1internal
+                    && self.bridge.is_none() =>
+            {
+                chunk
+            }
+            Some(_) => {
+                self.buffer.extend_from_slice(&chunk);
+                self.drain_complete_events(false)?
+            }
         };
-        if upstream == self.downstream && !self.unwrap_v1internal && self.bridge.is_none() {
-            return Ok(chunk);
+        match self.chat_compat.as_mut() {
+            Some(compat) => compat.push(output),
+            None => Ok(output),
         }
-        self.buffer.extend_from_slice(&chunk);
-        self.drain_complete_events(false)
     }
 
     pub(super) fn finish(&mut self) -> Result<Bytes, ProxyError> {
-        let Some(upstream) = self.upstream else {
-            return Ok(Bytes::new());
+        let passthrough = self.upstream.is_none()
+            || self.upstream.is_some_and(|upstream| {
+                upstream == self.downstream && !self.unwrap_v1internal && self.bridge.is_none()
+            });
+        let output = if passthrough {
+            Bytes::new()
+        } else {
+            let mut output = self.drain_complete_events(true)?.to_vec();
+            if let Some(terminal) = self.gemini_terminal.as_ref() {
+                terminal.validate()?;
+            }
+            if let Some(bridge) = self.bridge.as_mut() {
+                output.extend_from_slice(&encode_stream_frames(&bridge.finish_eof()?).into_bytes());
+            }
+            Bytes::from(output)
         };
-        if upstream == self.downstream && !self.unwrap_v1internal && self.bridge.is_none() {
-            return Ok(Bytes::new());
-        }
-        let mut output = self.drain_complete_events(true)?.to_vec();
-        if let Some(terminal) = self.gemini_terminal.as_ref() {
-            terminal.validate()?;
-        }
-        if let Some(bridge) = self.bridge.as_mut() {
-            output.extend_from_slice(&encode_stream_frames(&bridge.finish_eof()?).into_bytes());
-        }
-        Ok(Bytes::from(output))
+        let Some(compat) = self.chat_compat.as_mut() else {
+            return Ok(output);
+        };
+        let mut normalized = compat.push(output)?.to_vec();
+        normalized.extend_from_slice(&compat.finish()?);
+        Ok(Bytes::from(normalized))
     }
 
     fn drain_complete_events(&mut self, finish: bool) -> Result<Bytes, ProxyError> {
@@ -3182,10 +3211,11 @@ impl ChatAnthropicState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ResponsesChatState {
     response_id: String,
     model: String,
+    created: i64,
     role_sent: bool,
     next_tool_index: u64,
     tools: BTreeMap<i64, ResponsesChatToolState>,
@@ -3193,6 +3223,23 @@ struct ResponsesChatState {
     emitted_text_items: BTreeSet<String>,
     emitted_reasoning_items: BTreeSet<String>,
     completed: bool,
+}
+
+impl Default for ResponsesChatState {
+    fn default() -> Self {
+        Self {
+            response_id: String::new(),
+            model: String::new(),
+            created: super::openai_chat_compat::unix_timestamp_seconds(),
+            role_sent: false,
+            next_tool_index: 0,
+            tools: BTreeMap::new(),
+            item_ids: BTreeMap::new(),
+            emitted_text_items: BTreeSet::new(),
+            emitted_reasoning_items: BTreeSet::new(),
+            completed: false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3245,6 +3292,19 @@ impl ResponsesChatState {
         if let Some(model) = response.get("model").and_then(Value::as_str) {
             self.model = model.to_string();
         }
+        if !self.role_sent {
+            if let Some(created) = response
+                .get("created_at")
+                .and_then(super::openai_chat_compat::valid_created)
+                .or_else(|| {
+                    response
+                        .get("created")
+                        .and_then(super::openai_chat_compat::valid_created)
+                })
+            {
+                self.created = created;
+            }
+        }
     }
 
     fn ensure_role_chunk(&mut self) -> Vec<StreamFrame> {
@@ -3255,6 +3315,7 @@ impl ResponsesChatState {
         vec![chat_stream_chunk(
             &self.response_id,
             &self.model,
+            self.created,
             json!({"role": "assistant"}),
             Value::Null,
             None,
@@ -3270,6 +3331,7 @@ impl ResponsesChatState {
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
+            self.created,
             json!({"content": delta}),
             Value::Null,
             None,
@@ -3291,6 +3353,7 @@ impl ResponsesChatState {
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
+            self.created,
             json!({"reasoning_content": delta}),
             Value::Null,
             None,
@@ -3335,6 +3398,7 @@ impl ResponsesChatState {
             frames.push(chat_tool_arguments_chunk(
                 &self.response_id,
                 &self.model,
+                self.created,
                 state.downstream_index.unwrap_or(0),
                 &delta,
             ));
@@ -3410,6 +3474,7 @@ impl ResponsesChatState {
                 frames.push(chat_stream_chunk(
                     &self.response_id,
                     &self.model,
+                    self.created,
                     delta,
                     Value::Null,
                     None,
@@ -3546,6 +3611,7 @@ impl ResponsesChatState {
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
+            self.created,
             json!({"tool_calls": [tool_call]}),
             Value::Null,
             None,
@@ -3564,6 +3630,7 @@ impl ResponsesChatState {
             frames.push(chat_tool_arguments_chunk(
                 &self.response_id,
                 &self.model,
+                self.created,
                 state.downstream_index.unwrap_or(0),
                 &delta,
             ));
@@ -3591,6 +3658,7 @@ impl ResponsesChatState {
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
+            self.created,
             json!({}),
             finish_reason,
             usage,
@@ -4129,6 +4197,7 @@ impl ChatResponsesState {
 fn chat_stream_chunk(
     response_id: &str,
     model: &str,
+    created: i64,
     delta: Value,
     finish_reason: Value,
     usage: Option<Value>,
@@ -4143,6 +4212,7 @@ fn chat_stream_chunk(
     let mut chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
+        "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
     });
@@ -4155,12 +4225,14 @@ fn chat_stream_chunk(
 fn chat_tool_arguments_chunk(
     response_id: &str,
     model: &str,
+    created: i64,
     index: u64,
     arguments: &str,
 ) -> StreamFrame {
     chat_stream_chunk(
         response_id,
         model,
+        created,
         json!({"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}),
         Value::Null,
         None,
@@ -5048,6 +5120,7 @@ mod tests {
             bridge: Some(StreamBridgeState::ResponsesAnthropic(
                 ResponsesAnthropicState::default(),
             )),
+            chat_compat: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
         }
@@ -5619,6 +5692,173 @@ mod tests {
         assert_eq!(terminal["usage"]["prompt_tokens"], 8);
         assert_eq!(terminal["usage"]["completion_tokens"], 5);
         assert_eq!(done_frame_count(&chat), 1);
+    }
+
+    #[test]
+    fn responses_chat_created_prefers_upstream_and_freezes() {
+        let mut state = ResponsesChatState {
+            created: 41,
+            ..ResponsesChatState::default()
+        };
+        let events = [
+            json!({"type":"response.created","response":{"id":"resp-created","model":"gpt","created_at":73}}),
+            json!({"type":"response.output_text.delta","delta":"hello"}),
+            json!({"type":"response.reasoning_summary_text.delta","delta":"plan"}),
+            json!({"type":"response.completed","response":{"id":"resp-created","model":"gpt","created_at":99,"status":"completed","usage":{"input_tokens":2,"output_tokens":3}}}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(&event));
+        }
+        let chunks = json_stream_frames(&frames)
+            .into_iter()
+            .filter(|value| value["object"] == "chat.completion.chunk")
+            .collect::<Vec<_>>();
+        assert!(chunks.len() >= 4);
+        assert!(chunks.iter().all(|chunk| chunk["created"] == 73));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk["created"].as_i64().is_some_and(|value| value > 0)));
+    }
+
+    #[test]
+    fn responses_chat_created_rejects_invalid_upstream_values() {
+        for invalid in [json!(null), json!("73"), json!(1.5), json!(0), json!(-1)] {
+            let mut state = ResponsesChatState {
+                created: 47,
+                ..ResponsesChatState::default()
+            };
+            let frames = state.transform(&json!({
+                "type":"response.created",
+                "response":{"created_at":invalid}
+            }));
+            assert_eq!(json_stream_frames(&frames)[0]["created"], 47);
+        }
+    }
+
+    #[test]
+    fn anthropic_chat_created_is_positive_and_stable() {
+        let mut state = AnthropicChatState::new(transforms::ResponsesToolContext::default());
+        state.chat.created = 53;
+        let events = [
+            json!({"type":"message_start","message":{"id":"msg-created","model":"claude","usage":{"input_tokens":2}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(&event));
+        }
+        let chunks = json_stream_frames(&frames)
+            .into_iter()
+            .filter(|value| value["object"] == "chat.completion.chunk")
+            .collect::<Vec<_>>();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk["created"] == 53));
+    }
+
+    #[test]
+    fn gemini_chat_created_is_positive_and_stable() {
+        let mut state = GeminiOpenAiState::chat(transforms::ResponsesToolContext::default());
+        if let GeminiOpenAiTarget::Chat { chat, .. } = &mut state.target {
+            chat.created = 59;
+        }
+        let frames = gemini_openai_fixture(state);
+        let chunks = json_stream_frames(&frames)
+            .into_iter()
+            .filter(|value| value["object"] == "chat.completion.chunk")
+            .collect::<Vec<_>>();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk["created"] == 59));
+    }
+
+    #[test]
+    fn grok_oauth_responses_chat_stream_has_strict_created() {
+        use crate::domain::providers::model::{AppKind, ProviderType};
+
+        let stored = gemini_v1internal_stored_provider(AppKind::Codex, ProviderType::GrokOAuth);
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::CodexChatCompletions,
+            transforms::ResponsesToolContext::default(),
+        );
+        let input = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_grok\",\"model\":\"grok-4.6-build\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_grok\",\"model\":\"grok-4.6-build\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut output = transformer
+            .push(Bytes::from_static(input.as_bytes()))
+            .unwrap()
+            .to_vec();
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let chunks = output
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data: "))
+            .filter(|payload| *payload != b"[DONE]")
+            .map(|payload| serde_json::from_slice::<Value>(payload).unwrap())
+            .filter(|value| value["object"] == "chat.completion.chunk")
+            .collect::<Vec<_>>();
+        let created = chunks[0]["created"].as_i64().unwrap();
+        assert!(created > 0);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk["created"].as_i64() == Some(created)));
+        assert!(chunks.iter().all(|chunk| {
+            chunk["id"] == "chatcmpl_grok"
+                && chunk["model"] == "grok-4.6-build"
+                && chunk["choices"].is_array()
+        }));
+        let terminal = chunks
+            .iter()
+            .find(|chunk| chunk.pointer("/choices/0/finish_reason") == Some(&json!("stop")))
+            .unwrap();
+        assert_eq!(terminal.pointer("/usage/total_tokens"), Some(&json!(3)));
+        assert_eq!(
+            output
+                .windows(b"data: [DONE]".len())
+                .filter(|window| *window == b"data: [DONE]")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_chat_passthrough_normalizes_created_across_chunks() {
+        use crate::domain::providers::model::{AppKind, ProviderType};
+
+        let stored = gemini_v1internal_stored_provider(AppKind::Codex, ProviderType::OpenRouter);
+        let mut transformer = StreamEventTransformer::new(
+            &stored,
+            ProxyRoute::CodexChatCompletions,
+            transforms::ResponsesToolContext::default(),
+        );
+        let first = transformer
+            .push(Bytes::from_static(
+                b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n",
+            ))
+            .unwrap();
+        let second = transformer
+            .push(Bytes::from_static(
+                b"data: {\"object\":\"chat.completion.chunk\",\"created\":1,\"choices\":[]}\n\n",
+            ))
+            .unwrap();
+        let mut output = first.to_vec();
+        output.extend_from_slice(&second);
+        output.extend_from_slice(&transformer.finish().unwrap());
+        let created = output
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data: "))
+            .map(|payload| serde_json::from_slice::<Value>(payload).unwrap())
+            .map(|value| value["created"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(created.len(), 2);
+        assert!(created[0] > 0);
+        assert_eq!(created[0], created[1]);
     }
 
     #[test]
@@ -6447,6 +6687,7 @@ mod tests {
             bridge: Some(StreamBridgeState::GrokResponsesTools(
                 GrokResponsesToolsState::new(context),
             )),
+            chat_compat: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
         };

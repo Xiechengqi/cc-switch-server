@@ -1431,7 +1431,7 @@ fn render_downstream(
         ProxyRoute::CodexResponses => "resp_web_",
         _ => "web_",
     });
-    let created = crate::infra::time::now_ms() as u64 / 1000;
+    let created = super::openai_chat_compat::unix_timestamp_seconds();
     let encoded = match (route, stream) {
         (ProxyRoute::ClaudeMessages, false) => serde_json::to_vec(&json!({
             "id": id,
@@ -1568,7 +1568,7 @@ fn render_downstream(
 
 fn completed_response(
     id: &str,
-    created: u64,
+    created: i64,
     model: &str,
     text: &str,
     input_tokens: u64,
@@ -1635,6 +1635,45 @@ impl From<serde_json::Error> for ProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_chat_render_uses_one_positive_created_timestamp() {
+        let (json_body, content_type) = render_downstream(
+            ProxyRoute::CodexChatCompletions,
+            false,
+            "fixture-model",
+            "hello",
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(content_type, "application/json");
+        let json: Value = serde_json::from_slice(&json_body).unwrap();
+        let created = json["created"].as_i64().unwrap();
+        assert!(created > 0);
+
+        let (stream_body, content_type) = render_downstream(
+            ProxyRoute::CodexChatCompletions,
+            true,
+            "fixture-model",
+            "hello",
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(content_type, "text/event-stream");
+        let chunks = stream_body
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data: "))
+            .filter(|payload| *payload != b"[DONE]")
+            .map(|payload| serde_json::from_slice::<Value>(payload).unwrap())
+            .collect::<Vec<_>>();
+        let stream_created = chunks[0]["created"].as_i64().unwrap();
+        assert!(stream_created > 0);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk["created"].as_i64() == Some(stream_created)));
+    }
 
     #[test]
     fn grok_ndjson_requires_one_terminal_and_rejects_malformed_or_trailing_data() {
