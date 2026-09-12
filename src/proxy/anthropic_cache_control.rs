@@ -33,6 +33,27 @@ pub(crate) fn normalize_anthropic_cache_control(body: &mut Value, inject_default
     normalize_cache_control_ttls(body);
 }
 
+pub(crate) fn has_extended_cache_ttl(body: &Value) -> bool {
+    collect_cache_paths(body).into_iter().any(|path| {
+        cache_control(body, path)
+            .and_then(Value::as_object)
+            .and_then(|cache| cache.get("ttl"))
+            .and_then(Value::as_str)
+            == Some("1h")
+    })
+}
+
+pub(crate) fn strip_extended_cache_ttls(body: &mut Value) {
+    for path in collect_cache_paths(body) {
+        let Some(cache) = cache_control_mut(body, path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if cache.get("ttl").and_then(Value::as_str) == Some("1h") {
+            cache.remove("ttl");
+        }
+    }
+}
+
 fn inject_default_breakpoints(body: &mut Value) {
     let paths = collect_cache_paths(body);
     if !paths
@@ -229,6 +250,29 @@ fn cache_control_mut(body: &mut Value, path: CachePath) -> Option<&mut Value> {
             .as_array_mut()?
             .get_mut(block)?
             .get_mut("cache_control"),
+    }
+}
+
+fn cache_control(body: &Value, path: CachePath) -> Option<&Value> {
+    match path {
+        CachePath::Tool(index) => body
+            .get("tools")?
+            .as_array()?
+            .get(index)?
+            .get("cache_control"),
+        CachePath::System(index) => body
+            .get("system")?
+            .as_array()?
+            .get(index)?
+            .get("cache_control"),
+        CachePath::Message(message, block) => body
+            .get("messages")?
+            .as_array()?
+            .get(message)?
+            .get("content")?
+            .as_array()?
+            .get(block)?
+            .get("cache_control"),
     }
 }
 

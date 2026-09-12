@@ -38,6 +38,27 @@
     ],
     "transientPrecommitRetry": "disabled_pending_separate_live_idempotency_evidence"
   },
+  "cursorReferenceDeltaAudit": {
+    "capturedAt": "2026-09-11T00:00:00Z",
+    "baseline": "assets/contract/cursor-reference-delta.json",
+    "registryContractRevision": 4,
+    "fixtureVerified": [
+      "public_oauth_alias_and_exact_scope_api_key_discovery",
+      "authoritative_empty_and_presentation_only_transient_stale_catalog",
+      "server_config_and_interaction_unknown_fields",
+      "duplicate_server_config_fields_fail_closed",
+      "fragmented_connect_frame_and_partial_eof",
+      "strict_terminal_envelope_and_plain_eof",
+      "fresh_full_fast_model_id"
+    ],
+    "livePending": ["oauth", "api_key"],
+    "binding": "fixed_provider_share_and_credential_identity_per_receipt",
+    "periodicAudit": "scripts/audit/audit-cursor-reference-delta.mjs",
+    "realHarness": "scripts/smoke/cursor-real.mjs",
+    "externalSourceCheck": "optional --check-sources; committed Git objects are read-only evidence and never runtime or build dependencies",
+    "crossRailEvidence": false,
+    "crossRailFallback": false
+  },
   "kiroTextImplementation": {
     "scope": "single explicitly bound subscription account per Provider; no pool, rotation, cross-account union, or cross-Provider failover",
     "contractState": "fixture_verified_live_pending",
@@ -54,11 +75,58 @@
       "strict_tool_bridge_and_eventstream",
       "downstream_keepalive_independent_of_upstream_deadlines",
       "same_account_quota_throttle_cooldown",
-      "supplemental_credit_metering"
+      "supplemental_credit_metering",
+      "top_level_auto_and_explicit_four_breakpoint_prompt_cache",
+      "twenty_position_tool_grouped_lookback_and_entry_ttl_renewal",
+      "authoritative_upstream_usage_zero_and_integer_ratio_conservation",
+      "bounded_async_generation_cas_sqlite_prompt_cache_persistence"
     ],
     "geminiSurface": "unsupported",
     "amazonQBoundary": "independent_amazon_q_oauth_typed_family; Kiro credentials, entitlement, endpoint identity, and quota are never accepted",
     "realAccountAcceptance": "live_pending"
+  },
+  "kiroReferenceDeltaAudit": {
+    "capturedAt": "2026-09-11T00:00:00Z",
+    "baseline": "assets/contract/kiro-reference-delta.json",
+    "fixtureVerified": [
+      "top_level_auto_and_explicit_breakpoints",
+      "four_breakpoint_and_twenty_position_limits",
+      "tool_use_and_tool_result_grouping",
+      "mixed_ttl_order_and_entry_renewal",
+      "latest_user_guardrail",
+      "authoritative_upstream_usage_including_zero",
+      "integer_ratio_conservation",
+      "bounded_async_sqlite_generation_cas_and_restart_ttl"
+    ],
+    "livePending": ["builder_id", "idc", "social", "api_key"],
+    "regions": ["us-east-1", "eu-central-1"],
+    "binding": "fixed_provider_share_account_user_auth_kind_and_region_per_receipt",
+    "periodicAudit": "scripts/audit/audit-kiro-reference-delta.mjs",
+    "externalSourceCheck": "optional --check-sources; committed Git objects are read-only evidence and never runtime or build dependencies",
+    "sharedCacheRuntimeEnabled": false,
+    "remoteStore": "disabled"
+  },
+  "codexDifferentialContract": {
+    "capturedAt": "2026-09-11T00:00:00Z",
+    "baseline": "assets/contract/codex-reference-delta.json",
+    "fixtureVerified": [
+      "bounded_unicode_schema_sanitizer",
+      "pure_const_union_equivalence",
+      "http_sse_ws_nested_error_sequence",
+      "named_tool_output",
+      "bootstrap_overload",
+      "websocket_http_precommit_fallback"
+    ],
+    "livePending": [
+      "gpt-image-2.5",
+      "gpt-image-2.5-flare",
+      "gpt-image-2.5-sunburst",
+      "websocket_prewarm",
+      "gpt_image_25_quota_cache"
+    ],
+    "binding": "fixed_provider_account",
+    "sharedAttemptBudget": true,
+    "postCommitReplay": false
   },
   "amazonQImplementation": {
     "scope": "one explicitly bound amazon_q_oauth account per Provider; no Kiro credential reuse, account pool, catalog union, rotation, or cross-Provider fallback",
@@ -147,9 +215,46 @@
       "deprecated_model_alias_evidence",
       "gemini_claude_gpt_family_evidence",
       "transient_only_same_identity_stale_catalog",
-      "mixed_search_function_thought_signature_and_terminal_bridges"
+      "mixed_search_function_thought_signature_and_terminal_bridges",
+      "bounded_generation_scoped_reasoning_signature_replay_with_cas",
+      "conversation_scoped_session_id_and_same_binding_rollover_once",
+      "explicit_all_model_zero_quota_only",
+      "structured_retry_after_and_model_scoped_cooldown",
+      "antigravity_specific_schema_projection",
+      "http11_short_connection_default_and_credential_scoped_opt_in_pool"
     ],
+    "reasoningReplay": {
+      "ttlMs": 3600000,
+      "scope": ["app", "provider_id", "provider_revision", "runtime_fingerprint", "account_id", "auth_identity_generation", "token_refresh_generation", "share_id", "user_namespace", "session_id", "model_family", "upstream_plane"],
+      "commit": "complete_terminal_response_after_successful_transforms",
+      "concurrency": "snapshot_cas",
+      "crossAccountFallback": false
+    },
+    "transport": {
+      "protocol": "http_1_1_only",
+      "default": "short_connection",
+      "pool": "explicit_opt_in_credential_scoped_and_bounded",
+      "http2Goaway": "not_applicable_http2_is_disabled"
+    },
+    "conversationCompaction": "disabled_live_pending_no_verified_provider_receipt",
     "weeklyQuotaSummary": "not_implemented_no_reproducible_reference_endpoint",
+    "realAccountAcceptance": "live_pending"
+  },
+  "claudeReferenceDeltaAudit": {
+    "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no credential-rail fallback; no cross-Provider fallback",
+    "contractState": "fixture_verified_live_pending",
+    "implementedContracts": [
+      "native_leading_text_system_hoist_before_final_cch",
+      "main_subagent_probe_helper_count_tokens_cache_ttl_matrix",
+      "claude_to_chat_trailing_usage_opt_in_and_ordering",
+      "split_lifecycle_cache_and_explicit_zero_usage_merge",
+      "partial_usage_preserved_for_failed_stream_accounting",
+      "claude_scoped_structured_output_instruction",
+      "strictly_sequential_interleaved_content_and_tool_blocks",
+      "helper_request_id_follows_actual_upstream_base"
+    ],
+    "periodicAudit": "scripts/audit/audit-claude-reference-delta.mjs",
+    "externalSourceCheck": "optional --check-sources; external repositories are read-only evidence and never runtime or build dependencies",
     "realAccountAcceptance": "live_pending"
   },
   "grokCodePlanImplementation": {
@@ -170,6 +275,33 @@
       "taskKind": "video_generation",
       "ownerKeyFields": ["share", "user_namespace", "task_kind", "task_id", "provider_id", "account_id", "auth_identity_generation", "runtime_fingerprint", "upstream_plane"]
     },
+    "referenceDeltaAudit": {
+      "contract": "assets/contract/grok-reference-delta.json",
+      "audit": "scripts/audit/audit-grok-reference-delta.mjs",
+      "externalSourcesOptional": true,
+      "sourceCommit": "8913b53fe92307a6f111b2885ab298a43c74a9ba"
+    },
+    "reasoningReplay": {
+      "status": "fixture_verified",
+      "rails": ["http", "sse", "websocket"],
+      "scopeFields": ["app", "provider_revision", "runtime_fingerprint", "account_id", "auth_identity_generation", "token_refresh_generation", "share_id", "signed_user_namespace", "session_id", "turn_index", "model_family", "rail", "upstream_plane"],
+      "commitBoundary": "unique_successful_completed_terminal",
+      "recovery": "one same-account same-rail pre-commit explicit rejection inside shared budget",
+      "ordinarySchemaAuthCapacityRecovery": false,
+      "postCommitRecovery": false
+    },
+    "rootUnionAdapter": {
+      "status": "fixture_verified",
+      "localRefDepthLimit": 32,
+      "objectLeafLimit": 32,
+      "ambiguousCycleOrNonObject": "fail_closed"
+    },
+    "remoteCompaction": {
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "requiresLiveOAuthReceipt": true,
+      "webCookieOrCrossAccountOrExternalRouting": false
+    },
     "implementedContracts": [
       "responses_http_sse_and_websocket",
       "hosted_search_translation_and_usage",
@@ -180,7 +312,11 @@
       "durable_video_task_sticky_ownership",
       "media_task_schema_v1_v3_migration"
     ],
-    "realAccountAcceptance": "live_pending"
+    "realAccountAcceptance": {
+      "inference": "live_pending",
+      "media": "live_pending",
+      "remoteCompaction": "live_pending"
+    }
   },
   "githubCopilotCodePlanImplementation": {
     "scope": "three explicit Claude, Codex, and Gemini Providers bind one selected github_copilot Account and auth identity generation; no pool, account rotation, model-driven rebinding, or cross-Provider fallback",

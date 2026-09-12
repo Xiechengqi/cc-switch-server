@@ -1,6 +1,6 @@
 {
   "format": "cc-switch-kiro-wire-protocol",
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "capturedAt": "2026-08-27T00:00:00Z",
   "provenance": {
     "kind": "sanitized_protocol_comparison",
@@ -212,10 +212,58 @@
     }
   },
   "promptCache": {
-    "namespaceComponents": ["provider_id", "account_id", "auth_identity_generation", "route", "session"],
+    "namespaceComponents": [
+      "app",
+      "provider_id",
+      "provider_revision",
+      "runtime_fingerprint",
+      "account_id",
+      "auth_identity_generation",
+      "token_refresh_generation",
+      "share_id",
+      "signed_user",
+      "route",
+      "runtime_region",
+      "session",
+      "model_and_inference_options"
+    ],
     "capacity": 4096,
+    "mode": "local_metering_fallback_only",
+    "changesUpstreamInferenceCost": false,
+    "topLevelAutoCaching": true,
+    "explicitBlockBreakpoints": true,
+    "unifiedBreakpointLimit": 4,
+    "lookbackPositions": 20,
+    "lookbackGrouping": ["consecutive_tool_use", "consecutive_tool_result"],
     "defaultTtlSeconds": 300,
     "maxTtlSeconds": 3600,
+    "ttlRenewal": "sliding_by_entry_own_ttl",
+    "mixedTtlOrder": "1h_before_5m",
+    "latestUserGuardrail": "top_level_auto_targets_previous_cacheable_turn_when_present",
+    "invalidDeclarationPolicy": "no_cache_fail_closed_with_bounded_reason",
+    "usageMapping": {
+      "authoritativeUpstreamTokenUsageWinsIncludingExplicitZero": true,
+      "fallback": "integer_ratio_map_local_covered_and_read_estimates_to_authoritative_total",
+      "roundingRemainder": "uncached_input",
+      "conservation": "input_plus_creation_plus_read_equals_authoritative_total",
+      "sourceField": "cache_usage_source",
+      "localSource": "local_prompt_cache_estimate",
+      "upstreamSource": "upstream_token_usage"
+    },
+    "persistence": {
+      "format": "sqlite",
+      "configuredPathSuffix": ".sqlite",
+      "requestPathBlockingWrites": false,
+      "boundedWriterQueue": 2,
+      "dirtyGeneration": true,
+      "coalescing": true,
+      "boundedBackoff": true,
+      "transactionalMutationUpsertDelete": true,
+      "generationCas": true,
+      "shutdownFlush": true,
+      "legacyJson": "read_once_import_source_preserved",
+      "remoteStore": "disabled"
+    },
     "sessionPrecedence": {
       "claude": [
         "x-cc-switch-session-id",
@@ -260,6 +308,7 @@
     "fields": ["credit_usage", "credit_unit", "credit_unit_plural"],
     "multipleEventSemantics": "usage_increment_sum_latest_unit",
     "explicitZeroPreserved": true,
+    "cacheUsageSourceField": "cache_usage_source",
     "invalidAmountPolicy": "omit_negative_non_finite_or_total_above_1000000000",
     "liveVerification": "pending"
   },

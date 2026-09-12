@@ -703,6 +703,26 @@ mod tests {
     }
 
     #[test]
+    fn cursor_reference_fixture_freezes_terminal_and_eof() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../assets/contract/cursor-reference-delta.json"
+        ))
+        .unwrap();
+        let terminal = fixture.pointer("/protobufFixtures/terminal").unwrap();
+        let clean = terminal["cleanEnvelope"].as_str().unwrap().as_bytes();
+        assert_eq!(parse_connect_end_stream(clean), Ok(()));
+
+        let upstream_error =
+            parse_connect_end_stream(terminal["errorEnvelope"].as_str().unwrap().as_bytes());
+        assert!(upstream_error.is_err());
+        let error = validate_cursor_terminal(None, Some(&upstream_error), None).unwrap_err();
+        assert!(error.message.contains("unavailable: retry later"));
+
+        let eof = validate_cursor_terminal(None, None, None).unwrap_err();
+        assert!(eof.message.contains("without a valid Connect-RPC terminal"));
+    }
+
+    #[test]
     fn connect_terminal_envelope_is_strict_and_surfaces_errors() {
         assert_eq!(parse_connect_end_stream(br#"{}"#), Ok(()));
         assert_eq!(

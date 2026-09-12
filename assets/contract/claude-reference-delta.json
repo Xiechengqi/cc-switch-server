@@ -1,0 +1,148 @@
+{
+  "format": "cc-switch-claude-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
+    "liveEvidence": "local fixtures do not imply live Anthropic acceptance"
+  },
+  "sources": [
+    {
+      "id": "omniroute",
+      "rootEnv": "CC_SWITCH_CLAUDE_OMNIROUTE_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/OmniRoute",
+      "deltas": [
+        {
+          "id": "leading_text_system",
+          "commit": "a3ca33fa6442b59adc42976c795709eaf5351109",
+          "files": [
+            {
+              "path": "open-sse/handlers/chatCore/claudeSystemRole.ts",
+              "sha256": "b6abcc8568cea54490e93c4a8673839aa9a8be85ec1dbc7d50de7ad20cd03efe"
+            },
+            {
+              "path": "tests/unit/claude-leading-text-system-hoist.test.ts",
+              "sha256": "47839fe68fc95e362b50a77fb4e18c35d8dc8737ed77097ea35c721837c8d7bc"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cliproxyapi",
+      "rootEnv": "CC_SWITCH_CLAUDE_CLIPROXYAPI_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Claude/CLIProxyAPI",
+      "deltas": [
+        {
+          "id": "request_category_cache_ttl",
+          "commit": "6a73f39627358ecf3724fee2952fd234ada919b1",
+          "files": [
+            {
+              "path": "internal/runtime/executor/claude_executor_request.go",
+              "sha256": "f503a64f6999b218cb9e855e5987ec3142ae7ccdf7a60182c819ec8d6e5c14d3"
+            },
+            {
+              "path": "internal/runtime/executor/claude_executor_test.go",
+              "sha256": "6c7c61f147b179519481346b233bae2ccbecefe4f4fc4cc0b364854d12cb5abe"
+            }
+          ]
+        },
+        {
+          "id": "trailing_usage_timing",
+          "commit": "a59b1764e781e0c20bf102349cd9bc202ce8f668",
+          "files": [
+            {
+              "path": "internal/translator/claude/openai/chat-completions/claude_openai_response.go",
+              "sha256": "7a0ca7ccf246ccc43e95dd892acc6811580e018cd10c7c01549f9ef67b0facd5"
+            },
+            {
+              "path": "internal/translator/claude/openai/chat-completions/claude_openai_response_test.go",
+              "sha256": "3ff4ec1b35308d703c0b45447e618521fcab703e660b42c190f9c0ee9fdfd1bb"
+            }
+          ]
+        },
+        {
+          "id": "structured_output",
+          "commit": "4f03809901ddde88d71e2eed8ee045420da098ad",
+          "files": [
+            {
+              "path": "internal/translator/common/claude_system.go",
+              "sha256": "bf538fcfdf57d669e6865e0dbf4d2db083b8016f1f65c4c422db980de07433a4"
+            },
+            {
+              "path": "internal/translator/common/claude_system_test.go",
+              "sha256": "096376336f02c4a9d4760cc22502ab17e03aa05be82d9cb7b3fda94345fbca6a"
+            }
+          ]
+        },
+        {
+          "id": "sequential_interleaved_tools",
+          "commit": "ef99119e57f4607893c6592827d79c69acd2792a",
+          "files": [
+            {
+              "path": "internal/translator/openai/claude/openai_claude_response.go",
+              "sha256": "3ff23e29da4613b45af8483e99237fd38030628525e6087d339850a4b5fc5d5c"
+            },
+            {
+              "path": "internal/translator/openai/claude/openai_claude_response_test.go",
+              "sha256": "090c5dee509a9069fa82f4066406a0300526f441b8788abeb039fe17d6ba03e9"
+            }
+          ]
+        },
+        {
+          "id": "helper_request_id",
+          "commit": "35a4723872a4a04aef053ba290eb362ccdf14d07",
+          "files": [
+            {
+              "path": "internal/runtime/executor/claude_executor_request.go",
+              "sha256": "bbdaace8d5b5bc824d16aae975d1f343b64df2dc380ffffa51ca932e8d67e689"
+            },
+            {
+              "path": "internal/runtime/executor/claude_executor_native_helper_test.go",
+              "sha256": "f0720f160c366f09091542de44d1d0599deee6cb8f35d38df5b8cb84daa31ec2"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "localContracts": [
+    {
+      "id": "leading_text_system",
+      "status": "fixture_verified",
+      "path": "src/proxy/claude_oauth.rs",
+      "anchors": ["hoist_leading_text_system_messages", "native_leading_system_hoist_runs_before_final_cch_signature"]
+    },
+    {
+      "id": "request_category_cache_ttl",
+      "status": "fixture_verified",
+      "path": "src/proxy/claude_oauth.rs",
+      "anchors": ["claude_request_category_cache_matrix_preserves_only_supported_one_hour_requests"]
+    },
+    {
+      "id": "trailing_usage_timing",
+      "status": "fixture_verified",
+      "path": "src/proxy/stream_transforms.rs",
+      "anchors": ["claude_chat_usage_golden_merges_lifecycle_and_emits_one_ordered_tail", "claude_chat_usage_golden_honors_opt_out_and_preserves_explicit_zero"]
+    },
+    {
+      "id": "structured_output",
+      "status": "fixture_verified",
+      "path": "src/proxy/transforms.rs",
+      "anchors": ["claude_structured_output_instruction", "claude_structured_output_translation_is_scoped_and_preserves_system_text"]
+    },
+    {
+      "id": "sequential_interleaved_tools",
+      "status": "fixture_verified",
+      "path": "src/proxy/stream_transforms.rs",
+      "anchors": ["InterleavedChatContent", "chat_interleaved_tools_and_content_emit_strictly_sequential_blocks"]
+    },
+    {
+      "id": "helper_request_id",
+      "status": "fixture_verified",
+      "path": "src/proxy/claude_oauth.rs",
+      "anchors": ["is_first_party_anthropic_url", "helper_request_id_follows_the_actual_upstream_base"]
+    }
+  ]
+}

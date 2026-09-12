@@ -32,11 +32,14 @@ use crate::logging::{error_fingerprint, opaque_ref, AuditEvent};
 use crate::proxy::adapters::AdapterRequest;
 use crate::state::{AccountInFlightGuard, ServerState, ShareInFlightGuard};
 
+use super::super::execution::context::{
+    AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CommitGuard, DelaySource,
+    RecoveryStage, RetryDecision,
+};
 use super::super::forwarder::{
     managed_credential_accounts_snapshot, mark_managed_account_auth_cooldown_for_stored,
     record_provider_outcome, record_share_invocation_result,
 };
-use super::super::retry_policy::{AuthRecoveryDecision, AuthRecoveryState};
 use super::super::router::ProxyRoute;
 use super::super::usage::{log_usage, update_stream_usage};
 use super::super::{setting, ProxyError};
@@ -89,6 +92,7 @@ const MAX_CURSOR_ERROR_BODY_BYTES: usize = 8 * 1024;
 const CURSOR_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 const CURSOR_DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_SEMANTIC_ATTEMPTS: usize = 3;
+const MAX_CURSOR_RECOVERY_RETRIES: u32 = 3;
 
 fn cursor_downstream_keepalive_frame(
     format: super::protocol::CursorResponseFormat,
@@ -192,21 +196,153 @@ enum CursorAgentServiceAuthAction {
     UseResponse,
 }
 
+#[derive(Debug, Clone)]
+struct CursorAttemptContext {
+    budget: AttemptBudget,
+    commit: CommitGuard,
+    binding: BindingSnapshot,
+    rail: String,
+}
+
+impl CursorAttemptContext {
+    async fn capture(
+        state: &ServerState,
+        stored: &StoredProvider,
+        runtime_fingerprint: &str,
+        request_timeout: Duration,
+    ) -> Result<Self, ProxyError> {
+        let rail = cursor_attempt_rail(stored, runtime_fingerprint)?;
+        let accounts = cursor_binding_accounts_snapshot(state, stored).await?;
+        let binding = BindingSnapshot::capture_stored(stored, &accounts, rail.clone())
+            .map_err(cursor_binding_snapshot_error)?;
+        let now_ms = crate::infra::time::now_ms();
+        Ok(Self {
+            budget: AttemptBudget::new(
+                AttemptLimits::forward_default(
+                    MAX_CURSOR_RECOVERY_RETRIES,
+                    request_timeout.as_millis().max(1),
+                ),
+                now_ms,
+            ),
+            commit: CommitGuard::default(),
+            binding,
+            rail,
+        })
+    }
+
+    async fn reserve(
+        &mut self,
+        state: &ServerState,
+        stored: &StoredProvider,
+        stage: RecoveryStage,
+        reason: &'static str,
+    ) -> Result<RetryDecision, ProxyError> {
+        let accounts = cursor_binding_accounts_snapshot(state, stored).await?;
+        let current = BindingSnapshot::capture_stored(stored, &accounts, self.rail.clone()).ok();
+        let decision = self.budget.reserve(
+            stage,
+            reason,
+            DelaySource::Immediate,
+            crate::infra::time::now_ms(),
+            &self.commit,
+            Some(&self.binding),
+            current.as_ref(),
+        );
+        crate::metrics::record_recovery_decision(
+            stored.provider_type.as_str(),
+            stage.as_str(),
+            if self.commit.is_committed() {
+                "committed"
+            } else {
+                "pre_commit"
+            },
+            decision.as_str(),
+            DelaySource::Immediate.as_str(),
+        );
+        if decision == RetryDecision::DeniedBindingDrift {
+            return Err(ProxyError::conflict(
+                "Cursor retry binding changed; start a new request",
+            ));
+        }
+        Ok(decision)
+    }
+
+    async fn advance_after_auth_refresh(
+        &mut self,
+        state: &ServerState,
+        stored: &StoredProvider,
+    ) -> Result<(), ProxyError> {
+        let accounts = cursor_binding_accounts_snapshot(state, stored).await?;
+        self.binding
+            .advance_stored_token_generation(stored, &accounts, self.rail.clone())
+            .map_err(cursor_binding_snapshot_error)
+    }
+
+    fn auth_attempted(&self) -> bool {
+        self.budget.used_for(RecoveryStage::Auth) > 0
+    }
+}
+
+fn cursor_attempt_rail(
+    stored: &StoredProvider,
+    runtime_fingerprint: &str,
+) -> Result<String, ProxyError> {
+    let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
+        ProxyError::bad_request("Cursor AgentService driver requires a Cursor provider")
+    })?;
+    Ok(format!(
+        "cursor_agentservice:{}:{}:{}",
+        rail.label(),
+        rail.protocol_revision(),
+        runtime_fingerprint
+    ))
+}
+
+async fn cursor_binding_accounts_snapshot(
+    state: &ServerState,
+    stored: &StoredProvider,
+) -> Result<crate::domain::accounts::store::AccountStore, ProxyError> {
+    if stored.provider_type == ProviderType::CursorOAuth {
+        managed_credential_accounts_snapshot(state).await
+    } else {
+        Ok(state.accounts_snapshot().await)
+    }
+}
+
+fn cursor_binding_snapshot_error(error: BindingSnapshotError) -> ProxyError {
+    ProxyError::conflict(match error {
+        BindingSnapshotError::AccountMissing => {
+            "Cursor bound account disappeared; rebind the Provider"
+        }
+        BindingSnapshotError::AuthIdentityChanged => {
+            "Cursor bound account identity changed; rebind the Provider"
+        }
+        BindingSnapshotError::BindingChanged => "Cursor retry binding changed; start a new request",
+        BindingSnapshotError::TokenGenerationRegressed => {
+            "Cursor token generation regressed; rebind the Provider"
+        }
+    })
+}
+
 async fn cursor_agentservice_auth_action(
     state: &ServerState,
     stored: &StoredProvider,
     runtime_fingerprint: &str,
     rejected_access_token: Option<&str>,
-    auth_recovery: &mut AuthRecoveryState,
+    attempt_context: &mut CursorAttemptContext,
     status: StatusCode,
     replay_allowed: bool,
-) -> CursorAgentServiceAuthAction {
-    match auth_recovery.decide(status, stored.provider_type, replay_allowed) {
-        Some(AuthRecoveryDecision::RefreshAndReplaySameBinding) => {
-            CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
-        }
-        Some(AuthRecoveryDecision::ReturnUnauthorized) => {
-            if auth_recovery.attempted() {
+) -> Result<CursorAgentServiceAuthAction, ProxyError> {
+    if status != StatusCode::UNAUTHORIZED || !replay_allowed {
+        return Ok(CursorAgentServiceAuthAction::UseResponse);
+    }
+    match attempt_context
+        .reserve(state, stored, RecoveryStage::Auth, "cursor_unauthorized")
+        .await?
+    {
+        RetryDecision::Reserved => Ok(CursorAgentServiceAuthAction::RefreshAndReplaySameBinding),
+        _ => {
+            if attempt_context.auth_attempted() {
                 mark_cursor_agentservice_auth_cooldown(
                     state,
                     stored,
@@ -216,9 +352,8 @@ async fn cursor_agentservice_auth_action(
                 )
                 .await;
             }
-            CursorAgentServiceAuthAction::UseResponse
+            Ok(CursorAgentServiceAuthAction::UseResponse)
         }
-        None => CursorAgentServiceAuthAction::UseResponse,
     }
 }
 
@@ -476,7 +611,7 @@ async fn drive_semantic_attempts(
     input_tokens: u32,
     timeouts: CursorH2Timeouts,
     started: Instant,
-    mut auth_recovery: AuthRecoveryState,
+    mut attempt_context: CursorAttemptContext,
 ) -> Result<SemanticDriveSuccess, ProxyError> {
     let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
         ProxyError::bad_request("Cursor AgentService driver requires a Cursor provider")
@@ -611,6 +746,14 @@ async fn drive_semantic_attempts(
             Some(&rejection),
             Some(StatusCode::OK),
         );
+        let retry_decision = attempt_context
+            .reserve(
+                state,
+                stored,
+                RecoveryStage::BodyCompatibility,
+                "cursor_tool_constraint",
+            )
+            .await?;
         state
             .cursor_sessions
             .release(session_entry.clone(), SessionState::Closed)
@@ -635,7 +778,7 @@ async fn drive_semantic_attempts(
             "attempt" => semantic_attempt.to_string()
         )
         .increment(1);
-        if semantic_attempt >= MAX_SEMANTIC_ATTEMPTS {
+        if semantic_attempt >= MAX_SEMANTIC_ATTEMPTS || retry_decision != RetryDecision::Reserved {
             emit_cursor_tool_constraint_event(
                 state,
                 stored,
@@ -701,7 +844,7 @@ async fn drive_semantic_attempts(
             &retry_context,
             &retry_session_key,
             None,
-            &mut auth_recovery,
+            &mut attempt_context,
         )
         .await
         {
@@ -916,7 +1059,9 @@ pub async fn forward_agentservice(
     let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_agent_plan_input_tokens(&plan);
-    let mut auth_recovery = AuthRecoveryState::default();
+    let mut attempt_context =
+        CursorAttemptContext::capture(&state, &stored, &runtime_fingerprint, timeouts.request)
+            .await?;
     let session_open_context = CursorSessionOpenContext {
         state: &state,
         stored: &stored,
@@ -929,7 +1074,7 @@ pub async fn forward_agentservice(
         &session_open_context,
         &session_key,
         resolved_session.parked.as_ref(),
-        &mut auth_recovery,
+        &mut attempt_context,
     )
     .await?;
     let session_entry = opened.entry;
@@ -987,7 +1132,7 @@ pub async fn forward_agentservice(
             started,
             model,
             timeouts,
-            auth_recovery,
+            attempt_context,
             account_in_flight_guard,
             share_invocation_guard,
             response_state,
@@ -1013,7 +1158,7 @@ pub async fn forward_agentservice(
         input_tokens,
         timeouts,
         started,
-        auth_recovery,
+        attempt_context,
     )
     .await
     {
@@ -1647,7 +1792,7 @@ async fn stream_semantic_response(
     started: Instant,
     model: UsageModelMetadata,
     timeouts: CursorH2Timeouts,
-    auth_recovery: AuthRecoveryState,
+    attempt_context: CursorAttemptContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     response_state: Option<CursorResponseStateContext>,
@@ -1704,7 +1849,7 @@ async fn stream_semantic_response(
             input_tokens,
             timeouts,
             started,
-            auth_recovery,
+            attempt_context,
         );
         tokio::pin!(drive);
         let mut keepalive = tokio::time::interval_at(
@@ -2658,7 +2803,7 @@ async fn acquire_or_open_session(
     context: &CursorSessionOpenContext<'_>,
     session_key: &CursorSessionKey,
     parked: Option<&CursorSessionReference>,
-    auth_recovery: &mut AuthRecoveryState,
+    attempt_context: &mut CursorAttemptContext,
 ) -> Result<OpenedCursorSession, ProxyError> {
     if let Some(parked) = parked {
         let entry = context
@@ -2721,11 +2866,11 @@ async fn acquire_or_open_session(
                     context.stored,
                     context.runtime_fingerprint,
                     Some(&access_token),
-                    auth_recovery,
+                    attempt_context,
                     error.status,
                     true,
                 )
-                .await;
+                .await?;
                 match action {
                     CursorAgentServiceAuthAction::UseResponse => return Err(error),
                     CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
@@ -2736,6 +2881,9 @@ async fn acquire_or_open_session(
                             Some(&access_token),
                         )
                         .await?;
+                        attempt_context
+                            .advance_after_auth_refresh(context.state, context.stored)
+                            .await?;
                         let refreshed_scope = cursor_session_scope(
                             context.state,
                             context.stored,
@@ -2756,9 +2904,9 @@ async fn acquire_ready_session(
     context: &CursorSessionOpenContext<'_>,
     session_key: &CursorSessionKey,
     parked: Option<&CursorSessionReference>,
-    auth_recovery: &mut AuthRecoveryState,
+    attempt_context: &mut CursorAttemptContext,
 ) -> Result<OpenedCursorSession, ProxyError> {
-    let mut opened = acquire_or_open_session(context, session_key, parked, auth_recovery).await?;
+    let mut opened = acquire_or_open_session(context, session_key, parked, attempt_context).await?;
     loop {
         let status = session_status(&opened.entry).await?;
         match cursor_agentservice_auth_action(
@@ -2766,11 +2914,11 @@ async fn acquire_ready_session(
             context.stored,
             context.runtime_fingerprint,
             opened.access_token.as_deref(),
-            auth_recovery,
+            attempt_context,
             status,
             opened.access_token.is_some(),
         )
-        .await
+        .await?
         {
             CursorAgentServiceAuthAction::UseResponse => {
                 ensure_cursor_success_status(context.state, context.stored, &opened.entry, status)
@@ -2790,6 +2938,9 @@ async fn acquire_ready_session(
                     opened.access_token.as_deref(),
                 )
                 .await?;
+                attempt_context
+                    .advance_after_auth_refresh(context.state, context.stored)
+                    .await?;
                 let refreshed_scope = cursor_session_scope(
                     context.state,
                     context.stored,
@@ -2799,7 +2950,7 @@ async fn acquire_ready_session(
                 .await?;
                 let refreshed_key = rekey_cursor_session(&opened.key, refreshed_scope);
                 opened =
-                    acquire_or_open_session(context, &refreshed_key, None, auth_recovery).await?;
+                    acquire_or_open_session(context, &refreshed_key, None, attempt_context).await?;
             }
         }
     }
@@ -4764,6 +4915,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_auth_and_semantic_recovery_share_one_total_budget() {
+        let state = cursor_stream_test_state("shared-attempt-budget");
+        let config_dir = state.config_dir.clone();
+        let stored = StoredProvider {
+            app: crate::domain::providers::model::AppKind::Codex,
+            provider: crate::domain::providers::model::Provider {
+                id: "cursor-shared-budget-provider".to_string(),
+                name: "Cursor shared budget provider".to_string(),
+                settings_config: json!({"env": {"CURSOR_API_KEY": "cursor-budget-key"}}),
+                category: None,
+                meta: Some(crate::domain::providers::model::ProviderMeta {
+                    provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
+            provider_type: ProviderType::CursorApiKey,
+            provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
+            resource: Default::default(),
+        };
+        let mut context = CursorAttemptContext::capture(
+            &state,
+            &stored,
+            "cursor-budget-runtime",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            context
+                .reserve(&state, &stored, RecoveryStage::Auth, "fixture_auth",)
+                .await
+                .unwrap(),
+            RetryDecision::Reserved
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .reserve(
+                        &state,
+                        &stored,
+                        RecoveryStage::BodyCompatibility,
+                        "fixture_semantic",
+                    )
+                    .await
+                    .unwrap(),
+                RetryDecision::Reserved
+            );
+        }
+        assert_eq!(
+            context
+                .reserve(
+                    &state,
+                    &stored,
+                    RecoveryStage::BodyCompatibility,
+                    "fixture_semantic_excess",
+                )
+                .await
+                .unwrap(),
+            RetryDecision::DeniedTotalLimit
+        );
+        assert_eq!(context.budget.retries_used(), MAX_CURSOR_RECOVERY_RETRIES);
+
+        drop(state);
+        std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn cursor_stream_holds_account_lease_until_response_body_is_dropped() {
         let state = cursor_stream_test_state("stream-account-lease");
         let account_id = "cursor-stream-account";
@@ -4984,7 +5204,14 @@ mod tests {
             provider_type_id: ProviderType::CursorOAuth.as_str().to_string(),
             resource: Default::default(),
         };
-        let mut auth_recovery = AuthRecoveryState::default();
+        let mut attempt_context = CursorAttemptContext::capture(
+            &state,
+            &stored,
+            "cursor-auth-runtime",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             cursor_agentservice_auth_action(
@@ -4992,11 +5219,12 @@ mod tests {
                 &stored,
                 "cursor-auth-runtime",
                 Some("cursor-old-access-token"),
-                &mut auth_recovery,
+                &mut attempt_context,
                 StatusCode::UNAUTHORIZED,
                 true,
             )
-            .await,
+            .await
+            .unwrap(),
             CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
         );
         let after_first = state.find_account_by_id(account_id).await.unwrap();
@@ -5009,11 +5237,12 @@ mod tests {
                 &stored,
                 "cursor-auth-runtime",
                 Some("cursor-old-access-token"),
-                &mut auth_recovery,
+                &mut attempt_context,
                 StatusCode::UNAUTHORIZED,
                 true,
             )
-            .await,
+            .await
+            .unwrap(),
             CursorAgentServiceAuthAction::UseResponse
         );
         let after_second = state.find_account_by_id(account_id).await.unwrap();
@@ -5121,7 +5350,14 @@ mod tests {
             provider_type_id: ProviderType::CursorApiKey.as_str().to_string(),
             resource: Default::default(),
         };
-        let mut auth_recovery = AuthRecoveryState::default();
+        let mut attempt_context = CursorAttemptContext::capture(
+            &state,
+            &stored,
+            "cursor-api-key-runtime",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             cursor_agentservice_auth_action(
@@ -5129,11 +5365,12 @@ mod tests {
                 &stored,
                 "cursor-api-key-runtime",
                 None,
-                &mut auth_recovery,
+                &mut attempt_context,
                 StatusCode::UNAUTHORIZED,
                 true,
             )
-            .await,
+            .await
+            .unwrap(),
             CursorAgentServiceAuthAction::RefreshAndReplaySameBinding
         );
         assert_eq!(
@@ -5142,11 +5379,12 @@ mod tests {
                 &stored,
                 "cursor-api-key-runtime",
                 None,
-                &mut auth_recovery,
+                &mut attempt_context,
                 StatusCode::UNAUTHORIZED,
                 true,
             )
-            .await,
+            .await
+            .unwrap(),
             CursorAgentServiceAuthAction::UseResponse
         );
         let scope = cursor_api_key_credential_scope(&stored, "cursor-api-key-runtime", api_key);

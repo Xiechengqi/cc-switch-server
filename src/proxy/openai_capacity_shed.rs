@@ -578,6 +578,72 @@ data: {"type":"error","error":{"type":"service_unavailable_error","code":"server
     }
 
     #[test]
+    fn codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/codex-reference-delta.json"
+        ))
+        .unwrap();
+        let input = fixture
+            .pointer("/wireGoldens/capacityFailure/input")
+            .unwrap();
+        let expected = fixture
+            .pointer("/wireGoldens/capacityFailure/expected")
+            .unwrap();
+
+        let (http, changed) =
+            sanitize_openai_capacity_shed_json_bytes(&serde_json::to_vec(input).unwrap());
+        assert!(changed);
+        assert_eq!(serde_json::from_slice::<Value>(&http).unwrap(), *expected);
+
+        let sse = format!("event: error\ndata: {input}\n\n");
+        let sse = sanitize_openai_capacity_shed_sse_bytes(sse.as_bytes());
+        assert_eq!(openai_payload_values(&sse), vec![expected.clone()]);
+
+        let (websocket, changed) = sanitize_openai_capacity_shed_json_text(&input.to_string());
+        assert!(changed);
+        assert_eq!(
+            serde_json::from_str::<Value>(&websocket).unwrap(),
+            *expected
+        );
+
+        assert_eq!(input["sequence_number"], expected["sequence_number"]);
+        assert_eq!(input["error"]["details"], expected["error"]["details"]);
+    }
+
+    #[test]
+    fn codex_bootstrap_overload_golden_is_precommit_capacity_failure() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/codex-reference-delta.json"
+        ))
+        .unwrap();
+        let failure = fixture
+            .pointer("/wireGoldens/capacityFailure/input")
+            .unwrap();
+        assert!(is_openai_capacity_shed_value(failure));
+        assert!(!openai_payload_starts_client_output(failure));
+
+        let frames = fixture
+            .pointer("/wireGoldens/successfulFrames")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(frames.first().unwrap()["type"], "response.created");
+        assert_eq!(frames.last().unwrap()["type"], "response.completed");
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame["sequence_number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        for frame in frames {
+            let (wire, changed) =
+                sanitize_openai_capacity_shed_json_bytes(&serde_json::to_vec(frame).unwrap());
+            assert!(!changed);
+            assert_eq!(serde_json::from_slice::<Value>(&wire).unwrap(), *frame);
+        }
+    }
+
+    #[test]
     fn empty_reasoning_and_summary_do_not_start_output() {
         assert!(!openai_payload_starts_client_output(&json!({
             "type":"response.output_item.added",

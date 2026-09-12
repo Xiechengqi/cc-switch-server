@@ -1,0 +1,177 @@
+{
+  "format": "cc-switch-grok-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
+    "scope": "one fixed Provider, one fixed Account, one fixed Share and one signed user namespace; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
+    "recoveryBoundary": "same-account, same-rail, pre-commit, one explicit-rejection recovery inside the shared total attempt and elapsed-time budget",
+    "liveEvidence": "fixtures never prove live OAuth inference, media entitlement, WebSocket behavior, version gates, cooldowns or remote compaction"
+  },
+  "sources": [
+    {
+      "id": "grok2api",
+      "rootEnv": "CC_SWITCH_GROK_GROK2API_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Grok/grok2api",
+      "commit": "8913b53fe92307a6f111b2885ab298a43c74a9ba",
+      "historicalCommits": [
+        "8641a782",
+        "ca392e68",
+        "7d1b4246",
+        "3de758e7",
+        "22ac653a",
+        "72a3a347",
+        "5d19ccff",
+        "e5285ebe"
+      ],
+      "files": [
+        {
+          "path": "backend/internal/infra/provider/conversation/reasoning_cache.go",
+          "sha256": "857067a734405d7d80e33b669c4178efd6eaca692564bef7272d7b8673bfa58a"
+        },
+        {
+          "path": "backend/internal/infra/provider/conversation/reasoning_cache_test.go",
+          "sha256": "59f0461d49921fda4ac56bac9f022d4765bc59e3507c3424f9c4b48de78dc1a0"
+        },
+        {
+          "path": "backend/internal/infra/provider/conversation/reasoning_integration_test.go",
+          "sha256": "998cc1a8d346933524505cd7e029025d5b49e3d27f657b9e65a3313097463dce"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_reasoning_recovery.go",
+          "sha256": "5379850b4a929a89d7b4f839d658579d31f91a6f4f54c3c2bd27f8559546709c"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_reasoning_recovery_test.go",
+          "sha256": "83e9b2b552b37bed03a93ec22b7b75e958d2780ced04c710273859d1ddf63d61"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_tool_declarations.go",
+          "sha256": "fd14e2181a1a845c766cd6bc02a6978a0aacf46718f1f363db112e0e6094e38a"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_tools_test.go",
+          "sha256": "7f1a0ae7b5b928466d9c0009459a975e2c825816e9d939a7cb941c6f3c9d9f32"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "GR-01",
+      "status": "fixture_verified",
+      "path": "src/proxy/grok_replay.rs",
+      "anchors": [
+        "parallel_calls_restore_one_exact_reasoning_item",
+        "stream_capture_handles_fragmented_crlf_and_raw_websocket_json"
+      ]
+    },
+    {
+      "id": "GR-02",
+      "status": "fixture_verified",
+      "path": "src/proxy/forwarder.rs",
+      "anchors": [
+        "grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once",
+        "grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit"
+      ]
+    },
+    {
+      "id": "GR-03",
+      "status": "fixture_verified",
+      "path": "src/proxy/grok.rs",
+      "anchors": [
+        "normalize_grok_build_parameters",
+        "grok_build_root_union_rejects_ambiguous_cycles_and_non_object_roots"
+      ]
+    },
+    {
+      "id": "GR-04",
+      "status": "live_pending",
+      "path": "docs/provider/grok-oauth.md",
+      "anchors": [
+        "Grok reasoning replay 与恢复",
+        "推理和媒体 capability receipt 必须分别留证"
+      ]
+    },
+    {
+      "id": "GR-05",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "path": "docs/provider/grok-oauth.md",
+      "anchors": [
+        "remote compaction 保持运行时禁用",
+        "不采用 Grok Web Cookie"
+      ]
+    }
+  ],
+  "fixtureAcceptance": {
+    "transportRails": ["http", "sse", "websocket"],
+    "checks": [
+      "reasoning_capture",
+      "reasoning_replay",
+      "reasoning_rejection_recovery",
+      "parallel_tools",
+      "strict_sse_crlf_fragmentation",
+      "post_commit_no_recovery",
+      "ordinary_schema_auth_capacity_no_reasoning_recovery",
+      "provider_account_share_user_session_turn_scope",
+      "auth_token_generation_fence",
+      "bounded_ttl_entries_items_bytes",
+      "cas_conflict_fail_closed",
+      "root_union_object_projection",
+      "root_union_ambiguous_cycle_fail_closed"
+    ]
+  },
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "scopeDigest": "sha256 lowercase hex over a private canonical Provider/Account/Share/user/session scope; raw identities and credentials are excluded",
+    "requiredChecks": [
+      "reasoning_capture_replay_reject",
+      "parallel_tools",
+      "http_json",
+      "sse",
+      "websocket",
+      "version_gate",
+      "rate_limit_cooldown",
+      "search_ownership",
+      "media_ownership",
+      "catalog_fresh",
+      "catalog_authoritative_empty",
+      "catalog_transient_stale",
+      "identity_generation_drift",
+      "share_binding_drift",
+      "session_turn_drift"
+    ],
+    "receipts": [
+      {
+        "capability": "inference",
+        "rail": "oauth",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "capability": "media",
+        "rail": "oauth",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "capability": "remote_compaction",
+        "rail": "oauth",
+        "status": "live_pending",
+        "runtimeEnabled": false,
+        "receipt": null
+      }
+    ]
+  },
+  "remoteCompactionGate": {
+    "runtimeEnabled": false,
+    "requiresLiveOAuthReceipt": true,
+    "forbiddenInputs": [
+      "grok_web_cookie",
+      "cross_account_cache",
+      "sub2api_pool_or_routing"
+    ]
+  }
+}

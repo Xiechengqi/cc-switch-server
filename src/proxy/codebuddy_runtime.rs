@@ -497,6 +497,7 @@ pub fn build_codebuddy_payload(
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "CodeBuddy request must contain messages array".to_string())?;
+    messages.retain(codebuddy_message_is_semantic);
     if messages
         .first()
         .and_then(|message| message.get("role"))
@@ -522,7 +523,7 @@ pub fn build_codebuddy_payload(
             }
         }
     }
-    normalize_codebuddy_tool_choice(&mut request)?;
+    normalize_codebuddy_tools_and_choice(&mut request)?;
     request.insert("model".to_string(), Value::String(model_id.to_string()));
     request.insert("stream".to_string(), Value::Bool(true));
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
@@ -586,17 +587,94 @@ pub fn build_codebuddy_payload(
     Ok(Value::Object(request))
 }
 
-fn normalize_codebuddy_tool_choice(
+fn codebuddy_message_is_semantic(message: &Value) -> bool {
+    let Some(message) = message.as_object() else {
+        return true;
+    };
+    let content_empty = match message.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.trim().is_empty(),
+        Some(Value::Array(value)) => value.is_empty(),
+        Some(_) => false,
+    };
+    if !content_empty {
+        return true;
+    }
+    let carries_tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| call.as_object().is_some_and(|call| !call.is_empty()))
+        });
+    let carries_tool_result = message.get("role").and_then(Value::as_str) == Some("tool")
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty());
+    carries_tool_calls || carries_tool_result
+}
+
+fn normalize_codebuddy_tools_and_choice(
     request: &mut serde_json::Map<String, Value>,
 ) -> Result<(), String> {
+    match request.get("tools") {
+        Some(Value::Null) => {
+            request.remove("tools");
+            request.remove("tool_choice");
+            return Ok(());
+        }
+        Some(Value::Array(tools)) if tools.is_empty() => {
+            request.remove("tools");
+            request.remove("tool_choice");
+            return Ok(());
+        }
+        Some(Value::Array(_)) | None => {}
+        Some(_) => return Err("CodeBuddy tools must be an array".to_string()),
+    }
     let Some(choice) = request.get("tool_choice").cloned() else {
         return Ok(());
     };
-    let Some(choice) = choice.as_object() else {
+    if choice.is_null() {
+        request.remove("tool_choice");
         return Ok(());
+    }
+    if let Some(choice) = choice.as_str() {
+        return match choice {
+            "none" => {
+                request.remove("tools");
+                request.remove("tool_choice");
+                Ok(())
+            }
+            "auto" | "required" => {
+                if !request.contains_key("tools") {
+                    request.remove("tool_choice");
+                }
+                Ok(())
+            }
+            _ => Err("CodeBuddy tool_choice string must be none, auto, or required".to_string()),
+        };
+    }
+    let Some(choice) = choice.as_object() else {
+        return Err("CodeBuddy tool_choice must be a string or object".to_string());
     };
-    if choice.get("type").and_then(Value::as_str) != Some("function") {
-        return Err("CodeBuddy named tool_choice type must be function".to_string());
+    match choice.get("type").and_then(Value::as_str) {
+        Some("none") => {
+            request.remove("tools");
+            request.remove("tool_choice");
+            return Ok(());
+        }
+        Some(kind @ ("auto" | "required")) => {
+            if request.contains_key("tools") {
+                request.insert("tool_choice".to_string(), Value::String(kind.to_string()));
+            } else {
+                request.remove("tool_choice");
+            }
+            return Ok(());
+        }
+        Some("function") => {}
+        _ => return Err("CodeBuddy named tool_choice type must be function".to_string()),
     }
     let name = choice
         .get("function")
@@ -911,5 +989,86 @@ mod tests {
         )
         .unwrap_err()
         .contains("unsafe"));
+    }
+
+    #[test]
+    fn payload_drops_empty_messages_but_preserves_tool_protocol_history() {
+        let payload = build_codebuddy_payload(
+            &json!({
+                "messages":[
+                    {"role":"system","content":"   "},
+                    {"role":"user","content":null},
+                    {"role":"assistant","content":[],"tool_calls":[{
+                        "id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}
+                    }]},
+                    {"role":"tool","content":"","tool_call_id":"call-1"}
+                ]
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["messages"][0]["role"], "system");
+        assert_eq!(
+            payload["messages"][0]["content"],
+            "You are a helpful coding assistant."
+        );
+        assert_eq!(payload["messages"][1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(payload["messages"][2]["tool_call_id"], "call-1");
+
+        let empty = build_codebuddy_payload(
+            &json!({"messages":[{"role":"user","content":[]}] }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(empty["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(empty["messages"][0]["role"], "system");
+        assert!(!empty["messages"][0]["content"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn payload_normalizes_empty_none_and_attached_tool_choices() {
+        for tools in [Value::Null, json!([])] {
+            let payload = build_codebuddy_payload(
+                &json!({
+                    "messages":[{"role":"user","content":"run"}],
+                    "tools": tools,
+                    "tool_choice":"required"
+                }),
+                "default-model",
+                &text_capability(),
+            )
+            .unwrap();
+            assert!(payload.get("tools").is_none());
+            assert!(payload.get("tool_choice").is_none());
+        }
+        let none = build_codebuddy_payload(
+            &json!({
+                "messages":[{"role":"user","content":"run"}],
+                "tools":[{"type":"function","function":{"name":"lookup"}}],
+                "tool_choice":{"type":"none"}
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert!(none.get("tools").is_none());
+        assert!(none.get("tool_choice").is_none());
+
+        for choice in ["auto", "required"] {
+            let payload = build_codebuddy_payload(
+                &json!({
+                    "messages":[{"role":"user","content":"run"}],
+                    "tools":[{"type":"function","function":{"name":"lookup"}}],
+                    "tool_choice":choice
+                }),
+                "default-model",
+                &text_capability(),
+            )
+            .unwrap();
+            assert_eq!(payload["tool_choice"], choice);
+        }
     }
 }

@@ -1,0 +1,195 @@
+{
+  "format": "cc-switch-qoder-reference-delta",
+  "schemaVersion": 1,
+  "policy": {
+    "scope": "single bound Provider/Share/Account; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no cross-site fallback, no cross-account fallback, no cross-Provider fallback",
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "liveEvidence": "Global OAuth, Global PAT, and CN OAuth require independent real receipts; offline and loopback evidence remain live_pending"
+  },
+  "sources": [
+    {
+      "id": "tokenrouter",
+      "rootEnv": "QODER_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/TokenRouter",
+      "commit": "3488b4a9208c41e4f9db4108ef5133cb3710648c",
+      "files": [
+        {
+          "path": "docs/interfaces/qoder_upstream.md",
+          "sha256": "94324afcfb785f8781136c25b44aa8b2e9e00fb76a4603f2a79b02a24e276fdb"
+        },
+        {
+          "path": "docs/operations/account_maintenance.md",
+          "sha256": "94fa521a816ac61853752782cda0db1be2837ea8f3c619db9f57421370fab3ed"
+        }
+      ]
+    }
+  ],
+  "contractMap": {
+    "providerType": "qoder_cosy",
+    "driverId": "special.qoder_cosy",
+    "driverContractRevision": 2,
+    "optionSchemaId": "special.qoder_cosy.v1",
+    "profileSchemaRevision": 1,
+    "profiles": [
+      "claude.qoder_cosy",
+      "codex.qoder_cosy",
+      "gemini.qoder_cosy"
+    ],
+    "operations": {
+      "forward": "supported",
+      "test": "supported",
+      "discovery": "supported",
+      "connectivity": "supported"
+    },
+    "conformance": {
+      "forward": "fixture_verified",
+      "test": "fixture_verified",
+      "discovery": "fixture_verified"
+    },
+    "oracle": {
+      "schemaVersion": 2,
+      "offlineState": "fixture_verified",
+      "liveState": "live_pending",
+      "rails": [
+        "cn_oauth",
+        "global_oauth",
+        "global_pat"
+      ]
+    }
+  },
+  "capabilities": [
+    {
+      "id": "QD-01",
+      "status": "fixture_verified",
+      "evidence": [
+        {
+          "path": "assets/contract/provider-registry.json",
+          "anchors": [
+            "\"driverId\":\"special.qoder_cosy\",\"driverContractRevision\":2",
+            "\"profileId\":\"claude.qoder_cosy\"",
+            "\"profileId\":\"codex.qoder_cosy\"",
+            "\"profileId\":\"gemini.qoder_cosy\""
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "async fn forward_qoder(",
+            "async fn recover_qoder_auth_before_commit("
+          ]
+        },
+        {
+          "path": "src/state.rs",
+          "anchors": [
+            "pub(crate) async fn prepare_qoder_runtime(",
+            "pub(crate) async fn qoder_runtime_generation_matches("
+          ]
+        }
+      ]
+    },
+    {
+      "id": "QD-02",
+      "status": "live_pending",
+      "evidence": [
+        {
+          "path": "scripts/smoke/qoder-real.mjs",
+          "anchors": [
+            "global_oauth",
+            "global_pat",
+            "cn_oauth",
+            "otherAccountRequests: 0",
+            "otherProviderRequests: 0",
+            "otherSiteRequests: 0"
+          ]
+        },
+        {
+          "path": "scripts/audit/qoder-real.test.mjs",
+          "anchors": [
+            "blocked_inputs",
+            "live_pending",
+            "fails closed on a mismatched bound Account"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "QD-03",
+      "status": "fixture_verified",
+      "evidence": [
+        {
+          "path": "scripts/audit/audit-qoder-cli-oracle.mjs",
+          "anchors": [
+            "expectedPackages",
+            "expectedRailSectionDigests",
+            "expectedCanonicalDigests",
+            "assertNoExternalDependency"
+          ]
+        },
+        {
+          "path": "scripts/audit/qoder-cli-oracle.test.mjs",
+          "anchors": [
+            "oracle rejects missing rail and cross-site package reuse",
+            "oracle rejects unexplained projection drift",
+            "oracle cannot claim live verification without independent receipts"
+          ]
+        }
+      ]
+    }
+  ],
+  "upgradeWorkflow": {
+    "orderedStages": [
+      "freeze_package_name_version_integrity_and_bundle_digest",
+      "extract_stable_wire_from_immutable_official_package",
+      "cross_check_secondary_read_only_reference",
+      "update_oracle_and_make_mutation_tests_fail_on_old_contract",
+      "update_rust_after_oracle_review",
+      "regenerate_contract_map_and_provider_coverage",
+      "run_offline_and_loopback_gates",
+      "keep_each_rail_live_pending_until_independent_receipt"
+    ],
+    "forbidden": [
+      "runtime_dependency_on_external_repository_or_npm_bundle",
+      "fixture_and_rust_coherent_update_without_independent_digest",
+      "cross_site_package_reuse",
+      "one_rail_receipt_promotes_another_rail"
+    ]
+  },
+  "realAcceptance": {
+    "rails": [
+      {
+        "rail": "cn_oauth",
+        "site": "cn",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "rail": "global_oauth",
+        "site": "global",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "rail": "global_pat",
+        "site": "global",
+        "status": "live_pending",
+        "receipt": null
+      }
+    ],
+    "requiredChecks": [
+      "login_or_pat_import",
+      "refresh_rotation_or_job_token_exchange",
+      "fresh_catalog",
+      "authoritative_empty_catalog",
+      "quota",
+      "claude_nonstream_stream_tool_usage",
+      "codex_nonstream_stream_tool_usage",
+      "gemini_nonstream_stream_tool_usage",
+      "same_account_first_401_recovery",
+      "second_401_terminal",
+      "unique_terminal_then_eof",
+      "three_decoy_zero_request_counts",
+      "site_rail_and_generation_digest",
+      "secret_scan"
+    ]
+  }
+}

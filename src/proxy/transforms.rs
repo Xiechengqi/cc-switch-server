@@ -886,6 +886,12 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
         }
         output_messages.extend(openai_chat_message_to_anthropic(message, role)?);
     }
+    if let Some(instruction) = input
+        .get("response_format")
+        .and_then(claude_structured_output_instruction)
+    {
+        system_parts.push(instruction);
+    }
 
     merge_adjacent_anthropic_messages(&mut output_messages);
     drop_empty_anthropic_messages(&mut output_messages);
@@ -950,6 +956,13 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
             }
         }
     }
+    if let Some(instruction) = input
+        .pointer("/text/format")
+        .or_else(|| input.get("response_format"))
+        .and_then(claude_structured_output_instruction)
+    {
+        system_parts.push(instruction);
+    }
     if !system_parts.is_empty() {
         output.insert(
             "system".to_string(),
@@ -988,6 +1001,52 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
     apply_openai_tool_controls_to_anthropic(input, &mut output, Some(&tool_context))?;
 
     Ok(Value::Object(output))
+}
+
+fn claude_structured_output_instruction(format: &Value) -> Option<String> {
+    const JSON_ONLY: &str = "You must format your entire response as a valid JSON object. Do not include explanations, Markdown code blocks, or text outside the JSON object.";
+    match format.get("type").and_then(Value::as_str)?.trim() {
+        "json_object" => Some(JSON_ONLY.to_string()),
+        "json_schema" => {
+            let descriptor = format.get("json_schema").unwrap_or(format);
+            let Some(schema) = descriptor.get("schema").or_else(|| format.get("schema")) else {
+                return Some(JSON_ONLY.to_string());
+            };
+            let mut instruction = String::from(
+                "You must format your entire response as valid JSON that strictly conforms to this JSON schema:\n",
+            );
+            if let Some(name) = descriptor
+                .get("name")
+                .or_else(|| format.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                instruction.push_str("Schema name: ");
+                instruction.push_str(name);
+                instruction.push('\n');
+            }
+            if let Some(description) = descriptor
+                .get("description")
+                .or_else(|| format.get("description"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                instruction.push_str("Schema description: ");
+                instruction.push_str(description);
+                instruction.push('\n');
+            }
+            instruction.push_str("JSON schema:\n");
+            instruction
+                .push_str(&serde_json::to_string(schema).unwrap_or_else(|_| "{}".to_string()));
+            instruction.push_str(
+                "\nDo not include explanations, Markdown code blocks, or text outside the JSON object.",
+            );
+            Some(instruction)
+        }
+        _ => None,
+    }
 }
 
 pub fn openai_chat_to_responses(input: &Value) -> Result<Value, TransformError> {
@@ -6539,6 +6598,7 @@ pub(super) fn openai_chat_usage_from_responses_usage(usage: Option<&Value>) -> V
             json!(cache_creation),
         );
         output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
+        output["prompt_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
     }
     if let Some(details) = usage
         .and_then(|usage| usage.get("output_tokens_details"))
@@ -7063,6 +7123,52 @@ mod tests {
         assert_eq!(output["messages"][1]["role"], "assistant");
         assert_eq!(output["messages"][1]["content"][0]["text"], "prior answer");
         assert_eq!(output["max_tokens"], DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS);
+    }
+
+    #[test]
+    fn claude_structured_output_translation_is_scoped_and_preserves_system_text() {
+        let chat = openai_chat_to_anthropic(&json!({
+            "model":"claude-sonnet-4-6",
+            "messages":[
+                {"role":"system","content":"Operator instruction."},
+                {"role":"user","content":"extract"}
+            ],
+            "response_format": {
+                "type":"json_schema",
+                "json_schema": {
+                    "name":"facts",
+                    "description":"Extracted facts",
+                    "schema":{"type":"object","properties":{"items":{"type":"array"}}}
+                }
+            }
+        }))
+        .unwrap();
+        let system = chat["system"].as_str().unwrap();
+        assert!(system.contains("Operator instruction."));
+        assert!(system.contains("Schema name: facts"));
+        assert!(system.contains("Extracted facts"));
+        assert!(system.contains("\"items\""));
+
+        let responses = openai_responses_to_anthropic(&json!({
+            "model":"claude-sonnet-4-6",
+            "instructions":"Be concise.",
+            "input":"extract",
+            "text":{"format":{"type":"json_object"}},
+            "response_format":{"type":"json_schema","schema":{"type":"string"}}
+        }))
+        .unwrap();
+        let system = responses["system"].as_str().unwrap();
+        assert!(system.contains("Be concise."));
+        assert!(system.contains("valid JSON object"));
+        assert!(!system.contains("\"type\":\"string\""));
+
+        let plain = openai_chat_to_anthropic(&json!({
+            "model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"plain"}],
+            "response_format":{"type":"text"}
+        }))
+        .unwrap();
+        assert!(plain.get("system").is_none());
     }
 
     #[test]

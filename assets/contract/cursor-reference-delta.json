@@ -1,0 +1,152 @@
+{
+  "format": "cc-switch-cursor-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
+    "scope": "one fixed Provider and one fixed credential identity per receipt; no pool; no rotation; no rail fallback; no cross-account fallback; no cross-Provider fallback",
+    "liveEvidence": "OAuth and API-key rails require separate real receipts; fixture success never upgrades either rail"
+  },
+  "sources": [
+    {
+      "id": "omniroute",
+      "rootEnv": "CC_SWITCH_CURSOR_OMNIROUTE_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Cursor/OmniRoute",
+      "commit": "a3ca33fa6442b59adc42976c795709eaf5351109",
+      "files": [
+        {
+          "path": "open-sse/utils/cursorAgentProtobuf.ts",
+          "sha256": "9afc02030eb09f79f74f4a25c4a61673b66e9f785e932abff58d416dd8cb7c2b"
+        },
+        {
+          "path": "open-sse/services/cursorSessionManager.ts",
+          "sha256": "f9e8809841680e0baec8db64ecaed5ced995e8b84922cc65ccab88e6b2a3d862"
+        },
+        {
+          "path": "open-sse/executors/cursor.ts",
+          "sha256": "76d8b4c5b148d52a34b49932bdf819f098323b59d37c2e79fb65470ff28ff546"
+        },
+        {
+          "path": "tests/unit/cursor-agent-protobuf.test.ts",
+          "sha256": "8382d7b62792d9a43ddf72da55514c4ddaac28427cbb0b1ff9378f296fe77c9c"
+        },
+        {
+          "path": "tests/unit/cursor-agent-session.test.ts",
+          "sha256": "ac4fbe52ff2dd3f72d203f14fe436f1a99c208f024e442256da58b3619f1006d"
+        },
+        {
+          "path": "tests/unit/cursor-protobuf-wire-split.test.ts",
+          "sha256": "969fb8725a30cd0fb13f86f172ea997fd4310c9d570f118628c1bb1aa04628cf"
+        }
+      ]
+    }
+  ],
+  "registryTruth": {
+    "driverId": "special.cursor",
+    "driverContractRevision": 4,
+    "operations": {
+      "forward": "supported",
+      "test": "supported",
+      "discovery": "supported",
+      "connectivity": "supported"
+    },
+    "conformance": {
+      "forward": "fixture_verified",
+      "test": "fixture_verified",
+      "discovery": "fixture_verified"
+    },
+    "discoveryMeaning": "public model-selection endpoints expose static OAuth aliases and exact-scope API-key /v1/models catalogs; successful empty catalogs are authoritative and transient stale is presentation-only"
+  },
+  "capabilities": [
+    {
+      "id": "CUR-01",
+      "status": "fixture_verified",
+      "path": "assets/contract/provider-registry.json",
+      "anchors": ["\"driverId\":\"special.cursor\",\"driverContractRevision\":4"]
+    },
+    {
+      "id": "CUR-02",
+      "status": "live_pending",
+      "path": "scripts/smoke/cursor-real.mjs",
+      "anchors": ["cursor dual-rail evidence remains live_pending"]
+    },
+    {
+      "id": "CUR-03",
+      "status": "fixture_verified",
+      "path": "src/proxy/cursor/agent_proto.rs",
+      "anchors": ["cursor_reference_fixture_preserves_known_semantics_around_unknown_fields"]
+    }
+  ],
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "scopeDigest": "sha256 lowercase hex over a private canonical scope; raw provider/account/credential values are excluded",
+    "requiredChecks": [
+      "fresh_catalog",
+      "authoritative_empty_catalog",
+      "transient_stale_catalog",
+      "full_fast_model_id",
+      "claude_stream",
+      "claude_non_stream",
+      "codex_stream",
+      "codex_non_stream",
+      "gemini_stream",
+      "gemini_non_stream",
+      "declared_tool",
+      "image_input",
+      "park_resume",
+      "same_identity_401",
+      "absolute_deadline",
+      "identity_generation_drift"
+    ],
+    "rails": [
+      {
+        "rail": "oauth",
+        "credentialOwner": "managed_account",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "rail": "api_key",
+        "credentialOwner": "provider_static_secret",
+        "status": "live_pending",
+        "receipt": null
+      }
+    ]
+  },
+  "protobufFixtures": {
+    "serverConfigUnknownFields": {
+      "hex": "1a0769676e6f726564da015e0a2468747470733a2f2f6167656e742e666978747572652e617069352e637572736f722e73689a060e6f70617175652d756e6b6e6f776e122568747470733a2f2f6167656e746e2e666978747572652e617069352e637572736f722e7368ea040b746f702d756e6b6e6f776e",
+      "expectedAgentUrl": "https://agent.fixture.api5.cursor.sh",
+      "expectedAgentnUrl": "https://agentn.fixture.api5.cursor.sh"
+    },
+    "serverConfigDuplicate": {
+      "hex": "da015e0a2468747470733a2f2f6167656e742e666978747572652e617069352e637572736f722e73689a060e6f70617175652d756e6b6e6f776e122568747470733a2f2f6167656e746e2e666978747572652e617069352e637572736f722e7368da015e0a2468747470733a2f2f6167656e742e666978747572652e617069352e637572736f722e73689a060e6f70617175652d756e6b6e6f776e122568747470733a2f2f6167656e746e2e666978747572652e617069352e637572736f722e7368",
+      "expected": "fail_closed"
+    },
+    "interactionUnknownBeforeKnown": {
+      "hex": "0a199a06066f70617175650a0e0a0c666978747572652074657874",
+      "expectedText": "fixture text"
+    },
+    "interactionUnknownOnly": {
+      "hex": "0a099a06066f7061717565",
+      "expectedUnknownField": 99
+    },
+    "connectFrame": {
+      "hex": "000000001b0a199a06066f70617175650a0e0a0c666978747572652074657874",
+      "splitOffsets": [1, 4, 5, 17, 31],
+      "expectedPayloadHex": "0a199a06066f70617175650a0e0a0c666978747572652074657874",
+      "partialEof": "fail_closed"
+    },
+    "terminal": {
+      "cleanEnvelope": "{}",
+      "errorEnvelope": "{\"error\":{\"code\":\"unavailable\",\"message\":\"retry later\"}}",
+      "plainEofWithoutEnvelope": "fail_closed"
+    },
+    "model": {
+      "freshCatalogId": "composer-2.5-fast",
+      "expectedWireId": "composer-2.5-fast",
+      "staleCatalogMayAuthorizeWireId": false
+    }
+  }
+}

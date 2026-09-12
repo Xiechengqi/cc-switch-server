@@ -13,6 +13,7 @@ pub mod logging;
 pub mod metrics;
 pub mod provider_identity;
 pub mod proxy;
+pub(crate) mod repository;
 pub mod self_update;
 pub mod setup;
 pub mod state;

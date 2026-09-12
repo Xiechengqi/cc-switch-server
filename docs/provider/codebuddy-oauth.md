@@ -8,6 +8,8 @@
 
 本文定义 cc-switch-server 的 `codebuddy_oauth` Provider 边界。一个 CodeBuddy Provider 固定绑定一个 CodeBuddy Account；Server 不实现账号池、轮询、权重、按配额/并发选号、自动切站，或跨 Provider fallback。
 
+当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；`assets/contract/codebuddy-reference-delta.json` 将 CB-01 至 CB-04、Registry 状态、外部只读提交与双站真实门禁固定为可审计映射。
+
 ---
 
 ## 0. 证据来源与置信度标注
@@ -278,6 +280,8 @@ POST {endpoint}/v2/chat/completions
 
 **新增硬约束【D】**：若 `messages[0].role != "system"`，上游返回 **HTTP 400** + `{"code":11128,"msg":"first message is not system prompt"}`。
 
+在注入固定非空 system 前，revision 2 会删除 content 缺失、null、空白字符串或空数组且不承载协议语义的 message，避免上游 `11151`。assistant 的有效 `tool_calls` 与带非空 `tool_call_id` 的 tool result 即使 content 为空也必须保留；清理后为空时只注入固定最小 system，不改写普通 prompt。该差分来自只读 `cli2api@e5893f0`，目标实现采用更严格的 tool-result 保留边界。
+
 这是反代必须处理的强制项：下游若送来一个不以 system 开头的对话（Anthropic Messages 形态常见——system 是独立顶层字段），实现**必须**合成或前置一条 system 消息，否则请求必然失败。
 
 ### 5.5 请求体 gzip
@@ -306,6 +310,7 @@ POST {endpoint}/v2/chat/completions
 - `reasoning_effort` 是**顶层字符串**（非 `reasoning:{effort}` 对象）。
 - 下游 canonical `reasoning.effort` 会归一为顶层 `reasoning_effort`；同时出现且值冲突、类型错误、或 effort 不在实时目录的 `supportedEfforts` 时，本地 400。仅在下游明确请求 reasoning 且未指定 effort 时采用目录 `defaultEffort`，不会无请求自动开启推理。
 - OpenAI named `tool_choice` 会先确认目标函数存在，再把 `tools` 缩减到该函数并映射为上游支持的 `"required"`；缺失/未知函数或畸形类型在发网前失败。
+- `tools: null`/`[]` 会与失去依附的 `tool_choice` 一起删除；`tool_choice: none` 同步删除 tools，`auto`/`required` 仅在非空 tools 存在时保留。named function 继续执行名字格式和声明存在性校验，不能借清理降级为 auto。
 - `stream_options.include_usage=true` 是末帧 usage 的来源；实现若需用量统计必须带上。
 - 回填轮的 assistant / tool 消息带非标准 `messageId`、`model`、`requestModelId`、`requestModelName`、`traceId`、`conversationRequestId`、`agent`。这些**不是必需的**，反代可不透传。
 
@@ -316,6 +321,8 @@ POST {endpoint}/v2/chat/completions
 `tool_calls` 为标准增量（首帧 `id`+`name`，后续帧只递增 `arguments`）；**首帧的 `index` 是否存在随模型而变**，按 `index` 归并的实现须容忍首帧缺失。终帧 `finish_reason` ∈ `{tool_calls, stop, length}`，随后独立一帧携带 `usage`，最后 `data: [DONE]`。**U10 已关闭。**
 
 SSE 解码接受 CRLF/LF/单 CR event boundary、多条 `data:`（按规范用换行拼接）、comment、`event:`、`id:` 与 `retry:` 心跳字段；仍要求唯一 `[DONE]` 后到达 EOF 才提交终态，`[DONE]` 后数据、重复 terminal、缺 terminal 或超限 event 全部失败。
+
+revision 2 在 CodeBuddy decoder 内删除空 `content`、`reasoning_content`、`reasoning`、`refusal`、空 `tool_calls` 与 dummy `function_call`，重复 role 只保留第一次；若 chunk 随后不含 role、finish、usage、error、tool、reasoning 或 content 语义则整帧丢弃。finish、显式 usage（包括零）、真实 tool arguments 和合法首 role 不得丢失。该差分以 `cli2api@32aa108` 为只读交叉证据，严格 `[DONE]` + EOF 规则不变。
 
 ### 5.7 usage 字段
 
@@ -450,7 +457,7 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
   ```json
   {
     "driverId": "special.codebuddy_oauth",
-    "driverContractRevision": 1,
+    "driverContractRevision": 2,
     "upstreamProtocol": "special",
     "acceptedAuthSchemes": ["oauth"],
     "operations": { "forward": "supported", "test": "supported",
@@ -460,9 +467,9 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
     "optionSchemaId": "special.codebuddy_oauth.v1"
   }
   ```
-  `capabilities.images` 先置 `false`；国际版目录含图像/视频模型，但在 U5/U11 确认 wire 形态前不开。
+`capabilities.images` 保持 `false`；国际版目录含图像/视频模型，但在 U5/U11 确认 wire 形态前不开。
 - `profiles` +3：`claude.codebuddy_oauth` / `codex.codebuddy_oauth` / `gemini.codebuddy_oauth`，`formComposition: "managed_account"`、`endpointPolicy: "fixed"`、`credentialPolicy: { mode: "managed_account", accountProviderType: "codebuddy_oauth" }`、`modelPolicy: "single"`、`allowedModelPolicies: ["single","passthrough"]`、`maturity: "experimental"`、`defaultUpstreamModel: "auto"`。`auto` 只是表单必需的站点中立 sentinel，运行时必须按绑定 Account 的 site 解析，绝不能直接发往上游。
-- `conformance` +1：初始 `forward: "live_pending"`、`test: "live_pending"`、`discovery: "live_pending"`
+- Registry conformance 当前三项均为 `fixture_verified`，只表达本地实现与 fixture 等级；独立的 `assets/contract/provider-conformance-evidence.json` 将三项 live gate 保持为 `live_pending`，receipt 为空。两类状态不得再写回同一字段或相互冒充。
 
 ### 7.2 注册表不变量
 

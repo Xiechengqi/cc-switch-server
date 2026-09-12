@@ -1,0 +1,135 @@
+{
+  "format": "cc-switch-kiro-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
+    "scope": "one fixed Provider, one fixed Share, one fixed Account and one signed user namespace; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
+    "cacheBoundary": "local downstream metering fallback only; never changes upstream request, cost, account binding or routing",
+    "liveEvidence": "fixtures never prove live cache behavior, upstream cost reduction, auth-kind support, region support or multi-replica safety"
+  },
+  "sources": [
+    {
+      "id": "kiro-rs",
+      "rootEnv": "CC_SWITCH_KIRO_RS_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Kiro/kiro.rs",
+      "commit": "22d2c2d0695ba350890072c19990f54782827ae5",
+      "historicalCommits": ["f2cc574", "19b7f4b", "47633a4"],
+      "files": [
+        {
+          "path": "src/anthropic/cache_metering.rs",
+          "sha256": "f18d4cc2ee73a817359366a45b560c6fa684915422d9131c01ca46e19ab48fd5"
+        },
+        {
+          "path": "src/anthropic/stream.rs",
+          "sha256": "ea907b7180553ff37fd2c39b68f10b873bb29fefdd3c24ebdd4f55df23b47847"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "KI-01",
+      "status": "fixture_verified",
+      "path": "src/proxy/kiro_prompt_cache.rs",
+      "anchors": [
+        "auto_cache_keeps_latest_user_tail_uncached",
+        "twenty_position_lookback_groups_consecutive_tool_blocks",
+        "mixed_ttl_order_is_enforced",
+        "hit_renews_with_entry_own_ttl"
+      ]
+    },
+    {
+      "id": "KI-02",
+      "status": "fixture_verified",
+      "path": "src/proxy/kiro.rs",
+      "anchors": [
+        "kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate",
+        "local_prompt_cache_estimate",
+        "upstream_token_usage"
+      ]
+    },
+    {
+      "id": "KI-03",
+      "status": "fixture_verified",
+      "path": "src/proxy/kiro_prompt_cache.rs",
+      "anchors": [
+        "sqlite_restart_preserves_unexpired_entries_and_legacy_source",
+        "unavailable_disk_never_blocks_or_changes_memory_semantics",
+        "sqlite_generation_cas_rolls_back_conflicting_batch"
+      ]
+    },
+    {
+      "id": "KI-04",
+      "status": "live_pending",
+      "path": "docs/provider/kiro-prompt-cache.md",
+      "anchors": ["KI-04：真实验收", "全部保持 `live_pending`"]
+    },
+    {
+      "id": "KI-05",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "path": "docs/provider/kiro-prompt-cache.md",
+      "anchors": ["KI-05：共享缓存门禁", "runtimeEnabled=false"]
+    }
+  ],
+  "fixtureAcceptance": {
+    "checks": [
+      "top_level_auto",
+      "explicit_breakpoint",
+      "no_cache",
+      "five_minute_ttl",
+      "one_hour_ttl",
+      "four_breakpoint_limit",
+      "mixed_ttl_order",
+      "twenty_block_lookback",
+      "tool_use_result_grouping",
+      "latest_user_guardrail",
+      "entry_own_ttl_renewal",
+      "namespace_isolation",
+      "authoritative_usage_including_zero",
+      "integer_ratio_conservation",
+      "sqlite_restart_and_cas",
+      "disk_failure_non_blocking_degradation"
+    ]
+  },
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "scopeDigest": "sha256 lowercase hex over a private canonical Provider/Share/Account/user/auth-kind/region scope; raw identities, prompts and credentials are excluded",
+    "requiredChecks": [
+      "claude_non_stream",
+      "claude_stream",
+      "codex_non_stream",
+      "codex_stream",
+      "auto_explicit_no_cache",
+      "five_minute_and_one_hour_ttl",
+      "four_breakpoint_and_twenty_block_boundaries",
+      "latest_user_guardrail",
+      "upstream_usage_precedence",
+      "same_account_401"
+    ],
+    "receipts": [
+      {"authKind": "builder_id", "region": "us-east-1", "status": "live_pending", "receipt": null},
+      {"authKind": "builder_id", "region": "eu-central-1", "status": "live_pending", "receipt": null},
+      {"authKind": "idc", "region": "us-east-1", "status": "live_pending", "receipt": null},
+      {"authKind": "idc", "region": "eu-central-1", "status": "live_pending", "receipt": null},
+      {"authKind": "social", "region": "us-east-1", "status": "live_pending", "receipt": null},
+      {"authKind": "social", "region": "eu-central-1", "status": "live_pending", "receipt": null},
+      {"authKind": "api_key", "region": "us-east-1", "status": "live_pending", "receipt": null},
+      {"authKind": "api_key", "region": "eu-central-1", "status": "live_pending", "receipt": null}
+    ]
+  },
+  "sharedCacheGate": {
+    "runtimeEnabled": false,
+    "requiresExplicitMultiReplicaNeed": true,
+    "requiresLiveEvidence": true,
+    "forbiddenInputs": [
+      "account_affinity",
+      "account_routing",
+      "cache_hit_account_selection",
+      "cross_account_cache",
+      "reference_redis_runtime_dependency"
+    ]
+  }
+}

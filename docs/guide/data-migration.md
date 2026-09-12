@@ -110,3 +110,40 @@ backup that does not contain the root key. It does not protect against disclosur
 of the complete data directory, the environment root key, or compromise of the
 Server OS user. A staged restore of S2 data must have the matching `accounts.key`
 or environment key before any live file is replaced.
+
+## Server SQLite Authority
+
+Provider S1 -> S2 conversion must be complete before a non-empty Provider store
+can enter SQLite. Keep the Server stopped and run the read-only preflight first:
+
+```bash
+cc-switch-server --config-dir "$CONFIG_DIR" config migrate-server-store
+```
+
+The preflight validates legacy stores or an existing shadow but does not create
+a database or marker. Apply the authority transition explicitly:
+
+```bash
+cc-switch-server --config-dir "$CONFIG_DIR" config migrate-server-store --apply
+```
+
+The command creates or verifies the shadow, then advances the durable
+`shadow_verified -> prepared -> committed` state machine. It is idempotent and
+can be rerun after interruption. Once committed, SQLite is the sole authority;
+root-level Provider, Account, Share, and Usage legacy files are retired into a
+read-only migration backup and are never imported again.
+
+For a one-release-window downgrade, export the current committed state to a new
+directory while the Server is stopped:
+
+```bash
+cc-switch-server --config-dir "$CONFIG_DIR" config migrate-server-store \
+  --rollback-export /secure/cc-switch-server-legacy-export
+```
+
+The destination must not already exist. The export contains current encrypted
+Provider/Account/Share payloads, rebuilt current Usage, and `accounts.key` when
+the key is file-backed. If the installation uses
+`CC_SWITCH_SERVER_ACCOUNTS_ENCRYPTION_KEY`, supply the same environment key to
+the older binary. Validate the export in isolation before replacing any live
+directory; the command never performs that replacement itself.

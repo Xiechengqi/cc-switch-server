@@ -100,6 +100,22 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 生产中 WebSocket 上游不可配置。仅 `cfg(test)` 的 Driver option `testGrokWebsocketUrl` 可指向 loopback mock。
 
+## Grok reasoning replay 与恢复
+
+Grok Build 对多轮 function call 可能要求上一轮返回的 opaque `reasoning.encrypted_content`。Server 使用 Grok 专用、进程内、短期 cache 补齐无状态客户端省略的 proof；它不是通用会话历史，也不是账号调度器。
+
+- scope 哈希同时覆盖 App、Provider id/revision/runtime、Account id、auth/token generation、Share、签名用户命名空间、session、turn、model family、HTTP 或 WebSocket rail 以及 upstream plane；任一维度漂移均 miss 或在提交前 fail closed。
+- 只关联最近的前置 reasoning 与其后的 function call；并行 call 可共享同一 proof。重复 call id、调用名/参数被编辑、乱序或无法证明的上下文不做部分注入。
+- cache 上限为 2,048 entries、每 proof 64 calls、单 reasoning item 1 MiB、单 entry 4 MiB、总计 64 MiB、TTL 30 分钟；流式解析总输入 8 MiB，并复用严格 Responses SSE/JSON 解码器处理 LF/CRLF 和任意分片。
+- HTTP JSON 只从 `status=completed` 响应捕获；SSE 和 WebSocket 只在唯一成功 `response.completed` 终态提交。EOF、failed/incomplete、重复终态、协议错误、超限、绑定漂移和 CAS 冲突均不产生新 proof。
+- 只有本 attempt 确实注入 cache proof，且上游在业务输出提交前返回冻结的 `missing_reasoning`、`invalid_reasoning`、`reasoning_rejected`、`invalid_encrypted_content` 或精确 decrypt/decode 错误时，才 CAS 删除被拒 snapshot 并重试一次。重试保持原 Provider、Account、Share、session、rail 和 plane，并消耗共享 attempt/10 秒窗口。
+- 客户端自带 reasoning、普通 schema 400、401/403、429/capacity、5xx、传输故障以及已提交业务 delta 后的拒绝不进入 reasoning recovery。第二次明确拒绝直接终止，不再借 WS→HTTP fallback 形成第二次恢复。
+- 缺少合法 `x-grok-turn-idx`、Share 或签名用户时 replay 关闭；Server 不猜测 turn。该关闭不改变原有 direct Provider 测试和基础转发语义。
+
+本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理和媒体 capability receipt 必须分别留证，缺少任一真实 receipt 时对应能力保持 `live_pending`。
+
+GR-05 的 remote compaction 保持运行时禁用。只有固定 OAuth rail 的真实上游 receipt 能证明协议存在且完成独立的 scope、AEAD、TTL、失败语义与降级评审后才可另行设计；当前不采用 Grok Web Cookie、跨账号 cache，也不采用 sub2api 的账号池、商业路由或 fallback 逻辑。
+
 ## 媒体能力
 
 图片生成、图片编辑和视频生成分别对应 `image_generation`、`image_edit`、`video_generation` capability。三个入口各自执行三层 fail-closed 门禁，顺序固定为：
@@ -148,6 +164,8 @@ Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan
 | 媒体首次 401 | 强制 refresh 后重放 1 次 | 原 Provider、原账号 |
 | WS 握手首次 401 | 强制 refresh 后重连 1 次 | 原 Provider、原账号 |
 | WS 首业务事件前的受支持传输错误 | HTTP/SSE fallback 1 次 | 原 Provider、原账号 |
+| 实际注入的 reasoning 被明确拒绝 | 清除该 snapshot 后恢复 1 次 | 原 Provider、原账号、原 rail |
+| 第二次 reasoning 拒绝或已提交业务事件 | 返回/终止当前流 | 永不再恢复或切换 |
 | 第二次 401、403、429、5xx | 返回并记录原账号状态 | 永不切换 |
 | SSE/WS 已提交业务事件后中断 | 终止当前流 | 永不重放 |
 | capability 未验证 | 上游零请求，返回 503 | 永不切换 |
@@ -171,6 +189,7 @@ Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan
 - `cc_switch_codex_websocket_fallback_total`：Responses WS fallback 的 source/result。
 - `cc_switch_grok_cli_version_gate_total`：上游 CLI version gate。
 - `cc_switch_grok_model_catalog_total{source}`：目录来源与降级频率。
+- `cc_switch_grok_reasoning_replay_total{outcome}`：hit/miss、上下文不匹配、明确拒绝清除、binding drift、commit/CAS conflict。
 - 账号 quota/cooldown、in-flight/max 和 warm-refresh 指标。
 
 日志和 evidence 只能记录 Provider id、脱敏账号、状态码、request id、模型、catalog source 和时间，不能记录 token、raw OAuth/JWKS 响应或完整上游错误体。
@@ -192,7 +211,7 @@ node scripts/smoke/grok-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。
 
-脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON/SSE，以及 OpenAI Chat 非流式/流式。Chat 检查严格要求非流式 `created` 为正整数，并要求所有流式 chunk 的 `created` 合法且流内一致，同时观察 `finish_reason`、usage 信息和唯一 `[DONE]`。四个推理请求都携带固定 session id 与合法 `x-grok-turn-idx`。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
+脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON/SSE，以及 OpenAI Chat 非流式/流式。Chat 检查严格要求非流式 `created` 为正整数，并要求所有流式 chunk 的 `created` 合法且流内一致，同时观察 `finish_reason`、usage 信息和唯一 `[DONE]`。四个推理请求都携带固定 session id 与合法 `x-grok-turn-idx`。推理和媒体 capability receipt 必须分别留证；一个成功不能推导另一个，也不能据本地 fixture 升级真实状态。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/acceptance/real-acceptance-runbook.md` 单独留证。
 
@@ -200,6 +219,7 @@ node scripts/smoke/grok-oauth-real.mjs
 
 - 不实现多账号调度、轮询、权重、健康 failover 或 quota spillover。
 - 不实现 grok.com Web cookie 反代，不迁移 Grok Web、Tauri、Skill、MCP 或 Desktop 行为。
+- 不启用 remote compaction；本地 reasoning replay 不是远程压缩、摘要服务或跨账号历史。
 - 不允许生产配置任意 OAuth、WebSocket、models 或 inference upstream。
 - 本地 mock 测试不能证明真实 xAI OAuth、订阅权限、模型、媒体、WebSocket 和限流语义可用。
 - Capability evidence 证明某账号曾成功使用能力，不保证其订阅未来始终保有该能力；真实 403/429 和 entitlement 变化仍需告警与人工处理。

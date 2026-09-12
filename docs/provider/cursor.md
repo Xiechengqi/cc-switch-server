@@ -1,6 +1,13 @@
 # Cursor AgentService acceptance
 
-Cursor Provider profiles remain `experimental` until OAuth and API-key credentials pass separate real-account runs. Static tests establish only `wired` and `statically-tested`; they never set `live-verified`.
+Cursor Provider profiles remain `experimental` until OAuth and API-key credentials pass separate real-account runs. Public model discovery, forward, and Provider test are `fixture_verified`; local tests never set `live_verified`.
+
+## Evidence and public discovery
+
+- Registry driver contract revision 4 marks forward, test, discovery, and connectivity as supported. Public selection returns static OAuth aliases and exact-scope API-key `/v1/models` results; a successful empty catalog is authoritative, while transient stale data is presentation-only and never authorizes a wire model.
+- `assets/contract/cursor-reference-delta.json` freezes committed OmniRoute protobuf/session evidence and self-contained hex fixtures. The normal audit has no external dependency; `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` is an optional read-only Git-object verification.
+- `scripts/smoke/cursor-real.mjs --rail oauth|api_key` validates one rail at a time. It requires an exact Provider, Share, OAuth Account where applicable, a fresh full `*-fast` model ID, and a private receipt outside the repository. Receipts contain only the rail, a SHA-256 scope digest, evidence state, timestamp, and the complete 16-check pass map—never Provider/Share/Account identifiers, credentials, prompts, or raw bodies.
+- Fixture mode proves only the harness contract and records `contract_verified` / `live_pending`. OAuth success cannot satisfy API-key acceptance, nor vice versa; both contract rails remain `live_pending` until independent real receipts are reviewed.
 
 ## Typed credential contract
 

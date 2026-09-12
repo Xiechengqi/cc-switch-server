@@ -756,7 +756,7 @@ fn patch_grok_request_value(
             ],
         );
         sanitize_reasoning(object, &model);
-        sanitize_tools(object);
+        sanitize_tools(object)?;
     }
     if store_false {
         strip_server_item_ids(value);
@@ -1352,11 +1352,11 @@ fn is_server_item_id(value: &str) -> bool {
         .any(|prefix| value.starts_with(prefix))
 }
 
-fn sanitize_tools(object: &mut Map<String, Value>) {
+fn sanitize_tools(object: &mut Map<String, Value>) -> Result<(), ProxyError> {
     let tool_choice = object.get("tool_choice").cloned();
     let should_drop_choice = {
         let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
-            return;
+            return Ok(());
         };
         tools.retain(|tool| {
             tool.get("type")
@@ -1366,7 +1366,20 @@ fn sanitize_tools(object: &mut Map<String, Value>) {
         if tools.is_empty() {
             object.remove("tools");
             object.remove("tool_choice");
-            return;
+            return Ok(());
+        }
+        for (index, tool) in tools.iter_mut().enumerate() {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let Some(parameters) = tool.get_mut("parameters") else {
+                continue;
+            };
+            *parameters = normalize_grok_build_parameters(parameters).map_err(|reason| {
+                ProxyError::protocol_incompatible(format!(
+                    "Grok function tool {index} parameters {reason}"
+                ))
+            })?;
         }
         let tools_snapshot = tools.clone();
         tool_choice
@@ -1375,6 +1388,256 @@ fn sanitize_tools(object: &mut Map<String, Value>) {
     };
     if should_drop_choice {
         object.remove("tool_choice");
+    }
+    Ok(())
+}
+
+const GROK_SCHEMA_MAX_BYTES: usize = 1024 * 1024;
+const GROK_SCHEMA_MAX_DEPTH: usize = 32;
+const GROK_SCHEMA_MAX_NODES: usize = 4096;
+const GROK_SCHEMA_MAX_ROOT_LEAVES: usize = 32;
+
+#[derive(Default)]
+struct GrokRootObjectCollector {
+    nodes: usize,
+    keyword: Option<&'static str>,
+    leaves: Vec<Map<String, Value>>,
+    changed: bool,
+}
+
+fn normalize_grok_build_parameters(schema: &Value) -> Result<Value, &'static str> {
+    if serde_json::to_vec(schema)
+        .map_err(|_| "cannot be encoded")?
+        .len()
+        > GROK_SCHEMA_MAX_BYTES
+    {
+        return Err("exceed the byte budget");
+    }
+    let document = schema
+        .as_object()
+        .ok_or("must have an object JSON Schema root")?;
+    let mut collector = GrokRootObjectCollector::default();
+    collect_grok_root_objects(
+        schema,
+        document,
+        &[],
+        &mut BTreeSet::new(),
+        0,
+        false,
+        &mut collector,
+    )?;
+    if collector.leaves.is_empty() {
+        return Err("contain no provable object root branch");
+    }
+    if !collector.changed {
+        return Ok(schema.clone());
+    }
+    let mut output = if collector.leaves.len() == 1 {
+        collector.leaves.remove(0)
+    } else {
+        let keyword = collector
+            .keyword
+            .ok_or("mix incompatible root union kinds")?;
+        Map::from_iter([(
+            keyword.to_string(),
+            Value::Array(collector.leaves.into_iter().map(Value::Object).collect()),
+        )])
+    };
+    if let Some(defs) = document.get("$defs") {
+        output.insert("$defs".to_string(), defs.clone());
+    }
+    if let Some(definitions) = document.get("definitions") {
+        output.insert("definitions".to_string(), definitions.clone());
+    }
+    Ok(Value::Object(output))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_grok_root_objects(
+    node: &Value,
+    document: &Map<String, Value>,
+    constraints: &[Map<String, Value>],
+    seen_refs: &mut BTreeSet<String>,
+    depth: usize,
+    inside_union: bool,
+    collector: &mut GrokRootObjectCollector,
+) -> Result<(), &'static str> {
+    collector.nodes = collector
+        .nodes
+        .checked_add(1)
+        .ok_or("exceed the node budget")?;
+    if depth > GROK_SCHEMA_MAX_DEPTH || collector.nodes > GROK_SCHEMA_MAX_NODES {
+        return Err("exceed the traversal budget");
+    }
+    let Some(object) = node.as_object() else {
+        return if inside_union {
+            collector.changed = true;
+            Ok(())
+        } else {
+            Err("must have an object JSON Schema root")
+        };
+    };
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if !reference.starts_with("#/") || !seen_refs.insert(reference.to_string()) {
+            return Err("contain an unresolved or recursive local root ref");
+        }
+        let resolved = resolve_grok_local_ref(document, reference)
+            .ok_or("contain an unresolved or recursive local root ref")?;
+        let sibling = grok_root_sibling_constraint(object, "$ref")?;
+        let mut next_constraints = constraints.to_vec();
+        if !sibling.is_empty() {
+            next_constraints.push(sibling);
+        }
+        collector.changed = true;
+        let result = collect_grok_root_objects(
+            resolved,
+            document,
+            &next_constraints,
+            seen_refs,
+            depth + 1,
+            inside_union,
+            collector,
+        );
+        seen_refs.remove(reference);
+        return result;
+    }
+
+    let union = grok_root_union(object)?;
+    if let Some((keyword, branches)) = union {
+        match collector.keyword {
+            None => collector.keyword = Some(keyword),
+            Some(existing) if existing != keyword => {
+                return Err("mix incompatible root union kinds");
+            }
+            _ => {}
+        }
+        let sibling = grok_root_sibling_constraint(object, keyword)?;
+        let mut next_constraints = constraints.to_vec();
+        if !sibling.is_empty() {
+            next_constraints.push(sibling);
+        }
+        for branch in branches {
+            collect_grok_root_objects(
+                branch,
+                document,
+                &next_constraints,
+                &mut seen_refs.clone(),
+                depth + 1,
+                true,
+                collector,
+            )?;
+            if collector.leaves.len() > GROK_SCHEMA_MAX_ROOT_LEAVES {
+                return Err("exceed the root branch budget");
+            }
+        }
+        return Ok(());
+    }
+
+    if !grok_schema_is_object_root(object) {
+        if inside_union && grok_schema_is_explicit_non_object(object) {
+            collector.changed = true;
+            return Ok(());
+        }
+        return Err("contain a root branch that is not provably an object");
+    }
+    let mut leaf = object.clone();
+    leaf.remove("$defs");
+    leaf.remove("definitions");
+    if leaf.get("type").and_then(Value::as_str) != Some("object") {
+        leaf.insert("type".to_string(), Value::String("object".to_string()));
+        collector.changed = true;
+    }
+    if !constraints.is_empty() {
+        let mut all_of = constraints
+            .iter()
+            .filter(|constraint| !constraint.is_empty())
+            .cloned()
+            .map(Value::Object)
+            .collect::<Vec<_>>();
+        all_of.push(Value::Object(leaf));
+        leaf = Map::from_iter([
+            ("type".to_string(), Value::String("object".to_string())),
+            ("allOf".to_string(), Value::Array(all_of)),
+        ]);
+        collector.changed = true;
+    }
+    collector.leaves.push(leaf);
+    Ok(())
+}
+
+fn grok_root_union(
+    object: &Map<String, Value>,
+) -> Result<Option<(&'static str, &[Value])>, &'static str> {
+    let any_of = object.get("anyOf");
+    let one_of = object.get("oneOf");
+    if any_of.is_some() && one_of.is_some() {
+        return Err("contain simultaneous anyOf and oneOf roots");
+    }
+    let (keyword, value) = if let Some(value) = any_of {
+        ("anyOf", value)
+    } else if let Some(value) = one_of {
+        ("oneOf", value)
+    } else {
+        return Ok(None);
+    };
+    let branches = value
+        .as_array()
+        .filter(|branches| !branches.is_empty())
+        .ok_or("contain an empty or malformed root union")?;
+    Ok(Some((keyword, branches)))
+}
+
+fn grok_root_sibling_constraint(
+    object: &Map<String, Value>,
+    excluded: &str,
+) -> Result<Map<String, Value>, &'static str> {
+    let mut constraint = Map::new();
+    for (key, value) in object {
+        if matches!(key.as_str(), "$defs" | "definitions") || key == excluded {
+            continue;
+        }
+        if matches!(key.as_str(), "anyOf" | "oneOf" | "$ref") {
+            return Err("contain conflicting root expressions");
+        }
+        if key == "type" && value.as_str() == Some("object") {
+            continue;
+        }
+        constraint.insert(key.clone(), value.clone());
+    }
+    Ok(constraint)
+}
+
+fn resolve_grok_local_ref<'a>(
+    document: &'a Map<String, Value>,
+    reference: &str,
+) -> Option<&'a Value> {
+    let mut current = document.get(reference.strip_prefix("#/")?.split('/').next()?)?;
+    for segment in reference.strip_prefix("#/")?.split('/').skip(1) {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        current = current.get(&segment)?;
+    }
+    Some(current)
+}
+
+fn grok_schema_is_object_root(object: &Map<String, Value>) -> bool {
+    match object.get("type") {
+        Some(Value::String(value)) => value == "object",
+        Some(Value::Array(values)) => {
+            values
+                .iter()
+                .all(|value| matches!(value.as_str(), Some("object" | "null")))
+                && values.iter().any(|value| value.as_str() == Some("object"))
+        }
+        Some(_) => false,
+        None => object.contains_key("properties") || object.contains_key("required"),
+    }
+}
+
+fn grok_schema_is_explicit_non_object(object: &Map<String, Value>) -> bool {
+    match object.get("type") {
+        Some(Value::String(value)) => value != "object",
+        Some(Value::Array(values)) => !values.iter().any(|value| value.as_str() == Some("object")),
+        _ => object.contains_key("const") || object.contains_key("enum"),
     }
 }
 
@@ -2351,6 +2614,84 @@ mod tests {
         inspector.push(Bytes::from(frame));
         assert!(!inspector.take_search_observation());
         assert_eq!(inspector.completed_search_count(), 1);
+    }
+
+    #[test]
+    fn grok_build_root_union_filters_only_explicit_non_object_branches() {
+        let schema = json!({
+            "title": "reference-22ac653a-72a3a347",
+            "anyOf": [
+                {"type":"null"},
+                {"type":"string"},
+                {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+            ]
+        });
+        let normalized = normalize_grok_build_parameters(&schema).unwrap();
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(
+            normalized["allOf"][0]["title"],
+            "reference-22ac653a-72a3a347"
+        );
+        assert_eq!(normalized["allOf"][1]["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn grok_build_root_union_resolves_deep_local_refs_without_erasing_defs() {
+        let schema = json!({
+            "$defs": {
+                "Create": {"oneOf": [
+                    {"$ref":"#/$defs/File"},
+                    {"type":"null"}
+                ]},
+                "File": {
+                    "type":"object",
+                    "properties": {
+                        "kind":{"const":"file"},
+                        "payload":{"$ref":"#/$defs/Payload"}
+                    },
+                    "required":["kind","payload"]
+                },
+                "Payload":{"type":"object","properties":{"text":{"type":"string"}}}
+            },
+            "$ref":"#/$defs/Create"
+        });
+        let normalized = normalize_grok_build_parameters(&schema).unwrap();
+        assert_eq!(normalized["type"], "object");
+        assert_eq!(normalized["properties"]["kind"]["const"], "file");
+        assert_eq!(
+            normalized["properties"]["payload"]["$ref"],
+            "#/$defs/Payload"
+        );
+        assert!(
+            normalized.get("$defs").is_some(),
+            "reference-5d19ccff keeps deep defs"
+        );
+    }
+
+    #[test]
+    fn grok_build_root_union_rejects_ambiguous_cycles_and_non_object_roots() {
+        for schema in [
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+            json!({"$defs":{"Loop":{"$ref":"#/$defs/Loop"}},"$ref":"#/$defs/Loop"}),
+            json!({"anyOf":[{"oneOf":[{"type":"object"}]}]}),
+            json!({"anyOf":[{"description":"not provably an object"},{"type":"object"}]}),
+        ] {
+            assert!(normalize_grok_build_parameters(&schema).is_err());
+        }
+    }
+
+    #[test]
+    fn grok_build_tool_sanitizer_fails_closed_instead_of_emitting_empty_schema() {
+        let mut body = json_body(json!({
+            "model":"grok-4.6",
+            "input":"ping",
+            "tools":[{"type":"function","name":"bad","parameters":{"oneOf":[{"type":"integer"}]}}]
+        }));
+        let error = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap_err();
+        assert!(error.is_protocol_incompatible());
+        assert!(error
+            .message
+            .contains("contain no provable object root branch"));
     }
 }
 

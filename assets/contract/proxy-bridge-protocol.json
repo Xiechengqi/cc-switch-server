@@ -13,7 +13,7 @@
     "rollbackEnvironmentVariable": "CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED",
     "downstreamCommitBoundary": "first_business_or_terminal_event",
     "lifecycleCommitsDownstream": false,
-    "providerFailureFailoverBoundary": "before_downstream_commit",
+    "providerFailureFailoverBoundary": "disabled_fixed_provider_binding",
     "clientFailurePolicy": "forward_without_provider_penalty",
     "incompletePolicy": "valid_partial_terminal"
   },
@@ -87,7 +87,7 @@
       "owner": "src/proxy/response_semantics.rs",
       "assertions": [
         "client validation failures are not provider failures",
-        "provider failures remain eligible for pre-commit failover"
+        "provider failures remain on the ingress-selected Provider and never trigger cross-Provider failover"
       ]
     },
     {

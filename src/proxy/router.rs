@@ -370,15 +370,24 @@ fn provider_account_usage_error(
         .unwrap_or(u64::MAX)
         .saturating_add(999)
         / 1_000;
+    let retry_after_seconds = retry_after_seconds.max(1);
+    // The router quotes this message verbatim in the dashboard's connection test
+    // and in its share logs, so it has to be legible on its own: the block's own
+    // scope names which cooldown fired, and the remaining seconds answer the only
+    // question the caller actually has. A bare epoch cannot do either.
     ProxyError::rate_limited(
         format!(
-            "provider {} account is {}: {} until {}",
+            "provider {} account is {} ({}): {}, retry in {}s (until {})",
             provider.provider.id,
             block.kind.availability(),
+            block.scope,
             block.reason,
-            block.until_ms,
+            retry_after_seconds,
+            chrono::DateTime::from_timestamp_millis(block.until_ms)
+                .map(|until| until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| block.until_ms.to_string()),
         ),
-        retry_after_seconds.max(1),
+        retry_after_seconds,
     )
 }
 
@@ -908,6 +917,18 @@ mod tests {
         let error = ensure_provider_account_usage_available(&provider, &accounts, now as u128)
             .expect_err("Kiro account cooldown must be enforced");
         assert_eq!(error.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        // The router surfaces this message to the share owner, so it has to name
+        // which cooldown fired and how long is left rather than a raw epoch.
+        assert!(
+            error.message.contains("(account_rate_limit)"),
+            "cooldown message must name its scope: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("retry in 60s"),
+            "cooldown message must carry the remaining seconds: {}",
+            error.message
+        );
     }
 
     #[test]

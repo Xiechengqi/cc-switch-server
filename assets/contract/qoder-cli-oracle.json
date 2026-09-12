@@ -947,6 +947,7 @@
   },
   "receiptSchema": {
     "requiredFields": [
+      "acceptanceChecks",
       "accountIdentityDigest",
       "authIdentityGeneration",
       "catalogSource",

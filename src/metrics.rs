@@ -56,6 +56,43 @@ pub fn record_forward_retry(app: &str, stage: &str, source: &str) {
     .increment(1);
 }
 
+pub fn record_recovery_decision(
+    provider_type: &'static str,
+    stage: &'static str,
+    commit_state: &'static str,
+    decision: &'static str,
+    delay_source: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_recovery_decision_total",
+        "provider_type" => provider_type,
+        "stage" => stage,
+        "commit_state" => commit_state,
+        "decision" => decision,
+        "delay_source" => delay_source
+    )
+    .increment(1);
+}
+
+pub fn record_server_sqlite_commit(
+    domain: &'static str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+) {
+    metrics::counter!(
+        "cc_switch_server_sqlite_commits_total",
+        "domain" => domain,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "cc_switch_server_sqlite_commit_duration_seconds",
+        "domain" => domain,
+        "outcome" => outcome
+    )
+    .record(elapsed.as_secs_f64());
+}
+
 pub fn record_codex_websocket_cache(result: &'static str) {
     metrics::counter!(
         "cc_switch_codex_websocket_cache_total",
@@ -514,6 +551,59 @@ pub fn record_kimi_thinking_replay(outcome: &'static str, count: u64) {
     .increment(count);
 }
 
+pub fn record_antigravity_reasoning_replay(outcome: &'static str, count: u64) {
+    metrics::counter!(
+        "cc_switch_antigravity_reasoning_replay_total",
+        "outcome" => outcome
+    )
+    .increment(count);
+}
+
+pub fn record_grok_reasoning_replay(outcome: &'static str, count: u64) {
+    metrics::counter!(
+        "cc_switch_grok_reasoning_replay_total",
+        "outcome" => outcome
+    )
+    .increment(count);
+}
+
+pub fn record_kiro_prompt_cache_decision(decision: &'static str) {
+    metrics::counter!(
+        "cc_switch_kiro_prompt_cache_decisions_total",
+        "decision" => decision
+    )
+    .increment(1);
+}
+
+pub fn record_kiro_prompt_cache_persistence(event: &'static str) {
+    metrics::counter!(
+        "cc_switch_kiro_prompt_cache_persistence_total",
+        "event" => event
+    )
+    .increment(1);
+}
+
+pub fn set_kiro_prompt_cache_entries(entries: usize) {
+    metrics::gauge!("cc_switch_kiro_prompt_cache_entries").set(entries as f64);
+}
+
+pub fn set_kiro_prompt_cache_persistence_degraded(degraded: bool) {
+    metrics::gauge!("cc_switch_kiro_prompt_cache_persistence_degraded").set(if degraded {
+        1.0
+    } else {
+        0.0
+    });
+}
+
+pub fn record_antigravity_transport(mode: &'static str, event: &'static str) {
+    metrics::counter!(
+        "cc_switch_antigravity_transport_total",
+        "mode" => mode,
+        "event" => event
+    )
+    .increment(1);
+}
+
 pub fn record_proxy_semantic_guard(surface: &'static str, observation: &'static str) {
     metrics::counter!(
         "cc_switch_proxy_semantic_guard_total",
@@ -535,6 +625,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_forward_retry_total",
         "Protocol-safe transparent forwarding retries by application, stage, and source"
+    );
+    metrics::describe_counter!(
+        "cc_switch_recovery_decision_total",
+        "Bounded transparent recovery decisions without tenant or request identifiers"
     );
     metrics::describe_counter!(
         "cc_switch_codex_websocket_cache_total",
@@ -709,12 +803,48 @@ fn describe() {
         "Kimi signed-thinking replay cache outcomes without tenant identifiers"
     );
     metrics::describe_counter!(
+        "cc_switch_antigravity_reasoning_replay_total",
+        "Antigravity opaque reasoning replay outcomes without tenant identifiers"
+    );
+    metrics::describe_counter!(
+        "cc_switch_grok_reasoning_replay_total",
+        "Grok opaque reasoning replay outcomes without tenant identifiers"
+    );
+    metrics::describe_counter!(
+        "cc_switch_kiro_prompt_cache_decisions_total",
+        "Kiro local prompt-cache estimate decisions and fail-closed reasons"
+    );
+    metrics::describe_counter!(
+        "cc_switch_kiro_prompt_cache_persistence_total",
+        "Kiro prompt-cache SQLite writer outcomes"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_kiro_prompt_cache_entries",
+        "Current bounded Kiro prompt-cache entries"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_kiro_prompt_cache_persistence_degraded",
+        "Whether Kiro prompt-cache durability is currently degraded"
+    );
+    metrics::describe_counter!(
+        "cc_switch_antigravity_transport_total",
+        "Antigravity HTTP/1.1 short-connection and credential-scoped pool outcomes"
+    );
+    metrics::describe_counter!(
         "cc_switch_proxy_semantic_guard_total",
         "Bounded Responses semantic classifications at downstream commit boundaries"
     );
     metrics::describe_counter!(
         "cc_switch_responses_sse_transport_total",
         "Bounded OpenAI Responses SSE normalization and liveness classifications"
+    );
+    metrics::describe_counter!(
+        "cc_switch_server_sqlite_commits_total",
+        "Committed Server SQLite repository writes by bounded domain and outcome"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_server_sqlite_commit_duration_seconds",
+        "Server SQLite repository commit and checkpoint latency"
     );
 }
 
@@ -730,12 +860,20 @@ mod tests {
             "claude_oauth",
             crate::domain::health::ProviderRequestOutcome::Success { status_code: 200 },
         );
+        super::record_recovery_decision(
+            "codex_oauth",
+            "auth",
+            "pre_commit",
+            "reserved",
+            "immediate",
+        );
 
         let output = super::render();
         assert!(output.contains("cc_switch_account_warm_refresh_total"));
         assert!(output.contains("provider_type=\"claude_oauth\""));
         assert!(output.contains("cc_switch_account_inflight{provider_type=\"claude_oauth\"} 2"));
         assert!(output.contains("cc_switch_provider_outcome_total"));
+        assert!(output.contains("cc_switch_recovery_decision_total"));
         for forbidden_label in ["account_id=", "provider_id=", "request_id="] {
             assert!(
                 !output.contains(forbidden_label),

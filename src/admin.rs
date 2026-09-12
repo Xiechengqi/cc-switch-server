@@ -36,6 +36,167 @@ pub fn run_config_command(cli: &Cli, command: ConfigCommand) -> anyhow::Result<(
             rollback,
             cleanup_snapshot,
         } => migrate_provider_store(cli, apply, rollback, cleanup_snapshot),
+        ConfigCommand::MigrateServerStore {
+            apply,
+            rollback_export,
+        } => migrate_server_store(cli, apply, rollback_export),
+    }
+}
+
+fn migrate_server_store(
+    cli: &Cli,
+    apply: bool,
+    rollback_export: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let result = migrate_server_store_result(cli, apply, rollback_export)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn migrate_server_store_result(
+    cli: &Cli,
+    apply: bool,
+    rollback_export: Option<PathBuf>,
+) -> anyhow::Result<serde_json::Value> {
+    let config_dir = cli.resolved_config_dir()?;
+    let _data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+    let marker_before = crate::repository::server_sqlite::read_marker(&config_dir)?;
+
+    if let Some(destination) = rollback_export {
+        let marker = marker_before
+            .as_ref()
+            .context("rollback export requires a committed Server SQLite authority")?;
+        anyhow::ensure!(
+            marker.authority == crate::repository::server_sqlite::AuthorityState::Committed,
+            "rollback export requires a committed Server SQLite authority"
+        );
+        crate::repository::server_sqlite::validate_backup_pair(&config_dir)
+            .context("validate committed Server SQLite authority before rollback export")?;
+        let exported_files =
+            crate::repository::server_sqlite::export_legacy(&config_dir, &destination)?;
+        return Ok(serde_json::json!({
+            "ok": true,
+            "action": "rollback_export",
+            "authority": "committed",
+            "destination": destination,
+            "exportedFiles": exported_files,
+            "requiresServerStopped": true,
+        }));
+    }
+
+    if !apply {
+        let authority = marker_before
+            .as_ref()
+            .map(|marker| server_store_authority_label(marker.authority))
+            .unwrap_or("legacy");
+        if let Some(marker) = marker_before.as_ref() {
+            if marker.authority == crate::repository::server_sqlite::AuthorityState::Committed {
+                crate::repository::server_sqlite::validate_backup_pair(&config_dir)
+                    .context("validate committed Server SQLite authority")?;
+            } else {
+                let stores = load_legacy_server_stores(&config_dir)?;
+                crate::repository::server_sqlite::verify_shadow(
+                    &config_dir,
+                    crate::repository::server_sqlite::ShadowImportInput {
+                        providers: &stores.providers,
+                        accounts: &stores.accounts,
+                        shares: &stores.shares,
+                        usage: &stores.usage,
+                    },
+                )
+                .context("validate Server SQLite shadow")?;
+            }
+        } else {
+            let _ = load_legacy_server_stores(&config_dir)?;
+        }
+        return Ok(serde_json::json!({
+            "ok": true,
+            "action": "preflight",
+            "authority": authority,
+            "shadowPresent": marker_before.is_some(),
+            "readyToApply": true,
+            "changed": false,
+            "requiresServerStopped": true,
+        }));
+    }
+
+    let shadow_report = match marker_before.as_ref().map(|marker| marker.authority) {
+        Some(crate::repository::server_sqlite::AuthorityState::Prepared)
+        | Some(crate::repository::server_sqlite::AuthorityState::Committed) => None,
+        _ => {
+            let stores = load_legacy_server_stores(&config_dir)?;
+            Some(crate::repository::server_sqlite::ensure_shadow(
+                &config_dir,
+                crate::repository::server_sqlite::ShadowImportInput {
+                    providers: &stores.providers,
+                    accounts: &stores.accounts,
+                    shares: &stores.shares,
+                    usage: &stores.usage,
+                },
+            )?)
+        }
+    };
+    let marker = crate::repository::server_sqlite::activate_authority(&config_dir)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "action": "apply",
+        "authorityBefore": marker_before
+            .as_ref()
+            .map(|value| server_store_authority_label(value.authority))
+            .unwrap_or("legacy"),
+        "authorityAfter": server_store_authority_label(marker.authority),
+        "changed": marker_before.as_ref().is_none_or(|value| {
+            value.authority != crate::repository::server_sqlite::AuthorityState::Committed
+        }),
+        "sourceDigest": marker.source_digest,
+        "legacyBackupDir": marker.legacy_backup_dir,
+        "shadow": shadow_report.map(|report| serde_json::json!({
+            "providers": report.provider_count,
+            "accounts": report.account_count,
+            "shares": report.share_count,
+            "usage": report.usage_count,
+            "sourceFiles": report.source_file_count,
+            "credentialsVerified": report.credentials_verified,
+        })),
+    }))
+}
+
+struct LegacyServerStores {
+    providers: ProviderStore,
+    accounts: AccountStore,
+    shares: ShareStore,
+    usage: UsageStore,
+}
+
+fn load_legacy_server_stores(config_dir: &Path) -> anyhow::Result<LegacyServerStores> {
+    let providers = ProviderStore::load_runtime_or_default(config_dir)?;
+    let accounts = AccountStore::load_or_default(config_dir)?;
+    let shares = ShareStore::load_or_default(config_dir)?;
+    let usage = UsageStore::load_read_only(config_dir)?;
+    if let Some(error) =
+        crate::domain::sharing::subscription_identity::subscription_reference_graph_errors(
+            &providers, &accounts, &shares,
+        )
+        .into_iter()
+        .next()
+    {
+        anyhow::bail!("invalid subscription reference graph: {error}");
+    }
+    Ok(LegacyServerStores {
+        providers,
+        accounts,
+        shares,
+        usage,
+    })
+}
+
+fn server_store_authority_label(
+    authority: crate::repository::server_sqlite::AuthorityState,
+) -> &'static str {
+    match authority {
+        crate::repository::server_sqlite::AuthorityState::ShadowVerified => "shadow_verified",
+        crate::repository::server_sqlite::AuthorityState::Prepared => "prepared",
+        crate::repository::server_sqlite::AuthorityState::Committed => "committed",
     }
 }
 
@@ -915,6 +1076,37 @@ mod tests {
         fs::remove_dir_all(config_dir).unwrap();
 
         assert!(error.contains("parse providers"));
+    }
+
+    #[test]
+    fn server_store_cli_preflights_applies_idempotently_and_exports_legacy() {
+        let config_dir = temp_config_dir("server-store-migration");
+        let export_dir = config_dir.with_extension("legacy-export");
+        let cli = test_cli(config_dir.clone());
+
+        let preview = migrate_server_store_result(&cli, false, None).unwrap();
+        assert_eq!(preview["authority"], "legacy");
+        assert_eq!(preview["changed"], false);
+        assert!(!crate::repository::server_sqlite::database_path(&config_dir).exists());
+        assert!(!crate::repository::server_sqlite::marker_path(&config_dir).exists());
+
+        let applied = migrate_server_store_result(&cli, true, None).unwrap();
+        assert_eq!(applied["authorityAfter"], "committed");
+        assert_eq!(applied["changed"], true);
+        assert!(crate::repository::server_sqlite::is_committed(&config_dir).unwrap());
+
+        let repeated = migrate_server_store_result(&cli, true, None).unwrap();
+        assert_eq!(repeated["authorityAfter"], "committed");
+        assert_eq!(repeated["changed"], false);
+
+        let exported = migrate_server_store_result(&cli, false, Some(export_dir.clone())).unwrap();
+        assert_eq!(exported["action"], "rollback_export");
+        assert_eq!(exported["authority"], "committed");
+        assert!(export_dir.is_dir());
+        UsageStore::load_read_only(&export_dir).unwrap();
+
+        fs::remove_dir_all(config_dir).unwrap();
+        fs::remove_dir_all(export_dir).unwrap();
     }
 
     #[test]

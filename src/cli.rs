@@ -139,6 +139,15 @@ pub enum ConfigCommand {
         #[arg(long, conflicts_with_all = ["apply", "rollback"])]
         cleanup_snapshot: bool,
     },
+    /// Preview, apply, or export a rollback snapshot for the Server SQLite store.
+    MigrateServerStore {
+        /// Promote the verified SQLite shadow to the sole authority.
+        #[arg(long, conflicts_with = "rollback_export")]
+        apply: bool,
+        /// Export the committed SQLite authority to a new legacy-format directory.
+        #[arg(long, value_name = "DIRECTORY", conflicts_with = "apply")]
+        rollback_export: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -310,6 +319,63 @@ mod tests {
                 command: ConfigCommand::MigrateProviderStore { rollback: true, .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_server_store_migration_actions() {
+        let preview =
+            Cli::try_parse_from(["cc-switch-server", "config", "migrate-server-store"]).unwrap();
+        assert!(matches!(
+            preview.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateServerStore {
+                    apply: false,
+                    rollback_export: None,
+                }
+            }
+        ));
+
+        let apply = Cli::try_parse_from([
+            "cc-switch-server",
+            "config",
+            "migrate-server-store",
+            "--apply",
+        ])
+        .unwrap();
+        assert!(matches!(
+            apply.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateServerStore { apply: true, .. }
+            }
+        ));
+
+        let export = Cli::try_parse_from([
+            "cc-switch-server",
+            "config",
+            "migrate-server-store",
+            "--rollback-export",
+            "/tmp/cc-switch-server-legacy-export",
+        ])
+        .unwrap();
+        assert!(matches!(
+            export.effective_command(),
+            Command::Config {
+                command: ConfigCommand::MigrateServerStore {
+                    rollback_export: Some(path),
+                    ..
+                }
+            } if path == std::path::Path::new("/tmp/cc-switch-server-legacy-export")
+        ));
+
+        assert!(Cli::try_parse_from([
+            "cc-switch-server",
+            "config",
+            "migrate-server-store",
+            "--apply",
+            "--rollback-export",
+            "/tmp/cc-switch-server-legacy-export",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -1420,12 +1420,10 @@ async fn web_invoke_dispatch(
             Ok(json!({ "empty": true }))
         }
         "webdav_sync_upload" | "s3_sync_upload" => {
-            let backup = crate::infra::backup::create_backup(
-                &state.config_dir,
-                &crate::state::backup_targets(&state.config_dir),
-                Some("cloud-sync-upload".to_string()),
-            )
-            .map_err(ApiError::internal)?;
+            let backup = state
+                .create_consistent_backup(Some("cloud-sync-upload".to_string()))
+                .await
+                .map_err(ApiError::internal)?;
             Ok(json!({ "status": format!("uploaded:{}", backup.id) }))
         }
         "webdav_sync_download" | "s3_sync_download" => {

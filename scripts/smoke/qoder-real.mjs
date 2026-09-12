@@ -730,13 +730,33 @@ async function main() {
     fail("Qoder Account identity or credential generation drifted during acceptance");
   }
 
-  const verificationState = fixtureMode ? "contract_verified" : "live_verified";
-  const liveState = fixtureMode ? "live_pending" : "live_verified";
+  // This harness observes the happy-path data plane. Login/import, credential
+  // rotation, authoritative-empty discovery, and controlled 401 scenarios are
+  // separate destructive/manual gates, so this receipt must never promote the
+  // whole rail by itself.
+  const verificationState = fixtureMode ? "contract_verified" : "partial_live_verified";
+  const liveState = "live_pending";
   const receipt = {
     schemaVersion: 1,
     providerType: "qoder_cosy",
     verificationState,
     liveState,
+    acceptanceChecks: {
+      login_or_pat_import: "not_observed",
+      refresh_rotation_or_job_token_exchange: "not_observed",
+      fresh_catalog: "pass",
+      authoritative_empty_catalog: "not_observed",
+      quota: "pass",
+      claude_nonstream_stream_tool_usage: "pass",
+      codex_nonstream_stream_tool_usage: "pass",
+      gemini_nonstream_stream_tool_usage: "pass",
+      same_account_first_401_recovery: "not_observed",
+      second_401_terminal: "not_observed",
+      unique_terminal_then_eof: "pass",
+      three_decoy_zero_request_counts: "binding_only",
+      site_rail_and_generation_digest: "pass",
+      secret_scan: "pass",
+    },
     accountIdentityDigest: digest("cc-switch-server:qoder-account:v1", {
       id: finalAccount.id,
       site: spec.site,

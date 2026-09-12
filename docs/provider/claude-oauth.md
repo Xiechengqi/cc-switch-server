@@ -91,6 +91,12 @@ Messages beta 由确定顺序的 capability engine 生成，未知客户端 beta
 
 cache-control pass 在 CCH 前全局扫描 tools、system 和 messages，规范化 TTL/order、最多保留 4 个 breakpoint，并优先保留最后 tool、最后 system 和最近 message marker；重复执行幂等。forced `tool_choice` 会同步移除不兼容的 thinking/context-management。可用 `CC_SWITCH_CLAUDE_CACHE_REWRITE=disabled` 关闭该 pass。
 
+请求类别 cache matrix 进一步区分 main、subagent、probe/title helper、native helper 与 `count_tokens`：main native 保留 extended profile；subagent 默认回到 5m，但 body/header 明确请求 1h 时保留；probe/helper 总是抑制 1h；`count_tokens` 不发 generation-only extended TTL。判断只扫描受支持的 cache-control 位置，不把历史正文中的任意同名字段当成 TTL 请求。
+
+OpenAI Chat/Responses 转 Claude 时，只有 `response_format=json_object|json_schema` 或 Responses `text.format` 会加入 Claude-scoped structured-output system instruction，并保留已有 operator instructions；普通 text 请求不改写。OpenAI Chat 流转 Anthropic 时，tool/text/reasoning block 采用严格单开块状态机，交错内容与后续 tool 在当前 tool 结束后按序释放。Claude 流转 OpenAI Chat 时，usage 从 `message_start` 与多个 `message_delta` 按字段合并；原始下游明确 `stream_options.include_usage=true` 才在 finish 后、`[DONE]` 前得到唯一 `choices: []` usage tail，显式零和 cache read/write 均保留。失败前局部 usage 仍由 server-side accumulator 写入失败记录，不重复计费。
+
+helper request ID 遵循真实上游 base：`api.anthropic.com` 缺值时生成 UUID v4；自定义 base 只转发 confirmed helper 已携带的 `x-client-request-id`，不合成 first-party 指纹。上述差异由 `assets/contract/claude-reference-delta.json` 与 `scripts/audit/audit-claude-reference-delta.mjs` 定期审计；外部 checkout 仅是可选只读证据，真实账号验收继续为 `live_pending`。
+
 ## 凭据形态与可选隐私增强
 
 Claude 凭据显式区分 `refreshable_oauth` 与 `access_only_setup_token`。OAuth exchange 只有在 scope 明确包含 `user:inference` 且不含 profile/office scope 时，才允许缺失 refresh token；该 scope 会在任何 bootstrap/profile 请求之前识别并直接跳过无权访问的 enrichment。手工 credentials import 则由 access-only 凭据拓扑标记 setup-token。setup-token 不进入 refresh，profile/quota 403 只降低 enrichment，不阻断 inference；缺失账号 UUID 时使用带域分离的 credential digest 生成不可逆内部 ID。过期后直接要求重新导入，不形成 refresh loop。可用 `CC_SWITCH_CLAUDE_SETUP_TOKEN=disabled` 关闭 access-only exchange/import 入口，标准 refreshable OAuth 不受影响。

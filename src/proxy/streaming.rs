@@ -51,12 +51,14 @@ pub struct StreamUsageAccumulator {
     usage: TokenUsage,
     input_semantics: InputTokenSemantics,
     parse_error: bool,
+    usage_estimated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct StreamUsageResult {
     pub usage: TokenUsage,
     pub parse_error: bool,
+    pub usage_estimated: bool,
 }
 
 #[derive(Debug)]
@@ -455,6 +457,7 @@ impl StreamUsageAccumulator {
             usage: TokenUsage::default(),
             input_semantics,
             parse_error: false,
+            usage_estimated: false,
         }
     }
 
@@ -474,6 +477,10 @@ impl StreamUsageAccumulator {
         self.finish_with_status().usage
     }
 
+    pub fn mark_estimated(&mut self) {
+        self.usage_estimated = true;
+    }
+
     pub fn finish_with_status(mut self) -> StreamUsageResult {
         match self.decoder.finish() {
             Ok(events) => self.merge_events(events),
@@ -485,6 +492,7 @@ impl StreamUsageAccumulator {
         StreamUsageResult {
             usage: self.usage,
             parse_error: self.parse_error,
+            usage_estimated: self.usage_estimated,
         }
     }
 
@@ -493,6 +501,7 @@ impl StreamUsageAccumulator {
             merge_usage(
                 &mut self.usage,
                 usage_from_json_with_semantics(&event.value, self.input_semantics),
+                self.input_semantics,
             );
         }
     }
@@ -934,7 +943,7 @@ fn stream_terminal_error(value: &Value) -> ResponsesSseAggregationError {
     )
 }
 
-fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
+fn merge_usage(target: &mut TokenUsage, next: TokenUsage, input_semantics: InputTokenSemantics) {
     let next_has_raw_input = next.raw_input_tokens.is_some();
     let next_has_input = next.input_tokens.is_some();
     let next_has_cache = next.cache_read_tokens.is_some() || next.cache_creation_tokens.is_some();
@@ -957,7 +966,7 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
     if next.credit_usage.is_some() {
         target.credit_usage = next.credit_usage;
     }
-    if !next_has_raw_input && next_has_cache {
+    if input_semantics != InputTokenSemantics::Exclusive && !next_has_raw_input && next_has_cache {
         if let Some(raw_input_tokens) = target.raw_input_tokens {
             target.input_tokens = Some(
                 raw_input_tokens
@@ -990,11 +999,43 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage) {
                 .saturating_add(target.output_tokens.unwrap_or(0)),
         );
     }
+    if input_semantics == InputTokenSemantics::Exclusive
+        && (next_has_input || next_has_cache || next_has_output)
+    {
+        if target.input_tokens.is_some()
+            || target.cache_read_tokens.is_some()
+            || target.cache_creation_tokens.is_some()
+        {
+            target.raw_input_tokens = Some(
+                target
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(target.cache_read_tokens.unwrap_or(0))
+                    .saturating_add(target.cache_creation_tokens.unwrap_or(0)),
+            );
+        }
+        if target.raw_input_tokens.is_some() || target.output_tokens.is_some() {
+            target.total_tokens = Some(
+                target
+                    .raw_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(target.output_tokens.unwrap_or(0)),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_usage_estimate_provenance_survives_finish() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.mark_estimated();
+        let result = accumulator.finish_with_status();
+        assert!(result.usage_estimated);
+    }
     use serde_json::json;
 
     #[test]
@@ -1115,6 +1156,35 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         assert_eq!(usage.raw_input_tokens, Some(16));
         assert_eq!(usage.cache_read_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(16));
+    }
+
+    #[test]
+    fn claude_partial_usage_survives_failure_without_duplicate_billing() {
+        let mut parser = StreamUsageAccumulator::new(InputTokenSemantics::Exclusive);
+        parser.push(
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"cache_creation_input_tokens\":4}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":2}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"
+            )
+            .as_bytes(),
+        );
+        let result = parser.finish_with_status();
+
+        assert!(!result.parse_error);
+        assert_eq!(result.usage.input_tokens, Some(3));
+        assert_eq!(result.usage.cache_read_tokens, Some(0));
+        assert_eq!(result.usage.cache_creation_tokens, Some(4));
+        assert_eq!(result.usage.output_tokens, Some(5));
+        assert_eq!(result.usage.raw_input_tokens, Some(7));
+        assert_eq!(result.usage.total_tokens, Some(12));
     }
 
     #[test]

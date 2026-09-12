@@ -19,11 +19,17 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
-    sync::{LazyLock, Mutex},
+    sync::OnceLock,
     time::Duration,
 };
 
 use tool_bridge::ToolCompatibilityMode;
+
+#[cfg(test)]
+use crate::proxy::kiro_prompt_cache::{
+    CACHE_CAPACITY as PROMPT_CACHE_CAPACITY, DEFAULT_TTL_SECS as PROMPT_CACHE_DEFAULT_TTL_SECS,
+    MAX_TTL_SECS as PROMPT_CACHE_MAX_TTL_SECS,
+};
 
 const DEFAULT_SYSTEM_VERSION: &str = "macos";
 const TOOL_NAME_MAX_LEN: usize = 63;
@@ -33,9 +39,6 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 const SYSTEM_CHUNKED_POLICY: &str = "When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.";
 const ACCOUNT_THROTTLE_COOLDOWN_SECS: i64 = 30 * 60;
 const QUOTA_EXHAUSTED_COOLDOWN_SECS: i64 = 24 * 60 * 60;
-const PROMPT_CACHE_CAPACITY: usize = 4096;
-const PROMPT_CACHE_DEFAULT_TTL_SECS: i64 = 5 * 60;
-const PROMPT_CACHE_MAX_TTL_SECS: i64 = 60 * 60;
 const THINKING_SIGNATURE_FALLBACK: &str = "cc-switch-kiro-thinking-signature";
 
 #[cfg(test)]
@@ -63,13 +66,22 @@ pub(crate) fn fixture_event_frame(event_type: &str, payload: &Value) -> Vec<u8> 
     frame
 }
 
-static KIRO_PROMPT_CACHE: LazyLock<KiroPromptCache> = LazyLock::new(|| {
-    let path = std::env::var_os("CC_SWITCH_KIRO_PROMPT_CACHE_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    KiroPromptCache::new(path)
-});
+static KIRO_PROMPT_CACHE: OnceLock<crate::proxy::kiro_prompt_cache::KiroPromptCache> =
+    OnceLock::new();
 static KIRO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn kiro_prompt_cache() -> &'static crate::proxy::kiro_prompt_cache::KiroPromptCache {
+    KIRO_PROMPT_CACHE.get_or_init(|| {
+        let path = std::env::var_os("CC_SWITCH_KIRO_PROMPT_CACHE_PATH")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        crate::proxy::kiro_prompt_cache::KiroPromptCache::new(path)
+    })
+}
+
+pub(crate) fn shutdown_prompt_cache() {
+    crate::proxy::kiro_prompt_cache::shutdown_global(KIRO_PROMPT_CACHE.get());
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct KiroAccountData {
@@ -129,15 +141,30 @@ pub(crate) struct KiroCallContext {
 
 impl KiroCallContext {
     fn fallback(account: &Account, body: &Value) -> Self {
+        let runtime_region =
+            crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
+                .ok()
+                .map(|identity| identity.runtime_region)
+                .unwrap_or_else(|| "unresolved".to_string());
+        let session = cache_scope_seed(body);
         Self {
             ide_version: endpoint::FALLBACK_IDE_VERSION.to_string(),
             claude_code_tools: false,
-            cache_namespace: format!(
-                "account:{}:generation:{}:session:{}",
-                account.id,
-                account.auth_identity_generation,
-                cache_scope_seed(body)
-            ),
+            cache_namespace: crate::proxy::kiro_prompt_cache::PromptCacheScope {
+                app: "direct",
+                provider_id: account.provider_type.as_str(),
+                provider_revision: 0,
+                runtime_fingerprint: "direct",
+                account_id: &account.id,
+                auth_identity_generation: account.auth_identity_generation,
+                token_refresh_generation: account.token_refresh_generation,
+                share_id: "direct",
+                signed_user: "anonymous",
+                route: "direct",
+                runtime_region: &runtime_region,
+                session: &session,
+            }
+            .namespace(),
             catalog_model_id: None,
             catalog_max_input_tokens: None,
             session_id: None,
@@ -1529,6 +1556,26 @@ fn canonical_tool_input(input: &Value) -> String {
     serde_json::to_string(&canonical_prompt_cache_value(input)).unwrap_or_default()
 }
 
+fn canonical_prompt_cache_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                if key != "cache_control" {
+                    canonical.insert(key.clone(), canonical_prompt_cache_value(&object[key]));
+                }
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(canonical_prompt_cache_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 #[derive(Default)]
 struct SseBuilder {
     message_id: String,
@@ -2580,146 +2627,14 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
     }))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct KiroPromptCacheUsage {
-    cache_read_tokens: i32,
-    cache_creation_tokens: i32,
-}
-
-#[derive(Debug, Clone)]
-struct KiroPromptCacheSegment {
-    hash: u64,
-    cumulative_tokens: u32,
-    ttl_secs: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct KiroPromptCacheEntry {
-    tokens: u32,
-    expires_at: i64,
-    last_hit_at: i64,
-}
-
-struct KiroPromptCache {
-    entries: Mutex<HashMap<u64, KiroPromptCacheEntry>>,
-    persist_path: Option<PathBuf>,
-}
-
-impl KiroPromptCache {
-    fn new(persist_path: Option<PathBuf>) -> Self {
-        let entries = persist_path
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| {
-                serde_json::from_slice::<HashMap<u64, KiroPromptCacheEntry>>(&bytes).ok()
-            })
-            .map(|entries| {
-                let now = unix_timestamp_secs();
-                entries
-                    .into_iter()
-                    .filter(|(_, entry)| entry.expires_at > now)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            entries: Mutex::new(entries),
-            persist_path,
-        }
-    }
-
-    fn compute_usage(&self, segments: &[KiroPromptCacheSegment]) -> KiroPromptCacheUsage {
-        if segments.is_empty() {
-            return KiroPromptCacheUsage::default();
-        }
-
-        let now = unix_timestamp_secs();
-        let mut entries = self.entries.lock().unwrap_or_else(|err| err.into_inner());
-        entries.retain(|_, entry| entry.expires_at > now);
-
-        let deepest_hit = segments
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, segment)| {
-                entries.get_mut(&segment.hash).and_then(|entry| {
-                    if entry.expires_at > now {
-                        entry.last_hit_at = now;
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-            });
-
-        let total = segments
-            .last()
-            .map(|segment| segment.cumulative_tokens)
-            .unwrap_or(0);
-        let (cache_creation_tokens, cache_read_tokens) = match deepest_hit {
-            Some(idx) => (
-                total.saturating_sub(segments[idx].cumulative_tokens),
-                segments[idx].cumulative_tokens,
-            ),
-            None => (total, 0),
-        };
-
-        for segment in segments {
-            entries.insert(
-                segment.hash,
-                KiroPromptCacheEntry {
-                    tokens: segment.cumulative_tokens,
-                    expires_at: now + segment.ttl_secs.clamp(60, PROMPT_CACHE_MAX_TTL_SECS),
-                    last_hit_at: now,
-                },
-            );
-        }
-        if entries.len() > PROMPT_CACHE_CAPACITY {
-            let drop_count = entries.len() - PROMPT_CACHE_CAPACITY;
-            let mut victims = entries
-                .iter()
-                .map(|(hash, entry)| (*hash, entry.last_hit_at))
-                .collect::<Vec<_>>();
-            victims.sort_by_key(|(_, last_hit_at)| *last_hit_at);
-            for (hash, _) in victims.into_iter().take(drop_count) {
-                entries.remove(&hash);
-            }
-        }
-
-        let snapshot = entries.clone();
-        drop(entries);
-        self.flush_snapshot(snapshot);
-
-        KiroPromptCacheUsage {
-            cache_read_tokens: cache_read_tokens as i32,
-            cache_creation_tokens: cache_creation_tokens as i32,
-        }
-    }
-
-    fn flush_snapshot(&self, snapshot: HashMap<u64, KiroPromptCacheEntry>) {
-        let Some(path) = self.persist_path.as_ref() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                tracing::warn!("Kiro PromptCache 创建目录失败 {}: {err}", parent.display());
-                return;
-            }
-        }
-        match serde_json::to_vec(&snapshot) {
-            Ok(bytes) => {
-                if let Err(err) = std::fs::write(path, bytes) {
-                    tracing::warn!("Kiro PromptCache 写入失败 {}: {err}", path.display());
-                }
-            }
-            Err(err) => tracing::warn!("Kiro PromptCache 序列化失败: {err}"),
-        }
-    }
-}
+type KiroPromptCacheUsage = crate::proxy::kiro_prompt_cache::PromptCacheUsage;
+type KiroPromptCache = crate::proxy::kiro_prompt_cache::KiroPromptCache;
 
 fn compute_kiro_prompt_cache_usage(body: &Value, cache_namespace: &str) -> KiroPromptCacheUsage {
-    compute_kiro_prompt_cache_usage_scoped_with_cache(body, cache_namespace, &KIRO_PROMPT_CACHE)
+    kiro_prompt_cache().compute_usage(body, cache_namespace)
 }
 
+#[cfg(test)]
 fn compute_kiro_prompt_cache_usage_with_cache(
     body: &Value,
     cache: &KiroPromptCache,
@@ -2727,166 +2642,13 @@ fn compute_kiro_prompt_cache_usage_with_cache(
     compute_kiro_prompt_cache_usage_scoped_with_cache(body, "test", cache)
 }
 
+#[cfg(test)]
 fn compute_kiro_prompt_cache_usage_scoped_with_cache(
     body: &Value,
     cache_namespace: &str,
     cache: &KiroPromptCache,
 ) -> KiroPromptCacheUsage {
-    let segments = extract_kiro_prompt_cache_segments(body, cache_namespace);
-    cache.compute_usage(&segments)
-}
-
-fn extract_kiro_prompt_cache_segments(
-    body: &Value,
-    cache_namespace: &str,
-) -> Vec<KiroPromptCacheSegment> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"cc-switch-kiro-cache-v2\0");
-    hasher.update(cache_namespace.as_bytes());
-    hasher.update(b"\0");
-    let mut cumulative_tokens = 0u32;
-    let mut segments = Vec::new();
-
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        for tool in tools {
-            feed_prompt_cache_value(&mut hasher, tool, &mut cumulative_tokens);
-            if let Some(cache_control) = tool.get("cache_control") {
-                commit_prompt_cache_segment(
-                    &hasher,
-                    cumulative_tokens,
-                    cache_control,
-                    &mut segments,
-                );
-            }
-        }
-    }
-
-    match body.get("system") {
-        Some(Value::String(system)) => {
-            feed_prompt_cache_text(&mut hasher, system, &mut cumulative_tokens)
-        }
-        Some(Value::Array(items)) => {
-            for item in items {
-                feed_prompt_cache_value(&mut hasher, item, &mut cumulative_tokens);
-                if let Some(cache_control) = item.get("cache_control") {
-                    commit_prompt_cache_segment(
-                        &hasher,
-                        cumulative_tokens,
-                        cache_control,
-                        &mut segments,
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-
-    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
-        for message in messages {
-            if let Some(role) = message.get("role").and_then(Value::as_str) {
-                feed_prompt_cache_text(&mut hasher, role, &mut cumulative_tokens);
-            }
-            match message.get("content") {
-                Some(Value::String(text)) => {
-                    feed_prompt_cache_text(&mut hasher, text, &mut cumulative_tokens);
-                }
-                Some(Value::Array(blocks)) => {
-                    for block in blocks {
-                        feed_prompt_cache_value(&mut hasher, block, &mut cumulative_tokens);
-                        if let Some(cache_control) = block.get("cache_control") {
-                            commit_prompt_cache_segment(
-                                &hasher,
-                                cumulative_tokens,
-                                cache_control,
-                                &mut segments,
-                            );
-                        }
-                    }
-                }
-                Some(other) => feed_prompt_cache_value(&mut hasher, other, &mut cumulative_tokens),
-                None => {}
-            }
-            if let Some(cache_control) = message.get("cache_control") {
-                commit_prompt_cache_segment(
-                    &hasher,
-                    cumulative_tokens,
-                    cache_control,
-                    &mut segments,
-                );
-            }
-        }
-    }
-
-    segments
-}
-
-fn feed_prompt_cache_value(hasher: &mut Sha256, value: &Value, cumulative_tokens: &mut u32) {
-    let signature = prompt_cache_signature(value);
-    feed_prompt_cache_text(hasher, &signature, cumulative_tokens);
-}
-
-fn feed_prompt_cache_text(hasher: &mut Sha256, text: &str, cumulative_tokens: &mut u32) {
-    if text.is_empty() {
-        return;
-    }
-    hasher.update(text.as_bytes());
-    *cumulative_tokens = cumulative_tokens.saturating_add(estimate_tokens(text).max(0) as u32);
-}
-
-fn prompt_cache_signature(value: &Value) -> String {
-    serde_json::to_string(&canonical_prompt_cache_value(value)).unwrap_or_default()
-}
-
-fn canonical_prompt_cache_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut normalized = serde_json::Map::new();
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if key != "cache_control" {
-                    if let Some(child) = map.get(key) {
-                        normalized.insert(key.clone(), canonical_prompt_cache_value(child));
-                    }
-                }
-            }
-            Value::Object(normalized)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(canonical_prompt_cache_value)
-                .collect::<Vec<_>>(),
-        ),
-        _ => value.clone(),
-    }
-}
-
-fn commit_prompt_cache_segment(
-    hasher: &Sha256,
-    cumulative_tokens: u32,
-    cache_control: &Value,
-    segments: &mut Vec<KiroPromptCacheSegment>,
-) {
-    if cumulative_tokens == 0 {
-        return;
-    }
-    let digest = hasher.clone().finalize();
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    segments.push(KiroPromptCacheSegment {
-        hash: u64::from_be_bytes(bytes),
-        cumulative_tokens,
-        ttl_secs: parse_prompt_cache_ttl(cache_control),
-    });
-}
-
-fn parse_prompt_cache_ttl(cache_control: &Value) -> i64 {
-    match cache_control.get("ttl").and_then(Value::as_str) {
-        Some(ttl) if ttl.eq_ignore_ascii_case("1h") => 60 * 60,
-        Some(ttl) if ttl.eq_ignore_ascii_case("5m") => 5 * 60,
-        _ => PROMPT_CACHE_DEFAULT_TTL_SECS,
-    }
+    cache.compute_usage(body, cache_namespace)
 }
 
 fn unix_timestamp_secs() -> i64 {
@@ -2905,10 +2667,16 @@ struct KiroUsage {
     credit_usage: Option<f64>,
     credit_unit: Option<String>,
     credit_unit_plural: Option<String>,
+    cache_usage_source: &'static str,
+    cache_usage_decision: Option<&'static str>,
 }
 
 impl KiroUsage {
     fn apply_metering_fields(&self, usage: &mut Value) {
+        usage["cache_usage_source"] = json!(self.cache_usage_source);
+        if let Some(decision) = self.cache_usage_decision {
+            usage["cache_usage_decision"] = json!(decision);
+        }
         if let Some(value) = self.credit_usage {
             usage["credit_usage"] = json!(value);
         }
@@ -2929,8 +2697,7 @@ struct KiroUsageAccumulator {
     output_tokens: Option<i32>,
     cache_read_tokens: Option<i32>,
     cache_creation_tokens: Option<i32>,
-    prompt_cache_read_tokens: i32,
-    prompt_cache_creation_tokens: i32,
+    prompt_cache_usage: KiroPromptCacheUsage,
     credit_usage: Option<f64>,
     credit_unit: Option<String>,
     credit_unit_plural: Option<String>,
@@ -2951,16 +2718,14 @@ impl KiroUsageAccumulator {
             output_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
-            prompt_cache_read_tokens: 0,
-            prompt_cache_creation_tokens: 0,
+            prompt_cache_usage: KiroPromptCacheUsage::default(),
             credit_usage: None,
             credit_unit: None,
             credit_unit_plural: None,
         }
     }
     fn set_prompt_cache_usage(&mut self, usage: KiroPromptCacheUsage) {
-        self.prompt_cache_read_tokens = usage.cache_read_tokens;
-        self.prompt_cache_creation_tokens = usage.cache_creation_tokens;
+        self.prompt_cache_usage = usage;
     }
 
     fn apply_event(&mut self, event_type: &str, payload: &Value) {
@@ -3048,12 +2813,10 @@ impl KiroUsageAccumulator {
             if input_total > 0 {
                 self.metrics_input_tokens = Some(input_total);
             }
-            if cache_read > 0 {
-                self.cache_read_tokens = Some(cache_read);
-            }
-            if cache_creation > 0 {
-                self.cache_creation_tokens = Some(cache_creation);
-            }
+            // The presence of tokenUsage is authoritative, including explicit
+            // zero cache buckets. Never replace upstream zero with a local hit.
+            self.cache_read_tokens = Some(cache_read);
+            self.cache_creation_tokens = Some(cache_creation);
             if let Some(tokens) = number_field(
                 token_usage,
                 &[
@@ -3103,25 +2866,19 @@ impl KiroUsageAccumulator {
         ) {
             self.output_tokens = Some(tokens);
         }
-        if let Some(tokens) = number_field(
-            metrics,
-            &[
-                "cacheReadInputTokens",
-                "cache_read_input_tokens",
-                "cacheReadTokens",
-            ],
-        ) {
-            self.cache_read_tokens = Some(tokens);
-        }
-        if let Some(tokens) = number_field(
-            metrics,
-            &[
-                "cacheCreationInputTokens",
-                "cache_creation_input_tokens",
-                "cacheCreationTokens",
-            ],
-        ) {
-            self.cache_creation_tokens = Some(tokens);
+        const READ_KEYS: &[&str] = &[
+            "cacheReadInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadTokens",
+        ];
+        const CREATION_KEYS: &[&str] = &[
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+            "cacheCreationTokens",
+        ];
+        if has_any_field(metrics, READ_KEYS) || has_any_field(metrics, CREATION_KEYS) {
+            self.cache_read_tokens = Some(number_field(metrics, READ_KEYS).unwrap_or(0));
+            self.cache_creation_tokens = Some(number_field(metrics, CREATION_KEYS).unwrap_or(0));
         }
     }
 
@@ -3131,24 +2888,43 @@ impl KiroUsageAccumulator {
             .or(self.context_input_tokens)
             .unwrap_or(0)
             .max(0);
-        let cache_read_tokens = self
-            .cache_read_tokens
-            .unwrap_or(self.prompt_cache_read_tokens)
-            .max(0);
-        let cache_creation_tokens = self
-            .cache_creation_tokens
-            .unwrap_or(self.prompt_cache_creation_tokens)
-            .max(0);
+        let authoritative_cache_usage =
+            self.cache_read_tokens.is_some() || self.cache_creation_tokens.is_some();
+        let (input_tokens, cache_creation_tokens, cache_read_tokens) = if authoritative_cache_usage
+        {
+            let cache_read = self.cache_read_tokens.unwrap_or(0).max(0);
+            let cache_creation = self.cache_creation_tokens.unwrap_or(0).max(0);
+            let authoritative_total =
+                raw_input_tokens.max(cache_read.saturating_add(cache_creation));
+            let read = cache_read.min(authoritative_total);
+            let creation = cache_creation.min(authoritative_total.saturating_sub(read));
+            (
+                authoritative_total
+                    .saturating_sub(read)
+                    .saturating_sub(creation),
+                creation,
+                read,
+            )
+        } else {
+            self.prompt_cache_usage
+                .split_against_total(raw_input_tokens)
+        };
+        let cache_usage_source = if authoritative_cache_usage {
+            "upstream_token_usage"
+        } else {
+            "local_prompt_cache_estimate"
+        };
         KiroUsage {
-            input_tokens: raw_input_tokens
-                .saturating_sub(cache_read_tokens)
-                .saturating_sub(cache_creation_tokens),
+            input_tokens,
             output_tokens: self.output_tokens.unwrap_or(fallback_output_tokens).max(0),
             cache_read_tokens,
             cache_creation_tokens,
             credit_usage: self.credit_usage,
             credit_unit: self.credit_unit.clone(),
             credit_unit_plural: self.credit_unit_plural.clone(),
+            cache_usage_source,
+            cache_usage_decision: (!authoritative_cache_usage)
+                .then_some(self.prompt_cache_usage.decision.as_str()),
         }
     }
 }
@@ -3198,6 +2974,10 @@ fn context_usage_input_tokens(payload: &Value, context_window: u64) -> Option<i3
 fn number_field(value: &Value, keys: &[&str]) -> Option<i32> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(number_value))
+}
+
+fn has_any_field(value: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| value.get(*key).is_some())
 }
 
 fn number_f64_field(value: &Value, keys: &[&str]) -> Option<f64> {
@@ -3314,7 +3094,7 @@ fn count_content_tokens(value: &Value) -> Result<u64, ProxyError> {
     }
 }
 
-fn count_content_block_tokens(value: &Value) -> Result<u64, ProxyError> {
+pub(super) fn count_content_block_tokens(value: &Value) -> Result<u64, ProxyError> {
     let Some(object) = value.as_object() else {
         return count_value_tokens(value);
     };
@@ -3522,11 +3302,11 @@ mod tests {
     fn wire_protocol_fixture_matches_surface_cache_tool_and_recovery_contracts() {
         use crate::domain::providers::model::AppKind;
         use crate::proxy::adapters::{capability_for, AdapterSupport};
-        use crate::proxy::retry_policy::{AuthRecoveryDecision, AuthRecoveryState};
+        use crate::proxy::retry_policy::{unauthorized_recovery_decision, AuthRecoveryDecision};
 
         let fixture: Value = serde_json::from_str(WIRE_PROTOCOL_JSON).unwrap();
         assert_eq!(fixture["format"], "cc-switch-kiro-wire-protocol");
-        assert_eq!(fixture["schemaVersion"], 2);
+        assert_eq!(fixture["schemaVersion"], 3);
         assert_eq!(fixture["accountBinding"]["mode"], "single_explicit_account");
         assert_eq!(fixture["accountBinding"]["accountPool"], false);
         assert_eq!(fixture["accountBinding"]["rotation"], false);
@@ -3569,19 +3349,20 @@ mod tests {
         assert_eq!(recovery["replayAttempts"], 1);
         assert_eq!(recovery["maxInferenceAttempts"], 2);
         assert_eq!(recovery["target"], "same_bound_account");
-        let mut recovery_state = AuthRecoveryState::default();
         assert_eq!(
-            recovery_state.decide(
+            unauthorized_recovery_decision(
                 axum::http::StatusCode::UNAUTHORIZED,
                 ProviderType::KiroOAuth,
+                false,
                 true,
             ),
             Some(AuthRecoveryDecision::RefreshAndReplaySameBinding)
         );
         assert_eq!(
-            recovery_state.decide(
+            unauthorized_recovery_decision(
                 axum::http::StatusCode::UNAUTHORIZED,
                 ProviderType::KiroOAuth,
+                true,
                 true,
             ),
             Some(AuthRecoveryDecision::ReturnUnauthorized)
@@ -3660,6 +3441,22 @@ mod tests {
         assert_eq!(
             fixture["promptCache"]["maxTtlSeconds"],
             PROMPT_CACHE_MAX_TTL_SECS
+        );
+        assert_eq!(fixture["promptCache"]["topLevelAutoCaching"], true);
+        assert_eq!(fixture["promptCache"]["unifiedBreakpointLimit"], 4);
+        assert_eq!(fixture["promptCache"]["lookbackPositions"], 20);
+        assert_eq!(
+            fixture["promptCache"]["usageMapping"]
+                ["authoritativeUpstreamTokenUsageWinsIncludingExplicitZero"],
+            true
+        );
+        assert_eq!(
+            fixture["promptCache"]["persistence"]["requestPathBlockingWrites"],
+            false
+        );
+        assert_eq!(
+            fixture["promptCache"]["persistence"]["remoteStore"],
+            "disabled"
         );
     }
 
@@ -3796,13 +3593,14 @@ mod tests {
             "https://q.us-west-2.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(request.host, "q.us-west-2.amazonaws.com");
-        assert_eq!(
-            request.cache_namespace,
-            format!(
-                "account:kiro_server:generation:1:session:{}",
-                stable_uuid_like("session-a")
-            )
-        );
+        let cache_scope: Value = serde_json::from_str(&request.cache_namespace).unwrap();
+        assert_eq!(cache_scope["app"], "direct");
+        assert_eq!(cache_scope["providerId"], "kiro_oauth");
+        assert_eq!(cache_scope["accountId"], "kiro_server");
+        assert_eq!(cache_scope["authIdentityGeneration"], 1);
+        assert_eq!(cache_scope["tokenRefreshGeneration"], 1);
+        assert_eq!(cache_scope["runtimeRegion"], "us-west-2");
+        assert_eq!(cache_scope["session"], stable_uuid_like("session-a"));
         assert!(request
             .headers
             .iter()
@@ -4395,12 +4193,11 @@ mod tests {
         });
 
         let first = compute_kiro_prompt_cache_usage_with_cache(&body, &cache);
-        assert!(first.cache_creation_tokens > 0);
-        assert_eq!(first.cache_read_tokens, 0);
+        assert!(first.cache_covered_estimate > 0);
+        assert_eq!(first.cache_read_estimate, 0);
 
         let second = compute_kiro_prompt_cache_usage_with_cache(&body, &cache);
-        assert_eq!(second.cache_creation_tokens, 0);
-        assert_eq!(second.cache_read_tokens, first.cache_creation_tokens);
+        assert_eq!(second.cache_read_estimate, first.cache_covered_estimate);
     }
 
     #[test]
@@ -4432,11 +4229,13 @@ mod tests {
             &cache,
         );
 
-        assert!(first.cache_creation_tokens > 0);
-        assert_eq!(isolated.cache_read_tokens, 0);
-        assert_eq!(isolated.cache_creation_tokens, first.cache_creation_tokens);
-        assert_eq!(hit.cache_creation_tokens, 0);
-        assert_eq!(hit.cache_read_tokens, first.cache_creation_tokens);
+        assert!(first.cache_covered_estimate > 0);
+        assert_eq!(isolated.cache_read_estimate, 0);
+        assert_eq!(
+            isolated.cache_covered_estimate,
+            first.cache_covered_estimate
+        );
+        assert_eq!(hit.cache_read_estimate, first.cache_covered_estimate);
     }
 
     #[test]
@@ -4478,17 +4277,18 @@ mod tests {
         let miss = compute_kiro_prompt_cache_usage_with_cache(&first, &cache);
         let hit = compute_kiro_prompt_cache_usage_with_cache(&second, &cache);
 
-        assert!(miss.cache_creation_tokens > 0);
-        assert_eq!(hit.cache_read_tokens, miss.cache_creation_tokens);
-        assert_eq!(hit.cache_creation_tokens, 0);
+        assert!(miss.cache_covered_estimate > 0);
+        assert_eq!(hit.cache_read_estimate, miss.cache_covered_estimate);
     }
 
     #[test]
     fn kiro_prompt_cache_tokens_are_subtracted_from_fresh_input() {
         let mut usage = KiroUsageAccumulator::default();
         usage.set_prompt_cache_usage(KiroPromptCacheUsage {
-            cache_read_tokens: 700,
-            cache_creation_tokens: 30,
+            cache_read_estimate: 700,
+            cache_covered_estimate: 730,
+            prompt_total_estimate: 1_000,
+            decision: crate::proxy::kiro_prompt_cache::CacheDecision::Explicit,
         });
         usage.apply_event(
             "metricsEvent",
@@ -4500,6 +4300,43 @@ mod tests {
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cache_read_tokens, 700);
         assert_eq!(usage.cache_creation_tokens, 30);
+        assert_eq!(usage.cache_usage_source, "local_prompt_cache_estimate");
+        assert_eq!(usage.cache_usage_decision, Some("explicit"));
+        assert_eq!(
+            usage.input_tokens + usage.cache_creation_tokens + usage.cache_read_tokens,
+            1_000
+        );
+    }
+
+    #[test]
+    fn kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate() {
+        let mut usage = KiroUsageAccumulator::default();
+        usage.set_prompt_cache_usage(KiroPromptCacheUsage {
+            cache_read_estimate: 700,
+            cache_covered_estimate: 730,
+            prompt_total_estimate: 1_000,
+            decision: crate::proxy::kiro_prompt_cache::CacheDecision::Explicit,
+        });
+        usage.apply_event(
+            "messageMetadataEvent",
+            &json!({
+                "messageMetadataEvent": {
+                    "tokenUsage": {
+                        "uncachedInputTokens": 1_000,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 12
+                    }
+                }
+            }),
+        );
+
+        let usage = usage.final_usage(1);
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.cache_usage_source, "upstream_token_usage");
+        assert_eq!(usage.cache_usage_decision, None);
     }
 
     #[test]

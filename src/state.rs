@@ -546,11 +546,19 @@ impl PersistedStateSnapshot for AccountStore {
     const NAME: &'static str = "accounts";
 
     fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
-        self.save(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            crate::repository::server_sqlite::persist_accounts(config_dir, self)
+        } else {
+            self.save(config_dir)
+        }
     }
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
-        Self::load_or_default(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.accounts)
+        } else {
+            Self::load_or_default(config_dir)
+        }
     }
 
     fn reconciliation_value(&self) -> Option<Value> {
@@ -562,11 +570,19 @@ impl PersistedStateSnapshot for UsageStore {
     const NAME: &'static str = "usage";
 
     fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
-        self.save(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            crate::repository::server_sqlite::replace_usage_records(config_dir, self)
+        } else {
+            self.save(config_dir)
+        }
     }
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
-        Self::load_or_default(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.usage)
+        } else {
+            Self::load_or_default(config_dir)
+        }
     }
 
     fn reconciliation_value(&self) -> Option<Value> {
@@ -578,11 +594,19 @@ impl PersistedStateSnapshot for ShareStore {
     const NAME: &'static str = "shares";
 
     fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
-        self.save(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            crate::repository::server_sqlite::persist_shares(config_dir, self)
+        } else {
+            self.save(config_dir)
+        }
     }
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
-        Self::load_or_default(config_dir)
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.shares)
+        } else {
+            Self::load_or_default(config_dir)
+        }
     }
 
     fn reconciliation_value(&self) -> Option<Value> {
@@ -643,24 +667,31 @@ async fn reconcile_usage_store_after_persistence_error(
     error: anyhow::Error,
 ) -> anyhow::Result<UsageStore> {
     let load_dir = config_dir.to_path_buf();
-    let reconciled =
-        match tokio::task::spawn_blocking(move || UsageStore::load_or_default(&load_dir)).await {
-            Ok(Ok(store)) => store,
-            Ok(Err(reconcile_error)) => {
-                tracing::error!(
-                    %reconcile_error,
-                    "failed to reload usage state after a persistence error"
-                );
-                return Err(error);
-            }
-            Err(join_error) => {
-                tracing::error!(
-                    %join_error,
-                    "usage reconciliation task panicked after a persistence error"
-                );
-                return Err(error);
-            }
-        };
+    let reconciled = match tokio::task::spawn_blocking(move || {
+        if crate::repository::server_sqlite::is_committed(&load_dir)? {
+            Ok(crate::repository::server_sqlite::load_authoritative(&load_dir)?.usage)
+        } else {
+            UsageStore::load_or_default(&load_dir)
+        }
+    })
+    .await
+    {
+        Ok(Ok(store)) => store,
+        Ok(Err(reconcile_error)) => {
+            tracing::error!(
+                %reconcile_error,
+                "failed to reload usage state after a persistence error"
+            );
+            return Err(error);
+        }
+        Err(join_error) => {
+            tracing::error!(
+                %join_error,
+                "usage reconciliation task panicked after a persistence error"
+            );
+            return Err(error);
+        }
+    };
     let expected_value = serde_json::to_value(&expected_log).ok();
     let disk_matches = reconciled
         .logs
@@ -980,6 +1011,11 @@ pub struct ServerStateInner {
     pub cursor_model_catalogs: crate::proxy::cursor::credential_cache::CursorModelCatalogCache,
     pub(crate) kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache,
     pub(crate) kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache,
+    pub(crate) antigravity_reasoning_replays:
+        crate::proxy::antigravity_replay::AntigravityReplayCache,
+    pub(crate) grok_reasoning_replays: crate::proxy::grok_replay::GrokReplayCache,
+    pub(crate) antigravity_transports:
+        crate::proxy::antigravity_transport::AntigravityTransportCache,
     pub(crate) qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache,
     pub(crate) codebuddy_runtime: crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache,
     pub(crate) trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache,
@@ -2660,6 +2696,8 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::sharing::legacy_token_market_migration::retirement_audit_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
         grok_media_tasks_path(config_dir),
+        crate::repository::server_sqlite::database_path(config_dir),
+        crate::repository::server_sqlite::marker_path(config_dir),
     ]
 }
 
@@ -3033,9 +3071,14 @@ fn recover_pending_native_refresh_journals(
         recovered_paths.push(path);
     }
     if changed {
-        candidate
-            .save(config_dir)
-            .context("persist accounts recovered from native refresh journal")?;
+        if crate::repository::server_sqlite::is_committed(config_dir)? {
+            crate::repository::server_sqlite::persist_accounts(config_dir, &candidate)
+                .context("persist accounts recovered from native refresh journal")?;
+        } else {
+            candidate
+                .save(config_dir)
+                .context("persist accounts recovered from native refresh journal")?;
+        }
         *accounts = candidate;
     }
     for path in recovered_paths {
@@ -3291,6 +3334,42 @@ fn apply_codex_workspace_rebind_transaction(config_dir: &Path) -> anyhow::Result
             crate::domain::sharing::shares::shares_path(config_dir),
         ),
     ];
+    if crate::repository::server_sqlite::is_committed(config_dir)? {
+        for (file_name, expected, _) in &entries {
+            let staged_path = stage_dir.join(file_name);
+            let content = std::fs::read(&staged_path).with_context(|| {
+                format!(
+                    "read staged SQLite transaction file {}",
+                    staged_path.display()
+                )
+            })?;
+            if sha256_bytes(&content) != expected.staged_sha256 {
+                anyhow::bail!("staged workspace rebind file digest mismatch: {file_name}");
+            }
+        }
+        let accounts = AccountStore::load_or_default(&stage_dir)
+            .context("load staged Accounts for committed SQLite rebind recovery")?;
+        let mut providers = ProviderStore::load_runtime_or_default(&stage_dir)
+            .context("load staged Providers for committed SQLite rebind recovery")?;
+        providers
+            .rebuild_runtime_index(&accounts)
+            .context("compile staged Provider graph for committed SQLite rebind recovery")?;
+        let shares = ShareStore::load_or_default(&stage_dir)
+            .context("load staged Shares for committed SQLite rebind recovery")?;
+        crate::domain::sharing::subscription_identity::validate_subscription_reference_graph(
+            &providers, &accounts, &shares,
+        )
+        .map_err(|error| anyhow::anyhow!("[{}] {error}", error.code()))?;
+        crate::repository::server_sqlite::persist_reference_graph(
+            config_dir, &providers, &accounts, &shares,
+        )?;
+        std::fs::remove_file(&marker_path)
+            .with_context(|| format!("remove transaction marker {}", marker_path.display()))?;
+        crate::infra::storage::sync_directory(config_dir)?;
+        remove_codex_workspace_rebind_stage(&stage_dir)?;
+        crate::infra::storage::sync_directory(config_dir)?;
+        return Ok(true);
+    }
     let mut writes = Vec::with_capacity(entries.len());
     for (file_name, expected, target_path) in entries {
         let staged_path = stage_dir.join(file_name);
@@ -3462,6 +3541,16 @@ fn validate_server_backup_restore_stage(
     if includes("tunnels.json") {
         crate::clients::router::tunnel::validate_tunnel_store(stage_dir)
             .context("validate staged tunnels.json")?;
+    }
+    let includes_sqlite = includes(crate::repository::server_sqlite::DATABASE_FILE_NAME);
+    let includes_sqlite_marker = includes(crate::repository::server_sqlite::MARKER_FILE_NAME);
+    if includes_sqlite || includes_sqlite_marker {
+        anyhow::ensure!(
+            includes_sqlite && includes_sqlite_marker,
+            "SQLite backup must contain both database and migration marker"
+        );
+        crate::repository::server_sqlite::validate_backup_pair(stage_dir)
+            .context("validate staged Server SQLite backup")?;
     }
     Ok(())
 }
@@ -5845,6 +5934,49 @@ fn prepare_account_binding_migration_preview(
 }
 
 impl ServerStateInner {
+    /// Freeze durable core-store writers in the declared lock order, refresh
+    /// the SQLite shadow from those exact durable snapshots, then create one
+    /// backup manifest containing both representations.
+    pub async fn create_consistent_backup(
+        &self,
+        reason: Option<String>,
+    ) -> anyhow::Result<crate::infra::backup::BackupManifest> {
+        let _config_commit = self.config_persistence.gate.lock().await;
+        let _provider_commit = self.provider_commits.lock().await;
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let _usage_commit = self.usage_persistence.gate.lock().await;
+        let _shares_commit = self.shares_persistence.gate.lock().await;
+        let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
+
+        if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
+            crate::repository::server_sqlite::checkpoint_authority(&self.config_dir)
+                .context("checkpoint committed SQLite authority for backup")?;
+        } else {
+            let providers = ProviderStore::load_runtime_or_default(&self.config_dir)
+                .context("load durable Providers for consistent backup")?;
+            let accounts = AccountStore::load_or_default(&self.config_dir)
+                .context("load durable Accounts for consistent backup")?;
+            let shares = ShareStore::load_or_default(&self.config_dir)
+                .context("load durable Shares for consistent backup")?;
+            let usage = UsageStore::load_read_only(&self.config_dir)
+                .context("load durable Usage for consistent backup")?;
+            crate::repository::server_sqlite::refresh_shadow(
+                &self.config_dir,
+                crate::repository::server_sqlite::ShadowImportInput {
+                    providers: &providers,
+                    accounts: &accounts,
+                    shares: &shares,
+                    usage: &usage,
+                },
+            )?;
+        }
+        crate::infra::backup::create_backup(
+            &self.config_dir,
+            &backup_targets(&self.config_dir),
+            reason,
+        )
+    }
+
     pub(crate) fn accept_router_ingress_request(
         &self,
         context: &crate::clients::router::ingress::IngressContext,
@@ -6537,8 +6669,30 @@ impl ServerStateInner {
                 "legacy universal provider data requires an explicit migration; startup left it unchanged"
             );
         }
-        let mut providers = ProviderStore::load_runtime_or_default(&config_dir)?;
-        let mut accounts = AccountStore::load_or_default(&config_dir)?;
+        let existing_sqlite_marker = crate::repository::server_sqlite::read_marker(&config_dir)?;
+        let sqlite_committed = existing_sqlite_marker.as_ref().is_some_and(|marker| {
+            marker.authority == crate::repository::server_sqlite::AuthorityState::Committed
+        });
+        let sqlite_roll_forward_required = existing_sqlite_marker.as_ref().is_some_and(|marker| {
+            marker.authority == crate::repository::server_sqlite::AuthorityState::Prepared
+        });
+        let sqlite_activation_requested =
+            crate::repository::server_sqlite::authority_activation_requested();
+        if sqlite_committed {
+            crate::repository::server_sqlite::activate_authority(&config_dir)
+                .context("resume committed Server SQLite authority cleanup")?;
+        }
+        let authoritative = sqlite_committed
+            .then(|| crate::repository::server_sqlite::load_authoritative(&config_dir))
+            .transpose()?;
+        let mut providers = match authoritative.as_ref() {
+            Some(stores) => stores.providers.clone(),
+            None => ProviderStore::load_runtime_or_default(&config_dir)?,
+        };
+        let mut accounts = match authoritative.as_ref() {
+            Some(stores) => stores.accounts.clone(),
+            None => AccountStore::load_or_default(&config_dir)?,
+        };
         recover_pending_native_refresh_journals(&config_dir, &mut accounts)?;
         let reasoning_root_key = crate::infra::credentials::load_or_create_root_key(&config_dir)
             .context("resolve proxy reasoning bridge root key")?;
@@ -6547,23 +6701,35 @@ impl ServerStateInner {
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let usage = UsageStore::load_or_default(&config_dir)?;
+        let mut usage = match authoritative.as_ref() {
+            Some(stores) => stores.usage.clone(),
+            None => UsageStore::load_or_default(&config_dir)?,
+        };
+        usage.provider_health =
+            crate::domain::health::ProviderHealthStore::load_rebuildable(&config_dir);
         remove_obsolete_model_pricing_file(&config_dir)?;
         let grok_media_tasks =
             GrokMediaTaskStore::load_or_default(&config_dir, crate::infra::time::now_ms() as i64)
                 .context("load Grok media task store")?;
-        let legacy_share_load =
-            crate::domain::sharing::legacy_token_market_migration::load_and_migrate(&config_dir)?;
-        if let Some(migration) = legacy_share_load.migration.as_ref() {
-            tracing::warn!(
-                source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
-                affected_fields = migration.affected_fields,
-                retired_archive_files = migration.retired_archive_files,
-                audit_path = %migration.audit_path.display(),
-                "retired legacy capacity binding data during startup"
-            );
-        }
-        let mut shares = legacy_share_load.store;
+        let mut shares = match authoritative.as_ref() {
+            Some(stores) => stores.shares.clone(),
+            None => {
+                let legacy_share_load =
+                    crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
+                        &config_dir,
+                    )?;
+                if let Some(migration) = legacy_share_load.migration.as_ref() {
+                    tracing::warn!(
+                        source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
+                        affected_fields = migration.affected_fields,
+                        retired_archive_files = migration.retired_archive_files,
+                        audit_path = %migration.audit_path.display(),
+                        "retired legacy capacity binding data during startup"
+                    );
+                }
+                legacy_share_load.store
+            }
+        };
         let integrity_outcomes =
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
         let mut shares_changed = integrity_outcomes.iter().any(|outcome| outcome.changed());
@@ -6630,7 +6796,59 @@ impl ServerStateInner {
             );
         }
         if shares_changed {
-            shares.save(&config_dir)?;
+            if sqlite_committed {
+                crate::repository::server_sqlite::persist_shares(&config_dir, &shares)?;
+            } else {
+                shares.save(&config_dir)?;
+            }
+        }
+        if !sqlite_committed {
+            let shadow_result = crate::repository::server_sqlite::ensure_shadow(
+                &config_dir,
+                crate::repository::server_sqlite::ShadowImportInput {
+                    providers: &providers,
+                    accounts: &accounts,
+                    shares: &shares,
+                    usage: &usage,
+                },
+            );
+            match shadow_result {
+                Ok(report) if sqlite_roll_forward_required || sqlite_activation_requested => {
+                    let marker = crate::repository::server_sqlite::activate_authority(&config_dir)
+                        .context("commit Server SQLite authority migration")?;
+                    tracing::info!(
+                        provider_count = report.provider_count,
+                        account_count = report.account_count,
+                        share_count = report.share_count,
+                        usage_count = report.usage_count,
+                        source_file_count = report.source_file_count,
+                        credentials_verified = report.credentials_verified,
+                        source_digest = %report.source_digest,
+                        committed_at_ms = marker.committed_at_ms,
+                        legacy_backup_dir = marker.legacy_backup_dir.as_deref().unwrap_or("none"),
+                        "committed the transactional SQLite authority"
+                    );
+                }
+                Ok(report) => tracing::info!(
+                    provider_count = report.provider_count,
+                    account_count = report.account_count,
+                    share_count = report.share_count,
+                    usage_count = report.usage_count,
+                    source_file_count = report.source_file_count,
+                    credentials_verified = report.credentials_verified,
+                    source_digest = %report.source_digest,
+                    "verified the transactional SQLite shadow store"
+                ),
+                Err(error) if sqlite_roll_forward_required || sqlite_activation_requested => {
+                    return Err(error).context(
+                        "SQLite authority activation was requested but its shadow is invalid",
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "SQLite shadow import failed; legacy stores remain authoritative"
+                ),
+            }
         }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
         let parsed_log_config =
@@ -6740,6 +6958,11 @@ impl ServerStateInner {
                 crate::proxy::cursor::credential_cache::CursorModelCatalogCache::default(),
             kimi_model_catalogs: crate::proxy::kimi_runtime::KimiModelCatalogCache::default(),
             kimi_thinking_replays: crate::proxy::kimi_runtime::KimiThinkingReplayCache::default(),
+            antigravity_reasoning_replays:
+                crate::proxy::antigravity_replay::AntigravityReplayCache::default(),
+            grok_reasoning_replays: crate::proxy::grok_replay::GrokReplayCache::default(),
+            antigravity_transports:
+                crate::proxy::antigravity_transport::AntigravityTransportCache::default(),
             qoder_runtime: crate::proxy::qoder_runtime::QoderRuntimeCache::default(),
             codebuddy_runtime: crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache::default(),
             trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache::default(),
@@ -7806,32 +8029,51 @@ impl ServerStateInner {
         let web_session_http_client = build_web_session_http_client()?;
         let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
             .context("resolve proxy reasoning bridge root key")?;
-        let mut providers = ProviderStore::load_runtime_or_default(&self.config_dir)?;
-        let accounts = AccountStore::load_or_default(&self.config_dir)?;
+        let authoritative = crate::repository::server_sqlite::is_committed(&self.config_dir)?
+            .then(|| crate::repository::server_sqlite::load_authoritative(&self.config_dir))
+            .transpose()?;
+        let mut providers = match authoritative.as_ref() {
+            Some(stores) => stores.providers.clone(),
+            None => ProviderStore::load_runtime_or_default(&self.config_dir)?,
+        };
+        let accounts = match authoritative.as_ref() {
+            Some(stores) => stores.accounts.clone(),
+            None => AccountStore::load_or_default(&self.config_dir)?,
+        };
         providers.set_runtime_defaults(config.provider_runtime_defaults());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let usage = UsageStore::load_or_default(&self.config_dir)?;
+        let mut usage = match authoritative.as_ref() {
+            Some(stores) => stores.usage.clone(),
+            None => UsageStore::load_or_default(&self.config_dir)?,
+        };
+        usage.provider_health =
+            crate::domain::health::ProviderHealthStore::load_rebuildable(&self.config_dir);
         remove_obsolete_model_pricing_file(&self.config_dir)?;
         let grok_media_tasks = GrokMediaTaskStore::load_or_default(
             &self.config_dir,
             crate::infra::time::now_ms() as i64,
         )?;
-        let legacy_share_load =
-            crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
-                &self.config_dir,
-            )?;
-        if let Some(migration) = legacy_share_load.migration.as_ref() {
-            tracing::warn!(
-                source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
-                affected_fields = migration.affected_fields,
-                retired_archive_files = migration.retired_archive_files,
-                audit_path = %migration.audit_path.display(),
-                "retired legacy capacity binding data during persistent-store reload"
-            );
-        }
-        let mut shares = legacy_share_load.store;
+        let mut shares = match authoritative.as_ref() {
+            Some(stores) => stores.shares.clone(),
+            None => {
+                let legacy_share_load =
+                    crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
+                        &self.config_dir,
+                    )?;
+                if let Some(migration) = legacy_share_load.migration.as_ref() {
+                    tracing::warn!(
+                        source_sha256 = migration.source_sha256.as_deref().unwrap_or("none"),
+                        affected_fields = migration.affected_fields,
+                        retired_archive_files = migration.retired_archive_files,
+                        audit_path = %migration.audit_path.display(),
+                        "retired legacy capacity binding data during persistent-store reload"
+                    );
+                }
+                legacy_share_load.store
+            }
+        };
         let (preserved_client_state, rebased_client_share_subdomains) =
             reconcile_client_subdomain_adoption_on_reload(
                 &current_config,
@@ -10897,15 +11139,28 @@ impl ServerStateInner {
 
         let config_dir = self.config_dir.clone();
         let persisted_candidate = candidate.clone();
-        let persist_result =
-            tokio::task::spawn_blocking(move || persisted_candidate.save(&config_dir))
-                .await
-                .context("provider persistence task panicked")?;
+        let persist_result = tokio::task::spawn_blocking(move || {
+            if crate::repository::server_sqlite::is_committed(&config_dir)? {
+                crate::repository::server_sqlite::persist_providers(
+                    &config_dir,
+                    &persisted_candidate,
+                )
+            } else {
+                persisted_candidate.save(&config_dir)
+            }
+        })
+        .await
+        .context("provider persistence task panicked")?;
 
         if let Err(error) = persist_result {
             // rename is the commit point. A directory-fsync error can be reported after the
             // candidate is already authoritative on disk, so reconcile before deciding.
-            let on_disk = ProviderStore::load_runtime_or_default(&self.config_dir);
+            let on_disk = if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
+                crate::repository::server_sqlite::load_authoritative(&self.config_dir)
+                    .map(|stores| stores.providers)
+            } else {
+                ProviderStore::load_runtime_or_default(&self.config_dir)
+            };
             let candidate_json = serde_json::to_value(&candidate);
             let disk_matches = on_disk
                 .as_ref()
@@ -12095,6 +12350,15 @@ impl ServerStateInner {
         let persisted_providers = candidate_providers.clone();
         let persisted_shares = candidate_shares.clone();
         let apply_error = tokio::task::spawn_blocking(move || {
+            if crate::repository::server_sqlite::is_committed(&config_dir)? {
+                crate::repository::server_sqlite::persist_reference_graph(
+                    &config_dir,
+                    &persisted_providers,
+                    &persisted_accounts,
+                    &persisted_shares,
+                )?;
+                return Ok::<_, anyhow::Error>(None);
+            }
             prepare_codex_workspace_rebind_transaction(
                 &config_dir,
                 &transaction_accounts,
@@ -12386,6 +12650,15 @@ impl ServerStateInner {
         let persisted_providers = candidate_providers.clone();
         let persisted_shares = candidate_shares.clone();
         let apply_error = tokio::task::spawn_blocking(move || {
+            if crate::repository::server_sqlite::is_committed(&config_dir)? {
+                crate::repository::server_sqlite::persist_reference_graph(
+                    &config_dir,
+                    &persisted_providers,
+                    &persisted_accounts,
+                    &persisted_shares,
+                )?;
+                return Ok::<_, anyhow::Error>(None);
+            }
             prepare_codex_workspace_rebind_transaction(
                 &config_dir,
                 &transaction_accounts,
@@ -12842,6 +13115,18 @@ impl ServerStateInner {
 
     async fn commit_usage_append(&self, append: PreparedUsageAppend) -> anyhow::Result<UsageLog> {
         let expected_log = append.log().clone();
+        if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
+            let config_dir = self.config_dir.clone();
+            let persisted_log = expected_log.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::repository::server_sqlite::upsert_usage_log(&config_dir, &persisted_log)
+            })
+            .await
+            .context("Usage SQLite persistence task panicked")??;
+            self.usage.write().await.apply_append(append);
+            self.usage_persistence.mark_published();
+            return Ok(expected_log);
+        }
         let persisted_append = append.clone();
         let config_dir = self.config_dir.clone();
         let result = tokio::task::spawn_blocking(move || persisted_append.persist(&config_dir))
@@ -18636,11 +18921,10 @@ pub fn spawn_periodic_backups(state: ServerState) {
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(6 * 60 * 60)).await;
-            match crate::infra::backup::create_backup(
-                &state.config_dir,
-                &backup_targets(&state.config_dir),
-                Some("periodic".to_string()),
-            ) {
+            match state
+                .create_consistent_backup(Some("periodic".to_string()))
+                .await
+            {
                 Ok(manifest) => {
                     state.emit_event(
                         ServerEvent::new("backup.created", "backup")
@@ -31228,6 +31512,39 @@ mod tests {
         .unwrap();
 
         drop(recovered);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_sqlite_account_writer_and_reader_survive_state_reload() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        crate::repository::server_sqlite::activate_authority(&config_dir).unwrap();
+
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let input: crate::domain::accounts::store::UpsertAccountInput =
+                    serde_json::from_value(json!({
+                        "id": "sqlite-state-account",
+                        "providerType": "claude_oauth",
+                        "accessToken": "sqlite-state-secret"
+                    }))
+                    .unwrap();
+                accounts.upsert(input);
+            })
+            .await
+            .unwrap();
+        assert!(!crate::domain::accounts::store::accounts_path(&config_dir).exists());
+
+        state.reload_persistent_stores().await.unwrap();
+        let accounts = state.accounts.read().await;
+        assert_eq!(accounts.accounts.len(), 1);
+        assert_eq!(
+            accounts.accounts[0].access_token.as_deref(),
+            Some("sqlite-state-secret")
+        );
+        drop(accounts);
+        drop(state);
         fs::remove_dir_all(config_dir).unwrap();
     }
 

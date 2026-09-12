@@ -1,0 +1,286 @@
+{
+  "format": "cc-switch-codex-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
+    "recoveryBoundary": "same-account, pre-commit, shared total attempt budget",
+    "liveEvidence": "local fixtures do not imply live ChatGPT entitlement or production WebSocket performance"
+  },
+  "sources": [
+    {
+      "id": "cliproxyapi",
+      "rootEnv": "CC_SWITCH_CODEX_CLIPROXYAPI_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Codex/CLIProxyAPI",
+      "deltas": [
+        {
+          "id": "unicode_schema_and_const_union",
+          "commits": [
+            "e56abd56f1424b9b25b4609839833724100f3ef5",
+            "37ce368c5002bc4a83cd622ec01602b0b7984672"
+          ],
+          "files": [
+            {
+              "commit": "37ce368c5002bc4a83cd622ec01602b0b7984672",
+              "path": "internal/runtime/executor/helps/codex_tool_schema.go",
+              "sha256": "df052bc3273f2ae7241c2f1eb445271c2be69276a57ae9551045898d7c8579f6"
+            },
+            {
+              "commit": "37ce368c5002bc4a83cd622ec01602b0b7984672",
+              "path": "internal/runtime/executor/helps/codex_tool_schema_test.go",
+              "sha256": "42081a166877b8d61718bd1b83ee1c0b8233702bdbcd772632f50e3467cb40c0"
+            }
+          ]
+        },
+        {
+          "id": "gpt_image_25",
+          "commits": ["d1a024e9400bc65bd78ccd908945cf2eacc2835e"],
+          "files": [
+            {
+              "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
+              "path": "internal/runtime/executor/codex_openai_images.go",
+              "sha256": "705a69093c0676a7d82367848fbc1884d83cdbd7a06a74b17931dc282206a952"
+            },
+            {
+              "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
+              "path": "internal/runtime/executor/codex_openai_images_test.go",
+              "sha256": "6e397da76777e357cac6c192df29a44c1411a61ce5e2fcb11b1ce1853a7f87da"
+            }
+          ]
+        },
+        {
+          "id": "responses_error_sequence_and_bootstrap",
+          "commits": [
+            "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
+            "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f"
+          ],
+          "files": [
+            {
+              "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
+              "path": "sdk/api/handlers/openai_responses_stream_error.go",
+              "sha256": "0d1e68508c3cb4838622a7c85504a660a1337c2c2543d146eb2b60d7acaaf170"
+            },
+            {
+              "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
+              "path": "sdk/api/handlers/openai_responses_stream_error_test.go",
+              "sha256": "ae09731e1642ee744ca2b8c54cee6bf3be2c8d076c3d0c16fad15c03173d2e11"
+            },
+            {
+              "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
+              "path": "internal/runtime/executor/codex_executor_terminal.go",
+              "sha256": "c2deebd956b9b3d87a1d4265ed6531a3c92e213b36fa68c51f01f0376559d416"
+            },
+            {
+              "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
+              "path": "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go",
+              "sha256": "fc16deffc9fc32e069663e358fd2670ee5a22e1d6ee559c40e5b892c56846a12"
+            }
+          ]
+        },
+        {
+          "id": "websocket_prewarm_and_named_output",
+          "commits": ["bd03aabcf157e215ef50c5984d873f690a5c22bf"],
+          "files": [
+            {
+              "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
+              "path": "sdk/api/handlers/openai/openai_responses_websocket_prewarm.go",
+              "sha256": "b0e56827f9bebe9d6d86f7ea2f55bfc0400d4bb8785656bf56de58543becadb9"
+            },
+            {
+              "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
+              "path": "sdk/api/handlers/openai/openai_responses_websocket_test.go",
+              "sha256": "a3155c1059f89f78dc332de227f54b4915cd1bb48c270d918c920b9f858c3a6f"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "codex2api",
+      "rootEnv": "CC_SWITCH_CODEX_CODEX2API_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Codex/codex2api",
+      "deltas": [
+        {
+          "id": "gpt_image_25_cross_check",
+          "commits": ["f5220891b77d217fa32ab2e4d0cd254825fce780"],
+          "files": [
+            {
+              "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
+              "path": "proxy/images.go",
+              "sha256": "d9d08c859df2247740cd153a2e4989ef38a492a549cb327d2c75298ebd15fc37"
+            },
+            {
+              "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
+              "path": "proxy/images25_test.go",
+              "sha256": "a18654ac32acb2ff345c754b6fa7af2062a101b1ad021c58c9e289baf15cea29"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "CX-01",
+      "status": "fixture_verified",
+      "path": "src/proxy/tool_schema.rs",
+      "anchors": [
+        "has_incompatible_codex_unicode_escape",
+        "codex_schema_sanitizer_fails_closed_at_each_budget"
+      ]
+    },
+    {
+      "id": "CX-02",
+      "status": "fixture_verified",
+      "path": "src/proxy/tool_schema.rs",
+      "anchors": [
+        "simplify_codex_const_union",
+        "codex_leaves_uncertain_const_unions_unchanged"
+      ]
+    },
+    {
+      "id": "CX-03",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "path": "src/proxy/forwarder.rs",
+      "anchors": [
+        "CODEX_IMAGES_LIVE_PENDING_25_MODELS",
+        "codex_image_25_variants_remain_independently_live_evidence_gated"
+      ],
+      "variants": [
+        {
+          "model": "gpt-image-2.5",
+          "generation": "live_pending",
+          "multipartEdit": "live_pending",
+          "normalization": "live_pending",
+          "sizeQuality": "live_pending",
+          "usage": "live_pending",
+          "error": "live_pending",
+          "quotaCooldown": "live_pending"
+        },
+        {
+          "model": "gpt-image-2.5-flare",
+          "generation": "live_pending",
+          "multipartEdit": "live_pending",
+          "normalization": "live_pending",
+          "sizeQuality": "live_pending",
+          "usage": "live_pending",
+          "error": "live_pending",
+          "quotaCooldown": "live_pending"
+        },
+        {
+          "model": "gpt-image-2.5-sunburst",
+          "generation": "live_pending",
+          "multipartEdit": "live_pending",
+          "normalization": "live_pending",
+          "sizeQuality": "live_pending",
+          "usage": "live_pending",
+          "error": "live_pending",
+          "quotaCooldown": "live_pending"
+        }
+      ]
+    },
+    {
+      "id": "CX-04",
+      "status": "fixture_verified",
+      "path": "src/proxy/openai_capacity_shed.rs",
+      "anchors": [
+        "codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence",
+        "codex_bootstrap_overload_golden_is_precommit_capacity_failure"
+      ]
+    },
+    {
+      "id": "CX-05",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "benchmarkEvidence": false,
+      "upstreamReceipt": false,
+      "path": "docs/provider/codex-oauth.md",
+      "anchors": ["WS prewarm evidence gate"]
+    },
+    {
+      "id": "CX-06",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "dependsOn": "CX-03",
+      "path": "docs/provider/codex-oauth.md",
+      "anchors": ["GPT Image 2.5 quota/cache evidence gate"]
+    }
+  ],
+  "wireGoldens": {
+    "capacityFailure": {
+      "input": {
+        "type": "error",
+        "sequence_number": 2,
+        "error": {
+          "type": "service_unavailable_error",
+          "code": "server_is_overloaded",
+          "message": "Our servers are currently overloaded. Please try again later.",
+          "param": null,
+          "details": {
+            "reason": "bootstrap_capacity",
+            "retry": {"class": "same_account", "opaque": [1, 2, 3]}
+          }
+        }
+      },
+      "expected": {
+        "type": "error",
+        "sequence_number": 2,
+        "error": {
+          "type": "service_unavailable_error",
+          "code": "server_error",
+          "message": "Our servers are currently overloaded. Please try again later.",
+          "param": null,
+          "details": {
+            "reason": "bootstrap_capacity",
+            "retry": {"class": "same_account", "opaque": [1, 2, 3]}
+          }
+        }
+      }
+    },
+    "successfulFrames": [
+      {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp_fixture", "status": "in_progress"}
+      },
+      {
+        "type": "response.output_item.added",
+        "sequence_number": 1,
+        "output_index": 0,
+        "item": {
+          "type": "function_call",
+          "call_id": "call_fixture",
+          "name": "lookup",
+          "arguments": "{}"
+        }
+      },
+      {
+        "type": "response.completed",
+        "sequence_number": 2,
+        "response": {"id": "resp_fixture", "status": "completed", "output": []}
+      }
+    ],
+    "namedToolOutputRequest": {
+      "type": "response.create",
+      "model": "gpt-5.4",
+      "input": [
+        {
+          "type": "function_call_output",
+          "name": "lookup",
+          "output": "fixture result"
+        }
+      ]
+    },
+    "websocketHttpFallback": {
+      "allowedOnlyBeforeResponseCreateSent": true,
+      "sameProvider": true,
+      "sameAccount": true,
+      "sharedAttemptBudget": true,
+      "postCommitReplay": false,
+      "handshakeFallbackStatuses": [500, 502, 503, 504],
+      "handshakeNoFallbackStatuses": [400, 401, 403, 429]
+    }
+  }
+}

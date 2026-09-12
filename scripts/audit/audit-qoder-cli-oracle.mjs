@@ -509,6 +509,7 @@ function auditReceipt(receipt) {
   const forbidden = uniqueSortedStrings(receipt.forbiddenFields, "receipt.forbiddenFields");
   const zero = uniqueSortedStrings(receipt.successRequiresZero, "receipt.successRequiresZero");
   for (const field of [
+    "acceptanceChecks",
     "site",
     "credentialRail",
     "authIdentityGeneration",

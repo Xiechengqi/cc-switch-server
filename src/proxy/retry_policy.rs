@@ -8,31 +8,6 @@ pub(super) enum AuthRecoveryDecision {
     ReturnUnauthorized,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct AuthRecoveryState {
-    attempted: bool,
-}
-
-impl AuthRecoveryState {
-    pub(super) fn decide(
-        &mut self,
-        status: StatusCode,
-        provider_type: ProviderType,
-        replay_allowed: bool,
-    ) -> Option<AuthRecoveryDecision> {
-        let decision =
-            unauthorized_recovery_decision(status, provider_type, self.attempted, replay_allowed)?;
-        if decision == AuthRecoveryDecision::RefreshAndReplaySameBinding {
-            self.attempted = true;
-        }
-        Some(decision)
-    }
-
-    pub(super) fn attempted(self) -> bool {
-        self.attempted
-    }
-}
-
 pub(super) fn unauthorized_recovery_decision(
     status: StatusCode,
     provider_type: ProviderType,
@@ -86,14 +61,17 @@ mod tests {
             ProviderType::CursorApiKey,
             ProviderType::KimiCode,
         ] {
-            let mut state = AuthRecoveryState::default();
             assert_eq!(
-                state.decide(StatusCode::UNAUTHORIZED, provider_type, true),
+                unauthorized_recovery_decision(
+                    StatusCode::UNAUTHORIZED,
+                    provider_type,
+                    false,
+                    true,
+                ),
                 Some(AuthRecoveryDecision::RefreshAndReplaySameBinding)
             );
-            assert!(state.attempted());
             assert_eq!(
-                state.decide(StatusCode::UNAUTHORIZED, provider_type, true),
+                unauthorized_recovery_decision(StatusCode::UNAUTHORIZED, provider_type, true, true,),
                 Some(AuthRecoveryDecision::ReturnUnauthorized)
             );
         }
@@ -101,18 +79,31 @@ mod tests {
 
     #[test]
     fn recovery_requires_unauthorized_status_and_replayable_request() {
-        let mut state = AuthRecoveryState::default();
         assert_eq!(
-            state.decide(StatusCode::FORBIDDEN, ProviderType::ClaudeOAuth, true),
+            unauthorized_recovery_decision(
+                StatusCode::FORBIDDEN,
+                ProviderType::ClaudeOAuth,
+                false,
+                true,
+            ),
             None
         );
         assert_eq!(
-            state.decide(StatusCode::UNAUTHORIZED, ProviderType::ClaudeOAuth, false),
+            unauthorized_recovery_decision(
+                StatusCode::UNAUTHORIZED,
+                ProviderType::ClaudeOAuth,
+                false,
+                false,
+            ),
             Some(AuthRecoveryDecision::ReturnUnauthorized)
         );
-        assert!(!state.attempted());
         assert_eq!(
-            state.decide(StatusCode::UNAUTHORIZED, ProviderType::Claude, true),
+            unauthorized_recovery_decision(
+                StatusCode::UNAUTHORIZED,
+                ProviderType::Claude,
+                false,
+                true,
+            ),
             Some(AuthRecoveryDecision::ReturnUnauthorized)
         );
     }

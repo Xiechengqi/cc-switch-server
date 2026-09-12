@@ -1,0 +1,136 @@
+{
+  "format": "cc-switch-codebuddy-reference-delta",
+  "schemaVersion": 1,
+  "policy": {
+    "scope": "single bound Provider/Share/Account and immutable site; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no domain fallback, no cross-account fallback, no cross-Provider fallback",
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "liveEvidence": "Intl and CN require separate complete real receipts; fixture success never upgrades either site"
+  },
+  "sources": [
+    {
+      "id": "cli2api-empty-messages",
+      "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/cli2api",
+      "commit": "e5893f0864149caef4c3b9752454190e45875c33",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/payload.go",
+          "sha256": "65c889afb034791146c4c984e8248fde81eeea7cdd190f41e3204a3a53169f31"
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "9c14b7fc6f9d6b76c79cef440988e19256d2aefda775ef7d200a3f0c412bba1b"
+        }
+      ]
+    },
+    {
+      "id": "cli2api-empty-deltas",
+      "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/cli2api",
+      "commit": "32aa108b7442cf168c1606d19f9691feafbc116c",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/sse.go",
+          "sha256": "e61d969264e83f23e6ccaed3b07c4e50d2b10cc50733d86f79e15a88723d6725"
+        },
+        {
+          "path": "internal/providers/workbuddy/client.go",
+          "sha256": "b3924fdd18b174968df3b1d8cf7d1d6bbf73d9f504765a75903f6142571b094c"
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "f8f9254e26ce0cc1f23be1ee060617c09b452e97979c8e999c985a569c4167e0"
+        }
+      ]
+    }
+  ],
+  "registryTruth": {
+    "driverId": "special.codebuddy_oauth",
+    "driverContractRevision": 2,
+    "operations": {
+      "forward": "supported",
+      "test": "supported",
+      "discovery": "supported",
+      "connectivity": "supported"
+    },
+    "conformance": {
+      "forward": "fixture_verified",
+      "test": "fixture_verified",
+      "discovery": "fixture_verified"
+    }
+  },
+  "capabilities": [
+    {
+      "id": "CB-01",
+      "status": "fixture_verified",
+      "path": "src/proxy/codebuddy_runtime.rs",
+      "anchors": [
+        "messages.retain(codebuddy_message_is_semantic)",
+        "fn codebuddy_message_is_semantic(",
+        "payload_drops_empty_messages_but_preserves_tool_protocol_history"
+      ]
+    },
+    {
+      "id": "CB-02",
+      "status": "fixture_verified",
+      "path": "src/proxy/codebuddy.rs",
+      "anchors": [
+        "fn sanitize_codebuddy_stream_chunk(",
+        "fn dummy_function_call(",
+        "decoder_drops_empty_deltas_and_preserves_semantic_stream_fields"
+      ]
+    },
+    {
+      "id": "CB-03",
+      "status": "fixture_verified",
+      "path": "src/proxy/codebuddy_runtime.rs",
+      "anchors": [
+        "fn normalize_codebuddy_tools_and_choice(",
+        "CodeBuddy tool_choice string must be none, auto, or required",
+        "payload_normalizes_empty_none_and_attached_tool_choices"
+      ]
+    },
+    {
+      "id": "CB-04",
+      "status": "live_pending",
+      "path": "docs/provider/codebuddy-oauth.md",
+      "anchors": [
+        "fixture_verified / live_pending",
+        "Intl/CN 两站真实订阅"
+      ]
+    }
+  ],
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "sites": [
+      {
+        "site": "cn",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "site": "intl",
+        "status": "live_pending",
+        "receipt": null
+      }
+    ],
+    "requiredChecks": [
+      "oauth_login_cookie_flow",
+      "refresh_rotation_and_jitter",
+      "session_dead_12153",
+      "fresh_catalog",
+      "authoritative_empty_catalog",
+      "billing_quota",
+      "claude_empty_payload_and_stream",
+      "codex_empty_payload_and_stream",
+      "gemini_empty_payload_and_stream",
+      "tool_history_and_choice_matrix",
+      "strict_terminal_then_eof",
+      "same_account_first_401_recovery",
+      "second_401_terminal",
+      "site_account_provider_generation_digest",
+      "decoy_zero_request_counts",
+      "secret_scan"
+    ]
+  }
+}

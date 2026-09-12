@@ -11,7 +11,7 @@ use super::copilot_optimizer::{
 };
 use super::request_governance::{govern_request_body, RequestGovernanceConfig};
 use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
-use super::tool_schema::normalize_gemini_tool_schemas;
+use super::tool_schema::{normalize_antigravity_request_schemas, normalize_gemini_tool_schemas};
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::store::{Account, AccountStore};
@@ -113,6 +113,10 @@ pub struct AdapterRequest {
     pub stream_requested: bool,
     /// Whether the selected upstream transport must be streaming.
     pub upstream_stream_requested: bool,
+    /// The original downstream OpenAI-compatible request explicitly asked for
+    /// the optional trailing usage chunk. This is captured before protocol
+    /// translation or forced upstream streaming can rewrite `stream_options`.
+    pub downstream_include_usage: bool,
     pub custom_tool_names: BTreeSet<String>,
     pub(crate) responses_tool_context: transforms::ResponsesToolContext,
     pub claude_tool_name_map: BTreeMap<String, String>,
@@ -243,6 +247,7 @@ impl GenericForwardingAdapter {
         let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
         let custom_tool_names = responses_tool_context.custom_tool_names();
         let downstream_stream_requested = is_stream_requested(&body);
+        let downstream_include_usage = stream_include_usage_requested(&body);
         let cache_config = cache_injection_config(stored);
         let thinking_config = thinking_pipeline_config(stored);
         let governance_config = request_governance_config(stored);
@@ -292,6 +297,7 @@ impl GenericForwardingAdapter {
             gemini_action: None,
             stream_requested,
             upstream_stream_requested: stream_requested,
+            downstream_include_usage,
             upstream_headers,
             custom_tool_names,
             responses_tool_context,
@@ -497,6 +503,7 @@ pub(crate) fn cursor_agentservice_request(
     let body = maybe_inject_gemini_route_model(body, route, gemini_path)?;
     let downstream_stream_requested =
         is_stream_requested(&body) || route_implies_stream(route, gemini_path);
+    let downstream_include_usage = stream_include_usage_requested(&body);
     let governance_config = request_governance_config(stored);
     let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
     let custom_tool_names = responses_tool_context.custom_tool_names();
@@ -517,6 +524,7 @@ pub(crate) fn cursor_agentservice_request(
         gemini_action: None,
         stream_requested,
         upstream_stream_requested: stream_requested,
+        downstream_include_usage,
         custom_tool_names,
         responses_tool_context,
         claude_tool_name_map: Default::default(),
@@ -2423,7 +2431,11 @@ fn sanitize_gemini_v1internal_request(
             "Gemini v1internal request must be a JSON object",
         ));
     }
-    normalize_gemini_tool_schemas(value);
+    if inject_antigravity_identity {
+        normalize_antigravity_request_schemas(value);
+    } else {
+        normalize_gemini_tool_schemas(value);
+    }
     let object = value.as_object_mut().ok_or_else(|| {
         ProxyError::bad_request("Gemini v1internal request must be a JSON object")
     })?;
@@ -4288,6 +4300,17 @@ fn ensure_stream_enabled(
         .map_err(|error| ProxyError::bad_request(format!("request stream encode failed: {error}")))
 }
 
+fn stream_include_usage_requested(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/stream_options/include_usage")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5387,6 +5410,7 @@ mod tests {
             gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: true,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -5871,6 +5895,43 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ping")
         );
+    }
+
+    #[test]
+    fn claude_chat_bridge_captures_downstream_usage_opt_in_before_translation() {
+        let adapter = adapter_for(AppKind::Codex, ProviderType::Claude);
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Claude,
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_API_KEY": "secret"
+                }
+            }),
+        );
+
+        for (include_usage, expected) in [(true, true), (false, false)] {
+            let request = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        serde_json::to_vec(&json!({
+                            "model": "claude-sonnet-4",
+                            "messages": [{"role":"user","content":"ping"}],
+                            "stream": true,
+                            "stream_options": {"include_usage": include_usage}
+                        }))
+                        .unwrap(),
+                    ),
+                    &stored,
+                    ProxyRoute::CodexChatCompletions,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(request.downstream_include_usage, expected);
+            let upstream: Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(upstream.get("stream_options").is_none());
+        }
     }
 
     #[test]
@@ -8208,6 +8269,7 @@ mod tests {
             gemini_action: None,
             stream_requested: true,
             upstream_stream_requested: true,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -8280,6 +8342,7 @@ mod tests {
             gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -8394,6 +8457,7 @@ mod tests {
             gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -8508,6 +8572,7 @@ mod tests {
             gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),
@@ -8676,6 +8741,7 @@ mod tests {
             gemini_action: None,
             stream_requested: false,
             upstream_stream_requested: false,
+            downstream_include_usage: false,
             custom_tool_names: Default::default(),
             responses_tool_context: Default::default(),
             claude_tool_name_map: Default::default(),

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use bytes::Bytes;
+use rand::RngCore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use twox_hash::XxHash64;
@@ -18,7 +19,8 @@ use crate::domain::claude_cli::{
 };
 
 use super::anthropic_cache_control::{
-    normalize_anthropic_cache_control, reconcile_forced_tool_choice,
+    has_extended_cache_ttl, normalize_anthropic_cache_control, reconcile_forced_tool_choice,
+    strip_extended_cache_ttls,
 };
 use super::anthropic_dateline::{dateline_normalization_enabled, normalize_anthropic_dateline};
 use super::claude_client_detection::{detect_claude_client, ClaudeClientClass};
@@ -254,6 +256,17 @@ fn apply_forward_contract_inner(
             beta_operation,
             client_class,
         );
+        if client_class.is_confirmed_native()
+            && !native_extended_cache_ttl_allowed(
+                client_headers,
+                Some(&value),
+                &internal_betas,
+                beta_operation,
+                client_class,
+            )
+        {
+            strip_extended_cache_ttls(&mut value);
+        }
         if is_count_tokens {
             remove_generation_fields_for_count_tokens(&mut value);
         }
@@ -262,6 +275,12 @@ fn apply_forward_contract_inner(
                 &mut value,
                 !client_class.is_confirmed_native() && !is_count_tokens,
             );
+        }
+        if client_class.is_confirmed_native()
+            && !is_count_tokens
+            && hoist_leading_text_system_messages(&mut value)
+        {
+            crate::metrics::record_claude_optional_rewrite("leading_system_hoist");
         }
         value = finalize_claude_cch(value);
         body_shape = Some(value.clone());
@@ -275,6 +294,7 @@ fn apply_forward_contract_inner(
         session_id.as_deref(),
         identity_seed,
         body_shape.as_ref(),
+        url,
     );
     headers.push((
         "anthropic-beta",
@@ -299,6 +319,78 @@ fn apply_forward_contract_inner(
         session_id,
         tool_name_map,
     })
+}
+
+/// Native Claude Code requests may opt into mid-conversation system turns, but
+/// Anthropic still rejects text-bearing system/developer messages before the
+/// first real turn. Hoist only that leading text run. Empty directive messages
+/// and all system messages after the first user/assistant turn keep their
+/// existing position and semantics.
+fn hoist_leading_text_system_messages(body: &mut Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+
+    let mut hoisted = Vec::new();
+    let mut retained_leading = Vec::new();
+    let mut run_end = 0;
+    for message in messages {
+        if !message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| {
+                role.eq_ignore_ascii_case("system") || role.eq_ignore_ascii_case("developer")
+            })
+        {
+            break;
+        }
+        run_end += 1;
+        let mut found_text = false;
+        match message.get("content") {
+            Some(Value::String(text)) if !text.is_empty() => {
+                hoisted.push(serde_json::json!({"type": "text", "text": text}));
+                found_text = true;
+            }
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                    {
+                        hoisted.push(block.clone());
+                        found_text = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !found_text {
+            retained_leading.push(message.clone());
+        }
+    }
+    if hoisted.is_empty() {
+        return false;
+    }
+
+    let mut system = match body.get("system") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![serde_json::json!({"type": "text", "text": text})]
+        }
+        Some(Value::Array(blocks)) => blocks.clone(),
+        _ => Vec::new(),
+    };
+    system.extend(hoisted);
+
+    let mut next_messages = retained_leading;
+    next_messages.extend(messages.iter().skip(run_end).cloned());
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    object.insert("system".to_string(), Value::Array(system));
+    object.insert("messages".to_string(), Value::Array(next_messages));
+    true
 }
 
 fn normalize_claude_oauth_tool_names(
@@ -696,8 +788,30 @@ fn claude_forward_headers(
     session_id: Option<&str>,
     identity_seed: &str,
     body: Option<&Value>,
+    upstream_url: &str,
 ) -> Vec<(&'static str, String)> {
     let mut headers = claude_cli_headers(session_id, identity_seed, body);
+    let incoming_request_id = client_headers
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256);
+    if is_first_party_anthropic_url(upstream_url) {
+        headers.push((
+            "x-client-request-id",
+            if client_class.is_confirmed_native() {
+                incoming_request_id
+                    .map(str::to_string)
+                    .unwrap_or_else(random_uuid_v4)
+            } else {
+                random_uuid_v4()
+            },
+        ));
+    } else if client_class == ClaudeClientClass::NativeHelper {
+        if let Some(request_id) = incoming_request_id {
+            headers.push(("x-client-request-id", request_id.to_string()));
+        }
+    }
     if !client_class.is_confirmed_native() {
         return headers;
     }
@@ -731,6 +845,39 @@ fn claude_forward_headers(
         }
     }
     headers
+}
+
+fn is_first_party_anthropic_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com"))
+}
+
+fn random_uuid_v4() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 fn ensure_claude_oauth_beta_query(url: &str) -> String {
@@ -1370,7 +1517,14 @@ fn build_anthropic_beta_value_for_class(
     client_class: ClaudeClientClass,
 ) -> String {
     if client_class.is_confirmed_native() {
-        return native_passthrough_betas(headers, body, internal_betas, is_claude_oauth, operation);
+        return native_passthrough_betas(
+            headers,
+            body,
+            internal_betas,
+            is_claude_oauth,
+            operation,
+            client_class,
+        );
     }
 
     let requested = requested_anthropic_betas(headers, internal_betas);
@@ -1503,8 +1657,11 @@ fn native_passthrough_betas(
     internal_betas: &[String],
     is_claude_oauth: bool,
     operation: ClaudeBetaOperation,
+    client_class: ClaudeClientClass,
 ) -> String {
     let mut betas = Vec::new();
+    let extended_cache_ttl_allowed =
+        native_extended_cache_ttl_allowed(headers, body, internal_betas, operation, client_class);
     for beta in requested_anthropic_betas(headers, internal_betas) {
         let shape_matches = match beta.as_str() {
             SERVER_SIDE_FALLBACK_ARRAY_BETA | SERVER_SIDE_FALLBACK_DEFAULT_BETA => body
@@ -1515,7 +1672,8 @@ fn native_passthrough_betas(
             REDACT_THINKING_BETA => !body.is_some_and(body_has_thinking_display),
             _ => true,
         };
-        if native_beta_allowed(&beta, operation) && shape_matches {
+        let cache_shape_matches = beta != EXTENDED_CACHE_TTL_BETA || extended_cache_ttl_allowed;
+        if native_beta_allowed(&beta, operation) && shape_matches && cache_shape_matches {
             push_beta(&mut betas, &beta);
         } else {
             crate::metrics::record_claude_beta_decision(operation.as_str(), "dropped_unknown");
@@ -1531,10 +1689,152 @@ fn native_passthrough_betas(
     if is_claude_oauth
         && operation == ClaudeBetaOperation::Messages
         && current_beta_profile_enabled()
+        && extended_cache_ttl_allowed
     {
         push_beta(&mut betas, EXTENDED_CACHE_TTL_BETA);
     }
     betas.join(",")
+}
+
+fn native_extended_cache_ttl_allowed(
+    headers: &HeaderMap,
+    body: Option<&Value>,
+    internal_betas: &[String],
+    operation: ClaudeBetaOperation,
+    client_class: ClaudeClientClass,
+) -> bool {
+    if operation != ClaudeBetaOperation::Messages || client_class == ClaudeClientClass::NativeHelper
+    {
+        return false;
+    }
+    let Some(body) = body else {
+        return true;
+    };
+    if is_claude_probe_or_title_helper(body) {
+        return false;
+    }
+    if !is_claude_subagent_request(headers, body) {
+        return true;
+    }
+    has_extended_cache_ttl(body)
+        || requested_anthropic_betas(headers, internal_betas)
+            .iter()
+            .any(|beta| beta == EXTENDED_CACHE_TTL_BETA)
+}
+
+fn is_claude_subagent_request(headers: &HeaderMap, body: &Value) -> bool {
+    for name in ["x-claude-code-agent-id", "x-claude-code-parent-agent-id"] {
+        if headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return true;
+        }
+    }
+    let first_system_text = match body.get("system") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(Value::Array(blocks)) => blocks
+            .first()
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    first_system_text.is_some_and(|text| text.contains("cc_is_subagent=true"))
+}
+
+fn is_claude_probe_or_title_helper(body: &Value) -> bool {
+    if is_claude_probe_request(body) {
+        return true;
+    }
+    let title_schema = body
+        .pointer("/output_config/format/schema/properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.len() == 1 && properties.contains_key("title"));
+    title_schema && body_has_title_helper_instruction(body)
+}
+
+fn is_claude_probe_request(body: &Value) -> bool {
+    if body.get("max_tokens").and_then(Value::as_u64) != Some(1)
+        || body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return false;
+    }
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return true;
+    };
+    if messages.is_empty() {
+        return true;
+    }
+    if messages.len() != 1 || messages[0].get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match messages[0].get("content") {
+        Some(Value::String(text)) => matches!(text.trim(), "quota" | "test" | "." | "probe"),
+        Some(Value::Array(blocks)) => {
+            let mut matched = false;
+            let mut ordinary = 0;
+            for block in blocks {
+                let Some(text) = block.get("text").and_then(Value::as_str).map(str::trim) else {
+                    continue;
+                };
+                if text.contains("<system-reminder>") {
+                    continue;
+                }
+                ordinary += 1;
+                matched |= matches!(text, "quota" | "test" | "." | "probe")
+                    || (text == "Hi" && block.get("cache_control").is_some());
+            }
+            ordinary == 1 && matched
+        }
+        _ => false,
+    }
+}
+
+fn body_has_title_helper_instruction(body: &Value) -> bool {
+    fn matches(text: &str) -> bool {
+        [
+            "Return a short title",
+            "naming a coding session",
+            "Write the title in the predominant language",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    }
+    match body.get("system") {
+        Some(Value::String(text)) if matches(text) => return true,
+        Some(Value::Array(blocks))
+            if blocks.iter().any(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(matches)
+            }) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && match message.get("content") {
+                        Some(Value::String(text)) => matches(text),
+                        Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(matches)
+                        }),
+                        _ => false,
+                    }
+            })
+        })
 }
 
 fn native_beta_allowed(beta: &str, operation: ClaudeBetaOperation) -> bool {
@@ -1623,19 +1923,6 @@ fn body_has_effort(body: &Value) -> bool {
     body.pointer("/output_config/effort")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn body_has_extended_cache_ttl(body: &Value) -> bool {
-    match body {
-        Value::Array(items) => items.iter().any(body_has_extended_cache_ttl),
-        Value::Object(object) => {
-            object
-                .get("cache_control")
-                .is_some_and(|cache| cache.get("ttl").and_then(Value::as_str) == Some("1h"))
-                || object.values().any(body_has_extended_cache_ttl)
-        }
-        _ => false,
-    }
 }
 
 fn body_has_streaming_tools(body: &Value) -> bool {
@@ -2130,6 +2417,302 @@ mod tests {
             claude_cache_control_for_ttl(Some("1h")),
             json!({"type": "ephemeral", "ttl": "1h"})
         );
+    }
+
+    #[test]
+    fn native_leading_string_system_is_hoisted_without_moving_mid_conversation_system() {
+        let mut body = json!({
+            "system": "existing",
+            "messages": [
+                {"role": "system", "content": "leading"},
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "keep in place"},
+                {"role": "assistant", "content": "answer"}
+            ]
+        });
+
+        assert!(hoist_leading_text_system_messages(&mut body));
+        assert_eq!(
+            body["system"],
+            json!([
+                {"type": "text", "text": "existing"},
+                {"type": "text", "text": "leading"}
+            ])
+        );
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "keep in place");
+    }
+
+    #[test]
+    fn native_leading_block_system_preserves_block_metadata_and_existing_blocks() {
+        let mut body = json!({
+            "system": [{"type": "text", "text": "existing", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [
+                {"role": "developer", "content": [
+                    {"type": "text", "text": "leading", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        assert!(hoist_leading_text_system_messages(&mut body));
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
+        assert_eq!(body["system"][1]["text"], "leading");
+        assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_leading_directives_remain_while_text_is_hoisted() {
+        let directive = json!({
+            "role": "system",
+            "content": [],
+            "output_config": {"effort": "high"}
+        });
+        let mut body = json!({
+            "messages": [
+                directive.clone(),
+                {"role": "system", "content": [{"type": "text", "text": "style"}]},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        assert!(hoist_leading_text_system_messages(&mut body));
+        assert_eq!(body["system"], json!([{"type": "text", "text": "style"}]));
+        assert_eq!(body["messages"][0], directive);
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn native_user_first_system_hoist_is_a_value_identical_noop() {
+        let mut body = json!({
+            "system": [{"type": "text", "text": "existing"}],
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "mid"}
+            ]
+        });
+        let original = body.clone();
+
+        assert!(!hoist_leading_text_system_messages(&mut body));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn native_leading_system_hoist_runs_before_final_cch_signature() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
+        headers.insert(
+            "user-agent",
+            axum::http::HeaderValue::from_static("claude-cli/2.1.258 (external, cli, linux-x64)"),
+        );
+        headers.insert(
+            "x-stainless-package-version",
+            axum::http::HeaderValue::from_static("0.112.1"),
+        );
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(CLAUDE_CODE_BETA),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli; cch=00000;"}],"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"system","content":[{"type":"text","text":"style","cache_control":{"type":"ephemeral","ttl":"1h"}}]},{"role":"user","content":"hi"}]}"#,
+        );
+
+        apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["system"][1]["text"], "style");
+        assert_eq!(value["system"][1]["cache_control"]["ttl"], "1h");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(sign_claude_oauth_messages_body(value.clone()), value);
+    }
+
+    #[test]
+    fn claude_request_category_cache_matrix_preserves_only_supported_one_hour_requests() {
+        const HELPER_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+        struct Case {
+            name: &'static str,
+            beta: &'static str,
+            subagent: bool,
+            count_tokens: bool,
+            body: Value,
+            expect_extended_beta: bool,
+            expect_one_hour_body: bool,
+        }
+        let native_metadata = json!({"user_id": "user_a_account__session_abc"});
+        let cases = vec![
+            Case {
+                name: "main_non_stream_explicit_1h_header_beta",
+                beta: "claude-code-20250219,extended-cache-ttl-2025-04-11",
+                subagent: false,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "stream": false,
+                    "metadata": native_metadata.clone(),
+                    "messages": [{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]
+                }),
+                expect_extended_beta: true,
+                expect_one_hour_body: true,
+            },
+            Case {
+                name: "main_stream_explicit_5m",
+                beta: "claude-code-20250219",
+                subagent: false,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "stream": true,
+                    "metadata": native_metadata.clone(),
+                    "messages": [{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"5m"}}]}]
+                }),
+                expect_extended_beta: true,
+                expect_one_hour_body: false,
+            },
+            Case {
+                name: "subagent_stream_explicit_1h",
+                beta: "claude-code-20250219,extended-cache-ttl-2025-04-11",
+                subagent: true,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "stream": true,
+                    "metadata": native_metadata.clone(),
+                    "messages": [{"role":"user","content":[{"type":"text","text":"task","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]
+                }),
+                expect_extended_beta: true,
+                expect_one_hour_body: true,
+            },
+            Case {
+                name: "subagent_non_stream_default_5m",
+                beta: "claude-code-20250219",
+                subagent: true,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "stream": false,
+                    "metadata": native_metadata.clone(),
+                    "messages": [{"role":"user","content":[{"type":"text","text":"task","cache_control":{"type":"ephemeral"}}]}]
+                }),
+                expect_extended_beta: false,
+                expect_one_hour_body: false,
+            },
+            Case {
+                name: "probe_strips_explicit_1h",
+                beta: "claude-code-20250219,extended-cache-ttl-2025-04-11",
+                subagent: false,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "max_tokens": 1,
+                    "metadata": native_metadata.clone(),
+                    "system": [{"type":"text","text":"probe","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+                    "messages": [{"role":"user","content":"probe"}]
+                }),
+                expect_extended_beta: false,
+                expect_one_hour_body: false,
+            },
+            Case {
+                name: "helper_strips_explicit_1h",
+                beta: HELPER_BETA,
+                subagent: false,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-haiku-4-5-20251001", "max_tokens": 1024,
+                    "metadata": native_metadata.clone(),
+                    "system": [{"type":"text","text":"classify","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+                    "messages": [{"role":"user","content":"classify"}]
+                }),
+                expect_extended_beta: false,
+                expect_one_hour_body: false,
+            },
+            Case {
+                name: "count_tokens_strips_generation_only_1h",
+                beta: "claude-code-20250219,extended-cache-ttl-2025-04-11",
+                subagent: false,
+                count_tokens: true,
+                body: json!({
+                    "model": "claude-sonnet-5",
+                    "system": [{"type":"text","text":"count","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+                    "messages": [{"role":"user","content":"count"}]
+                }),
+                expect_extended_beta: false,
+                expect_one_hour_body: false,
+            },
+            Case {
+                name: "third_party_body_beta_stream",
+                beta: "",
+                subagent: false,
+                count_tokens: false,
+                body: json!({
+                    "model": "claude-sonnet-5", "stream": true,
+                    "betas": ["extended-cache-ttl-2025-04-11"],
+                    "tools": [{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],
+                    "messages": [{"role":"user","content":"hi"}]
+                }),
+                expect_extended_beta: true,
+                expect_one_hour_body: true,
+            },
+        ];
+
+        for case in cases {
+            let mut headers = HeaderMap::new();
+            if !case.beta.is_empty() {
+                headers.insert(
+                    "anthropic-beta",
+                    axum::http::HeaderValue::from_str(case.beta).unwrap(),
+                );
+            }
+            if case.name != "third_party_body_beta_stream" {
+                headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
+                headers.insert(
+                    "user-agent",
+                    axum::http::HeaderValue::from_static(
+                        "claude-cli/2.1.258 (external, cli, linux-x64)",
+                    ),
+                );
+            }
+            if case.subagent {
+                headers.insert(
+                    "x-claude-code-agent-id",
+                    axum::http::HeaderValue::from_static("agent-sub-123"),
+                );
+            }
+            let mut url = if case.count_tokens {
+                "https://api.anthropic.com/v1/messages/count_tokens".to_string()
+            } else {
+                "https://api.anthropic.com/v1/messages".to_string()
+            };
+            let mut body = Bytes::from(serde_json::to_vec(&case.body).unwrap());
+            let contract = if case.count_tokens {
+                apply_count_tokens_forward_contract(
+                    &mut url,
+                    &mut body,
+                    &headers,
+                    "account-matrix",
+                    false,
+                )
+            } else {
+                apply_forward_contract(&mut url, &mut body, &headers, "account-matrix", false, None)
+            }
+            .unwrap_or_else(|error| panic!("{}: {}", case.name, error.message));
+            let outbound: Value = serde_json::from_slice(&body).unwrap();
+            let beta = contract
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "anthropic-beta")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                beta.split(',').any(|item| item == EXTENDED_CACHE_TTL_BETA),
+                case.expect_extended_beta,
+                "{} beta={beta}",
+                case.name
+            );
+            assert_eq!(
+                has_extended_cache_ttl(&outbound),
+                case.expect_one_hour_body,
+                "{} body={outbound}",
+                case.name
+            );
+            assert!(outbound.get("betas").is_none(), "{}", case.name);
+        }
     }
 
     #[test]
@@ -3093,6 +3676,72 @@ mod tests {
         assert!(helper_body.get("system").is_none());
         assert!(helper_body.get("tools").is_none());
         assert_eq!(helper_body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn helper_request_id_follows_the_actual_upstream_base() {
+        const HELPER_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+        const NATIVE_ID: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+        for (upstream, incoming_id, expected) in [
+            ("https://api.anthropic.com/v1/messages", None, "generated"),
+            ("https://gateway.example/v1/messages", None, "absent"),
+            (
+                "https://gateway.example/v1/messages",
+                Some(NATIVE_ID),
+                "preserved",
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
+            headers.insert(
+                "user-agent",
+                axum::http::HeaderValue::from_static(
+                    "claude-cli/2.1.258 (external, cli, linux-x64)",
+                ),
+            );
+            headers.insert(
+                "anthropic-beta",
+                axum::http::HeaderValue::from_static(HELPER_BETA),
+            );
+            if let Some(incoming_id) = incoming_id {
+                headers.insert(
+                    "x-client-request-id",
+                    axum::http::HeaderValue::from_static(incoming_id),
+                );
+            }
+            let mut url = upstream.to_string();
+            let mut body = Bytes::from_static(
+                br#"{"model":"claude-haiku-4-5-20251001","max_tokens":1024,"metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"user","content":"classify"}]}"#,
+            );
+            let contract = apply_forward_contract(
+                &mut url,
+                &mut body,
+                &headers,
+                "account-helper",
+                false,
+                None,
+            )
+            .unwrap();
+            let request_id = contract
+                .headers
+                .iter()
+                .find_map(|(name, value)| (*name == "x-client-request-id").then_some(value));
+            match expected {
+                "generated" => {
+                    let request_id = request_id.expect("first-party helper request id");
+                    assert_eq!(request_id.len(), 36);
+                    assert_eq!(request_id.as_bytes()[14], b'4');
+                    assert!(matches!(
+                        request_id.as_bytes()[19],
+                        b'8' | b'9' | b'a' | b'b'
+                    ));
+                }
+                "preserved" => assert_eq!(request_id.map(String::as_str), Some(NATIVE_ID)),
+                "absent" => assert!(request_id.is_none()),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

@@ -383,6 +383,17 @@ test("Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts i
         const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
         assert.equal(receipt.verificationState, "contract_verified");
         assert.equal(receipt.liveState, "live_pending");
+        assert.equal(receipt.acceptanceChecks.fresh_catalog, "pass");
+        assert.equal(receipt.acceptanceChecks.unique_terminal_then_eof, "pass");
+        for (const pending of [
+          "login_or_pat_import",
+          "refresh_rotation_or_job_token_exchange",
+          "authoritative_empty_catalog",
+          "same_account_first_401_recovery",
+          "second_401_terminal",
+        ]) {
+          assert.equal(receipt.acceptanceChecks[pending], "not_observed", pending);
+        }
         assert.equal(receipt.site, specs[rail].site);
         assert.equal(
           receipt.credentialRail,
@@ -438,6 +449,9 @@ test("Qoder real harness reports missing inputs as blocked_inputs/live_pending",
   assert.ok(output.missingInputs.includes("QODER_REAL_RECEIPT_FILE"));
   assert.doesNotMatch(result.stdout, /live_verified/);
   assert.equal(result.stderr, "");
+  const source = fs.readFileSync(script, "utf8");
+  assert.match(source, /const liveState = "live_pending"/);
+  assert.doesNotMatch(source, /const liveState = .*live_verified/);
 });
 
 test("Qoder real harness fails closed on a mismatched bound Account before data-plane calls", async () => {

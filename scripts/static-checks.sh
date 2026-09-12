@@ -26,6 +26,14 @@ for (const file of [
   'assets/contract/server-provider-requirements.json',
   'assets/contract/provider-legacy-compatibility.json',
   'assets/contract/coding-plan-source-baseline.json',
+  'assets/contract/antigravity-reference-delta.json',
+  'assets/contract/claude-reference-delta.json',
+  'assets/contract/codebuddy-reference-delta.json',
+  'assets/contract/codex-reference-delta.json',
+  'assets/contract/cursor-reference-delta.json',
+  'assets/contract/grok-reference-delta.json',
+  'assets/contract/kiro-reference-delta.json',
+  'assets/contract/qoder-reference-delta.json',
   'assets/contract/coding-plan-registry-manifest.json',
   'assets/contract/web-session-source-baseline.json',
   'assets/contract/web-session-registry.json',
@@ -58,6 +66,16 @@ echo "== provider audits =="
 node --test scripts/audit/*.test.mjs
 node --test scripts/smoke/*.test.mjs
 node scripts/audit/audit-qoder-cli-oracle.mjs
+node scripts/audit/audit-antigravity-reference-delta.mjs
+node scripts/audit/audit-codebuddy-reference-delta.mjs
+node scripts/audit/audit-provider-conformance-evidence.mjs
+node scripts/audit/audit-server-sqlite-contract.mjs
+node scripts/audit/audit-claude-reference-delta.mjs
+node scripts/audit/audit-codex-reference-delta.mjs
+node scripts/audit/audit-cursor-reference-delta.mjs
+node scripts/audit/audit-grok-reference-delta.mjs
+node scripts/audit/audit-kiro-reference-delta.mjs
+node scripts/audit/audit-qoder-reference-delta.mjs
 node scripts/audit/audit-server-provider-contract.mjs
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check

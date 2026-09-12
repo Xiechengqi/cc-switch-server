@@ -491,6 +491,19 @@ impl UsageState {
 }
 
 impl UsageStore {
+    /// Rebuild the authoritative in-memory view from SQLite rows. SQLite owns
+    /// record durability after the Server-store authority switch, so the
+    /// legacy journal checkpoint is deliberately regenerated instead of being
+    /// treated as a second source of truth.
+    pub(crate) fn from_authoritative_logs(logs: Vec<UsageLog>) -> (Self, bool) {
+        let mut store = Self::default();
+        for log in logs {
+            store.push(log);
+        }
+        let recovered = store.recover_pending_after_restart();
+        (store, recovered)
+    }
+
     /// Returns the append-only journal waterline used to make quota rebase
     /// snapshots auditable.  A missing checkpoint is treated as zero for old
     /// in-memory/test stores.

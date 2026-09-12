@@ -17,12 +17,10 @@ pub(in crate::api) async fn create_backup(
 ) -> Result<Json<BackupCreateResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let reason = body.and_then(|Json(input)| input.reason);
-    let backup = crate::infra::backup::create_backup(
-        &state.config_dir,
-        &crate::state::backup_targets(&state.config_dir),
-        reason,
-    )
-    .map_err(ApiError::internal)?;
+    let backup = state
+        .create_consistent_backup(reason)
+        .await
+        .map_err(ApiError::internal)?;
     state.emit_event(
         ServerEvent::new("backup.created", "backup")
             .id(backup.id.clone())

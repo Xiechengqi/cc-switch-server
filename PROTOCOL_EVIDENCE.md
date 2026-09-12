@@ -19,6 +19,62 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-11 Antigravity replay, session, schema, and transport freeze
+
+本次只读差异研究冻结于 `assets/contract/antigravity-reference-delta.json`，对应 `CLIProxyAPI` commit `09a29bd345bc44c473abe7fd07859e32df2ea543` 与 `Antigravity-Manager` commit `85fb4fe688997d3a0c2930b7a202cf22f617b092`。外部源码只提供协议缺陷和边界的交叉证据，不进入本仓库构建、测试或运行时；默认审计只核对本地合同，人工运行 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才读取外部 Git object。冻结文件摘要为：
+
+- `CLIProxyAPI/internal/cache/antigravity_reasoning_replay_cache.go`：`76498bed74e737f02aa708567942301131ff3c163270a4d575ee31fc87ee452f`；
+- `CLIProxyAPI/internal/runtime/executor/antigravity_reasoning_replay.go`：`9c62466b0ba8e8435341f127953076406fd302dbf2e90428dc9f752db5381975`；
+- `CLIProxyAPI/internal/runtime/executor/antigravity_executor_request.go`：`6f3a0e28045944b807ca2cf92c0e503bd15ca9636d8cf6183387c7344aa468a6`；
+- `CLIProxyAPI/internal/util/gemini_schema.go`：`a824f1f36b0b3b5bbf16e5a629b4f37ba8a67e868645a1a1d7d554b70b0f4f74`；
+- `Antigravity-Manager/src-tauri/src/proxy/common/session.rs`：`7c4fb3c753b6c0ba85e7c0e79ed0e5faecc6d786f698f1649506d2e76c0abccc`。
+
+Server 独立实现只吸收四组有限事实：reasoning signature 需要 conversation/model 隔离并以 snapshot CAS 防并发覆盖；`request.sessionId` 必须按 conversation 派生，且只有精确的 1,048,576-token 累积上限错误允许同绑定升代重试一次；Antigravity 的 JSON Schema 接受集比通用 Gemini 方言更窄；连接池配置必须参与 client cache identity。实现进一步把 replay scope 扩展至 App、Provider revision/runtime、Account credential generations、Share、用户 namespace 与 upstream plane，所有恢复保持 pre-commit、同 Provider/Account 且预算有界。默认传输固定 HTTP/1.1 短连接；显式连接池按 credential scope 隔离，因此不声称或模拟 HTTP/2 GOAWAY 支持。
+
+`CLIProxyAPI@70f45604522282965247add17f6cce619876919b` 的 compaction 仅是风险证据。其 capsule 使用固定字符串派生 secret，且本仓库没有真实 Antigravity receipt 证明该 wire 能力，因此未吸收实现。Server 明确拒绝 Antigravity `/responses/compact` 和 `compaction_trigger`，状态保持 `live_pending`；未来只有在冻结真实 receipt 后，才可另行设计使用本仓库根密钥按用途派生、绑定 Provider/Account/session/model 的 versioned AEAD。离线 fixture 仅支持 `fixture_verified`，不表示真实 Google entitlement 或长流已经验收。
+
+## 2026-09-11 Claude differential contract freeze
+
+Claude 差异合同冻结在 `assets/contract/claude-reference-delta.json`。一次性只读证据包括 `OmniRoute@a3ca33fa6442` 的 leading text system、`CLIProxyAPI@6a73f396` 的请求类别缓存 TTL、`@a59b1764` 的 trailing usage、`@4f038099` 的 structured output、`@ef99119e` 的顺序 content block，以及 `@35a47238` 的 helper request id。baseline 固定每个提交的实现与测试文件 SHA-256；`node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 可在外部 checkout 可用时复核 Git object，但默认构建、测试和运行时不读取外部仓库。
+
+Server 的独立合同为：confirmed-native Messages 只提升首个真实 turn 前的 text-bearing system/developer，directive-only 与真实中段 system 原位保留，最终 CCH 在移动后重算；main native 可使用 1h cache，subagent 默认 5m 但保留显式 1h，probe/helper/count_tokens 不继承 generation-only extended TTL。Claude→OpenAI Chat 只在原始下游 `stream_options.include_usage=true` 时，于 finish chunk 后、`[DONE]` 前发一个 `choices: []` usage chunk；input/cache read/cache write/output 跨生命周期按字段合并，显式零保留，失败前局部 usage 仍进入唯一终态账单记录。
+
+OpenAI Chat/Responses→Claude 的 structured output 只在相应 `response_format` 或 `text.format` shape 上加入 Claude-scoped system instruction；普通 text/缺失 format 不改写。Chat→Anthropic 的 tool、text 与 reasoning block 始终严格顺序，后续交错内容或 tool 在当前 tool 关闭前有界保留并按 wire 次序释放。native helper 的 `x-client-request-id` 由真实 upstream base 决定：Anthropic first-party 缺值时生成 UUID v4，自定义 base 只保留客户端已有值而不凭空添加。以上 fixture 不引入通用兼容层、账号池、cloaking、跨账号或跨 Provider fallback；真实 Claude 账号仍为 `live_pending`。
+
+## 2026-09-11 Codex differential contract freeze
+
+Codex 差异合同冻结在 `assets/contract/codex-reference-delta.json`。一次性只读证据为 `CLIProxyAPI@e56abd56/@37ce368c` 的 Unicode schema/纯 const union、`@d1a024e9` 与 `codex2api@f5220891` 的 GPT Image 2.5、`CLIProxyAPI@25913086/@3ae9093d` 的 nested error/sequence/bootstrap overload，以及 `@bd03aabc` 的 prewarm/具名 tool output。基线记录完整 commit、文件路径与 SHA-256；`node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 只在人工要求时复核外部 Git object，默认构建、测试和运行时不读取外部工作树。
+
+Server 独立实现只吸收已能证明的正确性合同：工具 schema walker 仅进入 JSON Schema 关键字位置，并以 64 层、8192 节点和 1 MiB 保守字节预算 fail closed；只删除活动的 `\\p{`/`\\P{`（包括 `\\u005c` 绕过），大型 union 仅在所有分支为唯一、同类型、父类型兼容且无额外约束的纯 const 时变为 enum。Responses 同一 fixture 冻结 HTTP/SSE/WS 的 nested detail、sequence、首尾帧、具名无 call_id output 和 bootstrap overload；容量恢复与 WS→HTTP fallback 固定原 Provider/Account、只在 pre-commit 发生并共用总 attempt budget。
+
+GPT Image 2.5 三个 variant 不从外部项目的静态声明推导真实 entitlement。当前没有真实 receipt，因此 `gpt-image-2.5`、`-flare`、`-sunburst` 分别保持 `live_pending`，不发布到 registry/UI，Dedicated Images 在发网前失败关闭。WS prewarm 也因缺 upstream receipt 和 TTFB 基准保持未实现；2.5 专属 quota/cache 治理依赖同一真实门禁。没有迁入 codex2api 的商业计价、账号池、轮换、跨账号或跨 Provider fallback。
+
+## 2026-09-11 Cursor OmniRoute differential freeze
+
+Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。一次性只读证据只取 OmniRoute 提交 `a3ca33fa6442b59adc42976c795709eaf5351109` 的六个已提交 Git object；其工作树未提交内容明确排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。
+
+Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段语义、重复 field 27/URL 失败关闭、Connect frame 任意分片与 partial EOF、成功/错误 terminal envelope、plain EOF 失败关闭，以及 fresh `composer-2.5-fast` 必须保留完整 wire ID。公开模型选择入口已经存在，因此 registry `special.cursor` revision 4 将 discovery 与 forward/test 一并标为 supported/`fixture_verified`；OAuth 返回静态 aliases，API-key 目录保持 exact Provider/runtime/credential scope，成功空目录权威，transient stale 只用于展示。
+
+CUR-02 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识，receipt 只允许 rail、SHA-256 scope digest、状态、时间和 16 项完整 pass map。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
+
+## 2026-09-11 Grok reasoning replay/root-union differential freeze
+
+Grok 差异合同冻结在 `assets/contract/grok-reference-delta.json`。一次性只读证据只取 `grok2api@8913b53fe92307a6f111b2885ab298a43c74a9ba` 的七个已提交 Git object，并以 SHA-256 固定 conversation reasoning cache、明确 decode rejection recovery 和 Build tool root-union adapter；历史 delta 仅记录 `8641a782`、`ca392e68`、`7d1b4246`、`3de758e7`、`22ac653a`、`72a3a347`、`5d19ccff`、`e5285ebe`。外部工作树未提交内容和 `sub2api` 的账号池、路由、fallback 都被排除；默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核只读 Git object。
+
+Server 的独立实现把 replay scope 固定到 Provider revision/runtime、Account auth/token generation、Share、签名用户、session/turn、model family、HTTP/WS rail 和 upstream plane；有界 cache 使用 CAS/tombstone，只从成功 completed 终态提交，并在重复/编辑 call、协议/容量/代际漂移时 fail closed。Grok Build root union 在通用 sanitizer 后解析有界 local `$ref`，只投影可证明的 object root，循环、混合 union、全非 object 与歧义 schema 在网络前明确拒绝。HTTP、CRLF/分片 SSE 与 WebSocket loopback 验证 capture/replay、parallel calls、一次 pre-commit 明确拒绝恢复及 post-commit 禁止恢复。
+
+这些 fixture 只支持 GR-01..03 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog receipt 仍分别 `live_pending`；GR-05 remote compaction 明确 `runtimeEnabled=false`，没有固定 OAuth rail 的真实上游 receipt 前不得启用，也不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
+
+## 2026-09-11 Kiro prompt-cache differential freeze
+
+Kiro 差异合同冻结在 `assets/contract/kiro-reference-delta.json`。一次性只读证据只取 `kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 已提交的 `src/anthropic/cache_metering.rs` 与 `src/anthropic/stream.rs`，并记录 `f2cc574`、`19b7f4b`、`47633a4` 三个历史 delta。完整 commit/file SHA-256 由 `scripts/audit/audit-kiro-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布、运行时和审计不读取外部工作树，也不采用其中 Redis、session affinity、账号调度或成本折算策略。
+
+Server 的独立实现只在 Kiro 缺权威 token usage 时模拟下游 Prompt Cache 计量：top-level auto 与显式 breakpoint 统一限制四个，lookback 限 20 个 position，连续 tool_use/tool_result 分组，1h 必须先于 5m，命中按 entry 自身 TTL 续期，多轮 auto 不吞掉最新 user input。非法声明整次 no-cache 并记录固定原因。Provider/Share/Account/auth generation/route/session/model/thinking 等 scope 进入哈希，cache miss 或 hit 都不能改变原绑定。
+
+本地 covered/read estimate 以整数比例映射到 Kiro context/metrics total，舍入余数归入 uncached input，三项严格守恒；上游 `tokenUsage` 或明确 cache 字段始终优先，包括显式 0。响应以 `cache_usage_source` 区分上游真值与本地估算，本地模拟不声称降低 Kiro 推理成本。持久化从同步整表 JSON 改为有界 non-blocking 通知、dirty mutation generation、合并/退避、shutdown flush 和 WAL/FULL SQLite transaction/CAS；旧 JSON 只导入并保留，磁盘失败不阻塞响应且通过 degraded 指标暴露。
+
+这些 fixture 只支持 KI-01..03 的 `fixture_verified`。KI-04 必须按 Builder ID、IdC、Social、API Key 与 `us-east-1`、`eu-central-1` 分别留存真实脱敏 receipt，当前均为 `live_pending`。KI-05 shared/remote cache 明确 `runtimeEnabled=false`；没有多副本实际需求和真实证据前不得启用，也不得让 cache 命中参与账号选择、跨账号复用或 fallback。
+
 ## 2026-09-09 OpenAI Chat `created` compatibility freeze
 
 OpenAI Chat Completions 的流式 `chat.completion.chunk.created` 是 Unix 秒级整数，且同一 completion 流中的所有 chunk 使用同一个时间戳。Server 将此视为所有 `/v1/chat/completions` Provider 出口的协议不变量，而不是 `grok_oauth` 的专用修补：跨协议 Responses/Anthropic/Gemini 合成必须从源头生成合法且流内稳定的 `created`，原生 OpenAI Chat 透传和专用 canonical emitter 还必须经过同一出口合同。非流式 `chat.completion` 同样不得缺失、输出 `null` 或输出非正整数 `created`。官方协议依据为 <https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events#chat.completion.chunk>。
@@ -49,6 +105,8 @@ OpenAI Chat Completions 的流式 `chat.completion.chunk.created` 是 Unix 秒�
 
 `qoder_cosy` 的 native Rust 实现以一次性、只读的官方 CLI 审计作为漂移 oracle，不在构建或运行时加载 CLI。证据冻结于 `assets/contract/qoder-cli-oracle.json`：Global `@qoder-ai/qodercli@1.1.32` bundle SHA-256 为 `24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf`，CN `@qodercn-ai/qoderclicn@1.1.32` bundle SHA-256 为 `5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b`。`cli2api` commit `9b18f2de06c53f12bf2c5112c7a71e3e64755b97` 仅提供带文件摘要的 capture/plaintext projection 交叉样本，不是依赖、同步源或生产 executor。
 
+2026-09-11 将已落地的动态 entitlement/capability、三 rail、严格 EOF terminal、generation fencing 与同账号单次恢复统一确认为 `special.qoder_cosy` Driver contract revision 2。`assets/contract/qoder-reference-delta.json` 与对应审计把 Registry、三个 Profile、oracle、coverage、生产入口和 `live_pending` 状态交叉闭合，并冻结“先官方包 digest/独立 wire，后 oracle mutation，最后 Rust”的 CLI 升级顺序。TokenRouter 当前文档提交 `3488b4a9208c41e4f9db4108ef5133cb3710648c` 仅作为可选只读 source audit 输入。
+
 两份官方 bundle 共同确认：Device authorization 使用 `/device/selectAccounts`、UUID v4 nonce 与 S256；poll 为 OpenAPI `GET /api/v1/deviceToken/poll`，1 秒间隔、300 秒 TTL、404 pending 且不发送 Authorization/COSY/User-Agent；refresh 为 OpenAPI `POST /api/v1/deviceToken/refresh`，只发送 JSON body `refresh_token` 与 `User-Agent: qoder/1.1.32`，响应主字段为 `device_token`、轮换 `refresh_token`、`expires_at`。Global 36 位小写 hex machine ID 与 CN UUID v4 machine ID 是独立站点事实。Qoder CLI `1.1.32` 和 COSY wire `1.24.2` 属于不同版本空间；旧 Global center job-token endpoint 不可作为 Device refresh fallback。
 
 oracle schema v2 额外用审计脚本内的独立摘要冻结三 rail 的精确 origin、actual/signature path、Global/CN profile、完整 signed-header 集、encoding/signature vectors、两侧 projection 与每条 accepted-difference 原因，因而不能通过同时修改 fixture 两侧来维持假绿。canonical synthetic Chat 同时保存去随机 UUID 后的完整 server body；Rust 对 Global/CN 生产 builder 生成的整棵 JSON 做 exact equality，并验证 signed-header 集没有额外字段。Global profile/session 只接受恰好 36 位小写 hex machine ID，CN 只接受 RFC 4122 variant UUID v4，错站、空白、大小写、version 与 variant 在发网前失败。
@@ -62,6 +120,8 @@ CN `cosy-clientip` 现由 Server 自身出站路由决定并在 catalog、quota�
 ## 2026-09-01 CodeBuddy OAuth evidence freeze
 
 `codebuddy_oauth` 的实现合同来自一次性、只读的协议研究，优先级如下：
+
+2026-09-11 的 revision 2 差分新增 `cli2api@e5893f0864149caef4c3b9752454190e45875c33` 空消息处理与 `@32aa108b7442cf168c1606d19f9691feafbc116c` 空 stream delta 处理作为只读交叉证据。本地实现额外保留空 content 的 tool result、严格 named choice 校验及唯一 terminal + EOF；`assets/contract/codebuddy-reference-delta.json` 固定源码摘要、CB-01 至 CB-04 与 Intl/CN 独立 `live_pending` 门禁。
 
 1. CodeBuddy CLI `2.142.0` bundle、站点 overlay，以及国际个人订阅账号的脱敏真实流量；
 2. 本仓库 [`docs/provider/codebuddy-oauth.md`](docs/provider/codebuddy-oauth.md) 已冻结的端点、OAuth、refresh、目录、计费与 terminal 约束；

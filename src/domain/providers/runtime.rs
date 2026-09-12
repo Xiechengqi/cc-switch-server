@@ -463,6 +463,12 @@ pub struct RuntimeTransportPolicy {
     pub stream_idle_timeout_ms: Option<u64>,
     pub redirect_policy: String,
     pub direct_connection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_pool_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_max_idle_per_host: Option<usize>,
 }
 
 impl Default for RuntimeTransportPolicy {
@@ -474,6 +480,9 @@ impl Default for RuntimeTransportPolicy {
             stream_idle_timeout_ms: Some(defaults.stream_idle_timeout_ms),
             redirect_policy: "same_origin".to_string(),
             direct_connection: true,
+            connection_pool_enabled: None,
+            pool_idle_timeout_ms: None,
+            pool_max_idle_per_host: None,
         }
     }
 }
@@ -1322,6 +1331,16 @@ fn runtime_transport_policy(
                 typed_timeout_ms(provider, "/transport/streamIdleTimeoutMs")
                     .unwrap_or(defaults.stream_idle_timeout_ms),
             ),
+            connection_pool_enabled: provider
+                .settings_config
+                .pointer("/transport/connectionPoolEnabled")
+                .and_then(Value::as_bool),
+            pool_idle_timeout_ms: typed_timeout_ms(provider, "/transport/poolIdleTimeoutMs"),
+            pool_max_idle_per_host: provider
+                .settings_config
+                .pointer("/transport/poolMaxIdlePerHost")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
             ..RuntimeTransportPolicy::default()
         };
     }
@@ -2140,6 +2159,26 @@ mod tests {
             assert!(!plan.runtime_fingerprint.is_empty());
             assert!(plan.transport_policy.direct_connection);
         }
+    }
+
+    #[test]
+    fn antigravity_pool_configuration_is_typed_and_part_of_runtime_fingerprint() {
+        let profile = profile_by_id("gemini.antigravity_oauth").unwrap();
+        let mut accounts = AccountStore::default();
+        let mut stored = provider_for_profile(profile, 77, &mut accounts);
+        stored.provider.settings_config["transport"] = json!({
+            "connectionPoolEnabled": true,
+            "poolIdleTimeoutMs": 30_000,
+            "poolMaxIdlePerHost": 2
+        });
+        let first = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert_eq!(first.transport_policy.connection_pool_enabled, Some(true));
+        assert_eq!(first.transport_policy.pool_idle_timeout_ms, Some(30_000));
+        assert_eq!(first.transport_policy.pool_max_idle_per_host, Some(2));
+
+        stored.provider.settings_config["transport"]["poolIdleTimeoutMs"] = json!(40_000);
+        let changed = compile_runtime_plan(&stored, &accounts).unwrap();
+        assert_ne!(first.runtime_fingerprint, changed.runtime_fingerprint);
     }
 
     #[test]

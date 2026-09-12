@@ -228,6 +228,16 @@ WebSocket 生命周期及其 HTTP fallback 不在自动压缩范围内：握手�
 
 内部摘要是一次真实模型调用，其 usage 单独记录为 `dataSource=codex_overflow_compact_summary`；最终重试继续记录原请求 usage。运维应把该额外 token 消耗纳入容量和审计评估。
 
+### GPT Image 2.5 quota/cache evidence gate
+
+`gpt-image-2.5`、`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst` 必须分别取得真实绑定账号的 generation、multipart edit、model normalization、size/quality、usage、error 和 quota/cooldown 脱敏 receipt。当前三者均为 `live_pending`，不会进入 registry、模型目录或 UI，Dedicated Images 在发网前明确拒绝；任一基础模型成功也不能外推另外两个 variant 的 entitlement。
+
+在三个 variant 尚未逐项通过前，不实施 2.5 专属 quota refresh、缓存或性能路径。未来评估仍必须保持 prompt/图片不进入日志或 receipt，只保存计数、大小、格式和脱敏错误；现有单图 48 MiB、累计 72 MiB 输出上限与持久化 capability store 继续作为通用资源边界，不能被外部项目的商业计价逻辑改写。
+
+### WS prewarm evidence gate
+
+当前不创建或合成 WS prewarm lifecycle。只有真实 upstream receipt 证明协议允许，并且固定 Provider/Account 的本地基准显示 TTFB 有稳定收益后才可启用。届时 pool key 至少包含 Provider、Account、auth/token generation、runtime、model/feature profile；取消、credential generation 或 runtime 漂移必须销毁连接。现有 WS→HTTP 恢复继续只发生在 `response.create` 成功发送前，共用总 attempt budget；发送后禁止重放。
+
 ## OAuth 刷新与持久化
 
 OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化完整候选 `accounts.json`。如果旋转 token 已到达提交点但 durable write 失败，Server 保留内存中的新 token、进入 credential persistence degraded，并后台指数退避重试。

@@ -7,6 +7,14 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const contractPath = "assets/contract/proxy-bridge-protocol.json";
 const contract = readJson(contractPath);
+const forwarderSource = fs.readFileSync(
+  path.join(repoRoot, "src/proxy/forwarder.rs"),
+  "utf8",
+);
+const recoverySource = fs.readFileSync(
+  path.join(repoRoot, "src/proxy/execution/recovery.rs"),
+  "utf8",
+);
 
 const requiredCases = new Map([
   ["tool-schema-root-object", "tool_schema"],
@@ -59,14 +67,22 @@ if (semantic.rollbackEnvironmentVariable !== "CC_SWITCH_PROXY_SEMANTIC_GUARD_ENA
 if (semantic.lifecycleCommitsDownstream !== false) {
   fail("lifecycle events must not commit downstream");
 }
-if (semantic.providerFailureFailoverBoundary !== "before_downstream_commit") {
-  fail("provider semantic failover must stop at downstream commit");
+if (semantic.providerFailureFailoverBoundary !== "disabled_fixed_provider_binding") {
+  fail("provider semantic failures must preserve the fixed ingress Provider binding");
 }
 if (semantic.clientFailurePolicy !== "forward_without_provider_penalty") {
   fail("client failures must be forwarded without provider penalty");
 }
 if (semantic.incompletePolicy !== "valid_partial_terminal") {
   fail("incomplete responses must remain valid partial terminals");
+}
+if (
+  forwarderSource.includes("switching request to failover Provider") ||
+  forwarderSource.includes("next_provider_failover") ||
+  forwarderSource.includes("select_failover_provider") ||
+  recoverySource.includes("ProviderFailover")
+) {
+  fail("cross-Provider failover re-entered the recovery state machine");
 }
 
 const requiredCategories = new Set(contract.requiredCategories || []);

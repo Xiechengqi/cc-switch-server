@@ -1,0 +1,110 @@
+{
+  "format": "cc-switch-antigravity-reference-delta",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-11T00:00:00Z",
+  "policy": {
+    "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "scope": "one fixed Provider, Share, Account, rail, and credential generation; no pool; no rotation; no credential fallback; no cross-account fallback; no cross-Provider fallback",
+    "recoveryBoundary": "same binding, pre-commit, shared total attempt and elapsed-time budget",
+    "liveEvidence": "local fixtures do not imply live Google entitlement, compaction support, or production transport behavior"
+  },
+  "sources": [
+    {
+      "id": "cliproxyapi",
+      "rootEnv": "CC_SWITCH_ANTIGRAVITY_CLIPROXYAPI_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/CLIProxyAPI",
+      "deltas": [
+        {
+          "id": "reasoning_replay",
+          "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+          "files": [
+            {"path": "internal/cache/antigravity_reasoning_replay_cache.go", "sha256": "76498bed74e737f02aa708567942301131ff3c163270a4d575ee31fc87ee452f"},
+            {"path": "internal/runtime/executor/antigravity_reasoning_replay.go", "sha256": "9c62466b0ba8e8435341f127953076406fd302dbf2e90428dc9f752db5381975"}
+          ]
+        },
+        {
+          "id": "schema_subset",
+          "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+          "files": [
+            {"path": "internal/runtime/executor/antigravity_executor_request.go", "sha256": "6f3a0e28045944b807ca2cf92c0e503bd15ca9636d8cf6183387c7344aa468a6"},
+            {"path": "internal/util/gemini_schema.go", "sha256": "a824f1f36b0b3b5bbf16e5a629b4f37ba8a67e868645a1a1d7d554b70b0f4f74"}
+          ]
+        },
+        {
+          "id": "transport_scope",
+          "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
+          "files": [
+            {"path": "internal/runtime/executor/antigravity_executor.go", "sha256": "99eb8c72a7c75bbeebde6f483d9926362c4965bbd0eb15b1ac52db523e406116"},
+            {"path": "internal/runtime/executor/antigravity_executor_transport_test.go", "sha256": "735698a04454c70fadcb5c3f996a847ff7d23a9339a73139f4e2eaebe6779e0e"}
+          ]
+        },
+        {
+          "id": "compaction_risk_only",
+          "commit": "70f45604522282965247add17f6cce619876919b",
+          "files": [
+            {"path": "internal/runtime/executor/helps/antigravity_compaction.go", "sha256": "7455c7720fb5eb2fa69984bcd168e21bf81627e0ad37cae5450fb30f6d872ef8"},
+            {"path": "internal/runtime/executor/helps/antigravity_compaction_test.go", "sha256": "796a0f5ca125394f4dc9a78d88b156d3f2eaa5af6d1be61ea0d0ae9651c282ee"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "antigravity_manager",
+      "rootEnv": "CC_SWITCH_ANTIGRAVITY_MANAGER_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Antigravity/Antigravity-Manager",
+      "deltas": [
+        {
+          "id": "conversation_session",
+          "commit": "85fb4fe688997d3a0c2930b7a202cf22f617b092",
+          "files": [
+            {"path": "src-tauri/src/proxy/common/session.rs", "sha256": "7c4fb3c753b6c0ba85e7c0e79ed0e5faecc6d786f698f1649506d2e76c0abccc"}
+          ]
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "AG-01",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/antigravity_replay.rs", "anchors": ["AntigravityReplayScope", "miss_tombstone_and_snapshot_cas_fence_concurrent_writers", "inserts_parallel_signed_calls_before_tool_results", "expired_snapshot_cannot_delete_newer_value"]},
+        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+      ]
+    },
+    {
+      "id": "AG-02",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/antigravity_replay.rs", "anchors": ["derive_session_id", "is_session_accumulation_error", "session_id_is_conversation_scoped_and_rollover_error_is_exact"]},
+        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_session_accumulation_rolls_over_once_on_the_same_binding", "antigravity_session_contract_skips_count_tokens_and_web_search"]}
+      ]
+    },
+    {
+      "id": "AG-03",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/tool_schema.rs", "anchors": ["normalize_antigravity_request_schemas", "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]},
+        {"path": "src/proxy/antigravity_transport.rs", "anchors": ["defaults_to_short_connections_and_bounds_pool_settings", "cache_key_fences_runtime_account_generation_and_resolved_settings", "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"]},
+        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_retry_after_is_rounded_up_bounded_and_preserves_upstream", "antigravity_long_limit_cools_only_the_structured_share_runtime_model"]},
+        {"path": "src/clients/oauth/quota.rs", "anchors": ["antigravity_missing_family_and_non_model_capacity_remain_unknown"]}
+      ]
+    },
+    {
+      "id": "AG-04",
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "contracts": [
+        {"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]}
+      ]
+    }
+  ],
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "rails": [
+      {"rail": "antigravity_oauth", "status": "live_pending", "receipt": null},
+      {"rail": "agy_oauth", "status": "live_pending", "receipt": null}
+    ],
+    "compaction": {"status": "live_pending", "runtimeEnabled": false, "receipt": null}
+  }
+}

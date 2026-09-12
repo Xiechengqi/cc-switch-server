@@ -129,6 +129,7 @@ pub(super) async fn update_stream_usage(
         first_token_ms,
         usage,
         false,
+        false,
         stream_status,
     )
     .await;
@@ -154,6 +155,7 @@ pub(super) async fn update_stream_usage_result(
         first_token_ms,
         result.usage,
         result.parse_error,
+        result.usage_estimated,
         stream_status,
     )
     .await;
@@ -169,6 +171,7 @@ async fn update_stream_usage_with_parse_status(
     first_token_ms: Option<u128>,
     usage: TokenUsage,
     usage_parse_error: bool,
+    usage_estimated: bool,
     stream_status: Option<&str>,
 ) {
     let persisted = state
@@ -180,6 +183,7 @@ async fn update_stream_usage_with_parse_status(
                 first_token_ms,
                 usage,
                 usage_parse_error,
+                usage_estimated,
                 stream_status,
             );
             if router_visible_changed {
@@ -235,6 +239,7 @@ pub(super) async fn update_image_stream_usage(
                 duration_ms,
                 first_token_ms,
                 usage,
+                false,
                 false,
                 Some(stream_status),
             );
@@ -308,6 +313,7 @@ pub(super) async fn update_websocket_stream_usage(
                 first_token_ms,
                 usage,
                 false,
+                false,
                 Some(stream_status),
             );
             let next_error = error_message.map(str::to_string);
@@ -345,6 +351,7 @@ pub(super) async fn update_websocket_stream_usage(
     crate::state::notify_router_share_log_sync(state);
 }
 
+#[allow(clippy::too_many_arguments)] // Stream completion fields are applied atomically to one log.
 fn apply_stream_usage_fields(
     log: &mut UsageLog,
     status_code: u16,
@@ -352,6 +359,7 @@ fn apply_stream_usage_fields(
     first_token_ms: Option<u128>,
     usage: TokenUsage,
     usage_parse_error: bool,
+    usage_estimated: bool,
     stream_status: Option<&str>,
 ) -> bool {
     let mut router_visible_changed =
@@ -400,6 +408,8 @@ fn apply_stream_usage_fields(
     router_visible_changed |= log.usage_state != next_usage_state;
     log.usage_state = next_usage_state;
     log.upstream_duration_ms = duration_ms;
+    router_visible_changed |= usage_estimated && !log.usage_estimated;
+    log.usage_estimated |= usage_estimated;
     if next_usage_state == UsageState::Pending {
         log.completed_at_ms = 0;
         log.end_to_end_duration_ms = 0;
@@ -700,6 +710,7 @@ mod tests {
                 ..TokenUsage::default()
             },
             false,
+            false,
             Some("completed"),
         ));
         assert_eq!(log.usage_state, UsageState::Observed);
@@ -714,6 +725,7 @@ mod tests {
             10,
             None,
             TokenUsage::default(),
+            false,
             false,
             Some("completed"),
         );
@@ -730,6 +742,7 @@ mod tests {
             None,
             TokenUsage::default(),
             true,
+            false,
             Some("completed"),
         );
         assert_eq!(parse_error.usage_state, UsageState::ParseError);
@@ -746,11 +759,45 @@ mod tests {
                 ..TokenUsage::default()
             },
             false,
+            false,
             Some("client_cancelled"),
         );
         assert_eq!(interrupted.usage_state, UsageState::Interrupted);
         assert_eq!(interrupted.output_tokens, Some(4));
         assert_eq!(interrupted.usage_revision, 2);
+    }
+
+    #[test]
+    fn stream_usage_estimate_provenance_is_sticky() {
+        let mut log = pending_usage_log();
+        assert!(apply_stream_usage_fields(
+            &mut log,
+            200,
+            10,
+            None,
+            TokenUsage {
+                input_tokens: Some(10),
+                ..TokenUsage::default()
+            },
+            false,
+            true,
+            Some("completed"),
+        ));
+        assert!(log.usage_estimated);
+        apply_stream_usage_fields(
+            &mut log,
+            200,
+            11,
+            None,
+            TokenUsage::default(),
+            false,
+            false,
+            Some("completed"),
+        );
+        assert!(
+            log.usage_estimated,
+            "later updates must not erase provenance"
+        );
     }
 
     fn test_state() -> crate::state::ServerState {

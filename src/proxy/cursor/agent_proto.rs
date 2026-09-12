@@ -2348,6 +2348,83 @@ mod tests {
     }
 
     #[test]
+    fn cursor_reference_fixture_preserves_known_semantics_around_unknown_fields() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../assets/contract/cursor-reference-delta.json"
+        ))
+        .unwrap();
+        let wire = fixture.pointer("/protobufFixtures").unwrap();
+
+        let interaction = hex::decode(
+            wire.pointer("/interactionUnknownBeforeKnown/hex")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_agent_server_message(&interaction).unwrap().as_slice(),
+            [InteractionDelta::Text(text)] if text == "fixture text"
+        ));
+
+        let unknown = hex::decode(
+            wire.pointer("/interactionUnknownOnly/hex")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_agent_server_message(&unknown).unwrap().as_slice(),
+            [InteractionDelta::Unknown(99)]
+        ));
+
+        let framed = hex::decode(
+            wire.pointer("/connectFrame/hex")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut parser = ConnectFrameParser::new();
+        let mut frames = Vec::new();
+        let mut previous = 0;
+        for offset in wire
+            .pointer("/connectFrame/splitOffsets")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|offset| offset.as_u64().unwrap() as usize)
+            .chain(std::iter::once(framed.len()))
+        {
+            frames.extend(parser.feed(&framed[previous..offset]).unwrap());
+            previous = offset;
+        }
+        parser.finish().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].flags, 0);
+        assert_eq!(
+            hex::encode(&frames[0].payload),
+            wire.pointer("/connectFrame/expectedPayloadHex")
+                .and_then(Value::as_str)
+                .unwrap()
+        );
+
+        let mut partial = ConnectFrameParser::new();
+        assert!(partial
+            .feed(&framed[..framed.len() - 1])
+            .unwrap()
+            .is_empty());
+        assert!(partial.finish().is_err());
+
+        let model = wire
+            .pointer("/model/freshCatalogId")
+            .and_then(Value::as_str)
+            .unwrap();
+        let live = HashSet::from([model.to_string()]);
+        let resolved = resolve_cursor_model_with_catalog(model, Some(&live)).unwrap();
+        assert_eq!(resolved.model_id, model);
+        assert!(!resolved.fast);
+    }
+
+    #[test]
     fn decode_kv_uses_last_known_oneof_variant_and_ignores_unknown_bytes() {
         let get = encode_bytes(GBA_BLOB_ID, b"get-blob");
         let set = concat_bytes(&[

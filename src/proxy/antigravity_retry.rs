@@ -31,6 +31,10 @@ impl AntigravityRetryInfo {
     pub(crate) fn is_short_delay(&self) -> bool {
         self.retry_delay_ms <= MAX_SHORT_RETRY_DELAY_MS
     }
+
+    pub(crate) fn retry_after_seconds(&self) -> u64 {
+        self.retry_delay_ms.saturating_add(999) / 1_000
+    }
 }
 
 pub(crate) fn parse_google_rpc_retry(

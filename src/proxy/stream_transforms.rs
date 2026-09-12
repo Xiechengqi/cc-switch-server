@@ -40,6 +40,18 @@ impl StreamEventTransformer {
     where
         T: Into<transforms::ResponsesToolContext>,
     {
+        Self::new_with_downstream_usage(stored, route, responses_tool_context, true)
+    }
+
+    pub(super) fn new_with_downstream_usage<T>(
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        responses_tool_context: T,
+        downstream_include_usage: bool,
+    ) -> Self
+    where
+        T: Into<transforms::ResponsesToolContext>,
+    {
         let responses_tool_context = responses_tool_context.into();
         let upstream = upstream_format_for_route(stored, Some(route), &[]);
         let downstream = downstream_format_for_route(route);
@@ -69,19 +81,21 @@ impl StreamEventTransformer {
                     GeminiOpenAiState::responses(responses_tool_context.clone()),
                 )))
             }
-            (Some(UpstreamFormat::GeminiNative), UpstreamFormat::OpenAiChat) => {
-                Some(StreamBridgeState::GeminiOpenAi(Box::new(
-                    GeminiOpenAiState::chat(responses_tool_context.clone()),
-                )))
-            }
-            (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiChat) => Some(
-                StreamBridgeState::ResponsesChat(ResponsesChatState::default()),
+            (Some(UpstreamFormat::GeminiNative), UpstreamFormat::OpenAiChat) => Some(
+                StreamBridgeState::GeminiOpenAi(Box::new(GeminiOpenAiState::chat(
+                    responses_tool_context.clone(),
+                    downstream_include_usage,
+                ))),
             ),
-            (Some(UpstreamFormat::AnthropicMessages), UpstreamFormat::OpenAiChat) => {
-                Some(StreamBridgeState::AnthropicChat(Box::new(
-                    AnthropicChatState::new(responses_tool_context.clone()),
-                )))
-            }
+            (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiChat) => Some(
+                StreamBridgeState::ResponsesChat(ResponsesChatState::new(downstream_include_usage)),
+            ),
+            (Some(UpstreamFormat::AnthropicMessages), UpstreamFormat::OpenAiChat) => Some(
+                StreamBridgeState::AnthropicChat(Box::new(AnthropicChatState::new(
+                    responses_tool_context.clone(),
+                    downstream_include_usage,
+                ))),
+            ),
             (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::OpenAiResponses) => {
                 Some(StreamBridgeState::ChatResponses(Box::new(
                     ChatResponsesState::new(responses_tool_context.clone()),
@@ -2193,12 +2207,15 @@ impl GeminiOpenAiState {
         }
     }
 
-    fn chat(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+    fn chat(
+        responses_tool_context: transforms::ResponsesToolContext,
+        downstream_include_usage: bool,
+    ) -> Self {
         Self {
             source: GeminiAnthropicState::default(),
             target: GeminiOpenAiTarget::Chat {
                 responses: AnthropicResponsesState::new(responses_tool_context),
-                chat: ResponsesChatState::default(),
+                chat: ResponsesChatState::new(downstream_include_usage),
             },
         }
     }
@@ -2251,10 +2268,13 @@ struct AnthropicChatState {
 }
 
 impl AnthropicChatState {
-    fn new(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+    fn new(
+        responses_tool_context: transforms::ResponsesToolContext,
+        downstream_include_usage: bool,
+    ) -> Self {
         Self {
             responses: AnthropicResponsesState::new(responses_tool_context),
-            chat: ResponsesChatState::default(),
+            chat: ResponsesChatState::new(downstream_include_usage),
         }
     }
 
@@ -2792,6 +2812,7 @@ struct ChatAnthropicState {
     reasoning_signature: String,
     tools: BTreeMap<i64, ToolBlockState>,
     deferred_tools: BTreeMap<i64, DeferredChatToolState>,
+    interleaved_content: Vec<InterleavedChatContent>,
     usage: Option<Value>,
     pending_finish_reason: Option<String>,
     defer_terminal: bool,
@@ -2805,6 +2826,13 @@ struct DeferredChatToolState {
     name: String,
     arguments: String,
     signature: Option<String>,
+}
+
+#[derive(Debug)]
+enum InterleavedChatContent {
+    Text(String),
+    Reasoning(String),
+    Signature(String),
 }
 
 impl ChatAnthropicState {
@@ -2836,13 +2864,25 @@ impl ChatAnthropicState {
         let mut frames = self.ensure_message_start(input);
         let delta = transforms::openai_chat_choice_payload(choice);
         if let Some(reasoning) = chat_reasoning_delta(delta) {
-            frames.extend(self.reasoning_delta(reasoning));
+            if self.has_open_tool() {
+                self.buffer_interleaved(InterleavedChatContent::Reasoning(reasoning.to_string()));
+            } else {
+                frames.extend(self.reasoning_delta(reasoning));
+            }
         }
         if let Some(signature) = bridge_thought_signature(delta) {
-            frames.extend(self.reasoning_signature(signature));
+            if self.has_open_tool() {
+                self.buffer_interleaved(InterleavedChatContent::Signature(signature.to_string()));
+            } else {
+                frames.extend(self.reasoning_signature(signature));
+            }
         }
         for text in transforms::openai_chat_visible_text_fragments(delta) {
-            frames.extend(self.text_delta(text));
+            if self.has_open_tool() {
+                self.buffer_interleaved(InterleavedChatContent::Text(text.to_string()));
+            } else {
+                frames.extend(self.text_delta(text));
+            }
         }
         let tool_calls = delta.get("tool_calls").and_then(Value::as_array);
         if let Some(tool_calls) = tool_calls {
@@ -2852,6 +2892,12 @@ impl ChatAnthropicState {
                     continue;
                 };
                 if self.defer_terminal {
+                    frames.extend(self.deferred_tool_delta(tool_index, tool_call));
+                    continue;
+                }
+                if self.deferred_tools.contains_key(&tool_index)
+                    || (!self.tools.contains_key(&tool_index) && self.has_open_tool())
+                {
                     frames.extend(self.deferred_tool_delta(tool_index, tool_call));
                     continue;
                 }
@@ -3039,6 +3085,41 @@ impl ChatAnthropicState {
         frames
     }
 
+    fn has_open_tool(&self) -> bool {
+        self.tools.values().any(|tool| tool.block.open)
+    }
+
+    fn buffer_interleaved(&mut self, incoming: InterleavedChatContent) {
+        match (self.interleaved_content.last_mut(), incoming) {
+            (Some(InterleavedChatContent::Text(current)), InterleavedChatContent::Text(next))
+            | (
+                Some(InterleavedChatContent::Reasoning(current)),
+                InterleavedChatContent::Reasoning(next),
+            )
+            | (
+                Some(InterleavedChatContent::Signature(current)),
+                InterleavedChatContent::Signature(next),
+            ) => current.push_str(&next),
+            (_, incoming) => self.interleaved_content.push(incoming),
+        }
+    }
+
+    fn flush_interleaved_content(&mut self) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
+        for content in std::mem::take(&mut self.interleaved_content) {
+            match content {
+                InterleavedChatContent::Text(text) => frames.extend(self.text_delta(&text)),
+                InterleavedChatContent::Reasoning(reasoning) => {
+                    frames.extend(self.reasoning_delta(&reasoning));
+                }
+                InterleavedChatContent::Signature(signature) => {
+                    frames.extend(self.reasoning_signature(&signature));
+                }
+            }
+        }
+        frames
+    }
+
     fn text_delta(&mut self, text: &str) -> Vec<StreamFrame> {
         let mut frames = self.close_reasoning_block();
         if !self.text_block.is_some_and(|block| block.open) {
@@ -3181,6 +3262,9 @@ impl ChatAnthropicState {
         } else {
             self.deferred_tools.clear();
         }
+        frames.extend(self.flush_interleaved_content());
+        frames.extend(self.close_text_block());
+        frames.extend(self.close_reasoning_block());
         let stop_reason = match finish_reason.as_str() {
             reason @ ("length" | "content_filter") => {
                 transforms::openai_finish_reason_to_anthropic(reason)
@@ -3222,6 +3306,7 @@ struct ResponsesChatState {
     item_ids: BTreeMap<i64, String>,
     emitted_text_items: BTreeSet<String>,
     emitted_reasoning_items: BTreeSet<String>,
+    include_usage: bool,
     completed: bool,
 }
 
@@ -3237,6 +3322,7 @@ impl Default for ResponsesChatState {
             item_ids: BTreeMap::new(),
             emitted_text_items: BTreeSet::new(),
             emitted_reasoning_items: BTreeSet::new(),
+            include_usage: true,
             completed: false,
         }
     }
@@ -3257,6 +3343,13 @@ struct ResponsesChatToolState {
 }
 
 impl ResponsesChatState {
+    fn new(include_usage: bool) -> Self {
+        Self {
+            include_usage,
+            ..Self::default()
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
         if self.completed {
             return Vec::new();
@@ -3652,17 +3745,24 @@ impl ResponsesChatState {
         }
         let has_tools = self.tools.values().any(|state| state.added);
         let finish_reason = transforms::openai_response_finish_reason_to_chat(response, has_tools);
-        let usage = response
-            .get("usage")
-            .map(|usage| transforms::openai_chat_usage_from_responses_usage(Some(usage)));
         frames.push(chat_stream_chunk(
             &self.response_id,
             &self.model,
             self.created,
             json!({}),
             finish_reason,
-            usage,
+            None,
         ));
+        if self.include_usage {
+            if let Some(usage) = response.get("usage") {
+                frames.push(chat_stream_usage_chunk(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    transforms::openai_chat_usage_from_responses_usage(Some(usage)),
+                ));
+            }
+        }
         frames.push(StreamFrame::done());
         self.completed = true;
         frames
@@ -4222,6 +4322,29 @@ fn chat_stream_chunk(
     StreamFrame::json(chunk)
 }
 
+fn chat_stream_usage_chunk(
+    response_id: &str,
+    model: &str,
+    created: i64,
+    usage: Value,
+) -> StreamFrame {
+    let id = if let Some(suffix) = response_id.strip_prefix("resp_") {
+        format!("chatcmpl_{suffix}")
+    } else if response_id.starts_with("chatcmpl_") {
+        response_id.to_string()
+    } else {
+        format!("chatcmpl_{response_id}")
+    };
+    StreamFrame::json(json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage
+    }))
+}
+
 fn chat_tool_arguments_chunk(
     response_id: &str,
     model: &str,
@@ -4530,9 +4653,7 @@ impl AnthropicResponsesState {
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = model.to_string();
         }
-        if let Some(usage) = message.get("usage") {
-            self.usage = Some(usage.clone());
-        }
+        self.observe_usage(message.get("usage"));
         self.ensure_started()
     }
 
@@ -4976,10 +5097,22 @@ impl AnthropicResponsesState {
         if let Some(reason) = input.pointer("/delta/stop_reason").and_then(Value::as_str) {
             self.stop_reason = Some(reason.to_string());
         }
-        if let Some(usage) = input.get("usage") {
-            self.usage = Some(usage.clone());
-        }
+        self.observe_usage(input.get("usage"));
         Vec::new()
+    }
+
+    fn observe_usage(&mut self, usage: Option<&Value>) {
+        let Some(incoming) = usage.and_then(Value::as_object) else {
+            return;
+        };
+        let target = self.usage.get_or_insert_with(|| json!({}));
+        let Some(target) = target.as_object_mut() else {
+            self.usage = Some(Value::Object(incoming.clone()));
+            return;
+        };
+        for (key, value) in incoming {
+            target.insert(key.clone(), value.clone());
+        }
     }
 
     fn complete(&mut self) -> Vec<StreamFrame> {
@@ -5640,6 +5773,7 @@ mod tests {
 
         let chat = gemini_openai_fixture(GeminiOpenAiState::chat(
             transforms::ResponsesToolContext::default(),
+            true,
         ));
         let chat_json = json_stream_frames(&chat);
         assert_eq!(
@@ -5689,9 +5823,126 @@ mod tests {
             .iter()
             .find(|value| value.pointer("/choices/0/finish_reason") == Some(&json!("tool_calls")))
             .unwrap();
-        assert_eq!(terminal["usage"]["prompt_tokens"], 8);
-        assert_eq!(terminal["usage"]["completion_tokens"], 5);
+        assert!(terminal.get("usage").is_none());
+        let usage = chat_json
+            .iter()
+            .find(|value| value["choices"] == json!([]) && value.get("usage").is_some())
+            .unwrap();
+        assert_eq!(usage["usage"]["prompt_tokens"], 8);
+        assert_eq!(usage["usage"]["completion_tokens"], 5);
         assert_eq!(done_frame_count(&chat), 1);
+    }
+
+    fn anthropic_chat_usage_fixture(include_usage: bool, explicit_zero: bool) -> Vec<StreamFrame> {
+        let mut state =
+            AnthropicChatState::new(transforms::ResponsesToolContext::default(), include_usage);
+        let start_usage = if explicit_zero {
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            })
+        } else {
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0
+            })
+        };
+        let mut events = vec![json!({
+            "type": "message_start",
+            "message": {"id": "msg_usage", "model": "claude-opus-5", "usage": start_usage}
+        })];
+        if !explicit_zero {
+            events.extend([
+                json!({"type":"message_delta","delta":{},"usage":{"cache_creation_input_tokens":20}}),
+                json!({"type":"message_delta","delta":{},"usage":{"output_tokens":7}}),
+                json!({"type":"message_delta","delta":{},"usage":{"cache_read_input_tokens":50}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}),
+            ]);
+        } else {
+            events.push(json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":0}
+            }));
+        }
+        events.extend([
+            json!({"type":"message_stop"}),
+            json!({"type":"message_stop"}),
+        ]);
+
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(&event));
+        }
+        frames
+    }
+
+    #[test]
+    fn claude_chat_usage_golden_merges_lifecycle_and_emits_one_ordered_tail() {
+        let frames = anthropic_chat_usage_fixture(true, false);
+        let finish = frames
+            .iter()
+            .position(|frame| match &frame.payload {
+                transforms::StreamPayload::Json(value) => value
+                    .pointer("/choices/0/finish_reason")
+                    .is_some_and(|reason| !reason.is_null()),
+                transforms::StreamPayload::Done => false,
+            })
+            .unwrap();
+        let usage_positions = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| match &frame.payload {
+                transforms::StreamPayload::Json(value)
+                    if value["choices"] == json!([]) && value.get("usage").is_some() =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let done = frames
+            .iter()
+            .position(|frame| matches!(frame.payload, transforms::StreamPayload::Done))
+            .unwrap();
+
+        assert_eq!(usage_positions.len(), 1);
+        assert!(finish < usage_positions[0] && usage_positions[0] < done);
+        let usage = frames[usage_positions[0]].payload_json()["usage"].clone();
+        assert_eq!(usage["prompt_tokens"], 170);
+        assert_eq!(usage["completion_tokens"], 15);
+        assert_eq!(usage["total_tokens"], 185);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 50);
+        assert_eq!(usage["prompt_tokens_details"]["cached_creation_tokens"], 20);
+        assert_eq!(usage["prompt_tokens_details"]["cache_write_tokens"], 20);
+        assert!(frames[finish].payload_json().get("usage").is_none());
+        assert_eq!(done_frame_count(&frames), 1);
+    }
+
+    #[test]
+    fn claude_chat_usage_golden_honors_opt_out_and_preserves_explicit_zero() {
+        let opted_out = anthropic_chat_usage_fixture(false, false);
+        assert!(!json_stream_frames(&opted_out)
+            .iter()
+            .any(|value| value["choices"] == json!([]) && value.get("usage").is_some()));
+        assert_eq!(done_frame_count(&opted_out), 1);
+
+        let explicit_zero = anthropic_chat_usage_fixture(true, true);
+        let usage = json_stream_frames(&explicit_zero)
+            .into_iter()
+            .find(|value| value["choices"] == json!([]) && value.get("usage").is_some())
+            .unwrap();
+        assert_eq!(usage["usage"]["prompt_tokens"], 0);
+        assert_eq!(usage["usage"]["completion_tokens"], 0);
+        assert_eq!(usage["usage"]["total_tokens"], 0);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(
+            usage["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            0
+        );
     }
 
     #[test]
@@ -5738,7 +5989,7 @@ mod tests {
 
     #[test]
     fn anthropic_chat_created_is_positive_and_stable() {
-        let mut state = AnthropicChatState::new(transforms::ResponsesToolContext::default());
+        let mut state = AnthropicChatState::new(transforms::ResponsesToolContext::default(), true);
         state.chat.created = 53;
         let events = [
             json!({"type":"message_start","message":{"id":"msg-created","model":"claude","usage":{"input_tokens":2}}}),
@@ -5762,7 +6013,7 @@ mod tests {
 
     #[test]
     fn gemini_chat_created_is_positive_and_stable() {
-        let mut state = GeminiOpenAiState::chat(transforms::ResponsesToolContext::default());
+        let mut state = GeminiOpenAiState::chat(transforms::ResponsesToolContext::default(), true);
         if let GeminiOpenAiTarget::Chat { chat, .. } = &mut state.target {
             chat.created = 59;
         }
@@ -5817,7 +6068,12 @@ mod tests {
             .iter()
             .find(|chunk| chunk.pointer("/choices/0/finish_reason") == Some(&json!("stop")))
             .unwrap();
-        assert_eq!(terminal.pointer("/usage/total_tokens"), Some(&json!(3)));
+        assert!(terminal.get("usage").is_none());
+        let usage = chunks
+            .iter()
+            .find(|chunk| chunk["choices"] == json!([]) && chunk.get("usage").is_some())
+            .unwrap();
+        assert_eq!(usage.pointer("/usage/total_tokens"), Some(&json!(3)));
         assert_eq!(
             output
                 .windows(b"data: [DONE]".len())
@@ -5999,7 +6255,7 @@ mod tests {
     fn gemini_cross_protocol_refusal_terminal_and_unexpected_eof_fail_closed() {
         for mut state in [
             GeminiOpenAiState::responses(transforms::ResponsesToolContext::default()),
-            GeminiOpenAiState::chat(transforms::ResponsesToolContext::default()),
+            GeminiOpenAiState::chat(transforms::ResponsesToolContext::default(), true),
         ] {
             let initial = state
                 .transform(&json!({
@@ -8091,6 +8347,92 @@ mod tests {
                 .and_then(Value::as_str)
                 == Some("max_tokens")
         }));
+    }
+
+    #[test]
+    fn chat_interleaved_tools_and_content_emit_strictly_sequential_blocks() {
+        let mut state = ChatAnthropicState::default();
+        let events = [
+            json!({
+                "id":"chatcmpl_interleaved",
+                "model":"chat",
+                "choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_a","function":{"name":"first","arguments":"{\"a\":"}},
+                    {"index":1,"id":"call_b","function":{"name":"second","arguments":"{\"b\":"}}
+                ]},"finish_reason":null}]
+            }),
+            json!({"choices":[{"delta":{"content":"between"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"after tools"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"1}"}},
+                {"index":1,"function":{"arguments":"2}"}}
+            ]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.transform(&event));
+        }
+
+        let mut open = None;
+        for frame in &frames {
+            let payload = frame.payload_json();
+            match payload.get("type").and_then(Value::as_str) {
+                Some("content_block_start") => {
+                    assert!(
+                        open.is_none(),
+                        "started a content block while another was open"
+                    );
+                    open = payload.get("index").and_then(Value::as_u64);
+                }
+                Some("content_block_delta") => {
+                    assert_eq!(open, payload.get("index").and_then(Value::as_u64));
+                }
+                Some("content_block_stop") => {
+                    assert_eq!(open, payload.get("index").and_then(Value::as_u64));
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none());
+        let starts = frames
+            .iter()
+            .filter(|frame| frame.payload_json()["type"] == "content_block_start")
+            .map(|frame| frame.payload_json()["content_block"]["type"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            [
+                json!("tool_use"),
+                json!("tool_use"),
+                json!("text"),
+                json!("thinking")
+            ]
+        );
+        let arguments = frames
+            .iter()
+            .filter(|frame| {
+                frame.payload_json().pointer("/delta/type") == Some(&json!("input_json_delta"))
+            })
+            .filter_map(|frame| {
+                frame
+                    .payload_json()
+                    .pointer("/delta/partial_json")
+                    .and_then(Value::as_str)
+            })
+            .collect::<String>();
+        assert_eq!(arguments, "{\"a\":1}{\"b\":2}");
+        assert_eq!(
+            frames
+                .iter()
+                .filter_map(|frame| frame
+                    .payload_json()
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str))
+                .collect::<String>(),
+            "between"
+        );
     }
 
     #[test]

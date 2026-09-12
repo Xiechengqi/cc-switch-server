@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
@@ -66,6 +66,10 @@ use super::adapters::{self, ProviderAdapter, UpstreamFormat};
 use super::anthropic_semantics::{
     self, AnthropicJsonObservation, AnthropicObservation, AnthropicSseInspector, AnthropicTerminal,
 };
+use super::antigravity_replay::{
+    AntigravityReplayChain, AntigravityReplayScope, AntigravityReplaySnapshot,
+    AntigravityReplayStreamAccumulator,
+};
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::claude_quota_headers::{
     claude_fable_only_rejected, header_lower, parse_anthropic_reset_header,
@@ -73,6 +77,17 @@ use super::claude_quota_headers::{
 };
 use super::cursor;
 use super::deepseek;
+use super::execution::context::{
+    AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CacheSnapshotOwnership,
+    CommitGuard, DelaySource, RecoveryStage, RetryDecision,
+};
+use super::execution::transport::{
+    wait_with_downstream_cancellation as wait_codex_http_fallback,
+    DownstreamWait as CodexHttpFallbackWait,
+};
+use super::grok_replay::{
+    GrokReplayProof, GrokReplayScope, GrokReplaySnapshot, GrokReplayStreamAccumulator,
+};
 use super::kimi_runtime::{
     kimi_thinking_replay_model_family, kimi_thinking_replay_user_namespace,
     restore_kimi_thinking_replay_content, KimiThinkingReplayScope, KimiThinkingReplaySnapshot,
@@ -104,7 +119,7 @@ use super::router::select_test_provider;
 use super::router::{
     account_concurrency_for_provider, codex_image_generation_provider,
     ensure_provider_account_does_not_need_relogin, provider_supports_claude_count_tokens,
-    select_failover_provider, ProxyRoute,
+    ProxyRoute,
 };
 use super::streaming::{
     ClaudeSseError, ClaudeSseErrorDetector, GeminiV1InternalSseAggregator,
@@ -123,6 +138,11 @@ use crate::domain::accounts::store::{active_account_capacity_pool_limit, CLAUDE_
 
 const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
+const CODEX_IMAGES_LIVE_PENDING_25_MODELS: &[&str] = &[
+    "gpt-image-2.5",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+];
 const CODEX_IMAGES_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const IMAGE_CLIENT_CANCELLED_MESSAGE: &str = "downstream client cancelled the image response";
 const CODEX_IMAGES_MAX_PARTIAL_IMAGES: i64 = 3;
@@ -503,20 +523,21 @@ fn codex_websocket_cache_max_age() -> Duration {
 
 #[derive(Debug, Clone)]
 struct ForwardAttemptContext {
-    attempt: u32,
     request_started_at_ms: u128,
-    started_at_ms: u128,
+    attempt_budget: AttemptBudget,
+    commit_guard: CommitGuard,
+    binding_snapshot: Option<BindingSnapshot>,
     body_retry_stage: Option<ClaudeBodyRetryStage>,
     execution: Option<ProviderExecution>,
-    auth_refresh_attempted: bool,
     antigravity_retry_attempted: bool,
+    antigravity_session_rollover_attempted: bool,
+    antigravity_session_generation: u64,
     codex_overflow_compact_attempted: bool,
     codex_body_override: Option<Bytes>,
-    excluded_provider_ids: BTreeSet<String>,
     grok_session_id: Option<String>,
+    grok_reasoning_recovery_attempted: bool,
     provider_binding_pinned: bool,
     retry_audit: Option<ForwardRetryAudit>,
-    codex_capacity_retry_attempted: u32,
     pending_capacity_retry_delay: Option<Duration>,
     skip_capacity_retry_delay: bool,
 }
@@ -525,26 +546,33 @@ struct ForwardAttemptContext {
 struct ForwardRetryAudit {
     stage: &'static str,
     source: &'static str,
-    previous_provider_id: Option<String>,
 }
 
 impl Default for ForwardAttemptContext {
     fn default() -> Self {
+        let now_ms = current_time_ms();
         Self {
-            attempt: 0,
-            request_started_at_ms: current_time_ms(),
-            started_at_ms: current_time_ms(),
+            request_started_at_ms: now_ms,
+            attempt_budget: AttemptBudget::new(
+                AttemptLimits::forward_default(
+                    MAX_FORWARD_RETRY_ATTEMPTS,
+                    MAX_FORWARD_RETRY_ELAPSED_MS,
+                ),
+                now_ms,
+            ),
+            commit_guard: CommitGuard::default(),
+            binding_snapshot: None,
             body_retry_stage: None,
             execution: None,
-            auth_refresh_attempted: false,
             antigravity_retry_attempted: false,
+            antigravity_session_rollover_attempted: false,
+            antigravity_session_generation: 0,
             codex_overflow_compact_attempted: false,
             codex_body_override: None,
-            excluded_provider_ids: BTreeSet::new(),
             grok_session_id: None,
+            grok_reasoning_recovery_attempted: false,
             provider_binding_pinned: false,
             retry_audit: None,
-            codex_capacity_retry_attempted: 0,
             pending_capacity_retry_delay: None,
             skip_capacity_retry_delay: false,
         }
@@ -552,9 +580,21 @@ impl Default for ForwardAttemptContext {
 }
 
 impl ForwardAttemptContext {
+    fn attempt(&self) -> u32 {
+        self.attempt_budget.retries_used()
+    }
+
+    fn auth_refresh_attempted(&self) -> bool {
+        self.attempt_budget.used_for(RecoveryStage::Auth) > 0
+    }
+
+    fn codex_capacity_retry_attempted(&self) -> u32 {
+        self.attempt_budget.used_for(RecoveryStage::Capacity)
+    }
+
     fn retry_allowed(&self) -> bool {
-        self.attempt < MAX_FORWARD_RETRY_ATTEMPTS
-            && current_time_ms().saturating_sub(self.started_at_ms) < MAX_FORWARD_RETRY_ELAPSED_MS
+        self.attempt_budget
+            .has_remaining(current_time_ms(), &self.commit_guard)
     }
 
     fn next(
@@ -563,59 +603,141 @@ impl ForwardAttemptContext {
         body_retry_stage: Option<ClaudeBodyRetryStage>,
         stage: &'static str,
         source: &'static str,
-    ) -> Self {
+    ) -> Option<Self> {
+        let recovery_stage = match stage {
+            "auth" => RecoveryStage::Auth,
+            "capacity" => RecoveryStage::Capacity,
+            "body" => RecoveryStage::BodyCompatibility,
+            "transport" => RecoveryStage::Transport,
+            _ => RecoveryStage::Transport,
+        };
+        self.next_for(
+            execution,
+            body_retry_stage,
+            stage,
+            source,
+            recovery_stage,
+            DelaySource::Immediate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn next_for(
+        &self,
+        execution: &ProviderExecution,
+        body_retry_stage: Option<ClaudeBodyRetryStage>,
+        stage: &'static str,
+        source: &'static str,
+        recovery_stage: RecoveryStage,
+        delay_source: DelaySource,
+    ) -> Option<Self> {
         let mut next = self.clone();
-        next.attempt = next.attempt.saturating_add(1);
+        let decision = next.attempt_budget.reserve(
+            recovery_stage,
+            source,
+            delay_source,
+            current_time_ms(),
+            &next.commit_guard,
+            self.binding_snapshot.as_ref(),
+            next.binding_snapshot.as_ref(),
+        );
+        crate::metrics::record_recovery_decision(
+            execution.stored.provider_type.as_str(),
+            recovery_stage.as_str(),
+            if next.commit_guard.is_committed() {
+                "committed"
+            } else {
+                "pre_commit"
+            },
+            decision.as_str(),
+            delay_source.as_str(),
+        );
+        if decision != RetryDecision::Reserved {
+            tracing::debug!(
+                stage = recovery_stage.as_str(),
+                reason = source,
+                delay_source = delay_source.as_str(),
+                decision = decision.as_str(),
+                "transparent recovery denied by the shared attempt budget"
+            );
+            return None;
+        }
         next.body_retry_stage = body_retry_stage;
         next.execution = Some(execution.clone());
         next.pending_capacity_retry_delay = None;
-        next.retry_audit = Some(ForwardRetryAudit {
-            stage,
-            source,
-            previous_provider_id: None,
-        });
-        next
+        next.retry_audit = Some(ForwardRetryAudit { stage, source });
+        Some(next)
     }
 
-    fn after_auth_refresh(&self, execution: &ProviderExecution) -> Self {
-        let mut next = self.next(execution, self.body_retry_stage, "auth", "unauthorized");
-        next.auth_refresh_attempted = true;
-        next
+    fn reserve_auth_refresh(&self, execution: &ProviderExecution) -> Option<Self> {
+        self.next_for(
+            execution,
+            self.body_retry_stage,
+            "auth",
+            "unauthorized",
+            RecoveryStage::Auth,
+            DelaySource::Immediate,
+        )
     }
 
-    fn after_antigravity_retry(&self, execution: &ProviderExecution, source: &'static str) -> Self {
-        let mut next = self.next(execution, self.body_retry_stage, "capacity", source);
-        next.antigravity_retry_attempted = true;
-        next
-    }
-
-    fn after_provider_failover(
-        &self,
-        failed: &ProviderExecution,
-        next_execution: &ProviderExecution,
-        source: &'static str,
-    ) -> Self {
-        let mut next = self.next(next_execution, self.body_retry_stage, "provider", source);
-        next.excluded_provider_ids
-            .insert(failed.stored.provider.id.clone());
-        if let Some(audit) = next.retry_audit.as_mut() {
-            audit.previous_provider_id = Some(failed.stored.provider.id.clone());
+    fn advance_binding_after_token_refresh(
+        &mut self,
+        execution: &ProviderExecution,
+        accounts: &AccountStore,
+    ) -> Result<(), BindingSnapshotError> {
+        if let Some(binding) = self.binding_snapshot.as_mut() {
+            binding.advance_token_generation(execution, accounts)?;
         }
-        next.auth_refresh_attempted = false;
-        next.codex_body_override = None;
-        next
+        Ok(())
     }
 
-    fn after_codex_overflow_compact(&self, execution: &ProviderExecution, body: Bytes) -> Self {
-        let mut next = self.next(
+    fn after_antigravity_retry(
+        &self,
+        execution: &ProviderExecution,
+        source: &'static str,
+    ) -> Option<Self> {
+        let mut next = self.next_for(
+            execution,
+            self.body_retry_stage,
+            "capacity",
+            source,
+            RecoveryStage::Capacity,
+            DelaySource::ProviderHint,
+        )?;
+        next.antigravity_retry_attempted = true;
+        Some(next)
+    }
+
+    fn after_antigravity_session_rollover(&self, execution: &ProviderExecution) -> Option<Self> {
+        let mut next = self.next_for(
+            execution,
+            self.body_retry_stage,
+            "body",
+            "session_accumulation_exceeded",
+            RecoveryStage::SessionRollover,
+            DelaySource::Immediate,
+        )?;
+        next.antigravity_session_rollover_attempted = true;
+        next.antigravity_session_generation = self.antigravity_session_generation.saturating_add(1);
+        Some(next)
+    }
+
+    fn after_codex_overflow_compact(
+        &self,
+        execution: &ProviderExecution,
+        body: Bytes,
+    ) -> Option<Self> {
+        let mut next = self.next_for(
             execution,
             self.body_retry_stage,
             "body",
             "context_overflow_compaction",
-        );
+            RecoveryStage::BodyCompatibility,
+            DelaySource::Immediate,
+        )?;
         next.codex_overflow_compact_attempted = true;
         next.codex_body_override = Some(body);
-        next
+        Some(next)
     }
 
     fn after_codex_capacity_retry(
@@ -623,16 +745,75 @@ impl ForwardAttemptContext {
         execution: &ProviderExecution,
         source: &'static str,
         delay: Duration,
-    ) -> Self {
-        let mut next = self.next(execution, self.body_retry_stage, "capacity", source);
-        next.codex_capacity_retry_attempted = next.codex_capacity_retry_attempted.saturating_add(1);
+    ) -> Option<Self> {
+        let mut next = self.next_for(
+            execution,
+            self.body_retry_stage,
+            "capacity",
+            source,
+            RecoveryStage::Capacity,
+            DelaySource::BoundedBackoff,
+        )?;
         next.skip_capacity_retry_delay = self.skip_capacity_retry_delay;
         next.pending_capacity_retry_delay = Some(if self.skip_capacity_retry_delay {
             Duration::ZERO
         } else {
             delay
         });
-        next
+        Some(next)
+    }
+
+    fn after_grok_reasoning_recovery(&self, execution: &ProviderExecution) -> Option<Self> {
+        let mut next = self.next_for(
+            execution,
+            self.body_retry_stage,
+            "body",
+            "grok_reasoning_rejected",
+            RecoveryStage::Reasoning,
+            DelaySource::Immediate,
+        )?;
+        next.grok_reasoning_recovery_attempted = true;
+        Some(next)
+    }
+
+    fn ensure_binding(
+        &mut self,
+        execution: &ProviderExecution,
+        accounts: &AccountStore,
+    ) -> Result<(), BindingSnapshotError> {
+        if let Some(binding) = self.binding_snapshot.as_ref() {
+            binding.validate(execution, accounts)
+        } else {
+            self.binding_snapshot = Some(BindingSnapshot::capture(execution, accounts)?);
+            Ok(())
+        }
+    }
+
+    fn mark_downstream_committed(&mut self) {
+        self.commit_guard.commit_business_output(self.attempt());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_in_place(
+        &mut self,
+        execution: &ProviderExecution,
+        stage: &'static str,
+        source: &'static str,
+        recovery_stage: RecoveryStage,
+        delay_source: DelaySource,
+    ) -> bool {
+        let Some(next) = self.next_for(
+            execution,
+            self.body_retry_stage,
+            stage,
+            source,
+            recovery_stage,
+            delay_source,
+        ) else {
+            return false;
+        };
+        *self = next;
+        true
     }
 }
 
@@ -770,7 +951,7 @@ async fn materialize_codex_auth_context(
     execution.finalize_outbound_identity(&mut headers)?;
     Ok(CodexAuthContext {
         execution: execution.clone(),
-        http_client: forward_http_client(state, &stored).await?,
+        http_client: forward_http_client(state, execution).await?,
         stored,
         headers,
         url,
@@ -860,12 +1041,14 @@ pub async fn forward_codex_models_manifest(
         &audit_attempt,
     );
     let accounts = state.accounts_snapshot().await;
+    audit_attempt
+        .ensure_binding(&execution, &accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
         acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
     let endpoint = codex_models_manifest_url(&execution);
     let version = codex_models_client_version(client_version.as_deref());
-    let mut auth_refresh_attempted = false;
     loop {
         let context =
             materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
@@ -877,11 +1060,9 @@ pub async fn forward_codex_models_manifest(
             &version,
         )?;
         let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
-        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
-            drop(upstream);
-            force_refresh_codex_auth_context(&state, &execution).await?;
-            auth_refresh_attempted = true;
-            advance_audited_attempt(
+        if upstream.status() == StatusCode::UNAUTHORIZED
+            && !audit_attempt.auth_refresh_attempted()
+            && advance_audited_attempt(
                 &state,
                 ProxyRoute::CodexResponses,
                 &request_context,
@@ -889,10 +1070,17 @@ pub async fn forward_codex_models_manifest(
                 &mut audit_attempt,
                 "auth",
                 "models_unauthorized",
-            );
+            )
+        {
+            drop(upstream);
+            force_refresh_codex_auth_context(&state, &execution).await?;
+            let refreshed_accounts = state.accounts_snapshot().await;
+            audit_attempt
+                .advance_binding_after_token_refresh(&execution, &refreshed_accounts)
+                .map_err(binding_snapshot_error_to_proxy_error)?;
             continue;
         }
-        if upstream.status() == StatusCode::UNAUTHORIZED {
+        if upstream.status() == StatusCode::UNAUTHORIZED && audit_attempt.auth_refresh_attempted() {
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
@@ -992,11 +1180,13 @@ pub async fn forward_codex_alpha_search(
     )
     .await?;
     let accounts = state.accounts_snapshot().await;
+    audit_attempt
+        .ensure_binding(&execution, &accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
         acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
     let endpoint = codex_alpha_search_url(&execution);
-    let mut auth_refresh_attempted = false;
     loop {
         let context =
             materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
@@ -1012,11 +1202,9 @@ pub async fn forward_codex_alpha_search(
             request = request.header(name, value);
         }
         let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
-        if upstream.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
-            drop(upstream);
-            force_refresh_codex_auth_context(&state, &execution).await?;
-            auth_refresh_attempted = true;
-            advance_audited_attempt(
+        if upstream.status() == StatusCode::UNAUTHORIZED
+            && !audit_attempt.auth_refresh_attempted()
+            && advance_audited_attempt(
                 &state,
                 ProxyRoute::CodexResponses,
                 &request_context,
@@ -1024,10 +1212,17 @@ pub async fn forward_codex_alpha_search(
                 &mut audit_attempt,
                 "auth",
                 "alpha_search_unauthorized",
-            );
+            )
+        {
+            drop(upstream);
+            force_refresh_codex_auth_context(&state, &execution).await?;
+            let refreshed_accounts = state.accounts_snapshot().await;
+            audit_attempt
+                .advance_binding_after_token_refresh(&execution, &refreshed_accounts)
+                .map_err(binding_snapshot_error_to_proxy_error)?;
             continue;
         }
-        if upstream.status() == StatusCode::UNAUTHORIZED {
+        if upstream.status() == StatusCode::UNAUTHORIZED && audit_attempt.auth_refresh_attempted() {
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
@@ -1227,7 +1422,7 @@ async fn next_codex_overflow_attempt(
         compacted_bytes = compacted.len(),
         "retrying Codex request after context overflow compaction"
     );
-    Some(attempt_context.after_codex_overflow_compact(execution, compacted))
+    attempt_context.after_codex_overflow_compact(execution, compacted)
 }
 
 async fn summarize_codex_overflow(
@@ -1416,7 +1611,7 @@ async fn forward_with_attempt(
         let mut request_context = request_context_from_headers(&headers);
         request_context.operation = inference_operation_for_route(route);
         request_context.started_at_ms = Some(attempt_context.request_started_at_ms);
-        request_context.attempt_count = Some(attempt_context.attempt.saturating_add(1));
+        request_context.attempt_count = Some(attempt_context.attempt().saturating_add(1));
         request_context.session_id = session_id_from_request(route, &headers, &body);
         let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
             let (share_name, guard) = validate_and_acquire_share_invocation(
@@ -1475,11 +1670,19 @@ async fn forward_with_attempt(
             app,
         )
         .await?;
+        attempt_context
+            .ensure_binding(&execution, &accounts_for_lease)
+            .map_err(binding_snapshot_error_to_proxy_error)?;
         let snapshot = state.account_in_flight.snapshot();
         let mut account_in_flight_guard =
             acquire_account_in_flight(&state, &execution.stored, &accounts_for_lease, &snapshot)?;
         let stored = execution.runtime_stored_view();
         audit_forward_attempt(&state, route, &request_context, &stored, &attempt_context);
+        super::antigravity_compaction::enforce_disabled_contract(
+            stored.provider_type,
+            route,
+            &body,
+        )?;
         let codex_request_intent = if execution.driver_is("oauth.openai_codex") {
             super::codex_request_policy::extract_intent_from_bytes(&body)
         } else {
@@ -1930,6 +2133,34 @@ async fn forward_with_attempt(
             (adapter_request, url, target_headers)
         };
 
+        apply_antigravity_session_contract(
+            &execution,
+            route,
+            &request_context,
+            &attempt_context,
+            &mut adapter_request.body,
+        );
+        let antigravity_reasoning_replay = prepare_antigravity_reasoning_replay(
+            &state,
+            &execution,
+            route,
+            &request_context,
+            &url,
+            &mut adapter_request.body,
+        )
+        .await;
+
+        let grok_reasoning_replay = prepare_grok_reasoning_replay(
+            &state,
+            &execution,
+            &request_context,
+            &headers,
+            &url,
+            attempt_context.grok_reasoning_recovery_attempted,
+            &mut adapter_request.body,
+        )
+        .await?;
+
         let kimi_thinking_replay = prepare_kimi_thinking_replay(
             &state,
             &execution,
@@ -1952,7 +2183,7 @@ async fn forward_with_attempt(
         )
         .await?;
 
-        let http_client = forward_http_client(&state, &stored).await?;
+        let http_client = forward_http_client(&state, &execution).await?;
         let request = build_upstream_post_request(
             &http_client,
             &url,
@@ -2071,7 +2302,7 @@ async fn forward_with_attempt(
                     retry_policy::unauthorized_recovery_decision(
                         StatusCode::UNAUTHORIZED,
                         provider_type,
-                        attempt_context.auth_refresh_attempted,
+                        attempt_context.auth_refresh_attempted(),
                         attempt_context.retry_allowed(),
                     )
                 })
@@ -2095,25 +2326,6 @@ async fn forward_with_attempt(
                 continue 'attempt;
             }
         }
-        if matches!(
-            route,
-            ProxyRoute::ClaudeMessages | ProxyRoute::ClaudeCountTokens
-        ) && status.as_u16() == 529
-            && !request_is_provider_pinned(&attempt_context, &request_context)
-        {
-            if let Some(next_attempt) =
-                next_provider_failover(&state, route, &attempt_context, &execution, "http_529")
-                    .await
-            {
-                record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
-                    .await;
-                attempt_context = next_attempt;
-                drop(upstream);
-                drop(account_in_flight_guard);
-                drop(share_invocation_guard);
-                continue 'attempt;
-            }
-        }
         maybe_update_grok_entitlement(&state, &execution, &response_headers).await;
         maybe_mark_grok_cooldown(&state, &execution, status, &response_headers).await;
         let mut content_type = response_headers
@@ -2122,6 +2334,38 @@ async fn forward_with_attempt(
             .map(str::to_string);
         let mut content_encoding = content_encoding_value(&response_headers);
         let mut buffered_upstream_body = None;
+
+        if status == StatusCode::BAD_REQUEST
+            && !attempt_context.grok_reasoning_recovery_attempted
+            && attempt_context.retry_allowed()
+            && grok_reasoning_replay
+                .as_ref()
+                .is_some_and(|context| context.replay_applied)
+        {
+            let response_bytes = crate::infra::http::read_response_body_limited(
+                &mut upstream,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+            let decoded = decode_response_body_for_proxy_with_limit(
+                &response_headers,
+                response_bytes,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            )?;
+            if super::grok_replay::is_explicit_rejection(status.as_u16(), &decoded.body) {
+                clear_rejected_grok_reasoning_replay(&state, grok_reasoning_replay.as_ref()).await;
+                if let Some(next_attempt) =
+                    attempt_context.after_grok_reasoning_recovery(&execution)
+                {
+                    attempt_context = next_attempt;
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
+            }
+            buffered_upstream_body = Some(decoded);
+        }
 
         if codex_image_tool_strip_policy(&stored) == CodexImageToolStripPolicy::OnError
             && execution.driver_is("oauth.openai_codex")
@@ -2399,6 +2643,7 @@ async fn forward_with_attempt(
             };
             let antigravity_limit = antigravity_limit_info(&execution, status, &decoded.body);
             if let Some(limit) = antigravity_limit.as_ref() {
+                install_antigravity_retry_after(&mut response_headers, limit);
                 record_antigravity_limit_evidence(&state, &execution, limit).await;
                 if let Some(next_attempt) =
                     next_antigravity_limit_attempt(route, &attempt_context, &execution, limit)
@@ -2428,23 +2673,6 @@ async fn forward_with_attempt(
                     final_model.as_deref(),
                 )
                 .await;
-            }
-            if !request_is_provider_pinned(&attempt_context, &request_context) {
-                if let Some(next_attempt) =
-                    next_provider_failover(&state, route, &attempt_context, &execution, "http_429")
-                        .await
-                {
-                    record_provider_outcome(
-                        &state,
-                        &stored,
-                        provider_outcome_from_status(status_code),
-                    )
-                    .await;
-                    attempt_context = next_attempt;
-                    drop(account_in_flight_guard);
-                    drop(share_invocation_guard);
-                    continue 'attempt;
-                }
             }
             if route == ProxyRoute::ClaudeCountTokens {
                 crate::metrics::record_claude_count_tokens_outcome("rate_limited");
@@ -3176,15 +3404,17 @@ async fn forward_with_attempt(
                                             next_stage.as_header_value(),
                                             "sse_error",
                                         );
-                                        attempt_context = attempt_context.next(
+                                        if let Some(next_attempt) = attempt_context.next(
                                             &execution,
                                             Some(next_stage),
                                             "body",
                                             next_stage.as_header_value(),
-                                        );
-                                        drop(account_in_flight_guard);
-                                        drop(share_invocation_guard);
-                                        continue 'attempt;
+                                        ) {
+                                            attempt_context = next_attempt;
+                                            drop(account_in_flight_guard);
+                                            drop(share_invocation_guard);
+                                            continue 'attempt;
+                                        }
                                     }
                                 }
                             }
@@ -3196,22 +3426,6 @@ async fn forward_with_attempt(
                                 ProviderOutcome::Failure { status_code: 502 },
                             )
                             .await;
-                            if !request_is_provider_pinned(&attempt_context, &request_context) {
-                                if let Some(next_attempt) = next_provider_failover(
-                                    &state,
-                                    route,
-                                    &attempt_context,
-                                    &execution,
-                                    "responses_stream_protocol_error",
-                                )
-                                .await
-                                {
-                                    attempt_context = next_attempt;
-                                    drop(account_in_flight_guard);
-                                    drop(share_invocation_guard);
-                                    continue 'attempt;
-                                }
-                            }
                             return Err(ProxyError::bad_gateway(error));
                         }
                         if let Some(failure) = match &semantic_decision {
@@ -3325,25 +3539,6 @@ async fn forward_with_attempt(
                                     )
                                     .await;
                                     semantic_provider_outcome_recorded = true;
-                                    if !request_is_provider_pinned(
-                                        &attempt_context,
-                                        &request_context,
-                                    ) {
-                                        if let Some(next_attempt) = next_provider_failover(
-                                            &state,
-                                            route,
-                                            &attempt_context,
-                                            &execution,
-                                            "responses_stream_semantic_failure",
-                                        )
-                                        .await
-                                        {
-                                            attempt_context = next_attempt;
-                                            drop(account_in_flight_guard);
-                                            drop(share_invocation_guard);
-                                            continue 'attempt;
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -3362,22 +3557,6 @@ async fn forward_with_attempt(
                                 ProviderOutcome::Failure { status_code: 502 },
                             )
                             .await;
-                            if !request_is_provider_pinned(&attempt_context, &request_context) {
-                                if let Some(next_attempt) = next_provider_failover(
-                                    &state,
-                                    route,
-                                    &attempt_context,
-                                    &execution,
-                                    "responses_stream_protocol_eof",
-                                )
-                                .await
-                                {
-                                    attempt_context = next_attempt;
-                                    drop(account_in_flight_guard);
-                                    drop(share_invocation_guard);
-                                    continue 'attempt;
-                                }
-                            }
                             return Err(ProxyError::bad_gateway(error));
                         }
                     }
@@ -3425,6 +3604,9 @@ async fn forward_with_attempt(
 
             let stream_stored = stored.clone();
             let interrupted_update_armed = Arc::new(AtomicBool::new(true));
+            if pending_chunk_committed_output {
+                attempt_context.mark_downstream_committed();
+            }
             let stream_state = StreamForwardState {
                 inner,
                 stored: stream_stored,
@@ -3459,17 +3641,32 @@ async fn forward_with_attempt(
                 grok_responses_sse,
                 grok_search_identity,
                 grok_search_evidence_recorded: false,
+                grok_reasoning_replay: grok_reasoning_replay.clone().map(|context| {
+                    GrokReplayStreamWrite {
+                        context,
+                        accumulator: GrokReplayStreamAccumulator::default(),
+                    }
+                }),
+                antigravity_reasoning_replay: antigravity_reasoning_replay.clone().map(|context| {
+                    AntigravityReplayStreamWrite {
+                        request_body: adapter_request.body.clone(),
+                        context,
+                        accumulator: AntigravityReplayStreamAccumulator::default(),
+                    }
+                }),
                 kimi_thinking_replay: kimi_thinking_replay.clone().map(|context| {
                     KimiThinkingReplayStreamWrite {
                         context,
                         accumulator: KimiThinkingReplayStreamAccumulator::default(),
                     }
                 }),
-                stream_transform: super::stream_transforms::StreamEventTransformer::new(
-                    &stored,
-                    route,
-                    adapter_request.responses_tool_context.clone(),
-                ),
+                stream_transform:
+                    super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+                        &stored,
+                        route,
+                        adapter_request.responses_tool_context.clone(),
+                        adapter_request.downstream_include_usage,
+                    ),
                 terminal_detector,
                 claude_tool_name_stream_patcher:
                     super::claude_oauth::ClaudeToolNameStreamPatcher::new(
@@ -3706,6 +3903,8 @@ async fn forward_with_attempt(
                                     .await;
                             }
                         }
+                        stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk);
+                        stream_state.inspect_grok_reasoning_replay_chunk(&chunk);
                         stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
@@ -3862,6 +4061,9 @@ async fn forward_with_attempt(
                             stream_state.commit_text_downstream();
                         }
                         stream_state.record_image_transport_emit(&transformed, false);
+                        stream_state
+                            .commit_antigravity_reasoning_replay_stream()
+                            .await;
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
                         Ok(Some((transformed, stream_state)))
@@ -4029,6 +4231,10 @@ async fn forward_with_attempt(
                             }
                             let transformed = join_bytes(transformed, synthesized);
                             stream_state.record_image_transport_emit(&transformed, false);
+                            stream_state
+                                .commit_antigravity_reasoning_replay_stream()
+                                .await;
+                            stream_state.finish_grok_reasoning_replay_stream().await;
                             stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
                             return Ok(Some((transformed, stream_state)));
@@ -4102,6 +4308,10 @@ async fn forward_with_attempt(
                             transformed_tail,
                             stream_state.codex_custom_tool_stream_patcher.finish(),
                         );
+                        stream_state
+                            .commit_antigravity_reasoning_replay_stream()
+                            .await;
+                        stream_state.finish_grok_reasoning_replay_stream().await;
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         let synthesized =
                             stream_state.maybe_synthesize_codex_responses_failed_frame();
@@ -4273,6 +4483,7 @@ async fn forward_with_attempt(
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
         if let Some(limit) = antigravity_limit_info(&execution, status, &bytes) {
+            install_antigravity_retry_after(&mut response_headers, &limit);
             record_antigravity_limit_evidence(&state, &execution, &limit).await;
             if let Some(next_attempt) =
                 next_antigravity_limit_attempt(route, &attempt_context, &execution, &limit)
@@ -4286,6 +4497,32 @@ async fn forward_with_attempt(
                 continue 'attempt;
             }
             mark_antigravity_limit_cooldown(&state, &execution, &request_context, &limit);
+        }
+        if matches!(
+            execution.stored.provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) && super::antigravity_replay::is_session_accumulation_error(status.as_u16(), &bytes)
+            && !attempt_context.antigravity_session_rollover_attempted
+            && attempt_context.retry_allowed()
+            && execution.managed_account_identity_target().is_some()
+            && request_context.session_id.is_some()
+        {
+            record_forward_retry(route, "body", "session_accumulation_exceeded");
+            if let Some(next_attempt) =
+                attempt_context.after_antigravity_session_rollover(&execution)
+            {
+                attempt_context = next_attempt;
+                drop(account_in_flight_guard);
+                drop(share_invocation_guard);
+                continue 'attempt;
+            }
+        }
+        if super::antigravity_replay::is_signature_rejection(status.as_u16(), &bytes) {
+            clear_rejected_antigravity_reasoning_replay(
+                &state,
+                antigravity_reasoning_replay.as_ref(),
+            )
+            .await;
         }
         if status.is_success()
             && adapters::is_gemini_v1internal_provider_type(stored.provider_type)
@@ -4313,15 +4550,17 @@ async fn forward_with_attempt(
         if let Some(next_stage) = next_body_retry_stage {
             if attempt_context.retry_allowed() {
                 crate::metrics::record_claude_retry(next_stage.as_header_value(), "http_error");
-                attempt_context = attempt_context.next(
+                if let Some(next_attempt) = attempt_context.next(
                     &execution,
                     Some(next_stage),
                     "body",
                     next_stage.as_header_value(),
-                );
-                drop(account_in_flight_guard);
-                drop(share_invocation_guard);
-                continue 'attempt;
+                ) {
+                    attempt_context = next_attempt;
+                    drop(account_in_flight_guard);
+                    drop(share_invocation_guard);
+                    continue 'attempt;
+                }
             }
         }
         let (rewritten, version_gate_rewritten) =
@@ -4392,22 +4631,6 @@ async fn forward_with_attempt(
                         ProviderOutcome::Failure { status_code: 502 },
                     )
                     .await;
-                    if !request_is_provider_pinned(&attempt_context, &request_context) {
-                        if let Some(next_attempt) = next_provider_failover(
-                            &state,
-                            route,
-                            &attempt_context,
-                            &execution,
-                            "responses_document_protocol_error",
-                        )
-                        .await
-                        {
-                            attempt_context = next_attempt;
-                            drop(account_in_flight_guard);
-                            drop(share_invocation_guard);
-                            continue 'attempt;
-                        }
-                    }
                     return Err(ProxyError::bad_gateway(error));
                 }
             };
@@ -4493,22 +4716,6 @@ async fn forward_with_attempt(
                     )
                     .await;
                     semantic_provider_outcome_recorded = true;
-                    if !request_is_provider_pinned(&attempt_context, &request_context) {
-                        if let Some(next_attempt) = next_provider_failover(
-                            &state,
-                            route,
-                            &attempt_context,
-                            &execution,
-                            "responses_document_semantic_failure",
-                        )
-                        .await
-                        {
-                            attempt_context = next_attempt;
-                            drop(account_in_flight_guard);
-                            drop(share_invocation_guard);
-                            continue 'attempt;
-                        }
-                    }
                 }
             }
             Some(observation)
@@ -4520,6 +4727,23 @@ async fn forward_with_attempt(
         let kimi_thinking_replay_content = status
             .is_success()
             .then(|| kimi_thinking_replay_content_from_response(&bytes))
+            .flatten();
+        let antigravity_replay_terminal =
+            status.is_success() && super::antigravity_replay::response_has_terminal(&bytes);
+        let antigravity_replay_chain = antigravity_replay_terminal
+            .then(|| {
+                antigravity_reasoning_replay.as_ref().and_then(|context| {
+                    super::antigravity_replay::capture_response(
+                        &adapter_request.body,
+                        &bytes,
+                        context.previous_chain.as_ref(),
+                    )
+                })
+            })
+            .flatten();
+        let grok_replay_proof = status
+            .is_success()
+            .then(|| super::grok_replay::capture_document(&bytes))
             .flatten();
         let usage = if is_count_tokens_request {
             TokenUsage::default()
@@ -4562,12 +4786,21 @@ async fn forward_with_attempt(
             &adapter_request.claude_tool_name_map,
         );
         if status.is_success() {
+            commit_antigravity_reasoning_replay(
+                &state,
+                antigravity_reasoning_replay.as_ref(),
+                antigravity_replay_terminal,
+                antigravity_replay_chain,
+            )
+            .await;
             commit_kimi_thinking_replay(
                 &state,
                 kimi_thinking_replay.as_ref(),
                 kimi_thinking_replay_content,
             )
             .await;
+            commit_grok_reasoning_replay(&state, grok_reasoning_replay.as_ref(), grok_replay_proof)
+                .await;
         }
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
@@ -5732,6 +5965,10 @@ async fn forward_grok_media_with_execution(
         .await;
         return Err(error);
     }
+    let binding_accounts = state.accounts_snapshot().await;
+    audit_attempt
+        .ensure_binding(&execution, &binding_accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     let adapter = adapters::adapter_for(AppKind::Codex, stored.provider_type);
     let media_session_id = optional_header(&headers, "x-grok-conv-id")
         .map(|value| value.trim().to_string())
@@ -5755,9 +5992,8 @@ async fn forward_grok_media_with_execution(
         )
     };
     let media_model = grok_media_usage_model(&body);
-    let http_client = forward_http_client(&state, &stored).await?;
+    let http_client = forward_http_client(&state, &execution).await?;
     let started = Instant::now();
-    let mut auth_refresh_attempted = false;
     let mut upstream = loop {
         ensure_managed_credential_persistence_available(&state, &execution)?;
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
@@ -5819,7 +6055,7 @@ async fn forward_grok_media_with_execution(
             break upstream;
         }
         let rejected_access_token = bearer_token_from_owned_headers(&target_headers);
-        if auth_refresh_attempted {
+        if audit_attempt.auth_refresh_attempted() {
             mark_managed_account_auth_cooldown(
                 &state,
                 &execution,
@@ -5834,6 +6070,17 @@ async fn forward_grok_media_with_execution(
         else {
             break upstream;
         };
+        if !advance_audited_attempt(
+            &state,
+            ProxyRoute::CodexResponses,
+            &request_context,
+            &execution,
+            &mut audit_attempt,
+            "auth",
+            "grok_media_unauthorized",
+        ) {
+            break upstream;
+        }
         drop(upstream);
         if let Err(error) = state
             .refresh_managed_account_now_for_generation(
@@ -5864,16 +6111,10 @@ async fn forward_grok_media_with_execution(
             .await;
             return Err(error);
         }
-        auth_refresh_attempted = true;
-        advance_audited_attempt(
-            &state,
-            ProxyRoute::CodexResponses,
-            &request_context,
-            &execution,
-            &mut audit_attempt,
-            "auth",
-            "grok_media_unauthorized",
-        );
+        let refreshed_accounts = state.accounts_snapshot().await;
+        audit_attempt
+            .advance_binding_after_token_refresh(&execution, &refreshed_accounts)
+            .map_err(binding_snapshot_error_to_proxy_error)?;
     };
     let status = upstream.status();
     let status_code = status.as_u16();
@@ -6551,6 +6792,9 @@ async fn forward_codex_images_request(
     );
     ensure_managed_credential_persistence_available(&state, &execution)?;
     let accounts = state.accounts_snapshot().await;
+    audit_attempt
+        .ensure_binding(&execution, &accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     super::router::ensure_codex_oauth_binding(&stored, &accounts)?;
     validate_codex_allowed_client(
         &stored,
@@ -6569,6 +6813,7 @@ async fn forward_codex_images_request(
         gemini_action: None,
         stream_requested: true,
         upstream_stream_requested: true,
+        downstream_include_usage: true,
         custom_tool_names: Default::default(),
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
@@ -6632,7 +6877,6 @@ async fn forward_codex_images_request(
     // refresh from leaving an already-expired image transport deadline.
     let mut first_event_deadline =
         first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-    let mut auth_refresh_attempted = false;
     let (mut upstream, rejected_access_token) = loop {
         let header_timeout = first_event_deadline
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
@@ -6676,10 +6920,23 @@ async fn forward_codex_images_request(
                 return Err(error);
             }
         };
-        if attempt.response.status() == StatusCode::UNAUTHORIZED && !auth_refresh_attempted {
+        if attempt.response.status() == StatusCode::UNAUTHORIZED
+            && !audit_attempt.auth_refresh_attempted()
+        {
             if let Some((provider_type, account_id, expected_generation)) =
                 execution.managed_account_identity_target()
             {
+                if !advance_audited_attempt(
+                    &state,
+                    ProxyRoute::CodexResponses,
+                    &request_context,
+                    &execution,
+                    &mut audit_attempt,
+                    "auth",
+                    "images_unauthorized",
+                ) {
+                    break (attempt.response, attempt.access_token);
+                }
                 drop(attempt.response);
                 let refresh_result = state
                     .refresh_managed_account_now_for_generation(
@@ -6716,16 +6973,10 @@ async fn forward_codex_images_request(
                 }
                 first_event_deadline =
                     first_event_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
-                auth_refresh_attempted = true;
-                advance_audited_attempt(
-                    &state,
-                    ProxyRoute::CodexResponses,
-                    &request_context,
-                    &execution,
-                    &mut audit_attempt,
-                    "auth",
-                    "images_unauthorized",
-                );
+                let refreshed_accounts = state.accounts_snapshot().await;
+                audit_attempt
+                    .advance_binding_after_token_refresh(&execution, &refreshed_accounts)
+                    .map_err(binding_snapshot_error_to_proxy_error)?;
                 continue;
             }
         }
@@ -6733,7 +6984,7 @@ async fn forward_codex_images_request(
     };
     let status = upstream.status();
     let status_code = status.as_u16();
-    if status == StatusCode::UNAUTHORIZED && auth_refresh_attempted {
+    if status == StatusCode::UNAUTHORIZED && audit_attempt.auth_refresh_attempted() {
         mark_managed_account_auth_cooldown(
             &state,
             &execution,
@@ -7053,7 +7304,7 @@ async fn send_codex_images_attempt(
     target_headers.retain(|(name, _)| !name.eq_ignore_ascii_case(ACCEPT.as_str()));
     target_headers.push((ACCEPT.as_str().to_string(), "text/event-stream".to_string()));
     let access_token = bearer_token_from_owned_headers(&target_headers).map(str::to_string);
-    let http_client = forward_http_client(state, stored).await?;
+    let http_client = forward_http_client(state, execution).await?;
     let mut request = http_client
         .post(&url)
         .header(CONTENT_TYPE, "application/json")
@@ -7438,6 +7689,7 @@ fn codex_images_common_options(
     let requested_model = optional_codex_image_string(value, "model")?
         .unwrap_or_else(|| CODEX_IMAGES_DEFAULT_TOOL_MODEL.to_string());
     let (tool_model, alias_size) = normalize_codex_image_model(&requested_model, prompt);
+    ensure_codex_image_model_has_live_evidence(&tool_model)?;
     if !tool_model.to_ascii_lowercase().starts_with("gpt-image-") {
         return Err(ProxyError::bad_request(format!(
             "images endpoint requires a gpt-image-* model, got {requested_model:?}"
@@ -7529,6 +7781,21 @@ fn codex_images_common_options(
         response_format,
         stream,
     })
+}
+
+fn ensure_codex_image_model_has_live_evidence(model: &str) -> Result<(), ProxyError> {
+    let model = model.trim().to_ascii_lowercase();
+    if CODEX_IMAGES_LIVE_PENDING_25_MODELS.contains(&model.as_str()) {
+        return Err(ProxyError::bad_request(format!(
+            "Codex image model {model:?} is not enabled: live generation, edit, usage, error, and quota evidence is pending for this exact variant"
+        )));
+    }
+    if model.starts_with("gpt-image-2.5-") {
+        return Err(ProxyError::bad_request(format!(
+            "Codex image model {model:?} is not enabled without exact live variant evidence"
+        )));
+    }
+    Ok(())
 }
 
 fn optional_codex_image_string(value: &Value, field: &str) -> Result<Option<String>, ProxyError> {
@@ -9692,9 +9959,13 @@ async fn bridge_responses_websocket(
     let mut semantic_provider_outcome_recorded = false;
     let mut active_response_body = None;
     let mut active_response_intent = None;
+    let mut active_grok_reasoning_replay: Option<GrokReplayStreamWrite> = None;
+    let mut active_grok_reasoning_retry_message: Option<TungsteniteMessage> = None;
+    let mut active_grok_reasoning_recovery_attempted = false;
+    let mut active_response_started_at: Option<Instant> = None;
     let mut active_usage_turn: Option<ResponsesWebsocketUsageTurn> = None;
     let mut codex_session_model = single_upstream_model.clone();
-    let mut auth_refresh_attempted = false;
+    let mut active_attempt = ForwardAttemptContext::default();
     let mut refresh_target_before_connect = false;
     let mut upstream_read_deadline = None;
     let mut output_patcher = CodexWebsocketOutputPatcher::default();
@@ -9844,7 +10115,24 @@ async fn bridge_responses_websocket(
                 } else {
                     (message, None)
                 };
+                let mut message = message;
                 if starts_response {
+                    let grok_reasoning_retry_message =
+                        matches!(mode, ResponsesWebsocketMode::Grok).then(|| message.clone());
+                    let grok_reasoning_replay = if matches!(mode, ResponsesWebsocketMode::Grok) {
+                        prepare_grok_reasoning_replay_websocket(
+                            state,
+                            &execution,
+                            &request_context,
+                            grok_turn_index,
+                            grok_session_id.as_deref(),
+                            &ws_url,
+                            &mut message,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
                     let effective_response_body = responses_websocket_http_body(&message)?;
                     let requested_response_body = original_response_body
                         .as_ref()
@@ -9872,10 +10160,20 @@ async fn bridge_responses_websocket(
                                 &effective_response_body,
                             )
                         }),
-                        grok_tool_context,
+                        grok_tool_context.clone(),
                     );
                     active_response_body = Some(effective_response_body.clone());
                     active_response_intent = Some(intent.clone());
+                    active_grok_reasoning_retry_message = grok_reasoning_replay
+                        .as_ref()
+                        .and(grok_reasoning_retry_message);
+                    active_grok_reasoning_replay =
+                        grok_reasoning_replay.map(|context| GrokReplayStreamWrite {
+                            context,
+                            accumulator: GrokReplayStreamAccumulator::default(),
+                        });
+                    active_grok_reasoning_recovery_attempted = false;
+                    active_response_started_at = Some(Instant::now());
                     let mut turn_context = request_context.clone();
                     if let Some(metadata) = policy_metadata {
                         apply_codex_policy_metadata(&mut turn_context, metadata);
@@ -9894,6 +10192,10 @@ async fn bridge_responses_websocket(
                         .await?,
                     );
                     let accounts = state.accounts_snapshot().await;
+                    active_attempt = ForwardAttemptContext::default();
+                    active_attempt
+                        .ensure_binding(&execution, &accounts)
+                        .map_err(binding_snapshot_error_to_proxy_error)?;
                     let snapshot = state.account_in_flight.snapshot();
                     account_in_flight_guard = acquire_account_in_flight(
                         state,
@@ -9909,7 +10211,6 @@ async fn bridge_responses_websocket(
                     }
                     pending_lifecycle_messages.clear();
                     semantic_provider_outcome_recorded = false;
-                    auth_refresh_attempted = false;
                     if entry.is_none() {
                         if refresh_target_before_connect {
                             let forwarded_headers = codex_client_headers_from_owned(&headers);
@@ -9941,7 +10242,7 @@ async fn bridge_responses_websocket(
                             &mut headers,
                             &mut ws_url,
                             &mut pool_key,
-                            &mut auth_refresh_attempted,
+                            &mut active_attempt,
                             &mut active_usage_turn,
                         )
                         .await
@@ -10004,7 +10305,7 @@ async fn bridge_responses_websocket(
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                     source,
-                                    &mut auth_refresh_attempted,
+                                    &mut active_attempt,
                                     &mut output_patcher,
                                     active_response_intent.as_ref().expect("active response intent"),
                                     &mut active_usage_turn,
@@ -10028,6 +10329,55 @@ async fn bridge_responses_websocket(
                     return Err(ProxyError::bad_request(
                         "the first responses websocket request must be response.create",
                     ));
+                }
+                if starts_response
+                    && matches!(mode, ResponsesWebsocketMode::Grok)
+                    && active_grok_reasoning_replay.as_ref().is_some()
+                    && !grok_reasoning_replay_binding_is_current(
+                        state,
+                        &active_grok_reasoning_replay
+                            .as_ref()
+                            .expect("checked Grok replay context")
+                            .context,
+                    )
+                    .await
+                {
+                    let original = active_grok_reasoning_retry_message
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| {
+                            ProxyError::conflict(
+                                "Grok replay binding changed before the request was sent",
+                            )
+                        })?;
+                    message = original.clone();
+                    let refreshed = prepare_grok_reasoning_replay_websocket(
+                        state,
+                        &execution,
+                        &request_context,
+                        grok_turn_index,
+                        grok_session_id.as_deref(),
+                        &ws_url,
+                        &mut message,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        ProxyError::conflict(
+                            "Grok replay scope changed before the request was sent",
+                        )
+                    })?;
+                    if !grok_reasoning_replay_binding_is_current(state, &refreshed).await {
+                        return Err(ProxyError::conflict(
+                            "Grok Provider or Account changed before the request was sent",
+                        ));
+                    }
+                    active_response_body = Some(responses_websocket_http_body(&message)?);
+                    active_grok_reasoning_replay = Some(GrokReplayStreamWrite {
+                        context: refreshed,
+                        accumulator: GrokReplayStreamAccumulator::default(),
+                    });
+                    active_grok_reasoning_retry_message = Some(original);
+                    crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
                 }
                 let send_result = {
                     let _account_read_guard = if starts_response {
@@ -10075,7 +10425,7 @@ async fn bridge_responses_websocket(
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
-                            &mut auth_refresh_attempted,
+                            &mut active_attempt,
                             &mut output_patcher,
                             active_response_intent.as_ref().expect("active response intent"),
                             &mut active_usage_turn,
@@ -10149,7 +10499,7 @@ async fn bridge_responses_websocket(
                                 first_byte_timeout,
                                 stream_idle_timeout,
                                 "first_byte_timeout",
-                                &mut auth_refresh_attempted,
+                                &mut active_attempt,
                                 &mut output_patcher,
                                 active_response_intent.as_ref().expect("active response intent"),
                                 &mut active_usage_turn,
@@ -10225,7 +10575,7 @@ async fn bridge_responses_websocket(
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
-                            &mut auth_refresh_attempted,
+                            &mut active_attempt,
                             &mut output_patcher,
                             active_response_intent.as_ref().expect("active response intent"),
                             &mut active_usage_turn,
@@ -10288,7 +10638,7 @@ async fn bridge_responses_websocket(
                             first_byte_timeout,
                             stream_idle_timeout,
                                 source,
-                                &mut auth_refresh_attempted,
+                                &mut active_attempt,
                                 &mut output_patcher,
                                 active_response_intent.as_ref().expect("active response intent"),
                                 &mut active_usage_turn,
@@ -10393,7 +10743,7 @@ async fn bridge_responses_websocket(
                             first_byte_timeout,
                             stream_idle_timeout,
                             source,
-                            &mut auth_refresh_attempted,
+                            &mut active_attempt,
                             &mut output_patcher,
                             active_response_intent.as_ref().expect("active response intent"),
                             &mut active_usage_turn,
@@ -10468,7 +10818,7 @@ async fn bridge_responses_websocket(
                                         first_byte_timeout,
                                         stream_idle_timeout,
                                         "semantic_protocol_error",
-                                        &mut auth_refresh_attempted,
+                                        &mut active_attempt,
                                         &mut output_patcher,
                                         active_response_intent.as_ref().expect("active response intent"),
                                         &mut active_usage_turn,
@@ -10510,6 +10860,94 @@ async fn bridge_responses_websocket(
                 } else {
                     None
                 };
+                if response_in_flight {
+                    if let Some(bytes) = websocket_message_payload(&message) {
+                        if let Some(replay) = active_grok_reasoning_replay.as_mut() {
+                            replay.accumulator.push(bytes);
+                        }
+                    }
+                }
+                if matches!(mode, ResponsesWebsocketMode::Grok)
+                    && !emitted_business_event
+                    && !active_grok_reasoning_recovery_attempted
+                    && active_response_started_at.is_some_and(|started| {
+                        started.elapsed().as_millis() < MAX_FORWARD_RETRY_ELAPSED_MS
+                    })
+                    && active_grok_reasoning_replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.context.replay_applied)
+                    && grok_reasoning_rejection_from_websocket_message(&message)
+                    && active_attempt.reserve_in_place(
+                        &execution,
+                        "body",
+                        "grok_reasoning_rejected",
+                        RecoveryStage::Reasoning,
+                        DelaySource::Immediate,
+                    )
+                {
+                    let Some(retry_message) = active_grok_reasoning_retry_message.take() else {
+                        return Err(ProxyError::bad_gateway(
+                            "Grok reasoning recovery request was not retained",
+                        ));
+                    };
+                    let retry_body = responses_websocket_http_body(&retry_message)?;
+                    if let Some(replay) = active_grok_reasoning_replay.as_mut() {
+                        clear_rejected_grok_reasoning_replay(state, Some(&replay.context)).await;
+                        replay.context.replay_applied = false;
+                        replay.context.read = None;
+                        replay.accumulator = GrokReplayStreamAccumulator::default();
+                    }
+                    pending_lifecycle_messages.clear();
+                    output_patcher.begin_response(
+                        None,
+                        Some(transforms::responses_tool_context(&retry_body))
+                            .filter(transforms::ResponsesToolContext::requires_grok_emulation),
+                    );
+                    active_response_body = Some(retry_body);
+                    response_repeat_tracker = Some(ResponsesRepeatTracker::default());
+                    active_grok_reasoning_recovery_attempted = true;
+                    record_forward_retry(
+                        ProxyRoute::CodexResponses,
+                        "body",
+                        "grok_reasoning_rejected",
+                    );
+                    if let Some(turn) = active_usage_turn.as_mut() {
+                        turn.record_retry("body", "grok_reasoning_rejected");
+                    }
+                    let _account_read_guard =
+                        lock_responses_websocket_turn_accounts(state, &execution, mode).await?;
+                    if let Err(error) = entry
+                        .as_mut()
+                        .expect("upstream websocket is connected")
+                        .socket
+                        .send(retry_message)
+                        .await
+                    {
+                        let error = ProxyError::bad_gateway(error.to_string());
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            "upstream_stream_transport_error",
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("transport_error"),
+                            error_body,
+                            Some(ProviderOutcome::NetworkFailure),
+                            &mut active_usage_turn,
+                        )
+                        .await;
+                    }
+                    response_create_committed = true;
+                    upstream_read_deadline = first_byte_timeout
+                        .map(|timeout| tokio::time::Instant::now() + timeout);
+                    continue;
+                }
                 if let Some(observation) = &semantic_observation {
                     crate::metrics::record_proxy_semantic_guard(
                         "websocket",
@@ -10562,11 +11000,13 @@ async fn bridge_responses_websocket(
                     .as_ref()
                     .and_then(provider_stream_failure)
                 {
-                    if responses_websocket_http_replay_allowed(
-                        mode,
-                        emitted_business_event,
-                        response_create_committed,
-                    ) {
+                    if !grok_reasoning_rejection_from_websocket_message(&message)
+                        && responses_websocket_http_replay_allowed(
+                            mode,
+                            emitted_business_event,
+                            response_create_committed,
+                        )
+                    {
                         let failed = execution.runtime_stored_view();
                         if !semantic_provider_outcome_recorded {
                             record_provider_outcome(
@@ -10600,7 +11040,7 @@ async fn bridge_responses_websocket(
                                 first_byte_timeout,
                                 stream_idle_timeout,
                                 "semantic_failure",
-                                &mut auth_refresh_attempted,
+                                &mut active_attempt,
                                 &mut output_patcher,
                                 active_response_intent.as_ref().expect("active response intent"),
                                 &mut active_usage_turn,
@@ -10667,6 +11107,19 @@ async fn bridge_responses_websocket(
                         .clone()
                         .unwrap_or(SemanticTerminal::Success);
                     finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
+                    if matches!(semantic_terminal, Some(SemanticTerminal::Success))
+                        || (semantic_observation.is_none()
+                            && grok_websocket_completed_success(&message))
+                    {
+                        if let Some(replay) = active_grok_reasoning_replay.take() {
+                            let proof = replay.accumulator.finish();
+                            commit_grok_reasoning_replay(state, Some(&replay.context), proof).await;
+                        }
+                    } else {
+                        active_grok_reasoning_replay = None;
+                    }
+                    active_grok_reasoning_retry_message = None;
+                    active_response_started_at = None;
                     response_in_flight = false;
                     response_create_committed = false;
                     account_in_flight_guard.take();
@@ -10712,6 +11165,7 @@ async fn bridge_responses_websocket(
                         ))
                 {
                     emitted_business_event = true;
+                    active_attempt.mark_downstream_committed();
                     upstream_read_deadline = stream_idle_timeout
                         .map(|timeout| tokio::time::Instant::now() + timeout);
                 }
@@ -10812,7 +11266,7 @@ async fn connect_responses_websocket(
     headers: &mut Vec<(String, String)>,
     ws_url: &mut String,
     pool_key: &mut Option<String>,
-    auth_refresh_attempted: &mut bool,
+    attempt_context: &mut ForwardAttemptContext,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CachedResponsesWebSocket, ResponsesWebsocketConnectFailure> {
     loop {
@@ -10870,7 +11324,7 @@ async fn connect_responses_websocket(
                 });
             }
             Err(error)
-                if !*auth_refresh_attempted
+                if !attempt_context.auth_refresh_attempted()
                     && responses_websocket_http_error(&error)
                         .is_some_and(|(status, _, _)| status == StatusCode::UNAUTHORIZED) =>
             {
@@ -10885,6 +11339,23 @@ async fn connect_responses_websocket(
                         fallback_source: None,
                     });
                 };
+                let Some(next_attempt) = attempt_context.next_for(
+                    execution,
+                    attempt_context.body_retry_stage,
+                    "auth",
+                    "websocket_unauthorized",
+                    RecoveryStage::Auth,
+                    DelaySource::Immediate,
+                ) else {
+                    return Err(ResponsesWebsocketConnectFailure {
+                        error: responses_websocket_connect_error(
+                            state, execution, error, share_id, model,
+                        )
+                        .await,
+                        fallback_source: None,
+                    });
+                };
+                *attempt_context = next_attempt;
                 let refresh_result = state
                     .refresh_managed_account_now_for_generation(
                         provider_type,
@@ -10905,7 +11376,15 @@ async fn connect_responses_websocket(
                         fallback_source: None,
                     });
                 }
-                *auth_refresh_attempted = true;
+                if let Err(error) =
+                    advance_attempt_binding_after_token_refresh(state, execution, attempt_context)
+                        .await
+                {
+                    return Err(ResponsesWebsocketConnectFailure {
+                        error,
+                        fallback_source: None,
+                    });
+                }
                 record_forward_retry(ProxyRoute::CodexResponses, "auth", "websocket_unauthorized");
                 if let Some(turn) = active_usage_turn.as_mut() {
                     turn.record_retry("auth", "websocket_unauthorized");
@@ -10937,7 +11416,9 @@ async fn connect_responses_websocket(
                 let error =
                     responses_websocket_connect_error(state, execution, error, share_id, model)
                         .await;
-                if error.status == StatusCode::UNAUTHORIZED && *auth_refresh_attempted {
+                if error.status == StatusCode::UNAUTHORIZED
+                    && attempt_context.auth_refresh_attempted()
+                {
                     mark_managed_account_auth_cooldown(
                         state,
                         execution,
@@ -11049,18 +11530,41 @@ async fn run_codex_websocket_http_fallback(
     first_event_timeout: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
     source: &'static str,
-    auth_refresh_attempted: &mut bool,
+    attempt_context: &mut ForwardAttemptContext,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     intent: &super::codex_request_policy::CodexRequestIntent,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+    let Some(next_attempt) = attempt_context.next_for(
+        execution,
+        attempt_context.body_retry_stage,
+        "transport",
+        source,
+        RecoveryStage::WebsocketToHttp,
+        DelaySource::Immediate,
+    ) else {
+        return terminate_codex_http_fallback_with_error(
+            downstream,
+            state,
+            execution,
+            output_patcher,
+            source,
+            Vec::new(),
+            ProxyError::bad_gateway(
+                "Responses WebSocket to HTTP fallback was denied by the shared recovery budget",
+            ),
+            "recovery_budget_exhausted",
+            Some("transport_error"),
+            active_usage_turn,
+        )
+        .await;
+    };
+    *attempt_context = next_attempt;
     record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
     if let Some(turn) = active_usage_turn.as_mut() {
         turn.record_retry("transport", source);
     }
     crate::metrics::record_codex_websocket_fallback(source, "attempt");
-    let fallback_started = Instant::now();
-    let mut capacity_retry_attempted = 0_u32;
     let rate_limit_share_id = active_usage_turn
         .as_ref()
         .and_then(|turn| turn.request_context.share_id.clone());
@@ -11107,11 +11611,45 @@ async fn run_codex_websocket_http_fallback(
             }
         };
         let first_event_budget = first_event_timeout.map(CodexHttpFirstEventBudget::new);
-        let send_result = match first_event_budget {
-            Some(budget) => tokio::time::timeout_at(budget.deadline, request.send())
-                .await
-                .map_err(|_| budget.timeout_error()),
-            None => Ok(request.send().await),
+        let send_future = async move {
+            match first_event_budget {
+                Some(budget) => tokio::time::timeout_at(budget.deadline, request.send())
+                    .await
+                    .map_err(|_| budget.timeout_error()),
+                None => Ok(request.send().await),
+            }
+        };
+        let send_result = match wait_codex_http_fallback(downstream, send_future).await {
+            Ok(CodexHttpFallbackWait::Ready(result)) => result,
+            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                finish_active_websocket_usage(
+                    active_usage_turn,
+                    499,
+                    "client_cancelled",
+                    Some(
+                        "downstream websocket closed while HTTP fallback was connecting"
+                            .to_string(),
+                    ),
+                )
+                .await;
+                crate::metrics::record_codex_websocket_fallback(source, "cancelled");
+                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+            }
+            Err(error) => {
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "client_protocol_error",
+                    Some("protocol_error"),
+                    active_usage_turn,
+                )
+                .await;
+            }
         };
         let mut upstream = match send_result {
             Ok(Ok(upstream)) => upstream,
@@ -11150,7 +11688,7 @@ async fn run_codex_websocket_http_fallback(
         };
         let status = upstream.status();
         let response_headers = upstream.headers().clone();
-        if status == StatusCode::UNAUTHORIZED && !*auth_refresh_attempted {
+        if status == StatusCode::UNAUTHORIZED && !attempt_context.auth_refresh_attempted() {
             let Some((provider_type, account_id, expected_generation)) =
                 execution.managed_account_identity_target()
             else {
@@ -11180,6 +11718,34 @@ async fn run_codex_websocket_http_fallback(
                 )
                 .await;
             };
+            let Some(next_attempt) = attempt_context.next_for(
+                execution,
+                attempt_context.body_retry_stage,
+                "auth",
+                "websocket_http_fallback_unauthorized",
+                RecoveryStage::Auth,
+                DelaySource::Immediate,
+            ) else {
+                let error = ProxyError {
+                    status,
+                    message: "Responses HTTP fallback authentication recovery budget exhausted"
+                        .to_string(),
+                };
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_auth_error",
+                    None,
+                    active_usage_turn,
+                )
+                .await;
+            };
+            *attempt_context = next_attempt;
             drop(upstream);
             let refresh_result = state
                 .refresh_managed_account_now_for_generation(
@@ -11219,7 +11785,31 @@ async fn run_codex_websocket_http_fallback(
                 )
                 .await;
             }
-            *auth_refresh_attempted = true;
+            if let Err(error) =
+                advance_attempt_binding_after_token_refresh(state, execution, attempt_context).await
+            {
+                record_provider_outcome(
+                    state,
+                    &stored,
+                    ProviderOutcome::Failure {
+                        status_code: error.status.as_u16(),
+                    },
+                )
+                .await;
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "recovery_binding_changed",
+                    Some("protocol_error"),
+                    active_usage_turn,
+                )
+                .await;
+            }
             record_forward_retry(
                 ProxyRoute::CodexResponses,
                 "auth",
@@ -11230,7 +11820,7 @@ async fn run_codex_websocket_http_fallback(
             }
             continue;
         }
-        if status == StatusCode::UNAUTHORIZED && *auth_refresh_attempted {
+        if status == StatusCode::UNAUTHORIZED && attempt_context.auth_refresh_attempted() {
             mark_managed_account_auth_cooldown(
                 state,
                 execution,
@@ -11301,20 +11891,56 @@ async fn run_codex_websocket_http_fallback(
             });
             if execution.driver_is("oauth.openai_codex") {
                 if let Some(failure) = capacity_failure.as_ref() {
+                    let capacity_source = capacity_shed_retry_source(failure);
                     if let Some(delay) = take_codex_http_fallback_capacity_retry(
-                        &mut capacity_retry_attempted,
-                        fallback_started.elapsed(),
+                        attempt_context,
+                        execution,
+                        capacity_source,
                     ) {
                         record_forward_retry(
                             ProxyRoute::CodexResponses,
                             "capacity",
-                            capacity_shed_retry_source(failure),
+                            capacity_source,
                         );
                         if let Some(turn) = active_usage_turn.as_mut() {
-                            turn.record_retry("capacity", capacity_shed_retry_source(failure));
+                            turn.record_retry("capacity", capacity_source);
                         }
-                        tokio::time::sleep(delay).await;
-                        continue;
+                        match wait_codex_http_fallback(downstream, tokio::time::sleep(delay)).await
+                        {
+                            Ok(CodexHttpFallbackWait::Ready(())) => continue,
+                            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                                finish_active_websocket_usage(
+                                    active_usage_turn,
+                                    499,
+                                    "client_cancelled",
+                                    Some(
+                                        "downstream websocket closed during HTTP fallback backoff"
+                                            .to_string(),
+                                    ),
+                                )
+                                .await;
+                                crate::metrics::record_codex_websocket_fallback(
+                                    source,
+                                    "cancelled",
+                                );
+                                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                            }
+                            Err(error) => {
+                                return terminate_codex_http_fallback_with_error(
+                                    downstream,
+                                    state,
+                                    execution,
+                                    output_patcher,
+                                    source,
+                                    Vec::new(),
+                                    error,
+                                    "client_protocol_error",
+                                    Some("protocol_error"),
+                                    active_usage_turn,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     record_provider_outcome(state, &stored, capacity_shed_provider_outcome()).await;
                     return terminate_codex_http_fallback_with_error(
@@ -11507,21 +12133,57 @@ async fn run_codex_websocket_http_fallback(
                 if is_openai_capacity_shed_failure(&failure)
                     && execution.driver_is("oauth.openai_codex")
                 {
+                    let capacity_source = capacity_shed_retry_source(&failure);
                     if let Some(delay) = take_codex_http_fallback_capacity_retry(
-                        &mut capacity_retry_attempted,
-                        fallback_started.elapsed(),
+                        attempt_context,
+                        execution,
+                        capacity_source,
                     ) {
                         let _ = replay_payloads;
                         record_forward_retry(
                             ProxyRoute::CodexResponses,
                             "capacity",
-                            capacity_shed_retry_source(&failure),
+                            capacity_source,
                         );
                         if let Some(turn) = active_usage_turn.as_mut() {
-                            turn.record_retry("capacity", capacity_shed_retry_source(&failure));
+                            turn.record_retry("capacity", capacity_source);
                         }
-                        tokio::time::sleep(delay).await;
-                        continue;
+                        match wait_codex_http_fallback(downstream, tokio::time::sleep(delay)).await
+                        {
+                            Ok(CodexHttpFallbackWait::Ready(())) => continue,
+                            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                                finish_active_websocket_usage(
+                                    active_usage_turn,
+                                    499,
+                                    "client_cancelled",
+                                    Some(
+                                        "downstream websocket closed during HTTP fallback backoff"
+                                            .to_string(),
+                                    ),
+                                )
+                                .await;
+                                crate::metrics::record_codex_websocket_fallback(
+                                    source,
+                                    "cancelled",
+                                );
+                                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                            }
+                            Err(error) => {
+                                return terminate_codex_http_fallback_with_error(
+                                    downstream,
+                                    state,
+                                    execution,
+                                    output_patcher,
+                                    source,
+                                    Vec::new(),
+                                    error,
+                                    "client_protocol_error",
+                                    Some("protocol_error"),
+                                    active_usage_turn,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
                 record_provider_outcome(
@@ -11876,7 +12538,7 @@ async fn prepare_codex_http_fallback_target(
     execution.guard_coding_plan_request(ProxyRoute::CodexResponses, &adapter_request, &url)?;
 
     Ok(PreparedCodexHttpFallbackTarget {
-        http_client: forward_http_client(state, &stored).await?,
+        http_client: forward_http_client(state, execution).await?,
         url,
         headers,
         body: adapter_request.body,
@@ -11976,6 +12638,125 @@ fn responses_websocket_http_body(message: &TungsteniteMessage) -> Result<Value, 
     };
     object.remove("type");
     Ok(value)
+}
+
+fn websocket_message_payload(message: &TungsteniteMessage) -> Option<&[u8]> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(text.as_bytes()),
+        TungsteniteMessage::Binary(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
+fn grok_reasoning_rejection_from_websocket_message(message: &TungsteniteMessage) -> bool {
+    let Some(bytes) = websocket_message_payload(message) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    if !matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.failed" | "error")
+    ) {
+        return false;
+    }
+    super::grok_replay::is_explicit_rejection_value(&value)
+}
+
+fn grok_websocket_completed_success(message: &TungsteniteMessage) -> bool {
+    let Some(bytes) = websocket_message_payload(message) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    value.get("type").and_then(Value::as_str) == Some("response.completed")
+        && value
+            .get("response")
+            .unwrap_or(&value)
+            .get("status")
+            .and_then(Value::as_str)
+            .is_none_or(|status| status == "completed")
+}
+
+async fn prepare_grok_reasoning_replay_websocket(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    request_context: &UsageLogContext,
+    turn_index: Option<u64>,
+    session_id: Option<&str>,
+    upstream_url: &str,
+    message: &mut TungsteniteMessage,
+) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
+    let body = responses_websocket_http_body(message)?;
+    let original = serde_json::to_vec(&body).map_err(|error| {
+        ProxyError::bad_request(format!("encode Grok response.create body: {error}"))
+    })?;
+    let mut encoded = Bytes::from(original.clone());
+    let context = prepare_grok_reasoning_replay_for_transport(
+        state,
+        execution,
+        request_context,
+        turn_index,
+        session_id,
+        upstream_url,
+        "websocket",
+        false,
+        &mut encoded,
+    )
+    .await?;
+    if encoded.as_ref() != original.as_slice() {
+        replace_responses_websocket_http_body(message, &encoded)?;
+    }
+    Ok(context)
+}
+
+fn replace_responses_websocket_http_body(
+    message: &mut TungsteniteMessage,
+    body: &[u8],
+) -> Result<(), ProxyError> {
+    let binary = matches!(message, TungsteniteMessage::Binary(_));
+    let bytes = websocket_message_payload(message).ok_or_else(|| {
+        ProxyError::bad_request("response.create must be a text or binary JSON frame")
+    })?;
+    let mut frame = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
+    })?;
+    let body = serde_json::from_slice::<Value>(body).map_err(|error| {
+        ProxyError::bad_request(format!("invalid Grok replay response body: {error}"))
+    })?;
+    if !body.is_object() {
+        return Err(ProxyError::bad_request(
+            "Grok replay response body must be an object",
+        ));
+    }
+    if frame.get("response").is_some() {
+        frame
+            .as_object_mut()
+            .expect("response.create frame was validated as an object")
+            .insert("response".to_string(), body);
+    } else {
+        let mut object = body
+            .as_object()
+            .expect("Grok replay response body was validated as an object")
+            .clone();
+        object.insert(
+            "type".to_string(),
+            Value::String("response.create".to_string()),
+        );
+        frame = Value::Object(object);
+    }
+    *message = if binary {
+        TungsteniteMessage::Binary(serde_json::to_vec(&frame).map_err(|error| {
+            ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
+        })?)
+    } else {
+        TungsteniteMessage::Text(serde_json::to_string(&frame).map_err(|error| {
+            ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
+        })?)
+    };
+    Ok(())
 }
 
 fn inject_previous_response_context_into_websocket_message(
@@ -13720,19 +14501,31 @@ fn antigravity_limit_info(
 }
 
 fn take_codex_http_fallback_capacity_retry(
-    attempted: &mut u32,
-    elapsed: Duration,
+    attempt_context: &mut ForwardAttemptContext,
+    execution: &ProviderExecution,
+    source: &'static str,
 ) -> Option<Duration> {
-    if *attempted >= MAX_CODEX_CAPACITY_RETRIES {
+    let attempted = attempt_context.codex_capacity_retry_attempted();
+    if attempted >= MAX_CODEX_CAPACITY_RETRIES || !attempt_context.retry_allowed() {
         return None;
     }
-    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(elapsed.as_millis());
-    let (min_delay_ms, _) = codex_capacity_retry_delay_bounds(*attempted);
+    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(
+        current_time_ms().saturating_sub(attempt_context.attempt_budget.started_at_ms()),
+    );
+    let (min_delay_ms, _) = codex_capacity_retry_delay_bounds(attempted);
     if remaining_ms < min_delay_ms as u128 {
         return None;
     }
-    let delay = codex_capacity_retry_delay(remaining_ms, *attempted);
-    *attempted = attempted.saturating_add(1);
+    let delay = codex_capacity_retry_delay(remaining_ms, attempted);
+    let next_attempt = attempt_context.next_for(
+        execution,
+        attempt_context.body_retry_stage,
+        "capacity",
+        source,
+        RecoveryStage::Capacity,
+        DelaySource::BoundedBackoff,
+    )?;
+    *attempt_context = next_attempt;
     Some(delay)
 }
 
@@ -13828,25 +14621,29 @@ fn next_codex_capacity_retry_attempt(
     if !execution.driver_is("oauth.openai_codex") || !is_openai_capacity_shed_failure(failure) {
         return None;
     }
-    if attempt_context.codex_capacity_retry_attempted >= MAX_CODEX_CAPACITY_RETRIES
+    if attempt_context.codex_capacity_retry_attempted() >= MAX_CODEX_CAPACITY_RETRIES
         || !attempt_context.retry_allowed()
     {
         return None;
     }
-    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS
-        .saturating_sub(current_time_ms().saturating_sub(attempt_context.started_at_ms));
+    let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(
+        current_time_ms().saturating_sub(attempt_context.attempt_budget.started_at_ms()),
+    );
     let (min_delay_ms, _) =
-        codex_capacity_retry_delay_bounds(attempt_context.codex_capacity_retry_attempted);
+        codex_capacity_retry_delay_bounds(attempt_context.codex_capacity_retry_attempted());
     if remaining_ms < min_delay_ms as u128 {
         return None;
     }
     let source = capacity_shed_retry_source(failure);
     record_forward_retry(route, "capacity", source);
-    Some(attempt_context.after_codex_capacity_retry(
+    attempt_context.after_codex_capacity_retry(
         execution,
         source,
-        codex_capacity_retry_delay(remaining_ms, attempt_context.codex_capacity_retry_attempted),
-    ))
+        codex_capacity_retry_delay(
+            remaining_ms,
+            attempt_context.codex_capacity_retry_attempted(),
+        ),
+    )
 }
 
 fn next_antigravity_limit_attempt(
@@ -13864,7 +14661,7 @@ fn next_antigravity_limit_attempt(
     }
     let source = limit.kind.reason();
     record_forward_retry(route, "capacity", source);
-    Some(attempt_context.after_antigravity_retry(execution, source))
+    attempt_context.after_antigravity_retry(execution, source)
 }
 
 async fn record_antigravity_limit_evidence(
@@ -14554,7 +15351,11 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
         })?;
 
-    let mut auth_recovery_attempted = false;
+    let mut recovery_attempt = ForwardAttemptContext::default();
+    let binding_accounts = state.accounts_snapshot().await;
+    recovery_attempt
+        .ensure_binding(&execution, &binding_accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     loop {
         let runtime = match state
             .prepare_codebuddy_runtime(
@@ -14569,9 +15370,28 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             .await
         {
             Ok(runtime) => runtime,
-            Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
-                auth_recovery_attempted = true;
+            Err(error)
+                if error.is_authentication_failure()
+                    && !recovery_attempt.auth_refresh_attempted() =>
+            {
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut recovery_attempt,
+                    "auth",
+                    "codebuddy_runtime_unauthorized",
+                ) {
+                    return Err(codebuddy_runtime_error_to_proxy_error(error));
+                }
                 recover_codebuddy_auth(&state, &execution, None).await?;
+                advance_attempt_binding_after_token_refresh(
+                    &state,
+                    &execution,
+                    &mut recovery_attempt,
+                )
+                .await?;
                 continue;
             }
             Err(error) => {
@@ -14684,10 +15504,27 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         let wire = match send_codebuddy_generation(&state, &execution, &runtime, &payload).await {
             Ok(wire) => wire,
             Err(CodeBuddyForwardAttemptError::Upstream(error))
-                if error.is_authentication_failure() && !auth_recovery_attempted =>
+                if error.is_authentication_failure()
+                    && !recovery_attempt.auth_refresh_attempted() =>
             {
-                auth_recovery_attempted = true;
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut recovery_attempt,
+                    "auth",
+                    "codebuddy_generation_unauthorized",
+                ) {
+                    return Err(error.into_proxy_error());
+                }
                 recover_codebuddy_auth(&state, &execution, Some(&runtime)).await?;
+                advance_attempt_binding_after_token_refresh(
+                    &state,
+                    &execution,
+                    &mut recovery_attempt,
+                )
+                .await?;
                 continue;
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
@@ -14751,10 +15588,27 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 .await;
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error))
-                if error.is_authentication_failure() && !auth_recovery_attempted =>
+                if error.is_authentication_failure()
+                    && !recovery_attempt.auth_refresh_attempted() =>
             {
-                auth_recovery_attempted = true;
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut recovery_attempt,
+                    "auth",
+                    "codebuddy_stream_unauthorized",
+                ) {
+                    return Err(error.into_proxy_error());
+                }
                 recover_codebuddy_auth(&state, &execution, Some(&runtime)).await?;
+                advance_attempt_binding_after_token_refresh(
+                    &state,
+                    &execution,
+                    &mut recovery_attempt,
+                )
+                .await?;
                 continue;
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
@@ -15154,11 +16008,13 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
         started,
     } = options;
     let first_canonical = wire.first_canonical;
-    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
-        &stored,
-        route,
-        adapter_request.responses_tool_context.clone(),
-    );
+    let mut stream_transform =
+        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+            &stored,
+            route,
+            adapter_request.responses_tool_context.clone(),
+            adapter_request.downstream_include_usage,
+        );
     let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
         Ok(transformed) => transformed,
         Err(error) => {
@@ -16036,11 +16892,13 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
         started,
     } = options;
     let first_canonical = wire.first_canonical;
-    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
-        &stored,
-        route,
-        adapter_request.responses_tool_context.clone(),
-    );
+    let mut stream_transform =
+        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+            &stored,
+            route,
+            adapter_request.responses_tool_context.clone(),
+            adapter_request.downstream_include_usage,
+        );
     let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
         Ok(transformed) => transformed,
         Err(error) => {
@@ -16368,7 +17226,11 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         }
     };
 
-    let mut auth_recovery_attempted = false;
+    let mut recovery_attempt = ForwardAttemptContext::default();
+    let binding_accounts = state.accounts_snapshot().await;
+    recovery_attempt
+        .ensure_binding(&execution, &binding_accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
     let (runtime, model_key, wire) = loop {
         let runtime = match state
             .prepare_qoder_runtime(
@@ -16383,8 +17245,21 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             .await
         {
             Ok(runtime) => runtime,
-            Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
-                auth_recovery_attempted = true;
+            Err(error)
+                if error.is_authentication_failure()
+                    && !recovery_attempt.auth_refresh_attempted() =>
+            {
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut recovery_attempt,
+                    "auth",
+                    "qoder_runtime_unauthorized",
+                ) {
+                    return Err(qoder_runtime_error_to_proxy_error(error));
+                }
                 recover_qoder_auth_before_commit(
                     &state,
                     &execution,
@@ -16393,6 +17268,12 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                     &request_context,
                     started,
                     None,
+                )
+                .await?;
+                advance_attempt_binding_after_token_refresh(
+                    &state,
+                    &execution,
+                    &mut recovery_attempt,
                 )
                 .await?;
                 continue;
@@ -16519,9 +17400,20 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         match wire {
             Ok(wire) => break (runtime, model_key, wire),
             Err(QoderForwardAttemptError::Upstream(error))
-                if error.is_authentication_failure() && !auth_recovery_attempted =>
+                if error.is_authentication_failure()
+                    && !recovery_attempt.auth_refresh_attempted() =>
             {
-                auth_recovery_attempted = true;
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut recovery_attempt,
+                    "auth",
+                    "qoder_generation_unauthorized",
+                ) {
+                    return Err(error.into_proxy_error());
+                }
                 recover_qoder_auth_before_commit(
                     &state,
                     &execution,
@@ -16530,6 +17422,12 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                     &request_context,
                     started,
                     Some(&runtime),
+                )
+                .await?;
+                advance_attempt_binding_after_token_refresh(
+                    &state,
+                    &execution,
+                    &mut recovery_attempt,
                 )
                 .await?;
             }
@@ -17233,11 +18131,13 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
         started,
     } = options;
     let first_canonical = wire.first_canonical;
-    let mut stream_transform = super::stream_transforms::StreamEventTransformer::new(
-        &stored,
-        route,
-        adapter_request.responses_tool_context.clone(),
-    );
+    let mut stream_transform =
+        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+            &stored,
+            route,
+            adapter_request.responses_tool_context.clone(),
+            adapter_request.downstream_include_usage,
+        );
     let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
         Ok(transformed) => transformed,
         Err(error) => {
@@ -17662,6 +18562,7 @@ async fn forward_claude_deepseek(
         gemini_action: None,
         stream_requested: false,
         upstream_stream_requested: false,
+        downstream_include_usage: false,
         custom_tool_names: Default::default(),
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
@@ -18051,7 +18952,11 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     }
 
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
-    let http_client = forward_http_client(&state, &stored).await?;
+    let binding_accounts = state.accounts_snapshot().await;
+    audit_attempt
+        .ensure_binding(&execution, &binding_accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)?;
+    let http_client = forward_http_client(&state, &execution).await?;
     let ide_version = if expected_provider_type == ProviderType::KiroOAuth {
         state.kiro_ide_version().await
     } else {
@@ -18067,7 +18972,6 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 .get("anthropic-beta")
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.contains("claude-code")));
-    let mut auth_recovery = retry_policy::AuthRecoveryState::default();
     let (upstream, prepared, first_frame_deadline) = loop {
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
         execution.materialize_auth(&accounts)?;
@@ -18193,13 +19097,27 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             .session_id
             .as_deref()
             .expect("Kiro request session identity is always resolved");
+        let cache_runtime_region = kiro::KiroAccountData::from_account(&account)?.api_region;
+        let cache_route = format!("{route:?}");
+        let cache_namespace = super::kiro_prompt_cache::PromptCacheScope {
+            app: stored.app.as_str(),
+            provider_id: &stored.provider.id,
+            provider_revision: execution.plan.provider_revision,
+            runtime_fingerprint: &execution.plan.runtime_fingerprint,
+            account_id: &account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            share_id: request_context.share_id.as_deref().unwrap_or("direct"),
+            signed_user: request_context.user_email.as_deref().unwrap_or("anonymous"),
+            route: &cache_route,
+            runtime_region: &cache_runtime_region,
+            session: cache_session,
+        }
+        .namespace();
         let call_context = kiro::KiroCallContext {
             ide_version: ide_version.clone(),
             claude_code_tools,
-            cache_namespace: format!(
-                "provider:{}:account:{}:generation:{}:route:{route:?}:session:{cache_session}",
-                stored.provider.id, account.id, account.auth_identity_generation
-            ),
+            cache_namespace,
             catalog_model_id: Some(catalog_model_id),
             catalog_max_input_tokens,
             session_id: Some(cache_session.to_string()),
@@ -18266,9 +19184,13 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                 return Err(ProxyError::bad_gateway(error));
             }
         };
-        match auth_recovery.decide(upstream.status(), stored.provider_type, replay_allowed) {
+        match retry_policy::unauthorized_recovery_decision(
+            upstream.status(),
+            stored.provider_type,
+            audit_attempt.auth_refresh_attempted(),
+            replay_allowed,
+        ) {
             Some(AuthRecoveryDecision::RefreshAndReplaySameBinding) => {
-                drop(upstream);
                 let Some((provider_type, account_id, expected_generation)) =
                     execution.managed_account_identity_target()
                 else {
@@ -18277,6 +19199,18 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                         expected_provider_type.as_str()
                     )));
                 };
+                if !advance_audited_attempt(
+                    &state,
+                    route,
+                    &request_context,
+                    &execution,
+                    &mut audit_attempt,
+                    "auth",
+                    "kiro_unauthorized",
+                ) {
+                    break (upstream, prepared, first_frame_deadline);
+                }
+                drop(upstream);
                 if let Err(error) = state
                     .refresh_managed_account_now_for_generation(
                         provider_type,
@@ -18294,18 +19228,13 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                     .await;
                     return Err(managed_account_refresh_error_to_proxy_error(error));
                 }
-                advance_audited_attempt(
-                    &state,
-                    route,
-                    &request_context,
-                    &execution,
-                    &mut audit_attempt,
-                    "auth",
-                    "kiro_unauthorized",
-                );
+                let refreshed_accounts = state.accounts_snapshot().await;
+                audit_attempt
+                    .advance_binding_after_token_refresh(&execution, &refreshed_accounts)
+                    .map_err(binding_snapshot_error_to_proxy_error)?;
             }
             Some(AuthRecoveryDecision::ReturnUnauthorized) => {
-                if auth_recovery.attempted() {
+                if audit_attempt.auth_refresh_attempted() {
                     mark_managed_account_auth_cooldown(
                         &state,
                         &execution,
@@ -18342,6 +19271,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             tool_name_map: prepared.tool_name_map,
             cache_namespace: prepared.cache_namespace,
             responses_tool_context: runtime_request.responses_tool_context.clone(),
+            downstream_include_usage: runtime_request.downstream_include_usage,
             request_context,
             account_in_flight_guard,
             share_invocation_guard,
@@ -18453,6 +19383,10 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             return Err(proxy_error);
         }
     };
+    let cache_usage_estimated = message
+        .pointer("/usage/cache_usage_source")
+        .and_then(Value::as_str)
+        == Some("local_prompt_cache_estimate");
     let usage = crate::domain::usage::store::usage_from_json(&message);
     let canonical_response_bytes = serde_json::to_vec(&message)
         .map(Bytes::from)
@@ -18474,6 +19408,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         usage,
         UsageLogContext {
             is_streaming: false,
+            usage_estimated: request_context.usage_estimated || cache_usage_estimated,
             ..request_context
         },
     )
@@ -18507,6 +19442,7 @@ struct ClaudeKiroStreamOptions {
     tool_name_map: std::collections::HashMap<String, String>,
     cache_namespace: String,
     responses_tool_context: super::transforms::ResponsesToolContext,
+    downstream_include_usage: bool,
     request_context: UsageLogContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
@@ -18533,6 +19469,7 @@ async fn forward_claude_kiro_stream(
         tool_name_map,
         cache_namespace,
         responses_tool_context,
+        downstream_include_usage,
         request_context,
         account_in_flight_guard,
         share_invocation_guard,
@@ -18570,11 +19507,13 @@ async fn forward_claude_kiro_stream(
         idle_timeout,
         context_window,
     );
-    let stream_transform = super::stream_transforms::StreamEventTransformer::new(
-        &stored,
-        route,
-        responses_tool_context,
-    );
+    let stream_transform =
+        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+            &stored,
+            route,
+            responses_tool_context,
+            downstream_include_usage,
+        );
     let stream = async_stream::stream! {
         let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
@@ -18667,6 +19606,12 @@ async fn forward_claude_kiro_stream(
                     return;
                 }
             };
+            if canonical_chunk
+                .windows(b"\"cache_usage_source\":\"local_prompt_cache_estimate\"".len())
+                .any(|window| window == b"\"cache_usage_source\":\"local_prompt_cache_estimate\"")
+            {
+                interrupt_guard.usage.mark_estimated();
+            }
             let chunk = match stream_transform.push(canonical_chunk) {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -19857,15 +20802,15 @@ async fn next_claude_transport_attempt(
     let replay_safe = route == ProxyRoute::ClaudeCountTokens
         || (route == ProxyRoute::ClaudeMessages
             && reason == "connect_error"
-            && attempt_context.attempt == 0);
+            && attempt_context.attempt() == 0);
     if replay_safe {
         record_forward_retry(route, "transport", reason);
-        return Some(attempt_context.next(
+        return attempt_context.next(
             failed,
             attempt_context.body_retry_stage,
             "transport",
             reason,
-        ));
+        );
     }
     None
 }
@@ -19888,12 +20833,15 @@ async fn next_unauthorized_attempt(
     let decision = retry_policy::unauthorized_recovery_decision(
         StatusCode::UNAUTHORIZED,
         provider_type,
-        attempt_context.auth_refresh_attempted,
+        attempt_context.auth_refresh_attempted(),
         attempt_context.retry_allowed(),
     )
     .expect("an unauthorized status always produces an auth recovery decision");
 
     if decision == AuthRecoveryDecision::RefreshAndReplaySameBinding {
+        let Some(mut next_attempt) = attempt_context.reserve_auth_refresh(execution) else {
+            return Ok(None);
+        };
         if let Err(error) = force_refresh_execution_auth(
             state,
             provider_type,
@@ -19912,15 +20860,19 @@ async fn next_unauthorized_attempt(
             .await;
             return Err(error);
         }
+        let refreshed_accounts = state.accounts_snapshot().await;
+        next_attempt
+            .advance_binding_after_token_refresh(execution, &refreshed_accounts)
+            .map_err(binding_snapshot_error_to_proxy_error)?;
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome("auth_refresh");
         }
         record_forward_retry(route, "auth", "unauthorized");
-        return Ok(Some(attempt_context.after_auth_refresh(execution)));
+        return Ok(Some(next_attempt));
     }
 
     if decision == AuthRecoveryDecision::ReturnUnauthorized
-        && attempt_context.auth_refresh_attempted
+        && attempt_context.auth_refresh_attempted()
     {
         mark_managed_account_auth_cooldown(
             state,
@@ -19974,45 +20926,27 @@ fn bearer_token_from_owned_headers(headers: &[(String, String)]) -> Option<&str>
         .filter(|value| !value.is_empty())
 }
 
-async fn next_provider_failover(
-    state: &ServerState,
-    route: ProxyRoute,
-    attempt_context: &ForwardAttemptContext,
-    failed: &ProviderExecution,
-    reason: &'static str,
-) -> Option<ForwardAttemptContext> {
-    if matches!(route.app(), AppKind::Claude | AppKind::Codex)
-        || failed.managed_account_target().is_some()
-        || failed.driver_is("oauth.openai_codex")
-        || !attempt_context.retry_allowed()
-    {
-        return None;
-    }
-    if failed.driver_is("oauth.grok_responses") {
-        return None;
-    }
-    let mut excluded = attempt_context.excluded_provider_ids.clone();
-    excluded.insert(failed.stored.provider.id.clone());
-    let accounts = state.accounts_snapshot().await;
-    let in_flight = state.account_in_flight.snapshot();
-    let providers = state.providers.read().await;
-    let next =
-        select_failover_provider(&providers, &accounts, route, &in_flight, &excluded)?.execution;
-    tracing::debug!(
-        reason,
-        from_provider_id = %failed.stored.provider.id,
-        to_provider_id = %next.stored.provider.id,
-        "switching request to failover Provider"
-    );
-    record_forward_retry(route, "provider", reason);
-    Some(attempt_context.after_provider_failover(failed, &next, reason))
+fn binding_snapshot_error_to_proxy_error(error: BindingSnapshotError) -> ProxyError {
+    let reason = match error {
+        BindingSnapshotError::AccountMissing => "bound account disappeared",
+        BindingSnapshotError::AuthIdentityChanged => "auth identity generation changed",
+        BindingSnapshotError::BindingChanged => "Provider, account, rail, or generation changed",
+        BindingSnapshotError::TokenGenerationRegressed => "token generation regressed",
+    };
+    ProxyError::conflict(format!(
+        "transparent recovery stopped because the fixed request binding changed: {reason}"
+    ))
 }
 
-fn request_is_provider_pinned(
-    attempt_context: &ForwardAttemptContext,
-    request_context: &UsageLogContext,
-) -> bool {
-    attempt_context.provider_binding_pinned || request_context.share_id.is_some()
+async fn advance_attempt_binding_after_token_refresh(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    attempt_context: &mut ForwardAttemptContext,
+) -> Result<(), ProxyError> {
+    let accounts = state.accounts_snapshot().await;
+    attempt_context
+        .advance_binding_after_token_refresh(execution, &accounts)
+        .map_err(binding_snapshot_error_to_proxy_error)
 }
 
 fn supports_forced_auth_refresh(_route: ProxyRoute, execution: &ProviderExecution) -> bool {
@@ -20038,10 +20972,19 @@ fn advance_audited_attempt(
     attempt_context: &mut ForwardAttemptContext,
     stage: &'static str,
     source: &'static str,
-) {
+) -> bool {
+    let Some(next_attempt) =
+        attempt_context.next(execution, attempt_context.body_retry_stage, stage, source)
+    else {
+        tracing::warn!(
+            stage,
+            source,
+            "audited retry was denied by shared attempt budget"
+        );
+        return false;
+    };
+    *attempt_context = next_attempt;
     record_forward_retry(route, stage, source);
-    *attempt_context =
-        attempt_context.next(execution, attempt_context.body_retry_stage, stage, source);
     audit_forward_attempt(
         state,
         route,
@@ -20049,6 +20992,7 @@ fn advance_audited_attempt(
         &execution.runtime_stored_view(),
         attempt_context,
     );
+    true
 }
 
 fn audit_forward_attempt(
@@ -20068,8 +21012,8 @@ fn audit_forward_attempt(
         provider_type: Some(stored.provider_type.as_str().to_string()),
         provider_ref: Some(provider_ref.clone()),
         account_ref: account_ref.clone(),
-        attempt: Some(attempt_context.attempt.saturating_add(1)),
-        retry_count: Some(attempt_context.attempt),
+        attempt: Some(attempt_context.attempt().saturating_add(1)),
+        retry_count: Some(attempt_context.attempt()),
         ..AuditRequestDetails::default()
     };
     state.enrich_audit_request(request_id, details.clone());
@@ -20088,7 +21032,7 @@ fn audit_forward_attempt(
             app = route.app().as_str(),
             provider_type = stored.provider_type.as_str(),
             provider_ref = %provider_ref,
-            attempt = attempt_context.attempt.saturating_add(1),
+            attempt = attempt_context.attempt().saturating_add(1),
             "inference route selected"
         );
     }
@@ -20108,14 +21052,7 @@ fn audit_forward_attempt(
         retry.source,
         retry.source,
     ));
-    retry_event.retry_decision = Some(
-        if retry.previous_provider_id.is_some() {
-            "failover"
-        } else {
-            "retry_same_provider"
-        }
-        .to_string(),
-    );
+    retry_event.retry_decision = Some("retry_same_provider".to_string());
     retry_event.backoff_ms = Some(0);
     retry_event.outcome = Some("retrying".to_string());
     retry_event.retryable = Some(true);
@@ -20129,45 +21066,9 @@ fn audit_forward_attempt(
         provider_ref = %provider_ref,
         stage = retry.stage,
         source = retry.source,
-        attempt = attempt_context.attempt.saturating_add(1),
+        attempt = attempt_context.attempt().saturating_add(1),
         "retrying inference upstream"
     );
-    if let Some(previous_provider_id) = retry.previous_provider_id.as_deref() {
-        let previous_provider_ref = opaque_ref("provider", previous_provider_id);
-        let mut failover_event = AuditEvent::new("inference.provider.failover");
-        failover_event.request_id = Some(request_id.to_string());
-        failover_event.app = Some(route.app().as_str().to_string());
-        failover_event.provider_type = Some(stored.provider_type.as_str().to_string());
-        failover_event.provider_ref = Some(provider_ref.clone());
-        failover_event.previous_provider_ref = Some(previous_provider_ref.clone());
-        failover_event.account_ref = account_ref;
-        failover_event.stage = Some("provider_selection".to_string());
-        failover_event.error_code = Some(retry.source.to_string());
-        failover_event.component = Some("provider_selection".to_string());
-        failover_event.failure_kind = Some(retry.source.to_string());
-        failover_event.error_fingerprint = Some(error_fingerprint(
-            "provider_selection",
-            retry.source,
-            retry.source,
-        ));
-        failover_event.retry_decision = Some("failover".to_string());
-        failover_event.backoff_ms = Some(0);
-        failover_event.outcome = Some("failed_over".to_string());
-        failover_event.attempt = Some(attempt_context.attempt.saturating_add(1));
-        failover_event.retry_count = Some(attempt_context.attempt);
-        state.emit_audit_event_best_effort(failover_event);
-        tracing::info!(
-            target: "cc_switch_server::request_audit",
-            event = "inference.provider.failover",
-            request_id,
-            app = route.app().as_str(),
-            previous_provider_ref = %previous_provider_ref,
-            provider_ref = %provider_ref,
-            source = retry.source,
-            attempt = attempt_context.attempt.saturating_add(1),
-            "inference provider failover selected"
-        );
-    }
 }
 
 fn managed_account_id(stored: &StoredProvider) -> Option<&str> {
@@ -20773,7 +21674,11 @@ impl ResponsesImageJsonLifecycleGuard {
             status_code,
             self.started.elapsed().as_millis(),
             self.first_token_ms,
-            super::streaming::StreamUsageResult { usage, parse_error },
+            super::streaming::StreamUsageResult {
+                usage,
+                parse_error,
+                usage_estimated: false,
+            },
             Some(stream_status),
         )
         .await;
@@ -21985,6 +22890,627 @@ fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
         .any(|marker| text.contains(marker))
 }
 
+async fn prepare_grok_reasoning_replay(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    request_context: &UsageLogContext,
+    headers: &HeaderMap,
+    upstream_url: &str,
+    suppress_replay: bool,
+    body: &mut Bytes,
+) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
+    prepare_grok_reasoning_replay_for_transport(
+        state,
+        execution,
+        request_context,
+        super::grok::turn_index_from_headers(headers),
+        request_context.session_id.as_deref(),
+        upstream_url,
+        "http",
+        suppress_replay,
+        body,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_grok_reasoning_replay_for_transport(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    request_context: &UsageLogContext,
+    turn_index: Option<u64>,
+    session_id: Option<&str>,
+    upstream_url: &str,
+    rail: &'static str,
+    suppress_replay: bool,
+    body: &mut Bytes,
+) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
+    if !execution.driver_is("oauth.grok_responses") {
+        return Ok(None);
+    }
+    let Some(turn_index) = turn_index else {
+        crate::metrics::record_grok_reasoning_replay("turn_absent", 1);
+        return Ok(None);
+    };
+    let Some(share_id) = request_context
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        crate::metrics::record_grok_reasoning_replay("share_absent", 1);
+        return Ok(None);
+    };
+    let Some(user_namespace) = request_context
+        .user_email
+        .as_deref()
+        .and_then(super::grok_replay::user_namespace)
+    else {
+        crate::metrics::record_grok_reasoning_replay("user_absent", 1);
+        return Ok(None);
+    };
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a session"))?;
+    let document = serde_json::from_slice::<Value>(body)
+        .map_err(|_| ProxyError::bad_request("Grok reasoning replay request is invalid"))?;
+    let model_family = super::grok_replay::model_family(
+        document
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a model"))?,
+    )
+    .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay model is invalid"))?;
+    let upstream_plane = reqwest::Url::parse(upstream_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay plane is invalid"))?;
+    let (provider_type, account_id, auth_identity_generation) = execution
+        .managed_account_identity_target()
+        .filter(|(provider_type, _, _)| *provider_type == ProviderType::GrokOAuth)
+        .ok_or_else(|| ProxyError::bad_request("Grok Provider must bind one Account"))?;
+    let account = state
+        .find_account_for_provider(provider_type, account_id)
+        .await
+        .filter(|account| account.auth_identity_generation == auth_identity_generation)
+        .ok_or_else(|| ProxyError::bad_request("Grok Account generation drifted"))?;
+    let token_refresh_generation = account.token_refresh_generation;
+    let derive = |turn| {
+        GrokReplayScope::derive(
+            execution.plan.provider_key.app.as_str(),
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            account_id,
+            auth_identity_generation,
+            token_refresh_generation,
+            share_id,
+            &user_namespace,
+            session_id,
+            turn,
+            &model_family,
+            rail,
+            &upstream_plane,
+        )
+    };
+    let write_scope = derive(turn_index)
+        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
+    let now_ms = grok_replay_now_ms();
+    let (_, write_snapshot) = state.grok_reasoning_replays.get(&write_scope, now_ms).await;
+    let mut read = None;
+    let mut replay_applied = false;
+    if turn_index > 0 && !suppress_replay {
+        let read_scope = derive(turn_index - 1)
+            .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
+        let (proof, snapshot) = state.grok_reasoning_replays.get(&read_scope, now_ms).await;
+        let ownership = CacheSnapshotOwnership::from_hit(
+            "grok_reasoning_read",
+            read_scope.ownership_digest(),
+            snapshot.generation(),
+        );
+        read = Some((read_scope.clone(), snapshot, ownership.clone()));
+        if let Some(proof) = proof {
+            let result = super::grok_replay::apply(body, &proof);
+            if result.context_mismatch {
+                crate::metrics::record_grok_reasoning_replay("context_mismatch", 1);
+                if ownership.authorize_mutation(
+                    "grok_reasoning_read",
+                    &read_scope.ownership_digest(),
+                    snapshot.generation(),
+                ) {
+                    state
+                        .grok_reasoning_replays
+                        .delete_if_unchanged(&read_scope, snapshot, now_ms)
+                        .await;
+                }
+                return Err(ProxyError::bad_request(
+                    "Grok reasoning replay context does not match the cached turn",
+                ));
+            }
+            if result.applied {
+                *body = result.body;
+                replay_applied = true;
+                crate::metrics::record_grok_reasoning_replay("hit", 1);
+            } else {
+                crate::metrics::record_grok_reasoning_replay("present_noop", 1);
+            }
+        } else {
+            crate::metrics::record_grok_reasoning_replay("miss", 1);
+        }
+    }
+    Ok(Some(GrokReplayWriteContext {
+        read,
+        write_ownership: CacheSnapshotOwnership::from_hit(
+            "grok_reasoning_write",
+            write_scope.ownership_digest(),
+            write_snapshot.generation(),
+        ),
+        write_scope,
+        write_snapshot,
+        replay_applied,
+        app: execution.plan.provider_key.app,
+        provider_id: execution.stored.provider.id.clone(),
+        provider_revision: execution.plan.provider_revision,
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        account_id: account_id.to_string(),
+        auth_identity_generation,
+        token_refresh_generation,
+        share_id: share_id.to_string(),
+    }))
+}
+
+async fn clear_rejected_grok_reasoning_replay(
+    state: &ServerState,
+    context: Option<&GrokReplayWriteContext>,
+) {
+    let Some((scope, snapshot, ownership)) = context
+        .filter(|context| context.replay_applied)
+        .and_then(|context| context.read.as_ref())
+    else {
+        return;
+    };
+    if !ownership.authorize_mutation(
+        "grok_reasoning_read",
+        &scope.ownership_digest(),
+        snapshot.generation(),
+    ) {
+        crate::metrics::record_grok_reasoning_replay("rejection_ownership_denied", 1);
+        return;
+    }
+    let deleted = state
+        .grok_reasoning_replays
+        .delete_if_unchanged(scope, *snapshot, grok_replay_now_ms())
+        .await;
+    crate::metrics::record_grok_reasoning_replay(
+        if deleted {
+            "rejection_deleted"
+        } else {
+            "rejection_cas_conflict"
+        },
+        1,
+    );
+}
+
+async fn commit_grok_reasoning_replay(
+    state: &ServerState,
+    context: Option<&GrokReplayWriteContext>,
+    proof: Option<GrokReplayProof>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if !grok_reasoning_replay_binding_is_current(state, context).await {
+        crate::metrics::record_grok_reasoning_replay("binding_drift", 1);
+        return;
+    }
+    if !context.write_ownership.authorize_mutation(
+        "grok_reasoning_write",
+        &context.write_scope.ownership_digest(),
+        context.write_snapshot.generation(),
+    ) {
+        crate::metrics::record_grok_reasoning_replay("commit_ownership_denied", 1);
+        return;
+    }
+    let now_ms = grok_replay_now_ms();
+    let (outcome, committed) = if let Some(proof) = proof {
+        let committed = state
+            .grok_reasoning_replays
+            .replace_if_unchanged(
+                context.write_scope.clone(),
+                context.write_snapshot,
+                proof,
+                now_ms,
+            )
+            .await;
+        ("commit", committed)
+    } else {
+        let committed = state
+            .grok_reasoning_replays
+            .delete_if_unchanged(&context.write_scope, context.write_snapshot, now_ms)
+            .await;
+        ("non_replayable", committed)
+    };
+    crate::metrics::record_grok_reasoning_replay(
+        if committed {
+            outcome
+        } else {
+            "commit_cas_conflict"
+        },
+        1,
+    );
+}
+
+async fn grok_reasoning_replay_binding_is_current(
+    state: &ServerState,
+    context: &GrokReplayWriteContext,
+) -> bool {
+    if state.credential_persistence_degraded() {
+        return false;
+    }
+    let Some(plan) = state
+        .provider_runtime_plan(context.app, &context.provider_id)
+        .await
+    else {
+        return false;
+    };
+    if plan.provider_revision != context.provider_revision
+        || plan.runtime_fingerprint != context.runtime_fingerprint
+        || !matches!(
+            &plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type: ProviderType::GrokOAuth,
+                auth_identity_generation,
+            } if account_id == &context.account_id
+                && *auth_identity_generation == context.auth_identity_generation
+        )
+    {
+        return false;
+    }
+    let Some(account) = state
+        .find_account_for_provider(ProviderType::GrokOAuth, &context.account_id)
+        .await
+    else {
+        return false;
+    };
+    if account.auth_identity_generation != context.auth_identity_generation
+        || account.token_refresh_generation != context.token_refresh_generation
+    {
+        return false;
+    }
+    let shares = state.shares.read().await;
+    shares.get(&context.share_id).is_some_and(|share| {
+        share.enabled
+            && share.status == "active"
+            && ((share.app == context.app
+                && share.provider_id == context.provider_id
+                && share.provider_type == ProviderType::GrokOAuth)
+                || share.bindings.iter().any(|binding| {
+                    binding.app == context.app
+                        && binding.provider_id == context.provider_id
+                        && binding.provider_type == ProviderType::GrokOAuth
+                }))
+    })
+}
+
+fn grok_replay_now_ms() -> i64 {
+    current_time_ms().min(i64::MAX as u128) as i64
+}
+
+fn apply_antigravity_session_contract(
+    execution: &ProviderExecution,
+    route: ProxyRoute,
+    request_context: &UsageLogContext,
+    attempt_context: &ForwardAttemptContext,
+    body: &mut Bytes,
+) {
+    if route == ProxyRoute::ClaudeCountTokens
+        || !matches!(
+            execution.stored.provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        )
+    {
+        return;
+    }
+    let Ok(document) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    if document.get("requestType").and_then(Value::as_str) == Some("web_search") {
+        return;
+    }
+    let Some((_, account_id, _)) = execution.managed_account_identity_target() else {
+        return;
+    };
+    let Some(conversation_scope) = request_context
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(session_id) = super::antigravity_replay::derive_session_id(
+        account_id,
+        conversation_scope,
+        attempt_context.antigravity_session_generation,
+    ) else {
+        return;
+    };
+    if super::antigravity_replay::apply_session_id(body, &session_id) {
+        crate::metrics::record_antigravity_reasoning_replay("session_id_applied", 1);
+    }
+}
+
+async fn prepare_antigravity_reasoning_replay(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    route: ProxyRoute,
+    request_context: &UsageLogContext,
+    upstream_url: &str,
+    body: &mut Bytes,
+) -> Option<AntigravityReplayWriteContext> {
+    if route == ProxyRoute::ClaudeCountTokens
+        || !matches!(
+            execution.stored.provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        )
+    {
+        return None;
+    }
+    let share_id = request_context
+        .share_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let user_namespace = super::antigravity_replay::user_namespace(
+        request_context
+            .user_email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?,
+    )?;
+    let session_id = request_context
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let document = serde_json::from_slice::<Value>(body).ok()?;
+    if document.get("requestType").and_then(Value::as_str) == Some("web_search") {
+        return None;
+    }
+    let model = document.get("model")?.as_str()?;
+    let model_family = super::antigravity_replay::model_family(model)?;
+    let upstream_plane = reqwest::Url::parse(upstream_url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    let (provider_type, account_id, auth_identity_generation) =
+        execution.managed_account_identity_target()?;
+    if !matches!(
+        provider_type,
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    ) {
+        return None;
+    }
+    let account = state
+        .find_account_for_provider(provider_type, account_id)
+        .await
+        .filter(|account| account.auth_identity_generation == auth_identity_generation)?;
+    let token_refresh_generation = account.token_refresh_generation;
+    let scope = AntigravityReplayScope::derive(
+        execution.plan.provider_key.app.as_str(),
+        &execution.stored.provider.id,
+        execution.plan.provider_revision,
+        &execution.plan.runtime_fingerprint,
+        account_id,
+        auth_identity_generation,
+        token_refresh_generation,
+        share_id,
+        &user_namespace,
+        session_id,
+        &model_family,
+        &upstream_plane,
+    )?;
+    let now_ms = antigravity_replay_now_ms();
+    let (mut previous_chain, mut snapshot) = state
+        .antigravity_reasoning_replays
+        .get(&scope, now_ms)
+        .await;
+    let mut ownership = CacheSnapshotOwnership::from_hit(
+        "antigravity_reasoning",
+        scope.ownership_digest(),
+        snapshot.generation(),
+    );
+    let mut replay_applied = false;
+    if let Some(chain) = previous_chain.as_ref() {
+        let result = super::antigravity_replay::apply_replay(body, chain);
+        if result.applied {
+            *body = result.body;
+            replay_applied = true;
+            crate::metrics::record_antigravity_reasoning_replay("hit", 1);
+        } else if result.context_mismatch {
+            crate::metrics::record_antigravity_reasoning_replay("context_mismatch", 1);
+            if ownership.authorize_mutation(
+                "antigravity_reasoning",
+                &scope.ownership_digest(),
+                snapshot.generation(),
+            ) && state
+                .antigravity_reasoning_replays
+                .delete_if_unchanged(&scope, snapshot, now_ms)
+                .await
+            {
+                let refreshed = state
+                    .antigravity_reasoning_replays
+                    .get(&scope, now_ms)
+                    .await;
+                previous_chain = refreshed.0;
+                snapshot = refreshed.1;
+                ownership = CacheSnapshotOwnership::from_hit(
+                    "antigravity_reasoning",
+                    scope.ownership_digest(),
+                    snapshot.generation(),
+                );
+            }
+        } else {
+            crate::metrics::record_antigravity_reasoning_replay("present_noop", 1);
+        }
+    } else {
+        crate::metrics::record_antigravity_reasoning_replay("miss", 1);
+    }
+    Some(AntigravityReplayWriteContext {
+        scope,
+        snapshot,
+        ownership,
+        previous_chain,
+        replay_applied,
+        app: execution.plan.provider_key.app,
+        provider_id: execution.stored.provider.id.clone(),
+        provider_revision: execution.plan.provider_revision,
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_type,
+        account_id: account_id.to_string(),
+        auth_identity_generation,
+        token_refresh_generation,
+        share_id: share_id.to_string(),
+    })
+}
+
+async fn clear_rejected_antigravity_reasoning_replay(
+    state: &ServerState,
+    context: Option<&AntigravityReplayWriteContext>,
+) {
+    let Some(context) = context.filter(|context| context.replay_applied) else {
+        return;
+    };
+    if !context.ownership.authorize_mutation(
+        "antigravity_reasoning",
+        &context.scope.ownership_digest(),
+        context.snapshot.generation(),
+    ) {
+        crate::metrics::record_antigravity_reasoning_replay("delete_ownership_denied", 1);
+        return;
+    }
+    let deleted = state
+        .antigravity_reasoning_replays
+        .delete_if_unchanged(
+            &context.scope,
+            context.snapshot,
+            antigravity_replay_now_ms(),
+        )
+        .await;
+    crate::metrics::record_antigravity_reasoning_replay(
+        if deleted {
+            "upstream_rejected"
+        } else {
+            "delete_conflict"
+        },
+        1,
+    );
+}
+
+async fn commit_antigravity_reasoning_replay(
+    state: &ServerState,
+    context: Option<&AntigravityReplayWriteContext>,
+    terminal: bool,
+    chain: Option<AntigravityReplayChain>,
+) {
+    let Some(context) = context.filter(|_| terminal) else {
+        return;
+    };
+    if !antigravity_reasoning_replay_binding_is_current(state, context).await {
+        crate::metrics::record_antigravity_reasoning_replay("binding_drift", 1);
+        return;
+    }
+    if !context.ownership.authorize_mutation(
+        "antigravity_reasoning",
+        &context.scope.ownership_digest(),
+        context.snapshot.generation(),
+    ) {
+        crate::metrics::record_antigravity_reasoning_replay("write_ownership_denied", 1);
+        return;
+    }
+    let now_ms = antigravity_replay_now_ms();
+    let stored = if let Some(chain) = chain {
+        state
+            .antigravity_reasoning_replays
+            .replace_if_unchanged(context.scope.clone(), context.snapshot, chain, now_ms)
+            .await
+    } else {
+        state
+            .antigravity_reasoning_replays
+            .delete_if_unchanged(&context.scope, context.snapshot, now_ms)
+            .await
+    };
+    crate::metrics::record_antigravity_reasoning_replay(
+        if stored {
+            if context.previous_chain.is_some() {
+                "updated"
+            } else {
+                "stored"
+            }
+        } else {
+            "write_conflict"
+        },
+        1,
+    );
+}
+
+async fn antigravity_reasoning_replay_binding_is_current(
+    state: &ServerState,
+    context: &AntigravityReplayWriteContext,
+) -> bool {
+    if state.credential_persistence_degraded() {
+        return false;
+    }
+    let Some(plan) = state
+        .provider_runtime_plan(context.app, &context.provider_id)
+        .await
+    else {
+        return false;
+    };
+    if plan.provider_revision != context.provider_revision
+        || plan.runtime_fingerprint != context.runtime_fingerprint
+        || !matches!(
+            &plan.auth_ref,
+            RuntimeAuthRef::ManagedAccount {
+                account_id,
+                expected_provider_type,
+                auth_identity_generation,
+            } if account_id == &context.account_id
+                && *expected_provider_type == context.provider_type
+                && *auth_identity_generation == context.auth_identity_generation
+        )
+    {
+        return false;
+    }
+    let Some(account) = state
+        .find_account_for_provider(context.provider_type, &context.account_id)
+        .await
+    else {
+        return false;
+    };
+    if account.auth_identity_generation != context.auth_identity_generation
+        || account.token_refresh_generation != context.token_refresh_generation
+    {
+        return false;
+    }
+    let shares = state.shares.read().await;
+    shares.get(&context.share_id).is_some_and(|share| {
+        share.enabled
+            && share.status == "active"
+            && share.bindings.iter().any(|binding| {
+                binding.app == context.app
+                    && binding.provider_id == context.provider_id
+                    && binding.provider_type == context.provider_type
+            })
+    })
+}
+
+fn antigravity_replay_now_ms() -> i64 {
+    current_time_ms().min(i64::MAX as u128) as i64
+}
+
 async fn prepare_kimi_thinking_replay(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -22204,6 +23730,8 @@ struct StreamForwardState {
     grok_responses_sse: Option<super::grok::GrokResponsesSseInspector>,
     grok_search_identity: Option<(String, u64)>,
     grok_search_evidence_recorded: bool,
+    grok_reasoning_replay: Option<GrokReplayStreamWrite>,
+    antigravity_reasoning_replay: Option<AntigravityReplayStreamWrite>,
     kimi_thinking_replay: Option<KimiThinkingReplayStreamWrite>,
     stream_transform: super::stream_transforms::StreamEventTransformer,
     terminal_detector: UpstreamTerminalDetector,
@@ -22291,6 +23819,54 @@ struct KimiThinkingReplayWriteContext {
     share_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct AntigravityReplayWriteContext {
+    scope: AntigravityReplayScope,
+    snapshot: AntigravityReplaySnapshot,
+    ownership: CacheSnapshotOwnership,
+    previous_chain: Option<AntigravityReplayChain>,
+    replay_applied: bool,
+    app: AppKind,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
+    provider_type: ProviderType,
+    account_id: String,
+    auth_identity_generation: u64,
+    token_refresh_generation: u64,
+    share_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct GrokReplayWriteContext {
+    read: Option<(GrokReplayScope, GrokReplaySnapshot, CacheSnapshotOwnership)>,
+    write_scope: GrokReplayScope,
+    write_snapshot: GrokReplaySnapshot,
+    write_ownership: CacheSnapshotOwnership,
+    replay_applied: bool,
+    app: AppKind,
+    provider_id: String,
+    provider_revision: u64,
+    runtime_fingerprint: String,
+    account_id: String,
+    auth_identity_generation: u64,
+    token_refresh_generation: u64,
+    share_id: String,
+}
+
+#[derive(Debug)]
+struct AntigravityReplayStreamWrite {
+    context: AntigravityReplayWriteContext,
+    request_body: Bytes,
+    accumulator: AntigravityReplayStreamAccumulator,
+}
+
+#[derive(Debug)]
+struct GrokReplayStreamWrite {
+    context: GrokReplayWriteContext,
+    accumulator: GrokReplayStreamAccumulator,
+}
+
 #[derive(Debug)]
 struct KimiThinkingReplayStreamWrite {
     context: KimiThinkingReplayWriteContext,
@@ -22321,6 +23897,44 @@ impl StreamForwardState {
         if let Some(replay) = self.kimi_thinking_replay.as_mut() {
             replay.accumulator.push(chunk);
         }
+    }
+
+    fn inspect_antigravity_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
+        if let Some(replay) = self.antigravity_reasoning_replay.as_mut() {
+            replay.accumulator.push(chunk);
+        }
+    }
+
+    fn inspect_grok_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
+        if let Some(replay) = self.grok_reasoning_replay.as_mut() {
+            replay.accumulator.push(chunk);
+        }
+    }
+
+    async fn finish_grok_reasoning_replay_stream(&mut self) {
+        let Some(replay) = self.grok_reasoning_replay.take() else {
+            return;
+        };
+        let proof = replay.accumulator.finish();
+        commit_grok_reasoning_replay(&self.state, Some(&replay.context), proof).await;
+    }
+
+    async fn commit_antigravity_reasoning_replay_stream(&mut self) {
+        if !self
+            .antigravity_reasoning_replay
+            .as_ref()
+            .is_some_and(|replay| replay.accumulator.is_complete())
+        {
+            return;
+        }
+        let Some(replay) = self.antigravity_reasoning_replay.take() else {
+            return;
+        };
+        let previous_chain = replay.context.previous_chain.clone();
+        let chain = replay
+            .accumulator
+            .finish(&replay.request_body, previous_chain.as_ref());
+        commit_antigravity_reasoning_replay(&self.state, Some(&replay.context), true, chain).await;
     }
 
     async fn commit_kimi_thinking_replay_stream(&mut self) {
@@ -23577,10 +25191,50 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn install_antigravity_retry_after(
+    headers: &mut HeaderMap,
+    limit: &super::antigravity_retry::AntigravityRetryInfo,
+) {
+    if headers.contains_key(RETRY_AFTER) {
+        return;
+    }
+    let seconds = limit.retry_after_seconds().max(1);
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        headers.insert(RETRY_AFTER, value);
+    }
+}
+
 async fn forward_http_client(
     state: &ServerState,
-    _stored: &StoredProvider,
+    execution: &ProviderExecution,
 ) -> Result<reqwest::Client, ProxyError> {
+    if matches!(
+        execution.stored.provider_type,
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+    ) {
+        let policy = super::antigravity_transport::AntigravityTransportPolicy::resolve(
+            &execution.plan.transport_policy,
+        );
+        let key = execution.managed_account_identity_target().and_then(
+            |(provider_type, account_id, auth_identity_generation)| {
+                super::antigravity_transport::AntigravityTransportKey::new(
+                    execution.plan.provider_key.app,
+                    provider_type,
+                    &execution.stored.provider.id,
+                    execution.plan.provider_revision,
+                    &execution.plan.runtime_fingerprint,
+                    account_id,
+                    auth_identity_generation,
+                    policy,
+                )
+            },
+        );
+        return state
+            .antigravity_transports
+            .client(key, policy)
+            .await
+            .map_err(ProxyError::bad_gateway);
+    }
     Ok(state.http_client().await)
 }
 
@@ -24343,31 +25997,30 @@ mod tests {
     #[test]
     fn retry_context_pins_provider_and_tracks_body_stage() {
         let context = ForwardAttemptContext::default();
-        assert_eq!(context.attempt, 0);
+        assert_eq!(context.attempt(), 0);
         assert!(context.execution.is_none());
 
         let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}), None);
-        let mut failover_stored = stored.clone();
-        failover_stored.provider.id = "codex-failover".to_string();
         let mut store = ProviderStore {
-            providers: vec![stored.clone(), failover_stored.clone()],
+            providers: vec![stored.clone()],
             ..ProviderStore::default()
         };
         store
             .rebuild_runtime_index(&AccountStore::default())
             .unwrap();
         let execution = ProviderExecution::from_store(&store, stored).unwrap();
-        let failover_execution = ProviderExecution::from_store(&store, failover_stored).unwrap();
 
-        let next = context.next(
-            &execution,
-            Some(ClaudeBodyRetryStage::Thinking),
-            "body",
-            "thinking",
-        );
-        assert_eq!(next.attempt, 1);
+        let next = context
+            .next(
+                &execution,
+                Some(ClaudeBodyRetryStage::Thinking),
+                "body",
+                "thinking",
+            )
+            .unwrap();
+        assert_eq!(next.attempt(), 1);
         assert_eq!(next.body_retry_stage, Some(ClaudeBodyRetryStage::Thinking));
-        assert!(!next.auth_refresh_attempted);
+        assert!(!next.auth_refresh_attempted());
         assert_eq!(next.retry_audit.as_ref().unwrap().stage, "body");
         assert_eq!(next.retry_audit.as_ref().unwrap().source, "thinking");
         assert_eq!(
@@ -24377,32 +26030,12 @@ mod tests {
             Some("codex-fixture")
         );
 
-        let refreshed = next.after_auth_refresh(&execution);
-        assert!(refreshed.auth_refresh_attempted);
-        assert_eq!(refreshed.attempt, 2);
+        let refreshed = next.reserve_auth_refresh(&execution).unwrap();
+        assert!(refreshed.auth_refresh_attempted());
+        assert_eq!(refreshed.attempt(), 2);
         assert_eq!(
             refreshed.body_retry_stage,
             Some(ClaudeBodyRetryStage::Thinking)
-        );
-
-        let failed_over =
-            refreshed.after_provider_failover(&execution, &failover_execution, "rate_limited");
-        assert_eq!(failed_over.attempt, 3);
-        assert!(!failed_over.auth_refresh_attempted);
-        assert!(failed_over.excluded_provider_ids.contains("codex-fixture"));
-        let failover_audit = failed_over.retry_audit.as_ref().unwrap();
-        assert_eq!(failover_audit.stage, "provider");
-        assert_eq!(failover_audit.source, "rate_limited");
-        assert_eq!(
-            failover_audit.previous_provider_id.as_deref(),
-            Some("codex-fixture")
-        );
-        assert_eq!(
-            failed_over
-                .execution
-                .as_ref()
-                .map(|execution| execution.stored.provider.id.as_str()),
-            Some("codex-failover")
         );
     }
 
@@ -28208,6 +29841,152 @@ mod tests {
         body: Value,
     }
 
+    #[derive(Clone)]
+    struct AntigravityReplayFixtureState {
+        observations: Arc<StdMutex<Vec<GeminiV1InternalObservation>>>,
+        requests: Arc<AtomicUsize>,
+        stream_first: bool,
+        reject_request: Option<usize>,
+        accumulation_responses: usize,
+    }
+
+    async fn spawn_antigravity_replay_upstream(
+        stream_first: bool,
+        reject_request: Option<usize>,
+        accumulation_responses: usize,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<StdMutex<Vec<GeminiV1InternalObservation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        async fn inference(
+            axum::extract::State(state): axum::extract::State<AntigravityReplayFixtureState>,
+            headers: HeaderMap,
+            uri: axum::http::Uri,
+            body: Bytes,
+        ) -> Response {
+            let body = serde_json::from_slice(&body).unwrap();
+            state
+                .observations
+                .lock()
+                .unwrap()
+                .push(GeminiV1InternalObservation {
+                    authorization: headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string(),
+                    uri: uri.to_string(),
+                    body,
+                });
+            let request = state.requests.fetch_add(1, Ordering::SeqCst);
+            if request < state.accumulation_responses {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"code":400,"message":"The input token count exceeds the maximum number of tokens allowed 1048576"}}"#,
+                    ))
+                    .unwrap();
+            }
+            if state.reject_request == Some(request) {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":{"code":400,"message":"invalid thoughtSignature in function call history"}}"#,
+                    ))
+                    .unwrap();
+            }
+            let signed = request == 0;
+            let event = if signed {
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":\"call-a\",\"name\":\"lookup\",\"args\":{\"q\":1}},\"thoughtSignature\":\"opaque-antigravity-signature-a\"}]},\"finishReason\":\"STOP\"}]}}\n\n"
+            } else {
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}}\n\n"
+            };
+            if state.stream_first && signed {
+                let chunks = stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(event.as_bytes()))
+                })
+                .chain(stream::pending());
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(chunks))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(event))
+                .unwrap()
+        }
+
+        let state = AntigravityReplayFixtureState {
+            observations: Default::default(),
+            requests: Default::default(),
+            stream_first,
+            reject_request,
+            accumulation_responses,
+        };
+        let observations = Arc::clone(&state.observations);
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(inference))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, observations, server)
+    }
+
+    fn antigravity_replay_headers(share_id: &str, session_id: &str) -> HeaderMap {
+        let mut headers = antigravity_share_headers(share_id);
+        headers.insert(
+            "x-cc-switch-session-id",
+            HeaderValue::from_str(session_id).unwrap(),
+        );
+        headers
+    }
+
+    fn antigravity_replay_seed_request(streaming: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "look up"}]}],
+                "stream": streaming
+            })
+            .to_string(),
+        )
+    }
+
+    fn antigravity_replay_continuation_request(streaming: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "contents": [
+                    {"role": "user", "parts": [{"text": "look up"}]},
+                    {"role": "user", "parts": [{"functionResponse": {
+                        "id": "call-a",
+                        "name": "lookup",
+                        "response": {"ok": true}
+                    }}]}
+                ],
+                "stream": streaming
+            })
+            .to_string(),
+        )
+    }
+
+    fn request_has_antigravity_replay(body: &Value) -> bool {
+        body.pointer("/request/contents/1/parts/0/thoughtSignature")
+            .and_then(Value::as_str)
+            == Some("opaque-antigravity-signature-a")
+            && body.pointer("/request/contents/2/parts/0/functionResponse/id")
+                == Some(&json!("call-a"))
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum AntigravityLimitFixture {
         RateLimit,
@@ -28820,6 +30599,302 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers
+    }
+
+    #[tokio::test]
+    async fn antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated() {
+        let (address, observations, server) =
+            spawn_antigravity_replay_upstream(false, Some(2), 0).await;
+        let state = forwarder_test_state("antigravity-non-stream-replay-lifecycle");
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "non-stream-replay",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "antigravity-non-stream-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            &provider_id,
+        )
+        .await;
+        let path = Some("models/gemini-3.5-flash-medium:generateContent".to_string());
+
+        let seed = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id.clone(),
+            path.clone(),
+            antigravity_replay_headers(share_id, "session-a"),
+            antigravity_replay_seed_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seed.status(), StatusCode::OK);
+        let _ = collect_response_body(seed).await;
+
+        let other_session = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id.clone(),
+            path.clone(),
+            antigravity_replay_headers(share_id, "session-b"),
+            antigravity_replay_continuation_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other_session.status(), StatusCode::OK);
+        let _ = collect_response_body(other_session).await;
+
+        let rejected = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id.clone(),
+            path.clone(),
+            antigravity_replay_headers(share_id, "session-a"),
+            antigravity_replay_continuation_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let _ = collect_response_body(rejected).await;
+
+        let after_rejection = forward_for_test_surface(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            path,
+            antigravity_replay_headers(share_id, "session-a"),
+            antigravity_replay_continuation_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_rejection.status(), StatusCode::OK);
+        let _ = collect_response_body(after_rejection).await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 4);
+        assert!(!request_has_antigravity_replay(&observations[1].body));
+        assert!(request_has_antigravity_replay(&observations[2].body));
+        assert!(!request_has_antigravity_replay(&observations[3].body));
+        assert!(observations
+            .iter()
+            .all(|observation| observation.authorization == "Bearer antigravity-access"));
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_stream_commits_replay_at_terminal_before_upstream_eof() {
+        let (address, observations, server) =
+            spawn_antigravity_replay_upstream(true, None, 0).await;
+        let state = forwarder_test_state("antigravity-stream-replay-terminal");
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "stream-replay",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "antigravity-stream-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            &provider_id,
+        )
+        .await;
+        let path = Some("models/gemini-3.5-flash-medium:streamGenerateContent".to_string());
+
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::Gemini,
+            provider_id.clone(),
+            path.clone(),
+            antigravity_replay_headers(share_id, "stream-session"),
+            antigravity_replay_seed_request(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut downstream = Vec::new();
+        while !String::from_utf8_lossy(&downstream).contains("finishReason") {
+            let chunk = tokio::time::timeout(Duration::from_secs(2), body.next())
+                .await
+                .expect("Antigravity terminal chunk must arrive before EOF")
+                .expect("Antigravity stream must remain open through terminal")
+                .unwrap();
+            downstream.extend_from_slice(&chunk);
+        }
+        drop(body);
+
+        let continuation = forward_for_test_surface(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            path,
+            antigravity_replay_headers(share_id, "stream-session"),
+            antigravity_replay_continuation_request(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(continuation.status(), StatusCode::OK);
+        let _ = collect_response_body(continuation).await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(request_has_antigravity_replay(&observations[1].body));
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_session_accumulation_rolls_over_once_on_the_same_binding() {
+        for accumulation_responses in [1, usize::MAX] {
+            let (address, observations, server) =
+                spawn_antigravity_replay_upstream(false, None, accumulation_responses).await;
+            let state = forwarder_test_state(&format!(
+                "antigravity-session-rollover-{accumulation_responses}"
+            ));
+            let (provider_id, _, _) = install_antigravity_test_provider(
+                &state,
+                &format!("session-rollover-{accumulation_responses}"),
+                AppKind::Gemini,
+                ProviderType::AntigravityOAuth,
+                format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("antigravity-session-rollover-{accumulation_responses}");
+            install_antigravity_test_share(
+                &state,
+                &share_id,
+                AppKind::Gemini,
+                ProviderType::AntigravityOAuth,
+                &provider_id,
+            )
+            .await;
+
+            let response = forward_for_test_surface(
+                state,
+                ProxyRoute::Gemini,
+                provider_id,
+                Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+                antigravity_replay_headers(&share_id, "rollover-session"),
+                antigravity_replay_seed_request(false),
+            )
+            .await
+            .unwrap();
+            if accumulation_responses == 1 {
+                assert_eq!(response.status(), StatusCode::OK);
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            let _ = collect_response_body(response).await;
+
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 2, "rollover may retry only once");
+            assert!(observations
+                .iter()
+                .all(|observation| observation.authorization == "Bearer antigravity-access"));
+            let first = observations[0]
+                .body
+                .pointer("/request/sessionId")
+                .and_then(Value::as_str)
+                .unwrap();
+            let second = observations[1]
+                .body
+                .pointer("/request/sessionId")
+                .and_then(Value::as_str)
+                .unwrap();
+            assert_ne!(first, second);
+            drop(observations);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_session_contract_skips_count_tokens_and_web_search() {
+        let state = forwarder_test_state("antigravity-session-contract-exclusions");
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "session-contract-exclusions",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let execution = {
+            let providers = state.providers.read().await;
+            ProviderExecution::from_store(&providers, providers.providers[0].clone()).unwrap()
+        };
+        assert_eq!(execution.stored.provider.id, provider_id);
+        let request_context = UsageLogContext {
+            session_id: Some("contract-session".to_string()),
+            ..UsageLogContext::default()
+        };
+        let attempts = ForwardAttemptContext::default();
+        let original =
+            Bytes::from_static(br#"{"model":"gemini-3.5-flash-medium","request":{"contents":[]}}"#);
+
+        let mut count_tokens = original.clone();
+        apply_antigravity_session_contract(
+            &execution,
+            ProxyRoute::ClaudeCountTokens,
+            &request_context,
+            &attempts,
+            &mut count_tokens,
+        );
+        assert_eq!(count_tokens, original);
+
+        let mut search = Bytes::from_static(
+            br#"{"model":"gemini-3.5-flash-medium","requestType":"web_search","request":{"contents":[]}}"#,
+        );
+        let search_original = search.clone();
+        apply_antigravity_session_contract(
+            &execution,
+            ProxyRoute::Gemini,
+            &request_context,
+            &attempts,
+            &mut search,
+        );
+        assert_eq!(search, search_original);
+
+        let mut inference = original;
+        apply_antigravity_session_contract(
+            &execution,
+            ProxyRoute::Gemini,
+            &request_context,
+            &attempts,
+            &mut inference,
+        );
+        assert!(serde_json::from_slice::<Value>(&inference)
+            .unwrap()
+            .pointer("/request/sessionId")
+            .is_some());
+    }
+
+    #[test]
+    fn antigravity_retry_after_is_rounded_up_bounded_and_preserves_upstream() {
+        let limit = super::super::antigravity_retry::AntigravityRetryInfo {
+            kind: super::super::antigravity_retry::AntigravityLimitKind::RateLimit,
+            retry_delay_ms: 1_001,
+            model: "gemini-3.5-flash-medium".to_string(),
+        };
+        let mut headers = HeaderMap::new();
+        install_antigravity_retry_after(&mut headers, &limit);
+        assert_eq!(headers.get(RETRY_AFTER).unwrap(), "2");
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        install_antigravity_retry_after(&mut headers, &limit);
+        assert_eq!(headers.get(RETRY_AFTER).unwrap(), "30");
     }
 
     #[tokio::test]
@@ -29861,7 +31936,6 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        plan.runtime_fingerprint = format!("{name}-grok-test-runtime");
         if let Some(websocket_url) =
             stored.provider.settings_config["testGrokWebsocketUrl"].as_str()
         {
@@ -31249,6 +33323,15 @@ mod tests {
         session_id: &str,
         turn_index: Option<u64>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let share_id = format!("{}-share", execution.stored.provider.id);
+        install_antigravity_test_share(
+            &state,
+            &share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -31271,6 +33354,7 @@ mod tests {
                 let session_id = session_id.clone();
                 let target_headers = target.headers.clone();
                 let target_url = target.ws_url.clone();
+                let share_id = share_id.clone();
                 async move {
                     ws.on_upgrade(move |socket| async move {
                         let _ = bridge_responses_websocket(
@@ -31283,10 +33367,15 @@ mod tests {
                                 ws_url: target_url,
                                 pool_key: None,
                                 mode: ResponsesWebsocketMode::Grok,
-                                grok_session_id: Some(session_id),
+                                grok_session_id: Some(session_id.clone()),
                                 grok_turn_index: turn_index,
                                 single_upstream_model: Some("grok-4.6".to_string()),
-                                request_context: UsageLogContext::default(),
+                                request_context: UsageLogContext {
+                                    share_id: Some(share_id),
+                                    user_email: Some("owner@example.com".to_string()),
+                                    session_id: Some(session_id.clone()),
+                                    ..UsageLogContext::default()
+                                },
                                 state: &state,
                                 execution,
                             },
@@ -31351,6 +33440,7 @@ mod tests {
             tool_name_map: Default::default(),
             cache_namespace: "test".to_string(),
             responses_tool_context: Default::default(),
+            downstream_include_usage: false,
             request_context: UsageLogContext::default(),
             account_in_flight_guard: Some(account_in_flight_guard),
             share_invocation_guard: None,
@@ -35231,6 +37321,46 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[tokio::test]
+    async fn codex_http_and_websocket_preserve_named_tool_output_without_call_id() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/codex-reference-delta.json"
+        ))
+        .unwrap();
+        let request = fixture
+            .pointer("/wireGoldens/namedToolOutputRequest")
+            .unwrap()
+            .clone();
+        assert!(!requires_previous_response_tool_context(&request));
+
+        let mut http_body = request.clone();
+        http_body.as_object_mut().unwrap().remove("type");
+        let http_body =
+            normalize_codex_oauth_responses_body(http_body, None, CodexImageToolStripPolicy::Never);
+        assert_eq!(http_body["input"], request["input"]);
+
+        let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+        let intent = crate::proxy::codex_request_policy::extract_intent(&request);
+        let (prepared, _) = prepare_codex_responses_websocket_request(
+            TungsteniteMessage::Text(request.to_string()),
+            &provider,
+            false,
+            None,
+            &intent,
+            None,
+        )
+        .await
+        .unwrap();
+        let TungsteniteMessage::Text(prepared) = prepared else {
+            panic!("named tool output must remain a text frame");
+        };
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(prepared["input"], request["input"]);
+        assert_eq!(prepared["input"][0]["name"], "lookup");
+        assert!(prepared["input"][0].get("call_id").is_none());
+        assert!(sanitize_replayable_tool_item(&prepared["input"][0]).is_none());
+    }
+
+    #[tokio::test]
     async fn codex_websocket_request_inherits_model_for_policy_and_replay() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
         let request = json!({
@@ -35393,30 +37523,6 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.message.contains("image limit"));
-    }
-
-    #[test]
-    fn share_requests_always_pin_their_provider() {
-        let context = UsageLogContext {
-            share_id: Some("share-one-account".to_string()),
-            ..UsageLogContext::default()
-        };
-        assert!(request_is_provider_pinned(
-            &ForwardAttemptContext::default(),
-            &context
-        ));
-    }
-
-    #[test]
-    fn explicit_provider_fixtures_always_pin_their_provider() {
-        let attempt_context = ForwardAttemptContext {
-            provider_binding_pinned: true,
-            ..ForwardAttemptContext::default()
-        };
-        assert!(request_is_provider_pinned(
-            &attempt_context,
-            &UsageLogContext::default()
-        ));
     }
 
     #[test]
@@ -35707,6 +37813,46 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
         assert_eq!(completion.results.len(), 1);
         assert_eq!(completion.results[0].result, "aGVsbG8=");
         assert_eq!(completion.results[0].revised_prompt.as_deref(), Some("cat"));
+    }
+
+    #[test]
+    fn codex_image_25_variants_remain_independently_live_evidence_gated() {
+        for model in CODEX_IMAGES_LIVE_PENDING_25_MODELS {
+            for operation in [CodexImagesOperation::Generation, CodexImagesOperation::Edit] {
+                let error = match codex_images_common_options(
+                    &json!({
+                        "model": model,
+                        "quality": "high",
+                        "size": "1024x1024"
+                    }),
+                    "fixture prompt",
+                    operation,
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("{model} must remain evidence gated"),
+                };
+                assert_eq!(error.status, StatusCode::BAD_REQUEST, "{model}");
+                assert!(error.message.contains("live"), "{model}: {}", error.message);
+                assert!(error.message.contains(model), "{model}: {}", error.message);
+            }
+        }
+
+        let unknown = match codex_images_common_options(
+            &json!({"model": "gpt-image-2.5-unverified"}),
+            "fixture prompt",
+            CodexImagesOperation::Generation,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unknown GPT Image 2.5 variant must remain evidence gated"),
+        };
+        assert!(unknown.message.contains("exact live variant evidence"));
+
+        assert!(codex_images_common_options(
+            &json!({"model": "gpt-image-2", "quality": "high", "size": "1024x1024"}),
+            "fixture prompt",
+            CodexImagesOperation::Generation,
+        )
+        .is_ok());
     }
 
     #[tokio::test]
@@ -36333,19 +38479,89 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
 
     #[test]
     fn codex_http_fallback_capacity_retry_uses_one_total_elapsed_budget() {
-        let mut attempted = 0;
+        let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}), None);
+        let mut store = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        store
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        let execution = ProviderExecution::from_store(&store, stored).unwrap();
+        let mut attempt_context = ForwardAttemptContext {
+            attempt_budget: AttemptBudget::new(
+                AttemptLimits::forward_default(
+                    MAX_FORWARD_RETRY_ATTEMPTS,
+                    MAX_FORWARD_RETRY_ELAPSED_MS,
+                ),
+                current_time_ms().saturating_sub(MAX_FORWARD_RETRY_ELAPSED_MS - 1),
+            ),
+            ..ForwardAttemptContext::default()
+        };
         assert!(take_codex_http_fallback_capacity_retry(
-            &mut attempted,
-            Duration::from_millis(MAX_FORWARD_RETRY_ELAPSED_MS as u64 - 1)
+            &mut attempt_context,
+            &execution,
+            "capacity_shed",
         )
         .is_none());
-        assert_eq!(attempted, 0);
+        assert_eq!(attempt_context.codex_capacity_retry_attempted(), 0);
 
-        let delay =
-            take_codex_http_fallback_capacity_retry(&mut attempted, Duration::from_millis(0))
-                .expect("fresh fallback has retry budget");
-        assert_eq!(attempted, 1);
+        let mut attempt_context = ForwardAttemptContext::default();
+        let delay = take_codex_http_fallback_capacity_retry(
+            &mut attempt_context,
+            &execution,
+            "capacity_shed",
+        )
+        .expect("fresh fallback has retry budget");
+        assert_eq!(attempt_context.codex_capacity_retry_attempted(), 1);
         assert!(delay.as_millis() <= MAX_FORWARD_RETRY_ELAPSED_MS);
+    }
+
+    #[test]
+    fn websocket_fallback_auth_and_capacity_share_one_total_budget() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}), None);
+        let mut store = ProviderStore {
+            providers: vec![stored.clone()],
+            ..ProviderStore::default()
+        };
+        store
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        let execution = ProviderExecution::from_store(&store, stored).unwrap();
+        let mut attempt = ForwardAttemptContext::default();
+
+        assert!(attempt.reserve_in_place(
+            &execution,
+            "transport",
+            "websocket_failure",
+            RecoveryStage::WebsocketToHttp,
+            DelaySource::Immediate,
+        ));
+        assert!(attempt.reserve_in_place(
+            &execution,
+            "auth",
+            "unauthorized",
+            RecoveryStage::Auth,
+            DelaySource::Immediate,
+        ));
+        assert!(
+            take_codex_http_fallback_capacity_retry(&mut attempt, &execution, "capacity_shed",)
+                .is_some()
+        );
+        assert_eq!(attempt.attempt(), MAX_FORWARD_RETRY_ATTEMPTS);
+        assert!(
+            take_codex_http_fallback_capacity_retry(&mut attempt, &execution, "capacity_shed",)
+                .is_none()
+        );
+
+        attempt.mark_downstream_committed();
+        assert!(!attempt.reserve_in_place(
+            &execution,
+            "body",
+            "grok_reasoning_rejected",
+            RecoveryStage::Reasoning,
+            DelaySource::Immediate,
+        ));
     }
 
     #[tokio::test]
@@ -37952,6 +40168,72 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             websocket_close_fallback_source(&close(CloseCode::Policy), true),
             None
         );
+    }
+
+    #[test]
+    fn codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/codex-reference-delta.json"
+        ))
+        .unwrap();
+        let golden = fixture
+            .pointer("/wireGoldens/websocketHttpFallback")
+            .unwrap();
+        assert_eq!(golden["sameProvider"], true);
+        assert_eq!(golden["sameAccount"], true);
+        assert_eq!(golden["sharedAttemptBudget"], true);
+        assert_eq!(golden["postCommitReplay"], false);
+        assert_eq!(MAX_FORWARD_RETRY_ATTEMPTS, 3);
+
+        for status in golden["handshakeFallbackStatuses"].as_array().unwrap() {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status.as_u64().unwrap() as u16)
+                .body(Some(Vec::new()))
+                .unwrap();
+            assert_eq!(
+                websocket_connect_fallback_source(
+                    ResponsesWebsocketMode::Codex,
+                    &TungsteniteError::Http(response),
+                ),
+                Some("handshake_server_error")
+            );
+        }
+        for status in golden["handshakeNoFallbackStatuses"].as_array().unwrap() {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status.as_u64().unwrap() as u16)
+                .body(Some(Vec::new()))
+                .unwrap();
+            assert_eq!(
+                websocket_connect_fallback_source(
+                    ResponsesWebsocketMode::Codex,
+                    &TungsteniteError::Http(response),
+                ),
+                None
+            );
+        }
+        let close =
+            TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: CloseCode::Size,
+                reason: "fixture".into(),
+            }));
+        assert_eq!(
+            websocket_close_fallback_source(&close, false),
+            Some("message_too_big")
+        );
+        assert_eq!(
+            websocket_close_fallback_source(&close, true),
+            Some("message_too_big")
+        );
+        assert!(responses_websocket_http_replay_allowed(
+            ResponsesWebsocketMode::Codex,
+            false,
+            false,
+        ));
+        assert!(!responses_websocket_http_replay_allowed(
+            ResponsesWebsocketMode::Codex,
+            false,
+            true,
+        ));
     }
 
     #[tokio::test]
@@ -41461,6 +43743,293 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         upstream_server.abort();
     }
 
+    fn grok_reasoning_replay_headers(
+        share_id: &str,
+        session_id: &str,
+        turn_index: u64,
+    ) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        headers.insert(
+            "x-cc-switch-session-id",
+            HeaderValue::from_str(session_id).unwrap(),
+        );
+        headers.insert(
+            "x-grok-turn-idx",
+            HeaderValue::from_str(&turn_index.to_string()).unwrap(),
+        );
+        headers
+    }
+
+    fn grok_replay_seed_output(response_id: &str) -> Value {
+        json!({
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_grok_replay",
+                    "summary": [],
+                    "encrypted_content": "opaque-grok-reasoning-proof-1234567890"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"x\":1}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "lookup",
+                    "arguments": "{\"x\":2}"
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    fn grok_replay_continuation_body(stream: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "model": "grok-4.6",
+                "stream": stream,
+                "input": [
+                    {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"x\":1}"},
+                    {"type":"function_call","call_id":"call_2","name":"lookup","arguments":"{\"x\":2}"},
+                    {"type":"function_call_output","call_id":"call_1","output":"a"},
+                    {"type":"function_call_output","call_id":"call_2","output":"b"}
+                ]
+            })
+            .to_string(),
+        )
+    }
+
+    fn count_grok_reasoning_items(value: &Value) -> usize {
+        value
+            .get("input")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let observations_for_route = Arc::clone(&observations);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: Bytes| {
+                let observations = Arc::clone(&observations_for_route);
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    let body = serde_json::from_slice::<Value>(&body).unwrap();
+                    observations.lock().unwrap().push(body);
+                    match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(grok_replay_seed_output("resp-seed").to_string()))
+                            .unwrap(),
+                        1 => Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"error":{"code":"missing_reasoning","message":"reasoning item is missing"}}).to_string(),
+                            ))
+                            .unwrap(),
+                        2 => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"id":"resp-recovered","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}).to_string(),
+                            ))
+                            .unwrap(),
+                        _ => panic!("Grok reasoning recovery must retry exactly once"),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = forwarder_test_state("grok-http-reasoning-replay");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-http-reasoning-replay",
+            format!("http://{address}/v1"),
+            None,
+            "grok-replay-access",
+            None,
+            &[],
+        )
+        .await;
+        let share_id = "grok-http-reasoning-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
+
+        let seed = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            grok_reasoning_replay_headers(share_id, "grok-http-replay-session", 0),
+            Bytes::from_static(br#"{"model":"grok-4.6","stream":false,"input":"seed"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seed.status(), StatusCode::OK);
+
+        let recovered = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            grok_reasoning_replay_headers(share_id, "grok-http-replay-session", 1),
+            grok_replay_continuation_body(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let observations = observations.lock().unwrap();
+        assert_eq!(count_grok_reasoning_items(&observations[0]), 0);
+        assert_eq!(count_grok_reasoning_items(&observations[1]), 1);
+        assert_eq!(count_grok_reasoning_items(&observations[2]), 0);
+        assert_eq!(
+            observations[1]["input"][0]["encrypted_content"],
+            "opaque-grok-reasoning-proof-1234567890"
+        );
+        drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_sse_reasoning_replay_commits_only_completed_fragmented_streams() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let observations_for_route = Arc::clone(&observations);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |body: Bytes| {
+                let observations = Arc::clone(&observations_for_route);
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    observations
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice::<Value>(&body).unwrap());
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let chunks = [
+                            Bytes::from_static(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-sse-reasoning-proof-1234567890\"}}\r\n\r"),
+                            Bytes::from_static(b"\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"x\\\":1}\"}}\r\n\r\n"),
+                            Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sse-seed\",\"status\":\"completed\",\"output\":[]}}\r\n\r\n"),
+                            Bytes::from_static(b"data: [DONE]\r\n\r\n"),
+                        ];
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<
+                                _,
+                                std::convert::Infallible,
+                            >))))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"id":"resp-sse-next","status":"completed","output":[]}).to_string(),
+                            ))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = forwarder_test_state("grok-sse-reasoning-replay");
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-sse-reasoning-replay",
+            format!("http://{address}/v1"),
+            None,
+            "grok-sse-replay-access",
+            None,
+            &[],
+        )
+        .await;
+        let share_id = "grok-sse-reasoning-replay-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
+        let seed = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            grok_reasoning_replay_headers(share_id, "grok-sse-session", 0),
+            Bytes::from_static(br#"{"model":"grok-4.6","stream":true,"input":"seed"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seed.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(seed.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let next = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            grok_reasoning_replay_headers(share_id, "grok-sse-session", 1),
+            grok_replay_continuation_body(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(count_grok_reasoning_items(&observations[1]), 1);
+        assert_eq!(
+            observations[1]["input"][0]["encrypted_content"],
+            "opaque-sse-reasoning-proof-1234567890"
+        );
+        drop(observations);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn grok_chat_uses_only_responses_upstream_and_restores_chat_json() {
         let response_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -42694,117 +45263,235 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
-    async fn grok_execution_never_enters_generic_provider_failover() {
-        let state = forwarder_test_state("grok-no-provider-failover");
+    async fn grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let observations_for_route = Arc::clone(&observations);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = axum::Router::new().route(
+            "/ws",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let observations = Arc::clone(&observations_for_route);
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let value = match message {
+                                AxumWsMessage::Text(text) => serde_json::from_str(&text).ok(),
+                                AxumWsMessage::Binary(bytes) => serde_json::from_slice(&bytes).ok(),
+                                AxumWsMessage::Close(_) => break,
+                                _ => None,
+                            };
+                            let Some(value) = value else {
+                                continue;
+                            };
+                            observations.lock().unwrap().push(value);
+                            match requests.fetch_add(1, Ordering::SeqCst) {
+                                0 => {
+                                    for event in [
+                                        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_ws","summary":[],"encrypted_content":"opaque-grok-reasoning-proof-1234567890"}}),
+                                        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"x\":1}"}}),
+                                        json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","call_id":"call_2","name":"lookup","arguments":"{\"x\":2}"}}),
+                                        json!({"type":"response.completed","response":{"id":"resp-ws-seed","status":"completed","output":[]}}),
+                                    ] {
+                                        socket
+                                            .send(AxumWsMessage::Text(event.to_string()))
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                                1 => {
+                                    socket
+                                        .send(AxumWsMessage::Text(
+                                            json!({"type":"response.failed","response":{"id":"resp-ws-rejected","status":"failed","error":{"code":"missing_reasoning","message":"reasoning item is missing"}}}).to_string(),
+                                        ))
+                                        .await
+                                        .unwrap();
+                                }
+                                2 => {
+                                    socket
+                                        .send(AxumWsMessage::Text(
+                                            json!({"type":"response.completed","response":{"id":"resp-ws-recovered","status":"completed","output":[]}}).to_string(),
+                                        ))
+                                        .await
+                                        .unwrap();
+                                }
+                                3 => {
+                                    for event in [
+                                        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_ws_late","summary":[],"encrypted_content":"opaque-grok-reasoning-proof-late-1234567890"}}),
+                                        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"x\":1}"}}),
+                                        json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","call_id":"call_2","name":"lookup","arguments":"{\"x\":2}"}}),
+                                        json!({"type":"response.completed","response":{"id":"resp-ws-late-seed","status":"completed","output":[]}}),
+                                    ] {
+                                        socket
+                                            .send(AxumWsMessage::Text(event.to_string()))
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                                4 => {
+                                    for event in [
+                                        json!({"type":"response.output_text.delta","delta":"committed"}),
+                                        json!({"type":"response.failed","response":{"id":"resp-ws-too-late","status":"failed","error":{"code":"missing_reasoning","message":"reasoning item is missing"}}}),
+                                    ] {
+                                        socket
+                                            .send(AxumWsMessage::Text(event.to_string()))
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                                _ => panic!("Grok websocket reasoning recovery must retry once"),
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let state = forwarder_test_state("grok-ws-reasoning-replay");
         let execution = install_grok_test_execution(
             &state,
-            "grok-no-provider-failover",
-            "http://127.0.0.1:9/v1".to_string(),
+            "grok-ws-reasoning-replay",
+            format!("http://{address}/v1"),
+            Some(format!("ws://{address}/ws")),
+            "grok-ws-replay-access",
             None,
-            "grok-no-failover-access",
-            None,
-            &[],
+            &[GrokAccountCapability::Websocket],
         )
         .await;
-        let accounts = state.accounts_snapshot().await;
-        let mut providers = state.providers.read().await.clone();
-        let mut fallback = stored_provider(
-            AppKind::Codex,
-            ProviderType::Codex,
-            json!({
-                "env": {
-                    "OPENAI_API_KEY": "fallback-key",
-                    "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"
-                }
-            }),
-            None,
-        );
-        fallback.provider.id = "available-generic-fallback".to_string();
-        providers.providers.push(fallback);
-        providers.rebuild_runtime_index(&accounts).unwrap();
-        let mut excluded = BTreeSet::new();
-        excluded.insert(execution.stored.provider.id.clone());
-        assert!(select_failover_provider(
-            &providers,
-            &accounts,
-            ProxyRoute::CodexResponses,
-            &state.account_in_flight.snapshot(),
-            &excluded,
-        )
-        .is_none());
-        state.replace_provider_store_for_test(providers).await;
 
-        assert!(next_provider_failover(
-            &state,
-            ProxyRoute::CodexResponses,
-            &ForwardAttemptContext::default(),
-            &execution,
-            "test_failure",
-        )
-        .await
-        .is_none());
-    }
-
-    #[tokio::test]
-    async fn managed_gemini_execution_never_enters_generic_provider_failover() {
-        let state = forwarder_test_state("managed-gemini-no-provider-failover");
-        let (provider_id, _) = install_gemini_v1internal_test_provider(
-            &state,
-            "no-provider-failover",
-            "http://127.0.0.1:9".to_string(),
-            "http://127.0.0.1:9/token".to_string(),
-            true,
+        let (seed_bridge, seed_server) = spawn_test_grok_responses_bridge(
+            state.clone(),
+            execution.clone(),
+            "grok-ws-replay-session",
+            Some(0),
         )
         .await;
-        let accounts = state.accounts_snapshot().await;
-        let (execution, mut providers) = {
-            let providers = state.providers.read().await;
-            let stored = providers
-                .providers
-                .iter()
-                .find(|stored| stored.provider.id == provider_id)
-                .cloned()
-                .unwrap();
-            (
-                ProviderExecution::from_store(&providers, stored).unwrap(),
-                providers.clone(),
-            )
-        };
-        let mut fallback = stored_provider(
-            AppKind::Gemini,
-            ProviderType::OpenRouter,
-            json!({
-                "env": {
-                    "OPENAI_API_KEY": "fallback-key",
-                    "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"
-                }
-            }),
-            None,
-        );
-        fallback.provider.id = "available-gemini-fallback".to_string();
-        providers.providers.push(fallback);
-        providers.rebuild_runtime_index(&accounts).unwrap();
-        let mut excluded = BTreeSet::new();
-        excluded.insert(execution.stored.provider.id.clone());
-        assert!(select_failover_provider(
-            &providers,
-            &accounts,
-            ProxyRoute::Gemini,
-            &state.account_in_flight.snapshot(),
-            &excluded,
+        let seed_events = send_test_bridge_request(seed_bridge, "seed").await;
+        assert!(seed_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.completed")
+        }));
+        let (_, account_id, auth_identity_generation) =
+            execution.managed_account_identity_target().unwrap();
+        let account = state
+            .find_account_for_provider(ProviderType::GrokOAuth, account_id)
+            .await
+            .unwrap();
+        let seed_scope = GrokReplayScope::derive(
+            execution.plan.provider_key.app.as_str(),
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            account_id,
+            auth_identity_generation,
+            account.token_refresh_generation,
+            &format!("{}-share", execution.stored.provider.id),
+            &super::super::grok_replay::user_namespace("owner@example.com").unwrap(),
+            "grok-ws-replay-session",
+            0,
+            &super::super::grok_replay::model_family("grok-4.6").unwrap(),
+            "websocket",
+            "127.0.0.1",
         )
-        .is_none());
-        state.replace_provider_store_for_test(providers).await;
+        .unwrap();
+        assert!(
+            state
+                .grok_reasoning_replays
+                .get(&seed_scope, grok_replay_now_ms())
+                .await
+                .0
+                .is_some(),
+            "successful WS seed turn must commit a replay proof; proof_count={} entry_count={}",
+            state.grok_reasoning_replays.proof_count().await,
+            state.grok_reasoning_replays.entry_count().await
+        );
+        seed_server.abort();
 
-        assert!(next_provider_failover(
-            &state,
-            ProxyRoute::Gemini,
-            &ForwardAttemptContext::default(),
-            &execution,
-            "test_failure",
+        let (continuation_bridge, continuation_server) = spawn_test_grok_responses_bridge(
+            state.clone(),
+            execution.clone(),
+            "grok-ws-replay-session",
+            Some(1),
+        )
+        .await;
+        let continuation: Value =
+            serde_json::from_slice(&grok_replay_continuation_body(false)).unwrap();
+        let (events, close) = send_test_bridge_value_with_close(
+            continuation_bridge,
+            json!({"type":"response.create","response":continuation}),
+        )
+        .await;
+        assert_eq!(
+            close,
+            None,
+            "events={events:?} observations={:?} requests={}",
+            observations.lock().unwrap(),
+            requests.load(Ordering::SeqCst)
+        );
+        assert!(events
+            .iter()
+            .any(|event| { event.pointer("/response/id") == Some(&json!("resp-ws-recovered")) }));
+        assert!(events
+            .iter()
+            .all(|event| { event.pointer("/response/id") != Some(&json!("resp-ws-rejected")) }));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        {
+            let observation_guard = observations.lock().unwrap();
+            assert_eq!(
+                count_grok_reasoning_items(&observation_guard[1]["response"]),
+                1
+            );
+            assert_eq!(
+                count_grok_reasoning_items(&observation_guard[2]["response"]),
+                0
+            );
+        }
+        continuation_server.abort();
+
+        let (late_seed_bridge, late_seed_server) = spawn_test_grok_responses_bridge(
+            state.clone(),
+            execution.clone(),
+            "grok-ws-replay-session",
+            Some(2),
+        )
+        .await;
+        let late_seed_events = send_test_bridge_request(late_seed_bridge, "late seed").await;
+        assert!(late_seed_events
+            .iter()
+            .any(|event| { event.pointer("/response/id") == Some(&json!("resp-ws-late-seed")) }));
+        late_seed_server.abort();
+
+        let (late_bridge, late_server) =
+            spawn_test_grok_responses_bridge(state, execution, "grok-ws-replay-session", Some(3))
+                .await;
+        let continuation: Value =
+            serde_json::from_slice(&grok_replay_continuation_body(false)).unwrap();
+        let late_events = send_test_bridge_value_with_close(
+            late_bridge,
+            json!({"type":"response.create","response":continuation}),
         )
         .await
-        .is_none());
+        .0;
+        assert!(late_events
+            .iter()
+            .any(|event| event.get("delta").and_then(Value::as_str) == Some("committed")));
+        assert!(late_events
+            .iter()
+            .any(|event| event.pointer("/response/id") == Some(&json!("resp-ws-too-late"))));
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        let observation_guard = observations.lock().unwrap();
+        assert_eq!(
+            count_grok_reasoning_items(&observation_guard[4]["response"]),
+            1
+        );
+        drop(observation_guard);
+        late_server.abort();
+        upstream_server.abort();
     }
 
     #[test]

@@ -5,11 +5,11 @@
   "currentSourceEvidence": [
     {
       "path": "src/admin.rs",
-      "sha256": "4cf16f3e0cc3ec9e5e54401d099dceded271ed0e92f5ccbc2ff4d55823d1cb5b"
+      "sha256": "3d04b42e48ea98e2bae6a5a85e43ff50094e80b4dea5f2a126ab6c0f00687aab"
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "0b5e07f1b4e36d1508d52e62336b823bd3dd287b401bab6732698a05b67d3440"
+      "sha256": "bc8824fb9ba9d525ad5fe692423f5a10ec4c4dc0208d02c9147273b3bf6a8ab9"
     },
     {
       "path": "src/api/providers.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "e63b11ef22d3861ce688beebfc615efbdd5373cd28b3531b3f0b3b6988946ea1"
+      "sha256": "c7eab71c13799d12d23d44567b52eb2249637aec7ec3ae90d9e7bfc9a0f7a509"
     }
   ],
   "entries": [

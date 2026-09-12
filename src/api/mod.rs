@@ -188,6 +188,7 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
                 "managed OAuth refresh owners did not drain before the shutdown deadline"
             );
         }
+        flush_kiro_prompt_cache().await;
         return result.context("serve http");
     }
 
@@ -198,6 +199,7 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     if !refreshes_drained {
         tracing::error!("managed OAuth refresh owners did not drain before the shutdown deadline");
     }
+    flush_kiro_prompt_cache().await;
     match server_result {
         Ok(result) => result.context("serve http"),
         Err(_) => {
@@ -207,6 +209,13 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+async fn flush_kiro_prompt_cache() {
+    if let Err(error) = tokio::task::spawn_blocking(crate::proxy::kiro::shutdown_prompt_cache).await
+    {
+        tracing::warn!(%error, "Kiro prompt-cache shutdown task panicked");
     }
 }
 

@@ -158,6 +158,15 @@ pub struct ProviderTransportWriteDraft {
     pub stream_first_byte_timeout_ms: Option<u64>,
     #[serde(default)]
     pub stream_idle_timeout_ms: Option<u64>,
+    /// Antigravity only: opt in to credential-scoped HTTP/1.1 connection reuse.
+    /// The default remains short-lived connections because long-lived GFE
+    /// sockets have produced stale-pool failures in mature implementations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_pool_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_max_idle_per_host: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -838,6 +847,18 @@ fn validate_transport(transport: &ProviderTransportWriteDraft) -> anyhow::Result
         1_000,
         3_600_000,
     )?;
+    validate_duration(
+        "poolIdleTimeoutMs",
+        transport.pool_idle_timeout_ms,
+        1_000,
+        210_000,
+    )?;
+    if transport
+        .pool_max_idle_per_host
+        .is_some_and(|value| !(1..=64).contains(&value))
+    {
+        bail!("poolMaxIdlePerHost must be between 1 and 64");
+    }
     Ok(())
 }
 
@@ -857,10 +878,20 @@ fn transport_value(transport: &ProviderTransportWriteDraft) -> Map<String, Value
             transport.stream_first_byte_timeout_ms,
         ),
         ("streamIdleTimeoutMs", transport.stream_idle_timeout_ms),
+        ("poolIdleTimeoutMs", transport.pool_idle_timeout_ms),
     ] {
         if let Some(duration) = duration {
             value.insert(name.to_string(), Value::from(duration));
         }
+    }
+    if let Some(enabled) = transport.connection_pool_enabled {
+        value.insert("connectionPoolEnabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(max_idle) = transport.pool_max_idle_per_host {
+        value.insert(
+            "poolMaxIdlePerHost".to_string(),
+            Value::from(max_idle as u64),
+        );
     }
     value
 }

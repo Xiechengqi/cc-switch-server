@@ -307,6 +307,7 @@ pub fn default_cursor_server_config_url() -> &'static str {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -335,6 +336,28 @@ mod tests {
         let urls = parse_cursor_agent_urls(&payload).unwrap();
         assert_eq!(urls.agent_url, "https://agent.eu.api5.cursor.sh");
         assert_eq!(urls.agentn_url, "https://agentn.eu.api5.cursor.sh");
+    }
+
+    #[test]
+    fn cursor_reference_server_config_accepts_unknowns_and_rejects_duplicates() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../assets/contract/cursor-reference-delta.json"
+        ))
+        .unwrap();
+        let unknowns = fixture
+            .pointer("/protobufFixtures/serverConfigUnknownFields")
+            .unwrap();
+        let payload = hex::decode(unknowns["hex"].as_str().unwrap()).unwrap();
+        let urls = parse_cursor_agent_urls(&payload).unwrap();
+        assert_eq!(urls.agent_url, unknowns["expectedAgentUrl"]);
+        assert_eq!(urls.agentn_url, unknowns["expectedAgentnUrl"]);
+
+        let duplicate = fixture
+            .pointer("/protobufFixtures/serverConfigDuplicate/hex")
+            .and_then(Value::as_str)
+            .unwrap();
+        let error = parse_cursor_agent_urls(&hex::decode(duplicate).unwrap()).unwrap_err();
+        assert!(error.contains("duplicated"));
     }
 
     #[test]

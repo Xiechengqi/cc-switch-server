@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "authority": "cc-switch-server-provider-conformance-evidence",
+  "policy": {
+    "verificationOrder": [
+      "unsupported",
+      "planned",
+      "implemented",
+      "fixture_verified",
+      "live_verified"
+    ],
+    "livePendingIsVerificationLevel": false,
+    "liveVerifiedRequiresReceipt": true,
+    "receiptContainsSecrets": false
+  },
+  "drivers": [
+    {
+      "driverId": "special.antigravity",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "unsupported", "liveState": "not_applicable", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "special.agy",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "unsupported", "liveState": "not_applicable", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "oauth.claude_messages",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "oauth.openai_codex",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "unsupported", "liveState": "not_applicable", "receipts": []}
+      }
+    },
+    {
+      "driverId": "special.cursor",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "oauth.grok_responses",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "special.kiro",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "unsupported", "liveState": "not_applicable", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "special.qoder_cosy",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    },
+    {
+      "driverId": "special.codebuddy_oauth",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
+    }
+  ]
+}

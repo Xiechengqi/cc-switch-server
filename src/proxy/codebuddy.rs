@@ -147,6 +147,7 @@ pub struct CodeBuddySseDecoder {
     buffer: Vec<u8>,
     saw_done: bool,
     complete: bool,
+    sent_role: bool,
 }
 
 impl CodeBuddySseDecoder {
@@ -249,11 +250,14 @@ impl CodeBuddySseDecoder {
         if self.saw_done {
             return Err(ProxyError::bad_gateway("CodeBuddy SSE emitted data after [DONE]").into());
         }
-        let value = serde_json::from_str::<Value>(&data).map_err(|error| {
+        let mut value = serde_json::from_str::<Value>(&data).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid CodeBuddy SSE chunk: {error}"))
         })?;
         if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
             return Err(CodeBuddySseDecodeError::Upstream(error));
+        }
+        if !sanitize_codebuddy_stream_chunk(&mut value, &mut self.sent_role)? {
+            return Ok(());
         }
         let object = value
             .as_object()
@@ -271,6 +275,101 @@ impl CodeBuddySseDecoder {
         output.extend_from_slice(&canonical);
         output.extend_from_slice(b"\n\n");
         Ok(())
+    }
+}
+
+fn sanitize_codebuddy_stream_chunk(
+    value: &mut Value,
+    sent_role: &mut bool,
+) -> Result<bool, CodeBuddySseDecodeError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy SSE chunk must be an object"))?;
+    let mut meaningful = object.get("usage").is_some_and(|usage| !usage.is_null());
+    if let Some(choices) = object.get_mut("choices") {
+        let choices = choices
+            .as_array_mut()
+            .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy SSE choices must be an array"))?;
+        for choice in choices.iter() {
+            if let Some(choice) = choice.as_object() {
+                if choice.get("delta").is_some_and(|delta| !delta.is_object()) {
+                    return Err(ProxyError::bad_gateway(
+                        "CodeBuddy Chat SSE delta must be an object",
+                    )
+                    .into());
+                }
+            }
+        }
+        choices.retain_mut(|choice| {
+            let Some(choice) = choice.as_object_mut() else {
+                meaningful = true;
+                return true;
+            };
+            let mut choice_meaningful = choice
+                .get("message")
+                .is_some_and(|message| !semantic_empty(message));
+            if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
+                for field in ["content", "reasoning_content", "reasoning", "refusal"] {
+                    if delta.get(field).is_some_and(semantic_empty) {
+                        delta.remove(field);
+                    }
+                }
+                if delta.get("tool_calls").is_some_and(semantic_empty) {
+                    delta.remove("tool_calls");
+                }
+                if delta.get("function_call").is_some_and(dummy_function_call) {
+                    delta.remove("function_call");
+                }
+                if delta.get("role").is_some_and(semantic_empty) || *sent_role {
+                    delta.remove("role");
+                }
+                if delta.contains_key("role") {
+                    *sent_role = true;
+                }
+                choice_meaningful |= !delta.is_empty();
+                if delta.is_empty() {
+                    choice.remove("delta");
+                }
+            }
+            match choice.get("finish_reason") {
+                Some(finish) if semantic_empty(finish) => {
+                    choice.remove("finish_reason");
+                }
+                Some(_) => choice_meaningful = true,
+                None => {}
+            }
+            choice_meaningful |= choice
+                .get("error")
+                .is_some_and(|error| !semantic_empty(error));
+            meaningful |= choice_meaningful;
+            choice_meaningful
+        });
+    }
+    Ok(meaningful)
+}
+
+fn semantic_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.trim().is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+        _ => false,
+    }
+}
+
+fn dummy_function_call(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Object(call) => {
+            call.is_empty()
+                || (call.get("name").is_none_or(semantic_empty)
+                    && call.get("arguments").is_none_or(semantic_empty)
+                    && call.iter().all(|(key, value)| {
+                        matches!(key.as_str(), "name" | "arguments") || semantic_empty(value)
+                    }))
+        }
+        _ => false,
     }
 }
 
@@ -769,7 +868,10 @@ mod tests {
                 b": keepalive\rid: 1\revent: message\rdata: {\rdata: \"choices\":[]}\r\rdata: [DONE]\r\r",
             ))
             .unwrap();
-        assert!(String::from_utf8_lossy(&output).contains("\"choices\":[]"));
+        assert!(
+            output.is_empty(),
+            "semantic-empty liveness chunks are suppressed"
+        );
         assert_eq!(
             decoder.finish_classified().unwrap(),
             Bytes::from_static(b"data: [DONE]\n\n")
@@ -796,6 +898,53 @@ mod tests {
         };
         assert_eq!(error.code, Some(14_003));
         assert!(error.is_rate_limited());
+    }
+
+    #[test]
+    fn decoder_drops_empty_deltas_and_preserves_semantic_stream_fields() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        let empty = decoder
+            .push_classified(chunk(json!({
+                "id":"c1","choices":[{"index":0,"delta":{
+                    "content":"", "reasoning_content":"", "refusal":"",
+                    "tool_calls":[], "function_call":{"name":"","arguments":""}
+                },"finish_reason":null}]
+            })))
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let role = decoder
+            .push_classified(chunk(json!({
+                "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]
+            })))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&role).contains("assistant"));
+        let repeated_role = decoder
+            .push_classified(chunk(json!({
+                "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]
+            })))
+            .unwrap();
+        assert!(repeated_role.is_empty());
+
+        let finish = decoder
+            .push_classified(chunk(json!({
+                "choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]
+            })))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&finish).contains("finish_reason"));
+        let usage = decoder
+            .push_classified(chunk(json!({"choices":[],"usage":{"prompt_tokens":0}})))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&usage).contains("prompt_tokens"));
+        decoder
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&decoder.finish_classified().unwrap()).contains("[DONE]"));
+
+        let mut malformed = CodeBuddySseDecoder::default();
+        assert!(malformed
+            .push_classified(chunk(json!({"choices":[{"index":0,"delta":""}]})))
+            .is_err());
     }
 
     #[test]

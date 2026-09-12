@@ -163,10 +163,10 @@ function assertCodeBuddyEvidenceFreeze(registry) {
   if (
     !conformance ||
     ["forward", "test", "discovery"].some(
-      (operation) => conformance[operation] !== "live_pending",
+      (operation) => conformance[operation] !== "fixture_verified",
     )
   ) {
-    throw new Error("CodeBuddy conformance must remain live_pending before real acceptance");
+    throw new Error("CodeBuddy local conformance must remain fixture_verified");
   }
 }
 
