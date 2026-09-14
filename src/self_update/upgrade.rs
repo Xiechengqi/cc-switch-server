@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -491,6 +492,13 @@ async fn run_upgrade(
         .await;
         return Err(error);
     }
+    if let Err(error) = evict_staged_binary_file_cache(target) {
+        warn!(
+            path = %target.display(),
+            error = %error,
+            "evict staged binary file cache before memory preflight failed"
+        );
+    }
     match current_cgroup_memory_preflight() {
         Ok(Some(report)) => {
             let level = if report.oom_kill_count > 0 {
@@ -504,9 +512,11 @@ async fn run_upgrade(
                 4,
                 level,
                 format!(
-                    "cgroup memory preflight passed: limit={} MiB, current={} MiB, headroom={} MiB, prior oom_kill={}",
+                    "cgroup memory preflight passed: limit={} MiB, current={} MiB, inactive_file={} MiB, working_set={} MiB, headroom={} MiB, prior oom_kill={}",
                     report.limit_bytes / 1024 / 1024,
                     report.current_bytes / 1024 / 1024,
+                    report.inactive_file_bytes / 1024 / 1024,
+                    report.working_set_bytes / 1024 / 1024,
                     report.headroom_bytes / 1024 / 1024,
                     report.oom_kill_count
                 ),
@@ -831,6 +841,8 @@ fn command_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
 struct CgroupMemoryReport {
     limit_bytes: u64,
     current_bytes: u64,
+    inactive_file_bytes: u64,
+    working_set_bytes: u64,
     headroom_bytes: u64,
     oom_kill_count: u64,
 }
@@ -908,7 +920,17 @@ fn cgroup_memory_preflight(root: &Path) -> Result<Option<CgroupMemoryReport>, Se
         .map_err(|error| {
             SelfUpdateError::Internal(format!("parse memory.current failed: {error}"))
         })?;
-    let headroom_bytes = limit_bytes.saturating_sub(current_bytes);
+    // `memory.current` includes clean filesystem page cache. The release download and
+    // the immediately following SHA-256 pass can charge nearly the entire staged
+    // binary to this cgroup even though those pages are reclaimable. Linux and
+    // container runtimes conventionally use current - inactive_file as the cgroup
+    // working set; keeping the raw value here would reject safe upgrades precisely
+    // after populating the cache ourselves.
+    let inactive_file_bytes = read_cgroup_memory_stat_value(root, "inactive_file")
+        .filter(|value| *value <= current_bytes)
+        .unwrap_or(0);
+    let working_set_bytes = current_bytes.saturating_sub(inactive_file_bytes);
+    let headroom_bytes = limit_bytes.saturating_sub(working_set_bytes);
     let oom_kill_count = std::fs::read_to_string(root.join("memory.events"))
         .ok()
         .and_then(|events| {
@@ -929,17 +951,32 @@ fn cgroup_memory_preflight(root: &Path) -> Result<Option<CgroupMemoryReport>, Se
     }
     if headroom_bytes < MIN_UPGRADE_MEMORY_HEADROOM_BYTES {
         return Err(SelfUpdateError::Forbidden(format!(
-            "cgroup memory headroom is {} MiB; at least {} MiB is required before staged preflight",
+            "cgroup memory headroom (working set) is {} MiB (limit={} MiB, current={} MiB, inactive_file={} MiB); at least {} MiB is required before staged preflight",
             headroom_bytes / 1024 / 1024,
+            limit_bytes / 1024 / 1024,
+            current_bytes / 1024 / 1024,
+            inactive_file_bytes / 1024 / 1024,
             MIN_UPGRADE_MEMORY_HEADROOM_BYTES / 1024 / 1024
         )));
     }
     Ok(Some(CgroupMemoryReport {
         limit_bytes,
         current_bytes,
+        inactive_file_bytes,
+        working_set_bytes,
         headroom_bytes,
         oom_kill_count,
     }))
+}
+
+fn read_cgroup_memory_stat_value(root: &Path, field: &str) -> Option<u64> {
+    let memory_stat = std::fs::read_to_string(root.join("memory.stat")).ok()?;
+    memory_stat.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == field)
+            .then(|| value.trim().parse::<u64>().ok())
+            .flatten()
+    })
 }
 
 fn validate_staged_version_output(stdout: &[u8]) -> Result<String, SelfUpdateError> {
@@ -969,6 +1006,19 @@ fn sha256_of_file(path: &Path) -> Result<String, SelfUpdateError> {
     std::io::copy(&mut file, &mut hasher)
         .map_err(|err| SelfUpdateError::Internal(format!("read for sha256 failed: {err}")))?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn evict_staged_binary_file_cache(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    // The file was fsync'd before checksum verification, so its cached pages are
+    // clean and eligible for immediate eviction. This is best-effort: the
+    // working-set calculation above remains safe when the kernel retains pages.
+    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(result))
+    }
 }
 
 fn cleanup_tmp(file: &Path) {
@@ -1311,6 +1361,40 @@ mod tests {
         let report = cgroup_memory_preflight(&dir).unwrap().unwrap();
         assert_eq!(report.headroom_bytes, 64 * 1024 * 1024);
         assert_eq!(report.oom_kill_count, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cgroup_memory_preflight_excludes_reclaimable_inactive_file_cache() {
+        let dir =
+            std::env::temp_dir().join(format!("cc-switch-memory-cache-test-{}", new_task_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.max"), (128 * 1024 * 1024).to_string()).unwrap();
+        std::fs::write(dir.join("memory.current"), (120 * 1024 * 1024).to_string()).unwrap();
+        std::fs::write(
+            dir.join("memory.stat"),
+            format!(
+                "anon {}\ninactive_file {}\nactive_file {}\n",
+                64 * 1024 * 1024,
+                40 * 1024 * 1024,
+                16 * 1024 * 1024
+            ),
+        )
+        .unwrap();
+
+        let report = cgroup_memory_preflight(&dir).unwrap().unwrap();
+        assert_eq!(report.current_bytes, 120 * 1024 * 1024);
+        assert_eq!(report.inactive_file_bytes, 40 * 1024 * 1024);
+        assert_eq!(report.working_set_bytes, 80 * 1024 * 1024);
+        assert_eq!(report.headroom_bytes, 48 * 1024 * 1024);
+
+        std::fs::write(
+            dir.join("memory.stat"),
+            format!("inactive_file {}\n", 256 * 1024 * 1024),
+        )
+        .unwrap();
+        let inconsistent = cgroup_memory_preflight(&dir).unwrap_err();
+        assert!(inconsistent.to_string().contains("inactive_file=0 MiB"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
