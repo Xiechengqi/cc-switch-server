@@ -15,6 +15,7 @@ use crate::clients::oauth::quota::{
 };
 use crate::clients::oauth::refresh::provider_native_refresh_available;
 use crate::domain::providers::model::AppKind;
+use crate::domain::providers::runtime::PROVIDER_MODEL_PROBE_PROMPT;
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::sharing::router_contract::{
     ShareAppAvailability, ShareAppProviders, ShareAppRuntimes, ShareDescriptor,
@@ -28,6 +29,7 @@ use super::{
     now_ms, parse_app_kind, web_provider_health_check_config, ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
     APPLY_SHARE_SETTINGS_PATH, CLIENT_LOG_TAIL_PATH, COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH,
     PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH, REFRESH_SHARE_USAGE_PATH,
+    VERIFY_SHARE_ACCOUNT_RECOVERY_PATH,
 };
 
 mod ctl;
@@ -36,7 +38,7 @@ mod share_router;
 pub(crate) use ctl::{
     control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
-    control_refresh_share_usage,
+    control_refresh_share_usage, control_verify_share_account_recovery,
 };
 pub use ctl::{
     control_signature, control_signature_for_method, refresh_share_usage_items,

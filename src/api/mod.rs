@@ -31,9 +31,9 @@ pub(in crate::api) use backup::*;
 pub(crate) use control::{
     control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
-    control_refresh_share_usage, share_router_health, share_router_model_health,
-    share_router_model_health_batch, share_router_model_health_batch_v2, share_router_request_logs,
-    share_router_runtime,
+    control_refresh_share_usage, control_verify_share_account_recovery, share_router_health,
+    share_router_model_health, share_router_model_health_batch, share_router_model_health_batch_v2,
+    share_router_request_logs, share_router_runtime,
 };
 pub use control::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
@@ -142,6 +142,7 @@ use crate::state::{ServerEvent, ServerState, Session, ShareInFlightGuard};
 
 pub const APPLY_SHARE_SETTINGS_PATH: &str = "/_ctl/apply_share_settings";
 pub const REFRESH_SHARE_USAGE_PATH: &str = "/_ctl/refresh_share_usage";
+pub const VERIFY_SHARE_ACCOUNT_RECOVERY_PATH: &str = "/_ctl/verify_share_account_recovery";
 pub const PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/prepare";
 pub const COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/commit";
 pub const ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH: &str = "/_ctl/client-subdomain-adoption/abort";
@@ -278,6 +279,10 @@ pub fn app_router(state: ServerState) -> Router {
             post(control_apply_share_settings),
         )
         .route(REFRESH_SHARE_USAGE_PATH, post(control_refresh_share_usage))
+        .route(
+            VERIFY_SHARE_ACCOUNT_RECOVERY_PATH,
+            post(control_verify_share_account_recovery),
+        )
         .route(
             PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH,
             post(control_prepare_client_subdomain_adoption),

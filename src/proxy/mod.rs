@@ -369,6 +369,11 @@ impl ProxyError {
     pub fn error_scope(&self) -> Option<&'static str> {
         self.concurrency_metadata()
             .map(|metadata| metadata.scope.as_str())
+            .or_else(|| {
+                self.message_without_retry_metadata()
+                    .contains("(account_rate_limit)")
+                    .then_some("account_rate_limit")
+            })
     }
 
     fn concurrency_metadata_and_message(&self) -> Option<(ProxyConcurrencyMetadata, &str)> {

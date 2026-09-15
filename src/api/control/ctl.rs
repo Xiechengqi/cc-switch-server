@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::redact_account_public_diagnostic;
+use crate::api::TestProviderQuery;
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::runtime::{
     authoritative_managed_account, managed_account_binding_with_generation,
@@ -221,6 +222,99 @@ pub(crate) async fn control_refresh_share_usage(
     Ok(Json(ControlRefreshShareUsageResponse {
         ok: true,
         refreshed,
+    }))
+}
+
+pub(crate) async fn control_verify_share_account_recovery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ControlVerifyShareAccountRecoveryResponse>, ApiError> {
+    verify_control_request(&state, VERIFY_SHARE_ACCOUNT_RECOVERY_PATH, &headers, &body).await?;
+    let input: ControlVerifyShareAccountRecoveryInput =
+        serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    let app = parse_app_kind(input.app.trim())?;
+    let share = state
+        .shares
+        .read()
+        .await
+        .shares
+        .iter()
+        .find(|share| share.id == input.share_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("share not found"))?;
+    let provider_id = share
+        .bindings
+        .iter()
+        .find(|binding| binding.app == app)
+        .map(|binding| binding.provider_id.clone())
+        .or_else(|| (share.app == app).then(|| share.provider_id.clone()))
+        .ok_or_else(|| ApiError::conflict("share app binding not found"))?;
+    if input.expected_provider_id.trim() != provider_id {
+        return Ok(Json(ControlVerifyShareAccountRecoveryResponse::simple(
+            "provider_changed",
+            &provider_id,
+        )));
+    }
+    let execution =
+        crate::api::providers::resolve_provider_execution_by_key(&state, app, &provider_id).await?;
+    let recovery =
+        crate::api::providers::provider_rate_limit_recovery_snapshot(&state, &execution).await;
+    let Some((account_id, _, _, previous_until)) = recovery.as_ref() else {
+        return Ok(Json(ControlVerifyShareAccountRecoveryResponse::simple(
+            "not_blocked",
+            &provider_id,
+        )));
+    };
+    let account_id = account_id.clone();
+    let previous_until = *previous_until;
+    let query = TestProviderQuery {
+        app,
+        network: Some(true),
+        timeout_ms: Some(input.timeout_ms.unwrap_or(30_000).clamp(1_000, 30_000)),
+        model: None,
+        test_prompt: Some(PROVIDER_MODEL_PROBE_PROMPT.to_string()),
+        stream: Some(false),
+    };
+    let response = crate::api::providers::test_provider_inner(&state, execution, &query).await?;
+    let recovered = crate::api::providers::recover_provider_rate_limit_after_success(
+        &state,
+        recovery,
+        query.network,
+        &response,
+    )
+    .await;
+    let current_until = state
+        .find_account_by_id(&account_id)
+        .await
+        .and_then(|account| account.rate_limited_until);
+    let outcome = if recovered {
+        "recovered"
+    } else if response.network_status_code == Some(429) {
+        "still_rate_limited"
+    } else if response.ok {
+        "state_changed"
+    } else {
+        "upstream_failed"
+    };
+    tracing::info!(
+        share_id = %input.share_id,
+        app = app.as_str(),
+        provider_id = %provider_id,
+        previous_until,
+        current_until,
+        outcome,
+        "Router requested Share account rate-limit recovery verification"
+    );
+    Ok(Json(ControlVerifyShareAccountRecoveryResponse {
+        ok: recovered,
+        outcome: outcome.to_string(),
+        provider_id,
+        previous_until: Some(previous_until),
+        current_until,
+        upstream_status: response.network_status_code,
+        message: response.message,
+        tested_at: now_ms().min(i64::MAX as u128) as i64,
     }))
 }
 
@@ -966,6 +1060,44 @@ pub struct ControlRefreshShareUsageItem {
 pub(crate) struct ControlRefreshShareUsageResponse {
     ok: bool,
     refreshed: Vec<ControlRefreshShareUsageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ControlVerifyShareAccountRecoveryInput {
+    share_id: String,
+    app: String,
+    expected_provider_id: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlVerifyShareAccountRecoveryResponse {
+    ok: bool,
+    outcome: String,
+    provider_id: String,
+    previous_until: Option<i64>,
+    current_until: Option<i64>,
+    upstream_status: Option<u16>,
+    message: String,
+    tested_at: i64,
+}
+
+impl ControlVerifyShareAccountRecoveryResponse {
+    fn simple(outcome: &str, provider_id: &str) -> Self {
+        Self {
+            ok: outcome == "not_blocked",
+            outcome: outcome.to_string(),
+            provider_id: provider_id.to_string(),
+            previous_until: None,
+            current_until: None,
+            upstream_status: None,
+            message: outcome.replace('_', " "),
+            tested_at: now_ms().min(i64::MAX as u128) as i64,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

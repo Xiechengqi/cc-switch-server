@@ -835,9 +835,11 @@ pub(in crate::api) async fn test_provider(
             .map(|_| PROVIDER_MODEL_PROBE_PROMPT.to_string());
     }
     let execution = resolve_provider_execution_by_key(&state, query.app, &id).await?;
+    let recovery = provider_rate_limit_recovery_snapshot(&state, &execution).await;
     let expected_health_fingerprint = execution.plan.health_fingerprint();
     let provider = execution.runtime_stored_view();
     let response = test_provider_inner(&state, execution, &query).await?;
+    recover_provider_rate_limit_after_success(&state, recovery, query.network, &response).await;
     if let Some(config) = health_config.as_ref() {
         if let Err(error) = crate::api::provider_health_scheduler::record_provider_test_response(
             &state,
@@ -858,6 +860,53 @@ pub(in crate::api) async fn test_provider(
         }
     }
     Ok(Json(response))
+}
+
+type ProviderRateLimitRecoverySnapshot = (
+    String,
+    crate::domain::providers::model::ProviderType,
+    u64,
+    i64,
+);
+
+pub(crate) async fn provider_rate_limit_recovery_snapshot(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+) -> Option<ProviderRateLimitRecoverySnapshot> {
+    let (provider_type, account_id, auth_identity_generation) =
+        execution.managed_account_identity_target()?;
+    let account = state.find_account_by_id(account_id).await?;
+    let until = account.rate_limited_until?;
+    (until > now_ms().min(i64::MAX as u128) as i64).then(|| {
+        (
+            account_id.to_string(),
+            provider_type,
+            auth_identity_generation,
+            until,
+        )
+    })
+}
+
+pub(crate) async fn recover_provider_rate_limit_after_success(
+    state: &ServerState,
+    recovery: Option<ProviderRateLimitRecoverySnapshot>,
+    network: Option<bool>,
+    response: &TestProviderResponse,
+) -> bool {
+    let Some((account_id, provider_type, auth_identity_generation, until)) = recovery else {
+        return false;
+    };
+    if network != Some(true) || !response.ok {
+        return false;
+    }
+    state
+        .clear_account_rate_limit_if_current(
+            &account_id,
+            provider_type,
+            auth_identity_generation,
+            until,
+        )
+        .await
 }
 
 pub(in crate::api) async fn fetch_provider_models(
@@ -973,6 +1022,7 @@ pub(in crate::api) async fn test_providers(
     };
     let mut results = Vec::new();
     for execution in selected {
+        let recovery = provider_rate_limit_recovery_snapshot(&state, &execution).await;
         let expected_health_fingerprint = execution.plan.health_fingerprint();
         let provider = execution.runtime_stored_view();
         let query = TestProviderQuery {
@@ -992,6 +1042,7 @@ pub(in crate::api) async fn test_providers(
             stream: input.stream,
         };
         let response = test_provider_inner(&state, execution, &query).await?;
+        recover_provider_rate_limit_after_success(&state, recovery, query.network, &response).await;
         if let Some(config) = health_config.as_ref() {
             if let Err(error) =
                 crate::api::provider_health_scheduler::record_provider_test_response(

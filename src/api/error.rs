@@ -89,6 +89,27 @@ impl InferenceApiError {
         details.insert("retryable".to_string(), Value::Bool(self.retryable));
         if let Some(scope) = self.scope {
             details.insert("scope".to_string(), Value::String(scope.to_string()));
+            if scope == "account_rate_limit" {
+                if let Some(provider_id) = self
+                    .message
+                    .strip_prefix("provider ")
+                    .and_then(|rest| rest.split_once(" account is "))
+                    .map(|(provider_id, _)| provider_id)
+                {
+                    details.insert(
+                        "providerId".to_string(),
+                        Value::String(provider_id.to_string()),
+                    );
+                }
+                if let Some(retry_at) = self
+                    .message
+                    .split_once("(until ")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .map(|(retry_at, _)| retry_at)
+                {
+                    details.insert("retryAt".to_string(), Value::String(retry_at.to_string()));
+                }
+            }
         }
         if let Some(current) = self.current {
             details.insert("current".to_string(), Value::from(current));
@@ -730,6 +751,22 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn account_rate_limit_inference_error_has_structured_recovery_metadata() {
+        let error = InferenceApiError::proxy(
+            InferenceSurface::OpenAi,
+            Some("request-1".into()),
+            crate::proxy::ProxyError::rate_limited(
+                "provider provider-1 account is rate_limited (account_rate_limit): upstream rate limit is active, retry in 60s (until 2026-09-17T10:00:00Z)",
+                60,
+            ),
+        );
+        let body = error.body();
+        assert_eq!(body["error"]["details"]["scope"], "account_rate_limit");
+        assert_eq!(body["error"]["details"]["providerId"], "provider-1");
+        assert_eq!(body["error"]["details"]["retryAt"], "2026-09-17T10:00:00Z");
+    }
 
     #[tokio::test]
     async fn proxy_api_error_response_includes_stable_code_and_type() {

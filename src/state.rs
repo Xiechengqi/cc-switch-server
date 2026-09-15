@@ -14746,6 +14746,56 @@ impl ServerStateInner {
         account
     }
 
+    /// Clear one observed account cooldown only when neither the account
+    /// identity nor the cooldown changed while the recovery probe was in
+    /// flight. A newer 429 must always win over an older successful probe.
+    pub async fn clear_account_rate_limit_if_current(
+        self: &Arc<Self>,
+        account_id: &str,
+        provider_type: ProviderType,
+        auth_identity_generation: u64,
+        expected_rate_limited_until: i64,
+    ) -> bool {
+        let (before, after) = self
+            .mutate_accounts(|accounts| {
+                let account = accounts.accounts.iter_mut().find(|account| {
+                    account.id == account_id
+                        && account.provider_type == provider_type
+                        && account.auth_identity_generation == auth_identity_generation
+                        && account.rate_limited_until == Some(expected_rate_limited_until)
+                });
+                match account {
+                    Some(account) => {
+                        let before = account.clone();
+                        account.rate_limited_until = None;
+                        (Some(before), Some(account.clone()))
+                    }
+                    None => (None, None),
+                }
+            })
+            .await;
+        let (Some(before), Some(after)) = (before, after) else {
+            return false;
+        };
+        save_accounts_debounced(self);
+        if let Err(error) = self
+            .refresh_account_runtime_metadata_if_changed(&before, &after)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                %error,
+                "recovered account rate-limit Share descriptor sync remains pending"
+            );
+        }
+        tracing::info!(
+            account_id,
+            expected_rate_limited_until,
+            "cleared account rate-limit after successful recovery probe"
+        );
+        true
+    }
+
     pub async fn active_account_capacity_pool_limit_if_current(
         &self,
         account_id: &str,
@@ -23439,6 +23489,52 @@ mod tests {
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn account_rate_limit_recovery_is_compare_and_clear() {
+        let state = test_state();
+        let mut account = copilot_account_fixture(None);
+        account.rate_limited_until = Some(2_000);
+        state
+            .mutate_accounts_immediate(move |accounts| accounts.accounts.push(account))
+            .await
+            .unwrap();
+
+        assert!(
+            !state
+                .clear_account_rate_limit_if_current(
+                    "acct-copilot",
+                    ProviderType::GitHubCopilot,
+                    1,
+                    1_999,
+                )
+                .await
+        );
+        assert_eq!(
+            state
+                .find_account_by_id("acct-copilot")
+                .await
+                .and_then(|account| account.rate_limited_until),
+            Some(2_000)
+        );
+        assert!(
+            state
+                .clear_account_rate_limit_if_current(
+                    "acct-copilot",
+                    ProviderType::GitHubCopilot,
+                    1,
+                    2_000,
+                )
+                .await
+        );
+        assert_eq!(
+            state
+                .find_account_by_id("acct-copilot")
+                .await
+                .and_then(|account| account.rate_limited_until),
+            None
+        );
     }
 
     #[test]

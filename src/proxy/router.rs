@@ -929,6 +929,7 @@ mod tests {
             "cooldown message must carry the remaining seconds: {}",
             error.message
         );
+        assert_eq!(error.error_scope(), Some("account_rate_limit"));
     }
 
     #[test]
