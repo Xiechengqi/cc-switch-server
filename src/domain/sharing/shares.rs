@@ -3565,13 +3565,19 @@ fn normalize_verified_email(email: &str) -> Result<String, SharePatchError> {
     Ok(email)
 }
 
+const PERMANENT_SHARE_EXPIRY_SENTINEL_MS: i64 = 4_102_444_799_000;
+
+fn canonical_user_policy_expiry(expires_at: Option<i64>) -> Option<i64> {
+    expires_at.filter(|value| *value < PERMANENT_SHARE_EXPIRY_SENTINEL_MS)
+}
+
 fn default_user_policy(share: &Share) -> ShareUserPolicy {
     ShareUserPolicy {
         parallel_limit: share.parallel_limit,
         token_limit: share.token_limit,
         token_period: ShareTokenPeriod::Lifetime,
         token_period_anchor_at_ms: None,
-        expires_at: share.expires_at,
+        expires_at: canonical_user_policy_expiry(share.expires_at),
         allowed_apps: Vec::new(),
     }
 }
@@ -3920,6 +3926,12 @@ fn reconcile_user_grants(share: &mut Share) {
         grant.revoked_at_ms = None;
         grant.manager = ShareGrantManager::Owner;
         grant.entitlement_id = None;
+
+        if canonical_user_policy_expiry(grant.policy.expires_at) != grant.policy.expires_at {
+            grant.policy.expires_at = None;
+            grant.updated_at_ms = now;
+            grant.revision = grant.revision.saturating_add(1).max(1);
+        }
 
         for (email, grant) in &mut share.user_grants {
             if email != owner && grant.role == "owner" {
@@ -6854,6 +6866,36 @@ mod tests {
         assert_eq!(share.user_grants["client@example.com"].role, "owner");
         assert_eq!(share.user_grants["previous@example.com"].role, "shareto");
         assert!(share.user_grants["previous@example.com"].active);
+        assert!(store.normalize_all_user_grants().is_empty());
+    }
+
+    #[test]
+    fn permanent_share_sentinel_never_becomes_an_owner_grant_expiry() {
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("permanent-owner-policy");
+        input.owner_email = Some("owner@example.com".to_string());
+        input.expires_at = Some(PERMANENT_SHARE_EXPIRY_SENTINEL_MS);
+        store.upsert(input).unwrap();
+
+        let share = store.get("permanent-owner-policy").unwrap();
+        assert_eq!(
+            share.user_grants["owner@example.com"].policy.expires_at,
+            None
+        );
+
+        store.shares[0]
+            .user_grants
+            .get_mut("owner@example.com")
+            .unwrap()
+            .policy
+            .expires_at = Some(PERMANENT_SHARE_EXPIRY_SENTINEL_MS);
+        assert_eq!(store.normalize_all_user_grants().len(), 1);
+        assert_eq!(
+            store.get("permanent-owner-policy").unwrap().user_grants["owner@example.com"]
+                .policy
+                .expires_at,
+            None
+        );
         assert!(store.normalize_all_user_grants().is_empty());
     }
 
