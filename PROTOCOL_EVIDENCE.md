@@ -19,6 +19,18 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-18 Antigravity grounding, model capability, and conversation-edge freeze
+
+本轮增量证据追加在 `assets/contract/antigravity-reference-delta.json`，不改写 2026-09-11 的历史 observation。只读来源为 `CLIProxyAPI@ef63d2e7/@7fcbdf88/@a9e92b81/@b681a1e0/@8c984672/@fd3e6623` 与 `Antigravity-Manager@734e2bde/@9fd77989`；每个完整 commit、路径和提交态 SHA-256 均由 `scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核，默认构建、测试和运行时仍不读取外部仓库。
+
+Server 的独立 grounding 合同只读取选中候选，按 URL 去重 web chunk、忽略无效索引，并将 Gemini UTF-8 byte range 映射为下游 Unicode scalar range。非流式与流式分别生成 Claude `server_tool_use`/`web_search_tool_result`/citation、Responses `web_search_call`/`url_citation` 和 Chat annotation；搜索事件、文本、citation 与 terminal 的顺序由自包含 fixture 冻结，citation 不得晚于 terminal，URL/title 不进入日志或指标。ASCII、中文、emoji、组合字符、重复/缺失 chunk、跨增量 part 和只在最终快照出现 annotation 均有回归测试。
+
+模型搜索能力只接受目录中的 `supportsWebSearch`、`supports_web_search`、`webSearchSupported` 或 `nativeCapabilities.webSearch` 布尔值；冲突或缺失为 `Unknown`。证据以 Account `authIdentityGeneration`、TTL 和有界 `model_search:*` dimension 持久化。请求开始时固定使用当前 Account snapshot：请求模型有新鲜 `Supported` 才保留；`Unsupported`、`Unknown`、缺失或过期时使用已验证的 `gemini-2.5-flash` fallback；fallback 被当前目录明确标为 `Unsupported` 时失败关闭。运行时绑定代际漂移在发网前冲突，不重新选择账号、Provider、rail 或站点。
+
+转换边缘合同同时冻结为：billing metadata 只有在 trim 后为单独一行且以精确前缀 `x-anthropic-billing-header:` 开头时才从 system block 删除，多行正文、消息和工具参数不受影响；只有开头连续 system/developer 提升为顶层 system，中途指令按原顺序包装为 `<system-reminder>`；孤立、错配或部分工具输出以版本化 user 文本可逆保留，不伪造 pairing；空 Gemini text part 不关闭活动 Claude text block。
+
+`requestType` 的两个成熟参考结论互相冲突，因此 AG-N6 没有生产行为变更。当前合同继续固定普通文本、仅 function tools 和历史 functionCall/functionResponse 为 `agent`，含 web search（包括 function + search 混合）为 `web_search`。`antigravity_oauth` 与 `agy_oauth` 均无真实 receipt，故该决策和 compaction 继续为 `live_pending`，fixture 不得升级为厂商接受性证据。
+
 ## 2026-09-11 Antigravity replay, session, schema, and transport freeze
 
 本次只读差异研究冻结于 `assets/contract/antigravity-reference-delta.json`，对应 `CLIProxyAPI` commit `09a29bd345bc44c473abe7fd07859e32df2ea543` 与 `Antigravity-Manager` commit `85fb4fe688997d3a0c2930b7a202cf22f617b092`。外部源码只提供协议缺陷和边界的交叉证据，不进入本仓库构建、测试或运行时；默认审计只核对本地合同，人工运行 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才读取外部 Git object。冻结文件摘要为：

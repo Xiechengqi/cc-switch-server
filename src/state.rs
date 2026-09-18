@@ -66,10 +66,10 @@ use crate::clients::router::tunnel::{
     TunnelStateFn, TunnelSupervisor,
 };
 use crate::domain::accounts::capability_evidence::{
-    record_observation_drafts, AccountCapabilityObservationDraft,
-    AccountCapabilityObservationState, CLAUDE_QUOTA_FAMILY_DIMENSION,
-    GEMINI_QUOTA_FAMILY_DIMENSION, GPT_QUOTA_FAMILY_DIMENSION, MODEL_CAPACITY_DIMENSION,
-    MODEL_CATALOG_DIMENSION,
+    antigravity_model_search_dimension, record_observation_drafts,
+    AccountCapabilityObservationDraft, AccountCapabilityObservationState,
+    CLAUDE_QUOTA_FAMILY_DIMENSION, GEMINI_QUOTA_FAMILY_DIMENSION, GPT_QUOTA_FAMILY_DIMENSION,
+    MODEL_CAPACITY_DIMENSION, MODEL_CATALOG_DIMENSION,
 };
 use crate::domain::accounts::claude_quota::{
     claude_quota_visual_change_is_urgent, claude_quota_visual_fingerprint,
@@ -6551,7 +6551,7 @@ impl ServerStateInner {
         let has_capacity = catalog.descriptors.iter().any(|descriptor| {
             descriptor.remaining_fraction.is_some() || descriptor.reset_time.is_some()
         });
-        let observations = vec![
+        let mut observations = vec![
             AccountCapabilityObservationDraft::antigravity_feature(
                 MODEL_CATALOG_DIMENSION,
                 catalog_state,
@@ -6579,6 +6579,31 @@ impl ServerStateInner {
                 Some(expires_at_ms),
             ),
         ];
+        for descriptor in &catalog.descriptors {
+            let (state, reason) = match descriptor.supports_web_search {
+                Some(true) => (AccountCapabilityObservationState::Supported, None),
+                Some(false) => (
+                    AccountCapabilityObservationState::Unsupported,
+                    Some("catalog_explicitly_disables_web_search"),
+                ),
+                None => (
+                    AccountCapabilityObservationState::Unknown,
+                    Some("catalog_has_no_explicit_web_search_capability"),
+                ),
+            };
+            for model_id in
+                std::iter::once(&descriptor.model_id).chain(descriptor.deprecated_aliases.iter())
+            {
+                observations.push(AccountCapabilityObservationDraft::antigravity_feature(
+                    &antigravity_model_search_dimension(model_id),
+                    state,
+                    "fetch_available_models",
+                    reason,
+                    observed_at_ms,
+                    Some(expires_at_ms),
+                ));
+            }
+        }
         let account_id = account_id.to_string();
         self.try_mutate_accounts_immediate(move |accounts| {
             let account = accounts

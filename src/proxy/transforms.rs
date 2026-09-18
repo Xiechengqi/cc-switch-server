@@ -4,6 +4,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+use super::gemini_grounding::{scalar_range_for_cited_text, GroundingAccumulator, TextMapping};
 use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, anthropic_block_from_responses_reasoning_item,
     openai_reasoning_item_from_anthropic_block, reasoning_summary_text,
@@ -44,6 +45,7 @@ struct ResponsesToolSpec {
 pub(crate) struct ResponsesToolContext {
     chat_name_to_spec: BTreeMap<String, ResponsesToolSpec>,
     namespace_name_to_chat_name: BTreeMap<(String, String), String>,
+    web_search_requested: bool,
 }
 
 impl ResponsesToolContext {
@@ -91,6 +93,10 @@ impl ResponsesToolContext {
                     | ResponsesToolKind::LocalShell
             )
         })
+    }
+
+    pub(super) fn web_search_requested(&self) -> bool {
+        self.web_search_requested
     }
 
     fn has_tool_kind(&self, kind: ResponsesToolKind) -> bool {
@@ -292,7 +298,10 @@ impl From<BTreeSet<String>> for ResponsesToolContext {
 }
 
 pub(crate) fn responses_tool_context(input: &Value) -> ResponsesToolContext {
-    let mut context = ResponsesToolContext::default();
+    let mut context = ResponsesToolContext {
+        web_search_requested: request_has_web_search_tool(input),
+        ..Default::default()
+    };
     for tool in response_tools_from_request(input) {
         context.add_response_tool(tool);
     }
@@ -300,6 +309,26 @@ pub(crate) fn responses_tool_context(input: &Value) -> ResponsesToolContext {
         collect_tool_search_output_tools(history, &mut context);
     }
     context
+}
+
+fn request_has_web_search_tool(input: &Value) -> bool {
+    input
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|tool| {
+            tool.get("googleSearch")
+                .or_else(|| tool.get("google_search"))
+                .is_some_and(Value::is_object)
+                || [tool.get("type"), tool.get("name")]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .any(|value| value.starts_with("web_search") || value == "google_search")
+        })
 }
 
 pub(crate) fn responses_tool_context_from_bytes(input: &[u8]) -> ResponsesToolContext {
@@ -874,6 +903,7 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
         .ok_or_else(|| TransformError::new("openai chat messages must be an array"))?;
     let mut output_messages = Vec::new();
     let mut system_parts = Vec::new();
+    let mut leading_system = true;
 
     for message in messages {
         let role = message
@@ -881,9 +911,14 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
             .and_then(Value::as_str)
             .unwrap_or("user");
         if matches!(role, "system" | "developer") {
-            collect_text_like(&message["content"], &mut system_parts);
+            if leading_system {
+                collect_text_like(&message["content"], &mut system_parts);
+            } else if let Some(message) = demoted_system_message(message.get("content")) {
+                output_messages.push(message);
+            }
             continue;
         }
+        leading_system = false;
         output_messages.extend(openai_chat_message_to_anthropic(message, role)?);
     }
     if let Some(instruction) = input
@@ -947,13 +982,13 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
     let mut system_parts = Vec::new();
     append_response_system_text(input.get("instructions"), &mut system_parts);
     if let Some(items) = input.get("input").and_then(Value::as_array) {
-        for item in items {
-            if matches!(
+        for item in items.iter().take_while(|item| {
+            matches!(
                 item.get("role").and_then(Value::as_str),
                 Some("system" | "developer")
-            ) {
-                append_response_system_text(item.get("content"), &mut system_parts);
-            }
+            )
+        }) {
+            append_response_system_text(item.get("content"), &mut system_parts);
         }
     }
     if let Some(instruction) = input
@@ -977,7 +1012,20 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
             "content": [{"type": "text", "text": text}]
         })),
         Some(Value::Array(items)) => {
+            let mut leading_system = true;
             for item in items {
+                if matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                ) {
+                    if !leading_system {
+                        if let Some(message) = demoted_system_message(item.get("content")) {
+                            messages.push(message);
+                        }
+                    }
+                    continue;
+                }
+                leading_system = false;
                 messages.extend(openai_response_item_to_anthropic(item, &tool_context)?);
             }
         }
@@ -1663,7 +1711,64 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
             ))
         }
     };
-    let content = gemini_parts_to_anthropic(parts, true);
+    let grounding = GroundingAccumulator::from_candidate(first);
+    let mappings = parts
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| part.get("thought").and_then(Value::as_bool) != Some(true))
+        .filter_map(|(part_index, part)| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .map(|text| TextMapping {
+                    part_index,
+                    block_index: part_index as u64,
+                    start_scalar_in_block: 0,
+                    text: text.to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let citations = grounding.citations_by_block(&mappings);
+    let mut content = gemini_parts_to_anthropic(parts, true);
+    for (block_index, block_citations) in citations {
+        let Some(block) = usize::try_from(block_index)
+            .ok()
+            .and_then(|block_index| content.get_mut(block_index))
+        else {
+            continue;
+        };
+        block["citations"] = Value::Array(
+            block_citations
+                .iter()
+                .map(|citation| citation.anthropic())
+                .collect(),
+        );
+    }
+    if grounding.has_web_grounding() {
+        let tool_use_id = format!(
+            "srvtoolu_{}",
+            input
+                .get("responseId")
+                .or_else(|| input.get("response_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("gemini_search")
+        );
+        content.splice(
+            0..0,
+            [
+                json!({
+                    "type": "server_tool_use",
+                    "id": tool_use_id,
+                    "name": "web_search",
+                    "input": {"query": grounding.primary_query()}
+                }),
+                json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": grounding.anthropic_search_results()
+                }),
+            ],
+        );
+    }
     let has_tool_calls = parts
         .iter()
         .any(|part| part.get("functionCall").is_some() || part.get("function_call").is_some());
@@ -1675,6 +1780,14 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
     } else {
         mapped_stop_reason
     };
+    let mut usage = anthropic_usage_from_gemini_usage(
+        input
+            .get("usageMetadata")
+            .or_else(|| input.get("usage_metadata")),
+    );
+    if grounding.has_web_grounding() {
+        usage["server_tool_use"] = json!({"web_search_requests": 1});
+    }
     Ok(json!({
         "id": input.get("responseId").and_then(Value::as_str).unwrap_or("gemini"),
         "type": "message",
@@ -1683,9 +1796,7 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
-        "usage": anthropic_usage_from_gemini_usage(
-            input.get("usageMetadata").or_else(|| input.get("usage_metadata"))
-        )
+        "usage": usage
     }))
 }
 
@@ -1711,6 +1822,8 @@ pub fn anthropic_response_to_openai_chat(input: &Value) -> Result<Value, Transfo
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     let mut reasoning = Vec::new();
+    let mut annotations = Vec::new();
+    let mut text_scalar_offset = 0usize;
     for block in content_blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => tool_calls.push(anthropic_tool_use_to_openai(block)),
@@ -1722,6 +1835,11 @@ pub fn anthropic_response_to_openai_chat(input: &Value) -> Result<Value, Transfo
             Some("redacted_thinking") => {}
             _ => {
                 if let Some(value) = block.get("text").and_then(Value::as_str) {
+                    annotations.extend(anthropic_citations_to_chat_annotations(
+                        block,
+                        text_scalar_offset,
+                    ));
+                    text_scalar_offset = text_scalar_offset.saturating_add(value.chars().count());
                     text.push(value.to_string());
                 }
             }
@@ -1752,6 +1870,9 @@ pub fn anthropic_response_to_openai_chat(input: &Value) -> Result<Value, Transfo
             "reasoning_content".to_string(),
             Value::String(reasoning.join("\n\n")),
         );
+    }
+    if !annotations.is_empty() {
+        message.insert("annotations".to_string(), Value::Array(annotations));
     }
 
     Ok(json!({
@@ -1798,6 +1919,36 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
     let response_id = input.get("id").and_then(Value::as_str).unwrap_or("resp");
     for block in content_blocks {
         match block.get("type").and_then(Value::as_str) {
+            Some("server_tool_use")
+                if block.get("name").and_then(Value::as_str) == Some("web_search") =>
+            {
+                flush_response_output_message(&mut output, &mut message_content);
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("srvtoolu_search");
+                let item_id = if tool_use_id.starts_with("ws_") {
+                    tool_use_id.to_string()
+                } else {
+                    format!("ws_{}", tool_use_id.trim_start_matches("srvtoolu_"))
+                };
+                let query = block
+                    .pointer("/input/query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let sources = anthropic_web_search_sources(content_blocks, tool_use_id);
+                output.push(json!({
+                    "id": item_id,
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": query,
+                        "sources": sources
+                    }
+                }));
+            }
+            Some("web_search_tool_result") => {}
             Some("tool_use") => {
                 flush_response_output_message(&mut output, &mut message_content);
                 output.push(anthropic_tool_use_to_openai_response_with_tool_context(
@@ -1830,7 +1981,11 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
                 if !text.is_empty() {
                     output_text.push(text.to_string());
                 }
-                message_content.push(json!({"type": "output_text", "text": text}));
+                message_content.push(json!({
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": anthropic_citations_to_responses_annotations(block, 0)
+                }));
             }
         }
     }
@@ -1872,6 +2027,90 @@ fn flush_response_output_message(output: &mut Vec<Value>, content: &mut Vec<Valu
             "content": std::mem::take(content)
         }));
     }
+}
+
+fn anthropic_web_search_sources(content_blocks: &[Value], tool_use_id: &str) -> Vec<Value> {
+    content_blocks
+        .iter()
+        .find(|block| {
+            block.get("type").and_then(Value::as_str) == Some("web_search_tool_result")
+                && block.get("tool_use_id").and_then(Value::as_str) == Some(tool_use_id)
+        })
+        .and_then(|block| block.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let url = result.get("url").and_then(Value::as_str)?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "type": "url",
+                "url": url,
+                "title": result.get("title").and_then(Value::as_str).unwrap_or_default()
+            }))
+        })
+        .collect()
+}
+
+fn anthropic_citations_to_responses_annotations(block: &Value, base: usize) -> Vec<Value> {
+    let text = block
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut search_from_byte = 0usize;
+    let mut seen = BTreeSet::new();
+    block
+        .get("citations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|citation| {
+            let url = citation.get("url").and_then(Value::as_str)?.trim();
+            let cited_text = citation
+                .get("cited_text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if url.is_empty() || cited_text.is_empty() {
+                return None;
+            }
+            let range = scalar_range_for_cited_text(text, cited_text, search_from_byte)
+                .or_else(|| scalar_range_for_cited_text(text, cited_text, 0))?;
+            search_from_byte = range.2;
+            let start_index = base.saturating_add(range.0);
+            let end_index = base.saturating_add(range.1);
+            let key = format!("{url}:{start_index}:{end_index}");
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(json!({
+                "type": "url_citation",
+                "url": url,
+                "title": citation.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "start_index": start_index,
+                "end_index": end_index,
+                "text": cited_text
+            }))
+        })
+        .collect()
+}
+
+fn anthropic_citations_to_chat_annotations(block: &Value, base: usize) -> Vec<Value> {
+    anthropic_citations_to_responses_annotations(block, base)
+        .into_iter()
+        .map(|annotation| {
+            json!({
+                "type": "url_citation",
+                "url_citation": {
+                    "url": annotation.get("url").cloned().unwrap_or(Value::Null),
+                    "title": annotation.get("title").cloned().unwrap_or(Value::Null),
+                    "start_index": annotation.get("start_index").cloned().unwrap_or(Value::Null),
+                    "end_index": annotation.get("end_index").cloned().unwrap_or(Value::Null)
+                }
+            })
+        })
+        .collect()
 }
 
 pub fn anthropic_response_to_gemini(input: &Value) -> Result<Value, TransformError> {
@@ -4241,6 +4480,20 @@ fn append_response_system_text(value: Option<&Value>, output: &mut Vec<String>) 
     }
 }
 
+fn demoted_system_message(content: Option<&Value>) -> Option<Value> {
+    let text = content.and_then(response_instruction_text)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": format!("<system-reminder>\n{text}\n</system-reminder>")
+        }]
+    }))
+}
+
 fn drop_empty_anthropic_messages(messages: &mut Vec<Value>) {
     for message in messages.iter_mut() {
         if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
@@ -4277,27 +4530,29 @@ fn drop_incomplete_anthropic_tool_turns(messages: &mut Vec<Value>) {
             let paired_user = original
                 .get(index + 1)
                 .filter(|next| next.get("role").and_then(Value::as_str) == Some("user"));
-            let tool_result_ids = paired_user
-                .map(|user| anthropic_message_block_ids(user, "tool_result", "tool_use_id"))
-                .unwrap_or_default();
-            let unique_tool_uses: HashSet<&str> = tool_use_ids.iter().copied().collect();
-            let unique_tool_results: HashSet<&str> = tool_result_ids.iter().copied().collect();
-            let complete = tool_use_ids.iter().all(|id| !id.is_empty())
-                && tool_result_ids.iter().all(|id| !id.is_empty())
-                && unique_tool_uses.len() == tool_use_ids.len()
-                && unique_tool_results.len() == tool_result_ids.len()
-                && unique_tool_uses == unique_tool_results;
+            let tool_result_ids = paired_user.map_or_else(Vec::new, |user| {
+                anthropic_message_block_ids(user, "tool_result", "tool_use_id")
+            });
+            let tool_use_counts = id_counts(&tool_use_ids);
+            let tool_result_counts = id_counts(&tool_result_ids);
+            let paired_ids = tool_use_counts
+                .iter()
+                .filter_map(|(id, count)| {
+                    (!id.is_empty()
+                        && *count == 1
+                        && tool_result_counts.get(id).copied() == Some(1))
+                    .then(|| id.clone())
+                })
+                .collect::<BTreeSet<_>>();
 
-            if complete {
-                sanitized.push(message.clone());
-                sanitized.push(
-                    paired_user
-                        .expect("complete tool turn has a user message")
-                        .clone(),
-                );
-            } else if let Some(user) = paired_user {
+            let mut assistant = message.clone();
+            retain_paired_tool_uses(&mut assistant, &paired_ids);
+            if anthropic_message_has_content(&assistant) {
+                sanitized.push(assistant);
+            }
+            if let Some(user) = paired_user {
                 let mut user = user.clone();
-                drop_anthropic_tool_result_blocks(&mut user);
+                demote_unpaired_tool_results(&mut user, &paired_ids);
                 if anthropic_message_has_content(&user) {
                     sanitized.push(user);
                 }
@@ -4308,7 +4563,7 @@ fn drop_incomplete_anthropic_tool_turns(messages: &mut Vec<Value>) {
 
         let mut message = message.clone();
         if message.get("role").and_then(Value::as_str) == Some("user") {
-            drop_anthropic_tool_result_blocks(&mut message);
+            demote_unpaired_tool_results(&mut message, &BTreeSet::new());
         }
         if anthropic_message_has_content(&message) {
             sanitized.push(message);
@@ -4317,6 +4572,63 @@ fn drop_incomplete_anthropic_tool_turns(messages: &mut Vec<Value>) {
     }
 
     *messages = sanitized;
+}
+
+fn id_counts(ids: &[&str]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for id in ids {
+        *counts.entry((*id).to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn retain_paired_tool_uses(message: &mut Value, paired_ids: &BTreeSet<String>) {
+    if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+        content.retain(|block| {
+            block.get("type").and_then(Value::as_str) != Some("tool_use")
+                || block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| paired_ids.contains(id))
+        });
+    }
+}
+
+fn demote_unpaired_tool_results(message: &mut Value, paired_ids: &BTreeSet<String>) {
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for block in content.iter_mut() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let tool_use_id = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if paired_ids.contains(tool_use_id) {
+            continue;
+        }
+        let mut payload = Map::new();
+        payload.insert(
+            "tool_use_id".to_string(),
+            Value::String(tool_use_id.to_string()),
+        );
+        payload.insert(
+            "content".to_string(),
+            block.get("content").cloned().unwrap_or(Value::Null),
+        );
+        if let Some(is_error) = block.get("is_error") {
+            payload.insert("is_error".to_string(), is_error.clone());
+        }
+        let payload = serde_json::to_string(&Value::Object(payload)).unwrap_or_default();
+        *block = json!({
+            "type": "text",
+            "text": format!(
+                "<cc-switch-server-orphan-tool-output-v1>\n{payload}\n</cc-switch-server-orphan-tool-output-v1>"
+            )
+        });
+    }
 }
 
 fn anthropic_message_block_ids<'a>(
@@ -4337,12 +4649,6 @@ fn anthropic_message_block_ids<'a>(
                 .unwrap_or_default()
         })
         .collect()
-}
-
-fn drop_anthropic_tool_result_blocks(message: &mut Value) {
-    if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
-        content.retain(|block| block.get("type").and_then(Value::as_str) != Some("tool_result"));
-    }
 }
 
 fn anthropic_message_has_content(message: &Value) -> bool {
@@ -4505,12 +4811,13 @@ fn anthropic_system_to_openai_chat(system: Option<&Value>) -> Option<Value> {
 
 fn anthropic_system_to_openai_instructions(system: Option<&Value>) -> Option<String> {
     let instructions = match system? {
-        Value::String(text) => strip_leading_anthropic_billing_header(text).to_string(),
+        Value::String(text) => (!is_anthropic_billing_metadata_block(text))
+            .then(|| text.to_string())
+            .unwrap_or_default(),
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(anthropic_text_from_block)
-            .map(strip_leading_anthropic_billing_header)
-            .filter(|text| !text.is_empty())
+            .filter(|text| !is_anthropic_billing_metadata_block(text))
             .collect::<Vec<_>>()
             .join("\n\n"),
         _ => return None,
@@ -4533,36 +4840,25 @@ fn anthropic_system_to_openai_responses(system: Option<&Value>) -> Option<Value>
     }
 }
 
-fn strip_leading_anthropic_billing_header(text: &str) -> &str {
-    if !text.starts_with(ANTHROPIC_BILLING_HEADER_PREFIX) {
-        return text;
-    }
-
-    let Some(line_end) = text
-        .as_bytes()
-        .iter()
-        .position(|byte| matches!(*byte, b'\n' | b'\r'))
-    else {
-        return "";
-    };
-    let bytes = text.as_bytes();
-    let mut rest_start = line_end + 1;
-    if bytes[line_end] == b'\r' && bytes.get(rest_start) == Some(&b'\n') {
-        rest_start += 1;
-    }
-    let rest = &text[rest_start..];
-    rest.strip_prefix("\r\n")
-        .or_else(|| rest.strip_prefix('\n'))
-        .or_else(|| rest.strip_prefix('\r'))
-        .unwrap_or(rest)
+fn is_anthropic_billing_metadata_block(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with(ANTHROPIC_BILLING_HEADER_PREFIX)
+        && !text.contains('\n')
+        && !text.contains('\r')
 }
 
 fn anthropic_system_to_gemini(system: Option<&Value>) -> Option<Value> {
-    let parts = match system? {
-        Value::String(text) => vec![json!({"text": text})],
+    let parts: Vec<Value> = match system? {
+        Value::String(text) => (!is_anthropic_billing_metadata_block(text))
+            .then(|| json!({"text": text}))
+            .into_iter()
+            .collect(),
         Value::Array(blocks) => blocks
             .iter()
-            .filter(|block| anthropic_text_from_block(block).is_some())
+            .filter(|block| {
+                anthropic_text_from_block(block)
+                    .is_some_and(|text| !is_anthropic_billing_metadata_block(text))
+            })
             .map(anthropic_block_to_gemini_part)
             .collect(),
         _ => return None,
@@ -6662,7 +6958,12 @@ fn copy_provider_metering(source: Option<&Value>, target: &mut Map<String, Value
     let Some(source) = source.and_then(Value::as_object) else {
         return;
     };
-    for key in ["credit_usage", "credit_unit", "credit_unit_plural"] {
+    for key in [
+        "credit_usage",
+        "credit_unit",
+        "credit_unit_plural",
+        "server_tool_use",
+    ] {
         if let Some(value) = source.get(key) {
             target.insert(key.to_string(), value.clone());
         }
@@ -6853,7 +7154,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_chat_to_anthropic_validates_tool_arguments_and_drops_incomplete_turns() {
+    fn openai_chat_to_anthropic_validates_arguments_and_demotes_orphan_outputs() {
         for arguments in [json!("{broken"), json!("[]"), json!(1)] {
             let error = openai_chat_to_anthropic(&json!({
                 "model": "claude-sonnet-4-5",
@@ -6885,9 +7186,18 @@ mod tests {
         }))
         .unwrap();
 
+        let messages = output["messages"].as_array().unwrap();
+        assert!(!messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .any(|block| matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("tool_use" | "tool_result")
+            )));
         let serialized = output["messages"].to_string();
-        assert!(!serialized.contains("tool_use"));
-        assert!(!serialized.contains("tool_result"));
+        assert!(serialized.contains("cc-switch-server-orphan-tool-output-v1"));
+        assert!(serialized.contains("orphan"));
+        assert!(serialized.contains("ignored"));
         assert!(serialized.contains("run"));
         assert!(serialized.contains("continue"));
     }
@@ -7126,6 +7436,53 @@ mod tests {
     }
 
     #[test]
+    fn openai_requests_demote_mid_session_system_messages_without_reordering_them() {
+        let chat = openai_chat_to_anthropic(&json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "system", "content": "initial system"},
+                {"role": "developer", "content": "initial developer"},
+                {"role": "user", "content": "turn one"},
+                {"role": "assistant", "content": "answer one"},
+                {"role": "developer", "content": "call a tool now"},
+                {"role": "system", "content": [{"type": "text", "text": "be concise"}]},
+                {"role": "user", "content": "turn two"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(chat["system"], "initial system\ninitial developer");
+        assert_eq!(chat["messages"][2]["role"], "user");
+        assert_eq!(
+            chat["messages"][2]["content"][0]["text"],
+            "<system-reminder>\ncall a tool now\n</system-reminder>"
+        );
+        assert_eq!(
+            chat["messages"][2]["content"][1]["text"],
+            "<system-reminder>\nbe concise\n</system-reminder>"
+        );
+        assert_eq!(chat["messages"][2]["content"][2]["text"], "turn two");
+
+        let responses = openai_responses_to_anthropic(&json!({
+            "model": "claude-sonnet-4-6",
+            "instructions": "top-level",
+            "input": [
+                {"role": "system", "content": "initial system"},
+                {"role": "user", "content": "turn one"},
+                {"role": "assistant", "content": "answer one"},
+                {"role": "developer", "content": "call a tool now"},
+                {"role": "user", "content": "turn two"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(responses["system"], "top-level\n\ninitial system");
+        assert_eq!(
+            responses["messages"][2]["content"][0]["text"],
+            "<system-reminder>\ncall a tool now\n</system-reminder>"
+        );
+        assert_eq!(responses["messages"][2]["content"][1]["text"], "turn two");
+    }
+
+    #[test]
     fn claude_structured_output_translation_is_scoped_and_preserves_system_text() {
         let chat = openai_chat_to_anthropic(&json!({
             "model":"claude-sonnet-4-6",
@@ -7318,7 +7675,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_to_anthropic_drops_partial_and_incomplete_tool_turns() {
+    fn openai_responses_to_anthropic_repairs_partial_and_incomplete_tool_turns() {
         let output = openai_responses_to_anthropic(&json!({
             "model": "gpt-5.5",
             "input": [
@@ -7334,10 +7691,14 @@ mod tests {
         .unwrap();
 
         let serialized = output["messages"].to_string();
-        assert!(!serialized.contains("tool_use"));
-        assert!(!serialized.contains("tool_result"));
+        assert!(serialized.contains("\"id\":\"c1\""));
+        assert!(serialized.contains("\"tool_use_id\":\"c1\""));
+        assert!(!serialized.contains("\"id\":\"c2\""));
+        assert!(!serialized.contains("\"tool_use_id\":\"c2\""));
         assert!(serialized.contains("run both"));
         assert!(serialized.contains("continue"));
+        assert!(serialized.contains("cc-switch-server-orphan-tool-output-v1"));
+        assert!(serialized.contains("never ran"));
     }
 
     #[test]
@@ -7366,26 +7727,47 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_to_anthropic_drops_orphan_results_and_fails_closed() {
+    fn openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text() {
         let output = openai_responses_to_anthropic(&json!({
             "model": "gpt-5.5",
             "input": [
-                {"type": "function_call_output", "call_id": "ghost", "output": "ignored"},
+                {"type": "function_call_output", "call_id": "ghost", "output": "preserved"},
                 {"role": "user", "content": "keep this"}
             ]
         }))
         .unwrap();
         assert_eq!(output["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(output["messages"][0]["content"][0]["text"], "keep this");
+        assert!(output["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("preserved"));
+        assert_eq!(output["messages"][0]["content"][1]["text"], "keep this");
 
-        let error = openai_responses_to_anthropic(&json!({
+        let only_orphan = openai_responses_to_anthropic(&json!({
             "model": "gpt-5.5",
             "input": [
-                {"type": "function_call_output", "call_id": "ghost", "output": "ignored"}
+                {"type": "function_call_output", "call_id": "ghost", "output": "still here"}
             ]
         }))
-        .unwrap_err();
-        assert!(error.to_string().contains("no valid anthropic messages"));
+        .unwrap();
+        assert!(only_orphan["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("still here"));
+
+        let mismatched = openai_responses_to_anthropic(&json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "user", "content": "run"},
+                {"type": "function_call", "call_id": "expected", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "different", "output": "do not lose me"}
+            ]
+        }))
+        .unwrap();
+        let serialized = mismatched["messages"].to_string();
+        assert!(!serialized.contains("\"type\":\"tool_use\""));
+        assert!(!serialized.contains("\"type\":\"tool_result\""));
+        assert!(serialized.contains("do not lose me"));
     }
 
     #[test]
@@ -8151,15 +8533,15 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_to_openai_responses_strips_only_leading_billing_header() {
+    fn anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini() {
         for (system, expected) in [
             (
                 "x-anthropic-billing-header: dynamic\n\nStable policy",
-                "Stable policy",
+                "x-anthropic-billing-header: dynamic\n\nStable policy",
             ),
             (
                 "x-anthropic-billing-header: dynamic\r\n\r\nStable policy",
-                "Stable policy",
+                "x-anthropic-billing-header: dynamic\r\n\r\nStable policy",
             ),
             (
                 "Keep literal:\nx-anthropic-billing-header: user text",
@@ -8185,6 +8567,49 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(responses["instructions"], "Stable policy");
+
+        let input = json!({
+            "model": "gemini-2.5-flash",
+            "system": [
+                {"type": "text", "text": "  x-anthropic-billing-header: dynamic  \n"},
+                {"type": "text", "text": "Stable policy"},
+                {"type": "text", "text": "x-anthropic-billing-header: quoted\nKeep this line"}
+            ],
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let responses = anthropic_to_openai_responses_with_instructions(&input).unwrap();
+        assert_eq!(
+            responses["instructions"],
+            "Stable policy\n\nx-anthropic-billing-header: quoted\nKeep this line"
+        );
+        let gemini = anthropic_to_gemini_native(&input).unwrap();
+        assert_eq!(
+            gemini["systemInstruction"]["parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            gemini["systemInstruction"]["parts"][1]["text"],
+            "x-anthropic-billing-header: quoted\nKeep this line"
+        );
+
+        let only_metadata = json!({
+            "model": "gemini-2.5-flash",
+            "system": "x-anthropic-billing-header: dynamic",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        assert!(
+            anthropic_to_openai_responses_with_instructions(&only_metadata)
+                .unwrap()
+                .get("instructions")
+                .is_none()
+        );
+        assert!(anthropic_to_gemini_native(&only_metadata)
+            .unwrap()
+            .get("systemInstruction")
+            .is_none());
     }
 
     #[test]
@@ -8772,6 +9197,89 @@ mod tests {
         assert_eq!(output["stop_reason"], "end_turn");
         assert_eq!(output["usage"]["server_tool_use"]["web_search_requests"], 2);
         assert_eq!(output["usage"]["server_tool_use"]["x_search_requests"], 1);
+    }
+
+    #[test]
+    fn gemini_grounding_maps_to_all_snapshot_surfaces_with_scalar_offsets() {
+        let gemini = json!({
+            "responseId": "grounded-1",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {"parts": [{"text": "A中🙂e\u{301}Z"}]},
+                    "finishReason": "STOP",
+                    "groundingMetadata": {
+                        "webSearchQueries": ["unicode sources"],
+                        "groundingChunks": [
+                            {"web": {"uri": "https://example.test/a", "title": "A"}},
+                            {"web": {"uri": "https://example.test/a", "title": "duplicate"}},
+                            {"web": {"uri": "https://example.test/b", "title": "B"}}
+                        ],
+                        "groundingSupports": [{
+                            "segment": {"partIndex": 0, "startIndex": 1, "endIndex": 11},
+                            "groundingChunkIndices": [0, 1, 2, 99]
+                        }]
+                    }
+                },
+                {
+                    "index": 1,
+                    "content": {"parts": [{"text": "must be ignored"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [{"web": {"uri": "https://wrong.test"}}]
+                    }
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4}
+        });
+
+        let anthropic = gemini_response_to_anthropic(&gemini).unwrap();
+        assert_eq!(anthropic["content"][0]["type"], "server_tool_use");
+        assert_eq!(anthropic["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(
+            anthropic["content"][1]["content"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            anthropic["content"][2]["citations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            anthropic["content"][2]["citations"][0]["cited_text"],
+            "中🙂e\u{301}"
+        );
+        assert_eq!(
+            anthropic["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert!(!anthropic.to_string().contains("wrong.test"));
+
+        let responses = anthropic_response_to_openai_responses(&anthropic).unwrap();
+        assert_eq!(responses["output"][0]["type"], "web_search_call");
+        assert_eq!(
+            responses["output"][0]["action"]["sources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let annotation = &responses["output"][1]["content"][0]["annotations"][0];
+        assert_eq!(annotation["start_index"], 1);
+        assert_eq!(annotation["end_index"], 5);
+        assert_eq!(annotation["url"], "https://example.test/a");
+
+        let chat = anthropic_response_to_openai_chat(&anthropic).unwrap();
+        let chat_annotation = &chat["choices"][0]["message"]["annotations"][0];
+        assert_eq!(chat_annotation["type"], "url_citation");
+        assert_eq!(chat_annotation["url_citation"]["start_index"], 1);
+        assert_eq!(chat_annotation["url_citation"]["end_index"], 5);
+        assert_eq!(
+            chat_annotation["url_citation"]["url"],
+            "https://example.test/a"
+        );
     }
 
     #[test]

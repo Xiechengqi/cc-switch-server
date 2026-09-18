@@ -13,6 +13,10 @@ use super::request_governance::{govern_request_body, RequestGovernanceConfig};
 use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
 use super::tool_schema::{normalize_antigravity_request_schemas, normalize_gemini_tool_schemas};
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
+use crate::domain::accounts::capability_evidence::{
+    antigravity_model_search_dimension, fresh_observation_state, AccountCapabilityObservationState,
+    ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+};
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::store::{Account, AccountStore};
 use crate::domain::providers::model::{AppKind, ProviderType};
@@ -2271,16 +2275,19 @@ fn apply_gemini_v1internal_contract(
             stored.provider_type.as_str()
         )));
     }
-    let account_id = match &plan.auth_ref {
+    let antigravity_identity = has_antigravity_v1internal_identity(stored.provider_type);
+    let (account_id, expected_auth_identity_generation) = match &plan.auth_ref {
         crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
             account_id,
             expected_provider_type: bound_provider_type,
-            ..
-        } if *bound_provider_type == expected_provider_type => account_id.as_str(),
+            auth_identity_generation,
+        } if *bound_provider_type == expected_provider_type => {
+            (account_id.as_str(), Some(*auth_identity_generation))
+        }
         crate::domain::providers::runtime::RuntimeAuthRef::Legacy {
             account_id: Some(account_id),
             ..
-        } => account_id.as_str(),
+        } if !antigravity_identity => (account_id.as_str(), None),
         _ => {
             return Err(ProxyError::bad_request(format!(
                 "{} v1internal requires one fixed managed account",
@@ -2298,6 +2305,14 @@ fn apply_gemini_v1internal_contract(
                 expected_provider_type.as_str()
             ))
         })?;
+    if expected_auth_identity_generation
+        .is_some_and(|expected| account.auth_identity_generation != expected)
+    {
+        return Err(ProxyError::conflict(format!(
+            "bound {} account identity changed before v1internal request finalization",
+            expected_provider_type.as_str()
+        )));
+    }
     let mut model = gemini_v1internal_model(request)?.to_string();
     let mut inner = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
         ProxyError::bad_request(format!(
@@ -2326,14 +2341,21 @@ fn apply_gemini_v1internal_contract(
             expected_provider_type.as_str()
         ))
     })?;
-    let antigravity_identity = has_antigravity_v1internal_identity(stored.provider_type);
     sanitize_gemini_v1internal_request(&mut inner, antigravity_identity)?;
     let web_search = antigravity_identity && gemini_request_has_google_search(&inner);
-    if web_search && model != ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL {
-        model = ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL.to_string();
-        request.model = Some(model.clone());
-        request.actual_model = Some(model.clone());
-        request.actual_model_source = Some("antigravity_web_search_fallback".to_string());
+    if web_search {
+        let selected_model = select_antigravity_web_search_model(
+            account,
+            &model,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        if selected_model != model {
+            model = selected_model;
+            request.model = Some(model.clone());
+            request.actual_model = Some(model.clone());
+            request.actual_model_source =
+                Some("antigravity_web_search_capability_fallback".to_string());
+        }
     }
     let mut envelope = serde_json::Map::from_iter([
         ("project".to_string(), Value::String(project_id)),
@@ -2395,6 +2417,38 @@ fn gemini_request_has_google_search(value: &Value) -> bool {
                     .is_some_and(Value::is_object)
             })
         })
+}
+
+fn select_antigravity_web_search_model(
+    account: &Account,
+    requested_model: &str,
+    now_ms: i64,
+) -> Result<String, ProxyError> {
+    let state = fresh_observation_state(
+        account,
+        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+        &antigravity_model_search_dimension(requested_model),
+        now_ms,
+    );
+    if state == Some(AccountCapabilityObservationState::Supported) {
+        return Ok(requested_model.to_string());
+    }
+
+    let fallback_state = fresh_observation_state(
+        account,
+        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+        &antigravity_model_search_dimension(ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL),
+        now_ms,
+    );
+    if fallback_state == Some(AccountCapabilityObservationState::Unsupported) {
+        return Err(ProxyError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: "Antigravity web search fallback is explicitly unsupported by the bound account catalog"
+                .to_string(),
+        });
+    }
+
+    Ok(ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL.to_string())
 }
 
 fn gemini_ai_studio_base_url(_account: &Account) -> &str {
@@ -5374,7 +5428,7 @@ mod tests {
             );
             assert_eq!(
                 request.actual_model_source.as_deref(),
-                Some("antigravity_web_search_fallback")
+                Some("antigravity_web_search_capability_fallback")
             );
             assert_eq!(
                 body.pointer("/request/tools/0/functionDeclarations/0/name"),
@@ -5382,6 +5436,276 @@ mod tests {
             );
             assert!(body.pointer("/request/tools/1/googleSearch").is_some());
             assert_eq!(body["request"]["tools"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn antigravity_web_search_model_selection_uses_fresh_per_model_evidence() {
+        use crate::domain::accounts::capability_evidence::{
+            record_observation_drafts, AccountCapabilityObservationDraft,
+        };
+
+        let mut account: Account = serde_json::from_value(json!({
+            "id": "antigravity-search-capability",
+            "providerType": "antigravity_oauth",
+            "authIdentityGeneration": 7
+        }))
+        .unwrap();
+        let observation = |model: &str,
+                           state: AccountCapabilityObservationState,
+                           observed_at_ms: i64,
+                           expires_at_ms: i64| {
+            AccountCapabilityObservationDraft::antigravity_feature(
+                &antigravity_model_search_dimension(model),
+                state,
+                "fetch_available_models",
+                None,
+                observed_at_ms,
+                Some(expires_at_ms),
+            )
+        };
+
+        record_observation_drafts(
+            &mut account,
+            [
+                observation(
+                    "gemini-search-native",
+                    AccountCapabilityObservationState::Supported,
+                    100,
+                    10_000,
+                ),
+                observation(
+                    "gemini-search-disabled",
+                    AccountCapabilityObservationState::Unsupported,
+                    100,
+                    10_000,
+                ),
+                observation(
+                    "gemini-search-unknown",
+                    AccountCapabilityObservationState::Unknown,
+                    100,
+                    10_000,
+                ),
+                observation(
+                    "gemini-search-stale",
+                    AccountCapabilityObservationState::Supported,
+                    100,
+                    500,
+                ),
+                observation(
+                    ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL,
+                    AccountCapabilityObservationState::Supported,
+                    100,
+                    10_000,
+                ),
+            ],
+        );
+
+        assert_eq!(
+            select_antigravity_web_search_model(&account, "gemini-search-native", 1_000).unwrap(),
+            "gemini-search-native"
+        );
+        for model in [
+            "gemini-search-disabled",
+            "gemini-search-unknown",
+            "gemini-search-missing",
+            "gemini-search-stale",
+        ] {
+            assert_eq!(
+                select_antigravity_web_search_model(&account, model, 1_000).unwrap(),
+                ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL
+            );
+        }
+
+        record_observation_drafts(
+            &mut account,
+            [observation(
+                ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL,
+                AccountCapabilityObservationState::Unsupported,
+                200,
+                10_000,
+            )],
+        );
+        let error = select_antigravity_web_search_model(&account, "gemini-search-missing", 1_000)
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn gemini_v1internal_rejects_runtime_auth_generation_drift() {
+        let account_id = "antigravity-generation-drift";
+        let accounts = AccountStore {
+            accounts: vec![serde_json::from_value(json!({
+                "id": account_id,
+                "providerType": "antigravity_oauth",
+                "authIdentityGeneration": 2,
+                "accessToken": "new-generation-token",
+                "profile": {"projectId": "new-generation-project"}
+            }))
+            .unwrap()],
+            ..Default::default()
+        };
+        let stored = stored_provider(AppKind::Gemini, ProviderType::AntigravityOAuth, json!({}));
+        let plan = gemini_v1internal_runtime_plan(ProviderType::AntigravityOAuth, account_id);
+        let adapter = adapter_for(AppKind::Gemini, ProviderType::AntigravityOAuth);
+        let mut request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(br#"{"contents":[{"parts":[{"text":"ping"}]}]}"#),
+                &stored,
+                ProxyRoute::Gemini,
+                Some("models/gemini-2.5-flash:generateContent"),
+            )
+            .unwrap();
+        request.actual_model = Some("gemini-2.5-flash".to_string());
+        let mut endpoint = plan.endpoint.clone();
+
+        let error = finalize_runtime_protocol_auth(
+            &plan,
+            &stored,
+            &accounts,
+            &mut request,
+            &mut endpoint,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(error.message.contains("identity changed"));
+    }
+
+    #[test]
+    fn antigravity_request_type_matrix_keeps_current_wire_without_live_receipt() {
+        let cases = [
+            (
+                "plain_text",
+                json!({"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}),
+                "agent",
+                false,
+            ),
+            (
+                "function_tools",
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "lookup"}]}],
+                    "tools": [{"functionDeclarations": [{
+                        "name": "lookup",
+                        "parameters": {"type": "object"}
+                    }]}]
+                }),
+                "agent",
+                false,
+            ),
+            (
+                "function_history",
+                json!({
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "lookup"}]},
+                        {"role": "model", "parts": [{"functionCall": {
+                            "name": "lookup",
+                            "args": {"query": "rust"}
+                        }}]},
+                        {"role": "user", "parts": [{"functionResponse": {
+                            "name": "lookup",
+                            "response": {"result": "ok"}
+                        }}]}
+                    ]
+                }),
+                "agent",
+                false,
+            ),
+            (
+                "web_search",
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "search"}]}],
+                    "tools": [{"googleSearch": {}}]
+                }),
+                "web_search",
+                true,
+            ),
+            (
+                "mixed_function_and_web_search",
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "search and lookup"}]}],
+                    "tools": [
+                        {"functionDeclarations": [{
+                            "name": "lookup",
+                            "parameters": {"type": "object"}
+                        }]},
+                        {"googleSearch": {}}
+                    ]
+                }),
+                "web_search",
+                true,
+            ),
+        ];
+
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account_id = format!("{}-request-type-matrix", provider_type.as_str());
+            let accounts = AccountStore {
+                accounts: vec![serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": provider_type.as_str(),
+                    "authIdentityGeneration": 1,
+                    "accessToken": "matrix-token",
+                    "profile": {"projectId": "matrix-project"}
+                }))
+                .unwrap()],
+                ..Default::default()
+            };
+            let stored = stored_provider(AppKind::Gemini, provider_type, json!({}));
+            let plan = gemini_v1internal_runtime_plan(provider_type, &account_id);
+            let adapter = adapter_for(AppKind::Gemini, provider_type);
+
+            for (name, body, expected_request_type, expects_search_fallback) in &cases {
+                let mut request = adapter
+                    .transform_request_for_route(
+                        Bytes::from(serde_json::to_vec(body).unwrap()),
+                        &stored,
+                        ProxyRoute::Gemini,
+                        Some("models/gemini-3.5-flash-medium:generateContent"),
+                    )
+                    .unwrap();
+                request.actual_model = Some("gemini-3.5-flash-medium".to_string());
+                let mut endpoint = plan.endpoint.clone();
+                finalize_runtime_protocol_auth(
+                    &plan,
+                    &stored,
+                    &accounts,
+                    &mut request,
+                    &mut endpoint,
+                    &mut Vec::new(),
+                )
+                .unwrap_or_else(|error| panic!("{name} failed: {error}"));
+
+                let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    envelope["requestType"],
+                    json!(expected_request_type),
+                    "{name}"
+                );
+                assert_eq!(
+                    envelope["model"],
+                    json!(if *expects_search_fallback {
+                        ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL
+                    } else {
+                        "gemini-3.5-flash-medium"
+                    }),
+                    "{name}"
+                );
+                if *name == "mixed_function_and_web_search" {
+                    assert!(envelope
+                        .pointer("/request/tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| tools.len() == 2));
+                }
+                if *name == "function_history" {
+                    assert!(envelope
+                        .pointer("/request/contents/1/parts/0/functionCall")
+                        .is_some());
+                    assert!(envelope
+                        .pointer("/request/contents/2/parts/0/functionResponse")
+                        .is_some());
+                }
+            }
         }
     }
 

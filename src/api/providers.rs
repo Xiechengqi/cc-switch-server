@@ -4532,6 +4532,7 @@ fn antigravity_provider_models_fetch_result(
                 "capabilities": {
                     "supportsImages": descriptor.supports_images,
                     "supportsThinking": descriptor.supports_thinking,
+                    "supportsWebSearch": descriptor.supports_web_search,
                     "thinkingBudget": descriptor.thinking_budget,
                     "recommended": descriptor.recommended,
                     "maxTokens": descriptor.max_tokens,
@@ -8010,12 +8011,16 @@ mod tests {
                                             "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-09-01T00:00:00Z"},
                                             "supportsImages": true,
                                             "supportsThinking": true,
+                                            "supportsWebSearch": true,
                                             "thinkingBudget": 32768,
                                             "maxTokens": 1048576,
                                             "maxOutputTokens": 65536,
                                             "supportedMimeTypes": {"image/png": true}
                                         },
-                                        "claude-sonnet-4-6": {"supportsThinking": true},
+                                        "claude-sonnet-4-6": {
+                                            "supportsThinking": true,
+                                            "nativeCapabilities": {"webSearch": false}
+                                        },
                                         "gpt-oss-120b-medium": {"recommended": true}
                                     },
                                     "deprecatedModelIds": {
@@ -8137,6 +8142,7 @@ mod tests {
             .unwrap();
         assert_eq!(gemini.raw["quota"]["remainingFraction"], 0.0);
         assert_eq!(gemini.raw["capabilities"]["supportsImages"], true);
+        assert_eq!(gemini.raw["capabilities"]["supportsWebSearch"], true);
         assert_eq!(gemini.raw["deprecatedAliases"], json!(["gemini-old"]));
 
         model_status.store(503, std::sync::atomic::Ordering::SeqCst);
@@ -8189,6 +8195,36 @@ mod tests {
                 account.capability_observations[&key].auth_identity_generation,
                 1
             );
+        }
+        for (model, expected_state) in [
+            (
+                "gemini-3.1-pro",
+                crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+            ),
+            (
+                "gemini-old",
+                crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported,
+            ),
+            (
+                "claude-sonnet-4-6",
+                crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported,
+            ),
+            (
+                "gpt-oss-120b-medium",
+                crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unknown,
+            ),
+        ] {
+            let dimension =
+                crate::domain::accounts::capability_evidence::antigravity_model_search_dimension(
+                    model,
+                );
+            let key = crate::domain::accounts::capability_evidence::observation_key(
+                crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                &dimension,
+            );
+            let observation = &account.capability_observations[&key];
+            assert_eq!(observation.state, expected_state);
+            assert_eq!(observation.auth_identity_generation, 1);
         }
         assert!(observed.lock().unwrap().iter().all(|(_, authorization)| {
             authorization == "Bearer antigravity-bound-access"

@@ -62,6 +62,12 @@ const expectedCapabilities = new Map([
   ["AG-02", "fixture_verified"],
   ["AG-03", "fixture_verified"],
   ["AG-04", "live_pending"],
+  ["AG-N1", "fixture_verified"],
+  ["AG-N2", "fixture_verified"],
+  ["AG-N3", "fixture_verified"],
+  ["AG-N4", "fixture_verified"],
+  ["AG-N5", "fixture_verified"],
+  ["AG-N6", "live_pending"],
 ]);
 for (const capability of baseline.capabilities ?? []) {
   assert(
@@ -80,6 +86,11 @@ for (const capability of baseline.capabilities ?? []) {
   assert((capability.contracts ?? []).length > 0, `${capability.id} has no local contracts`);
 }
 assert(expectedCapabilities.size === 0, "Antigravity capability coverage is incomplete");
+const requestTypeGate = (baseline.capabilities ?? []).find((capability) => capability.id === "AG-N6");
+assert(
+  requestTypeGate?.runtimeChange === false,
+  "Antigravity requestType behavior changed without a real receipt",
+);
 const rails = baseline.realAcceptance?.rails ?? [];
 assert(
   JSON.stringify(rails.map((rail) => rail.rail).sort()) ===

@@ -9,6 +9,7 @@ use super::adapters::{
     downstream_format_for_route, encode_stream_frames, transform_stream_value,
     unwrap_gemini_v1internal_value, upstream_format_for_route, UpstreamFormat,
 };
+use super::gemini_grounding::{scalar_range_for_cited_text, GroundingAccumulator, TextMapping};
 use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, responses_reasoning_item_from_anthropic_block,
     unsigned_responses_reasoning_item,
@@ -74,7 +75,9 @@ impl StreamEventTransformer {
                 StreamBridgeState::ChatAnthropic(ChatAnthropicState::default()),
             ),
             (Some(UpstreamFormat::GeminiNative), UpstreamFormat::AnthropicMessages) => Some(
-                StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::default()),
+                StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::with_web_search_expected(
+                    responses_tool_context.web_search_requested(),
+                )),
             ),
             (Some(UpstreamFormat::GeminiNative), UpstreamFormat::OpenAiResponses) => {
                 Some(StreamBridgeState::GeminiOpenAi(Box::new(
@@ -1598,17 +1601,25 @@ impl ResponsesAnthropicState {
 
 #[derive(Debug, Default)]
 struct GeminiAnthropicState {
+    web_search_expected: bool,
+    web_search_gate_resolved: bool,
+    buffered_web_search_inputs: Vec<Value>,
     next_block_index: u64,
     selected_candidate_index: Option<i64>,
     message_started: bool,
     text_block: Option<BlockState>,
     text_seen: String,
+    text_mappings: Vec<TextMapping>,
+    text_by_block: BTreeMap<u64, String>,
     thinking_block: Option<BlockState>,
     thinking_seen: String,
     thinking_signature: Option<String>,
     tools: BTreeMap<GeminiAnthropicToolKey, GeminiAnthropicToolState>,
     tool_order: Vec<GeminiAnthropicToolKey>,
     usage: BTreeMap<String, Value>,
+    grounding: GroundingAccumulator,
+    grounding_search_emitted: bool,
+    emitted_grounding_citations: BTreeSet<String>,
     pending_finish_reason: Option<String>,
     pending_blocked_prompt: bool,
     saw_content: bool,
@@ -1633,13 +1644,43 @@ struct GeminiAnthropicToolState {
 }
 
 impl GeminiAnthropicState {
+    fn with_web_search_expected(web_search_expected: bool) -> Self {
+        Self {
+            web_search_expected,
+            web_search_gate_resolved: !web_search_expected,
+            ..Default::default()
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
         self.observe_usage(input);
         if self.completed {
             return Vec::new();
         }
-        if self.pending_finish_reason.is_some() {
-            return Vec::new();
+        if self.web_search_expected && !self.web_search_gate_resolved {
+            let candidate = selected_gemini_candidate(input, self.selected_candidate_index)
+                .map(|(_, candidate)| candidate);
+            let has_grounding = candidate
+                .map(GroundingAccumulator::from_candidate)
+                .is_some_and(|grounding| grounding.has_web_grounding());
+            let terminal = candidate.is_some_and(gemini_candidate_has_finish_reason)
+                || (candidate.is_none() && gemini_prompt_block_reason(input).is_some());
+            if !has_grounding && !terminal {
+                self.buffered_web_search_inputs.push(input.clone());
+                return Vec::new();
+            }
+
+            self.web_search_gate_resolved = true;
+            if has_grounding {
+                self.grounding
+                    .observe_candidate(candidate.expect("grounding candidate exists"));
+            }
+            let mut buffered = std::mem::take(&mut self.buffered_web_search_inputs);
+            buffered.push(input.clone());
+            return buffered
+                .iter()
+                .flat_map(|buffered| self.transform(buffered))
+                .collect();
         }
         let candidates = input.get("candidates").and_then(Value::as_array);
         let candidate = candidates.and_then(|candidates| {
@@ -1663,6 +1704,19 @@ impl GeminiAnthropicState {
                     (index, candidate)
                 })
         });
+        if let Some((_, candidate)) = candidate {
+            self.grounding.observe_candidate(candidate);
+        }
+        if self.pending_finish_reason.is_some() {
+            let mut frames = if self.grounding.has_web_grounding() {
+                self.ensure_message_start(input)
+            } else {
+                Vec::new()
+            };
+            frames.extend(self.emit_grounding_citations());
+            frames.extend(self.emit_grounding_search());
+            return frames;
+        }
         let blocked_prompt = candidate
             .is_none()
             .then(|| {
@@ -1694,11 +1748,20 @@ impl GeminiAnthropicState {
                 .or_else(|| candidate.get("finish_reason"))
                 .and_then(Value::as_str)
         });
-        if parts.is_none_or(|parts| parts.is_empty()) && finish_reason.is_none() {
+        if parts.is_none_or(|parts| parts.is_empty())
+            && finish_reason.is_none()
+            && !self.grounding.has_web_grounding()
+        {
             return Vec::new();
         }
 
         let mut frames = self.ensure_message_start(input);
+        if self.text_block.is_some_and(|block| block.open) {
+            frames.extend(self.emit_grounding_citations());
+            frames.extend(self.emit_grounding_search());
+        } else {
+            frames.extend(self.emit_grounding_search());
+        }
         if let Some(parts) = parts {
             let candidate_index = candidate.map(|(index, _)| index).unwrap_or_default();
             let mut occurrences = BTreeMap::<String, usize>::new();
@@ -1717,7 +1780,7 @@ impl GeminiAnthropicState {
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
-                    frames.extend(self.text_delta(text));
+                    frames.extend(self.text_delta(part_index, text));
                 }
                 if let Some(function_call) = part
                     .get("functionCall")
@@ -1740,6 +1803,7 @@ impl GeminiAnthropicState {
                 }
             }
         }
+        frames.extend(self.emit_grounding_citations());
         if let Some(finish_reason) = finish_reason {
             self.pending_finish_reason = Some(finish_reason.to_string());
         }
@@ -1779,7 +1843,7 @@ impl GeminiAnthropicState {
         )]
     }
 
-    fn text_delta(&mut self, text: &str) -> Vec<StreamFrame> {
+    fn text_delta(&mut self, part_index: usize, text: &str) -> Vec<StreamFrame> {
         let mut frames = self.close_thinking_block();
         frames.extend(self.close_tool_blocks());
         if !self.text_block.is_some_and(|block| block.open) {
@@ -1801,6 +1865,23 @@ impl GeminiAnthropicState {
             return frames;
         }
         let index = self.text_block.expect("text block exists").index;
+        let block_text = self.text_by_block.entry(index).or_default();
+        let start_scalar_in_block = block_text.chars().count();
+        block_text.push_str(&text);
+        if let Some(mapping) = self
+            .text_mappings
+            .last_mut()
+            .filter(|mapping| mapping.part_index == part_index && mapping.block_index == index)
+        {
+            mapping.text.push_str(&text);
+        } else {
+            self.text_mappings.push(TextMapping {
+                part_index,
+                block_index: index,
+                start_scalar_in_block,
+                text: text.clone(),
+            });
+        }
         frames.push(StreamFrame::event(
             "content_block_delta",
             json!({
@@ -1809,6 +1890,84 @@ impl GeminiAnthropicState {
                 "delta": {"type": "text_delta", "text": text}
             }),
         ));
+        frames
+    }
+
+    fn emit_grounding_search(&mut self) -> Vec<StreamFrame> {
+        if self.grounding_search_emitted || !self.grounding.has_web_grounding() {
+            return Vec::new();
+        }
+        self.grounding_search_emitted = true;
+        self.saw_content = true;
+        let mut frames = self.close_thinking_block();
+        frames.extend(self.close_text_block());
+        frames.extend(self.close_tool_blocks());
+        let tool_index = self.allocate_index();
+        let result_index = self.allocate_index();
+        let tool_use_id = "srvtoolu_gemini_search";
+        frames.push(StreamFrame::event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": tool_use_id,
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        ));
+        frames.push(input_json_delta(
+            tool_index,
+            &json!({"query": self.grounding.primary_query()}).to_string(),
+        ));
+        frames.push(content_block_stop(tool_index));
+        frames.push(StreamFrame::event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": result_index,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": self.grounding.anthropic_search_results()
+                }
+            }),
+        ));
+        frames.push(content_block_stop(result_index));
+        frames
+    }
+
+    fn emit_grounding_citations(&mut self) -> Vec<StreamFrame> {
+        let citations = self.grounding.citations(&self.text_mappings);
+        let mut frames = Vec::new();
+        for citation in citations {
+            let open = self
+                .text_block
+                .is_some_and(|block| block.open && block.index == citation.block_index);
+            if !open {
+                continue;
+            }
+            let key = format!(
+                "{}:{}:{}:{}",
+                citation.block_index, citation.url, citation.start_index, citation.end_index
+            );
+            if !self.emitted_grounding_citations.insert(key) {
+                continue;
+            }
+            frames.push(StreamFrame::event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": citation.block_index,
+                    "delta": {
+                        "type": "citations_delta",
+                        "citation": citation.anthropic()
+                    }
+                }),
+            ));
+        }
         frames
     }
 
@@ -2021,14 +2180,27 @@ impl GeminiAnthropicState {
         if self.completed {
             return Ok(Vec::new());
         }
+        let mut frames = Vec::new();
+        if self.web_search_expected && !self.web_search_gate_resolved {
+            self.web_search_gate_resolved = true;
+            let buffered = std::mem::take(&mut self.buffered_web_search_inputs);
+            for input in &buffered {
+                frames.extend(self.transform(input));
+            }
+        }
+        if self.completed {
+            return Ok(frames);
+        }
         let finish_reason = self.pending_finish_reason.take().ok_or_else(|| {
             ProxyError::bad_gateway("Gemini stream ended before candidate.finishReason")
         })?;
-        Ok(self.finish(&finish_reason))
+        frames.extend(self.finish(&finish_reason));
+        Ok(frames)
     }
 
     fn finish(&mut self, finish_reason: &str) -> Vec<StreamFrame> {
-        let mut frames = Vec::new();
+        let mut frames = self.emit_grounding_citations();
+        frames.extend(self.emit_grounding_search());
         if !self.saw_content && !self.pending_blocked_prompt {
             let index = self.allocate_index();
             frames.push(StreamFrame::event(
@@ -2058,12 +2230,16 @@ impl GeminiAnthropicState {
             }
         };
         let usage = self.normalized_usage();
+        let mut usage = transforms::anthropic_usage_from_gemini_usage(Some(&usage));
+        if self.grounding.has_web_grounding() {
+            usage["server_tool_use"] = json!({"web_search_requests": 1});
+        }
         frames.push(StreamFrame::event(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": transforms::anthropic_usage_from_gemini_usage(Some(&usage))
+                "usage": usage
             }),
         ));
         frames.push(StreamFrame::event(
@@ -2137,6 +2313,49 @@ fn gemini_candidate_index(candidate: &Value, position: usize) -> i64 {
         .unwrap_or(position as i64)
 }
 
+fn selected_gemini_candidate(
+    input: &Value,
+    selected_candidate_index: Option<i64>,
+) -> Option<(i64, &Value)> {
+    let candidates = input.get("candidates").and_then(Value::as_array)?;
+    candidates
+        .iter()
+        .enumerate()
+        .find(|(position, candidate)| {
+            let index = gemini_candidate_index(candidate, *position);
+            selected_candidate_index.map_or(index == 0, |selected| selected == index)
+        })
+        .or_else(|| {
+            selected_candidate_index
+                .is_none()
+                .then(|| candidates.iter().enumerate().next())
+                .flatten()
+        })
+        .map(|(position, candidate)| (gemini_candidate_index(candidate, position), candidate))
+}
+
+fn gemini_candidate_has_finish_reason(candidate: &Value) -> bool {
+    candidate
+        .get("finishReason")
+        .or_else(|| candidate.get("finish_reason"))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
+fn gemini_prompt_block_reason(input: &Value) -> Option<&str> {
+    input
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .or_else(|| {
+            input
+                .get("prompt_feedback")
+                .and_then(|feedback| feedback.get("block_reason"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+}
+
 fn merge_gemini_tool_arguments(current: &mut Value, incoming: &Value) {
     match (current, incoming) {
         (Value::Object(current), Value::Object(incoming)) => {
@@ -2199,8 +2418,9 @@ enum GeminiOpenAiTarget {
 
 impl GeminiOpenAiState {
     fn responses(responses_tool_context: transforms::ResponsesToolContext) -> Self {
+        let web_search_expected = responses_tool_context.web_search_requested();
         Self {
-            source: GeminiAnthropicState::default(),
+            source: GeminiAnthropicState::with_web_search_expected(web_search_expected),
             target: GeminiOpenAiTarget::Responses(AnthropicResponsesState::new(
                 responses_tool_context,
             )),
@@ -2211,8 +2431,9 @@ impl GeminiOpenAiState {
         responses_tool_context: transforms::ResponsesToolContext,
         downstream_include_usage: bool,
     ) -> Self {
+        let web_search_expected = responses_tool_context.web_search_requested();
         Self {
-            source: GeminiAnthropicState::default(),
+            source: GeminiAnthropicState::with_web_search_expected(web_search_expected),
             target: GeminiOpenAiTarget::Chat {
                 responses: AnthropicResponsesState::new(responses_tool_context),
                 chat: ResponsesChatState::new(downstream_include_usage),
@@ -3306,6 +3527,7 @@ struct ResponsesChatState {
     item_ids: BTreeMap<i64, String>,
     emitted_text_items: BTreeSet<String>,
     emitted_reasoning_items: BTreeSet<String>,
+    emitted_annotations: BTreeSet<String>,
     include_usage: bool,
     completed: bool,
 }
@@ -3322,6 +3544,7 @@ impl Default for ResponsesChatState {
             item_ids: BTreeMap::new(),
             emitted_text_items: BTreeSet::new(),
             emitted_reasoning_items: BTreeSet::new(),
+            emitted_annotations: BTreeSet::new(),
             include_usage: true,
             completed: false,
         }
@@ -3360,6 +3583,7 @@ impl ResponsesChatState {
                 self.ensure_role_chunk()
             }
             Some("response.output_text.delta") => self.text_delta(input),
+            Some("response.output_text.annotation.added") => self.annotation_added(input),
             Some(
                 "response.reasoning_summary_text.delta"
                 | "response.reasoning_text.delta"
@@ -3448,6 +3672,51 @@ impl ResponsesChatState {
             &self.model,
             self.created,
             json!({"reasoning_content": delta}),
+            Value::Null,
+            None,
+        ));
+        frames
+    }
+
+    fn annotation_added(&mut self, input: &Value) -> Vec<StreamFrame> {
+        let Some(annotation) = input.get("annotation") else {
+            return Vec::new();
+        };
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            return Vec::new();
+        }
+        let url = annotation
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let start = annotation
+            .get("start_index")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let end = annotation
+            .get("end_index")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let key = format!("{url}:{start}:{end}");
+        if url.is_empty() || !self.emitted_annotations.insert(key) {
+            return Vec::new();
+        }
+        let mut frames = self.ensure_role_chunk();
+        frames.push(chat_stream_chunk(
+            &self.response_id,
+            &self.model,
+            self.created,
+            json!({
+                "annotations": [{
+                    "type": "url_citation",
+                    "url_citation": {
+                        "url": url,
+                        "title": annotation.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        "start_index": start,
+                        "end_index": end
+                    }
+                }]
+            }),
             Value::Null,
             None,
         ));
@@ -3576,6 +3845,7 @@ impl ResponsesChatState {
             return frames;
         }
         if item.get("type").and_then(Value::as_str) == Some("message") {
+            let mut frames = Vec::new();
             if !response_item_was_emitted(
                 &self.emitted_text_items,
                 input,
@@ -3585,10 +3855,24 @@ impl ResponsesChatState {
                 if let Some(text) = response_message_text(item) {
                     let mut packed = input.clone();
                     packed["delta"] = Value::String(text);
-                    return self.text_delta(&packed);
+                    frames.extend(self.text_delta(&packed));
                 }
             }
-            return Vec::new();
+            for annotation in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|part| {
+                    part.get("annotations")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+            {
+                frames.extend(self.annotation_added(&json!({"annotation": annotation})));
+            }
+            return frames;
         }
         if !is_responses_tool_call(item) {
             return Vec::new();
@@ -4592,6 +4876,8 @@ enum AnthropicResponsesBlock {
         output_index: u64,
         item_id: String,
         text: String,
+        annotations: Vec<Value>,
+        citation_search_from_byte: usize,
         done: bool,
     },
     Reasoning {
@@ -4611,6 +4897,17 @@ enum AnthropicResponsesBlock {
         signature: Option<String>,
         custom: bool,
         done: bool,
+    },
+    Search {
+        output_index: u64,
+        item_id: String,
+        tool_use_id: String,
+        arguments: String,
+        sources: Vec<Value>,
+        done: bool,
+    },
+    SearchResult {
+        search_index: i64,
     },
 }
 
@@ -4698,6 +4995,8 @@ impl AnthropicResponsesState {
                         output_index,
                         item_id: item_id.clone(),
                         text: initial.clone(),
+                        annotations: Vec::new(),
+                        citation_search_from_byte: 0,
                         done: false,
                     },
                 );
@@ -4770,6 +5069,99 @@ impl AnthropicResponsesState {
                         "summary_index": 0,
                         "delta": text
                     })));
+                }
+            }
+            Some("server_tool_use")
+                if block.get("name").and_then(Value::as_str) == Some("web_search") =>
+            {
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("srvtoolu_search")
+                    .to_string();
+                let item_id = if tool_use_id.starts_with("ws_") {
+                    tool_use_id.clone()
+                } else {
+                    format!("ws_{}", tool_use_id.trim_start_matches("srvtoolu_"))
+                };
+                let arguments = block
+                    .get("input")
+                    .filter(|value| value.is_object())
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .filter(|value| value != "{}")
+                    .unwrap_or_default();
+                self.blocks.insert(
+                    index,
+                    AnthropicResponsesBlock::Search {
+                        output_index,
+                        item_id: item_id.clone(),
+                        tool_use_id,
+                        arguments,
+                        sources: Vec::new(),
+                        done: false,
+                    },
+                );
+                frames.push(StreamFrame::json(json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "web_search_call",
+                        "status": "in_progress",
+                        "action": {"type": "search", "query": ""}
+                    }
+                })));
+                frames.push(StreamFrame::json(json!({
+                    "type": "response.web_search_call.searching",
+                    "output_index": output_index,
+                    "item_id": item_id
+                })));
+            }
+            Some("web_search_tool_result") => {
+                self.next_output_index = self.next_output_index.saturating_sub(1);
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let search_index =
+                    self.blocks
+                        .iter()
+                        .find_map(|(known_index, known)| match known {
+                            AnthropicResponsesBlock::Search {
+                                tool_use_id: known_id,
+                                ..
+                            } if known_id == tool_use_id => Some(*known_index),
+                            _ => None,
+                        });
+                if let Some(search_index) = search_index {
+                    let sources = block
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|result| {
+                            let url = result.get("url").and_then(Value::as_str)?.trim();
+                            (!url.is_empty()).then(|| {
+                                json!({
+                                    "type": "url",
+                                    "url": url,
+                                    "title": result.get("title").and_then(Value::as_str).unwrap_or_default()
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(AnthropicResponsesBlock::Search {
+                        sources: known_sources,
+                        ..
+                    }) = self.blocks.get_mut(&search_index)
+                    {
+                        *known_sources = sources;
+                    }
+                    self.blocks.insert(
+                        index,
+                        AnthropicResponsesBlock::SearchResult { search_index },
+                    );
+                    frames.extend(self.finalize_block(search_index));
                 }
             }
             Some("tool_use") => {
@@ -4852,18 +5244,68 @@ impl AnthropicResponsesState {
                 output_index,
                 item_id,
                 text,
+                annotations,
+                citation_search_from_byte,
                 ..
             } => {
-                let Some(value) = delta.get("text").and_then(Value::as_str) else {
+                if let Some(value) = delta.get("text").and_then(Value::as_str) {
+                    text.push_str(value);
+                    return vec![StreamFrame::json(json!({
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": value
+                    }))];
+                }
+                let Some(citation) = delta.get("citation").filter(|_| {
+                    delta.get("type").and_then(Value::as_str) == Some("citations_delta")
+                }) else {
                     return Vec::new();
                 };
-                text.push_str(value);
+                let cited_text = citation
+                    .get("cited_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let Some((start_index, end_index, end_byte)) =
+                    scalar_range_for_cited_text(text, cited_text, *citation_search_from_byte)
+                        .or_else(|| scalar_range_for_cited_text(text, cited_text, 0))
+                else {
+                    return Vec::new();
+                };
+                let url = citation
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if url.is_empty()
+                    || annotations.iter().any(|annotation| {
+                        annotation.get("url").and_then(Value::as_str) == Some(url)
+                            && annotation.get("start_index").and_then(Value::as_u64)
+                                == u64::try_from(start_index).ok()
+                            && annotation.get("end_index").and_then(Value::as_u64)
+                                == u64::try_from(end_index).ok()
+                    })
+                {
+                    return Vec::new();
+                }
+                *citation_search_from_byte = end_byte;
+                let annotation = json!({
+                    "type": "url_citation",
+                    "url": url,
+                    "title": citation.get("title").and_then(Value::as_str).unwrap_or_default(),
+                    "start_index": start_index,
+                    "end_index": end_index,
+                    "text": cited_text
+                });
+                let annotation_index = annotations.len();
+                annotations.push(annotation.clone());
                 vec![StreamFrame::json(json!({
-                    "type": "response.output_text.delta",
+                    "type": "response.output_text.annotation.added",
                     "item_id": item_id,
                     "output_index": output_index,
                     "content_index": 0,
-                    "delta": value
+                    "annotation_index": annotation_index,
+                    "annotation": annotation
                 }))]
             }
             AnthropicResponsesBlock::Reasoning {
@@ -4909,6 +5351,13 @@ impl AnthropicResponsesState {
                     "delta": value
                 }))]
             }
+            AnthropicResponsesBlock::Search { arguments, .. } => {
+                if let Some(value) = delta.get("partial_json").and_then(Value::as_str) {
+                    arguments.push_str(value);
+                }
+                Vec::new()
+            }
+            AnthropicResponsesBlock::SearchResult { .. } => Vec::new(),
         }
     }
 
@@ -4916,6 +5365,12 @@ impl AnthropicResponsesState {
         let Some(index) = input.get("index").and_then(Value::as_i64) else {
             return Vec::new();
         };
+        if matches!(
+            self.blocks.get(&index),
+            Some(AnthropicResponsesBlock::Search { .. })
+        ) {
+            return Vec::new();
+        }
         self.finalize_block(index)
     }
 
@@ -4928,13 +5383,15 @@ impl AnthropicResponsesState {
                 output_index,
                 item_id,
                 text,
+                annotations,
                 done,
+                ..
             } => {
                 if *done {
                     return Vec::new();
                 }
                 *done = true;
-                let part = json!({"type": "output_text", "text": text, "annotations": []});
+                let part = json!({"type": "output_text", "text": text, "annotations": annotations});
                 let item = json!({
                     "id": item_id,
                     "type": "message",
@@ -5089,6 +5546,55 @@ impl AnthropicResponsesState {
                         "item": item
                     })),
                 ]
+            }
+            AnthropicResponsesBlock::Search {
+                output_index,
+                item_id,
+                arguments,
+                sources,
+                done,
+                ..
+            } => {
+                if *done {
+                    return Vec::new();
+                }
+                *done = true;
+                let query = serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .and_then(|arguments| {
+                        arguments
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let item = json!({
+                    "id": item_id,
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": query,
+                        "sources": sources
+                    }
+                });
+                self.output_items.push((*output_index, item.clone()));
+                vec![
+                    StreamFrame::json(json!({
+                        "type": "response.web_search_call.completed",
+                        "output_index": output_index,
+                        "item_id": item_id
+                    })),
+                    StreamFrame::json(json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item
+                    })),
+                ]
+            }
+            AnthropicResponsesBlock::SearchResult { search_index } => {
+                let _ = search_index;
+                Vec::new()
             }
         }
     }
@@ -5660,6 +6166,292 @@ mod tests {
             "tool_use"
         );
         assert!(state.completed);
+    }
+
+    #[test]
+    fn gemini_empty_text_part_does_not_close_the_active_text_block() {
+        let mut state = GeminiAnthropicState::default();
+        let mut frames = state.transform(&json!({
+            "responseId": "gem-empty-part",
+            "candidates": [{"content": {"parts": [{"text": "a"}]}}]
+        }));
+        frames.extend(state.transform(&json!({
+            "candidates": [{"content": {"parts": [{"text": ""}]}}]
+        })));
+        frames.extend(state.transform(&json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "b"}]},
+                "finishReason": "STOP"
+            }]
+        })));
+        frames.extend(state.finish_stream().unwrap());
+
+        let frames = json_stream_frames(&frames);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|value| value["type"] == "content_block_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|value| value["type"] == "content_block_stop")
+                .count(),
+            1
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter_map(|value| {
+                    (value.pointer("/delta/type") == Some(&json!("text_delta")))
+                        .then(|| value.pointer("/delta/text")?.as_str())
+                        .flatten()
+                })
+                .collect::<String>(),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal() {
+        let grounded = json!({
+            "responseId": "gem-grounded",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{
+                "index": 0,
+                "content": {"parts": [{"text": "A中🙂e\u{301}Z"}]},
+                "finishReason": "STOP",
+                "groundingMetadata": {
+                    "webSearchQueries": ["unicode sources"],
+                    "groundingChunks": [
+                        {"web": {"uri": "https://example.test/a", "title": "A"}},
+                        {"web": {"uri": "https://example.test/a", "title": "duplicate"}}
+                    ],
+                    "groundingSupports": [{
+                        "segment": {"partIndex": 0, "startIndex": 1, "endIndex": 11},
+                        "groundingChunkIndices": [0, 1, 99]
+                    }]
+                }
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4}
+        });
+
+        let mut responses =
+            GeminiOpenAiState::responses(transforms::ResponsesToolContext::default());
+        let mut response_frames = responses.transform(&grounded).unwrap();
+        response_frames.extend(responses.finish_stream().unwrap());
+        let response_values = json_stream_frames(&response_frames);
+        let event_types = response_values
+            .iter()
+            .filter_map(|value| value.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let searching = event_types
+            .iter()
+            .position(|event| *event == "response.web_search_call.searching")
+            .unwrap();
+        let text_delta = event_types
+            .iter()
+            .position(|event| *event == "response.output_text.delta")
+            .unwrap();
+        let annotation = event_types
+            .iter()
+            .position(|event| *event == "response.output_text.annotation.added")
+            .unwrap();
+        let text_done = event_types
+            .iter()
+            .position(|event| *event == "response.output_text.done")
+            .unwrap();
+        let terminal = event_types
+            .iter()
+            .position(|event| *event == "response.completed")
+            .unwrap();
+        assert!(searching < text_delta);
+        assert!(text_delta < annotation);
+        assert!(annotation < text_done);
+        assert!(text_done < terminal);
+
+        let annotation_value = response_values
+            .iter()
+            .find(|value| value["type"] == "response.output_text.annotation.added")
+            .unwrap();
+        assert_eq!(annotation_value["annotation"]["start_index"], 1);
+        assert_eq!(annotation_value["annotation"]["end_index"], 5);
+        let completed = response_values
+            .iter()
+            .find(|value| value["type"] == "response.completed")
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "web_search_call");
+        assert_eq!(output[0]["action"]["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            output[1]["content"][0]["annotations"][0]["url"],
+            "https://example.test/a"
+        );
+
+        let mut chat = GeminiOpenAiState::chat(transforms::ResponsesToolContext::default(), true);
+        let mut chat_frames = chat.transform(&grounded).unwrap();
+        chat_frames.extend(chat.finish_stream().unwrap());
+        let chat_values = json_stream_frames(&chat_frames);
+        let citation_index = chat_values
+            .iter()
+            .position(|value| {
+                value
+                    .pointer("/choices/0/delta/annotations/0/type")
+                    .and_then(Value::as_str)
+                    == Some("url_citation")
+            })
+            .unwrap();
+        let terminal_index = chat_values
+            .iter()
+            .position(|value| {
+                value
+                    .pointer("/choices/0/finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+            })
+            .unwrap();
+        assert!(citation_index < terminal_index);
+    }
+
+    #[test]
+    fn gemini_late_grounding_is_emitted_before_anthropic_terminal() {
+        let mut state = GeminiAnthropicState::with_web_search_expected(true);
+        let first = state.transform(&json!({
+            "responseId": "gem-late-grounding",
+            "candidates": [{"content": {"parts": [{"text": "中🙂"}]}}]
+        }));
+        assert!(first.is_empty());
+        let mut frames = state.transform(&json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "groundingMetadata": {
+                    "groundingChunks": [{"web": {"uri": "https://late.test", "title": "Late"}}],
+                    "groundingSupports": [{
+                        "segment": {"partIndex": 0, "startIndex": 0, "endIndex": 7},
+                        "groundingChunkIndices": [0]
+                    }]
+                }
+            }]
+        }));
+        frames.extend(state.finish_stream().unwrap());
+        let values = json_stream_frames(&frames);
+        let search = values
+            .iter()
+            .position(|value| {
+                value.pointer("/content_block/type") == Some(&json!("server_tool_use"))
+            })
+            .unwrap();
+        let text = values
+            .iter()
+            .position(|value| value.pointer("/delta/type") == Some(&json!("text_delta")))
+            .unwrap();
+        let citation = values
+            .iter()
+            .position(|value| value.pointer("/delta/type") == Some(&json!("citations_delta")))
+            .unwrap();
+        let block_stop = values
+            .iter()
+            .position(|value| value["type"] == "content_block_stop" && value["index"] == json!(2))
+            .unwrap();
+        let terminal = values
+            .iter()
+            .position(|value| value["type"] == "message_stop")
+            .unwrap();
+        assert!(search < text);
+        assert!(text < citation);
+        assert!(citation < block_stop);
+        assert!(block_stop < terminal);
+    }
+
+    #[test]
+    fn gemini_expected_search_without_grounding_flushes_at_terminal() {
+        let mut state = GeminiAnthropicState::with_web_search_expected(true);
+        assert!(state
+            .transform(&json!({
+                "responseId": "gem-search-without-grounding",
+                "candidates": [{"content": {"parts": [{"text": "plain answer"}]}}]
+            }))
+            .is_empty());
+        let mut frames = state.transform(&json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        frames.extend(state.finish_stream().unwrap());
+        let values = json_stream_frames(&frames);
+
+        assert_eq!(
+            values
+                .iter()
+                .filter_map(|value| {
+                    (value.pointer("/delta/type") == Some(&json!("text_delta")))
+                        .then(|| value.pointer("/delta/text")?.as_str())
+                        .flatten()
+                })
+                .collect::<String>(),
+            "plain answer"
+        );
+        assert!(!values.iter().any(|value| {
+            value.pointer("/content_block/type") == Some(&json!("server_tool_use"))
+        }));
+        assert!(values.iter().any(|value| value["type"] == "message_stop"));
+    }
+
+    #[test]
+    fn gemini_responses_late_grounding_buffers_until_search_precedes_text() {
+        let context = transforms::responses_tool_context(&json!({
+            "tools": [{"type": "web_search"}]
+        }));
+        let mut state = GeminiOpenAiState::responses(context);
+        assert!(state
+            .transform(&json!({
+                "responseId": "gem-responses-late-grounding",
+                "candidates": [{"content": {"parts": [{"text": "answer"}]}}]
+            }))
+            .unwrap()
+            .is_empty());
+        let mut frames = state
+            .transform(&json!({
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "groundingMetadata": {
+                        "webSearchQueries": ["query"],
+                        "groundingChunks": [{"web": {
+                            "uri": "https://late-responses.test",
+                            "title": "Late"
+                        }}],
+                        "groundingSupports": [{
+                            "segment": {"partIndex": 0, "startIndex": 0, "endIndex": 6},
+                            "groundingChunkIndices": [0]
+                        }]
+                    }
+                }]
+            }))
+            .unwrap();
+        frames.extend(state.finish_stream().unwrap());
+        let values = json_stream_frames(&frames);
+        let types = values
+            .iter()
+            .filter_map(|value| value.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let search = types
+            .iter()
+            .position(|kind| *kind == "response.web_search_call.searching")
+            .unwrap();
+        let text = types
+            .iter()
+            .position(|kind| *kind == "response.output_text.delta")
+            .unwrap();
+        let citation = types
+            .iter()
+            .position(|kind| *kind == "response.output_text.annotation.added")
+            .unwrap();
+        let terminal = types
+            .iter()
+            .position(|kind| *kind == "response.completed")
+            .unwrap();
+        assert!(search < text);
+        assert!(text < citation);
+        assert!(citation < terminal);
     }
 
     #[test]
@@ -7761,6 +8553,50 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(reasoning, vec!["first thought", "second thought"]);
         assert_eq!(text, vec!["first answer", "second answer"]);
+    }
+
+    #[test]
+    fn responses_to_chat_emits_snapshot_text_before_snapshot_annotations() {
+        let frames = ResponsesChatState::default().transform(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "id": "msg_snapshot",
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "source text",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.test/source",
+                            "title": "Source",
+                            "start_index": 0,
+                            "end_index": 6
+                        }]
+                    }]
+                }]
+            }
+        }));
+
+        let text_index = frames
+            .iter()
+            .position(|frame| {
+                frame.payload_json().pointer("/choices/0/delta/content")
+                    == Some(&json!("source text"))
+            })
+            .unwrap();
+        let annotation_index = frames
+            .iter()
+            .position(|frame| {
+                frame
+                    .payload_json()
+                    .pointer("/choices/0/delta/annotations/0/type")
+                    == Some(&json!("url_citation"))
+            })
+            .unwrap();
+
+        assert!(text_index < annotation_index);
     }
 
     #[test]

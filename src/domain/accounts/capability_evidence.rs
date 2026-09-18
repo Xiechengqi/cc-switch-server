@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::model::ProviderType;
@@ -24,6 +25,7 @@ pub const GEMINI_QUOTA_FAMILY_DIMENSION: &str = "gemini_quota_family";
 pub const CLAUDE_QUOTA_FAMILY_DIMENSION: &str = "claude_quota_family";
 pub const GPT_QUOTA_FAMILY_DIMENSION: &str = "gpt_quota_family";
 pub const MODEL_CAPACITY_DIMENSION: &str = "model_capacity";
+pub const ANTIGRAVITY_MODEL_SEARCH_DIMENSION_PREFIX: &str = "model_search:";
 pub const WEBSOCKET_DIMENSION: &str = "websocket";
 pub const IMAGE_GENERATION_DIMENSION: &str = "image_generation";
 pub const IMAGE_EDIT_DIMENSION: &str = "image_edit";
@@ -206,6 +208,29 @@ impl AccountCapabilityObservationDraft {
 
 pub fn observation_key(capability: &str, dimension: &str) -> String {
     format!("{capability}:{dimension}")
+}
+
+pub fn antigravity_model_search_dimension(model_id: &str) -> String {
+    const MAX_DIMENSION_BYTES: usize = 96;
+    let model_id = model_id.trim();
+    let model_id = model_id
+        .rsplit_once("/models/")
+        .map(|(_, model)| model)
+        .unwrap_or_else(|| model_id.strip_prefix("models/").unwrap_or(model_id));
+    let exact = format!("{ANTIGRAVITY_MODEL_SEARCH_DIMENSION_PREFIX}{model_id}");
+    let safe_exact = !model_id.is_empty()
+        && model_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if safe_exact && exact.len() <= MAX_DIMENSION_BYTES {
+        return exact;
+    }
+
+    let digest = Sha256::digest(model_id.as_bytes());
+    format!(
+        "{ANTIGRAVITY_MODEL_SEARCH_DIMENSION_PREFIX}sha256:{}",
+        hex::encode(&digest[..16])
+    )
 }
 
 pub fn record_observation_drafts(
@@ -1243,6 +1268,29 @@ mod tests {
         assert_eq!(
             projection.dimensions[SEARCH_DIMENSION].reason.as_deref(),
             Some("search_not_entitled")
+        );
+    }
+
+    #[test]
+    fn antigravity_model_search_dimensions_are_canonical_and_bounded() {
+        assert_eq!(
+            antigravity_model_search_dimension("models/gemini-2.5-flash"),
+            "model_search:gemini-2.5-flash"
+        );
+        assert_eq!(
+            antigravity_model_search_dimension("publishers/google/models/gemini-2.5-flash"),
+            "model_search:gemini-2.5-flash"
+        );
+
+        let long_model = format!("gemini-{}", "x".repeat(256));
+        let first = antigravity_model_search_dimension(&long_model);
+        let second = antigravity_model_search_dimension(&long_model);
+        assert_eq!(first, second);
+        assert!(first.starts_with("model_search:sha256:"));
+        assert!(first.len() <= 96);
+        assert_ne!(
+            first,
+            antigravity_model_search_dimension(&format!("{long_model}-different"))
         );
     }
 }

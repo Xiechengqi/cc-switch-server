@@ -23,6 +23,7 @@ pub struct AntigravityModelDescriptor {
     pub reset_time: Option<String>,
     pub supports_images: Option<bool>,
     pub supports_thinking: Option<bool>,
+    pub supports_web_search: Option<bool>,
     pub thinking_budget: Option<u64>,
     pub recommended: Option<bool>,
     pub max_tokens: Option<u64>,
@@ -282,6 +283,7 @@ fn parse_descriptors(raw: &Value) -> Result<Vec<AntigravityModelDescriptor>, Str
                 .map(str::to_string),
             supports_images: optional_bool(object, "supportsImages"),
             supports_thinking: optional_bool(object, "supportsThinking"),
+            supports_web_search: optional_web_search_capability(object),
             thinking_budget: optional_u64(object, "thinkingBudget"),
             recommended: optional_bool(object, "recommended"),
             max_tokens: optional_u64(object, "maxTokens"),
@@ -378,6 +380,24 @@ fn optional_bool(object: Option<&serde_json::Map<String, Value>>, field: &str) -
     object?.get(field)?.as_bool()
 }
 
+fn optional_web_search_capability(object: Option<&serde_json::Map<String, Value>>) -> Option<bool> {
+    let object = object?;
+    let values = [
+        object.get("supportsWebSearch").and_then(Value::as_bool),
+        object.get("supports_web_search").and_then(Value::as_bool),
+        object.get("webSearchSupported").and_then(Value::as_bool),
+        object
+            .get("nativeCapabilities")
+            .and_then(Value::as_object)
+            .and_then(|capabilities| capabilities.get("webSearch"))
+            .and_then(Value::as_bool),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    (values.len() == 1).then(|| *values.first().expect("one capability value"))
+}
+
 fn optional_u64(object: Option<&serde_json::Map<String, Value>>, field: &str) -> Option<u64> {
     object?.get(field)?.as_u64()
 }
@@ -395,6 +415,7 @@ mod tests {
                     "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-09-01T00:00:00Z"},
                     "supportsImages": true,
                     "supportsThinking": true,
+                    "nativeCapabilities": {"webSearch": true},
                     "thinkingBudget": 32768,
                     "maxTokens": 1048576,
                     "maxOutputTokens": 65536,
@@ -414,6 +435,7 @@ mod tests {
         assert_eq!(descriptors[0].family, "claude");
         assert_eq!(descriptors[1].family, "gemini");
         assert_eq!(descriptors[1].remaining_fraction, Some(0.0));
+        assert_eq!(descriptors[1].supports_web_search, Some(true));
         assert_eq!(descriptors[1].deprecated_aliases, ["gemini-old"]);
         assert_eq!(descriptors[2].family, "gpt");
     }
@@ -424,5 +446,35 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(parse_descriptors(&json!({"data": []})).is_err());
+    }
+
+    #[test]
+    fn web_search_capability_accepts_trusted_aliases_and_rejects_conflicts() {
+        let aliases = parse_descriptors(&json!({
+            "models": {
+                "gemini-camel": {"supportsWebSearch": true},
+                "gemini-snake": {"supports_web_search": false},
+                "gemini-suffix": {"webSearchSupported": true}
+            }
+        }))
+        .unwrap();
+        assert_eq!(aliases[0].supports_web_search, Some(true));
+        assert_eq!(aliases[1].supports_web_search, Some(false));
+        assert_eq!(aliases[2].supports_web_search, Some(true));
+
+        let nested = parse_descriptors(&json!({
+            "models": {"gemini-test": {"nativeCapabilities": {"webSearch": false}}}
+        }))
+        .unwrap();
+        assert_eq!(nested[0].supports_web_search, Some(false));
+
+        let conflicted = parse_descriptors(&json!({
+            "models": {"gemini-test": {
+                "supportsWebSearch": true,
+                "webSearchSupported": false
+            }}
+        }))
+        .unwrap();
+        assert_eq!(conflicted[0].supports_web_search, None);
     }
 }

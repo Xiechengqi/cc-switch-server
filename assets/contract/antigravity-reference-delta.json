@@ -2,6 +2,7 @@
   "format": "cc-switch-antigravity-reference-delta",
   "schemaVersion": 1,
   "capturedAt": "2026-09-11T00:00:00Z",
+  "updatedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider, Share, Account, rail, and credential generation; no pool; no rotation; no credential fallback; no cross-account fallback; no cross-Provider fallback",
@@ -45,6 +46,48 @@
             {"path": "internal/runtime/executor/helps/antigravity_compaction.go", "sha256": "7455c7720fb5eb2fa69984bcd168e21bf81627e0ad37cae5450fb30f6d872ef8"},
             {"path": "internal/runtime/executor/helps/antigravity_compaction_test.go", "sha256": "796a0f5ca125394f4dc9a78d88b156d3f2eaa5af6d1be61ea0d0ae9651c282ee"}
           ]
+        },
+        {
+          "id": "grounding_responses_initial",
+          "commit": "ef63d2e7fa8adfab8e6b29860e719028567e2226",
+          "files": [
+            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go", "sha256": "82de8fda7c185047e0c99bef1c7d9db56a9c311be9d12ebcefa1d1a144a240eb"}
+          ]
+        },
+        {
+          "id": "grounding_responses_stream_order",
+          "commit": "7fcbdf8896753d7af60f75c6c20d27bf0473f195",
+          "files": [
+            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go", "sha256": "cba60b7f720c84d4b2f208e284927e6adc2e5b0a6225b5b1d5126b5fd6795e1e"}
+          ]
+        },
+        {
+          "id": "request_model_metadata",
+          "commit": "a9e92b81453f1e23eccb2c7a9b6d1669aa733b9b",
+          "files": [
+            {"path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go", "sha256": "f10026cec60b5d299f002e9db08e90d2de20b6e26e1bdc48dd8668761b76e2b1"}
+          ]
+        },
+        {
+          "id": "mid_session_system_order",
+          "commit": "b681a1e0f7b89d26814f788b60bf84feaf72e912",
+          "files": [
+            {"path": "internal/translator/common/claude_system.go", "sha256": "ed2e0669c64e32b873de2e9113f2183a96f7ce2e29253a7935a58866ece71174"}
+          ]
+        },
+        {
+          "id": "orphan_function_output",
+          "commit": "8c984672a66ab824f96aace243248ec2a67403d5",
+          "files": [
+            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_request.go", "sha256": "d112b2b8e1eef9ee1e95af6eb2cb1bbf1a9df65ce5e8293570e98021aeb4f4ad"}
+          ]
+        },
+        {
+          "id": "empty_text_part_lifecycle",
+          "commit": "fd3e6623761d0d276f5ee6c5dbaf0996d4c6cd3f",
+          "files": [
+            {"path": "internal/translator/antigravity/claude/antigravity_claude_response.go", "sha256": "259bcdd33344a17aa8b14557ea97d3c457cce17c3a6652bab395ef732ee4f25a"}
+          ]
         }
       ]
     },
@@ -58,6 +101,20 @@
           "commit": "85fb4fe688997d3a0c2930b7a202cf22f617b092",
           "files": [
             {"path": "src-tauri/src/proxy/common/session.rs", "sha256": "7c4fb3c753b6c0ba85e7c0e79ed0e5faecc6d786f698f1649506d2e76c0abccc"}
+          ]
+        },
+        {
+          "id": "dynamic_request_type_conflicting_signal",
+          "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
+          "files": [
+            {"path": "src-tauri/src/proxy/mappers/gemini/wrapper.rs", "sha256": "5c24b5f58fe8dbfe85299369cc33645f1453840c7c05adc57966b2be11681c05"}
+          ]
+        },
+        {
+          "id": "claude_billing_metadata",
+          "commit": "9fd7798932146aee7eab38e1053843f8a512a2f5",
+          "files": [
+            {"path": "src-tauri/src/proxy/mappers/claude/request.rs", "sha256": "57eb5d011d4b8f268baf7a2d0e24cf362017b8861c36bca1fba42290655ad317"}
           ]
         }
       ]
@@ -96,6 +153,53 @@
       "runtimeEnabled": false,
       "contracts": [
         {"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]}
+      ]
+    },
+    {
+      "id": "AG-N1",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/gemini_grounding.rs", "anchors": ["GroundingAccumulator", "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks", "citation_ranges_can_span_incremental_mappings"]},
+        {"path": "src/proxy/transforms.rs", "anchors": ["gemini_grounding_maps_to_all_snapshot_surfaces_with_scalar_offsets"]},
+        {"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal", "gemini_responses_late_grounding_buffers_until_search_precedes_text", "gemini_expected_search_without_grounding_flushes_at_terminal"]}
+      ]
+    },
+    {
+      "id": "AG-N2",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/clients/oauth/antigravity_models.rs", "anchors": ["supports_web_search", "web_search_capability_accepts_trusted_aliases_and_rejects_conflicts"]},
+        {"path": "src/domain/accounts/capability_evidence.rs", "anchors": ["antigravity_model_search_dimension", "antigravity_model_search_dimensions_are_canonical_and_bounded"]},
+        {"path": "src/proxy/adapters.rs", "anchors": ["select_antigravity_web_search_model", "antigravity_web_search_model_selection_uses_fresh_per_model_evidence", "gemini_v1internal_rejects_runtime_auth_generation_drift"]}
+      ]
+    },
+    {
+      "id": "AG-N3",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/transforms.rs", "anchors": ["is_anthropic_billing_metadata_block", "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]}
+      ]
+    },
+    {
+      "id": "AG-N4",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/transforms.rs", "anchors": ["demoted_system_message", "cc-switch-server-orphan-tool-output-v1", "openai_requests_demote_mid_session_system_messages_without_reordering_them", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]}
+      ]
+    },
+    {
+      "id": "AG-N5",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_empty_text_part_does_not_close_the_active_text_block"]}
+      ]
+    },
+    {
+      "id": "AG-N6",
+      "status": "live_pending",
+      "runtimeChange": false,
+      "contracts": [
+        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]}
       ]
     }
   ],

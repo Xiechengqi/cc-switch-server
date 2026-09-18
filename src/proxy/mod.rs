@@ -28,6 +28,7 @@ pub(crate) mod deepseek_runtime;
 mod downstream_keepalive;
 mod execution;
 mod forwarder;
+mod gemini_grounding;
 mod grok;
 pub(crate) mod grok_replay;
 pub(crate) mod kimi;
