@@ -748,20 +748,12 @@ async fn run_tunnel_actor(
             }
             Ok(Err(error)) => {
                 let error_message = error.to_string();
-                let previous_router_generation = router_generation;
-                let previous_router_active_generation = router_active_generation;
-                (router_generation, router_active_generation) =
-                    sync_router_generations_after_lease_error(
-                        &error_message,
-                        router_generation,
-                        router_active_generation,
-                    );
-                if router_generation != previous_router_generation
-                    || router_active_generation != previous_router_active_generation
-                    || lease_issue_requires_new_rotation(&error)
-                {
-                    rotation_id = new_rotation_id();
-                }
+                recover_lease_issue_state_after_error(
+                    &error_message,
+                    &mut router_generation,
+                    &mut router_active_generation,
+                    &mut rotation_id,
+                );
                 set_status_for_generation(
                     &statuses,
                     &store_path,
@@ -1568,13 +1560,11 @@ fn log_lease_issue_retry(
 
 fn lease_issue_message_requires_new_rotation(message: &str) -> bool {
     message.contains("rotationId belongs to an expired or retired lease")
+        || message.contains("rotationId is already bound to different lease semantics")
+        || message.contains("rotationId has already been used")
         || message.contains("generation must be newer than persisted generation")
         || message.contains("route already has a non-expired candidate rotation")
         || message.contains("route generation changed: expected ")
-}
-
-fn lease_issue_requires_new_rotation(error: &anyhow::Error) -> bool {
-    lease_issue_message_requires_new_rotation(&error.to_string())
 }
 
 fn parse_route_active_generation_from_lease_error(message: &str) -> Option<u64> {
@@ -1609,12 +1599,38 @@ fn sync_router_generations_after_lease_error(
     (router_generation, router_active_generation)
 }
 
-fn next_router_generation_after_lease_error(message: &str, current: u64) -> u64 {
-    if let Some(rest) = message.strip_prefix("generation must be newer than persisted generation ")
+fn recover_lease_issue_state_after_error(
+    message: &str,
+    router_generation: &mut u64,
+    router_active_generation: &mut u64,
+    rotation_id: &mut String,
+) {
+    let previous_router_generation = *router_generation;
+    let previous_router_active_generation = *router_active_generation;
+    (*router_generation, *router_active_generation) = sync_router_generations_after_lease_error(
+        message,
+        *router_generation,
+        *router_active_generation,
+    );
+    if *router_generation != previous_router_generation
+        || *router_active_generation != previous_router_active_generation
+        || lease_issue_message_requires_new_rotation(message)
     {
-        if let Ok(max_generation) = rest.trim().parse::<u64>() {
-            return max_generation.saturating_add(1).max(current);
-        }
+        *rotation_id = new_rotation_id();
+    }
+}
+
+fn next_router_generation_after_lease_error(message: &str, current: u64) -> u64 {
+    if let Some(max_generation) = message
+        .split("generation must be newer than persisted generation ")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return max_generation.saturating_add(1).max(current);
     }
     current.saturating_add(1).max(1)
 }
@@ -2414,7 +2430,7 @@ mod tests {
     fn next_router_generation_after_lease_error_reads_persisted_max() {
         assert_eq!(
             next_router_generation_after_lease_error(
-                "generation must be newer than persisted generation 7",
+                "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"generation must be newer than persisted generation 7\"}",
                 3,
             ),
             8,
@@ -2451,5 +2467,46 @@ mod tests {
             ),
             (6, 4),
         );
+    }
+
+    #[test]
+    fn rotation_semantics_conflicts_replace_rotation_and_advance_generation() {
+        for message in [
+            "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"rotationId is already bound to different lease semantics\"}",
+            "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"rotationId has already been used\"}",
+        ] {
+            let mut router_generation = 4;
+            let mut router_active_generation = 3;
+            let mut rotation_id = "rotation-before-conflict".to_string();
+
+            recover_lease_issue_state_after_error(
+                message,
+                &mut router_generation,
+                &mut router_active_generation,
+                &mut rotation_id,
+            );
+
+            assert_eq!(router_generation, 5);
+            assert_eq!(router_active_generation, 3);
+            assert_ne!(rotation_id, "rotation-before-conflict");
+        }
+    }
+
+    #[test]
+    fn transient_lease_errors_preserve_rotation_and_generation() {
+        let mut router_generation = 4;
+        let mut router_active_generation = 3;
+        let mut rotation_id = "rotation-before-retry".to_string();
+
+        recover_lease_issue_state_after_error(
+            "send router namespace tunnel lease: connection reset",
+            &mut router_generation,
+            &mut router_active_generation,
+            &mut rotation_id,
+        );
+
+        assert_eq!(router_generation, 4);
+        assert_eq!(router_active_generation, 3);
+        assert_eq!(rotation_id, "rotation-before-retry");
     }
 }
