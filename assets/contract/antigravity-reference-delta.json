@@ -126,6 +126,7 @@
       "status": "fixture_verified",
       "contracts": [
         {"path": "src/proxy/antigravity_replay.rs", "anchors": ["AntigravityReplayScope", "miss_tombstone_and_snapshot_cas_fence_concurrent_writers", "inserts_parallel_signed_calls_before_tool_results", "expired_snapshot_cannot_delete_newer_value"]},
+        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "commit_complete_stream", "reasoning_replay_binding_is_current"]},
         {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
       ]
     },
@@ -134,6 +135,7 @@
       "status": "fixture_verified",
       "contracts": [
         {"path": "src/proxy/antigravity_replay.rs", "anchors": ["derive_session_id", "is_session_accumulation_error", "session_id_is_conversation_scoped_and_rollover_error_is_exact"]},
+        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["apply_session_contract", "session_rollover_source"]},
         {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_session_accumulation_rolls_over_once_on_the_same_binding", "antigravity_session_contract_skips_count_tokens_and_web_search"]}
       ]
     },
@@ -143,6 +145,7 @@
       "contracts": [
         {"path": "src/proxy/tool_schema.rs", "anchors": ["normalize_antigravity_request_schemas", "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]},
         {"path": "src/proxy/antigravity_transport.rs", "anchors": ["defaults_to_short_connections_and_bounds_pool_settings", "cache_key_fences_runtime_account_generation_and_resolved_settings", "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"]},
+        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["record_limit_evidence", "mark_limit_cooldown", "http_client"]},
         {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_retry_after_is_rounded_up_bounded_and_preserves_upstream", "antigravity_long_limit_cools_only_the_structured_share_runtime_model"]},
         {"path": "src/clients/oauth/quota.rs", "anchors": ["antigravity_missing_family_and_non_model_capacity_remain_unknown"]}
       ]
@@ -152,7 +155,8 @@
       "status": "live_pending",
       "runtimeEnabled": false,
       "contracts": [
-        {"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]}
+        {"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]},
+        {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["receipt.decisions?.compaction !== \"runtime_disabled\""]}
       ]
     },
     {
@@ -199,12 +203,48 @@
       "status": "live_pending",
       "runtimeChange": false,
       "contracts": [
-        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]}
+        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]},
+        {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\""]}
       ]
     }
   ],
   "realAcceptance": {
     "receiptSchemaVersion": 1,
+    "harnessRevision": 1,
+    "scopeDigest": "sha256 lowercase hex over the exact rail, target commit, Account generation, two Provider bindings, Share revision, selected models, and fresh catalog snapshots; raw credentials and prompts are excluded",
+    "requiredChecks": [
+      "bound_account_and_two_surface_bindings",
+      "fresh_catalog",
+      "authoritative_empty_catalog",
+      "transient_stale_catalog",
+      "claude_nonstream_stream_tool_usage",
+      "gemini_nonstream_stream_tool_usage",
+      "plain_request_type",
+      "tools_request_type",
+      "history_tool_request_type",
+      "web_search_request_type",
+      "mixed_tools_request_type",
+      "reasoning_replay",
+      "session_rollover",
+      "same_account_first_401_recovery",
+      "second_401_terminal",
+      "structured_429_scope",
+      "terminal_then_eof",
+      "decoy_zero_requests",
+      "compaction_gate_fail_closed",
+      "secret_scan"
+    ],
+    "requiredBodyHashes": [
+      "claude_nonstream",
+      "claude_stream",
+      "gemini_nonstream",
+      "gemini_stream",
+      "plain_request",
+      "tools_request",
+      "history_tool_request",
+      "web_search_request",
+      "mixed_tools_request"
+    ],
     "rails": [
       {"rail": "antigravity_oauth", "status": "live_pending", "receipt": null},
       {"rail": "agy_oauth", "status": "live_pending", "receipt": null}

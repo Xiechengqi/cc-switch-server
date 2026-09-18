@@ -28,6 +28,20 @@ function runEnvCheck(overrides) {
       ROUTER_API_TOKEN: "",
       CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT: "",
       CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "",
+      ANTIGRAVITY_OAUTH_TEST_ACCOUNT: "",
+      CC_SWITCH_ANTIGRAVITY_OAUTH_SHARE_ID: "",
+      CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_PROVIDER_ID: "",
+      CC_SWITCH_ANTIGRAVITY_OAUTH_GEMINI_PROVIDER_ID: "",
+      CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_MODEL: "",
+      CC_SWITCH_ANTIGRAVITY_OAUTH_GEMINI_MODEL: "",
+      ANTIGRAVITY_OAUTH_REAL_RECEIPT_FILE: "",
+      AGY_OAUTH_TEST_ACCOUNT: "",
+      CC_SWITCH_AGY_OAUTH_SHARE_ID: "",
+      CC_SWITCH_AGY_OAUTH_CLAUDE_PROVIDER_ID: "",
+      CC_SWITCH_AGY_OAUTH_GEMINI_PROVIDER_ID: "",
+      CC_SWITCH_AGY_OAUTH_CLAUDE_MODEL: "",
+      CC_SWITCH_AGY_OAUTH_GEMINI_MODEL: "",
+      AGY_OAUTH_REAL_RECEIPT_FILE: "",
       CC_SWITCH_CODEX_IMAGES_SMOKE: "0",
       GITHUB_COPILOT_TEST_ACCOUNT: "",
       CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID: "",
@@ -80,6 +94,41 @@ test("Claude Max and Grok external input gates remain isolated", () => {
   assert.equal(maxReady.checks.grokGateStatus, "blocked-inputs");
   assert.equal(maxReady.checks.claudeMax5xGateStatus, "inputs-ready");
   assert.equal(maxReady.checks.claudeMax20xGateStatus, "inputs-ready");
+});
+
+test("Antigravity and Agy external gates require independent bindings and receipts", () => {
+  const common = {
+    STAGE: "AB6",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+  };
+  const antigravity = runEnvCheck({
+    ...common,
+    ANTIGRAVITY_OAUTH_TEST_ACCOUNT: "antigravity-account",
+    CC_SWITCH_ANTIGRAVITY_OAUTH_SHARE_ID: "antigravity-share",
+    CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_PROVIDER_ID: "antigravity-claude",
+    CC_SWITCH_ANTIGRAVITY_OAUTH_GEMINI_PROVIDER_ID: "antigravity-gemini",
+    CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_MODEL: "claude-sonnet-4-6",
+    CC_SWITCH_ANTIGRAVITY_OAUTH_GEMINI_MODEL: "gemini-3.5-flash-medium",
+    ANTIGRAVITY_OAUTH_REAL_RECEIPT_FILE: "/tmp/antigravity-receipt.json",
+  });
+  assert.equal(antigravity.checks.antigravityOauthGateStatus, "inputs-ready");
+  assert.equal(antigravity.checks.agyOauthGateStatus, "blocked-inputs");
+
+  const agy = runEnvCheck({
+    ...common,
+    AGY_OAUTH_TEST_ACCOUNT: "agy-account",
+    CC_SWITCH_AGY_OAUTH_SHARE_ID: "agy-share",
+    CC_SWITCH_AGY_OAUTH_CLAUDE_PROVIDER_ID: "agy-claude",
+    CC_SWITCH_AGY_OAUTH_GEMINI_PROVIDER_ID: "agy-gemini",
+    CC_SWITCH_AGY_OAUTH_CLAUDE_MODEL: "claude-sonnet-4-6",
+    CC_SWITCH_AGY_OAUTH_GEMINI_MODEL: "gemini-3.5-flash-medium",
+    AGY_OAUTH_REAL_RECEIPT_FILE: "/tmp/agy-receipt.json",
+  });
+  assert.equal(agy.checks.antigravityOauthGateStatus, "blocked-inputs");
+  assert.equal(agy.checks.agyOauthGateStatus, "inputs-ready");
 });
 
 test("Codex Images gate distinguishes disabled, blocked, and input-ready states", () => {

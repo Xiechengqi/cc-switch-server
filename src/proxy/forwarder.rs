@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
+#[cfg(test)]
+use axum::http::header::RETRY_AFTER;
 use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
+    ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
@@ -69,10 +71,6 @@ use super::adapters::{self, ProviderAdapter, UpstreamFormat};
 use super::anthropic_semantics::{
     self, AnthropicJsonObservation, AnthropicObservation, AnthropicSseInspector, AnthropicTerminal,
 };
-use super::antigravity_replay::{
-    AntigravityReplayChain, AntigravityReplayScope, AntigravityReplaySnapshot,
-    AntigravityReplayStreamAccumulator,
-};
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::claude_quota_headers::{
     claude_shared_window_explicitly_healthy, header_lower, parse_anthropic_reset_header,
@@ -106,6 +104,7 @@ use super::openai_capacity_shed::{
     synthesize_openai_capacity_shed_failed_sse,
 };
 use super::provider_ops::{ProviderExecution, ProviderOperation};
+use super::providers::antigravity;
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
@@ -2593,14 +2592,14 @@ async fn forward_with_attempt(
             (adapter_request, url, target_headers)
         };
 
-        apply_antigravity_session_contract(
+        antigravity::apply_session_contract(
             &execution,
             route,
             &request_context,
-            &attempt_context,
+            attempt_context.antigravity_session_generation,
             &mut adapter_request.body,
         );
-        let antigravity_reasoning_replay = prepare_antigravity_reasoning_replay(
+        let antigravity_reasoning_replay = antigravity::prepare_reasoning_replay(
             &state,
             &execution,
             route,
@@ -3130,10 +3129,10 @@ async fn forward_with_attempt(
                     )?
                 }
             };
-            let antigravity_limit = antigravity_limit_info(&execution, status, &decoded.body);
+            let antigravity_limit = antigravity::limit_info(&execution, status, &decoded.body);
             if let Some(limit) = antigravity_limit.as_ref() {
-                install_antigravity_retry_after(&mut response_headers, limit);
-                record_antigravity_limit_evidence(&state, &execution, limit).await;
+                antigravity::install_retry_after(&mut response_headers, limit);
+                antigravity::record_limit_evidence(&state, &execution, limit).await;
                 if let Some(next_attempt) =
                     next_antigravity_limit_attempt(route, &attempt_context, &execution, limit)
                 {
@@ -3150,7 +3149,12 @@ async fn forward_with_attempt(
                     tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
                     continue 'attempt;
                 }
-                mark_antigravity_limit_cooldown(&state, &execution, &request_context, limit);
+                antigravity::mark_limit_cooldown(
+                    &state,
+                    &execution,
+                    request_context.share_id.as_deref(),
+                    limit,
+                );
             } else {
                 maybe_mark_upstream_rate_limited(
                     &state,
@@ -4218,11 +4222,7 @@ async fn forward_with_attempt(
                     }
                 }),
                 antigravity_reasoning_replay: antigravity_reasoning_replay.clone().map(|context| {
-                    AntigravityReplayStreamWrite {
-                        request_body: adapter_request.body.clone(),
-                        context,
-                        accumulator: AntigravityReplayStreamAccumulator::default(),
-                    }
+                    antigravity::ReplayStreamWrite::new(context, adapter_request.body.clone())
                 }),
                 kimi_thinking_replay: kimi_thinking_replay.clone().map(|context| {
                     KimiThinkingReplayStreamWrite {
@@ -5125,9 +5125,9 @@ async fn forward_with_attempt(
         };
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
-        if let Some(limit) = antigravity_limit_info(&execution, status, &bytes) {
-            install_antigravity_retry_after(&mut response_headers, &limit);
-            record_antigravity_limit_evidence(&state, &execution, &limit).await;
+        if let Some(limit) = antigravity::limit_info(&execution, status, &bytes) {
+            antigravity::install_retry_after(&mut response_headers, &limit);
+            antigravity::record_limit_evidence(&state, &execution, &limit).await;
             if let Some(next_attempt) =
                 next_antigravity_limit_attempt(route, &attempt_context, &execution, &limit)
             {
@@ -5139,18 +5139,22 @@ async fn forward_with_attempt(
                 tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
                 continue 'attempt;
             }
-            mark_antigravity_limit_cooldown(&state, &execution, &request_context, &limit);
+            antigravity::mark_limit_cooldown(
+                &state,
+                &execution,
+                request_context.share_id.as_deref(),
+                &limit,
+            );
         }
-        if matches!(
-            execution.stored.provider_type,
-            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-        ) && super::antigravity_replay::is_session_accumulation_error(status.as_u16(), &bytes)
-            && !attempt_context.antigravity_session_rollover_attempted
-            && attempt_context.retry_allowed()
-            && execution.managed_account_identity_target().is_some()
-            && request_context.session_id.is_some()
-        {
-            record_forward_retry(route, "body", "session_accumulation_exceeded");
+        if let Some(source) = antigravity::session_rollover_source(
+            &execution,
+            status,
+            &bytes,
+            attempt_context.antigravity_session_rollover_attempted,
+            attempt_context.retry_allowed(),
+            request_context.session_id.is_some(),
+        ) {
+            record_forward_retry(route, "body", source);
             if let Some(next_attempt) =
                 attempt_context.after_antigravity_session_rollover(&execution)
             {
@@ -5160,8 +5164,8 @@ async fn forward_with_attempt(
                 continue 'attempt;
             }
         }
-        if super::antigravity_replay::is_signature_rejection(status.as_u16(), &bytes) {
-            clear_rejected_antigravity_reasoning_replay(
+        if antigravity::is_signature_rejection(status, &bytes) {
+            antigravity::clear_rejected_reasoning_replay(
                 &state,
                 antigravity_reasoning_replay.as_ref(),
             )
@@ -5371,19 +5375,12 @@ async fn forward_with_attempt(
             .is_success()
             .then(|| kimi_thinking_replay_content_from_response(&bytes))
             .flatten();
-        let antigravity_replay_terminal =
-            status.is_success() && super::antigravity_replay::response_has_terminal(&bytes);
-        let antigravity_replay_chain = antigravity_replay_terminal
-            .then(|| {
-                antigravity_reasoning_replay.as_ref().and_then(|context| {
-                    super::antigravity_replay::capture_response(
-                        &adapter_request.body,
-                        &bytes,
-                        context.previous_chain.as_ref(),
-                    )
-                })
-            })
-            .flatten();
+        let antigravity_replay_capture = antigravity::capture_response(
+            antigravity_reasoning_replay.as_ref(),
+            &adapter_request.body,
+            &bytes,
+            status.is_success(),
+        );
         let grok_replay_proof = status
             .is_success()
             .then(|| super::grok_replay::capture_document(&bytes))
@@ -5445,11 +5442,10 @@ async fn forward_with_attempt(
             RequestMemoryComponent::NormalizedEvent,
         )?;
         if status.is_success() {
-            commit_antigravity_reasoning_replay(
+            antigravity::commit_captured_response(
                 &state,
                 antigravity_reasoning_replay.as_ref(),
-                antigravity_replay_terminal,
-                antigravity_replay_chain,
+                antigravity_replay_capture,
             )
             .await;
             commit_kimi_thinking_replay(
@@ -16319,19 +16315,6 @@ fn claude_fast_credit_refusal(body: &[u8]) -> bool {
             && (message.contains("usage credits") || message.contains("credits are required")))
 }
 
-fn antigravity_limit_info(
-    execution: &ProviderExecution,
-    status: StatusCode,
-    body: &[u8],
-) -> Option<super::antigravity_retry::AntigravityRetryInfo> {
-    matches!(
-        execution.stored.provider_type,
-        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-    )
-    .then(|| super::antigravity_retry::parse_google_rpc_retry(status.as_u16(), body))
-    .flatten()
-}
-
 fn take_codex_http_fallback_capacity_retry(
     attempt_context: &mut ForwardAttemptContext,
     execution: &ProviderExecution,
@@ -16484,89 +16467,14 @@ fn next_antigravity_limit_attempt(
     execution: &ProviderExecution,
     limit: &super::antigravity_retry::AntigravityRetryInfo,
 ) -> Option<ForwardAttemptContext> {
-    if attempt_context.antigravity_retry_attempted
-        || !attempt_context.retry_allowed()
-        || !limit.is_short_delay()
-        || execution.managed_account_identity_target().is_none()
-    {
-        return None;
-    }
-    let source = limit.kind.reason();
+    let source = antigravity::limit_retry_source(
+        attempt_context.antigravity_retry_attempted,
+        attempt_context.retry_allowed(),
+        execution,
+        limit,
+    )?;
     record_forward_retry(route, "capacity", source);
     attempt_context.after_antigravity_retry(execution, source)
-}
-
-async fn record_antigravity_limit_evidence(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    limit: &super::antigravity_retry::AntigravityRetryInfo,
-) {
-    use crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::{
-        Unknown, Unsupported,
-    };
-
-    let Some((provider_type, account_id, auth_identity_generation)) =
-        execution.managed_account_identity_target()
-    else {
-        return;
-    };
-    let observation_state = match limit.kind {
-        super::antigravity_retry::AntigravityLimitKind::RateLimit => Unknown,
-        super::antigravity_retry::AntigravityLimitKind::ModelCapacity => Unsupported,
-    };
-    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let expires_at_ms =
-        now_ms.saturating_add(i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX));
-    if let Err(error) = state
-        .record_antigravity_capability_observation_if_current(
-            account_id,
-            crate::domain::accounts::capability_evidence::MODEL_CAPACITY_DIMENSION,
-            crate::state::CurrentAccountCapabilityObservation {
-                provider_type,
-                auth_identity_generation,
-                state: observation_state,
-                source: "google_rpc_error",
-                reason: Some(limit.kind.reason()),
-                expires_at_ms: Some(expires_at_ms),
-            },
-        )
-        .await
-    {
-        tracing::warn!(
-            account_id,
-            provider_type = provider_type.as_str(),
-            error = %error,
-            "failed to persist Antigravity capacity evidence"
-        );
-    }
-}
-
-fn mark_antigravity_limit_cooldown(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    request_context: &UsageLogContext,
-    limit: &super::antigravity_retry::AntigravityRetryInfo,
-) {
-    let Some(share_id) = request_context
-        .share_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let delay_ms = i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX);
-    let until_ms =
-        super::bounded_upstream_rate_limit_until(now_ms, now_ms.saturating_add(delay_ms));
-    state.mark_share_model_cooldown(
-        share_id,
-        &execution.plan.runtime_fingerprint,
-        &limit.model,
-        until_ms,
-        limit.kind.reason(),
-        now_ms,
-    );
 }
 
 async fn mark_managed_account_auth_cooldown(
@@ -25170,319 +25078,6 @@ fn grok_replay_now_ms() -> i64 {
     current_time_ms().min(i64::MAX as u128) as i64
 }
 
-fn apply_antigravity_session_contract(
-    execution: &ProviderExecution,
-    route: ProxyRoute,
-    request_context: &UsageLogContext,
-    attempt_context: &ForwardAttemptContext,
-    body: &mut Bytes,
-) {
-    if route == ProxyRoute::ClaudeCountTokens
-        || !matches!(
-            execution.stored.provider_type,
-            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-        )
-    {
-        return;
-    }
-    let Ok(document) = serde_json::from_slice::<Value>(body) else {
-        return;
-    };
-    if document.get("requestType").and_then(Value::as_str) == Some("web_search") {
-        return;
-    }
-    let Some((_, account_id, _)) = execution.managed_account_identity_target() else {
-        return;
-    };
-    let Some(conversation_scope) = request_context
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let Some(session_id) = super::antigravity_replay::derive_session_id(
-        account_id,
-        conversation_scope,
-        attempt_context.antigravity_session_generation,
-    ) else {
-        return;
-    };
-    if super::antigravity_replay::apply_session_id(body, &session_id) {
-        crate::metrics::record_antigravity_reasoning_replay("session_id_applied", 1);
-    }
-}
-
-async fn prepare_antigravity_reasoning_replay(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    route: ProxyRoute,
-    request_context: &UsageLogContext,
-    upstream_url: &str,
-    body: &mut Bytes,
-) -> Option<AntigravityReplayWriteContext> {
-    if route == ProxyRoute::ClaudeCountTokens
-        || !matches!(
-            execution.stored.provider_type,
-            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-        )
-    {
-        return None;
-    }
-    let share_id = request_context
-        .share_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let user_namespace = super::antigravity_replay::user_namespace(
-        request_context
-            .user_email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?,
-    )?;
-    let session_id = request_context
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let document = serde_json::from_slice::<Value>(body).ok()?;
-    if document.get("requestType").and_then(Value::as_str) == Some("web_search") {
-        return None;
-    }
-    let model = document.get("model")?.as_str()?;
-    let model_family = super::antigravity_replay::model_family(model)?;
-    let upstream_plane = reqwest::Url::parse(upstream_url)
-        .ok()?
-        .host_str()?
-        .to_ascii_lowercase();
-    let (provider_type, account_id, auth_identity_generation) =
-        execution.managed_account_identity_target()?;
-    if !matches!(
-        provider_type,
-        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-    ) {
-        return None;
-    }
-    let account = state
-        .find_account_for_provider(provider_type, account_id)
-        .await
-        .filter(|account| account.auth_identity_generation == auth_identity_generation)?;
-    let token_refresh_generation = account.token_refresh_generation;
-    let scope = AntigravityReplayScope::derive(
-        execution.plan.provider_key.app.as_str(),
-        &execution.stored.provider.id,
-        execution.plan.provider_revision,
-        &execution.plan.runtime_fingerprint,
-        account_id,
-        auth_identity_generation,
-        token_refresh_generation,
-        share_id,
-        &user_namespace,
-        session_id,
-        &model_family,
-        &upstream_plane,
-    )?;
-    let now_ms = antigravity_replay_now_ms();
-    let (mut previous_chain, mut snapshot) = state
-        .antigravity_reasoning_replays
-        .get(&scope, now_ms)
-        .await;
-    let mut ownership = CacheSnapshotOwnership::from_hit(
-        "antigravity_reasoning",
-        scope.ownership_digest(),
-        snapshot.generation(),
-    );
-    let mut replay_applied = false;
-    if let Some(chain) = previous_chain.as_ref() {
-        let result = super::antigravity_replay::apply_replay(body, chain);
-        if result.applied {
-            *body = result.body;
-            replay_applied = true;
-            crate::metrics::record_antigravity_reasoning_replay("hit", 1);
-        } else if result.context_mismatch {
-            crate::metrics::record_antigravity_reasoning_replay("context_mismatch", 1);
-            if ownership.authorize_mutation(
-                "antigravity_reasoning",
-                &scope.ownership_digest(),
-                snapshot.generation(),
-            ) && state
-                .antigravity_reasoning_replays
-                .delete_if_unchanged(&scope, snapshot, now_ms)
-                .await
-            {
-                let refreshed = state
-                    .antigravity_reasoning_replays
-                    .get(&scope, now_ms)
-                    .await;
-                previous_chain = refreshed.0;
-                snapshot = refreshed.1;
-                ownership = CacheSnapshotOwnership::from_hit(
-                    "antigravity_reasoning",
-                    scope.ownership_digest(),
-                    snapshot.generation(),
-                );
-            }
-        } else {
-            crate::metrics::record_antigravity_reasoning_replay("present_noop", 1);
-        }
-    } else {
-        crate::metrics::record_antigravity_reasoning_replay("miss", 1);
-    }
-    Some(AntigravityReplayWriteContext {
-        scope,
-        snapshot,
-        ownership,
-        previous_chain,
-        replay_applied,
-        app: execution.plan.provider_key.app,
-        provider_id: execution.stored.provider.id.clone(),
-        provider_revision: execution.plan.provider_revision,
-        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
-        provider_type,
-        account_id: account_id.to_string(),
-        auth_identity_generation,
-        token_refresh_generation,
-        share_id: share_id.to_string(),
-    })
-}
-
-async fn clear_rejected_antigravity_reasoning_replay(
-    state: &ServerState,
-    context: Option<&AntigravityReplayWriteContext>,
-) {
-    let Some(context) = context.filter(|context| context.replay_applied) else {
-        return;
-    };
-    if !context.ownership.authorize_mutation(
-        "antigravity_reasoning",
-        &context.scope.ownership_digest(),
-        context.snapshot.generation(),
-    ) {
-        crate::metrics::record_antigravity_reasoning_replay("delete_ownership_denied", 1);
-        return;
-    }
-    let deleted = state
-        .antigravity_reasoning_replays
-        .delete_if_unchanged(
-            &context.scope,
-            context.snapshot,
-            antigravity_replay_now_ms(),
-        )
-        .await;
-    crate::metrics::record_antigravity_reasoning_replay(
-        if deleted {
-            "upstream_rejected"
-        } else {
-            "delete_conflict"
-        },
-        1,
-    );
-}
-
-async fn commit_antigravity_reasoning_replay(
-    state: &ServerState,
-    context: Option<&AntigravityReplayWriteContext>,
-    terminal: bool,
-    chain: Option<AntigravityReplayChain>,
-) {
-    let Some(context) = context.filter(|_| terminal) else {
-        return;
-    };
-    if !antigravity_reasoning_replay_binding_is_current(state, context).await {
-        crate::metrics::record_antigravity_reasoning_replay("binding_drift", 1);
-        return;
-    }
-    if !context.ownership.authorize_mutation(
-        "antigravity_reasoning",
-        &context.scope.ownership_digest(),
-        context.snapshot.generation(),
-    ) {
-        crate::metrics::record_antigravity_reasoning_replay("write_ownership_denied", 1);
-        return;
-    }
-    let now_ms = antigravity_replay_now_ms();
-    let stored = if let Some(chain) = chain {
-        state
-            .antigravity_reasoning_replays
-            .replace_if_unchanged(context.scope.clone(), context.snapshot, chain, now_ms)
-            .await
-    } else {
-        state
-            .antigravity_reasoning_replays
-            .delete_if_unchanged(&context.scope, context.snapshot, now_ms)
-            .await
-    };
-    crate::metrics::record_antigravity_reasoning_replay(
-        if stored {
-            if context.previous_chain.is_some() {
-                "updated"
-            } else {
-                "stored"
-            }
-        } else {
-            "write_conflict"
-        },
-        1,
-    );
-}
-
-async fn antigravity_reasoning_replay_binding_is_current(
-    state: &ServerState,
-    context: &AntigravityReplayWriteContext,
-) -> bool {
-    if state.credential_persistence_degraded() {
-        return false;
-    }
-    let Some(plan) = state
-        .provider_runtime_plan(context.app, &context.provider_id)
-        .await
-    else {
-        return false;
-    };
-    if plan.provider_revision != context.provider_revision
-        || plan.runtime_fingerprint != context.runtime_fingerprint
-        || !matches!(
-            &plan.auth_ref,
-            RuntimeAuthRef::ManagedAccount {
-                account_id,
-                expected_provider_type,
-                auth_identity_generation,
-            } if account_id == &context.account_id
-                && *expected_provider_type == context.provider_type
-                && *auth_identity_generation == context.auth_identity_generation
-        )
-    {
-        return false;
-    }
-    let Some(account) = state
-        .find_account_for_provider(context.provider_type, &context.account_id)
-        .await
-    else {
-        return false;
-    };
-    if account.auth_identity_generation != context.auth_identity_generation
-        || account.token_refresh_generation != context.token_refresh_generation
-    {
-        return false;
-    }
-    let shares = state.shares.read().await;
-    shares.get(&context.share_id).is_some_and(|share| {
-        share.enabled
-            && share.status == "active"
-            && share.bindings.iter().any(|binding| {
-                binding.app == context.app
-                    && binding.provider_id == context.provider_id
-                    && binding.provider_type == context.provider_type
-            })
-    })
-}
-
-fn antigravity_replay_now_ms() -> i64 {
-    current_time_ms().min(i64::MAX as u128) as i64
-}
-
 async fn prepare_kimi_thinking_replay(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -25703,7 +25298,7 @@ struct StreamForwardState {
     grok_search_identity: Option<(String, u64)>,
     grok_search_evidence_recorded: bool,
     grok_reasoning_replay: Option<GrokReplayStreamWrite>,
-    antigravity_reasoning_replay: Option<AntigravityReplayStreamWrite>,
+    antigravity_reasoning_replay: Option<antigravity::ReplayStreamWrite>,
     kimi_thinking_replay: Option<KimiThinkingReplayStreamWrite>,
     stream_transform: super::stream_transforms::StreamEventTransformer,
     terminal_detector: UpstreamTerminalDetector,
@@ -25850,24 +25445,6 @@ struct KimiThinkingReplayWriteContext {
 }
 
 #[derive(Debug, Clone)]
-struct AntigravityReplayWriteContext {
-    scope: AntigravityReplayScope,
-    snapshot: AntigravityReplaySnapshot,
-    ownership: CacheSnapshotOwnership,
-    previous_chain: Option<AntigravityReplayChain>,
-    replay_applied: bool,
-    app: AppKind,
-    provider_id: String,
-    provider_revision: u64,
-    runtime_fingerprint: String,
-    provider_type: ProviderType,
-    account_id: String,
-    auth_identity_generation: u64,
-    token_refresh_generation: u64,
-    share_id: String,
-}
-
-#[derive(Debug, Clone)]
 struct GrokReplayWriteContext {
     read: Option<(GrokReplayScope, GrokReplaySnapshot, CacheSnapshotOwnership)>,
     write_scope: GrokReplayScope,
@@ -25882,13 +25459,6 @@ struct GrokReplayWriteContext {
     auth_identity_generation: u64,
     token_refresh_generation: u64,
     share_id: String,
-}
-
-#[derive(Debug)]
-struct AntigravityReplayStreamWrite {
-    context: AntigravityReplayWriteContext,
-    request_body: Bytes,
-    accumulator: AntigravityReplayStreamAccumulator,
 }
 
 #[derive(Debug)]
@@ -25942,7 +25512,7 @@ impl StreamForwardState {
 
     fn inspect_antigravity_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
         if let Some(replay) = self.antigravity_reasoning_replay.as_mut() {
-            replay.accumulator.push(chunk);
+            replay.inspect(chunk);
         }
     }
 
@@ -25961,21 +25531,8 @@ impl StreamForwardState {
     }
 
     async fn commit_antigravity_reasoning_replay_stream(&mut self) {
-        if !self
-            .antigravity_reasoning_replay
-            .as_ref()
-            .is_some_and(|replay| replay.accumulator.is_complete())
-        {
-            return;
-        }
-        let Some(replay) = self.antigravity_reasoning_replay.take() else {
-            return;
-        };
-        let previous_chain = replay.context.previous_chain.clone();
-        let chain = replay
-            .accumulator
-            .finish(&replay.request_body, previous_chain.as_ref());
-        commit_antigravity_reasoning_replay(&self.state, Some(&replay.context), true, chain).await;
+        antigravity::commit_complete_stream(&self.state, &mut self.antigravity_reasoning_replay)
+            .await;
     }
 
     async fn commit_kimi_thinking_replay_stream(&mut self) {
@@ -27275,49 +26832,12 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn install_antigravity_retry_after(
-    headers: &mut HeaderMap,
-    limit: &super::antigravity_retry::AntigravityRetryInfo,
-) {
-    if headers.contains_key(RETRY_AFTER) {
-        return;
-    }
-    let seconds = limit.retry_after_seconds().max(1);
-    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-        headers.insert(RETRY_AFTER, value);
-    }
-}
-
 async fn forward_http_client(
     state: &ServerState,
     execution: &ProviderExecution,
 ) -> Result<reqwest::Client, ProxyError> {
-    if matches!(
-        execution.stored.provider_type,
-        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-    ) {
-        let policy = super::antigravity_transport::AntigravityTransportPolicy::resolve(
-            &execution.plan.transport_policy,
-        );
-        let key = execution.managed_account_identity_target().and_then(
-            |(provider_type, account_id, auth_identity_generation)| {
-                super::antigravity_transport::AntigravityTransportKey::new(
-                    execution.plan.provider_key.app,
-                    provider_type,
-                    &execution.stored.provider.id,
-                    execution.plan.provider_revision,
-                    &execution.plan.runtime_fingerprint,
-                    account_id,
-                    auth_identity_generation,
-                    policy,
-                )
-            },
-        );
-        return state
-            .antigravity_transports
-            .client(key, policy)
-            .await
-            .map_err(ProxyError::bad_gateway);
+    if let Some(client) = antigravity::http_client(state, execution).await? {
+        return Ok(client);
     }
     Ok(state.http_client().await)
 }
@@ -33253,16 +32773,15 @@ mod tests {
             session_id: Some("contract-session".to_string()),
             ..UsageLogContext::default()
         };
-        let attempts = ForwardAttemptContext::default();
         let original =
             Bytes::from_static(br#"{"model":"gemini-3.5-flash-medium","request":{"contents":[]}}"#);
 
         let mut count_tokens = original.clone();
-        apply_antigravity_session_contract(
+        antigravity::apply_session_contract(
             &execution,
             ProxyRoute::ClaudeCountTokens,
             &request_context,
-            &attempts,
+            0,
             &mut count_tokens,
         );
         assert_eq!(count_tokens, original);
@@ -33271,21 +32790,21 @@ mod tests {
             br#"{"model":"gemini-3.5-flash-medium","requestType":"web_search","request":{"contents":[]}}"#,
         );
         let search_original = search.clone();
-        apply_antigravity_session_contract(
+        antigravity::apply_session_contract(
             &execution,
             ProxyRoute::Gemini,
             &request_context,
-            &attempts,
+            0,
             &mut search,
         );
         assert_eq!(search, search_original);
 
         let mut inference = original;
-        apply_antigravity_session_contract(
+        antigravity::apply_session_contract(
             &execution,
             ProxyRoute::Gemini,
             &request_context,
-            &attempts,
+            0,
             &mut inference,
         );
         assert!(serde_json::from_slice::<Value>(&inference)
@@ -33302,11 +32821,11 @@ mod tests {
             model: "gemini-3.5-flash-medium".to_string(),
         };
         let mut headers = HeaderMap::new();
-        install_antigravity_retry_after(&mut headers, &limit);
+        antigravity::install_retry_after(&mut headers, &limit);
         assert_eq!(headers.get(RETRY_AFTER).unwrap(), "2");
 
         headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
-        install_antigravity_retry_after(&mut headers, &limit);
+        antigravity::install_retry_after(&mut headers, &limit);
         assert_eq!(headers.get(RETRY_AFTER).unwrap(), "30");
     }
 

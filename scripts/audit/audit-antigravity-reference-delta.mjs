@@ -92,6 +92,47 @@ assert(
   "Antigravity requestType behavior changed without a real receipt",
 );
 const rails = baseline.realAcceptance?.rails ?? [];
+const requiredChecks = [
+  "bound_account_and_two_surface_bindings",
+  "fresh_catalog",
+  "authoritative_empty_catalog",
+  "transient_stale_catalog",
+  "claude_nonstream_stream_tool_usage",
+  "gemini_nonstream_stream_tool_usage",
+  "plain_request_type",
+  "tools_request_type",
+  "history_tool_request_type",
+  "web_search_request_type",
+  "mixed_tools_request_type",
+  "reasoning_replay",
+  "session_rollover",
+  "same_account_first_401_recovery",
+  "second_401_terminal",
+  "structured_429_scope",
+  "terminal_then_eof",
+  "decoy_zero_requests",
+  "compaction_gate_fail_closed",
+  "secret_scan",
+];
+const requiredBodyHashes = [
+  "claude_nonstream",
+  "claude_stream",
+  "gemini_nonstream",
+  "gemini_stream",
+  "plain_request",
+  "tools_request",
+  "history_tool_request",
+  "web_search_request",
+  "mixed_tools_request",
+];
+assert(
+  baseline.realAcceptance?.receiptSchemaVersion === 1 &&
+    baseline.realAcceptance?.harnessRevision === 1 &&
+    JSON.stringify(baseline.realAcceptance?.requiredChecks) === JSON.stringify(requiredChecks) &&
+    JSON.stringify(baseline.realAcceptance?.requiredBodyHashes) ===
+      JSON.stringify(requiredBodyHashes),
+  "Antigravity real acceptance receipt contract changed",
+);
 assert(
   JSON.stringify(rails.map((rail) => rail.rail).sort()) ===
     JSON.stringify(["agy_oauth", "antigravity_oauth"]) &&

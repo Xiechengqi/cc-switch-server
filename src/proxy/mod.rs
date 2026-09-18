@@ -42,6 +42,7 @@ pub(crate) mod outbound_request;
 mod overflow_compact;
 pub mod protocol_compat;
 pub(crate) mod provider_ops;
+mod providers;
 pub(crate) mod qoder;
 pub(crate) mod qoder_runtime;
 pub(crate) mod reasoning_bridge;
