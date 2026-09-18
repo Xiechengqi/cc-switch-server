@@ -45,6 +45,8 @@ CX-N4 为每个 Codex HTTP 请求或 Responses WebSocket turn 建立独立 stick
 
 本轮增量证据追加在 `assets/contract/antigravity-reference-delta.json`，不改写 2026-09-11 的历史 observation。只读来源为 `CLIProxyAPI@ef63d2e7/@7fcbdf88/@a9e92b81/@b681a1e0/@8c984672/@fd3e6623` 与 `Antigravity-Manager@734e2bde/@9fd77989`；每个完整 commit、路径和提交态 SHA-256 均由 `scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核，默认构建、测试和运行时仍不读取外部仓库。
 
+后续 EVID-N1 迁移把该资产提升为 append-only schema v2：原 schema v1 `sources`、`capabilities` 和 file digest 原样保留，另追加 source commit/tree、观察时工作树声明、路径/符号、处置、target baseline、implementation commit 与 fixture 映射。audit 内固定历史 observation digest，默认只检查仓库内资产和目标合同；`--check-sources` 才读取外部已提交 Git object。`e5bfc34` 仅迁移 Antigravity lifecycle 编排并增加两条 rail 的私有 receipt validator，没有改变下述 requestType 决策，也没有把 fixture 提升为真实厂商证据。
+
 Server 的独立 grounding 合同只读取选中候选，按 URL 去重 web chunk、忽略无效索引，并将 Gemini UTF-8 byte range 映射为下游 Unicode scalar range。非流式与流式分别生成 Claude `server_tool_use`/`web_search_tool_result`/citation、Responses `web_search_call`/`url_citation` 和 Chat annotation；搜索事件、文本、citation 与 terminal 的顺序由自包含 fixture 冻结，citation 不得晚于 terminal，URL/title 不进入日志或指标。ASCII、中文、emoji、组合字符、重复/缺失 chunk、跨增量 part 和只在最终快照出现 annotation 均有回归测试。
 
 模型搜索能力只接受目录中的 `supportsWebSearch`、`supports_web_search`、`webSearchSupported` 或 `nativeCapabilities.webSearch` 布尔值；冲突或缺失为 `Unknown`。证据以 Account `authIdentityGeneration`、TTL 和有界 `model_search:*` dimension 持久化。请求开始时固定使用当前 Account snapshot：请求模型有新鲜 `Supported` 才保留；`Unsupported`、`Unknown`、缺失或过期时使用已验证的 `gemini-2.5-flash` fallback；fallback 被当前目录明确标为 `Unsupported` 时失败关闭。运行时绑定代际漂移在发网前冲突，不重新选择账号、Provider、rail 或站点。

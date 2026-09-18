@@ -1,6 +1,7 @@
 {
   "format": "cc-switch-antigravity-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-11T00:00:00Z",
   "updatedAt": "2026-09-18T00:00:00Z",
   "policy": {
@@ -9,6 +10,33 @@
     "recoveryBoundary": "same binding, pre-commit, shared total attempt and elapsed-time budget",
     "liveEvidence": "local fixtures do not imply live Google entitlement, compaction support, or production transport behavior"
   },
+  "observationPolicy": {
+    "history": "append_only; schema v1 sources and capability records remain immutable inputs",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "sourceDigest": "sha256 over UTF-8 JSON.stringify({sourceId,deltaId,commit,files}) using the frozen schema v1 file order",
+    "implementationCommit": "the committed target tree in which every mapped contract and fixture is present; it need not be the introducing commit",
+    "externalVerification": "optional --check-sources only; never a build or runtime dependency"
+  },
+  "sourceSnapshots": [
+    {
+      "id": "cliproxyapi-2026-09-18",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "b773607e3e7756dc6020a291825e4eb08899595a",
+      "headTree": "a740e14d0b3efea8877f901301d0f9926c39258b",
+      "worktreeClean": true,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "antigravity-manager-2026-09-18",
+      "sourceId": "antigravity_manager",
+      "repository": "Antigravity-Manager",
+      "headCommit": "08402030c81d1a521f5746d802029b3b1b7b271d",
+      "headTree": "299fed98c8eb107a77c3a5e0b4c648980201fbe2",
+      "worktreeClean": true,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
   "sources": [
     {
       "id": "cliproxyapi",
@@ -118,6 +146,440 @@
           ]
         }
       ]
+    }
+  ],
+  "observations": [
+    {
+      "id": "AG-OBS-0001",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "reasoning_replay",
+        "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+        "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
+        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
+        "symbols": ["AntigravityReasoningReplaySnapshot", "CacheAntigravityReasoningReplayItemsBestEffort"],
+        "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-01"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [{"path": "src/proxy/antigravity_replay.rs", "anchors": ["AntigravityReplayScope", "miss_tombstone_and_snapshot_cas_fence_concurrent_writers"]}],
+        "fixtureIds": ["miss_tombstone_and_snapshot_cas_fence_concurrent_writers"]
+      },
+      "reason": "Adopt only generation-fenced, bounded replay semantics under the selected Account and Share binding."
+    },
+    {
+      "id": "AG-OBS-0002",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "schema_subset",
+        "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+        "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
+        "paths": ["internal/runtime/executor/antigravity_executor_request.go", "internal/util/gemini_schema.go"],
+        "symbols": ["sanitizeAntigravityRequestSchemas", "cleanNestedSchema"],
+        "sourceDigest": "89884e976735923c657f878b3eab93f9fd991588db98268494b2fda8ebe19026"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-03"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [{"path": "src/proxy/tool_schema.rs", "anchors": ["normalize_antigravity_request_schemas", "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]}],
+        "fixtureIds": ["antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]
+      },
+      "reason": "Adopt the narrow Gemini-compatible schema projection without copying unrelated request mutation."
+    },
+    {
+      "id": "AG-OBS-0003",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "transport_scope",
+        "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
+        "tree": "e62788156c2afff0d31391dbd390035ec15168f4",
+        "paths": ["internal/runtime/executor/antigravity_executor.go", "internal/runtime/executor/antigravity_executor_transport_test.go"],
+        "symbols": ["resolveAntigravityPoolSettings", "antigravityTransportKey"],
+        "sourceDigest": "7795e6619aa29ba3a07eb8c9bcae4e6d8dea3a1e0b3d20ed555e07c4c9ef2afd"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-03"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [{"path": "src/proxy/antigravity_transport.rs", "anchors": ["AntigravityTransportKey", "cache_key_fences_runtime_account_generation_and_resolved_settings"]}],
+        "fixtureIds": ["cache_key_fences_runtime_account_generation_and_resolved_settings", "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"]
+      },
+      "reason": "Adopt an opt-in pool keyed by Provider revision, runtime fingerprint, Account and auth generation."
+    },
+    {
+      "id": "AG-OBS-0004",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "compaction_risk_only",
+        "commit": "70f45604522282965247add17f6cce619876919b",
+        "tree": "99e6ae1c29ac8e55bb418a5e4a17415e4e2bd0d6",
+        "paths": ["internal/runtime/executor/helps/antigravity_compaction.go", "internal/runtime/executor/helps/antigravity_compaction_test.go"],
+        "symbols": ["PrepareAntigravityCompactionSummaryPayload", "SealAntigravityCompaction"],
+        "sourceDigest": "e5e44269a0753a8e166145ba56f6f9e6dc3a85bf553928631de7fda4e7bc44e2"
+      },
+      "disposition": "live_gate",
+      "capabilityIds": ["AG-04"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [{"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]}],
+        "fixtureIds": ["antigravity_compaction_is_fail_closed_without_a_receipt"]
+      },
+      "reason": "Reference behavior is not entitlement evidence; runtime remains disabled until a private current-commit receipt exists."
+    },
+    {
+      "id": "AG-OBS-0005",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "grounding_responses_initial",
+        "commit": "ef63d2e7fa8adfab8e6b29860e719028567e2226",
+        "tree": "365c07612035534278297848a226c9d0e96dbf46",
+        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"],
+        "symbols": ["ExtractGroundingMetadata", "BuildResponsesWebSearchCallItem"],
+        "sourceDigest": "92d21762ead9fa8b7e1d8d125cb0a3760eaee7d2069389e655815d3b9e57395b"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N1"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/gemini_grounding.rs", "anchors": ["GroundingAccumulator", "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"]}],
+        "fixtureIds": ["citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"]
+      },
+      "reason": "Adopt grounding metadata as typed citations while keeping raw URLs and titles out of logs and labels."
+    },
+    {
+      "id": "AG-OBS-0006",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "grounding_responses_stream_order",
+        "commit": "7fcbdf8896753d7af60f75c6c20d27bf0473f195",
+        "tree": "11d840f47c6c950ea255440530437a11ac781870",
+        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"],
+        "symbols": ["MergeCitationAnnotations", "BuildResponsesURLCitations"],
+        "sourceDigest": "62e77f9f2553c1a16704a2ba4656882b1b13c28731cc7ccc72eae2ab9c9f860e"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N1"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal"]}],
+        "fixtureIds": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal"]
+      },
+      "reason": "Adopt citation ordering so annotations are emitted before terminal events on every streaming Surface."
+    },
+    {
+      "id": "AG-OBS-0007",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "request_model_metadata",
+        "commit": "a9e92b81453f1e23eccb2c7a9b6d1669aa733b9b",
+        "tree": "2b0f832d4ad46025b3e215a942cecd120ea22c9e",
+        "paths": ["internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"],
+        "symbols": ["antigravitySupportsNativeResponsesWebSearch", "requestType"],
+        "sourceDigest": "32d07d67981dbb4b73b17087dd860316c59f3ebeee0d211c0d490fb612e0f8ef"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N2"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/adapters.rs", "anchors": ["select_antigravity_web_search_model", "antigravity_web_search_model_selection_uses_fresh_per_model_evidence"]}],
+        "fixtureIds": ["antigravity_web_search_model_selection_uses_fresh_per_model_evidence", "gemini_v1internal_rejects_runtime_auth_generation_drift"]
+      },
+      "reason": "Adopt request-scoped catalog capability snapshots and reject Account generation drift before send."
+    },
+    {
+      "id": "AG-OBS-0008",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "mid_session_system_order",
+        "commit": "b681a1e0f7b89d26814f788b60bf84feaf72e912",
+        "tree": "83e6f25e48ce8f0021b1da92a51fa1019b081dbd",
+        "paths": ["internal/translator/common/claude_system.go"],
+        "symbols": ["SystemReminderText", "ClaudeMessageSystemReminderText"],
+        "sourceDigest": "a264e9d33040dadd0da049cba8557c8115cb208f1b642d7522a1766a62c80e48"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N4"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["demoted_system_message", "openai_requests_demote_mid_session_system_messages_without_reordering_them"]}],
+        "fixtureIds": ["openai_requests_demote_mid_session_system_messages_without_reordering_them"]
+      },
+      "reason": "Adopt stable reversible system-reminder demotion without reordering conversation turns."
+    },
+    {
+      "id": "AG-OBS-0009",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "orphan_function_output",
+        "commit": "8c984672a66ab824f96aace243248ec2a67403d5",
+        "tree": "812ea6134f62585fba9122b6089ebb36660fa95e",
+        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_request.go"],
+        "symbols": ["ConvertOpenAIResponsesRequestToGemini", "functionResponse"],
+        "sourceDigest": "70f0a1c600bf7cda4e5feec80037a3a378fa9c20cd66883a01eacf5dfde3a16b"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N4"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["cc-switch-server-orphan-tool-output-v1", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]}],
+        "fixtureIds": ["openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]
+      },
+      "reason": "Adopt lossless orphan output demotion and never synthesize a false tool-call pairing."
+    },
+    {
+      "id": "AG-OBS-0010",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "empty_text_part_lifecycle",
+        "commit": "fd3e6623761d0d276f5ee6c5dbaf0996d4c6cd3f",
+        "tree": "6518d987387dee9bfa8aace025249f5dbb0506d9",
+        "paths": ["internal/translator/antigravity/claude/antigravity_claude_response.go"],
+        "symbols": ["appendFinalEvents", "content_block_stop"],
+        "sourceDigest": "7055571f03e66d59b9b3826ff4f5d9a1315ed2f1bc9755cbed2e817227a5efe1"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N5"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_empty_text_part_does_not_close_the_active_text_block"]}],
+        "fixtureIds": ["gemini_empty_text_part_does_not_close_the_active_text_block"]
+      },
+      "reason": "Adopt active-block lifecycle handling so an empty part cannot close a still-live text block."
+    },
+    {
+      "id": "AG-OBS-0011",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "antigravity_manager",
+        "snapshotId": "antigravity-manager-2026-09-18",
+        "repository": "Antigravity-Manager",
+        "deltaId": "conversation_session",
+        "commit": "85fb4fe688997d3a0c2930b7a202cf22f617b092",
+        "tree": "3cadaa4743b0e828b6609ec87bff06325d08f5d6",
+        "paths": ["src-tauri/src/proxy/common/session.rs"],
+        "symbols": ["derive_session_id", "bump_session"],
+        "sourceDigest": "e479d2a7b25d76736a815569c4eb05918f5d2305198507783f6645a720ed73ed"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-02"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [{"path": "src/proxy/antigravity_replay.rs", "anchors": ["derive_session_id", "session_id_is_conversation_scoped_and_rollover_error_is_exact"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_session_accumulation_rolls_over_once_on_the_same_binding"]}],
+        "fixtureIds": ["session_id_is_conversation_scoped_and_rollover_error_is_exact", "antigravity_session_accumulation_rolls_over_once_on_the_same_binding"]
+      },
+      "reason": "Adopt conversation-scoped session generations with a single same-binding rollover."
+    },
+    {
+      "id": "AG-OBS-0012",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "antigravity_manager",
+        "snapshotId": "antigravity-manager-2026-09-18",
+        "repository": "Antigravity-Manager",
+        "deltaId": "dynamic_request_type_conflicting_signal",
+        "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
+        "tree": "9f53336b0e106383155a59b0adce0270b7f9a9b9",
+        "paths": ["src-tauri/src/proxy/mappers/gemini/wrapper.rs"],
+        "symbols": ["wrap_request_v2", "config.request_type"],
+        "sourceDigest": "f37332f9cfd46e2b881c028b25e2a43bc024ea407cdbbd51a8ace4e8318d6370"
+      },
+      "disposition": "differential",
+      "capabilityIds": ["AG-N6"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]}],
+        "fixtureIds": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]
+      },
+      "reason": "The reference conflicts with another mature implementation, so no runtime change is allowed without a bound live receipt."
+    },
+    {
+      "id": "AG-OBS-0013",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "antigravity_manager",
+        "snapshotId": "antigravity-manager-2026-09-18",
+        "repository": "Antigravity-Manager",
+        "deltaId": "claude_billing_metadata",
+        "commit": "9fd7798932146aee7eab38e1053843f8a512a2f5",
+        "tree": "51944a5948f744b2b1fe43cf0546b86e5e9315a1",
+        "paths": ["src-tauri/src/proxy/mappers/claude/request.rs"],
+        "symbols": ["is_gemini_client_billing_metadata", "x-anthropic-billing-header"],
+        "sourceDigest": "4c3e3848f4095917b61e26d598024f5e8253e0ccf7c03e46093e5f46b2a961e9"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N3"],
+      "target": {
+        "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
+        "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
+        "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["is_anthropic_billing_metadata_block", "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]}],
+        "fixtureIds": ["anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]
+      },
+      "reason": "Adopt only the exact standalone billing metadata matcher on Gemini-bound transformations."
+    },
+    {
+      "id": "AG-OBS-0014",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "reasoning_replay",
+        "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+        "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
+        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
+        "symbols": ["AntigravityReasoningReplaySnapshot", "CacheAntigravityReasoningReplayItemsBestEffort"],
+        "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-01", "AG-02"],
+      "target": {
+        "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
+        "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
+        "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
+        "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
+        "contracts": [{"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "commit_complete_stream", "reasoning_replay_binding_is_current", "apply_session_contract"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}],
+        "fixtureIds": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]
+      },
+      "reason": "Move replay and session orchestration behind the Antigravity Provider boundary without changing wire, terminal or CAS behavior."
+    },
+    {
+      "id": "AG-OBS-0015",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "transport_scope",
+        "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
+        "tree": "e62788156c2afff0d31391dbd390035ec15168f4",
+        "paths": ["internal/runtime/executor/antigravity_executor.go", "internal/runtime/executor/antigravity_executor_transport_test.go"],
+        "symbols": ["resolveAntigravityPoolSettings", "antigravityTransportKey"],
+        "sourceDigest": "7795e6619aa29ba3a07eb8c9bcae4e6d8dea3a1e0b3d20ed555e07c4c9ef2afd"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-03"],
+      "target": {
+        "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
+        "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
+        "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
+        "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
+        "contracts": [{"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["record_limit_evidence", "mark_limit_cooldown", "http_client", "limit_retry_source"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_long_limit_cools_only_the_structured_share_runtime_model", "antigravity_retry_rechecks_identity_generation_before_second_send"]}],
+        "fixtureIds": ["antigravity_long_limit_cools_only_the_structured_share_runtime_model", "antigravity_retry_rechecks_identity_generation_before_second_send"]
+      },
+      "reason": "Move transport and structured limit decisions behind the Provider boundary while preserving same-binding recovery."
+    },
+    {
+      "id": "AG-OBS-0016",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-18T00:00:00Z",
+      "reference": {
+        "sourceId": "antigravity_manager",
+        "snapshotId": "antigravity-manager-2026-09-18",
+        "repository": "Antigravity-Manager",
+        "deltaId": "dynamic_request_type_conflicting_signal",
+        "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
+        "tree": "9f53336b0e106383155a59b0adce0270b7f9a9b9",
+        "paths": ["src-tauri/src/proxy/mappers/gemini/wrapper.rs"],
+        "symbols": ["wrap_request_v2", "config.request_type"],
+        "sourceDigest": "f37332f9cfd46e2b881c028b25e2a43bc024ea407cdbbd51a8ace4e8318d6370"
+      },
+      "disposition": "live_gate",
+      "capabilityIds": ["AG-N6"],
+      "target": {
+        "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
+        "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
+        "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
+        "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
+        "contracts": [{"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\"", "receipt.decisions?.compaction !== \"runtime_disabled\""]}, {"path": "scripts/audit/antigravity-real.test.mjs", "anchors": ["Antigravity real harness keeps Antigravity and Agy receipts independent", "Antigravity real harness rejects a cross-rail receipt"]}],
+        "fixtureIds": ["Antigravity real harness keeps Antigravity and Agy receipts independent", "Antigravity real harness rejects a cross-rail receipt"]
+      },
+      "reason": "Add a current-commit private-receipt gate; both rails and compaction remain live_pending without real inputs."
     }
   ],
   "capabilities": [
