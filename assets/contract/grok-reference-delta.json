@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-grok-reference-delta",
   "schemaVersion": 1,
-  "capturedAt": "2026-09-11T00:00:00Z",
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
@@ -14,7 +14,8 @@
       "id": "grok2api",
       "rootEnv": "CC_SWITCH_GROK_GROK2API_AUDIT_ROOT",
       "defaultRelativeRoot": "../proxy/Grok/grok2api",
-      "commit": "8913b53fe92307a6f111b2885ab298a43c74a9ba",
+      "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+      "qualityPolicyCommit": "7f3f3d3ce030d5cf946b0bbe994f3026775fa308",
       "historicalCommits": [
         "8641a782",
         "ca392e68",
@@ -53,6 +54,18 @@
         {
           "path": "backend/internal/infra/provider/cli/responses_tools_test.go",
           "sha256": "7f1a0ae7b5b928466d9c0009459a975e2c825816e9d939a7cb941c6f3c9d9f32"
+        },
+        {
+          "path": "backend/internal/application/gateway/quality_retry.go",
+          "sha256": "f796a51494e55142e6ffb844bc43b23ff8b6d67f929b9dd5af369c1157556097"
+        },
+        {
+          "path": "backend/internal/application/gateway/quality_retry_scan.go",
+          "sha256": "bd1cc04e826e0f9b32688e7c68974f5cfebaa0d2532c012c90ce6b07ba34d156"
+        },
+        {
+          "path": "backend/internal/application/gateway/quality_retry_test.go",
+          "sha256": "b707dbc1e08059c74fc13701ea961ec7bdd17ad5e669ea2394bf4ec63b66564c"
         }
       ]
     }
@@ -105,6 +118,46 @@
       ]
     }
   ],
+  "enhancements": [
+    {
+      "id": "GR-N1",
+      "status": "fixture_verified",
+      "automaticRetry": false,
+      "accountRotation": false,
+      "responseMutation": false,
+      "metricLabels": [
+        "transport",
+        "outcome",
+        "has_terminal",
+        "has_tool",
+        "has_visible_text",
+        "visible_length_bucket"
+      ],
+      "localEvidence": [
+        {
+          "path": "src/proxy/grok.rs",
+          "anchors": [
+            "GrokQualityObserver",
+            "quality_observer_classifies_completed_shapes_without_retaining_content",
+            "quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump"
+          ]
+        },
+        {
+          "path": "src/metrics.rs",
+          "anchors": [
+            "cc_switch_grok_quality_observations_total"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "record_grok_quality_observation",
+            "active_grok_quality_observer"
+          ]
+        }
+      ]
+    }
+  ],
   "fixtureAcceptance": {
     "transportRails": ["http", "sse", "websocket"],
     "checks": [
@@ -120,7 +173,8 @@
       "bounded_ttl_entries_items_bytes",
       "cas_conflict_fail_closed",
       "root_union_object_projection",
-      "root_union_ambiguous_cycle_fail_closed"
+      "root_union_ambiguous_cycle_fail_closed",
+      "bounded_quality_observation_without_retry_or_response_mutation"
     ]
   },
   "realAcceptance": {

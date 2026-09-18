@@ -359,6 +359,26 @@ pub fn record_grok_model_catalog(source: &'static str) {
     .increment(1);
 }
 
+pub fn record_grok_quality_observation(
+    transport: &'static str,
+    outcome: &'static str,
+    has_terminal: bool,
+    has_tool: bool,
+    has_visible_text: bool,
+    visible_length_bucket: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_grok_quality_observations_total",
+        "transport" => transport,
+        "outcome" => outcome,
+        "has_terminal" => if has_terminal { "true" } else { "false" },
+        "has_tool" => if has_tool { "true" } else { "false" },
+        "has_visible_text" => if has_visible_text { "true" } else { "false" },
+        "visible_length_bucket" => visible_length_bucket
+    )
+    .increment(1);
+}
+
 pub fn record_qoder_client_ip_source(source: &'static str) {
     metrics::counter!(
         "cc_switch_qoder_client_ip_total",
@@ -760,6 +780,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_grok_model_catalog_total",
         "Grok model catalog responses by bounded source classification"
+    );
+    metrics::describe_counter!(
+        "cc_switch_grok_quality_observations_total",
+        "Grok response-shape observations with bounded labels and no response content"
     );
     metrics::describe_counter!(
         "cc_switch_qoder_client_ip_total",

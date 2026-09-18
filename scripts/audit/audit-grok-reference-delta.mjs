@@ -58,10 +58,14 @@ for (const source of contract.sources ?? []) {
   assert(source.id && source.rootEnv, "Grok source metadata is incomplete");
   assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
   assert(
+    source.qualityPolicyCommit === "7f3f3d3ce030d5cf946b0bbe994f3026775fa308",
+    `${source.id} quality-policy commit changed without review`,
+  );
+  assert(
     Array.isArray(source.historicalCommits) && source.historicalCommits.length === 8,
     `${source.id} historical delta set changed`,
   );
-  assert(Array.isArray(source.files) && source.files.length === 7, `${source.id} evidence files changed`);
+  assert(Array.isArray(source.files) && source.files.length === 10, `${source.id} evidence files changed`);
   const sourceRoot = path.resolve(
     repoRoot,
     process.env[source.rootEnv] || source.defaultRelativeRoot,
@@ -108,8 +112,43 @@ for (const id of ["GR-04", "GR-05"]) {
 }
 assert(capabilities.get("GR-05")?.runtimeEnabled === false, "GR-05 runtime gate opened");
 
+const enhancements = new Map(
+  (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),
+);
+assert(enhancements.size === 1 && enhancements.has("GR-N1"), "Grok enhancement set changed");
+const qualityObservation = enhancements.get("GR-N1");
+assert(qualityObservation.status === "fixture_verified", "GR-N1 fixture status changed");
+for (const field of ["automaticRetry", "accountRotation", "responseMutation"]) {
+  assert(qualityObservation[field] === false, `GR-N1 unexpectedly enabled ${field}`);
+}
+assert(
+  JSON.stringify(qualityObservation.metricLabels) ===
+    JSON.stringify([
+      "transport",
+      "outcome",
+      "has_terminal",
+      "has_tool",
+      "has_visible_text",
+      "visible_length_bucket",
+    ]),
+  "GR-N1 metric label set changed",
+);
+assert(
+  Array.isArray(qualityObservation.localEvidence) && qualityObservation.localEvidence.length === 3,
+  "GR-N1 local evidence set changed",
+);
+for (const evidence of qualityObservation.localEvidence) {
+  safeRelative(evidence.path, "GR-N1 local path");
+  const localPath = path.join(repoRoot, evidence.path);
+  assert(fs.existsSync(localPath), `GR-N1 local path is unavailable: ${evidence.path}`);
+  const source = fs.readFileSync(localPath, "utf8");
+  for (const anchor of evidence.anchors ?? []) {
+    assert(source.includes(anchor), `GR-N1 is missing local anchor ${anchor}`);
+  }
+}
+
 const fixtureChecks = contract.fixtureAcceptance?.checks ?? [];
-assert(fixtureChecks.length === 13 && new Set(fixtureChecks).size === 13, "Grok fixture matrix changed");
+assert(fixtureChecks.length === 14 && new Set(fixtureChecks).size === 14, "Grok fixture matrix changed");
 assert(
   JSON.stringify(contract.fixtureAcceptance?.transportRails) ===
     JSON.stringify(["http", "sse", "websocket"]),
@@ -143,7 +182,7 @@ assert(
 );
 
 console.log(
-  `grok reference delta audit ok (${capabilities.size} capabilities, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks${
+  `grok reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancement, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

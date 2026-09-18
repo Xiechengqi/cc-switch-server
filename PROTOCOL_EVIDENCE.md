@@ -101,11 +101,13 @@ Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段
 
 CUR-02 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识，receipt 只允许 rail、SHA-256 scope digest、状态、时间和 16 项完整 pass map。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
 
-## 2026-09-11 Grok reasoning replay/root-union differential freeze
+## 2026-09-18 Grok reasoning replay/root-union/quality-observation differential freeze
 
-Grok 差异合同冻结在 `assets/contract/grok-reference-delta.json`。一次性只读证据只取 `grok2api@8913b53fe92307a6f111b2885ab298a43c74a9ba` 的七个已提交 Git object，并以 SHA-256 固定 conversation reasoning cache、明确 decode rejection recovery 和 Build tool root-union adapter；历史 delta 仅记录 `8641a782`、`ca392e68`、`7d1b4246`、`3de758e7`、`22ac653a`、`72a3a347`、`5d19ccff`、`e5285ebe`。外部工作树未提交内容和 `sub2api` 的账号池、路由、fallback 都被排除；默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核只读 Git object。
+Grok 差异合同冻结在 `assets/contract/grok-reference-delta.json`。一次性只读证据只取 `grok2api@906b9493b099d192381c698d4e320fafeccb851c` 的十个已提交 Git object，并以 SHA-256 固定 conversation reasoning cache、明确 decode rejection recovery、Build tool root-union adapter，以及 `7f3f3d3ce030d5cf946b0bbe994f3026775fa308` 引入的启发式 quality hold/retry；历史 reasoning delta 仅记录 `8641a782`、`ca392e68`、`7d1b4246`、`3de758e7`、`22ac653a`、`72a3a347`、`5d19ccff`、`e5285ebe`。外部工作树未提交内容和 `sub2api` 的账号池、路由、fallback 都被排除；默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核只读 Git object。
 
 Server 的独立实现把 replay scope 固定到 Provider revision/runtime、Account auth/token generation、Share、签名用户、session/turn、model family、HTTP/WS rail 和 upstream plane；有界 cache 使用 CAS/tombstone，只从成功 completed 终态提交，并在重复/编辑 call、协议/容量/代际漂移时 fail closed。Grok Build root union 在通用 sanitizer 后解析有界 local `$ref`，只投影可证明的 object root，循环、混合 union、全非 object 与歧义 schema 在网络前明确拒绝。HTTP、CRLF/分片 SSE 与 WebSocket loopback 验证 capture/replay、parallel calls、一次 pre-commit 明确拒绝恢复及 post-commit 禁止恢复。
+
+GR-N1 只吸收“需要观测响应质量形状”这一事实，不采用参考项目的 hold、最多六次尝试、跨账号轮换、推理 token 比例或密文长度启发式。Server 在成功 HTTP JSON、SSE 与原生 WebSocket Responses 上用有界状态机记录固定 outcome、terminal/tool/visible 布尔值和 `0|1_7|8_31|32_127|128_plus` 长度桶；不保留 plaintext/reasoning，不写 Provider、Account、Share、用户、prompt 或模型标签。单个至少 1024 字符的流式 bulk fragment 仅记为 `anomalous_dump` 诊断。观察器逐字节透传且没有 retry/rotation/response rewrite 决策入口；失败/不完整终态不冒充质量样本。
 
 这些 fixture 只支持 GR-01..03 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog receipt 仍分别 `live_pending`；GR-05 remote compaction 明确 `runtimeEnabled=false`，没有固定 OAuth rail 的真实上游 receipt 前不得启用，也不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
 

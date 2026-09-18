@@ -114,6 +114,12 @@ Grok Build 对多轮 function call 可能要求上一轮返回的 opaque `reason
 
 本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理和媒体 capability receipt 必须分别留证，缺少任一真实 receipt 时对应能力保持 `live_pending`。
 
+## 脱敏质量观测
+
+GR-N1 在 Grok Responses 的 HTTP JSON、SSE 和原生 WebSocket rail 上记录只读响应形状。指标 `cc_switch_grok_quality_observations_total` 只包含固定的 transport/outcome、terminal/tool/visible 布尔值和 `0`、`1_7`、`8_31`、`32_127`、`128_plus` 长度桶；outcome 限于 `empty`、`tool_only`、`short_text`、`text`、`text_and_tool`、`reasoning_only`、`anomalous_dump`。观察器不保存或输出正文、reasoning、token 比例、模型、Provider/Account/Share/用户身份或 prompt。
+
+`anomalous_dump` 仅表示流中出现单个至少 1024 字符的可见 bulk fragment，供后续人工评估；它不是厂商错误信号。所有分类都在原响应旁路完成，SSE 字节保持不变，不 hold、不自动重试、不切换账号、不写 cooldown，也不改变成功/失败或 terminal 语义。只有未来真实 receipt 给出明确且可复现的厂商失败码后，才可另行评审同账号、pre-commit、共享预算内的一次恢复；本指标本身不得成为恢复条件。
+
 GR-05 的 remote compaction 保持运行时禁用。只有固定 OAuth rail 的真实上游 receipt 能证明协议存在且完成独立的 scope、AEAD、TTL、失败语义与降级评审后才可另行设计；当前不采用 Grok Web Cookie、跨账号 cache，也不采用 sub2api 的账号池、商业路由或 fallback 逻辑。
 
 ## 媒体能力

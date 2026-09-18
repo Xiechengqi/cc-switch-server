@@ -3561,7 +3561,9 @@ async fn forward_with_attempt(
                 && stored.provider_type == ProviderType::GrokOAuth
                 && upstream_format == UpstreamFormat::OpenAiResponses)
                 .then(|| {
-                    super::grok::GrokResponsesSseInspector::new(route == ProxyRoute::CodexResponses)
+                    Box::new(super::grok::GrokResponsesSseInspector::new(
+                        route == ProxyRoute::CodexResponses,
+                    ))
                 });
             let grok_search_identity = execution.managed_account_identity_target().and_then(
                 |(provider_type, account_id, auth_identity_generation)| {
@@ -5394,10 +5396,21 @@ async fn forward_with_attempt(
         if status.is_success()
             && stored.provider_type == ProviderType::GrokOAuth
             && semantic_upstream_format == UpstreamFormat::OpenAiResponses
-            && super::grok::grok_response_has_completed_search(&bytes)
         {
-            record_grok_capability_evidence(&state, &execution, GrokAccountCapability::Search)
-                .await;
+            if let Some(observation) = super::grok::grok_quality_observation(&bytes) {
+                crate::metrics::record_grok_quality_observation(
+                    "http_json",
+                    observation.outcome,
+                    observation.has_terminal,
+                    observation.has_tool,
+                    observation.has_visible_text,
+                    observation.visible_length_bucket,
+                );
+            }
+            if super::grok::grok_response_has_completed_search(&bytes) {
+                record_grok_capability_evidence(&state, &execution, GrokAccountCapability::Search)
+                    .await;
+            }
         }
         let bytes = if status.is_success() {
             match adapter.transform_response_for_request(bytes, &stored, route, &adapter_request) {
@@ -10613,6 +10626,7 @@ async fn bridge_responses_websocket_inner(
     let mut active_response_body = None;
     let mut active_response_intent = None;
     let mut active_grok_reasoning_replay: Option<GrokReplayStreamWrite> = None;
+    let mut active_grok_quality_observer: Option<Box<super::grok::GrokQualityObserver>> = None;
     let mut active_grok_reasoning_retry_message: Option<TungsteniteMessage> = None;
     let mut active_grok_reasoning_recovery_attempted = false;
     let mut active_response_started_at: Option<Instant> = None;
@@ -10899,6 +10913,8 @@ async fn bridge_responses_websocket_inner(
                             context,
                             accumulator: GrokReplayStreamAccumulator::default(),
                         });
+                    active_grok_quality_observer = matches!(mode, ResponsesWebsocketMode::Grok)
+                        .then(|| Box::new(super::grok::GrokQualityObserver::new(true)));
                     active_grok_reasoning_recovery_attempted = false;
                     active_response_started_at = Some(Instant::now());
                     let mut turn_context = request_context.clone();
@@ -11844,6 +11860,8 @@ async fn bridge_responses_websocket_inner(
                     );
                     active_response_body = Some(retry_body);
                     response_repeat_tracker = Some(ResponsesRepeatTracker::default());
+                    active_grok_quality_observer =
+                        Some(Box::new(super::grok::GrokQualityObserver::new(true)));
                     active_grok_reasoning_recovery_attempted = true;
                     record_forward_retry(
                         ProxyRoute::CodexResponses,
@@ -11930,6 +11948,14 @@ async fn bridge_responses_websocket_inner(
                     upstream_read_deadline = first_byte_timeout
                         .map(|timeout| tokio::time::Instant::now() + timeout);
                     continue;
+                }
+                if matches!(mode, ResponsesWebsocketMode::Grok) && response_in_flight {
+                    if let (Some(observer), Some(bytes)) = (
+                        active_grok_quality_observer.as_mut(),
+                        websocket_message_payload(&message),
+                    ) {
+                        observer.observe_json_bytes(bytes);
+                    }
                 }
                 if let Some(observation) = &semantic_observation {
                     crate::metrics::record_proxy_semantic_guard(
@@ -12154,10 +12180,24 @@ async fn bridge_responses_websocket_inner(
                         .clone()
                         .unwrap_or(SemanticTerminal::Success);
                     finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
-                    if matches!(semantic_terminal, Some(SemanticTerminal::Success))
-                        || (semantic_observation.is_none()
-                            && grok_websocket_completed_success(&message))
-                    {
+                    let completed_success =
+                        matches!(semantic_terminal, Some(SemanticTerminal::Success))
+                            || (semantic_observation.is_none()
+                                && grok_websocket_completed_success(&message));
+                    if completed_success {
+                        if let Some(observation) = active_grok_quality_observer
+                            .as_mut()
+                            .and_then(|observer| observer.finish())
+                        {
+                            crate::metrics::record_grok_quality_observation(
+                                "websocket",
+                                observation.outcome,
+                                observation.has_terminal,
+                                observation.has_tool,
+                                observation.has_visible_text,
+                                observation.visible_length_bucket,
+                            );
+                        }
                         if let Some(replay) = active_grok_reasoning_replay.take() {
                             let proof = replay.accumulator.finish();
                             commit_grok_reasoning_replay(state, Some(&replay.context), proof).await;
@@ -12165,6 +12205,7 @@ async fn bridge_responses_websocket_inner(
                     } else {
                         active_grok_reasoning_replay = None;
                     }
+                    active_grok_quality_observer = None;
                     active_grok_reasoning_retry_message = None;
                     active_response_started_at = None;
                     response_in_flight = false;
@@ -25652,7 +25693,7 @@ struct StreamForwardState {
     codex_completed_output_patcher: CodexCompletedOutputPatcher,
     codex_pending_function_call_patcher: CodexPendingFunctionCallPatcher,
     codex_custom_tool_stream_patcher: CodexCustomToolStreamPatcher,
-    grok_responses_sse: Option<super::grok::GrokResponsesSseInspector>,
+    grok_responses_sse: Option<Box<super::grok::GrokResponsesSseInspector>>,
     grok_search_identity: Option<(String, u64)>,
     grok_search_evidence_recorded: bool,
     grok_reasoning_replay: Option<GrokReplayStreamWrite>,
@@ -25872,7 +25913,18 @@ impl StreamForwardState {
         };
         let output = inspector.push(chunk);
         let observed_search = inspector.take_search_observation();
+        let quality_observation = inspector.take_quality_observation();
         self.record_grok_search_observation(observed_search).await;
+        if let Some(observation) = quality_observation {
+            crate::metrics::record_grok_quality_observation(
+                "sse",
+                observation.outcome,
+                observation.has_terminal,
+                observation.has_tool,
+                observation.has_visible_text,
+                observation.visible_length_bucket,
+            );
+        }
         output
     }
 
@@ -25945,7 +25997,18 @@ impl StreamForwardState {
         };
         let output = inspector.finish();
         let observed_search = inspector.take_search_observation();
+        let quality_observation = inspector.finish_quality_observation();
         self.record_grok_search_observation(observed_search).await;
+        if let Some(observation) = quality_observation {
+            crate::metrics::record_grok_quality_observation(
+                "sse",
+                observation.outcome,
+                observation.has_terminal,
+                observation.has_tool,
+                observation.has_visible_text,
+                observation.visible_length_bucket,
+            );
+        }
         output
     }
 

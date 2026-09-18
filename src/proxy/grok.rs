@@ -22,6 +22,269 @@ const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
 const GROK_VIDEO_REQUEST_ID_MAX_LEN: usize = 128;
 const GROK_SSE_INSPECTION_MAX_FRAME_BYTES: usize = 64 * 1024;
 const GROK_SSE_INSPECTION_MAX_FRAME_LINES: usize = 128;
+const GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GrokQualityObservation {
+    pub outcome: &'static str,
+    pub has_terminal: bool,
+    pub has_tool: bool,
+    pub has_visible_text: bool,
+    pub visible_length_bucket: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokQualityTerminal {
+    None,
+    Completed,
+    Other,
+}
+
+#[derive(Debug)]
+pub(super) struct GrokQualityObserver {
+    streaming: bool,
+    observable: bool,
+    saw_response_shape: bool,
+    terminal: GrokQualityTerminal,
+    has_tool: bool,
+    has_reasoning: bool,
+    visible_chars: usize,
+    visible_fragments: u8,
+    saw_text_delta: bool,
+    saw_text_done: bool,
+    reported: bool,
+}
+
+impl GrokQualityObserver {
+    pub(super) fn new(streaming: bool) -> Self {
+        Self {
+            streaming,
+            observable: true,
+            saw_response_shape: false,
+            terminal: GrokQualityTerminal::None,
+            has_tool: false,
+            has_reasoning: false,
+            visible_chars: 0,
+            visible_fragments: 0,
+            saw_text_delta: false,
+            saw_text_done: false,
+            reported: false,
+        }
+    }
+
+    pub(super) fn observe_json_bytes(&mut self, body: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return false;
+        };
+        self.observe_value(&value);
+        true
+    }
+
+    pub(super) fn observe_value(&mut self, value: &Value) {
+        let event_type = value.get("type").and_then(Value::as_str);
+        if event_type.is_some_and(|kind| kind.starts_with("response."))
+            || value.get("output").is_some()
+            || value.get("status").is_some()
+            || value.get("response").is_some()
+        {
+            self.saw_response_shape = true;
+        }
+
+        match event_type {
+            Some("response.output_text.delta") => {
+                self.saw_text_delta = true;
+                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                    self.note_visible_text(text);
+                }
+            }
+            Some("response.output_text.done") => {
+                if !self.saw_text_delta {
+                    if let Some(text) = value
+                        .get("text")
+                        .or_else(|| value.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        self.note_visible_text(text);
+                    }
+                }
+                self.saw_text_done = true;
+            }
+            Some(kind)
+                if kind.starts_with("response.reasoning")
+                    || kind.starts_with("response.thinking") =>
+            {
+                self.has_reasoning = true;
+            }
+            Some("response.output_item.added" | "response.output_item.done") => {
+                if let Some(item) = value.get("item") {
+                    self.observe_output_item(item, !self.saw_text_delta && !self.saw_text_done);
+                }
+            }
+            Some("response.completed" | "response.done") => {
+                self.terminal = GrokQualityTerminal::Completed;
+                self.observe_response_snapshot(value.get("response").unwrap_or(value));
+            }
+            Some("response.failed" | "response.incomplete") => {
+                self.terminal = GrokQualityTerminal::Other;
+                self.observe_response_snapshot(value.get("response").unwrap_or(value));
+            }
+            _ => {
+                let response = value.get("response").unwrap_or(value);
+                match response.get("status").and_then(Value::as_str) {
+                    Some("completed" | "succeeded" | "done") => {
+                        self.terminal = GrokQualityTerminal::Completed;
+                    }
+                    Some("failed" | "incomplete" | "cancelled") => {
+                        self.terminal = GrokQualityTerminal::Other;
+                    }
+                    _ => {}
+                }
+                self.observe_response_snapshot(response);
+            }
+        }
+    }
+
+    pub(super) fn take_completed_observation(&mut self) -> Option<GrokQualityObservation> {
+        if self.terminal != GrokQualityTerminal::Completed {
+            return None;
+        }
+        self.take_observation()
+    }
+
+    pub(super) fn finish(&mut self) -> Option<GrokQualityObservation> {
+        if self.terminal == GrokQualityTerminal::Other {
+            return None;
+        }
+        self.take_observation()
+    }
+
+    fn invalidate(&mut self) {
+        self.observable = false;
+    }
+
+    fn take_observation(&mut self) -> Option<GrokQualityObservation> {
+        if self.reported || !self.observable || !self.saw_response_shape {
+            return None;
+        }
+        self.reported = true;
+        Some(self.observation())
+    }
+
+    fn observation(&self) -> GrokQualityObservation {
+        let has_visible_text = self.visible_chars > 0;
+        let anomalous_dump = self.streaming
+            && self.terminal == GrokQualityTerminal::Completed
+            && !self.has_tool
+            && self.visible_fragments == 1
+            && self.visible_chars >= GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS;
+        let outcome = if anomalous_dump {
+            "anomalous_dump"
+        } else if has_visible_text && self.has_tool {
+            "text_and_tool"
+        } else if has_visible_text && self.visible_chars <= 7 {
+            "short_text"
+        } else if has_visible_text {
+            "text"
+        } else if self.has_tool {
+            "tool_only"
+        } else if self.has_reasoning {
+            "reasoning_only"
+        } else {
+            "empty"
+        };
+        GrokQualityObservation {
+            outcome,
+            has_terminal: self.terminal != GrokQualityTerminal::None,
+            has_tool: self.has_tool,
+            has_visible_text,
+            visible_length_bucket: match self.visible_chars {
+                0 => "0",
+                1..=7 => "1_7",
+                8..=31 => "8_31",
+                32..=127 => "32_127",
+                _ => "128_plus",
+            },
+        }
+    }
+
+    fn observe_response_snapshot(&mut self, response: &Value) {
+        let allow_text = !self.saw_text_delta && !self.saw_text_done && self.visible_chars == 0;
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            for item in output {
+                self.observe_output_item(item, allow_text);
+            }
+        }
+    }
+
+    fn observe_output_item(&mut self, item: &Value, allow_text: bool) {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if grok_quality_item_is_tool(kind) {
+            self.has_tool = true;
+            return;
+        }
+        if matches!(kind, "reasoning" | "thinking") {
+            self.has_reasoning = true;
+            return;
+        }
+        if kind != "message" || !allow_text {
+            return;
+        }
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for part in content {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                if matches!(part_type, "output_text" | "text") {
+                    if let Some(text) = part
+                        .get("text")
+                        .or_else(|| part.get("content"))
+                        .and_then(Value::as_str)
+                    {
+                        self.note_visible_text(text);
+                    }
+                } else if matches!(part_type, "reasoning" | "thinking") {
+                    self.has_reasoning = true;
+                }
+            }
+        }
+    }
+
+    fn note_visible_text(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let remaining = GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS.saturating_sub(self.visible_chars);
+        let observed = text.chars().take(remaining.saturating_add(1)).count();
+        self.visible_chars = self
+            .visible_chars
+            .saturating_add(observed)
+            .min(GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS);
+        self.visible_fragments = self.visible_fragments.saturating_add(1).min(2);
+    }
+}
+
+fn grok_quality_item_is_tool(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_call"
+            | "custom_tool_call"
+            | "web_search_call"
+            | "x_search_call"
+            | "tool_search_call"
+            | "computer_call"
+            | "file_search_call"
+            | "code_interpreter_call"
+            | "local_shell_call"
+            | "shell_call"
+            | "apply_patch_call"
+            | "mcp_call"
+    ) || (kind.ends_with("_call") && !matches!(kind, "message" | "reasoning" | "thinking"))
+}
+
+pub(super) fn grok_quality_observation(body: &[u8]) -> Option<GrokQualityObservation> {
+    let mut observer = GrokQualityObserver::new(false);
+    observer.observe_json_bytes(body).then_some(())?;
+    observer.take_completed_observation()
+}
 
 #[derive(Debug)]
 pub(super) struct GrokResponsesSseInspector {
@@ -31,6 +294,7 @@ pub(super) struct GrokResponsesSseInspector {
     passthrough_tail: Vec<u8>,
     completed_searches: BTreeSet<String>,
     search_observation_pending: bool,
+    quality_observer: GrokQualityObserver,
 }
 
 impl Default for GrokResponsesSseInspector {
@@ -48,6 +312,7 @@ impl GrokResponsesSseInspector {
             passthrough_tail: Vec::new(),
             completed_searches: BTreeSet::new(),
             search_observation_pending: false,
+            quality_observer: GrokQualityObserver::new(true),
         }
     }
 
@@ -73,6 +338,7 @@ impl GrokResponsesSseInspector {
             if self.buffer.len() > GROK_SSE_INSPECTION_MAX_FRAME_BYTES
                 || sse_frame_line_count(&self.buffer) > GROK_SSE_INSPECTION_MAX_FRAME_LINES
             {
+                self.quality_observer.invalidate();
                 output.extend_from_slice(&self.buffer);
                 self.passthrough_tail = trailing_sse_boundary_prefix(&self.buffer);
                 self.buffer.clear();
@@ -92,6 +358,14 @@ impl GrokResponsesSseInspector {
 
     pub(super) fn take_search_observation(&mut self) -> bool {
         std::mem::take(&mut self.search_observation_pending)
+    }
+
+    pub(super) fn take_quality_observation(&mut self) -> Option<GrokQualityObservation> {
+        self.quality_observer.take_completed_observation()
+    }
+
+    pub(super) fn finish_quality_observation(&mut self) -> Option<GrokQualityObservation> {
+        self.quality_observer.finish()
     }
 
     #[cfg(test)]
@@ -120,6 +394,7 @@ impl GrokResponsesSseInspector {
         if let Some(value) = grok_sse_json_payload(event) {
             let previous_count = self.completed_searches.len();
             observe_completed_searches(&value, &mut self.completed_searches);
+            self.quality_observer.observe_value(&value);
             if self.completed_searches.len() > previous_count {
                 self.search_observation_pending = true;
             }
@@ -2614,6 +2889,130 @@ mod tests {
         inspector.push(Bytes::from(frame));
         assert!(!inspector.take_search_observation());
         assert_eq!(inspector.completed_search_count(), 1);
+    }
+
+    #[test]
+    fn quality_observer_classifies_completed_shapes_without_retaining_content() {
+        let cases = [
+            (
+                json!({"status":"completed","output":[]}),
+                "empty",
+                false,
+                false,
+                "0",
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"function_call","name":"read","arguments":"{}"}]}),
+                "tool_only",
+                true,
+                false,
+                "0",
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"yes"}]}]}),
+                "short_text",
+                false,
+                true,
+                "1_7",
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"a useful answer"}]}]}),
+                "text",
+                false,
+                true,
+                "8_31",
+            ),
+            (
+                json!({"status":"completed","output":[
+                    {"type":"message","content":[{"type":"output_text","text":"done"}]},
+                    {"type":"custom_tool_call","name":"lookup","input":"{}"}
+                ]}),
+                "text_and_tool",
+                true,
+                true,
+                "1_7",
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"reasoning","summary":[]}]}),
+                "reasoning_only",
+                false,
+                false,
+                "0",
+            ),
+        ];
+
+        for (value, outcome, has_tool, has_visible_text, visible_length_bucket) in cases {
+            let body = serde_json::to_vec(&value).unwrap();
+            let observation = grok_quality_observation(&body).unwrap();
+            assert_eq!(observation.outcome, outcome);
+            assert!(observation.has_terminal);
+            assert_eq!(observation.has_tool, has_tool);
+            assert_eq!(observation.has_visible_text, has_visible_text);
+            assert_eq!(observation.visible_length_bucket, visible_length_bucket);
+        }
+
+        assert!(grok_quality_observation(br#"{"status":"failed","output":[]}"#).is_none());
+        assert!(grok_quality_observation(b"not-json").is_none());
+        let secret = "quality-observer-must-not-retain-this-plaintext";
+        let mut observer = GrokQualityObserver::new(true);
+        observer.observe_value(&json!({
+            "type":"response.output_text.delta",
+            "delta":secret
+        }));
+        assert!(!format!("{observer:?}").contains(secret));
+    }
+
+    #[test]
+    fn quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump() {
+        let visible = "x".repeat(GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS);
+        let input = format!(
+            "event: response.output_item.added\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+            json!({"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}),
+            json!({"type":"response.output_text.delta","delta":visible}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+        );
+        let mut inspector = GrokResponsesSseInspector::default();
+        let split = input.len() / 3;
+        let mut output = inspector
+            .push(Bytes::copy_from_slice(&input.as_bytes()[..split]))
+            .to_vec();
+        output
+            .extend_from_slice(&inspector.push(Bytes::copy_from_slice(&input.as_bytes()[split..])));
+        output.extend_from_slice(&inspector.finish());
+        assert_eq!(output, input.as_bytes());
+        let observation = inspector.take_quality_observation().unwrap();
+        assert_eq!(observation.outcome, "anomalous_dump");
+        assert!(observation.has_terminal);
+        assert!(observation.has_visible_text);
+        assert_eq!(observation.visible_length_bucket, "128_plus");
+        assert!(inspector.finish_quality_observation().is_none());
+    }
+
+    #[test]
+    fn quality_stream_observer_distinguishes_fragmented_text_and_missing_terminal() {
+        let mut observer = GrokQualityObserver::new(true);
+        for delta in ["hello", " world"] {
+            observer.observe_value(&json!({
+                "type":"response.output_text.delta",
+                "delta":delta
+            }));
+        }
+        observer.observe_value(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","output":[]}
+        }));
+        let observation = observer.take_completed_observation().unwrap();
+        assert_eq!(observation.outcome, "text");
+        assert_eq!(observation.visible_length_bucket, "8_31");
+
+        let mut missing_terminal = GrokQualityObserver::new(true);
+        missing_terminal.observe_value(&json!({
+            "type":"response.output_item.done",
+            "item":{"type":"custom_tool_call","name":"lookup","input":"{}"}
+        }));
+        let observation = missing_terminal.finish().unwrap();
+        assert_eq!(observation.outcome, "tool_only");
+        assert!(!observation.has_terminal);
     }
 
     #[test]
