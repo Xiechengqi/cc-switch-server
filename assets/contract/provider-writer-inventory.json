@@ -13,7 +13,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "13f401cea4405b6d562e0a37737fb98c4a7d8581f917c35274ad72f2b9e9956e"
+      "sha256": "c22c2669ce364d0ab675872df91d8262d62d0403b733182d6032b1324422ba73"
     },
     {
       "path": "src/api/types/providers.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "2c07adf08e510f3817c70a4c2314c7d3c829dd3980453195a745dca8f4a51a3d"
+      "sha256": "290c5e8fd3918e072699eb4adab36bf9e5d457d20898dbb148a112a818b24fd5"
     }
   ],
   "entries": [

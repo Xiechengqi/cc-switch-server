@@ -508,7 +508,10 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     {
       label: "fail-closed canonical grant decoder",
       required: [
-        [/serde_json::from_str\(&value\)/, "fallible JSON decoding"],
+        [
+          /serde_json::from_str(?:\s*::<[^()]+>)?\(&value\)/,
+          "fallible JSON decoding",
+        ],
         [/\.map_err\(/, "decode error propagation"],
         [/FromSqlConversionFailure/, "database conversion failure mapping"],
         [/CanonicalShareUserGrantsDecodeError/, "stable contextual decode error"],

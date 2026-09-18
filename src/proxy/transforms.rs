@@ -4538,10 +4538,14 @@ fn drop_incomplete_anthropic_tool_turns(messages: &mut Vec<Value>) {
             let paired_ids = tool_use_counts
                 .iter()
                 .filter_map(|(id, count)| {
-                    (!id.is_empty()
+                    if !id.is_empty()
                         && *count == 1
-                        && tool_result_counts.get(id).copied() == Some(1))
-                    .then(|| id.clone())
+                        && tool_result_counts.get(id).copied() == Some(1)
+                    {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
                 })
                 .collect::<BTreeSet<_>>();
 
@@ -4811,9 +4815,13 @@ fn anthropic_system_to_openai_chat(system: Option<&Value>) -> Option<Value> {
 
 fn anthropic_system_to_openai_instructions(system: Option<&Value>) -> Option<String> {
     let instructions = match system? {
-        Value::String(text) => (!is_anthropic_billing_metadata_block(text))
-            .then(|| text.to_string())
-            .unwrap_or_default(),
+        Value::String(text) => {
+            if is_anthropic_billing_metadata_block(text) {
+                String::new()
+            } else {
+                text.to_string()
+            }
+        }
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(anthropic_text_from_block)

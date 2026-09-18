@@ -12425,9 +12425,12 @@ async fn send_responses_upstream_while_serving_downstream(
         tokio::select! {
             biased;
             result = &mut completion => {
-                let result = result
-                    .map_err(|_| responses_websocket_channel_closed("writer stopped before completion"))
-                    .and_then(|result| result);
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err(responses_websocket_channel_closed(
+                        "writer stopped before completion",
+                    )),
+                };
                 return match result {
                     Ok(()) => Ok(ResponsesWebsocketSendOutcome::Sent),
                     // The old single-task transport could successfully queue a request
@@ -14338,6 +14341,7 @@ async fn prepare_codex_responses_websocket_request(
     Ok((message, Some(policy_metadata)))
 }
 
+#[allow(clippy::too_many_arguments)] // The relay owns one downstream stream and its request-scoped guards.
 async fn relay_codex_http_fallback_stream(
     downstream: &mut WebSocket,
     upstream: reqwest::Response,
@@ -14589,6 +14593,7 @@ async fn relay_codex_http_fallback_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keep transport decoding state explicit at the relay boundary.
 async fn relay_codex_http_fallback_transport_items(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
@@ -14644,6 +14649,7 @@ async fn relay_codex_http_fallback_transport_items(
     Ok((outcome, semantic_activity))
 }
 
+#[allow(clippy::too_many_arguments)] // Payload relay applies the same stream, usage, and memory guards.
 async fn relay_codex_http_fallback_payloads(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
