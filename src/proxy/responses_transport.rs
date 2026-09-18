@@ -133,6 +133,14 @@ impl ResponsesTransportDecoder {
         self.mode == ResponsesTransportMode::Sse
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self.mode {
+            ResponsesTransportMode::Unknown => self.undecided.len(),
+            ResponsesTransportMode::Sse => self.sse.retained_bytes(),
+            ResponsesTransportMode::Json => self.json.len(),
+        }
+    }
+
     pub(crate) fn push(
         &mut self,
         chunk: &[u8],

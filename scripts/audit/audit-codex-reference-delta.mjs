@@ -129,6 +129,76 @@ for (const id of ["CX-03", "CX-05", "CX-06"]) {
   assert(capability?.status === "live_pending", `${id} must remain live_pending`);
   assert(capability.runtimeEnabled === false, `${id} cannot be enabled without evidence`);
 }
+
+const sourceDeltaIds = new Set(
+  (baseline.sources ?? []).flatMap((source) =>
+    (source.deltas ?? []).map((delta) => delta.id),
+  ),
+);
+const incrementalEnhancements = new Map(
+  (baseline.incrementalEnhancements ?? []).map((enhancement) => [
+    enhancement.id,
+    enhancement,
+  ]),
+);
+assert(
+  incrementalEnhancements.size === 4,
+  "Codex incremental contract must contain CX-N1 through CX-N4",
+);
+for (let index = 1; index <= 4; index += 1) {
+  const id = `CX-N${index}`;
+  const enhancement = incrementalEnhancements.get(id);
+  assert(enhancement, `Codex incremental contract is missing ${id}`);
+  assert(
+    enhancement.status === "fixture_verified",
+    `${id} must be fixture_verified without claiming live evidence`,
+  );
+  assert(
+    sourceDeltaIds.has(enhancement.referenceDelta),
+    `${id} references an unknown source delta`,
+  );
+  assert(
+    Array.isArray(enhancement.evidence) && enhancement.evidence.length > 0,
+    `${id} must pin local evidence`,
+  );
+  for (const evidence of enhancement.evidence) {
+    const localPath = path.resolve(repoRoot, evidence.path);
+    assert(
+      localPath.startsWith(`${repoRoot}${path.sep}`) && fs.existsSync(localPath),
+      `${id} local evidence path is unavailable`,
+    );
+    const source = fs.readFileSync(localPath, "utf8");
+    for (const anchor of evidence.anchors ?? []) {
+      assert(source.includes(anchor), `${id} is missing local anchor ${anchor}`);
+    }
+  }
+}
+assert(
+  incrementalEnhancements.get("CX-N3")?.replayBoundary?.includes("same Account") &&
+    incrementalEnhancements.get("CX-N3")?.replayBoundary?.includes("never replayed"),
+  "CX-N3 lost its fixed-binding stale-socket replay boundary",
+);
+const memoryContract = incrementalEnhancements.get("CX-N4");
+assert(
+  memoryContract?.errorContract?.httpStatus === 503 &&
+    memoryContract.errorContract.retryAfterSeconds === 1 &&
+    memoryContract.errorContract.code === "cc_switch_request_memory_exhausted" &&
+    memoryContract.errorContract.websocketTerminal === "error_then_close",
+  "CX-N4 stable memory-exhaustion error contract changed",
+);
+for (const invariant of [
+  "active upstream",
+  "HTTP replay",
+  "account fallback",
+  "Provider fallback",
+  "rail fallback",
+  "site fallback",
+]) {
+  assert(
+    memoryContract?.fallbackBoundary?.includes(invariant),
+    `CX-N4 memory boundary lost ${invariant}`,
+  );
+}
 assert(
   capabilities.get("CX-05").benchmarkEvidence === false &&
     capabilities.get("CX-05").upstreamReceipt === false,
@@ -205,7 +275,7 @@ assert(
 );
 
 console.log(
-  `codex reference delta audit ok (${capabilities.size} capabilities${
+  `codex reference delta audit ok (${capabilities.size} baseline capabilities, ${incrementalEnhancements.size} incremental enhancements${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

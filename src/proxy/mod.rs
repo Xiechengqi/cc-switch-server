@@ -47,6 +47,7 @@ pub(crate) mod qoder_runtime;
 pub(crate) mod reasoning_bridge;
 mod remote_image;
 mod request_governance;
+mod request_memory;
 mod response_semantics;
 mod responses_transport;
 mod responses_wire;
@@ -179,6 +180,7 @@ impl ProxyError {
     const USER_IDENTITY_REQUIRED_PREFIX: &'static str = "[CC_USER_IDENTITY_REQUIRED] ";
     const PROTOCOL_INCOMPATIBLE_PREFIX: &'static str = "[CC_PROTOCOL_INCOMPATIBLE] ";
     const RESPONSE_CONTEXT_UNAVAILABLE_PREFIX: &'static str = "[CC_RESPONSE_CONTEXT_UNAVAILABLE] ";
+    const REQUEST_MEMORY_EXHAUSTED_PREFIX: &'static str = "[CC_REQUEST_MEMORY_EXHAUSTED] ";
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
@@ -314,6 +316,22 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn request_memory_exhausted() -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{}1]{}Request resident-memory capacity exhausted; retry later",
+                Self::RETRY_AFTER_PREFIX,
+                Self::REQUEST_MEMORY_EXHAUSTED_PREFIX,
+            ),
+        }
+    }
+
+    pub(super) fn is_request_memory_exhausted(&self) -> bool {
+        self.message_without_retry_metadata()
+            .starts_with(Self::REQUEST_MEMORY_EXHAUSTED_PREFIX)
+    }
+
     pub(super) fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
         Self {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -353,6 +371,7 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::PROTOCOL_INCOMPATIBLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::CAPACITY_SHED_PREFIX))
+            .or_else(|| message.strip_prefix(Self::REQUEST_MEMORY_EXHAUSTED_PREFIX))
             .unwrap_or(message)
     }
 
@@ -416,6 +435,9 @@ impl ProxyError {
         }
         if message.starts_with(Self::CAPACITY_SHED_PREFIX) {
             return "cc_switch_upstream_capacity_shed";
+        }
+        if message.starts_with(Self::REQUEST_MEMORY_EXHAUSTED_PREFIX) {
+            return "cc_switch_request_memory_exhausted";
         }
         if message.starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX) {
             return "cc_switch_protocol_incompatible";

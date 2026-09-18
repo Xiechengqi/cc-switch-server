@@ -623,6 +623,43 @@ pub fn record_proxy_semantic_guard(surface: &'static str, observation: &'static 
     .increment(1);
 }
 
+pub fn record_request_memory_reservation(
+    component: &'static str,
+    bytes: usize,
+    outcome: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_request_memory_reservations_total",
+        "component" => component,
+        "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "cc_switch_request_memory_reservation_bytes",
+        "component" => component,
+        "outcome" => outcome
+    )
+    .record(bytes as f64);
+}
+
+pub fn record_request_memory_high_water(
+    high_water_bytes: usize,
+    limit_bytes: usize,
+    exhausted: bool,
+) {
+    let outcome = if exhausted { "exhausted" } else { "completed" };
+    metrics::histogram!(
+        "cc_switch_request_memory_high_water_bytes",
+        "outcome" => outcome
+    )
+    .record(high_water_bytes as f64);
+    metrics::histogram!(
+        "cc_switch_request_memory_limit_bytes",
+        "outcome" => outcome
+    )
+    .record(limit_bytes as f64);
+}
+
 fn describe() {
     metrics::describe_gauge!(
         "cc_switch_account_inflight",
@@ -847,6 +884,22 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_responses_sse_transport_total",
         "Bounded OpenAI Responses SSE normalization and liveness classifications"
+    );
+    metrics::describe_counter!(
+        "cc_switch_request_memory_reservations_total",
+        "Request-scoped resident-memory reservation outcomes by bounded component"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_request_memory_reservation_bytes",
+        "Request-scoped resident-memory reservation bytes by bounded component and outcome"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_request_memory_high_water_bytes",
+        "Final request-scoped resident-memory high-water bytes"
+    );
+    metrics::describe_histogram!(
+        "cc_switch_request_memory_limit_bytes",
+        "Configured request-scoped resident-memory limit observed at request completion"
     );
     metrics::describe_counter!(
         "cc_switch_server_sqlite_commits_total",

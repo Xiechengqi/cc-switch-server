@@ -19,6 +19,18 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-18 Codex bootstrap, metadata, WebSocket fairness, and memory freeze
+
+Codex 增量证据追加在 `assets/contract/codex-reference-delta.json`，保留原有 CX-01～CX-06 历史合同。只读来源为 `CLIProxyAPI@cb73cd99` 的空 bootstrap announcement、`CLIProxyAPI@b5ba02c2` 的大帧写入公平性、`codex2api@dc47d131` 的 input-item metadata 层级和 `codex2api@19ee8db4` 的请求生命周期内存预算；完整 commit、文件路径与提交态 SHA-256 可由 `node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时均不读取外部 checkout。
+
+CX-N1 在 HTTP JSON、SSE、WS 与 Lite 共用的 Responses 分类器中，只把载荷语义为空的 `response.output_item.added`、`response.content_part.added` 和 `response.reasoning_summary_part.added` 视为 Lifecycle；未知类型、文本、工具参数、server operation、错误或任意其他可见字段继续 fail closed 为 Business。CX-N2 只删除 `input[*]` 对象顶层的 `internal_chat_message_metadata_passthrough`，根对象、content、arguments 和用户嵌套同名字段逐字保留，且转换幂等。
+
+CX-N3 将上游 Responses WebSocket 拆成单 reader/single writer actor、有界读写队列和 32 KiB continuation frame；大上传期间双向 Ping/Pong 与下游取消均有冻结时限。写入已提交、peer terminal 与 stale cached socket 的 replay 边界保持保守：只允许原 Provider、原 Account、原 rail 的 pre-commit WS→HTTP fallback，已发送或已产生业务输出时不重放，也不切换身份或站点。
+
+CX-N4 为每个 Codex HTTP 请求或 Responses WebSocket turn 建立独立 sticky budget，统一计入 raw/decoded/normalized body、响应 wire/decoded body、transport pending、semantic prelude、tool arguments、normalized event 及 WS read/write queue。重试共享原预算；耗尽立即取消/丢弃当前上游，禁止继续 HTTP replay、账号/Provider/rail/site fallback，并返回稳定 HTTP 503（`Retry-After: 1`、`cc_switch_request_memory_exhausted`）或 WS error 后 Close。reservation 与最终 `Bytes` owner 绑定，terminal、cancel 和最后一个 body view drop 后释放；指标只含低基数组件、结果、字节数、limit 与 high-water，不记录内容、凭据或身份。默认 256 MiB，可由 `requestBodyLimits.memoryBudgetMb` 或 `CC_SWITCH_REQUEST_MEMORY_BUDGET_MB` 在 16～1024 MiB 内配置。
+
+上述四项均为本仓库 `fixture_verified`。26 个 Codex WebSocket 回归覆盖 ping、公平写入、取消、handshake fallback、stale socket 与零 post-commit replay；压缩膨胀、raw+decoded+normalized 合计、稳定错误和 `Bytes` 生命周期另有专项测试。它们不构成真实 ChatGPT entitlement、生产网络性能或任何仍为 CX-03/CX-05/CX-06 `live_pending` 能力的 receipt。
+
 ## 2026-09-18 Antigravity grounding, model capability, and conversation-edge freeze
 
 本轮增量证据追加在 `assets/contract/antigravity-reference-delta.json`，不改写 2026-09-11 的历史 observation。只读来源为 `CLIProxyAPI@ef63d2e7/@7fcbdf88/@a9e92b81/@b681a1e0/@8c984672/@fd3e6623` 与 `Antigravity-Manager@734e2bde/@9fd77989`；每个完整 commit、路径和提交态 SHA-256 均由 `scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核，默认构建、测试和运行时仍不读取外部仓库。

@@ -16,7 +16,7 @@
 
 | 路径 | 内容 | 敏感 |
 | --- | --- | --- |
-| `server.json` | 管理员密码 hash、owner email、Router 配置与密钥、client tunnel 子域、`requestBodyLimits` | 是 |
+| `server.json` | 管理员密码 hash、owner email、Router 配置与密钥、client tunnel 子域、`requestBodyLimits`（三档 ingress body 上限与单请求生命周期内存预算） | 是 |
 | `providers.json` | 首次 SQLite 迁移前的 Provider 配置；提交后移入只读 migration backup | 是 |
 | `accounts.json` | 首次 SQLite 迁移前的 Provider 账号与 OAuth 凭据；提交后移入只读 migration backup | 是 |
 | `accounts.key` | 凭据根密钥 | 是 |

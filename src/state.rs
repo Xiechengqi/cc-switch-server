@@ -6991,7 +6991,8 @@ impl ServerStateInner {
             default_bytes = request_body_limits.default_bytes,
             media_bytes = request_body_limits.media_bytes,
             image_bytes = request_body_limits.image_bytes,
-            "resolved local request body limits (effective limit is min(local, router-declared))"
+            memory_budget_bytes = request_body_limits.memory_budget_bytes,
+            "resolved local request body and request-lifecycle memory limits (body limit is min(local, router-declared))"
         );
 
         Ok(Arc::new(Self {

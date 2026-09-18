@@ -95,6 +95,10 @@ impl SseEventDecoder {
         self.drain(true)
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.pending.len().saturating_add(self.event.wire_bytes)
+    }
+
     fn drain(&mut self, finish: bool) -> Result<Vec<SseEvent>, SseDecodeError> {
         let mut events = Vec::new();
         while let Some((line_end, delimiter_len)) = next_line_boundary(&self.pending, finish) {

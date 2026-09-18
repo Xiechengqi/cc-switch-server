@@ -545,6 +545,18 @@ impl ResponsesSseAggregator {
         self.stream_status.is_some()
     }
 
+    pub fn retained_bytes(&self) -> usize {
+        self.response_bytes
+            .saturating_add(self.output_item_bytes)
+            .saturating_add(self.decoder.retained_bytes())
+            .saturating_add(
+                self.last_error
+                    .as_ref()
+                    .and_then(|value| serde_json::to_vec(value).ok())
+                    .map_or(0, |value| value.len()),
+            )
+    }
+
     pub fn finish(mut self) -> Result<ResponsesSseAggregation, ResponsesSseAggregationError> {
         if !self.is_terminal() {
             let events = responses_aggregation_events(

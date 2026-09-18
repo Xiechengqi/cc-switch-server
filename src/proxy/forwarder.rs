@@ -22,7 +22,10 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{
+    CloseCode, Data as FrameData, OpCode,
+};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -107,6 +110,9 @@ use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
     response_decoding_required, ResponseDecodeResult,
+};
+use super::request_memory::{
+    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
@@ -337,7 +343,208 @@ impl Drop for ImageTransportMetrics {
     }
 }
 
-type ResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+type RawResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+const RESPONSES_WEBSOCKET_WRITE_CHUNK_BYTES: usize = 32 * 1024;
+const RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY: usize = 1;
+const RESPONSES_WEBSOCKET_READ_QUEUE_CAPACITY: usize = 128;
+
+struct ResponsesWebSocketWrite {
+    message: TungsteniteMessage,
+    completion: tokio::sync::oneshot::Sender<Result<(), TungsteniteError>>,
+    _memory: Option<RequestMemoryReservation>,
+}
+
+enum ResponsesWebSocketReadError {
+    Transport(TungsteniteError),
+    Memory(ProxyError),
+}
+
+struct ResponsesWebSocketReadMessage {
+    result: Result<TungsteniteMessage, ResponsesWebSocketReadError>,
+    _memory: Option<RequestMemoryReservation>,
+}
+
+struct ResponsesUpstreamWebSocket {
+    writes: tokio::sync::mpsc::Sender<ResponsesWebSocketWrite>,
+    reads: tokio::sync::mpsc::Receiver<ResponsesWebSocketReadMessage>,
+    request_memory: Arc<StdMutex<Option<RequestMemoryBudget>>>,
+    peer_terminal_observed: Arc<AtomicBool>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl ResponsesUpstreamWebSocket {
+    fn new(socket: RawResponsesUpstreamWebSocket) -> Self {
+        let (mut sink, mut source) = socket.split();
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<ResponsesWebSocketWrite>(
+            RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY,
+        );
+        let (read_tx, read_rx) =
+            tokio::sync::mpsc::channel(RESPONSES_WEBSOCKET_READ_QUEUE_CAPACITY);
+        let peer_terminal_observed = Arc::new(AtomicBool::new(false));
+        let reader_terminal_observed = Arc::clone(&peer_terminal_observed);
+        let request_memory = Arc::new(StdMutex::new(None::<RequestMemoryBudget>));
+        let reader_request_memory = Arc::clone(&request_memory);
+
+        let reader = tokio::spawn(async move {
+            while let Some(message) = source.next().await {
+                let memory = reader_request_memory
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let reservation = match message.as_ref() {
+                    Ok(message) => memory
+                        .as_ref()
+                        .map(|budget| {
+                            budget.reserve(
+                                RequestMemoryComponent::WebSocketReadQueue,
+                                websocket_message_payload_len(message),
+                            )
+                        })
+                        .transpose(),
+                    Err(_) => Ok(None),
+                };
+                let message = match reservation {
+                    Ok(reservation) => ResponsesWebSocketReadMessage {
+                        result: message.map_err(ResponsesWebSocketReadError::Transport),
+                        _memory: reservation,
+                    },
+                    Err(error) => ResponsesWebSocketReadMessage {
+                        result: Err(ResponsesWebSocketReadError::Memory(
+                            error.into_proxy_error(),
+                        )),
+                        _memory: None,
+                    },
+                };
+                let terminal = message
+                    .result
+                    .as_ref()
+                    .map_or(true, TungsteniteMessage::is_close);
+                if terminal {
+                    reader_terminal_observed.store(true, Ordering::Release);
+                }
+                if read_tx.send(message).await.is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        let writer = tokio::spawn(async move {
+            while let Some(write) = write_rx.recv().await {
+                let result = write_responses_websocket_message(&mut sink, write.message).await;
+                let terminal = result.is_err();
+                let _ = write.completion.send(result);
+                if terminal {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            writes: write_tx,
+            reads: read_rx,
+            request_memory,
+            peer_terminal_observed,
+            reader,
+            writer,
+        }
+    }
+
+    async fn start_send(
+        &self,
+        message: TungsteniteMessage,
+        memory: Option<RequestMemoryReservation>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TungsteniteError>>, TungsteniteError>
+    {
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        self.writes
+            .send(ResponsesWebSocketWrite {
+                message,
+                completion,
+                _memory: memory,
+            })
+            .await
+            .map_err(|_| responses_websocket_channel_closed("write queue closed"))?;
+        Ok(completed)
+    }
+
+    async fn send(&self, message: TungsteniteMessage) -> Result<(), TungsteniteError> {
+        self.start_send(message, None)
+            .await?
+            .await
+            .map_err(|_| responses_websocket_channel_closed("writer stopped before completion"))?
+    }
+
+    async fn next(&mut self) -> Option<ResponsesWebSocketReadMessage> {
+        self.reads.recv().await
+    }
+
+    fn set_request_memory(&self, budget: Option<RequestMemoryBudget>) {
+        *self
+            .request_memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = budget;
+    }
+
+    fn peer_terminal_observed(&self) -> bool {
+        self.peer_terminal_observed.load(Ordering::Acquire)
+    }
+
+    async fn close(&mut self) -> Result<(), TungsteniteError> {
+        self.send(TungsteniteMessage::Close(None)).await
+    }
+}
+
+impl Drop for ResponsesUpstreamWebSocket {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+fn responses_websocket_channel_closed(message: &'static str) -> TungsteniteError {
+    TungsteniteError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message))
+}
+
+async fn write_responses_websocket_message<S>(
+    sink: &mut S,
+    message: TungsteniteMessage,
+) -> Result<(), TungsteniteError>
+where
+    S: futures_util::Sink<TungsteniteMessage, Error = TungsteniteError> + Unpin,
+{
+    let (payload, first_opcode) = match message {
+        TungsteniteMessage::Text(text) if text.len() > RESPONSES_WEBSOCKET_WRITE_CHUNK_BYTES => {
+            (text.into_bytes(), FrameData::Text)
+        }
+        TungsteniteMessage::Binary(bytes)
+            if bytes.len() > RESPONSES_WEBSOCKET_WRITE_CHUNK_BYTES =>
+        {
+            (bytes, FrameData::Binary)
+        }
+        message => return sink.send(message).await,
+    };
+
+    let chunks = payload.chunks(RESPONSES_WEBSOCKET_WRITE_CHUNK_BYTES);
+    let total_chunks = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        let opcode = if index == 0 {
+            first_opcode
+        } else {
+            FrameData::Continue
+        };
+        let frame = Frame::message(
+            chunk.to_vec(),
+            OpCode::Data(opcode),
+            index.saturating_add(1) == total_chunks,
+        );
+        sink.feed(TungsteniteMessage::Frame(frame)).await?;
+        // The split read half must get a chance to consume Ping frames. Tungstenite
+        // then flushes its automatic Pong ahead of the next data fragment.
+        tokio::task::yield_now().await;
+    }
+    sink.flush().await
+}
 
 struct CachedResponsesWebSocket {
     socket: ResponsesUpstreamWebSocket,
@@ -540,6 +747,8 @@ struct ForwardAttemptContext {
     retry_audit: Option<ForwardRetryAudit>,
     pending_capacity_retry_delay: Option<Duration>,
     skip_capacity_retry_delay: bool,
+    request_memory: Option<RequestMemoryBudget>,
+    raw_body_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +784,8 @@ impl Default for ForwardAttemptContext {
             retry_audit: None,
             pending_capacity_retry_delay: None,
             skip_capacity_retry_delay: false,
+            request_memory: None,
+            raw_body_memory: None,
         }
     }
 }
@@ -593,8 +804,37 @@ impl ForwardAttemptContext {
     }
 
     fn retry_allowed(&self) -> bool {
-        self.attempt_budget
-            .has_remaining(current_time_ms(), &self.commit_guard)
+        !self
+            .request_memory
+            .as_ref()
+            .is_some_and(RequestMemoryBudget::is_exhausted)
+            && self
+                .attempt_budget
+                .has_remaining(current_time_ms(), &self.commit_guard)
+    }
+
+    fn initialize_request_memory(
+        &mut self,
+        limit_bytes: usize,
+        raw_body_bytes: usize,
+    ) -> Result<(), ProxyError> {
+        if self.request_memory.is_none() {
+            self.request_memory = Some(RequestMemoryBudget::new(limit_bytes));
+        }
+        if self.raw_body_memory.is_none() {
+            let budget = self.request_memory.as_ref().ok_or_else(|| {
+                ProxyError::bad_gateway("request memory budget initialization failed")
+            })?;
+            let reservation = budget
+                .reserve(RequestMemoryComponent::InboundRaw, raw_body_bytes)
+                .map_err(|error| error.into_proxy_error())?;
+            self.raw_body_memory = Some(reservation);
+        }
+        Ok(())
+    }
+
+    fn request_memory(&self) -> Option<&RequestMemoryBudget> {
+        self.request_memory.as_ref()
     }
 
     fn next(
@@ -631,6 +871,24 @@ impl ForwardAttemptContext {
         recovery_stage: RecoveryStage,
         delay_source: DelaySource,
     ) -> Option<Self> {
+        if self
+            .request_memory
+            .as_ref()
+            .is_some_and(RequestMemoryBudget::is_exhausted)
+        {
+            crate::metrics::record_recovery_decision(
+                execution.stored.provider_type.as_str(),
+                recovery_stage.as_str(),
+                if self.commit_guard.is_committed() {
+                    "committed"
+                } else {
+                    "pre_commit"
+                },
+                "denied_budget",
+                delay_source.as_str(),
+            );
+            return None;
+        }
         let mut next = self.clone();
         let decision = next.attempt_budget.reserve(
             recovery_stage,
@@ -815,6 +1073,189 @@ impl ForwardAttemptContext {
         *self = next;
         true
     }
+}
+
+fn request_body_has_content_coding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+}
+
+fn decode_request_body_with_memory(
+    headers: &HeaderMap,
+    raw: Bytes,
+    decoded_limit: usize,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<(Bytes, Option<RequestMemoryReservation>), ProxyError> {
+    let decoding_required = request_body_has_content_coding(headers);
+    let effective_limit = if decoding_required {
+        request_memory
+            .map(RequestMemoryBudget::remaining_bytes)
+            .map_or(decoded_limit, |remaining| decoded_limit.min(remaining))
+    } else {
+        decoded_limit
+    };
+    let body = match decode_request_body_for_proxy_with_limit(headers, raw, effective_limit) {
+        Ok(body) => body,
+        Err(error)
+            if decoding_required
+                && effective_limit < decoded_limit
+                && error.status == StatusCode::PAYLOAD_TOO_LARGE =>
+        {
+            let budget = request_memory.ok_or(error)?;
+            return Err(budget
+                .reject(
+                    RequestMemoryComponent::DecodedBody,
+                    effective_limit.saturating_add(1),
+                )
+                .into_proxy_error());
+        }
+        Err(error) => return Err(error),
+    };
+    let reservation = if decoding_required {
+        request_memory
+            .map(|budget| {
+                budget
+                    .reserve(RequestMemoryComponent::DecodedBody, body.len())
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok((body, reservation))
+}
+
+fn retain_request_bytes(
+    bytes: Bytes,
+    request_memory: Option<&RequestMemoryBudget>,
+    component: RequestMemoryComponent,
+) -> Result<Bytes, ProxyError> {
+    match request_memory {
+        Some(budget) => budget
+            .retain_bytes(component, bytes)
+            .map_err(|error| error.into_proxy_error()),
+        None => Ok(bytes),
+    }
+}
+
+#[derive(Debug)]
+enum RequestMemoryResponseReadError {
+    Upstream(crate::infra::http::BoundedResponseBodyError),
+    Memory(ProxyError),
+}
+
+impl RequestMemoryResponseReadError {
+    fn is_memory_exhausted(&self) -> bool {
+        matches!(self, Self::Memory(error) if error.is_request_memory_exhausted())
+    }
+
+    fn into_proxy_error(self) -> ProxyError {
+        match self {
+            Self::Upstream(error) => ProxyError::bad_gateway(error),
+            Self::Memory(error) => error,
+        }
+    }
+}
+
+async fn read_response_body_limited_with_memory(
+    response: &mut reqwest::Response,
+    configured_limit: usize,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<(Bytes, Option<RequestMemoryReservation>), RequestMemoryResponseReadError> {
+    let effective_limit = request_memory
+        .map(RequestMemoryBudget::remaining_bytes)
+        .map_or(configured_limit, |remaining| {
+            configured_limit.min(remaining)
+        });
+    let bytes =
+        match crate::infra::http::read_response_body_limited(response, effective_limit).await {
+            Ok(bytes) => bytes,
+            Err(error)
+                if effective_limit < configured_limit
+                    && matches!(
+                        error,
+                        crate::infra::http::BoundedResponseBodyError::TooLarge { .. }
+                    ) =>
+            {
+                let Some(budget) = request_memory else {
+                    return Err(RequestMemoryResponseReadError::Upstream(error));
+                };
+                return Err(RequestMemoryResponseReadError::Memory(
+                    budget
+                        .reject(
+                            RequestMemoryComponent::TransportPending,
+                            effective_limit.saturating_add(1),
+                        )
+                        .into_proxy_error(),
+                ));
+            }
+            Err(error) => return Err(RequestMemoryResponseReadError::Upstream(error)),
+        };
+    let memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(RequestMemoryComponent::TransportPending, bytes.len())
+                .map_err(|error| RequestMemoryResponseReadError::Memory(error.into_proxy_error()))
+        })
+        .transpose()?;
+    Ok((bytes, memory))
+}
+
+fn decode_response_body_with_memory(
+    headers: &HeaderMap,
+    body: Bytes,
+    transport_memory: Option<RequestMemoryReservation>,
+    configured_limit: usize,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<ResponseDecodeResult, ProxyError> {
+    let decoding_required = response_decoding_required(headers, &body[..body.len().min(4)]);
+    let effective_limit = if decoding_required {
+        request_memory
+            .map(RequestMemoryBudget::remaining_bytes)
+            .map_or(configured_limit, |remaining| {
+                configured_limit.min(remaining)
+            })
+    } else {
+        configured_limit
+    };
+    let mut decoded =
+        match decode_response_body_for_proxy_with_limit(headers, body, effective_limit) {
+            Ok(decoded) => decoded,
+            Err(error)
+                if decoding_required
+                    && effective_limit < configured_limit
+                    && error.status == StatusCode::BAD_GATEWAY
+                    && error
+                        .client_message()
+                        .starts_with("decoded upstream response body exceeds") =>
+            {
+                let budget = request_memory.ok_or(error)?;
+                return Err(budget
+                    .reject(
+                        RequestMemoryComponent::DecodedBody,
+                        effective_limit.saturating_add(1),
+                    )
+                    .into_proxy_error());
+            }
+            Err(error) => return Err(error),
+        };
+
+    if decoding_required {
+        decoded.body = retain_request_bytes(
+            decoded.body,
+            request_memory,
+            RequestMemoryComponent::DecodedBody,
+        )?;
+        drop(transport_memory);
+    } else if let Some(transport_memory) = transport_memory {
+        decoded.body = transport_memory.retain_bytes(decoded.body);
+    }
+    Ok(decoded)
 }
 
 pub async fn forward(
@@ -1592,6 +2033,12 @@ async fn forward_with_attempt(
 ) -> Result<Response, ProxyError> {
     let raw_body_for_retry = body;
     let retry_gemini_path = gemini_path;
+    if route.app() == AppKind::Codex {
+        attempt_context.initialize_request_memory(
+            state.request_body_limits.memory_budget_bytes,
+            raw_body_for_retry.len(),
+        )?;
+    }
     'attempt: loop {
         if let Some(delay) = attempt_context.pending_capacity_retry_delay.take() {
             if delay.is_zero() {
@@ -1601,10 +2048,11 @@ async fn forward_with_attempt(
             }
         }
         let gemini_path = retry_gemini_path.clone();
-        let body = decode_request_body_for_proxy_with_limit(
+        let (body, _decoded_body_memory) = decode_request_body_with_memory(
             &headers,
             raw_body_for_retry.clone(),
             state.request_body_limits.default_bytes,
+            attempt_context.request_memory(),
         )?;
         let app = route.app();
         let claude_body_retry_stage = attempt_context.body_retry_stage;
@@ -1811,6 +2259,17 @@ async fn forward_with_attempt(
                 adapter_request.body = body;
             }
         }
+        let _normalized_body_memory = attempt_context
+            .request_memory()
+            .map(|budget| {
+                budget
+                    .reserve(
+                        RequestMemoryComponent::NormalizedBody,
+                        adapter_request.body.len(),
+                    )
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?;
         let codex_previous_response_cache_scope =
             if execution.driver_is("oauth.openai_codex") && route == ProxyRoute::CodexResponses {
                 codex_previous_response_cache_scope(&state, &execution, &request_context).await
@@ -2183,6 +2642,12 @@ async fn forward_with_attempt(
         )
         .await?;
 
+        if let Some(reservation) = _normalized_body_memory.as_ref() {
+            reservation
+                .resize(adapter_request.body.len())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+
         let http_client = forward_http_client(&state, &execution).await?;
         let request = build_upstream_post_request(
             &http_client,
@@ -2342,16 +2807,20 @@ async fn forward_with_attempt(
                 .as_ref()
                 .is_some_and(|context| context.replay_applied)
         {
-            let response_bytes = crate::infra::http::read_response_body_limited(
-                &mut upstream,
-                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-            )
-            .await
-            .map_err(ProxyError::bad_gateway)?;
-            let decoded = decode_response_body_for_proxy_with_limit(
+            let (response_bytes, response_transport_memory) =
+                read_response_body_limited_with_memory(
+                    &mut upstream,
+                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    attempt_context.request_memory(),
+                )
+                .await
+                .map_err(RequestMemoryResponseReadError::into_proxy_error)?;
+            let decoded = decode_response_body_with_memory(
                 &response_headers,
                 response_bytes,
+                response_transport_memory,
                 PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                attempt_context.request_memory(),
             )?;
             if super::grok_replay::is_explicit_rejection(status.as_u16(), &decoded.body) {
                 clear_rejected_grok_reasoning_replay(&state, grok_reasoning_replay.as_ref()).await;
@@ -2376,16 +2845,20 @@ async fn forward_with_attempt(
             && !status.is_success()
             && status != StatusCode::TOO_MANY_REQUESTS
         {
-            let original_bytes = crate::infra::http::read_response_body_limited(
-                &mut upstream,
-                CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
-            )
-            .await
-            .map_err(ProxyError::bad_gateway)?;
-            let original_decoded = decode_response_body_for_proxy_with_limit(
+            let (original_bytes, response_transport_memory) =
+                read_response_body_limited_with_memory(
+                    &mut upstream,
+                    CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                    attempt_context.request_memory(),
+                )
+                .await
+                .map_err(RequestMemoryResponseReadError::into_proxy_error)?;
+            let original_decoded = decode_response_body_with_memory(
                 &response_headers,
                 original_bytes,
+                response_transport_memory,
                 CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                attempt_context.request_memory(),
             )?;
             if codex_image_tool_rejection_body(&original_decoded.body) {
                 if let Some(retry_body) =
@@ -2518,16 +2991,20 @@ async fn forward_with_attempt(
             let decoded = match buffered_upstream_body.take() {
                 Some(decoded) => decoded,
                 None => {
-                    let bytes = crate::infra::http::read_response_body_limited(
-                        &mut upstream,
-                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-                    )
-                    .await
-                    .map_err(ProxyError::bad_gateway)?;
-                    decode_response_body_for_proxy_with_limit(
+                    let (bytes, response_transport_memory) =
+                        read_response_body_limited_with_memory(
+                            &mut upstream,
+                            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                            attempt_context.request_memory(),
+                        )
+                        .await
+                        .map_err(RequestMemoryResponseReadError::into_proxy_error)?;
+                    decode_response_body_with_memory(
                         &response_headers,
                         bytes,
+                        response_transport_memory,
                         PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                        attempt_context.request_memory(),
                     )?
                 }
             };
@@ -2560,16 +3037,20 @@ async fn forward_with_attempt(
             let decoded = match buffered_upstream_body.take() {
                 Some(decoded) => decoded,
                 None => {
-                    let bytes = crate::infra::http::read_response_body_limited(
-                        &mut upstream,
-                        CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
-                    )
-                    .await
-                    .map_err(ProxyError::bad_gateway)?;
-                    decode_response_body_for_proxy_with_limit(
+                    let (bytes, response_transport_memory) =
+                        read_response_body_limited_with_memory(
+                            &mut upstream,
+                            CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                            attempt_context.request_memory(),
+                        )
+                        .await
+                        .map_err(RequestMemoryResponseReadError::into_proxy_error)?;
+                    decode_response_body_with_memory(
                         &response_headers,
                         bytes,
+                        response_transport_memory,
                         CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
+                        attempt_context.request_memory(),
                     )?
                 }
             };
@@ -2601,43 +3082,50 @@ async fn forward_with_attempt(
             let decoded = match buffered_upstream_body.take() {
                 Some(decoded) => decoded,
                 None => {
-                    let bytes = match crate::infra::http::read_response_body_limited(
-                        &mut upstream,
-                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-                    )
-                    .await
-                    {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            record_provider_outcome(
-                                &state,
-                                &stored,
-                                provider_outcome_from_status(status_code),
-                            )
-                            .await;
-                            if let Some(next_attempt) = next_claude_transport_attempt(
-                                &state,
-                                route,
-                                &headers,
-                                &request_context,
-                                &attempt_context,
-                                &execution,
-                                "rate_limit_body_read_error",
-                            )
-                            .await
-                            {
-                                attempt_context = next_attempt;
-                                drop(account_in_flight_guard);
-                                drop(share_invocation_guard);
-                                continue 'attempt;
+                    let (bytes, response_transport_memory) =
+                        match read_response_body_limited_with_memory(
+                            &mut upstream,
+                            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                            attempt_context.request_memory(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                if error.is_memory_exhausted() {
+                                    return Err(error.into_proxy_error());
+                                }
+                                record_provider_outcome(
+                                    &state,
+                                    &stored,
+                                    provider_outcome_from_status(status_code),
+                                )
+                                .await;
+                                if let Some(next_attempt) = next_claude_transport_attempt(
+                                    &state,
+                                    route,
+                                    &headers,
+                                    &request_context,
+                                    &attempt_context,
+                                    &execution,
+                                    "rate_limit_body_read_error",
+                                )
+                                .await
+                                {
+                                    attempt_context = next_attempt;
+                                    drop(account_in_flight_guard);
+                                    drop(share_invocation_guard);
+                                    continue 'attempt;
+                                }
+                                return Err(error.into_proxy_error());
                             }
-                            return Err(ProxyError::bad_gateway(error));
-                        }
-                    };
-                    decode_response_body_for_proxy_with_limit(
+                        };
+                    decode_response_body_with_memory(
                         &response_headers,
                         bytes,
+                        response_transport_memory,
                         PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                        attempt_context.request_memory(),
                     )?
                 }
             };
@@ -2706,7 +3194,12 @@ async fn forward_with_attempt(
             }
             record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
                 .await;
-            let mut response = Response::new(Body::from(decoded.body));
+            let response_body = retain_request_bytes(
+                decoded.body,
+                attempt_context.request_memory(),
+                RequestMemoryComponent::NormalizedEvent,
+            )?;
+            let mut response = Response::new(Body::from(response_body));
             *response.status_mut() = status;
             if let Some(content_type) = content_type {
                 if let Ok(value) = HeaderValue::from_str(&content_type) {
@@ -2762,6 +3255,7 @@ async fn forward_with_attempt(
                     keepalive_interval: image_keepalive_interval(&execution),
                     account_in_flight_guard,
                     share_invocation_guard,
+                    request_memory: attempt_context.request_memory().cloned(),
                 },
             ));
         }
@@ -2777,6 +3271,7 @@ async fn forward_with_attempt(
                 execution.request_timeout(),
                 stream_first_event_deadline,
                 execution.stream_first_byte_timeout(),
+                attempt_context.request_memory(),
             )
             .await
             {
@@ -3102,6 +3597,23 @@ async fn forward_with_attempt(
             });
             let mut anthropic_semantics =
                 inspect_anthropic_semantics.then(AnthropicSseInspector::default);
+            let stream_request_memory = attempt_context.request_memory().cloned();
+            let semantic_prelude_memory = stream_request_memory
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .reserve(RequestMemoryComponent::SemanticPrelude, 0)
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
+            let semantic_transport_memory = stream_request_memory
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .reserve(RequestMemoryComponent::TransportPending, 0)
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
             if inspect_anthropic_semantics {
                 sse_error_detector = None;
             }
@@ -3203,6 +3715,19 @@ async fn forward_with_attempt(
                                 }
                             }
                             prelude.extend_from_slice(&downstream_chunk);
+                            if let Some(reservation) = semantic_prelude_memory.as_ref() {
+                                reservation
+                                    .resize(prelude.len())
+                                    .map_err(|error| error.into_proxy_error())?;
+                            }
+                            if let (Some(reservation), Some(inspector)) = (
+                                semantic_transport_memory.as_ref(),
+                                responses_semantics.as_ref(),
+                            ) {
+                                reservation
+                                    .resize(inspector.retained_transport_bytes())
+                                    .map_err(|error| error.into_proxy_error())?;
+                            }
                             if semantic_protocol_error.is_none() {
                                 if let Err(error) = terminal_detector.push(&downstream_chunk) {
                                     semantic_protocol_error = Some(
@@ -3220,6 +3745,13 @@ async fn forward_with_attempt(
                                             if normalize_responses_transport {
                                                 batch.record_transport_metrics("http_stream_prime");
                                                 prelude.extend_from_slice(&batch.normalized);
+                                                if let Some(reservation) =
+                                                    semantic_prelude_memory.as_ref()
+                                                {
+                                                    reservation.resize(prelude.len()).map_err(
+                                                        |error| error.into_proxy_error(),
+                                                    )?;
+                                                }
                                             }
                                             let observations = batch.observations;
                                             for observation in &observations {
@@ -3312,6 +3844,13 @@ async fn forward_with_attempt(
                                             if normalize_responses_transport {
                                                 batch.record_transport_metrics("http_stream_prime");
                                                 prelude.extend_from_slice(&batch.normalized);
+                                                if let Some(reservation) =
+                                                    semantic_prelude_memory.as_ref()
+                                                {
+                                                    reservation.resize(prelude.len()).map_err(
+                                                        |error| error.into_proxy_error(),
+                                                    )?;
+                                                }
                                                 if semantic_protocol_error.is_none() {
                                                     if let Err(error) =
                                                         terminal_detector.push(&batch.normalized)
@@ -3604,6 +4143,34 @@ async fn forward_with_attempt(
 
             let stream_stored = stored.clone();
             let interrupted_update_armed = Arc::new(AtomicBool::new(true));
+            if let (Some(reservation), Some(inspector)) = (
+                semantic_transport_memory.as_ref(),
+                responses_semantics.as_ref(),
+            ) {
+                reservation
+                    .resize(inspector.retained_transport_bytes())
+                    .map_err(|error| error.into_proxy_error())?;
+            }
+            semantic_prelude_memory
+                .as_ref()
+                .map(RequestMemoryReservation::release);
+            let tool_argument_memory = stream_request_memory
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .reserve(RequestMemoryComponent::ToolArguments, 0)
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
+            let downstream_pending_memory = stream_request_memory
+                .as_ref()
+                .zip(pending_chunk.as_ref())
+                .map(|(budget, chunk)| {
+                    budget
+                        .reserve(RequestMemoryComponent::NormalizedEvent, chunk.len())
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
             if pending_chunk_committed_output {
                 attempt_context.mark_downstream_committed();
             }
@@ -3713,8 +4280,13 @@ async fn forward_with_attempt(
                     .and_then(super::downstream_keepalive::DownstreamKeepalive::new),
                 account_in_flight_guard,
                 share_invocation_guard,
+                request_memory: stream_request_memory,
+                semantic_transport_memory,
+                tool_argument_memory,
+                downstream_pending_memory,
             };
             let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
+                stream_state.downstream_pending_memory.take();
                 if stream_state.terminal_frame_sent {
                     return Ok(None);
                 }
@@ -3851,7 +4423,25 @@ async fn forward_with_attempt(
 
                 match next_chunk {
                     Ok(Some(upstream_chunk)) => {
+                        let _transport_pending_memory = match stream_state.reserve_request_memory(
+                            RequestMemoryComponent::TransportPending,
+                            upstream_chunk.len(),
+                        ) {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
                         let mut chunk = upstream_chunk;
+                        let normalized_event_memory = match stream_state.reserve_request_memory(
+                            RequestMemoryComponent::NormalizedEvent,
+                            chunk.len(),
+                        ) {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
                         let mut normalized_semantics = None;
                         if !chunk_already_inspected && stream_state.normalize_responses_transport {
                             let batch = match stream_state
@@ -3875,6 +4465,9 @@ async fn forward_with_attempt(
                                         .await;
                                 }
                             };
+                            if let Err(error) = stream_state.resize_semantic_transport_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             batch.record_transport_metrics("http_stream");
                             for observation in &batch.observations {
                                 crate::metrics::record_proxy_semantic_guard(
@@ -3893,6 +4486,13 @@ async fn forward_with_attempt(
                                     .any(SemanticObservation::commits_downstream),
                             ));
                             chunk = batch.normalized;
+                            if let Some(reservation) = normalized_event_memory.as_ref() {
+                                if let Err(error) = reservation.resize(chunk.len()) {
+                                    return stream_state
+                                        .terminate_transform_error(error.into_proxy_error())
+                                        .await;
+                                }
+                            }
                         }
                         if !chunk_already_inspected {
                             let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
@@ -3940,6 +4540,10 @@ async fn forward_with_attempt(
                                         "http_stream",
                                         observation.metric_kind(),
                                     );
+                                }
+                                if let Err(error) = stream_state.resize_semantic_transport_memory()
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
                                 }
                                 (
                                     observations
@@ -4055,8 +4659,18 @@ async fn forward_with_attempt(
                         let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
+                        if let Err(error) = stream_state.resize_tool_argument_memory() {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         let transformed =
                             stream_state.sanitize_openai_capacity_shed_chunk(transformed);
+                        if let Some(reservation) = normalized_event_memory.as_ref() {
+                            if let Err(error) = reservation.resize(transformed.len()) {
+                                return stream_state
+                                    .terminate_transform_error(error.into_proxy_error())
+                                    .await;
+                            }
+                        }
                         if committed_output && !transformed.is_empty() {
                             stream_state.commit_text_downstream();
                         }
@@ -4066,6 +4680,7 @@ async fn forward_with_attempt(
                             .await;
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
+                        stream_state.downstream_pending_memory = normalized_event_memory;
                         Ok(Some((transformed, stream_state)))
                     }
                     Ok(None) => {
@@ -4094,6 +4709,9 @@ async fn forward_with_attempt(
                                         .await;
                                 }
                             };
+                            if let Err(error) = stream_state.resize_semantic_transport_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             batch.record_transport_metrics("http_stream");
                             for observation in &batch.observations {
                                 crate::metrics::record_proxy_semantic_guard(
@@ -4222,6 +4840,9 @@ async fn forward_with_attempt(
                             let transformed = stream_state
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
+                            if let Err(error) = stream_state.resize_tool_argument_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             let transformed =
                                 stream_state.sanitize_openai_capacity_shed_chunk(transformed);
                             let synthesized =
@@ -4237,6 +4858,11 @@ async fn forward_with_attempt(
                             stream_state.finish_grok_reasoning_replay_stream().await;
                             stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
+                            if let Err(error) =
+                                stream_state.retain_downstream_chunk(transformed.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             return Ok(Some((transformed, stream_state)));
                         }
                         if !responses_transport_finished {
@@ -4308,6 +4934,9 @@ async fn forward_with_attempt(
                             transformed_tail,
                             stream_state.codex_custom_tool_stream_patcher.finish(),
                         );
+                        if let Err(error) = stream_state.resize_tool_argument_memory() {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         stream_state
                             .commit_antigravity_reasoning_replay_stream()
                             .await;
@@ -4321,6 +4950,11 @@ async fn forward_with_attempt(
                         let custom_tail = join_bytes(custom_tail, synthesized);
                         stream_state.finalize_terminal_usage(true).await;
                         if !custom_tail.is_empty() {
+                            if let Err(error) =
+                                stream_state.retain_downstream_chunk(custom_tail.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             return Ok(Some((custom_tail, stream_state)));
                         }
                         Ok(None)
@@ -4409,14 +5043,18 @@ async fn forward_with_attempt(
         let decoded = if let Some(decoded) = buffered_upstream_body {
             decoded
         } else {
-            let bytes = match crate::infra::http::read_response_body_limited(
+            let (bytes, response_transport_memory) = match read_response_body_limited_with_memory(
                 &mut upstream,
                 PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                attempt_context.request_memory(),
             )
             .await
             {
-                Ok(bytes) => bytes,
+                Ok(result) => result,
                 Err(error) => {
+                    if error.is_memory_exhausted() {
+                        return Err(error.into_proxy_error());
+                    }
                     record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
                     if route == ProxyRoute::ClaudeCountTokens {
                         crate::metrics::record_claude_count_tokens_outcome("network_error");
@@ -4437,15 +5075,17 @@ async fn forward_with_attempt(
                         drop(share_invocation_guard);
                         continue 'attempt;
                     }
-                    return Err(ProxyError::bad_gateway(error));
+                    return Err(error.into_proxy_error());
                 }
             };
             let decoding_required =
                 response_decoding_required(&response_headers, &bytes[..bytes.len().min(4)]);
-            let decoded = decode_response_body_for_proxy_with_limit(
+            let decoded = decode_response_body_with_memory(
                 &response_headers,
                 bytes,
+                response_transport_memory,
                 PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                attempt_context.request_memory(),
             );
             if stored.provider_type == ProviderType::ClaudeOAuth {
                 let surface = if !status.is_success() {
@@ -4785,6 +5425,11 @@ async fn forward_with_attempt(
             bytes,
             &adapter_request.claude_tool_name_map,
         );
+        let bytes = retain_request_bytes(
+            bytes,
+            attempt_context.request_memory(),
+            RequestMemoryComponent::NormalizedEvent,
+        )?;
         if status.is_success() {
             commit_antigravity_reasoning_replay(
                 &state,
@@ -9929,7 +10574,14 @@ fn responses_websocket_pool_key(
     hex::encode(digest.finalize())
 }
 
-async fn bridge_responses_websocket(
+fn bridge_responses_websocket<'a>(
+    downstream: WebSocket,
+    options: ResponsesWebsocketBridgeOptions<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + 'a>> {
+    Box::pin(bridge_responses_websocket_inner(downstream, options))
+}
+
+async fn bridge_responses_websocket_inner(
     downstream: WebSocket,
     options: ResponsesWebsocketBridgeOptions<'_>,
 ) -> Result<(), ProxyError> {
@@ -9966,6 +10618,9 @@ async fn bridge_responses_websocket(
     let mut active_usage_turn: Option<ResponsesWebsocketUsageTurn> = None;
     let mut codex_session_model = single_upstream_model.clone();
     let mut active_attempt = ForwardAttemptContext::default();
+    let mut active_normalized_memory: Option<RequestMemoryReservation> = None;
+    let mut active_semantic_prelude_memory: Option<RequestMemoryReservation> = None;
+    let mut active_tool_argument_memory: Option<RequestMemoryReservation> = None;
     let mut refresh_target_before_connect = false;
     let mut upstream_read_deadline = None;
     let mut output_patcher = CodexWebsocketOutputPatcher::default();
@@ -10008,6 +10663,77 @@ async fn bridge_responses_websocket(
                     AxumWsMessage::Pong(_) => continue,
                     AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
                 }
+                let inbound_message_bytes = axum_websocket_message_payload_len(&message);
+                let mut incoming_turn_memory = if response_in_flight {
+                    None
+                } else {
+                    let budget = RequestMemoryBudget::new(
+                        state.request_body_limits.memory_budget_bytes,
+                    );
+                    let reservation = match budget.reserve(
+                        RequestMemoryComponent::InboundRaw,
+                        inbound_message_bytes,
+                    ) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            let error = error.into_proxy_error();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                    };
+                    Some((budget, reservation))
+                };
+                let _active_incoming_memory = if response_in_flight {
+                    match active_attempt.request_memory() {
+                        Some(budget) => match budget.reserve(
+                            RequestMemoryComponent::TransportPending,
+                            inbound_message_bytes,
+                        ) {
+                            Ok(reservation) => Some(reservation),
+                            Err(error) => {
+                                let error = error.into_proxy_error();
+                                let _failed_entry = entry.take();
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("memory_capacity"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 let original_response_body = axum_responses_websocket_http_body(&message)?
                     .or_else(|| {
                         matches!(mode, ResponsesWebsocketMode::Grok)
@@ -10193,6 +10919,62 @@ async fn bridge_responses_websocket(
                     );
                     let accounts = state.accounts_snapshot().await;
                     active_attempt = ForwardAttemptContext::default();
+                    let Some((request_memory, raw_memory)) = incoming_turn_memory.take() else {
+                        let error = ProxyError::bad_gateway(
+                            "responses websocket turn memory was not initialized",
+                        );
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            "upstream_protocol_error",
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("protocol_error"),
+                            error_body,
+                            None,
+                            &mut active_usage_turn,
+                        )
+                        .await;
+                    };
+                    active_attempt.request_memory = Some(request_memory.clone());
+                    active_attempt.raw_body_memory = Some(raw_memory);
+                    match reserve_responses_websocket_turn_memory(
+                        &request_memory,
+                        websocket_message_payload_len(&message),
+                    ) {
+                        Ok((normalized, semantic_prelude, tool_arguments)) => {
+                            active_normalized_memory = Some(normalized);
+                            active_semantic_prelude_memory = Some(semantic_prelude);
+                            active_tool_argument_memory = Some(tool_arguments);
+                        }
+                        Err(error) => {
+                            let _failed_entry = entry.take();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                    }
                     active_attempt
                         .ensure_binding(&execution, &accounts)
                         .map_err(binding_snapshot_error_to_proxy_error)?;
@@ -10210,6 +10992,9 @@ async fn bridge_responses_websocket(
                         response_repeat_tracker = Some(ResponsesRepeatTracker::default());
                     }
                     pending_lifecycle_messages.clear();
+                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                        let _ = reservation.resize(0);
+                    }
                     semantic_provider_outcome_recorded = false;
                     if entry.is_none() {
                         if refresh_target_before_connect {
@@ -10295,6 +11080,9 @@ async fn bridge_responses_websocket(
                                     )
                                 })?;
                                 pending_lifecycle_messages.clear();
+                                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                    let _ = reservation.resize(0);
+                                }
                                 let outcome = run_codex_websocket_http_fallback(
                                     &mut downstream,
                                     state,
@@ -10319,6 +11107,13 @@ async fn bridge_responses_websocket(
                                 account_in_flight_guard.take();
                                 active_response_body = None;
                                 active_response_intent = None;
+                                release_responses_websocket_turn_memory(
+                                    entry.as_ref(),
+                                    &mut active_attempt,
+                                    &mut active_normalized_memory,
+                                    &mut active_semantic_prelude_memory,
+                                    &mut active_tool_argument_memory,
+                                );
                                 refresh_target_before_connect = true;
                                 continue;
                             }
@@ -10389,13 +11184,59 @@ async fn bridge_responses_websocket(
                         None
                     };
                     entry
-                        .as_mut()
+                        .as_ref()
                         .expect("upstream websocket is connected")
                         .socket
-                        .send(message)
+                        .set_request_memory(active_attempt.request_memory().cloned());
+                    send_responses_upstream_while_serving_downstream(
+                        &entry
+                        .as_ref()
+                        .expect("upstream websocket is connected")
+                        .socket,
+                        &mut downstream,
+                        message,
+                        active_attempt.request_memory(),
+                    )
                         .await
                 };
-                if let Err(error) = send_result {
+                let send_error = match send_result {
+                    Ok(ResponsesWebsocketSendOutcome::Sent) => None,
+                    Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
+                        finish_active_websocket_usage(
+                            &mut active_usage_turn,
+                            499,
+                            "client_cancelled",
+                            Some("downstream websocket closed during upstream write".to_string()),
+                        )
+                        .await;
+                        let _cancelled_entry = entry.take();
+                        break;
+                    }
+                    Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
+                    Err(ResponsesWebsocketSendFailure::Memory(error)) => {
+                        let _failed_entry = entry.take();
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            error.error_code(),
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("memory_capacity"),
+                            error_body,
+                            None,
+                            &mut active_usage_turn,
+                        )
+                        .await;
+                    }
+                    Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
+                };
+                if let Some(error) = send_error {
                     let _failed_entry = entry.take();
                     if response_in_flight
                         && responses_websocket_http_replay_allowed(
@@ -10415,6 +11256,9 @@ async fn bridge_responses_websocket(
                             "send_failure"
                         };
                         pending_lifecycle_messages.clear();
+                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                            let _ = reservation.resize(0);
+                        }
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -10439,6 +11283,13 @@ async fn bridge_responses_websocket(
                         account_in_flight_guard.take();
                         active_response_body = None;
                         active_response_intent = None;
+                        release_responses_websocket_turn_memory(
+                            entry.as_ref(),
+                            &mut active_attempt,
+                            &mut active_normalized_memory,
+                            &mut active_semantic_prelude_memory,
+                            &mut active_tool_argument_memory,
+                        );
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -10489,6 +11340,9 @@ async fn bridge_responses_websocket(
                                 )
                             })?;
                             pending_lifecycle_messages.clear();
+                            if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                let _ = reservation.resize(0);
+                            }
                             let outcome = run_codex_websocket_http_fallback(
                                 &mut downstream,
                                 state,
@@ -10513,6 +11367,13 @@ async fn bridge_responses_websocket(
                             account_in_flight_guard.take();
                             active_response_body = None;
                             active_response_intent = None;
+                            release_responses_websocket_turn_memory(
+                                entry.as_ref(),
+                                &mut active_attempt,
+                                &mut active_normalized_memory,
+                                &mut active_semantic_prelude_memory,
+                                &mut active_tool_argument_memory,
+                            );
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
                             continue;
@@ -10565,6 +11426,9 @@ async fn bridge_responses_websocket(
                             "closed_before_event"
                         };
                         pending_lifecycle_messages.clear();
+                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                            let _ = reservation.resize(0);
+                        }
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -10589,6 +11453,13 @@ async fn bridge_responses_websocket(
                         account_in_flight_guard.take();
                         active_response_body = None;
                         active_response_intent = None;
+                        release_responses_websocket_turn_memory(
+                            entry.as_ref(),
+                            &mut active_attempt,
+                            &mut active_normalized_memory,
+                            &mut active_semantic_prelude_memory,
+                            &mut active_tool_argument_memory,
+                        );
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -10608,9 +11479,37 @@ async fn bridge_responses_websocket(
                     refresh_target_before_connect = true;
                     continue;
                 };
+                let ResponsesWebSocketReadMessage {
+                    result: message,
+                    _memory: _read_queue_memory,
+                } = message;
                 let message = match message {
+                    Err(ResponsesWebSocketReadError::Memory(error)) => {
+                        let _failed_entry = entry.take();
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            error.error_code(),
+                        );
+                        if response_in_flight {
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                        return Err(error);
+                    }
                     Ok(message) => message,
-                    Err(error)
+                    Err(ResponsesWebSocketReadError::Transport(error))
                         if response_in_flight
                             && responses_websocket_http_replay_allowed(
                                 mode,
@@ -10628,6 +11527,9 @@ async fn bridge_responses_websocket(
                             )
                         })?;
                         pending_lifecycle_messages.clear();
+                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                            let _ = reservation.resize(0);
+                        }
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -10652,10 +11554,19 @@ async fn bridge_responses_websocket(
                         account_in_flight_guard.take();
                         active_response_body = None;
                         active_response_intent = None;
+                        release_responses_websocket_turn_memory(
+                            entry.as_ref(),
+                            &mut active_attempt,
+                            &mut active_normalized_memory,
+                            &mut active_semantic_prelude_memory,
+                            &mut active_tool_argument_memory,
+                        );
                         refresh_target_before_connect = true;
                         continue;
                     }
-                    Err(error) if websocket_message_too_big(&error) => {
+                    Err(ResponsesWebSocketReadError::Transport(error))
+                        if websocket_message_too_big(&error) =>
+                    {
                         let body = websocket_message_too_big_error_body();
                         let error = ProxyError {
                             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -10680,12 +11591,14 @@ async fn bridge_responses_websocket(
                         let _ = downstream.send(AxumWsMessage::Text(body)).await;
                         return Err(error);
                     }
-                    Err(error) if websocket_expected_reset(&error) && !response_in_flight => {
+                    Err(ResponsesWebSocketReadError::Transport(error))
+                        if websocket_expected_reset(&error) && !response_in_flight =>
+                    {
                         let _closed_entry = entry.take();
                         refresh_target_before_connect = true;
                         continue;
                     }
-                    Err(error) => {
+                    Err(ResponsesWebSocketReadError::Transport(error)) => {
                         let error = ProxyError::bad_gateway(error.to_string());
                         if response_in_flight {
                             let error_body = websocket_stream_error_body(
@@ -10733,6 +11646,9 @@ async fn bridge_responses_websocket(
                             )
                         })?;
                         pending_lifecycle_messages.clear();
+                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                            let _ = reservation.resize(0);
+                        }
                         let outcome = run_codex_websocket_http_fallback(
                             &mut downstream,
                             state,
@@ -10757,6 +11673,13 @@ async fn bridge_responses_websocket(
                         account_in_flight_guard.take();
                         active_response_body = None;
                         active_response_intent = None;
+                        release_responses_websocket_turn_memory(
+                            entry.as_ref(),
+                            &mut active_attempt,
+                            &mut active_normalized_memory,
+                            &mut active_semantic_prelude_memory,
+                            &mut active_tool_argument_memory,
+                        );
                         refresh_target_before_connect = true;
                         continue;
                     }
@@ -10802,6 +11725,11 @@ async fn bridge_responses_websocket(
                                 let _failed_entry = entry.take();
                                 {
                                     pending_lifecycle_messages.clear();
+                                    if let Some(reservation) =
+                                        active_semantic_prelude_memory.as_ref()
+                                    {
+                                        let _ = reservation.resize(0);
+                                    }
                                     output_patcher.clear_output_items();
                                     let body = active_response_body.as_ref().ok_or_else(|| {
                                         ProxyError::bad_request(
@@ -10832,6 +11760,13 @@ async fn bridge_responses_websocket(
                                     account_in_flight_guard.take();
                                     active_response_body = None;
                                     active_response_intent = None;
+                                    release_responses_websocket_turn_memory(
+                                        entry.as_ref(),
+                                        &mut active_attempt,
+                                        &mut active_normalized_memory,
+                                        &mut active_semantic_prelude_memory,
+                                        &mut active_tool_argument_memory,
+                                    );
                                     upstream_read_deadline = None;
                                     refresh_target_before_connect = true;
                                     continue;
@@ -10898,6 +11833,9 @@ async fn bridge_responses_websocket(
                         replay.accumulator = GrokReplayStreamAccumulator::default();
                     }
                     pending_lifecycle_messages.clear();
+                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                        let _ = reservation.resize(0);
+                    }
                     output_patcher.begin_response(
                         None,
                         Some(transforms::responses_tool_context(&retry_body))
@@ -10916,13 +11854,57 @@ async fn bridge_responses_websocket(
                     }
                     let _account_read_guard =
                         lock_responses_websocket_turn_accounts(state, &execution, mode).await?;
-                    if let Err(error) = entry
-                        .as_mut()
-                        .expect("upstream websocket is connected")
-                        .socket
-                        .send(retry_message)
-                        .await
-                    {
+                    let retry_send = send_responses_upstream_while_serving_downstream(
+                        &entry
+                            .as_ref()
+                            .expect("upstream websocket is connected")
+                            .socket,
+                        &mut downstream,
+                        retry_message,
+                        active_attempt.request_memory(),
+                    )
+                    .await;
+                    let error = match retry_send {
+                        Ok(ResponsesWebsocketSendOutcome::Sent) => None,
+                        Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
+                            finish_active_websocket_usage(
+                                &mut active_usage_turn,
+                                499,
+                                "client_cancelled",
+                                Some(
+                                    "downstream websocket closed during upstream retry write"
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                            let _cancelled_entry = entry.take();
+                            break;
+                        }
+                        Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
+                        Err(ResponsesWebsocketSendFailure::Memory(error)) => {
+                            let _failed_entry = entry.take();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                        Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
+                    };
+                    if let Some(error) = error {
                         let error = ProxyError::bad_gateway(error.to_string());
                         let error_body = websocket_stream_error_body(
                             error.client_message(),
@@ -10967,6 +11949,30 @@ async fn bridge_responses_websocket(
                         .map(websocket_message_payload_len)
                         .sum::<usize>()
                         .saturating_add(websocket_message_payload_len(&message));
+                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                        if let Err(error) = reservation.resize(buffered_bytes) {
+                            let _failed_entry = entry.take();
+                            let error = error.into_proxy_error();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                    }
                     if pending_lifecycle_messages.len()
                         >= MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES
                         || buffered_bytes > MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES
@@ -11024,6 +12030,9 @@ async fn bridge_responses_websocket(
                         let _failed_entry = entry.take();
                         {
                             pending_lifecycle_messages.clear();
+                            if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                let _ = reservation.resize(0);
+                            }
                             output_patcher.clear_output_items();
                             let body = active_response_body.as_ref().ok_or_else(|| {
                                 ProxyError::bad_request(
@@ -11054,6 +12063,13 @@ async fn bridge_responses_websocket(
                             account_in_flight_guard.take();
                             active_response_body = None;
                             active_response_intent = None;
+                            release_responses_websocket_turn_memory(
+                                entry.as_ref(),
+                                &mut active_attempt,
+                                &mut active_normalized_memory,
+                                &mut active_semantic_prelude_memory,
+                                &mut active_tool_argument_memory,
+                            );
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
                             continue;
@@ -11061,17 +12077,47 @@ async fn bridge_responses_websocket(
                     }
                 }
 
-                for pending in pending_lifecycle_messages.drain(..) {
-                    if send_responses_websocket_message(
+                for pending in std::mem::take(&mut pending_lifecycle_messages) {
+                    let sent_close = match send_responses_websocket_message(
                         &mut downstream,
                         &mut output_patcher,
                         mode,
                         pending,
+                        active_attempt.request_memory(),
+                        active_tool_argument_memory.as_ref(),
                     )
-                    .await?
+                    .await
                     {
+                        Ok(sent_close) => sent_close,
+                        Err(error) if error.is_request_memory_exhausted() => {
+                            let _failed_entry = entry.take();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if sent_close {
                         return Ok(());
                     }
+                }
+                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                    let _ = reservation.resize(0);
                 }
                 let semantic_terminal = match &semantic_observation {
                     Some(SemanticObservation::SuccessTerminal) => Some(SemanticTerminal::Success),
@@ -11169,13 +12215,49 @@ async fn bridge_responses_websocket(
                     upstream_read_deadline = stream_idle_timeout
                         .map(|timeout| tokio::time::Instant::now() + timeout);
                 }
-                let closes = send_responses_websocket_message(
+                let closes = match send_responses_websocket_message(
                     &mut downstream,
                     &mut output_patcher,
                     mode,
                     message,
+                    active_attempt.request_memory(),
+                    active_tool_argument_memory.as_ref(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(closes) => closes,
+                    Err(error) if error.is_request_memory_exhausted() => {
+                        let _failed_entry = entry.take();
+                        let error_body = websocket_stream_error_body(
+                            error.client_message(),
+                            error.error_code(),
+                        );
+                        return terminate_responses_websocket_with_error(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            state,
+                            &execution,
+                            &mut pending_lifecycle_messages,
+                            error,
+                            Some("memory_capacity"),
+                            error_body,
+                            None,
+                            &mut active_usage_turn,
+                        )
+                        .await;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if terminal {
+                    release_responses_websocket_turn_memory(
+                        entry.as_ref(),
+                        &mut active_attempt,
+                        &mut active_normalized_memory,
+                        &mut active_semantic_prelude_memory,
+                        &mut active_tool_argument_memory,
+                    );
+                }
                 if closes || upstream_closed {
                     return Ok(());
                 }
@@ -11194,9 +12276,52 @@ async fn bridge_responses_websocket(
         }
     }
     if let Some(mut entry) = entry {
-        let _ = entry.socket.close(None).await;
+        let _ = entry.socket.close().await;
     }
     Ok(())
+}
+
+fn reserve_responses_websocket_turn_memory(
+    budget: &RequestMemoryBudget,
+    normalized_body_bytes: usize,
+) -> Result<
+    (
+        RequestMemoryReservation,
+        RequestMemoryReservation,
+        RequestMemoryReservation,
+    ),
+    ProxyError,
+> {
+    let normalized = budget
+        .reserve(
+            RequestMemoryComponent::NormalizedBody,
+            normalized_body_bytes,
+        )
+        .map_err(|error| error.into_proxy_error())?;
+    let semantic_prelude = budget
+        .reserve(RequestMemoryComponent::SemanticPrelude, 0)
+        .map_err(|error| error.into_proxy_error())?;
+    let tool_arguments = budget
+        .reserve(RequestMemoryComponent::ToolArguments, 0)
+        .map_err(|error| error.into_proxy_error())?;
+    Ok((normalized, semantic_prelude, tool_arguments))
+}
+
+fn release_responses_websocket_turn_memory(
+    entry: Option<&CachedResponsesWebSocket>,
+    active_attempt: &mut ForwardAttemptContext,
+    normalized: &mut Option<RequestMemoryReservation>,
+    semantic_prelude: &mut Option<RequestMemoryReservation>,
+    tool_arguments: &mut Option<RequestMemoryReservation>,
+) {
+    if let Some(entry) = entry {
+        entry.socket.set_request_memory(None);
+    }
+    normalized.take();
+    semantic_prelude.take();
+    tool_arguments.take();
+    active_attempt.raw_body_memory.take();
+    active_attempt.request_memory.take();
 }
 
 fn acquire_cached_responses_websocket(
@@ -11219,8 +12344,107 @@ fn acquire_cached_responses_websocket(
 }
 
 enum ResponsesWebsocketRead {
-    Message(Option<Result<TungsteniteMessage, TungsteniteError>>),
+    Message(Option<ResponsesWebSocketReadMessage>),
     TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesWebsocketSendOutcome {
+    Sent,
+    DownstreamClosed,
+}
+
+enum ResponsesWebsocketSendFailure {
+    Upstream(TungsteniteError),
+    Downstream(ProxyError),
+    Memory(ProxyError),
+}
+
+async fn send_responses_upstream_while_serving_downstream(
+    upstream: &ResponsesUpstreamWebSocket,
+    downstream: &mut WebSocket,
+    message: TungsteniteMessage,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<ResponsesWebsocketSendOutcome, ResponsesWebsocketSendFailure> {
+    let write_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::WebSocketWriteQueue,
+                websocket_message_payload_len(&message),
+            )
+        })
+        .transpose()
+        .map_err(|error| ResponsesWebsocketSendFailure::Memory(error.into_proxy_error()))?;
+    let mut completion = upstream
+        .start_send(message, write_memory)
+        .await
+        .map_err(ResponsesWebsocketSendFailure::Upstream)?;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut completion => {
+                let result = result
+                    .map_err(|_| responses_websocket_channel_closed("writer stopped before completion"))
+                    .and_then(|result| result);
+                return match result {
+                    Ok(()) => Ok(ResponsesWebsocketSendOutcome::Sent),
+                    // The old single-task transport could successfully queue a request
+                    // before observing an already-buffered peer Close. The split reader
+                    // sees that Close sooner, so retain the same conservative commit
+                    // boundary: once a peer terminal races a write, do not replay the
+                    // request through HTTP as if it were known to be unsent.
+                    Err(_) if upstream.peer_terminal_observed() => {
+                        Ok(ResponsesWebsocketSendOutcome::Sent)
+                    }
+                    Err(error) => Err(ResponsesWebsocketSendFailure::Upstream(error)),
+                };
+            }
+            message = downstream.next() => {
+                let Some(message) = message else {
+                    return Ok(ResponsesWebsocketSendOutcome::DownstreamClosed);
+                };
+                let message = message.map_err(|error| {
+                    ResponsesWebsocketSendFailure::Downstream(ProxyError::bad_gateway(error.to_string()))
+                })?;
+                match message {
+                    AxumWsMessage::Close(frame) => {
+                        downstream
+                            .send(AxumWsMessage::Close(frame))
+                            .await
+                            .map_err(|error| {
+                                ResponsesWebsocketSendFailure::Downstream(
+                                    ProxyError::bad_gateway(error.to_string()),
+                                )
+                            })?;
+                        downstream.close().await.map_err(|error| {
+                            ResponsesWebsocketSendFailure::Downstream(ProxyError::bad_gateway(
+                                error.to_string(),
+                            ))
+                        })?;
+                        return Ok(ResponsesWebsocketSendOutcome::DownstreamClosed);
+                    }
+                    AxumWsMessage::Ping(payload) => {
+                        downstream
+                            .send(AxumWsMessage::Pong(payload))
+                            .await
+                            .map_err(|error| {
+                                ResponsesWebsocketSendFailure::Downstream(
+                                    ProxyError::bad_gateway(error.to_string()),
+                                )
+                            })?;
+                    }
+                    AxumWsMessage::Pong(_) => {}
+                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {
+                        return Err(ResponsesWebsocketSendFailure::Downstream(
+                            ProxyError::bad_request(
+                                "responses websocket received data while the previous upstream write was pending",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn next_responses_websocket_message(
@@ -11318,7 +12542,7 @@ async fn connect_responses_websocket(
                     .await;
                 }
                 return Ok(CachedResponsesWebSocket {
-                    socket: upstream,
+                    socket: ResponsesUpstreamWebSocket::new(upstream),
                     created_at: Instant::now(),
                     last_used_at: Instant::now(),
                 });
@@ -11519,353 +12743,276 @@ struct PreparedCodexHttpFallbackTarget {
     body: Bytes,
 }
 
+fn reserve_codex_http_fallback_memory(
+    budget: Option<&RequestMemoryBudget>,
+) -> Result<
+    (
+        Option<RequestMemoryReservation>,
+        Option<RequestMemoryReservation>,
+    ),
+    ProxyError,
+> {
+    let semantic = budget
+        .map(|budget| budget.reserve(RequestMemoryComponent::SemanticPrelude, 0))
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    let tool_arguments = budget
+        .map(|budget| budget.reserve(RequestMemoryComponent::ToolArguments, 0))
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    Ok((semantic, tool_arguments))
+}
+
 #[allow(clippy::too_many_arguments)] // Fallback preserves the active bridge, identity, timeout, and patch state.
-async fn run_codex_websocket_http_fallback(
-    downstream: &mut WebSocket,
-    state: &ServerState,
-    execution: &mut ProviderExecution,
-    response_body: &Value,
-    session_id: Option<&str>,
+fn run_codex_websocket_http_fallback<'a>(
+    downstream: &'a mut WebSocket,
+    state: &'a ServerState,
+    execution: &'a mut ProviderExecution,
+    response_body: &'a Value,
+    session_id: Option<&'a str>,
     grok_turn_index: Option<u64>,
     first_event_timeout: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
     source: &'static str,
-    attempt_context: &mut ForwardAttemptContext,
-    output_patcher: &mut CodexWebsocketOutputPatcher,
-    intent: &super::codex_request_policy::CodexRequestIntent,
-    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
-) -> Result<CodexHttpFallbackOutcome, ProxyError> {
-    let Some(next_attempt) = attempt_context.next_for(
-        execution,
-        attempt_context.body_retry_stage,
-        "transport",
-        source,
-        RecoveryStage::WebsocketToHttp,
-        DelaySource::Immediate,
-    ) else {
-        return terminate_codex_http_fallback_with_error(
-            downstream,
-            state,
+    attempt_context: &'a mut ForwardAttemptContext,
+    output_patcher: &'a mut CodexWebsocketOutputPatcher,
+    intent: &'a super::codex_request_policy::CodexRequestIntent,
+    active_usage_turn: &'a mut Option<ResponsesWebsocketUsageTurn>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<CodexHttpFallbackOutcome, ProxyError>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let Some(next_attempt) = attempt_context.next_for(
             execution,
-            output_patcher,
+            attempt_context.body_retry_stage,
+            "transport",
             source,
-            Vec::new(),
-            ProxyError::bad_gateway(
-                "Responses WebSocket to HTTP fallback was denied by the shared recovery budget",
-            ),
-            "recovery_budget_exhausted",
-            Some("transport_error"),
-            active_usage_turn,
-        )
-        .await;
-    };
-    *attempt_context = next_attempt;
-    record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
-    if let Some(turn) = active_usage_turn.as_mut() {
-        turn.record_retry("transport", source);
-    }
-    crate::metrics::record_codex_websocket_fallback(source, "attempt");
-    let rate_limit_share_id = active_usage_turn
-        .as_ref()
-        .and_then(|turn| turn.request_context.share_id.clone());
-    let rate_limit_model = codex_model_from_value(response_body);
+            RecoveryStage::WebsocketToHttp,
+            DelaySource::Immediate,
+        ) else {
+            return terminate_codex_http_fallback_with_error(
+                downstream,
+                state,
+                execution,
+                output_patcher,
+                source,
+                Vec::new(),
+                ProxyError::bad_gateway(
+                    "Responses WebSocket to HTTP fallback was denied by the shared recovery budget",
+                ),
+                "recovery_budget_exhausted",
+                Some("transport_error"),
+                active_usage_turn,
+            )
+            .await;
+        };
+        *attempt_context = next_attempt;
+        let (fallback_semantic_memory, fallback_tool_argument_memory) =
+            match reserve_codex_http_fallback_memory(attempt_context.request_memory()) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "cc_switch_request_memory_exhausted",
+                        Some("capacity"),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+            };
+        record_forward_retry(ProxyRoute::CodexResponses, "transport", source);
+        if let Some(turn) = active_usage_turn.as_mut() {
+            turn.record_retry("transport", source);
+        }
+        crate::metrics::record_codex_websocket_fallback(source, "attempt");
+        let rate_limit_share_id = active_usage_turn
+            .as_ref()
+            .and_then(|turn| turn.request_context.share_id.clone());
+        let rate_limit_model = codex_model_from_value(response_body);
 
-    loop {
-        let stored = execution.runtime_stored_view();
-        let (request, rejected_access_token) = match prepare_codex_http_fallback_target(
-            state,
-            execution,
-            response_body,
-            session_id,
-            grok_turn_index,
-            intent,
-        )
-        .await
-        .and_then(build_codex_http_fallback_request)
-        {
-            Ok(request) => request,
-            Err(error) => {
-                if error.status.is_server_error() {
+        loop {
+            let stored = execution.runtime_stored_view();
+            let prepared_request = prepare_codex_http_fallback_target(
+                state,
+                execution,
+                response_body,
+                session_id,
+                grok_turn_index,
+                intent,
+            )
+            .await
+            .and_then(|target| {
+                let memory = attempt_context
+                    .request_memory()
+                    .map(|budget| {
+                        budget
+                            .reserve(RequestMemoryComponent::NormalizedBody, target.body.len())
+                            .map_err(|error| error.into_proxy_error())
+                    })
+                    .transpose()?;
+                build_codex_http_fallback_request(target).map(|request| (request, memory))
+            });
+            let ((request, rejected_access_token), _fallback_request_memory) =
+                match prepared_request {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if error.status.is_server_error() && !error.is_request_memory_exhausted() {
+                            record_provider_outcome(
+                                state,
+                                &stored,
+                                ProviderOutcome::Failure {
+                                    status_code: error.status.as_u16(),
+                                },
+                            )
+                            .await;
+                        }
+                        let (error_code, metric_kind) = if error.is_request_memory_exhausted() {
+                            ("cc_switch_request_memory_exhausted", Some("capacity"))
+                        } else {
+                            ("upstream_target_error", Some("protocol_error"))
+                        };
+                        return terminate_codex_http_fallback_with_error(
+                            downstream,
+                            state,
+                            execution,
+                            output_patcher,
+                            source,
+                            Vec::new(),
+                            error,
+                            error_code,
+                            metric_kind,
+                            active_usage_turn,
+                        )
+                        .await;
+                    }
+                };
+            let first_event_budget = first_event_timeout.map(CodexHttpFirstEventBudget::new);
+            let send_future = async move {
+                match first_event_budget {
+                    Some(budget) => tokio::time::timeout_at(budget.deadline, request.send())
+                        .await
+                        .map_err(|_| budget.timeout_error()),
+                    None => Ok(request.send().await),
+                }
+            };
+            let send_result = match wait_codex_http_fallback(downstream, send_future).await {
+                Ok(CodexHttpFallbackWait::Ready(result)) => result,
+                Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                    finish_active_websocket_usage(
+                        active_usage_turn,
+                        499,
+                        "client_cancelled",
+                        Some(
+                            "downstream websocket closed while HTTP fallback was connecting"
+                                .to_string(),
+                        ),
+                    )
+                    .await;
+                    crate::metrics::record_codex_websocket_fallback(source, "cancelled");
+                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                }
+                Err(error) => {
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "client_protocol_error",
+                        Some("protocol_error"),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+            };
+            let mut upstream = match send_result {
+                Ok(Ok(upstream)) => upstream,
+                Ok(Err(error)) => {
+                    record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        ProxyError::bad_gateway(error),
+                        "upstream_stream_transport_error",
+                        Some("transport_error"),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "upstream_stream_timeout",
+                        Some("transport_error"),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+            };
+            let status = upstream.status();
+            let response_headers = upstream.headers().clone();
+            if status == StatusCode::UNAUTHORIZED && !attempt_context.auth_refresh_attempted() {
+                let Some((provider_type, account_id, expected_generation)) =
+                    execution.managed_account_identity_target()
+                else {
+                    let error = ProxyError {
+                        status,
+                        message: "Responses HTTP fallback upstream rejected authentication"
+                            .to_string(),
+                    };
                     record_provider_outcome(
                         state,
                         &stored,
                         ProviderOutcome::Failure {
-                            status_code: error.status.as_u16(),
+                            status_code: status.as_u16(),
                         },
                     )
                     .await;
-                }
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "upstream_auth_error",
+                        None,
+                        active_usage_turn,
+                    )
+                    .await;
+                };
+                let Some(next_attempt) = attempt_context.next_for(
                     execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "upstream_target_error",
-                    Some("protocol_error"),
-                    active_usage_turn,
-                )
-                .await;
-            }
-        };
-        let first_event_budget = first_event_timeout.map(CodexHttpFirstEventBudget::new);
-        let send_future = async move {
-            match first_event_budget {
-                Some(budget) => tokio::time::timeout_at(budget.deadline, request.send())
-                    .await
-                    .map_err(|_| budget.timeout_error()),
-                None => Ok(request.send().await),
-            }
-        };
-        let send_result = match wait_codex_http_fallback(downstream, send_future).await {
-            Ok(CodexHttpFallbackWait::Ready(result)) => result,
-            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
-                finish_active_websocket_usage(
-                    active_usage_turn,
-                    499,
-                    "client_cancelled",
-                    Some(
-                        "downstream websocket closed while HTTP fallback was connecting"
+                    attempt_context.body_retry_stage,
+                    "auth",
+                    "websocket_http_fallback_unauthorized",
+                    RecoveryStage::Auth,
+                    DelaySource::Immediate,
+                ) else {
+                    let error = ProxyError {
+                        status,
+                        message: "Responses HTTP fallback authentication recovery budget exhausted"
                             .to_string(),
-                    ),
-                )
-                .await;
-                crate::metrics::record_codex_websocket_fallback(source, "cancelled");
-                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
-            }
-            Err(error) => {
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "client_protocol_error",
-                    Some("protocol_error"),
-                    active_usage_turn,
-                )
-                .await;
-            }
-        };
-        let mut upstream = match send_result {
-            Ok(Ok(upstream)) => upstream,
-            Ok(Err(error)) => {
-                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    ProxyError::bad_gateway(error),
-                    "upstream_stream_transport_error",
-                    Some("transport_error"),
-                    active_usage_turn,
-                )
-                .await;
-            }
-            Err(error) => {
-                record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "upstream_stream_timeout",
-                    Some("transport_error"),
-                    active_usage_turn,
-                )
-                .await;
-            }
-        };
-        let status = upstream.status();
-        let response_headers = upstream.headers().clone();
-        if status == StatusCode::UNAUTHORIZED && !attempt_context.auth_refresh_attempted() {
-            let Some((provider_type, account_id, expected_generation)) =
-                execution.managed_account_identity_target()
-            else {
-                let error = ProxyError {
-                    status,
-                    message: "Responses HTTP fallback upstream rejected authentication".to_string(),
-                };
-                record_provider_outcome(
-                    state,
-                    &stored,
-                    ProviderOutcome::Failure {
-                        status_code: status.as_u16(),
-                    },
-                )
-                .await;
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "upstream_auth_error",
-                    None,
-                    active_usage_turn,
-                )
-                .await;
-            };
-            let Some(next_attempt) = attempt_context.next_for(
-                execution,
-                attempt_context.body_retry_stage,
-                "auth",
-                "websocket_http_fallback_unauthorized",
-                RecoveryStage::Auth,
-                DelaySource::Immediate,
-            ) else {
-                let error = ProxyError {
-                    status,
-                    message: "Responses HTTP fallback authentication recovery budget exhausted"
-                        .to_string(),
-                };
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "upstream_auth_error",
-                    None,
-                    active_usage_turn,
-                )
-                .await;
-            };
-            *attempt_context = next_attempt;
-            drop(upstream);
-            let refresh_result = state
-                .refresh_managed_account_now_for_generation(
-                    provider_type,
-                    account_id,
-                    expected_generation,
-                )
-                .await;
-            if let Err(error) = refresh_result {
-                mark_managed_account_auth_cooldown(
-                    state,
-                    execution,
-                    rejected_access_token.as_deref(),
-                    "websocket_http_fallback_refresh_failed",
-                )
-                .await;
-                let error = managed_account_refresh_error_to_proxy_error(error);
-                record_provider_outcome(
-                    state,
-                    &stored,
-                    ProviderOutcome::Failure {
-                        status_code: error.status.as_u16(),
-                    },
-                )
-                .await;
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "upstream_auth_refresh_error",
-                    None,
-                    active_usage_turn,
-                )
-                .await;
-            }
-            if let Err(error) =
-                advance_attempt_binding_after_token_refresh(state, execution, attempt_context).await
-            {
-                record_provider_outcome(
-                    state,
-                    &stored,
-                    ProviderOutcome::Failure {
-                        status_code: error.status.as_u16(),
-                    },
-                )
-                .await;
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    Vec::new(),
-                    error,
-                    "recovery_binding_changed",
-                    Some("protocol_error"),
-                    active_usage_turn,
-                )
-                .await;
-            }
-            record_forward_retry(
-                ProxyRoute::CodexResponses,
-                "auth",
-                "websocket_http_fallback_unauthorized",
-            );
-            if let Some(turn) = active_usage_turn.as_mut() {
-                turn.record_retry("auth", "websocket_http_fallback_unauthorized");
-            }
-            continue;
-        }
-        if status == StatusCode::UNAUTHORIZED && attempt_context.auth_refresh_attempted() {
-            mark_managed_account_auth_cooldown(
-                state,
-                execution,
-                rejected_access_token.as_deref(),
-                "websocket_http_fallback_unauthorized_after_refresh",
-            )
-            .await;
-        }
-        if !status.is_success() {
-            let body_result = match first_event_budget {
-                Some(budget) => match tokio::time::timeout_at(
-                    budget.deadline,
-                    crate::infra::http::read_response_body_limited(
-                        &mut upstream,
-                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-                    ),
-                )
-                .await
-                {
-                    Ok(body) => body.map_err(ProxyError::bad_gateway),
-                    Err(_) => Err(budget.timeout_error()),
-                },
-                None => crate::infra::http::read_response_body_limited(
-                    &mut upstream,
-                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-                )
-                .await
-                .map_err(ProxyError::bad_gateway),
-            };
-            let body_result = body_result.and_then(|body| {
-                decode_response_body_for_proxy_with_limit(
-                    &response_headers,
-                    body,
-                    PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-                )
-                .map(|decoded| decoded.body)
-            });
-            let body = match body_result {
-                Ok(body) => body,
-                Err(error) => {
-                    record_provider_outcome(state, &stored, ProviderOutcome::NetworkFailure).await;
-                    let code = if error.status == StatusCode::GATEWAY_TIMEOUT {
-                        "upstream_stream_timeout"
-                    } else {
-                        "upstream_stream_transport_error"
                     };
                     return terminate_codex_http_fallback_with_error(
                         downstream,
@@ -11875,74 +13022,38 @@ async fn run_codex_websocket_http_fallback(
                         source,
                         Vec::new(),
                         error,
-                        code,
-                        Some("transport_error"),
+                        "upstream_auth_error",
+                        None,
                         active_usage_turn,
                     )
                     .await;
-                }
-            };
-            let capacity_failure = openai_capacity_shed_failure_from_bytes(&body).or_else(|| {
-                (status.as_u16() == 529).then(|| SemanticFailure {
-                    origin: FailureOrigin::Provider,
-                    code: "server_is_overloaded".to_string(),
-                    message: "OpenAI Codex upstream returned HTTP 529".to_string(),
-                })
-            });
-            if execution.driver_is("oauth.openai_codex") {
-                if let Some(failure) = capacity_failure.as_ref() {
-                    let capacity_source = capacity_shed_retry_source(failure);
-                    if let Some(delay) = take_codex_http_fallback_capacity_retry(
-                        attempt_context,
+                };
+                *attempt_context = next_attempt;
+                drop(upstream);
+                let refresh_result = state
+                    .refresh_managed_account_now_for_generation(
+                        provider_type,
+                        account_id,
+                        expected_generation,
+                    )
+                    .await;
+                if let Err(error) = refresh_result {
+                    mark_managed_account_auth_cooldown(
+                        state,
                         execution,
-                        capacity_source,
-                    ) {
-                        record_forward_retry(
-                            ProxyRoute::CodexResponses,
-                            "capacity",
-                            capacity_source,
-                        );
-                        if let Some(turn) = active_usage_turn.as_mut() {
-                            turn.record_retry("capacity", capacity_source);
-                        }
-                        match wait_codex_http_fallback(downstream, tokio::time::sleep(delay)).await
-                        {
-                            Ok(CodexHttpFallbackWait::Ready(())) => continue,
-                            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
-                                finish_active_websocket_usage(
-                                    active_usage_turn,
-                                    499,
-                                    "client_cancelled",
-                                    Some(
-                                        "downstream websocket closed during HTTP fallback backoff"
-                                            .to_string(),
-                                    ),
-                                )
-                                .await;
-                                crate::metrics::record_codex_websocket_fallback(
-                                    source,
-                                    "cancelled",
-                                );
-                                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
-                            }
-                            Err(error) => {
-                                return terminate_codex_http_fallback_with_error(
-                                    downstream,
-                                    state,
-                                    execution,
-                                    output_patcher,
-                                    source,
-                                    Vec::new(),
-                                    error,
-                                    "client_protocol_error",
-                                    Some("protocol_error"),
-                                    active_usage_turn,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    record_provider_outcome(state, &stored, capacity_shed_provider_outcome()).await;
+                        rejected_access_token.as_deref(),
+                        "websocket_http_fallback_refresh_failed",
+                    )
+                    .await;
+                    let error = managed_account_refresh_error_to_proxy_error(error);
+                    record_provider_outcome(
+                        state,
+                        &stored,
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
+                        },
+                    )
+                    .await;
                     return terminate_codex_http_fallback_with_error(
                         downstream,
                         state,
@@ -11950,209 +13061,158 @@ async fn run_codex_websocket_http_fallback(
                         output_patcher,
                         source,
                         Vec::new(),
-                        codex_capacity_shed_proxy_error(failure),
-                        "cc_switch_upstream_capacity_shed",
-                        Some("provider_failure"),
+                        error,
+                        "upstream_auth_refresh_error",
+                        None,
                         active_usage_turn,
                     )
                     .await;
                 }
-            }
-            maybe_mark_upstream_rate_limited(
-                state,
-                execution,
-                status,
-                &response_headers,
-                &body,
-                rate_limit_share_id.as_deref(),
-                rate_limit_model.as_deref(),
-            )
-            .await;
-            record_provider_outcome(
-                state,
-                &stored,
-                provider_outcome_from_status(status.as_u16()),
-            )
-            .await;
-            let message = if execution.driver_is("oauth.grok_responses")
-                && is_grok_cli_version_gate_message(&upstream_error_message(&body))
-            {
-                record_grok_cli_version_gate(&stored, "websocket_http_fallback");
-                grok_cli_version_gate_admin_message()
-            } else {
-                format!(
-                    "Responses HTTP fallback upstream returned HTTP {}",
-                    status.as_u16()
-                )
-            };
-            let error = ProxyError { status, message };
-            return terminate_codex_http_fallback_with_error(
-                downstream,
-                state,
-                execution,
-                output_patcher,
-                source,
-                Vec::new(),
-                error,
-                "upstream_http_error",
-                None,
-                active_usage_turn,
-            )
-            .await;
-        }
-
-        match relay_codex_http_fallback_stream(
-            downstream,
-            upstream,
-            CodexHttpRelayPolicy {
-                first_event: first_event_budget,
-                idle_timeout: stream_idle_timeout,
-                repeat_guard_enabled: stored.provider_type == ProviderType::GrokOAuth,
-            },
-            output_patcher,
-            active_usage_turn,
-        )
-        .await
-        {
-            Ok(CodexHttpRelayOutcome::Completed(terminal)) => {
-                match &terminal {
-                    SemanticTerminal::Failure(failure)
-                        if is_openai_rate_limit_failure(failure)
-                            && execution.driver_is("oauth.openai_codex") =>
-                    {
-                        let marker_body = semantic_failure_json(failure);
-                        maybe_mark_upstream_rate_limited(
-                            state,
-                            execution,
-                            StatusCode::TOO_MANY_REQUESTS,
-                            &response_headers,
-                            &marker_body,
-                            rate_limit_share_id.as_deref(),
-                            rate_limit_model.as_deref(),
-                        )
-                        .await;
-                        record_provider_outcome(
-                            state,
-                            &stored,
-                            ProviderOutcome::RateLimited {
-                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                            },
-                        )
-                        .await;
-                    }
-                    SemanticTerminal::Failure(failure)
-                        if failure.origin == FailureOrigin::Provider =>
-                    {
-                        record_provider_outcome(
-                            state,
-                            &stored,
-                            if is_openai_capacity_shed_failure(failure) {
-                                capacity_shed_provider_outcome()
-                            } else {
-                                ProviderOutcome::Failure { status_code: 502 }
-                            },
-                        )
-                        .await;
-                    }
-                    SemanticTerminal::Failure(_) => {}
-                    SemanticTerminal::Success | SemanticTerminal::Incomplete => {
-                        record_provider_outcome(
-                            state,
-                            &stored,
-                            ProviderOutcome::Success { status_code: 200 },
-                        )
-                        .await;
-                    }
-                }
-                finish_active_websocket_terminal(active_usage_turn, &terminal).await;
-                crate::metrics::record_codex_websocket_fallback(source, "success");
-                return Ok(CodexHttpFallbackOutcome::Completed);
-            }
-            Ok(CodexHttpRelayOutcome::DownstreamClosed) => {
-                finish_active_websocket_usage(
-                    active_usage_turn,
-                    499,
-                    "client_cancelled",
-                    Some("downstream websocket closed during HTTP fallback".to_string()),
-                )
-                .await;
-                crate::metrics::record_codex_websocket_fallback(source, "success");
-                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
-            }
-            Ok(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
-                failure,
-                replay_payloads,
-            }) => {
-                if is_openai_rate_limit_failure(&failure)
-                    && execution.driver_is("oauth.openai_codex")
+                if let Err(error) =
+                    advance_attempt_binding_after_token_refresh(state, execution, attempt_context)
+                        .await
                 {
-                    let marker_body = semantic_failure_json(&failure);
-                    maybe_mark_upstream_rate_limited(
-                        state,
-                        execution,
-                        StatusCode::TOO_MANY_REQUESTS,
-                        &response_headers,
-                        &marker_body,
-                        rate_limit_share_id.as_deref(),
-                        rate_limit_model.as_deref(),
-                    )
-                    .await;
                     record_provider_outcome(
                         state,
                         &stored,
-                        ProviderOutcome::RateLimited {
-                            status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
                         },
                     )
                     .await;
-                    let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
-                        responses_payload_terminal(payload).is_some_and(|terminal| {
-                            matches!(terminal, SemanticTerminal::Failure(_))
-                        })
-                    });
-                    for payload in replay_payloads {
-                        relay_codex_http_fallback_event(downstream, output_patcher, payload)
-                            .await?;
-                    }
-                    if needs_failed_terminal {
-                        relay_codex_http_fallback_event(
-                            downstream,
-                            output_patcher,
-                            synthesize_openai_capacity_shed_failed_json(&failure),
-                        )
-                        .await?;
-                    }
-                    finish_active_websocket_terminal(
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        Vec::new(),
+                        error,
+                        "recovery_binding_changed",
+                        Some("protocol_error"),
                         active_usage_turn,
-                        &SemanticTerminal::Failure(failure),
                     )
                     .await;
-                    crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
-                    return Ok(CodexHttpFallbackOutcome::Completed);
                 }
-                if is_openai_capacity_shed_failure(&failure)
-                    && execution.driver_is("oauth.openai_codex")
-                {
-                    let capacity_source = capacity_shed_retry_source(&failure);
-                    if let Some(delay) = take_codex_http_fallback_capacity_retry(
-                        attempt_context,
-                        execution,
-                        capacity_source,
-                    ) {
-                        let _ = replay_payloads;
-                        record_forward_retry(
-                            ProxyRoute::CodexResponses,
-                            "capacity",
-                            capacity_source,
-                        );
-                        if let Some(turn) = active_usage_turn.as_mut() {
-                            turn.record_retry("capacity", capacity_source);
+                record_forward_retry(
+                    ProxyRoute::CodexResponses,
+                    "auth",
+                    "websocket_http_fallback_unauthorized",
+                );
+                if let Some(turn) = active_usage_turn.as_mut() {
+                    turn.record_retry("auth", "websocket_http_fallback_unauthorized");
+                }
+                continue;
+            }
+            if status == StatusCode::UNAUTHORIZED && attempt_context.auth_refresh_attempted() {
+                mark_managed_account_auth_cooldown(
+                    state,
+                    execution,
+                    rejected_access_token.as_deref(),
+                    "websocket_http_fallback_unauthorized_after_refresh",
+                )
+                .await;
+            }
+            if !status.is_success() {
+                let body_result = match first_event_budget {
+                    Some(budget) => match tokio::time::timeout_at(
+                        budget.deadline,
+                        read_response_body_limited_with_memory(
+                            &mut upstream,
+                            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                            attempt_context.request_memory(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(body) => body.map_err(RequestMemoryResponseReadError::into_proxy_error),
+                        Err(_) => Err(budget.timeout_error()),
+                    },
+                    None => read_response_body_limited_with_memory(
+                        &mut upstream,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                        attempt_context.request_memory(),
+                    )
+                    .await
+                    .map_err(RequestMemoryResponseReadError::into_proxy_error),
+                };
+                let body_result = body_result.and_then(|(body, transport_memory)| {
+                    decode_response_body_with_memory(
+                        &response_headers,
+                        body,
+                        transport_memory,
+                        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                        attempt_context.request_memory(),
+                    )
+                    .map(|decoded| decoded.body)
+                });
+                let body = match body_result {
+                    Ok(body) => body,
+                    Err(error) => {
+                        if !error.is_request_memory_exhausted() {
+                            record_provider_outcome(
+                                state,
+                                &stored,
+                                ProviderOutcome::NetworkFailure,
+                            )
+                            .await;
                         }
-                        match wait_codex_http_fallback(downstream, tokio::time::sleep(delay)).await
-                        {
-                            Ok(CodexHttpFallbackWait::Ready(())) => continue,
-                            Ok(CodexHttpFallbackWait::DownstreamClosed) => {
-                                finish_active_websocket_usage(
+                        let code = if error.is_request_memory_exhausted() {
+                            "cc_switch_request_memory_exhausted"
+                        } else if error.status == StatusCode::GATEWAY_TIMEOUT {
+                            "upstream_stream_timeout"
+                        } else {
+                            "upstream_stream_transport_error"
+                        };
+                        return terminate_codex_http_fallback_with_error(
+                            downstream,
+                            state,
+                            execution,
+                            output_patcher,
+                            source,
+                            Vec::new(),
+                            error,
+                            code,
+                            Some(if code == "cc_switch_request_memory_exhausted" {
+                                "capacity"
+                            } else {
+                                "transport_error"
+                            }),
+                            active_usage_turn,
+                        )
+                        .await;
+                    }
+                };
+                let capacity_failure =
+                    openai_capacity_shed_failure_from_bytes(&body).or_else(|| {
+                        (status.as_u16() == 529).then(|| SemanticFailure {
+                            origin: FailureOrigin::Provider,
+                            code: "server_is_overloaded".to_string(),
+                            message: "OpenAI Codex upstream returned HTTP 529".to_string(),
+                        })
+                    });
+                if execution.driver_is("oauth.openai_codex") {
+                    if let Some(failure) = capacity_failure.as_ref() {
+                        let capacity_source = capacity_shed_retry_source(failure);
+                        if let Some(delay) = take_codex_http_fallback_capacity_retry(
+                            attempt_context,
+                            execution,
+                            capacity_source,
+                        ) {
+                            record_forward_retry(
+                                ProxyRoute::CodexResponses,
+                                "capacity",
+                                capacity_source,
+                            );
+                            if let Some(turn) = active_usage_turn.as_mut() {
+                                turn.record_retry("capacity", capacity_source);
+                            }
+                            match wait_codex_http_fallback(downstream, tokio::time::sleep(delay))
+                                .await
+                            {
+                                Ok(CodexHttpFallbackWait::Ready(())) => continue,
+                                Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                                    finish_active_websocket_usage(
                                     active_usage_turn,
                                     499,
                                     "client_cancelled",
@@ -12162,80 +13222,177 @@ async fn run_codex_websocket_http_fallback(
                                     ),
                                 )
                                 .await;
-                                crate::metrics::record_codex_websocket_fallback(
-                                    source,
-                                    "cancelled",
-                                );
-                                return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
-                            }
-                            Err(error) => {
-                                return terminate_codex_http_fallback_with_error(
-                                    downstream,
-                                    state,
-                                    execution,
-                                    output_patcher,
-                                    source,
-                                    Vec::new(),
-                                    error,
-                                    "client_protocol_error",
-                                    Some("protocol_error"),
-                                    active_usage_turn,
-                                )
-                                .await;
+                                    crate::metrics::record_codex_websocket_fallback(
+                                        source,
+                                        "cancelled",
+                                    );
+                                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                                }
+                                Err(error) => {
+                                    return terminate_codex_http_fallback_with_error(
+                                        downstream,
+                                        state,
+                                        execution,
+                                        output_patcher,
+                                        source,
+                                        Vec::new(),
+                                        error,
+                                        "client_protocol_error",
+                                        Some("protocol_error"),
+                                        active_usage_turn,
+                                    )
+                                    .await;
+                                }
                             }
                         }
+                        record_provider_outcome(state, &stored, capacity_shed_provider_outcome())
+                            .await;
+                        return terminate_codex_http_fallback_with_error(
+                            downstream,
+                            state,
+                            execution,
+                            output_patcher,
+                            source,
+                            Vec::new(),
+                            codex_capacity_shed_proxy_error(failure),
+                            "cc_switch_upstream_capacity_shed",
+                            Some("provider_failure"),
+                            active_usage_turn,
+                        )
+                        .await;
                     }
                 }
+                maybe_mark_upstream_rate_limited(
+                    state,
+                    execution,
+                    status,
+                    &response_headers,
+                    &body,
+                    rate_limit_share_id.as_deref(),
+                    rate_limit_model.as_deref(),
+                )
+                .await;
                 record_provider_outcome(
                     state,
                     &stored,
-                    if is_openai_capacity_shed_failure(&failure) {
-                        capacity_shed_provider_outcome()
-                    } else {
-                        ProviderOutcome::Failure { status_code: 502 }
-                    },
+                    provider_outcome_from_status(status.as_u16()),
                 )
                 .await;
-                tracing::debug!(
-                    error = %failure.display_message(),
-                    "forwarding Responses semantic failure after HTTP fallback failover exhausted"
-                );
-                let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
-                    responses_payload_terminal(payload)
-                        .is_some_and(|terminal| matches!(terminal, SemanticTerminal::Failure(_)))
-                });
-                for payload in replay_payloads {
-                    let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
-                    relay_codex_http_fallback_event(downstream, output_patcher, payload).await?;
-                }
-                if needs_failed_terminal {
-                    relay_codex_http_fallback_event(
-                        downstream,
-                        output_patcher,
-                        synthesize_openai_capacity_shed_failed_json(&failure),
-                    )
-                    .await?;
-                }
-                finish_active_websocket_terminal(
-                    active_usage_turn,
-                    &SemanticTerminal::Failure(failure),
-                )
-                .await;
-                crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
-                return Ok(CodexHttpFallbackOutcome::Completed);
-            }
-            Ok(CodexHttpRelayOutcome::Interrupted {
-                error,
-                committed_business_event: _,
-                replay_payloads,
-                last_error,
-            }) => {
-                if let Some(failure) =
-                    last_error.or_else(|| last_responses_error_from_payloads(&replay_payloads))
+                let message = if execution.driver_is("oauth.grok_responses")
+                    && is_grok_cli_version_gate_message(&upstream_error_message(&body))
                 {
-                    let rate_limited = is_openai_rate_limit_failure(&failure)
-                        && execution.driver_is("oauth.openai_codex");
-                    if rate_limited {
+                    record_grok_cli_version_gate(&stored, "websocket_http_fallback");
+                    grok_cli_version_gate_admin_message()
+                } else {
+                    format!(
+                        "Responses HTTP fallback upstream returned HTTP {}",
+                        status.as_u16()
+                    )
+                };
+                let error = ProxyError { status, message };
+                return terminate_codex_http_fallback_with_error(
+                    downstream,
+                    state,
+                    execution,
+                    output_patcher,
+                    source,
+                    Vec::new(),
+                    error,
+                    "upstream_http_error",
+                    None,
+                    active_usage_turn,
+                )
+                .await;
+            }
+
+            match relay_codex_http_fallback_stream(
+                downstream,
+                upstream,
+                CodexHttpRelayPolicy {
+                    first_event: first_event_budget,
+                    idle_timeout: stream_idle_timeout,
+                    repeat_guard_enabled: stored.provider_type == ProviderType::GrokOAuth,
+                },
+                output_patcher,
+                active_usage_turn,
+                attempt_context.request_memory(),
+                fallback_semantic_memory.as_ref(),
+                fallback_tool_argument_memory.as_ref(),
+            )
+            .await
+            {
+                Ok(CodexHttpRelayOutcome::Completed(terminal)) => {
+                    match &terminal {
+                        SemanticTerminal::Failure(failure)
+                            if is_openai_rate_limit_failure(failure)
+                                && execution.driver_is("oauth.openai_codex") =>
+                        {
+                            let marker_body = semantic_failure_json(failure);
+                            maybe_mark_upstream_rate_limited(
+                                state,
+                                execution,
+                                StatusCode::TOO_MANY_REQUESTS,
+                                &response_headers,
+                                &marker_body,
+                                rate_limit_share_id.as_deref(),
+                                rate_limit_model.as_deref(),
+                            )
+                            .await;
+                            record_provider_outcome(
+                                state,
+                                &stored,
+                                ProviderOutcome::RateLimited {
+                                    status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                                },
+                            )
+                            .await;
+                        }
+                        SemanticTerminal::Failure(failure)
+                            if failure.origin == FailureOrigin::Provider =>
+                        {
+                            record_provider_outcome(
+                                state,
+                                &stored,
+                                if is_openai_capacity_shed_failure(failure) {
+                                    capacity_shed_provider_outcome()
+                                } else {
+                                    ProviderOutcome::Failure { status_code: 502 }
+                                },
+                            )
+                            .await;
+                        }
+                        SemanticTerminal::Failure(_) => {}
+                        SemanticTerminal::Success | SemanticTerminal::Incomplete => {
+                            record_provider_outcome(
+                                state,
+                                &stored,
+                                ProviderOutcome::Success { status_code: 200 },
+                            )
+                            .await;
+                        }
+                    }
+                    finish_active_websocket_terminal(active_usage_turn, &terminal).await;
+                    crate::metrics::record_codex_websocket_fallback(source, "success");
+                    return Ok(CodexHttpFallbackOutcome::Completed);
+                }
+                Ok(CodexHttpRelayOutcome::DownstreamClosed) => {
+                    finish_active_websocket_usage(
+                        active_usage_turn,
+                        499,
+                        "client_cancelled",
+                        Some("downstream websocket closed during HTTP fallback".to_string()),
+                    )
+                    .await;
+                    crate::metrics::record_codex_websocket_fallback(source, "success");
+                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                }
+                Ok(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                    failure,
+                    replay_payloads,
+                }) => {
+                    if is_openai_rate_limit_failure(&failure)
+                        && execution.driver_is("oauth.openai_codex")
+                    {
                         let marker_body = semantic_failure_json(&failure);
                         maybe_mark_upstream_rate_limited(
                             state,
@@ -12247,21 +13404,121 @@ async fn run_codex_websocket_http_fallback(
                             rate_limit_model.as_deref(),
                         )
                         .await;
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            ProviderOutcome::RateLimited {
+                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                            },
+                        )
+                        .await;
+                        let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
+                            responses_payload_terminal(payload).is_some_and(|terminal| {
+                                matches!(terminal, SemanticTerminal::Failure(_))
+                            })
+                        });
+                        for payload in replay_payloads {
+                            relay_codex_http_fallback_event(
+                                downstream,
+                                output_patcher,
+                                payload,
+                                attempt_context.request_memory(),
+                                fallback_tool_argument_memory.as_ref(),
+                            )
+                            .await?;
+                        }
+                        if needs_failed_terminal {
+                            relay_codex_http_fallback_event(
+                                downstream,
+                                output_patcher,
+                                synthesize_openai_capacity_shed_failed_json(&failure),
+                                attempt_context.request_memory(),
+                                fallback_tool_argument_memory.as_ref(),
+                            )
+                            .await?;
+                        }
+                        finish_active_websocket_terminal(
+                            active_usage_turn,
+                            &SemanticTerminal::Failure(failure),
+                        )
+                        .await;
+                        crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
+                        return Ok(CodexHttpFallbackOutcome::Completed);
+                    }
+                    if is_openai_capacity_shed_failure(&failure)
+                        && execution.driver_is("oauth.openai_codex")
+                    {
+                        let capacity_source = capacity_shed_retry_source(&failure);
+                        if let Some(delay) = take_codex_http_fallback_capacity_retry(
+                            attempt_context,
+                            execution,
+                            capacity_source,
+                        ) {
+                            let _ = replay_payloads;
+                            if let Some(reservation) = fallback_semantic_memory.as_ref() {
+                                let _ = reservation.resize(0);
+                            }
+                            record_forward_retry(
+                                ProxyRoute::CodexResponses,
+                                "capacity",
+                                capacity_source,
+                            );
+                            if let Some(turn) = active_usage_turn.as_mut() {
+                                turn.record_retry("capacity", capacity_source);
+                            }
+                            match wait_codex_http_fallback(downstream, tokio::time::sleep(delay))
+                                .await
+                            {
+                                Ok(CodexHttpFallbackWait::Ready(())) => continue,
+                                Ok(CodexHttpFallbackWait::DownstreamClosed) => {
+                                    finish_active_websocket_usage(
+                                    active_usage_turn,
+                                    499,
+                                    "client_cancelled",
+                                    Some(
+                                        "downstream websocket closed during HTTP fallback backoff"
+                                            .to_string(),
+                                    ),
+                                )
+                                .await;
+                                    crate::metrics::record_codex_websocket_fallback(
+                                        source,
+                                        "cancelled",
+                                    );
+                                    return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
+                                }
+                                Err(error) => {
+                                    return terminate_codex_http_fallback_with_error(
+                                        downstream,
+                                        state,
+                                        execution,
+                                        output_patcher,
+                                        source,
+                                        Vec::new(),
+                                        error,
+                                        "client_protocol_error",
+                                        Some("protocol_error"),
+                                        active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     }
                     record_provider_outcome(
                         state,
                         &stored,
-                        if rate_limited {
-                            ProviderOutcome::RateLimited {
-                                status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                            }
-                        } else if is_openai_capacity_shed_failure(&failure) {
+                        if is_openai_capacity_shed_failure(&failure) {
                             capacity_shed_provider_outcome()
                         } else {
                             ProviderOutcome::Failure { status_code: 502 }
                         },
                     )
                     .await;
+                    tracing::debug!(
+                        error = %failure.display_message(),
+                        "forwarding Responses semantic failure after HTTP fallback failover exhausted"
+                    );
                     let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
                         responses_payload_terminal(payload).is_some_and(|terminal| {
                             matches!(terminal, SemanticTerminal::Failure(_))
@@ -12269,14 +13526,22 @@ async fn run_codex_websocket_http_fallback(
                     });
                     for payload in replay_payloads {
                         let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
-                        relay_codex_http_fallback_event(downstream, output_patcher, payload)
-                            .await?;
+                        relay_codex_http_fallback_event(
+                            downstream,
+                            output_patcher,
+                            payload,
+                            attempt_context.request_memory(),
+                            fallback_tool_argument_memory.as_ref(),
+                        )
+                        .await?;
                     }
                     if needs_failed_terminal {
                         relay_codex_http_fallback_event(
                             downstream,
                             output_patcher,
                             synthesize_openai_capacity_shed_failed_json(&failure),
+                            attempt_context.request_memory(),
+                            fallback_tool_argument_memory.as_ref(),
                         )
                         .await?;
                     }
@@ -12288,68 +13553,163 @@ async fn run_codex_websocket_http_fallback(
                     crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
                     return Ok(CodexHttpFallbackOutcome::Completed);
                 }
-                let protocol_error = stream_error_code_and_message(error.client_message()).0
-                    == "upstream_stream_protocol_error";
-                record_provider_outcome(
-                    state,
-                    &stored,
-                    if protocol_error {
-                        ProviderOutcome::Failure { status_code: 502 }
-                    } else {
-                        ProviderOutcome::NetworkFailure
-                    },
-                )
-                .await;
-                let error_code = if error.status == StatusCode::GATEWAY_TIMEOUT {
-                    "upstream_stream_timeout"
-                } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
-                    "upstream_stream_too_large"
-                } else if error
-                    .client_message()
-                    .contains("ended before a terminal response event")
-                {
-                    "upstream_closed_before_terminal"
-                } else if protocol_error {
-                    "upstream_stream_protocol_error"
-                } else {
-                    "upstream_stream_error"
-                };
-                return terminate_codex_http_fallback_with_error(
-                    downstream,
-                    state,
-                    execution,
-                    output_patcher,
-                    source,
-                    replay_payloads,
+                Ok(CodexHttpRelayOutcome::Interrupted {
                     error,
-                    error_code,
-                    Some(match error_code {
-                        "upstream_closed_before_terminal" => "missing_terminal",
-                        "upstream_stream_too_large" => "capacity",
-                        "upstream_stream_protocol_error" => "protocol_error",
-                        _ => "transport_error",
-                    }),
-                    active_usage_turn,
-                )
-                .await;
-            }
-            Err(error) => {
-                crate::metrics::record_codex_websocket_fallback(source, "error");
-                finish_active_websocket_usage(
-                    active_usage_turn,
-                    error.status.as_u16(),
-                    if error.status.is_client_error() {
-                        "client_error"
+                    committed_business_event: _,
+                    replay_payloads,
+                    last_error,
+                }) => {
+                    if let Some(failure) =
+                        last_error.or_else(|| last_responses_error_from_payloads(&replay_payloads))
+                    {
+                        let rate_limited = is_openai_rate_limit_failure(&failure)
+                            && execution.driver_is("oauth.openai_codex");
+                        if rate_limited {
+                            let marker_body = semantic_failure_json(&failure);
+                            maybe_mark_upstream_rate_limited(
+                                state,
+                                execution,
+                                StatusCode::TOO_MANY_REQUESTS,
+                                &response_headers,
+                                &marker_body,
+                                rate_limit_share_id.as_deref(),
+                                rate_limit_model.as_deref(),
+                            )
+                            .await;
+                        }
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            if rate_limited {
+                                ProviderOutcome::RateLimited {
+                                    status_code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                                }
+                            } else if is_openai_capacity_shed_failure(&failure) {
+                                capacity_shed_provider_outcome()
+                            } else {
+                                ProviderOutcome::Failure { status_code: 502 }
+                            },
+                        )
+                        .await;
+                        let needs_failed_terminal = !replay_payloads.iter().any(|payload| {
+                            responses_payload_terminal(payload).is_some_and(|terminal| {
+                                matches!(terminal, SemanticTerminal::Failure(_))
+                            })
+                        });
+                        for payload in replay_payloads {
+                            let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
+                            relay_codex_http_fallback_event(
+                                downstream,
+                                output_patcher,
+                                payload,
+                                attempt_context.request_memory(),
+                                fallback_tool_argument_memory.as_ref(),
+                            )
+                            .await?;
+                        }
+                        if needs_failed_terminal {
+                            relay_codex_http_fallback_event(
+                                downstream,
+                                output_patcher,
+                                synthesize_openai_capacity_shed_failed_json(&failure),
+                                attempt_context.request_memory(),
+                                fallback_tool_argument_memory.as_ref(),
+                            )
+                            .await?;
+                        }
+                        finish_active_websocket_terminal(
+                            active_usage_turn,
+                            &SemanticTerminal::Failure(failure),
+                        )
+                        .await;
+                        crate::metrics::record_codex_websocket_fallback(source, "semantic_failure");
+                        return Ok(CodexHttpFallbackOutcome::Completed);
+                    }
+                    let memory_exhausted = error.is_request_memory_exhausted();
+                    let protocol_error = !memory_exhausted
+                        && stream_error_code_and_message(error.client_message()).0
+                            == "upstream_stream_protocol_error";
+                    if !memory_exhausted {
+                        record_provider_outcome(
+                            state,
+                            &stored,
+                            if protocol_error {
+                                ProviderOutcome::Failure { status_code: 502 }
+                            } else {
+                                ProviderOutcome::NetworkFailure
+                            },
+                        )
+                        .await;
+                    }
+                    let error_code = if memory_exhausted {
+                        "cc_switch_request_memory_exhausted"
+                    } else if error.status == StatusCode::GATEWAY_TIMEOUT {
+                        "upstream_stream_timeout"
+                    } else if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                        "upstream_stream_too_large"
+                    } else if error
+                        .client_message()
+                        .contains("ended before a terminal response event")
+                    {
+                        "upstream_closed_before_terminal"
+                    } else if protocol_error {
+                        "upstream_stream_protocol_error"
                     } else {
-                        "interrupted"
-                    },
-                    Some(error.client_message().to_string()),
-                )
-                .await;
-                return Err(error);
+                        "upstream_stream_error"
+                    };
+                    return terminate_codex_http_fallback_with_error(
+                        downstream,
+                        state,
+                        execution,
+                        output_patcher,
+                        source,
+                        replay_payloads,
+                        error,
+                        error_code,
+                        Some(match error_code {
+                            "cc_switch_request_memory_exhausted" => "capacity",
+                            "upstream_closed_before_terminal" => "missing_terminal",
+                            "upstream_stream_too_large" => "capacity",
+                            "upstream_stream_protocol_error" => "protocol_error",
+                            _ => "transport_error",
+                        }),
+                        active_usage_turn,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    if error.is_request_memory_exhausted() {
+                        return terminate_codex_http_fallback_with_error(
+                            downstream,
+                            state,
+                            execution,
+                            output_patcher,
+                            source,
+                            Vec::new(),
+                            error,
+                            "cc_switch_request_memory_exhausted",
+                            Some("capacity"),
+                            active_usage_turn,
+                        )
+                        .await;
+                    }
+                    crate::metrics::record_codex_websocket_fallback(source, "error");
+                    finish_active_websocket_usage(
+                        active_usage_turn,
+                        error.status.as_u16(),
+                        if error.status.is_client_error() {
+                            "client_error"
+                        } else {
+                            "interrupted"
+                        },
+                        Some(error.client_message().to_string()),
+                    )
+                    .await;
+                    return Err(error);
+                }
             }
         }
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12359,12 +13719,16 @@ async fn terminate_codex_http_fallback_with_error(
     execution: &ProviderExecution,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     source: &'static str,
-    replay_payloads: Vec<String>,
+    mut replay_payloads: Vec<String>,
     error: ProxyError,
     error_code: &'static str,
     metric_kind: Option<&'static str>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CodexHttpFallbackOutcome, ProxyError> {
+    if error.is_request_memory_exhausted() {
+        replay_payloads.clear();
+        output_patcher.clear_output_items();
+    }
     crate::metrics::record_codex_websocket_fallback(source, "error");
     if let Some(metric_kind) = metric_kind {
         crate::metrics::record_proxy_semantic_guard("websocket_http_fallback", metric_kind);
@@ -12938,9 +14302,20 @@ async fn relay_codex_http_fallback_stream(
     policy: CodexHttpRelayPolicy,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+    request_memory: Option<&RequestMemoryBudget>,
+    semantic_prelude_memory: Option<&RequestMemoryReservation>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<CodexHttpRelayOutcome, ProxyError> {
     let mut upstream = upstream.bytes_stream();
     let mut decoder = CodexHttpFallbackSseDecoder::default();
+    let transport_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::TransportPending, 0))
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    let normalized_event_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, 0))
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let mut committed_business_event = false;
     let mut pending_lifecycle_payloads = Vec::new();
     let mut last_error = None;
@@ -13013,9 +14388,28 @@ async fn relay_codex_http_fallback_stream(
 
             match next_chunk {
                 Some(chunk) => {
+                    if let Some(reservation) = transport_memory.as_ref() {
+                        reservation
+                            .resize(decoder.retained_bytes().saturating_add(chunk.len()))
+                            .map_err(|error| {
+                                CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                            })?;
+                    }
                     let items = decoder
                         .push(&chunk)
                         .map_err(CodexHttpRelayFailure::Upstream)?;
+                    if let Some(reservation) = transport_memory.as_ref() {
+                        reservation.resize(decoder.retained_bytes()).map_err(|error| {
+                            CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                        })?;
+                    }
+                    if let Some(reservation) = normalized_event_memory.as_ref() {
+                        reservation
+                            .resize(codex_http_fallback_transport_items_bytes(&items))
+                            .map_err(|error| {
+                                CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                            })?;
+                    }
                     remember_codex_http_fallback_transport_error_frames(
                         &items,
                         &mut last_error,
@@ -13028,8 +14422,39 @@ async fn relay_codex_http_fallback_stream(
                         &mut committed_business_event,
                         response_repeat_tracker.as_mut(),
                         active_usage_turn,
+                        request_memory,
+                        tool_argument_memory,
                     )
                     .await?;
+                    if let Some(reservation) = normalized_event_memory.as_ref() {
+                        let _ = reservation.resize(0);
+                    }
+                    if let Some(reservation) = semantic_prelude_memory {
+                        let retained = outcome.as_ref().map_or_else(
+                            || {
+                                codex_http_fallback_payload_bytes(
+                                    &pending_lifecycle_payloads,
+                                )
+                            },
+                            |outcome| match outcome {
+                                CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                                    replay_payloads,
+                                    ..
+                                }
+                                | CodexHttpRelayOutcome::Interrupted {
+                                    replay_payloads,
+                                    ..
+                                } => codex_http_fallback_payload_bytes(replay_payloads),
+                                CodexHttpRelayOutcome::Completed(_)
+                                | CodexHttpRelayOutcome::DownstreamClosed => 0,
+                            },
+                        );
+                        reservation
+                            .resize(retained)
+                            .map_err(|error| {
+                                CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                            })?;
+                    }
                     if let Some(outcome) = outcome {
                         return Ok(outcome);
                     }
@@ -13043,6 +14468,18 @@ async fn relay_codex_http_fallback_stream(
                     let items = decoder
                         .finish()
                         .map_err(CodexHttpRelayFailure::Upstream)?;
+                    if let Some(reservation) = transport_memory.as_ref() {
+                        reservation.resize(decoder.retained_bytes()).map_err(|error| {
+                            CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                        })?;
+                    }
+                    if let Some(reservation) = normalized_event_memory.as_ref() {
+                        reservation
+                            .resize(codex_http_fallback_transport_items_bytes(&items))
+                            .map_err(|error| {
+                                CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                            })?;
+                    }
                     remember_codex_http_fallback_transport_error_frames(
                         &items,
                         &mut last_error,
@@ -13055,8 +14492,36 @@ async fn relay_codex_http_fallback_stream(
                         &mut committed_business_event,
                         response_repeat_tracker.as_mut(),
                         active_usage_turn,
+                        request_memory,
+                        tool_argument_memory,
                     )
                     .await?;
+                    if let Some(reservation) = semantic_prelude_memory {
+                        let retained = outcome.as_ref().map_or_else(
+                            || {
+                                codex_http_fallback_payload_bytes(
+                                    &pending_lifecycle_payloads,
+                                )
+                            },
+                            |outcome| match outcome {
+                                CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
+                                    replay_payloads,
+                                    ..
+                                }
+                                | CodexHttpRelayOutcome::Interrupted {
+                                    replay_payloads,
+                                    ..
+                                } => codex_http_fallback_payload_bytes(replay_payloads),
+                                CodexHttpRelayOutcome::Completed(_)
+                                | CodexHttpRelayOutcome::DownstreamClosed => 0,
+                            },
+                        );
+                        reservation
+                            .resize(retained)
+                            .map_err(|error| {
+                                CodexHttpRelayFailure::Upstream(error.into_proxy_error())
+                            })?;
+                    }
                     if let Some(outcome) = outcome {
                         return Ok(outcome);
                     }
@@ -13090,6 +14555,8 @@ async fn relay_codex_http_fallback_transport_items(
     committed_business_event: &mut bool,
     mut response_repeat_tracker: Option<&mut ResponsesRepeatTracker>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+    request_memory: Option<&RequestMemoryBudget>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<(Option<CodexHttpRelayOutcome>, bool), CodexHttpRelayFailure> {
     let mut payloads = Vec::new();
     let mut semantic_activity = false;
@@ -13105,6 +14572,8 @@ async fn relay_codex_http_fallback_transport_items(
                     committed_business_event,
                     response_repeat_tracker.as_deref_mut(),
                     active_usage_turn,
+                    request_memory,
+                    tool_argument_memory,
                 )
                 .await?;
                 semantic_activity |= activity;
@@ -13125,6 +14594,8 @@ async fn relay_codex_http_fallback_transport_items(
         committed_business_event,
         response_repeat_tracker,
         active_usage_turn,
+        request_memory,
+        tool_argument_memory,
     )
     .await?;
     semantic_activity |= activity;
@@ -13139,6 +14610,8 @@ async fn relay_codex_http_fallback_payloads(
     committed_business_event: &mut bool,
     mut response_repeat_tracker: Option<&mut ResponsesRepeatTracker>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
+    request_memory: Option<&RequestMemoryBudget>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<(Option<CodexHttpRelayOutcome>, bool), CodexHttpRelayFailure> {
     let mut semantic_activity = false;
     if !*committed_business_event {
@@ -13191,6 +14664,8 @@ async fn relay_codex_http_fallback_payloads(
             payload,
             pending_lifecycle_payloads,
             committed_business_event,
+            request_memory,
+            tool_argument_memory,
         )
         .await?
         {
@@ -13257,12 +14732,20 @@ async fn relay_codex_http_fallback_semantic_event(
     payload: String,
     pending_lifecycle_payloads: &mut Vec<String>,
     committed_business_event: &mut bool,
+    request_memory: Option<&RequestMemoryBudget>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<CodexHttpRelayEventOutcome, CodexHttpRelayFailure> {
     if !response_semantics::semantic_guard_enabled() {
         let terminal = responses_payload_terminal(&payload);
-        relay_codex_http_fallback_event(downstream, output_patcher, payload)
-            .await
-            .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
+        relay_codex_http_fallback_event(
+            downstream,
+            output_patcher,
+            payload,
+            request_memory,
+            tool_argument_memory,
+        )
+        .await
+        .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
         *committed_business_event = true;
         return Ok(terminal
             .map(CodexHttpRelayEventOutcome::Terminal)
@@ -13301,14 +14784,26 @@ async fn relay_codex_http_fallback_semantic_event(
 
     for pending in pending_lifecycle_payloads.drain(..) {
         let pending = sanitize_openai_capacity_shed_json_text(&pending).0;
-        relay_codex_http_fallback_event(downstream, output_patcher, pending)
-            .await
-            .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
-    }
-    let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
-    relay_codex_http_fallback_event(downstream, output_patcher, payload)
+        relay_codex_http_fallback_event(
+            downstream,
+            output_patcher,
+            pending,
+            request_memory,
+            tool_argument_memory,
+        )
         .await
         .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
+    }
+    let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
+    relay_codex_http_fallback_event(
+        downstream,
+        output_patcher,
+        payload,
+        request_memory,
+        tool_argument_memory,
+    )
+    .await
+    .map_err(|_| CodexHttpRelayFailure::DownstreamClosed)?;
     *committed_business_event |= observation.commits_downstream();
     Ok(match observation {
         SemanticObservation::SuccessTerminal => {
@@ -13387,15 +14882,54 @@ fn remember_codex_http_fallback_transport_error_frames(
     }
 }
 
+async fn send_responses_websocket_memory_error_and_close(
+    downstream: &mut WebSocket,
+    error: &ProxyError,
+) {
+    let body = websocket_stream_error_body(error.client_message(), error.error_code());
+    let _ = downstream.send(AxumWsMessage::Text(body)).await;
+    let _ = downstream
+        .send(AxumWsMessage::Close(Some(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::ERROR,
+            reason: "request memory capacity exhausted".into(),
+        })))
+        .await;
+}
+
 async fn relay_codex_http_fallback_event(
     downstream: &mut WebSocket,
     output_patcher: &mut CodexWebsocketOutputPatcher,
     payload: String,
+    request_memory: Option<&RequestMemoryBudget>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<bool, ProxyError> {
     let message = TungsteniteMessage::Text(payload);
     let terminal = responses_websocket_response_is_terminal(&message)
         || websocket_message_json_type(&message).as_deref() == Some("error");
-    for message in output_patcher.patch_messages(message) {
+    let messages = output_patcher.patch_messages(message);
+    if let Some(reservation) = tool_argument_memory {
+        if let Err(error) = reservation.resize(output_patcher.retained_tool_argument_bytes()) {
+            let error = error.into_proxy_error();
+            send_responses_websocket_memory_error_and_close(downstream, &error).await;
+            return Err(error);
+        }
+    }
+    let normalized_bytes = messages
+        .iter()
+        .map(websocket_message_payload_len)
+        .fold(0_usize, usize::saturating_add);
+    let normalized_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, normalized_bytes))
+        .transpose();
+    let _normalized_memory = match normalized_memory {
+        Ok(memory) => memory,
+        Err(error) => {
+            let error = error.into_proxy_error();
+            send_responses_websocket_memory_error_and_close(downstream, &error).await;
+            return Err(error);
+        }
+    };
+    for message in messages {
         let Some(message) = tungstenite_message_to_axum_ws(message) else {
             continue;
         };
@@ -13416,6 +14950,23 @@ struct CodexHttpFallbackSseDecoder {
 enum CodexHttpFallbackTransportItem {
     Payload(String),
     Done,
+}
+
+fn codex_http_fallback_transport_items_bytes(items: &[CodexHttpFallbackTransportItem]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            CodexHttpFallbackTransportItem::Payload(payload) => payload.len(),
+            CodexHttpFallbackTransportItem::Done => 0,
+        })
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn codex_http_fallback_payload_bytes(payloads: &[String]) -> usize {
+    payloads
+        .iter()
+        .map(String::len)
+        .fold(0_usize, usize::saturating_add)
 }
 
 impl Default for CodexHttpFallbackSseDecoder {
@@ -13448,6 +14999,10 @@ impl CodexHttpFallbackSseDecoder {
             .finish()
             .map_err(codex_http_fallback_transport_error)?;
         codex_http_fallback_transport_items(items)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.decoder.retained_bytes()
     }
 }
 
@@ -13584,6 +15139,16 @@ fn websocket_message_payload_len(message: &TungsteniteMessage) -> usize {
     }
 }
 
+fn axum_websocket_message_payload_len(message: &AxumWsMessage) -> usize {
+    match message {
+        AxumWsMessage::Text(text) => text.len(),
+        AxumWsMessage::Binary(bytes) | AxumWsMessage::Ping(bytes) | AxumWsMessage::Pong(bytes) => {
+            bytes.len()
+        }
+        AxumWsMessage::Close(_) => 0,
+    }
+}
+
 fn sanitize_openai_capacity_shed_websocket_message(message: &mut TungsteniteMessage) {
     match message {
         TungsteniteMessage::Text(text) => {
@@ -13604,6 +15169,8 @@ async fn send_responses_websocket_message(
     output_patcher: &mut CodexWebsocketOutputPatcher,
     mode: ResponsesWebsocketMode,
     mut message: TungsteniteMessage,
+    request_memory: Option<&RequestMemoryBudget>,
+    tool_argument_memory: Option<&RequestMemoryReservation>,
 ) -> Result<bool, ProxyError> {
     sanitize_openai_capacity_shed_websocket_message(&mut message);
     let messages = if matches!(
@@ -13614,6 +15181,19 @@ async fn send_responses_websocket_message(
     } else {
         vec![message]
     };
+    if let Some(reservation) = tool_argument_memory {
+        reservation
+            .resize(output_patcher.retained_tool_argument_bytes())
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    let normalized_bytes = messages
+        .iter()
+        .map(websocket_message_payload_len)
+        .fold(0_usize, usize::saturating_add);
+    let _normalized_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, normalized_bytes))
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let mut closes = false;
     for message in messages {
         let Some(message) = tungstenite_message_to_axum_ws(message) else {
@@ -13689,13 +15269,19 @@ async fn terminate_responses_websocket_with_error(
     provider_outcome: Option<ProviderOutcome>,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<(), ProxyError> {
+    if error.is_request_memory_exhausted() {
+        pending_lifecycle_messages.clear();
+        output_patcher.clear_output_items();
+    }
     if let Some(metric_kind) = metric_kind {
         crate::metrics::record_proxy_semantic_guard("websocket", metric_kind);
     }
     if let Some(outcome) = provider_outcome {
         record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
     }
-    let stream_status = if error.is_protocol_incompatible() {
+    let stream_status = if error.is_request_memory_exhausted() {
+        "memory_capacity"
+    } else if error.is_protocol_incompatible() {
         "protocol_incompatible"
     } else if error.status.is_client_error() {
         "client_error"
@@ -13711,7 +15297,9 @@ async fn terminate_responses_websocket_with_error(
     .await;
 
     for pending in pending_lifecycle_messages.drain(..) {
-        if send_responses_websocket_message(downstream, output_patcher, mode, pending).await? {
+        if send_responses_websocket_message(downstream, output_patcher, mode, pending, None, None)
+            .await?
+        {
             return Ok(());
         }
     }
@@ -13720,12 +15308,16 @@ async fn terminate_responses_websocket_with_error(
         output_patcher,
         mode,
         TungsteniteMessage::Text(error_body),
+        None,
+        None,
     )
     .await?
     {
         return Ok(());
     }
-    let close_reason = if error.status.is_client_error() {
+    let close_reason = if error.is_request_memory_exhausted() {
+        "request memory capacity exhausted"
+    } else if error.status.is_client_error() {
         "request rejected by protocol adapter"
     } else {
         "upstream response ended without terminal event"
@@ -13738,6 +15330,8 @@ async fn terminate_responses_websocket_with_error(
             code: CloseCode::Error,
             reason: close_reason.into(),
         })),
+        None,
+        None,
     )
     .await?;
     Err(error)
@@ -13931,6 +15525,14 @@ impl CodexWebsocketOutputPatcher {
         self.clear_output_items();
         self.cache_write = None;
         self.grok_tools = None;
+    }
+
+    fn retained_tool_argument_bytes(&self) -> usize {
+        self.output_items_by_index
+            .values()
+            .chain(self.output_items_fallback.iter())
+            .map(codex_tool_item_argument_bytes)
+            .fold(0_usize, usize::saturating_add)
     }
 }
 
@@ -21647,6 +23249,7 @@ struct ResponsesImageJsonHeartbeatArgs {
     keepalive_interval: Duration,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs) -> Response {
@@ -21667,6 +23270,7 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
         keepalive_interval,
         account_in_flight_guard,
         share_invocation_guard,
+        request_memory,
     } = args;
     let mut lifecycle = ResponsesImageJsonLifecycleGuard {
         armed: true,
@@ -21689,6 +23293,7 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
             timeout,
             first_event_deadline,
             first_event_timeout,
+            request_memory.as_ref(),
         );
         tokio::pin!(aggregation);
         let mut keepalive = tokio::time::interval_at(
@@ -21733,6 +23338,13 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
                             body,
                             &adapter_request.claude_tool_name_map,
                         )
+                    })
+                    .and_then(|body| {
+                        retain_request_bytes(
+                            body,
+                            request_memory.as_ref(),
+                            RequestMemoryComponent::NormalizedEvent,
+                        )
                     });
                 match encoded {
                     Ok(body) => {
@@ -21751,12 +23363,18 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
                         yield Ok(body);
                     }
                     Err(error) => {
+                        let memory_exhausted = error.is_request_memory_exhausted();
                         let failure = OpenAiResponsesAggregationFailure {
                             error,
                             usage,
                             usage_state: observed_or_missing_usage_state(usage),
-                            stream_status: "transform_error",
-                            provider_outcome: Some(ProviderOutcome::Failure { status_code: 502 }),
+                            stream_status: if memory_exhausted {
+                                "memory_capacity"
+                            } else {
+                                "transform_error"
+                            },
+                            provider_outcome: (!memory_exhausted)
+                                .then_some(ProviderOutcome::Failure { status_code: 502 }),
                             semantic_failure: None,
                             saw_business_output: true,
                         };
@@ -21804,11 +23422,15 @@ fn responses_image_json_heartbeat_response(args: ResponsesImageJsonHeartbeatArgs
 }
 
 fn responses_image_json_error_body(failure: &OpenAiResponsesAggregationFailure) -> Bytes {
-    let code = failure
-        .semantic_failure
-        .as_ref()
-        .map(|failure| failure.code.as_str())
-        .unwrap_or("image_generation_failed");
+    let code = if failure.error.is_request_memory_exhausted() {
+        failure.error.error_code()
+    } else {
+        failure
+            .semantic_failure
+            .as_ref()
+            .map(|failure| failure.code.as_str())
+            .unwrap_or("image_generation_failed")
+    };
     let error_type = if failure.error.status.is_client_error() {
         "invalid_request_error"
     } else {
@@ -21935,6 +23557,13 @@ impl Drop for ResponsesImageJsonLifecycleGuard {
 }
 
 #[derive(Debug)]
+struct BudgetedOpenAiResponsesAggregation {
+    response: Value,
+    stream_status: &'static str,
+    _retained_memory: Option<RequestMemoryReservation>,
+}
+
+#[derive(Debug)]
 struct OpenAiResponsesAggregationFailure {
     error: ProxyError,
     usage: TokenUsage,
@@ -22032,12 +23661,14 @@ impl OpenAiResponsesAggregationFailure {
     }
 
     fn interrupted(error: ProxyError, usage: TokenUsage, stream_status: &'static str) -> Self {
+        let provider_outcome =
+            (!error.is_request_memory_exhausted()).then_some(ProviderOutcome::NetworkFailure);
         Self {
             error,
             usage,
             usage_state: UsageState::Interrupted,
             stream_status,
-            provider_outcome: Some(ProviderOutcome::NetworkFailure),
+            provider_outcome,
             semantic_failure: None,
             saw_business_output: false,
         }
@@ -22137,11 +23768,42 @@ async fn aggregate_openai_responses_upstream(
     timeout: Duration,
     mut first_event_deadline: Option<tokio::time::Instant>,
     first_event_timeout: Option<Duration>,
-) -> Result<super::streaming::ResponsesSseAggregation, OpenAiResponsesAggregationFailure> {
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<BudgetedOpenAiResponsesAggregation, OpenAiResponsesAggregationFailure> {
     let overall_deadline = tokio::time::Instant::now() + timeout;
     let mut aggregator = ResponsesSseAggregator::new();
     let mut semantics = ResponsesSseInspector::default();
     let mut usage = StreamUsageAccumulator::new(InputTokenSemantics::Inclusive);
+    let transport_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::TransportPending, 0))
+        .transpose()
+        .map_err(|error| {
+            OpenAiResponsesAggregationFailure::interrupted(
+                error.into_proxy_error(),
+                std::mem::take(&mut usage).finish(),
+                "memory_capacity",
+            )
+        })?;
+    let normalized_event_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, 0))
+        .transpose()
+        .map_err(|error| {
+            OpenAiResponsesAggregationFailure::interrupted(
+                error.into_proxy_error(),
+                std::mem::take(&mut usage).finish(),
+                "memory_capacity",
+            )
+        })?;
+    let semantic_prelude_memory = request_memory
+        .map(|budget| budget.reserve(RequestMemoryComponent::SemanticPrelude, 0))
+        .transpose()
+        .map_err(|error| {
+            OpenAiResponsesAggregationFailure::interrupted(
+                error.into_proxy_error(),
+                std::mem::take(&mut usage).finish(),
+                "memory_capacity",
+            )
+        })?;
     loop {
         let deadline = first_event_deadline
             .map(|first| first.min(overall_deadline))
@@ -22184,6 +23846,15 @@ async fn aggregate_openai_responses_upstream(
         let Some(chunk) = chunk else {
             break;
         };
+        if let Some(reservation) = transport_memory.as_ref() {
+            reservation.resize(chunk.len()).map_err(|error| {
+                OpenAiResponsesAggregationFailure::interrupted(
+                    error.into_proxy_error(),
+                    std::mem::take(&mut usage).finish(),
+                    "memory_capacity",
+                )
+            })?;
+        }
         let batch = match semantics.push_normalized(&chunk) {
             Ok(batch) => batch,
             Err(error) => {
@@ -22201,6 +23872,32 @@ async fn aggregate_openai_responses_upstream(
                 );
             }
         };
+        if let Some(reservation) = transport_memory.as_ref() {
+            reservation
+                .resize(
+                    chunk
+                        .len()
+                        .saturating_add(semantics.retained_transport_bytes()),
+                )
+                .map_err(|error| {
+                    OpenAiResponsesAggregationFailure::interrupted(
+                        error.into_proxy_error(),
+                        std::mem::take(&mut usage).finish(),
+                        "memory_capacity",
+                    )
+                })?;
+        }
+        if let Some(reservation) = normalized_event_memory.as_ref() {
+            reservation
+                .resize(batch.normalized.len())
+                .map_err(|error| {
+                    OpenAiResponsesAggregationFailure::interrupted(
+                        error.into_proxy_error(),
+                        std::mem::take(&mut usage).finish(),
+                        "memory_capacity",
+                    )
+                })?;
+        }
         batch.record_transport_metrics("responses_aggregation");
         if batch
             .observations
@@ -22234,6 +23931,23 @@ async fn aggregate_openai_responses_upstream(
                 semantics.saw_business(),
             ));
         }
+        if let Some(reservation) = semantic_prelude_memory.as_ref() {
+            reservation
+                .resize(aggregator.retained_bytes())
+                .map_err(|error| {
+                    OpenAiResponsesAggregationFailure::interrupted(
+                        error.into_proxy_error(),
+                        std::mem::take(&mut usage).finish(),
+                        "memory_capacity",
+                    )
+                })?;
+        }
+        if let Some(reservation) = transport_memory.as_ref() {
+            let _ = reservation.resize(semantics.retained_transport_bytes());
+        }
+        if let Some(reservation) = normalized_event_memory.as_ref() {
+            let _ = reservation.resize(0);
+        }
         if aggregator.is_terminal() {
             break;
         }
@@ -22256,6 +23970,15 @@ async fn aggregate_openai_responses_upstream(
         }
     };
     tail.record_transport_metrics("responses_aggregation");
+    if let Some(reservation) = normalized_event_memory.as_ref() {
+        reservation.resize(tail.normalized.len()).map_err(|error| {
+            OpenAiResponsesAggregationFailure::interrupted(
+                error.into_proxy_error(),
+                std::mem::take(&mut usage).finish(),
+                "memory_capacity",
+            )
+        })?;
+    }
     usage.push(&tail.normalized);
     if let Err(error) = aggregator.push(&tail.normalized) {
         return Err(OpenAiResponsesAggregationFailure::from_aggregation_error(
@@ -22265,13 +23988,29 @@ async fn aggregate_openai_responses_upstream(
             semantics.saw_business(),
         ));
     }
-    aggregator.finish().map_err(|error| {
+    if let Some(reservation) = semantic_prelude_memory.as_ref() {
+        reservation
+            .resize(aggregator.retained_bytes())
+            .map_err(|error| {
+                OpenAiResponsesAggregationFailure::interrupted(
+                    error.into_proxy_error(),
+                    std::mem::take(&mut usage).finish(),
+                    "memory_capacity",
+                )
+            })?;
+    }
+    let aggregation = aggregator.finish().map_err(|error| {
         OpenAiResponsesAggregationFailure::from_aggregation_error(
             error,
             usage.finish(),
             semantics.terminal().cloned(),
             semantics.saw_business(),
         )
+    })?;
+    Ok(BudgetedOpenAiResponsesAggregation {
+        response: aggregation.response,
+        stream_status: aggregation.stream_status,
+        _retained_memory: semantic_prelude_memory,
     })
 }
 
@@ -22678,6 +24417,9 @@ fn sanitize_codex_oauth_request_body(body: &mut Value) {
                 && item.get("type").and_then(Value::as_str) != Some("item_reference")
         });
         for item in input {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("internal_chat_message_metadata_passthrough");
+            }
             let has_server_item_id = item
                 .get("id")
                 .and_then(Value::as_str)
@@ -23940,6 +25682,10 @@ struct StreamForwardState {
     downstream_keepalive: Option<super::downstream_keepalive::DownstreamKeepalive>,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+    request_memory: Option<RequestMemoryBudget>,
+    semantic_transport_memory: Option<RequestMemoryReservation>,
+    tool_argument_memory: Option<RequestMemoryReservation>,
+    downstream_pending_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Clone)]
@@ -23950,6 +25696,60 @@ struct CodexRateLimitContext {
 }
 
 impl StreamForwardState {
+    fn reserve_request_memory(
+        &self,
+        component: RequestMemoryComponent,
+        bytes: usize,
+    ) -> Result<Option<RequestMemoryReservation>, ProxyError> {
+        self.request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve(component, bytes)
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()
+    }
+
+    fn resize_semantic_transport_memory(&self) -> Result<(), ProxyError> {
+        let retained = self
+            .responses_semantics
+            .as_ref()
+            .map_or(0, ResponsesSseInspector::retained_transport_bytes);
+        if let Some(reservation) = self.semantic_transport_memory.as_ref() {
+            reservation
+                .resize(retained)
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+
+    fn resize_tool_argument_memory(&self) -> Result<(), ProxyError> {
+        let retained = self
+            .codex_completed_output_patcher
+            .retained_tool_argument_bytes()
+            .saturating_add(
+                self.codex_pending_function_call_patcher
+                    .retained_tool_argument_bytes(),
+            )
+            .saturating_add(
+                self.codex_custom_tool_stream_patcher
+                    .retained_tool_argument_bytes(),
+            );
+        if let Some(reservation) = self.tool_argument_memory.as_ref() {
+            reservation
+                .resize(retained)
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+
+    fn retain_downstream_chunk(&mut self, bytes: usize) -> Result<(), ProxyError> {
+        self.downstream_pending_memory =
+            self.reserve_request_memory(RequestMemoryComponent::NormalizedEvent, bytes)?;
+        Ok(())
+    }
+
     fn sanitize_openai_capacity_shed_chunk(&self, chunk: Bytes) -> Bytes {
         if self.stored.provider_type != ProviderType::CodexOAuth {
             return chunk;
@@ -24456,14 +26256,16 @@ impl StreamForwardState {
             usage,
         )
         .await;
-        record_provider_outcome(
-            &self.state,
-            &self.stored,
-            ProviderOutcome::Failure {
-                status_code: status,
-            },
-        )
-        .await;
+        if !error.is_request_memory_exhausted() {
+            record_provider_outcome(
+                &self.state,
+                &self.stored,
+                ProviderOutcome::Failure {
+                    status_code: status,
+                },
+            )
+            .await;
+        }
         if self.stored.provider_type == ProviderType::ClaudeOAuth {
             crate::metrics::record_claude_stream_duration(stream_status, self.started.elapsed());
         }
@@ -24624,6 +26426,14 @@ impl CodexCompletedOutputPatcher {
     fn abort_response(&mut self) {
         self.clear_output_items();
         self.cache_write = None;
+    }
+
+    fn retained_tool_argument_bytes(&self) -> usize {
+        self.output_items_by_index
+            .values()
+            .chain(self.output_items_fallback.iter())
+            .map(codex_tool_item_argument_bytes)
+            .fold(0_usize, usize::saturating_add)
     }
 }
 
@@ -24831,6 +26641,13 @@ impl CodexPendingFunctionCallPatcher {
             self.last_pending_key = None;
         }
     }
+
+    fn retained_tool_argument_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|call| call.arguments.len())
+            .fold(0_usize, usize::saturating_add)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -24999,6 +26816,21 @@ impl CodexCustomToolStreamPatcher {
             _ => event.to_string(),
         }
     }
+
+    fn retained_tool_argument_bytes(&self) -> usize {
+        self.calls
+            .values()
+            .map(|call| call.arguments.len())
+            .fold(0_usize, usize::saturating_add)
+    }
+}
+
+fn codex_tool_item_argument_bytes(item: &Value) -> usize {
+    ["arguments", "input"]
+        .into_iter()
+        .filter_map(|field| item.get(field).and_then(Value::as_str))
+        .map(str::len)
+        .fold(0_usize, usize::saturating_add)
 }
 
 fn custom_tool_input_from_arguments(arguments: &str) -> String {
@@ -25823,6 +27655,9 @@ fn stream_terminal_error_frame(
 
 fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
     let normalized = message.to_ascii_lowercase();
+    if normalized.contains("request resident-memory capacity exhausted") {
+        return ("cc_switch_request_memory_exhausted", message);
+    }
     if normalized.contains("upstream stream") && normalized.contains("timeout") {
         return ("upstream_stream_timeout", message);
     }
@@ -25858,6 +27693,10 @@ fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
         (
             "[CC_PROTOCOL_INCOMPATIBLE] ",
             "cc_switch_protocol_incompatible",
+        ),
+        (
+            "[CC_REQUEST_MEMORY_EXHAUSTED] ",
+            "cc_switch_request_memory_exhausted",
         ),
     ] {
         if let Some(message) = message.strip_prefix(prefix) {
@@ -27680,7 +29519,7 @@ mod tests {
         let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
             .await
             .unwrap();
-        (client, server)
+        (ResponsesUpstreamWebSocket::new(client), server)
     }
 
     fn forwarder_test_state(name: &str) -> ServerState {
@@ -28510,6 +30349,99 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(body).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn codex_request_memory_rejects_compressed_expansion_before_normalization() {
+        let plain = vec![b'x'; 4 * 1024];
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let budget = RequestMemoryBudget::new(compressed.len() + 512);
+        let raw_memory = budget
+            .reserve(RequestMemoryComponent::InboundRaw, compressed.len())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let error =
+            decode_request_body_with_memory(&headers, compressed, plain.len() * 2, Some(&budget))
+                .unwrap_err();
+
+        assert!(error.is_request_memory_exhausted());
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert!(budget.is_exhausted());
+        drop(raw_memory);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn codex_request_memory_combines_raw_decoded_and_normalized_bodies() {
+        let plain = vec![b'y'; 2 * 1024];
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let budget = RequestMemoryBudget::new(compressed.len() + plain.len() * 2 - 1);
+        let raw_memory = budget
+            .reserve(RequestMemoryComponent::InboundRaw, compressed.len())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let (decoded, decoded_memory) =
+            decode_request_body_with_memory(&headers, compressed, plain.len() * 2, Some(&budget))
+                .unwrap();
+
+        let error = budget
+            .reserve(RequestMemoryComponent::NormalizedBody, decoded.len())
+            .unwrap_err()
+            .into_proxy_error();
+        assert!(error.is_request_memory_exhausted());
+        drop(decoded_memory);
+        drop(raw_memory);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn codex_response_memory_rejects_compressed_expansion_and_releases_wire() {
+        let plain = vec![b'z'; 4 * 1024];
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let budget = RequestMemoryBudget::new(compressed.len() + 512);
+        let transport_memory = budget
+            .reserve(RequestMemoryComponent::TransportPending, compressed.len())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let error = decode_response_body_with_memory(
+            &headers,
+            compressed,
+            Some(transport_memory),
+            plain.len() * 2,
+            Some(&budget),
+        )
+        .unwrap_err();
+
+        assert!(error.is_request_memory_exhausted());
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn codex_identity_response_memory_follows_the_last_bytes_view() {
+        let body = Bytes::from_static(b"identity response");
+        let budget = RequestMemoryBudget::new(64);
+        let transport_memory = budget
+            .reserve(RequestMemoryComponent::TransportPending, body.len())
+            .unwrap();
+        let decoded = decode_response_body_with_memory(
+            &HeaderMap::new(),
+            body,
+            Some(transport_memory),
+            64,
+            Some(&budget),
+        )
+        .unwrap();
+        let view = decoded.body.slice(0..8);
+        assert_eq!(budget.snapshot().used_bytes, b"identity response".len());
+        drop(decoded);
+        assert_eq!(budget.snapshot().used_bytes, b"identity response".len());
+        drop(view);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
     fn brotli_bytes(body: &[u8]) -> Vec<u8> {
@@ -35517,7 +37449,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .acquire(pool_key);
         if let Some(mut entry) = entry {
-            let _ = entry.socket.close(None).await;
+            let _ = entry.socket.close().await;
         }
     }
 
@@ -37669,6 +39601,81 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(body.get("reasoning_effort").is_none());
     }
 
+    #[test]
+    fn codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata() {
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "internal_chat_message_metadata_passthrough": {"outside": true},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "keep",
+                        "internal_chat_message_metadata_passthrough": {"nested": true}
+                    }],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+                    "extension": {"unchanged": [1, 2, 3]}
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{\"internal_chat_message_metadata_passthrough\":true}",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-2",
+                    "name": "lookup_object",
+                    "arguments": {"internal_chat_message_metadata_passthrough": true},
+                    "internal_chat_message_metadata_passthrough": null
+                },
+                "plain input"
+            ]
+        });
+        let expected = json!({
+            "model": "gpt-5.5",
+            "internal_chat_message_metadata_passthrough": {"outside": true},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "keep",
+                        "internal_chat_message_metadata_passthrough": {"nested": true}
+                    }],
+                    "extension": {"unchanged": [1, 2, 3]}
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{\"internal_chat_message_metadata_passthrough\":true}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-2",
+                    "name": "lookup_object",
+                    "arguments": {"internal_chat_message_metadata_passthrough": true}
+                },
+                "plain input"
+            ]
+        });
+
+        sanitize_codex_oauth_request_body(&mut body);
+        assert_eq!(body, expected);
+        let once = body.clone();
+        sanitize_codex_oauth_request_body(&mut body);
+        assert_eq!(body, once, "the exact-level stripping must be idempotent");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][3], "plain input");
+    }
+
     #[tokio::test]
     async fn codex_websocket_request_uses_the_same_sanitizer() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
@@ -37892,6 +39899,29 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         );
         assert_eq!(
             classify_responses_websocket_message(&business, None).unwrap(),
+            Some(SemanticObservation::Business)
+        );
+
+        let empty_announcement = TungsteniteMessage::Text(
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "message", "role": "assistant", "content": []}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            classify_responses_websocket_message(&empty_announcement, None).unwrap(),
+            Some(SemanticObservation::Lifecycle)
+        );
+        let server_operation = TungsteniteMessage::Text(
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "web_search_call", "status": "in_progress"}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            classify_responses_websocket_message(&server_operation, None).unwrap(),
             Some(SemanticObservation::Business)
         );
 
@@ -38352,6 +40382,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
             default_bytes: 4 * 1024 * 1024,
             media_bytes: 8 * 1024 * 1024,
             image_bytes: 32 * 1024 * 1024,
+            memory_budget_bytes: 128 * 1024 * 1024,
         };
         let body_len = 16 * 1024 * 1024;
 
@@ -40705,6 +42736,245 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         server_a.abort();
         server_b.abort();
         server_c.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_large_upload_keeps_both_ping_lanes_responsive() {
+        const UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+        const CONTROL_DEADLINE: Duration = Duration::from_millis(150);
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream_order_for_server = std::sync::Arc::clone(&upstream_order);
+        let upstream_connected = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upstream_connected_for_server = std::sync::Arc::clone(&upstream_connected);
+        let upstream_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = websocket.split();
+            upstream_connected_for_server.notify_one();
+
+            // Let the proxy start a large write while this peer deliberately
+            // applies read-side backpressure, then inject several keepalives.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            for index in 0_u8..8 {
+                sink.send(TungsteniteMessage::Ping(vec![index]))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            let mut received_request = false;
+            while let Some(message) = source.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Pong(_) => {
+                        upstream_order_for_server.lock().unwrap().push("pong");
+                    }
+                    TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_) => {
+                        upstream_order_for_server.lock().unwrap().push("request");
+                        received_request = true;
+                        break;
+                    }
+                    TungsteniteMessage::Close(_) => return,
+                    TungsteniteMessage::Ping(_) | TungsteniteMessage::Frame(_) => {}
+                }
+            }
+            if received_request {
+                sink.send(TungsteniteMessage::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-pressure",
+                            "status": "completed",
+                            "output": []
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let endpoint = format!("http://{upstream_address}");
+        let (state, execution) = codex_bridge_test_context("ws-control-pressure", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{upstream_address}"),
+            None,
+            "control-pressure-session",
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{bridge_address}/bridge"))
+            .await
+            .unwrap();
+        let (mut downstream_sink, mut downstream_source) = socket.split();
+        let request = json!({
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call-pressure",
+                "name": "upload",
+                "arguments": "x".repeat(UPLOAD_BYTES)
+            }]
+        });
+        downstream_sink
+            .send(TungsteniteMessage::Text(request.to_string()))
+            .await
+            .unwrap();
+        // Start the client-control clock only after request parsing, policy
+        // normalization, and the upstream handshake have completed. This keeps
+        // the probe specific to write-side backpressure rather than debug-build
+        // JSON processing time.
+        tokio::time::timeout(Duration::from_secs(3), upstream_connected.notified())
+            .await
+            .expect("the bridge must establish its upstream pressure connection");
+        let downstream_ping_at = Instant::now();
+        downstream_sink
+            .send(TungsteniteMessage::Ping(b"client-pressure".to_vec()))
+            .await
+            .unwrap();
+
+        let mut downstream_pong_latency = None;
+        let mut completed = false;
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_secs(3), downstream_source.next()).await
+        {
+            match message.unwrap() {
+                TungsteniteMessage::Pong(payload) if payload == b"client-pressure" => {
+                    downstream_pong_latency = Some(downstream_ping_at.elapsed());
+                }
+                TungsteniteMessage::Text(payload) => {
+                    if serde_json::from_str::<Value>(&payload)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .as_deref()
+                        == Some("response.completed")
+                    {
+                        completed = true;
+                        break;
+                    }
+                }
+                TungsteniteMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        assert!(completed, "the pressure turn must still complete");
+        let downstream_pong_latency =
+            downstream_pong_latency.expect("the downstream ping must receive a pong");
+        assert!(
+            downstream_pong_latency <= CONTROL_DEADLINE,
+            "downstream pong was starved for {downstream_pong_latency:?}"
+        );
+        let upstream_order = upstream_order.lock().unwrap();
+        assert_eq!(
+            upstream_order.first().copied(),
+            Some("pong"),
+            "an upstream keepalive pong must overtake the fragmented large request: {upstream_order:?}"
+        );
+
+        bridge_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_large_upload_cancellation_is_not_write_starved() {
+        const UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+        const CANCEL_DEADLINE: Duration = Duration::from_millis(200);
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_connected = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upstream_connected_for_server = std::sync::Arc::clone(&upstream_connected);
+        let upstream_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            upstream_connected_for_server.notify_one();
+            // Hold read-side backpressure well beyond the cancellation SLO. The
+            // proxy must stop the in-flight writer when the downstream closes.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let endpoint = format!("http://{upstream_address}");
+        let (state, execution) = codex_bridge_test_context("ws-cancel-pressure", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{upstream_address}"),
+            None,
+            "cancel-pressure-session",
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{bridge_address}/bridge"))
+            .await
+            .unwrap();
+        let (mut downstream_sink, mut downstream_source) = socket.split();
+        downstream_sink
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": [{
+                        "type": "function_call",
+                        "call_id": "call-cancel-pressure",
+                        "name": "upload",
+                        "arguments": "x".repeat(UPLOAD_BYTES)
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), upstream_connected.notified())
+            .await
+            .expect("the bridge must establish its upstream cancellation probe");
+
+        let cancelled_at = Instant::now();
+        downstream_sink
+            .send(TungsteniteMessage::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "cancel pressure upload".into(),
+                },
+            )))
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(CANCEL_DEADLINE, downstream_source.next())
+            .await
+            .expect("downstream cancellation must not wait for the blocked upstream write");
+        assert!(
+            matches!(
+                &closed,
+                None | Some(Ok(TungsteniteMessage::Close(_)))
+                    | Some(Err(TungsteniteError::Protocol(
+                        ProtocolError::ResetWithoutClosingHandshake
+                    )))
+            ),
+            "the bridge must terminate cancellation promptly: {closed:?}"
+        );
+        assert!(cancelled_at.elapsed() <= CANCEL_DEADLINE);
+
+        bridge_server.abort();
+        upstream_server.abort();
     }
 
     fn capacity_shed_sse(id: &str) -> String {
@@ -43412,14 +45682,17 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         wait_for_cached_responses_websocket(&pool_key).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
         let second = send_test_bridge_request(bridge_address, "reject stale replay").await;
-        assert!(second.iter().any(|event| {
-            event.pointer("/error/code").and_then(Value::as_str)
-                == Some("upstream_closed_before_terminal")
-                || event
-                    .pointer("/response/error/code")
-                    .and_then(Value::as_str)
+        assert!(
+            second.iter().any(|event| {
+                event.pointer("/error/code").and_then(Value::as_str)
                     == Some("upstream_closed_before_terminal")
-        }));
+                    || event
+                        .pointer("/response/error/code")
+                        .and_then(Value::as_str)
+                        == Some("upstream_closed_before_terminal")
+            }),
+            "stale connection must fail without replay: {second:?}"
+        );
         assert_eq!(
             upstream
                 .http_requests

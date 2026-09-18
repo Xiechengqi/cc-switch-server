@@ -294,7 +294,73 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
     {
         return SemanticObservation::Lifecycle;
     }
+    if is_empty_startup_announcement(event_type, value) {
+        return SemanticObservation::Lifecycle;
+    }
     SemanticObservation::Business
+}
+
+/// Returns whether a Responses `*.added` event is only an empty startup shell.
+///
+/// This deliberately uses closed item and part lists. Unknown shapes, server-side
+/// operations, and any known content field that is already non-empty must commit
+/// the response so a later failure cannot replay observable work.
+fn is_empty_startup_announcement(event_type: &str, value: &Value) -> bool {
+    match event_type {
+        "response.output_item.added" => value.get("item").is_some_and(is_empty_startup_output_item),
+        "response.content_part.added" | "response.reasoning_summary_part.added" => {
+            value.get("part").is_some_and(is_empty_startup_part)
+        }
+        _ => false,
+    }
+}
+
+fn is_empty_startup_output_item(item: &Value) -> bool {
+    let Some(item) = item.as_object() else {
+        return false;
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item
+            .get("content")
+            .is_none_or(is_empty_startup_content_list),
+        Some("reasoning") => {
+            item.get("encrypted_content")
+                .is_none_or(|value| matches!(value, Value::Null) || value.as_str() == Some(""))
+                && item
+                    .get("summary")
+                    .is_none_or(is_empty_startup_content_list)
+                && item
+                    .get("content")
+                    .is_none_or(is_empty_startup_content_list)
+        }
+        Some("function_call") => item
+            .get("arguments")
+            .is_none_or(|arguments| arguments.as_str() == Some("")),
+        Some("custom_tool_call") => item
+            .get("input")
+            .is_none_or(|input| input.as_str() == Some("")),
+        _ => false,
+    }
+}
+
+fn is_empty_startup_content_list(content: &Value) -> bool {
+    let Some(content) = content.as_array() else {
+        return false;
+    };
+    content.iter().all(is_empty_startup_part)
+}
+
+fn is_empty_startup_part(part: &Value) -> bool {
+    let Some(part) = part.as_object() else {
+        return false;
+    };
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text" | "summary_text" | "text" | "reasoning_text") => {
+            part.get("text").and_then(Value::as_str) == Some("")
+        }
+        Some("refusal") => part.get("refusal").and_then(Value::as_str) == Some(""),
+        _ => false,
+    }
 }
 
 fn failure_from_value(value: &Value, response: &Value, status: Option<&str>) -> SemanticFailure {
@@ -551,6 +617,10 @@ impl ResponsesSseInspector {
         self.terminal.as_ref()
     }
 
+    pub(super) fn retained_transport_bytes(&self) -> usize {
+        self.transport.retained_bytes()
+    }
+
     pub(super) fn synthesized_failure_from_error_frame(&self) -> Option<&SemanticFailure> {
         match self.terminal.as_ref() {
             Some(SemanticTerminal::Failure(failure)) if self.terminal_from_error_frame => {
@@ -687,6 +757,111 @@ mod tests {
             })),
             SemanticObservation::Business
         );
+    }
+
+    #[test]
+    fn codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier() {
+        let lifecycle = [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "msg_1", "type": "message", "role": "assistant", "content": []}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "msg_2", "type": "message", "content": [
+                    {"type": "output_text", "text": ""},
+                    {"type": "refusal", "refusal": ""}
+                ]}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "rs_1", "type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": ""}
+                ], "content": [{"type": "reasoning_text", "text": ""}]}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "fc_1", "type": "function_call", "name": "lookup", "arguments": ""}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "ct_1", "type": "custom_tool_call", "name": "exec", "input": ""}
+            }),
+            json!({
+                "type": "response.content_part.added",
+                "part": {"type": "output_text", "text": ""}
+            }),
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "part": {"type": "summary_text", "text": ""},
+                "response_lite": true
+            }),
+        ];
+
+        for event in lifecycle {
+            assert_eq!(
+                classify_value(&event),
+                SemanticObservation::Lifecycle,
+                "event must remain pre-commit: {event}"
+            );
+            let encoded = serde_json::to_vec(&event).unwrap();
+            assert_eq!(
+                classify_json_document(&encoded).unwrap(),
+                SemanticObservation::Lifecycle
+            );
+        }
+
+        let mut inspector = ResponsesSseInspector::default();
+        let observations = inspector
+            .push(
+                concat!(
+                    "event: response.output_item.added\n",
+                    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n",
+                    "\n",
+                    "event: response.content_part.added\n",
+                    "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n",
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            observations,
+            vec![
+                SemanticObservation::Lifecycle,
+                SemanticObservation::Lifecycle
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_visible_or_unknown_startup_announcements_commit_fail_closed() {
+        let business = [
+            json!({"type": "response.output_item.added"}),
+            json!({"type": "response.output_item.added", "item": {"type": "some_future_item"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "web_search_call", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "file_search_call"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "message", "content": [{"type": "output_text", "text": "visible"}]}}),
+            json!({"type": "response.output_item.added", "item": {"type": "message", "content": [{"type": "output_audio", "audio": "AAAA"}]}}),
+            json!({"type": "response.output_item.added", "item": {"type": "reasoning", "encrypted_content": "opaque"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "function_call", "arguments": "{}"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "custom_tool_call", "input": "ls"}}),
+            json!({"type": "response.content_part.added", "part": {"type": "output_text", "text": "visible"}}),
+            json!({"type": "response.content_part.added", "part": {"type": "output_audio", "audio": "AAAA"}}),
+            json!({"type": "response.reasoning_summary_part.added", "part": {"type": "future_part"}}),
+            json!({"type": "response.some_future_event"}),
+        ];
+
+        for event in business {
+            let observation = classify_value(&event);
+            assert_eq!(
+                observation,
+                SemanticObservation::Business,
+                "event must commit fail closed: {event}"
+            );
+            assert!(observation.commits_downstream());
+        }
     }
 
     #[test]

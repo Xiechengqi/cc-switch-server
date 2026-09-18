@@ -3547,6 +3547,7 @@ mod grok_catalog_provider_tests {
             default_bytes: 16 * 1024 * 1024,
             media_bytes: 64 * 1024 * 1024,
             image_bytes: 48 * 1024 * 1024,
+            memory_budget_bytes: 256 * 1024 * 1024,
         };
 
         // Router 声明更低 → 跟随 Router。

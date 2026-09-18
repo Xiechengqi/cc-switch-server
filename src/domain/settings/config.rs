@@ -325,14 +325,20 @@ pub const MIN_REQUEST_BODY_LIMIT_MB: u64 = 1;
 pub const MAX_REQUEST_BODY_LIMIT_MB: u64 = 64;
 /// 视频/图片档的上限区间上界（MB）。
 pub const MAX_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = 256;
+/// 单请求驻留内存预算的区间。它约束请求生命周期内同时保留的逻辑字节，
+/// 不替代各路由的请求体上限。
+pub const MIN_REQUEST_MEMORY_BUDGET_MB: u64 = 16;
+pub const MAX_REQUEST_MEMORY_BUDGET_MB: u64 = 1024;
 
 const DEFAULT_REQUEST_BODY_LIMIT_MB: u64 = MAX_REQUEST_BODY_LIMIT_MB;
 const DEFAULT_MEDIA_REQUEST_BODY_LIMIT_MB: u64 = MAX_MEDIA_REQUEST_BODY_LIMIT_MB;
 const DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB: u64 = MAX_MEDIA_REQUEST_BODY_LIMIT_MB;
+const DEFAULT_REQUEST_MEMORY_BUDGET_MB: u64 = 256;
 
 const REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_REQUEST_BODY_LIMIT_MB";
 const MEDIA_REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_MEDIA_REQUEST_BODY_LIMIT_MB";
 const IMAGE_REQUEST_BODY_LIMIT_ENV: &str = "CC_SWITCH_IMAGE_REQUEST_BODY_LIMIT_MB";
+const REQUEST_MEMORY_BUDGET_ENV: &str = "CC_SWITCH_REQUEST_MEMORY_BUDGET_MB";
 
 fn default_request_body_limit_mb() -> u64 {
     DEFAULT_REQUEST_BODY_LIMIT_MB
@@ -344,6 +350,10 @@ fn default_media_request_body_limit_mb() -> u64 {
 
 fn default_image_request_body_limit_mb() -> u64 {
     DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB
+}
+
+fn default_request_memory_budget_mb() -> u64 {
+    DEFAULT_REQUEST_MEMORY_BUDGET_MB
 }
 
 /// `server.json` 中 `requestBodyLimits` 的持久化形态，单位 MB。
@@ -359,6 +369,10 @@ pub struct RequestBodyLimitsConfig {
     /// `/v1/images/{generations,edits}` 档。
     #[serde(default = "default_image_request_body_limit_mb")]
     pub image_mb: u64,
+    /// 单请求完整生命周期的逻辑驻留内存预算。覆盖原始/解压/规范化 body、
+    /// 语义 prelude、事件与 WebSocket 队列；不与其他请求共享配额。
+    #[serde(default = "default_request_memory_budget_mb")]
+    pub memory_budget_mb: u64,
 }
 
 impl Default for RequestBodyLimitsConfig {
@@ -367,6 +381,7 @@ impl Default for RequestBodyLimitsConfig {
             default_mb: DEFAULT_REQUEST_BODY_LIMIT_MB,
             media_mb: DEFAULT_MEDIA_REQUEST_BODY_LIMIT_MB,
             image_mb: DEFAULT_IMAGE_REQUEST_BODY_LIMIT_MB,
+            memory_budget_mb: DEFAULT_REQUEST_MEMORY_BUDGET_MB,
         }
     }
 }
@@ -378,6 +393,7 @@ pub struct RequestBodyLimits {
     pub default_bytes: usize,
     pub media_bytes: usize,
     pub image_bytes: usize,
+    pub memory_budget_bytes: usize,
 }
 
 impl RequestBodyLimits {
@@ -404,6 +420,10 @@ impl Default for RequestBodyLimits {
 /// 读取一个 MB 环境变量覆盖；非法值忽略并告警，避免打错一个字符就把上限压到 1 MB。
 fn env_limit_mb_override(key: &str, min: u64, max: u64) -> Option<u64> {
     let raw = std::env::var(key).ok()?;
+    parse_env_limit_mb_override(key, &raw, min, max)
+}
+
+fn parse_env_limit_mb_override(key: &str, raw: &str, min: u64, max: u64) -> Option<u64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -416,7 +436,7 @@ fn env_limit_mb_override(key: &str, min: u64, max: u64) -> Option<u64> {
                 value = trimmed,
                 min,
                 max,
-                "ignoring out-of-range request body limit override"
+                "ignoring invalid request resource limit override"
             );
             None
         }
@@ -454,11 +474,19 @@ impl RequestBodyLimitsConfig {
         )
         .unwrap_or(self.image_mb)
         .clamp(MIN_REQUEST_BODY_LIMIT_MB, MAX_MEDIA_REQUEST_BODY_LIMIT_MB);
+        let memory_budget_mb = env_limit_mb_override(
+            REQUEST_MEMORY_BUDGET_ENV,
+            MIN_REQUEST_MEMORY_BUDGET_MB,
+            MAX_REQUEST_MEMORY_BUDGET_MB,
+        )
+        .unwrap_or(self.memory_budget_mb)
+        .clamp(MIN_REQUEST_MEMORY_BUDGET_MB, MAX_REQUEST_MEMORY_BUDGET_MB);
         // 媒体档不得低于普通档：否则一个图片请求会比同样大小的文本请求先被拒。
         RequestBodyLimits {
             default_bytes: mb_to_bytes(default_mb),
             media_bytes: mb_to_bytes(media_mb.max(default_mb)),
             image_bytes: mb_to_bytes(image_mb.max(default_mb)),
+            memory_budget_bytes: mb_to_bytes(memory_budget_mb),
         }
     }
 }
@@ -912,6 +940,7 @@ mod tests {
         assert_eq!(limits.default_bytes, 64 * 1024 * 1024);
         assert_eq!(limits.media_bytes, 256 * 1024 * 1024);
         assert_eq!(limits.image_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.memory_budget_bytes, 256 * 1024 * 1024);
     }
 
     #[test]
@@ -920,11 +949,13 @@ mod tests {
             default_mb: 0,
             media_mb: 100_000,
             image_mb: 100_000,
+            memory_budget_mb: 100_000,
         }
         .resolve();
         assert_eq!(limits.default_bytes, 1024 * 1024);
         assert_eq!(limits.media_bytes, 256 * 1024 * 1024);
         assert_eq!(limits.image_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.memory_budget_bytes, 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -933,6 +964,7 @@ mod tests {
             default_mb: 64,
             media_mb: 8,
             image_mb: 8,
+            memory_budget_mb: 128,
         }
         .resolve();
         assert_eq!(limits.default_bytes, 64 * 1024 * 1024);
@@ -946,6 +978,7 @@ mod tests {
             default_bytes: 1,
             media_bytes: 2,
             image_bytes: 3,
+            memory_budget_bytes: 4,
         };
         for path in [
             "/v1/images/generations",
@@ -982,6 +1015,35 @@ mod tests {
             partial.image_mb,
             RequestBodyLimitsConfig::default().image_mb
         );
+        assert_eq!(
+            partial.memory_budget_mb,
+            RequestBodyLimitsConfig::default().memory_budget_mb
+        );
+    }
+
+    #[test]
+    fn request_memory_budget_env_override_parser_is_strict_and_bounded() {
+        assert_eq!(
+            parse_env_limit_mb_override(
+                REQUEST_MEMORY_BUDGET_ENV,
+                " 512 ",
+                MIN_REQUEST_MEMORY_BUDGET_MB,
+                MAX_REQUEST_MEMORY_BUDGET_MB,
+            ),
+            Some(512)
+        );
+        for invalid in ["", "15", "1025", "1GiB", "-1"] {
+            assert_eq!(
+                parse_env_limit_mb_override(
+                    REQUEST_MEMORY_BUDGET_ENV,
+                    invalid,
+                    MIN_REQUEST_MEMORY_BUDGET_MB,
+                    MAX_REQUEST_MEMORY_BUDGET_MB,
+                ),
+                None,
+                "{invalid:?} must not override the configured budget"
+            );
+        }
     }
 
     #[test]

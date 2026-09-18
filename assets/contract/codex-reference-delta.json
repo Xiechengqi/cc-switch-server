@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-codex-reference-delta",
   "schemaVersion": 1,
-  "capturedAt": "2026-09-11T00:00:00Z",
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
@@ -93,6 +93,38 @@
               "sha256": "a3155c1059f89f78dc332de227f54b4915cd1bb48c270d918c920b9f858c3a6f"
             }
           ]
+        },
+        {
+          "id": "empty_bootstrap_announcements",
+          "commits": ["cb73cd9936116848274afad42a41a4079325d383"],
+          "files": [
+            {
+              "commit": "cb73cd9936116848274afad42a41a4079325d383",
+              "path": "internal/runtime/executor/codex_executor_terminal.go",
+              "sha256": "76d25bbfe7318920b6067bce577542c17441098bd4e374830bbc570fc50be0e2"
+            },
+            {
+              "commit": "cb73cd9936116848274afad42a41a4079325d383",
+              "path": "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go",
+              "sha256": "86852dc7d753392dee936e919c58b3c36d975b2c5745e22ef9eae99ccade58de"
+            }
+          ]
+        },
+        {
+          "id": "websocket_fragmented_write_fairness",
+          "commits": ["b5ba02c2e3627e975538e217575abee9f73eccd8"],
+          "files": [
+            {
+              "commit": "b5ba02c2e3627e975538e217575abee9f73eccd8",
+              "path": "internal/runtime/executor/codex_websockets_session.go",
+              "sha256": "7524fa3515a291b1828d0f09b4c2008ceee4bdfe155118c33aba567619ec972e"
+            },
+            {
+              "commit": "b5ba02c2e3627e975538e217575abee9f73eccd8",
+              "path": "internal/runtime/executor/codex_websockets_executor_test.go",
+              "sha256": "0bac8243e1a9337aac5f4218684191f19f64e69c05d3d7d029c9ea6e910a2c6d"
+            }
+          ]
         }
       ]
     },
@@ -114,6 +146,43 @@
               "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
               "path": "proxy/images25_test.go",
               "sha256": "a18654ac32acb2ff345c754b6fa7af2062a101b1ad021c58c9e289baf15cea29"
+            }
+          ]
+        },
+        {
+          "id": "input_item_internal_metadata_scope",
+          "commits": ["dc47d1310006058d27c01320c76b3c2eb757a7f2"],
+          "files": [
+            {
+              "commit": "dc47d1310006058d27c01320c76b3c2eb757a7f2",
+              "path": "proxy/translator.go",
+              "sha256": "bc87eddde0fcf06661d66a32a799c53aa53bf81f9ecd82ba6eabfe011a93bbbd"
+            },
+            {
+              "commit": "dc47d1310006058d27c01320c76b3c2eb757a7f2",
+              "path": "proxy/translator_test.go",
+              "sha256": "4c8faad903c8d0b49de3e40ff9f881d4946310799edd5ddbb0a33695b53786cc"
+            }
+          ]
+        },
+        {
+          "id": "request_lifecycle_memory_budget",
+          "commits": ["19ee8db4eb02ab03a298bcd4139ba468ed86b54d"],
+          "files": [
+            {
+              "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
+              "path": "security/request_memory.go",
+              "sha256": "3a9c27c434d13a089b4b5d956e9cca27c14cb9887e70cffc50db607772dd8d6e"
+            },
+            {
+              "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
+              "path": "security/request_memory_test.go",
+              "sha256": "7cb5f287fdcc4dccd0770fe03563997ea66b44b50f964da6e0129dc19d796251"
+            },
+            {
+              "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
+              "path": "proxy/responses_ws_memory_test.go",
+              "sha256": "f999d68037fb0175bc11fd253eb20067b091df63870761e454dd3e3172b37bca"
             }
           ]
         }
@@ -206,6 +275,83 @@
       "dependsOn": "CX-03",
       "path": "docs/provider/codex-oauth.md",
       "anchors": ["GPT Image 2.5 quota/cache evidence gate"]
+    }
+  ],
+  "incrementalEnhancements": [
+    {
+      "id": "CX-N1",
+      "status": "fixture_verified",
+      "referenceDelta": "empty_bootstrap_announcements",
+      "evidence": [
+        {
+          "path": "src/proxy/response_semantics.rs",
+          "anchors": [
+            "is_empty_startup_announcement",
+            "codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier",
+            "codex_visible_or_unknown_startup_announcements_commit_fail_closed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CX-N2",
+      "status": "fixture_verified",
+      "referenceDelta": "input_item_internal_metadata_scope",
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "sanitize_codex_oauth_request_body",
+            "codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CX-N3",
+      "status": "fixture_verified",
+      "referenceDelta": "websocket_fragmented_write_fairness",
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "write_responses_websocket_message",
+            "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+            "codex_websocket_large_upload_cancellation_is_not_write_starved"
+          ]
+        }
+      ],
+      "replayBoundary": "same Provider, same Account, same rail; stale socket after send is never replayed"
+    },
+    {
+      "id": "CX-N4",
+      "status": "fixture_verified",
+      "referenceDelta": "request_lifecycle_memory_budget",
+      "evidence": [
+        {
+          "path": "src/proxy/request_memory.rs",
+          "anchors": [
+            "RequestMemoryBudget",
+            "exhaustion_is_sticky_but_release_always_returns_capacity",
+            "retained_bytes_release_only_after_the_last_view_is_dropped"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "decode_request_body_with_memory",
+            "decode_response_body_with_memory",
+            "cc_switch_request_memory_exhausted"
+          ]
+        }
+      ],
+      "errorContract": {
+        "httpStatus": 503,
+        "retryAfterSeconds": 1,
+        "code": "cc_switch_request_memory_exhausted",
+        "websocketTerminal": "error_then_close"
+      },
+      "fallbackBoundary": "memory exhaustion cancels the active upstream and denies HTTP replay, account fallback, Provider fallback, rail fallback, and site fallback"
     }
   ],
   "wireGoldens": {
