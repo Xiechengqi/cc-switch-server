@@ -497,6 +497,13 @@ pub fn build_codebuddy_payload(
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "CodeBuddy request must contain messages array".to_string())?;
+    for message in messages.iter_mut() {
+        let Some(message) = message.as_object_mut() else {
+            return Err("CodeBuddy message must be an object".to_string());
+        };
+        canonicalize_codebuddy_assistant_reasoning(message);
+    }
+    repair_codebuddy_tool_history(messages);
     messages.retain(codebuddy_message_is_semantic);
     if messages
         .first()
@@ -508,20 +515,6 @@ pub fn build_codebuddy_payload(
             0,
             json!({"role":"system","content":"You are a helpful coding assistant."}),
         );
-    }
-    for message in messages {
-        let Some(message) = message.as_object_mut() else {
-            return Err("CodeBuddy message must be an object".to_string());
-        };
-        if message.get("role").and_then(Value::as_str) == Some("assistant") {
-            if !message.contains_key("reasoning") {
-                if let Some(reasoning) = message.remove("reasoning_content") {
-                    message.insert("reasoning".to_string(), reasoning);
-                }
-            } else {
-                message.remove("reasoning_content");
-            }
-        }
     }
     normalize_codebuddy_tools_and_choice(&mut request)?;
     request.insert("model".to_string(), Value::String(model_id.to_string()));
@@ -587,6 +580,163 @@ pub fn build_codebuddy_payload(
     Ok(Value::Object(request))
 }
 
+fn canonicalize_codebuddy_assistant_reasoning(message: &mut Map<String, Value>) {
+    if !codebuddy_message_role(message).eq_ignore_ascii_case("assistant") {
+        return;
+    }
+    let reasoning = message.remove("reasoning");
+    let reasoning_content = message.remove("reasoning_content");
+    if let Some(reasoning) = reasoning
+        .filter(|value| !codebuddy_value_is_semantically_empty(value))
+        .or_else(|| reasoning_content.filter(|value| !codebuddy_value_is_semantically_empty(value)))
+    {
+        message.insert("reasoning".to_string(), reasoning);
+    }
+}
+
+/// CodeBuddy rejects a subsequent request with business code 11148 when an
+/// interrupted historical assistant tool call is replayed without one exact
+/// contiguous result for every call. Preserve complete rounds byte-for-byte,
+/// but remove only the unusable protocol portion of incomplete history. This
+/// never invents a tool result or changes tool output content.
+fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) {
+    let source = std::mem::take(messages);
+    let mut repaired = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        let Some(message) = source[index].as_object() else {
+            repaired.push(source[index].clone());
+            index += 1;
+            continue;
+        };
+        let role = codebuddy_message_role(message);
+        if role.eq_ignore_ascii_case("tool") {
+            // A tool result can only be emitted as part of the immediately
+            // preceding complete assistant round.
+            index += 1;
+            continue;
+        }
+        let has_tool_calls = role.eq_ignore_ascii_case("assistant")
+            && message
+                .get("tool_calls")
+                .is_some_and(|value| !codebuddy_value_is_semantically_empty(value));
+        if !has_tool_calls {
+            repaired.push(source[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let mut result_end = index + 1;
+        while result_end < source.len()
+            && source[result_end]
+                .as_object()
+                .is_some_and(|next| codebuddy_message_role(next).eq_ignore_ascii_case("tool"))
+        {
+            result_end += 1;
+        }
+        let results = &source[index + 1..result_end];
+        if codebuddy_tool_round_is_complete(message, results) {
+            repaired.push(source[index].clone());
+            repaired.extend(results.iter().cloned());
+        } else {
+            let mut assistant = source[index].clone();
+            if let Some(assistant) = assistant.as_object_mut() {
+                assistant.remove("tool_calls");
+            }
+            if codebuddy_message_is_semantic(&assistant) {
+                repaired.push(assistant);
+            }
+        }
+        index = result_end;
+    }
+    *messages = repaired;
+}
+
+fn codebuddy_tool_round_is_complete(assistant: &Map<String, Value>, results: &[Value]) -> bool {
+    let Some(calls) = assistant.get("tool_calls").and_then(Value::as_array) else {
+        return false;
+    };
+    if calls.is_empty() || calls.len() != results.len() {
+        return false;
+    }
+    let mut call_ids = std::collections::BTreeSet::new();
+    for call in calls {
+        let Some(call) = call.as_object() else {
+            return false;
+        };
+        let Some(id) = codebuddy_nonempty_string(call.get("id")) else {
+            return false;
+        };
+        if !call_ids.insert(id) || !codebuddy_tool_call_is_complete(call) {
+            return false;
+        }
+    }
+    let mut result_ids = std::collections::BTreeSet::new();
+    for result in results {
+        let Some(result) = result.as_object() else {
+            return false;
+        };
+        let Some(id) = codebuddy_nonempty_string(result.get("tool_call_id")) else {
+            return false;
+        };
+        if !codebuddy_message_role(result).eq_ignore_ascii_case("tool")
+            || !call_ids.contains(id)
+            || !result_ids.insert(id)
+        {
+            return false;
+        }
+    }
+    call_ids == result_ids
+}
+
+fn codebuddy_tool_call_is_complete(call: &Map<String, Value>) -> bool {
+    if call
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "function")
+    {
+        return false;
+    }
+    let Some(function) = call.get("function").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(name) = codebuddy_nonempty_string(function.get("name")) else {
+        return false;
+    };
+    if !codebuddy_tool_name_is_safe(name) {
+        return false;
+    }
+    function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .is_some_and(|arguments| serde_json::from_str::<Value>(arguments).is_ok())
+}
+
+fn codebuddy_nonempty_string(value: Option<&Value>) -> Option<&str> {
+    value?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn codebuddy_message_role(message: &Map<String, Value>) -> &str {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+}
+
+fn codebuddy_value_is_semantically_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.trim().is_empty(),
+        Value::Array(value) => value.is_empty(),
+        Value::Object(value) => value.is_empty(),
+        _ => false,
+    }
+}
+
 fn codebuddy_message_is_semantic(message: &Value) -> bool {
     let Some(message) = message.as_object() else {
         return true;
@@ -600,6 +750,9 @@ fn codebuddy_message_is_semantic(message: &Value) -> bool {
     if !content_empty {
         return true;
     }
+    let carries_reasoning = message
+        .get("reasoning")
+        .is_some_and(|reasoning| !codebuddy_value_is_semantically_empty(reasoning));
     let carries_tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -613,7 +766,14 @@ fn codebuddy_message_is_semantic(message: &Value) -> bool {
             .get("tool_call_id")
             .and_then(Value::as_str)
             .is_some_and(|id| !id.trim().is_empty());
-    carries_tool_calls || carries_tool_result
+    carries_reasoning || carries_tool_calls || carries_tool_result
+}
+
+fn codebuddy_tool_name_is_safe(name: &str) -> bool {
+    name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn normalize_codebuddy_tools_and_choice(
@@ -684,11 +844,7 @@ fn normalize_codebuddy_tools_and_choice(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "CodeBuddy named tool_choice is missing function.name".to_string())?;
-    if name.len() > 64
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !codebuddy_tool_name_is_safe(name) {
         return Err("CodeBuddy named tool_choice function.name is unsafe".to_string());
     }
     let tools = request
@@ -1026,6 +1182,195 @@ mod tests {
         assert_eq!(empty["messages"].as_array().unwrap().len(), 1);
         assert_eq!(empty["messages"][0]["role"], "system");
         assert!(!empty["messages"][0]["content"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn payload_repairs_only_incomplete_historical_tool_rounds() {
+        let broken_histories = [
+            json!([
+                {"role":"user","content":"before"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "id":"call-missing","type":"function","function":{"name":"lookup","arguments":"{}"}
+                }]},
+                {"role":"user","content":"after"}
+            ]),
+            json!([
+                {"role":"user","content":"before"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{}"}},
+                    {"id":"call-b","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call-a","content":"partial"},
+                {"role":"user","content":"after"}
+            ]),
+            json!([
+                {"role":"user","content":"before"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "id":"call-duplicate","type":"function","function":{"name":"lookup","arguments":"{}"}
+                },{
+                    "id":"call-duplicate","type":"function","function":{"name":"lookup","arguments":"{}"}
+                }]},
+                {"role":"tool","tool_call_id":"call-duplicate","content":"one"},
+                {"role":"tool","tool_call_id":"call-duplicate","content":"two"},
+                {"role":"user","content":"after"}
+            ]),
+            json!([
+                {"role":"user","content":"before"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "id":"call-truncated","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}
+                }]},
+                {"role":"tool","tool_call_id":"call-truncated","content":"must not legitimize a partial call"},
+                {"role":"user","content":"after"}
+            ]),
+            json!([
+                {"role":"user","content":"before"},
+                {"role":"tool","tool_call_id":"call-orphan","content":"orphan"},
+                {"role":"user","content":"after"}
+            ]),
+        ];
+        for history in broken_histories {
+            let payload = build_codebuddy_payload(
+                &json!({"messages": history}),
+                "default-model",
+                &text_capability(),
+            )
+            .unwrap();
+            let messages = payload["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter_map(|message| message.get("role").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                ["system", "user", "user"]
+            );
+            assert!(messages.iter().all(|message| {
+                message.get("tool_calls").is_none() && message.get("tool_call_id").is_none()
+            }));
+        }
+
+        let preserved = build_codebuddy_payload(
+            &json!({"messages":[
+                {"role":"user","content":"before"},
+                {"role":"assistant","content":"explanation","reasoning_content":"private","tool_calls":[{
+                    "id":"call-unfinished","type":"function","function":{"name":"lookup","arguments":"{}"}
+                }]},
+                {"role":"user","content":"after"}
+            ]}),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(preserved["messages"][2]["content"], "explanation");
+        assert_eq!(preserved["messages"][2]["reasoning"], "private");
+        assert!(preserved["messages"][2].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn payload_keeps_complete_tool_round_byte_shape_and_reasoning_only_history() {
+        let payload = build_codebuddy_payload(
+            &json!({"messages":[
+                {"role":"user","content":"run both"},
+                {"role":"assistant","content":null,"reasoning_content":"need both","tool_calls":[
+                    {"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"a\"}"}},
+                    {"id":"call-b","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"b\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call-b","content":"result-b"},
+                {"role":"tool","tool_call_id":"call-a","content":"result-a"},
+                {"role":"assistant","content":"","reasoning_content":"reasoning-only"},
+                {"role":"user","content":"continue"}
+            ]}),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["reasoning"], "need both");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(messages[3]["tool_call_id"], "call-b");
+        assert_eq!(messages[3]["content"], "result-b");
+        assert_eq!(messages[4]["tool_call_id"], "call-a");
+        assert_eq!(messages[5]["reasoning"], "reasoning-only");
+        assert!(messages[5].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn payload_closes_namespace_tool_rounds_across_claude_chat_and_responses() {
+        fn assert_round(payload: &Value, expected_name: &str) {
+            let declared = payload["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert!(declared.contains(&expected_name), "declared={declared:?}");
+            let assistant = payload["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message.get("role") == Some(&json!("assistant")))
+                .unwrap();
+            assert_eq!(
+                assistant["tool_calls"][0]["function"]["name"],
+                expected_name
+            );
+            assert!(payload["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message.get("tool_call_id") == Some(&json!("call-1"))));
+        }
+
+        let claude = crate::proxy::transforms::anthropic_to_openai_chat(&json!({
+            "model":"auto",
+            "tools":[{"name":"mcp_files__read","input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"read"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"mcp_files__read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}
+            ]
+        }))
+        .unwrap();
+        let claude = build_codebuddy_payload(&claude, "default-model", &text_capability()).unwrap();
+        assert_round(&claude, "mcp_files__read");
+
+        let chat = build_codebuddy_payload(
+            &json!({
+                "messages":[
+                    {"role":"user","content":"run"},
+                    {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"user__literal","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":"call-1","content":"ok"}
+                ],
+                "tools":[{"type":"function","function":{"name":"user__literal","parameters":{"type":"object"}}}]
+            }),
+            "default-model",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_round(&chat, "user__literal");
+
+        let responses = crate::proxy::transforms::openai_responses_to_chat(&json!({
+            "model":"auto",
+            "tools":[{"type":"namespace","name":"mcp_files","tools":[{
+                "type":"function","name":"read","parameters":{"type":"object"}
+            }]}],
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"read"}]},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"need the file"}]},
+                {"type":"function_call","call_id":"call-1","name":"read","namespace":"mcp_files","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-1","output":"ok"}
+            ]
+        }))
+        .unwrap();
+        let responses =
+            build_codebuddy_payload(&responses, "default-model", &text_capability()).unwrap();
+        assert_round(&responses, "mcp_files__read");
+        let assistant = responses["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("assistant")))
+            .unwrap();
+        assert_eq!(assistant["reasoning"], "need the file");
     }
 
     #[test]

@@ -171,9 +171,14 @@ CN `cosy-clientip` 现由 Server 自身出站路由决定并在 catalog、quota�
 
 2026-09-11 的 revision 2 差分新增 `cli2api@e5893f0864149caef4c3b9752454190e45875c33` 空消息处理与 `@32aa108b7442cf168c1606d19f9691feafbc116c` 空 stream delta 处理作为只读交叉证据。本地实现额外保留空 content 的 tool result、严格 named choice 校验及唯一 terminal + EOF；`assets/contract/codebuddy-reference-delta.json` 固定源码摘要、CB-01 至 CB-04 与 Intl/CN 独立 `live_pending` 门禁。
 
+2026-09-18 增量只读取 `cli2api@624874a0331f5e8f012ef104b633e69826487458` 及 cdc80d6、a9ae393、6ac6f83、d361559、eef5b2c、76c4dab 的已提交 Git object；参考工作树中的 `proxy.html`、`proxy.md` 未跟踪文件明确排除。CB-N1 对历史工具轮次执行连续、唯一 ID、一一配对及完整 JSON arguments 校验，修复可复现 11148，但不伪造 result 或修改 output。CB-N2 在空消息过滤前把 assistant `reasoning_content` 规范化为上游 `reasoning`，Responses reasoning/message/function call 由共享 transform 合并成同一 turn。CB-N3 的 Claude/Chat/Responses namespace 闭环已有 request-local 共享 bridge 覆盖，不增加裸 child 猜测。CB-N5 冻结 terminal 前截断、`[DONE]` 后无 EOF 与 marker 前后取消；共享 guard 会关闭上游 body、释放 Account/Share 租约，仍只有唯一 `[DONE]` + EOF 才成功。
+
+参考实现的 `deepseek-v4.1-flash` 精确 native ID、顶层 reasoning 字段和 context-window 只是 CB-N4 二级信号。本仓库没有 CN 绑定账号 receipt 或冻结厂商目录，因此 reviewed allowlist 不开放该 ID，`runtimeEnabled=false`、状态保持 `live_pending`；不采用 `deep-model` 静默改写，也不把模型专属字段泛化。
+
 1. CodeBuddy CLI `2.142.0` bundle、站点 overlay，以及国际个人订阅账号的脱敏真实流量；
 2. 本仓库 [`docs/provider/codebuddy-oauth.md`](docs/provider/codebuddy-oauth.md) 已冻结的端点、OAuth、refresh、目录、计费与 terminal 约束；
 3. `cli2api` commit `9b18f2d` 的 WorkBuddy CN/Global adapter，仅作为国内实现、payload、错误投影与缺陷的交叉样本。
+4. `cli2api@624874a0331f5e8f012ef104b633e69826487458` 的提交态增量，只用于 CB-N1～CB-N5 差分，不覆盖前两级证据。
 
 实现不得在构建或运行时读取上述外部源码。国际站固定为 `https://www.codebuddy.ai`，国内站固定为 `https://copilot.tencent.com`；站点属于账号身份，不允许失败后换 host。CLI `2.142.0` 证据优先于 `cli2api` 使用的旧 `2.139.0` wire。国际 fixture 可据此标为离线通过；国内真实数据面、企业账号、图像/视频与本仓库真实订阅 receipt 仍是 `live_pending`。
 

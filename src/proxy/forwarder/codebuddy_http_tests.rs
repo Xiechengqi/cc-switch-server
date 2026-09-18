@@ -1,7 +1,7 @@
 use super::*;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -26,6 +26,9 @@ enum CodeBuddyGenerationReply {
     LateUnauthorized,
     DuplicateDone,
     DataAfterDone,
+    TruncatedBeforeDone,
+    StallBeforeDone,
+    StallAfterDone,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,7 @@ struct CodeBuddyFixtureState {
     config_requests: Arc<AtomicUsize>,
     refresh_requests: Arc<AtomicUsize>,
     account_requests: Arc<AtomicUsize>,
+    upstream_body_dropped: Arc<AtomicBool>,
     observations: Arc<Mutex<Vec<CodeBuddyRequestObservation>>>,
 }
 
@@ -55,6 +59,7 @@ impl CodeBuddyFixtureState {
             config_requests: Default::default(),
             refresh_requests: Default::default(),
             account_requests: Default::default(),
+            upstream_body_dropped: Default::default(),
             observations: Default::default(),
         }
     }
@@ -273,6 +278,27 @@ fn sse_response(chunks: Vec<Bytes>) -> Response {
         .unwrap()
 }
 
+fn stalling_sse_response(first: Bytes, upstream_body_dropped: Arc<AtomicBool>) -> Response {
+    struct UpstreamBodyDropGuard(Arc<AtomicBool>);
+
+    impl Drop for UpstreamBodyDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let stream = async_stream::stream! {
+        let _drop_guard = UpstreamBodyDropGuard(upstream_body_dropped);
+        yield Ok::<Bytes, std::convert::Infallible>(first);
+        std::future::pending::<()>().await;
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 fn success_response() -> Response {
     let mut chunks = tool_chunks();
     // Split the terminal across network body frames. The decoder must not
@@ -327,6 +353,18 @@ async fn codebuddy_generation(
             chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
             chunks.push(chat_chunk("too-late", Some("stop")));
             sse_response(chunks)
+        }
+        CodeBuddyGenerationReply::TruncatedBeforeDone => {
+            sse_response(vec![chat_chunk("truncated", None)])
+        }
+        CodeBuddyGenerationReply::StallBeforeDone => stalling_sse_response(
+            chat_chunk("cancel-before-done", None),
+            Arc::clone(&state.upstream_body_dropped),
+        ),
+        CodeBuddyGenerationReply::StallAfterDone => {
+            let mut first = chat_chunk("cancel-after-done", None).to_vec();
+            first.extend_from_slice(b"data: [DONE]\n\n");
+            stalling_sse_response(Bytes::from(first), Arc::clone(&state.upstream_body_dropped))
         }
     }
 }
@@ -975,5 +1013,157 @@ fn codebuddy_stream_never_refreshes_after_first_business_output_and_second_auth_
         assert_eq!(fixture.count(&fixture.generation_requests), 2);
         assert_eq!(fixture.count(&fixture.refresh_requests), 1);
         server.abort();
+    });
+}
+
+#[test]
+fn codebuddy_truncation_before_done_is_never_reported_as_success() {
+    run_codebuddy_async_test(async {
+        let (address, fixture, server) = spawn_codebuddy_upstream(
+            CodeBuddySite::Intl,
+            vec![CodeBuddyGenerationReply::TruncatedBeforeDone],
+        )
+        .await;
+        let state = codebuddy_test_state("codebuddy-truncated-nonstream");
+        let (provider_id, _) = install_codebuddy_provider(
+            &state,
+            "codebuddy-truncated-nonstream",
+            AppKind::Codex,
+            CodeBuddySite::Intl,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = "codebuddy-truncated-nonstream-share";
+        install_codebuddy_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+        let error = forward_codebuddy_surface(state, AppKind::Codex, provider_id, share_id, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("exactly one [DONE]"));
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        server.abort();
+
+        let (address, fixture, server) = spawn_codebuddy_upstream(
+            CodeBuddySite::Intl,
+            vec![CodeBuddyGenerationReply::TruncatedBeforeDone],
+        )
+        .await;
+        let state = codebuddy_test_state("codebuddy-truncated-stream");
+        let (provider_id, _) = install_codebuddy_provider(
+            &state,
+            "codebuddy-truncated-stream",
+            AppKind::Codex,
+            CodeBuddySite::Intl,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = "codebuddy-truncated-stream-share";
+        install_codebuddy_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+        let response =
+            forward_codebuddy_surface(state.clone(), AppKind::Codex, provider_id, share_id, true)
+                .await
+                .unwrap();
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("a truncated CodeBuddy stream must terminate with an error frame")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("truncated"), "{body}");
+        assert!(body.contains("response.failed"), "{body}");
+        assert!(!body.contains("response.completed"), "{body}");
+        let usage = state.usage_snapshot().await;
+        assert_eq!(
+            usage
+                .logs
+                .last()
+                .and_then(|log| log.stream_status.as_deref()),
+            Some("upstream_error")
+        );
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        server.abort();
+    });
+}
+
+#[test]
+fn codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker() {
+    run_codebuddy_async_test(async {
+        for reply in [
+            CodeBuddyGenerationReply::StallBeforeDone,
+            CodeBuddyGenerationReply::StallAfterDone,
+        ] {
+            let name = format!("codebuddy-cancel-{reply:?}");
+            let (address, fixture, server) =
+                spawn_codebuddy_upstream(CodeBuddySite::Intl, vec![reply]).await;
+            let state = codebuddy_test_state(&name);
+            let (provider_id, account_id) = install_codebuddy_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                CodeBuddySite::Intl,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            let response = forward_codebuddy_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id,
+                &share_id,
+                true,
+            )
+            .await
+            .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            let first = tokio::time::timeout(Duration::from_secs(1), body.next())
+                .await
+                .expect("CodeBuddy must publish the first business frame")
+                .expect("CodeBuddy downstream body must remain open")
+                .unwrap();
+            assert!(String::from_utf8_lossy(&first).contains("cancel-"));
+            drop(body);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !fixture.upstream_body_dropped.load(Ordering::SeqCst)
+                    || state.share_in_flight.has_in_flight(&share_id)
+                    || state
+                        .account_in_flight
+                        .snapshot()
+                        .current(ProviderType::CodeBuddyOAuth, &account_id)
+                        != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("downstream cancellation must release the CodeBuddy upstream body and leases");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1);
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+            server.abort();
+        }
     });
 }

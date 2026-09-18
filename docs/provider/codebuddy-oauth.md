@@ -8,7 +8,7 @@
 
 本文定义 cc-switch-server 的 `codebuddy_oauth` Provider 边界。一个 CodeBuddy Provider 固定绑定一个 CodeBuddy Account；Server 不实现账号池、轮询、权重、按配额/并发选号、自动切站，或跨 Provider fallback。
 
-当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；`assets/contract/codebuddy-reference-delta.json` 将 CB-01 至 CB-04、Registry 状态、外部只读提交与双站真实门禁固定为可审计映射。
+当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；2026-09-18 增量复核又关闭了中断工具轮次、reasoning-only 历史和取消生命周期的离线缺口。`assets/contract/codebuddy-reference-delta.json` 将 CB-01 至 CB-04、CB-N1 至 CB-N5、Registry 状态、外部只读提交与双站真实门禁固定为可审计映射。
 
 ---
 
@@ -20,11 +20,13 @@
 | **B** | 国际版官方文档 `https://www.codebuddy.ai/docs/zh/cli/*` | `curl`（`WebFetch` 对该域名被拦截） | 2026-08-31 |
 | **C** | `/data/projects/proxy/workbuddy-cliproxy` 生产实现（国内站已跑通） | 直读源码 | — |
 | **D** | **国际版真实账号抓包**：CLI v2.142.0 + mitmproxy 11.0.2 正向代理，个人账号（`enterpriseId: ""`） | 实测流量 + bundle 定点反查 | 2026-08-31 |
+| **E** | `/data/projects/proxy/CodeBuddy/cli2api@624874a0331f5e8f012ef104b633e69826487458` | 只读 `git show`；排除工作树中两个未跟踪文件 | 2026-09-18 |
 
 正文中的标注含义：
 
 - **【D】** — **真实流量实测**，置信度最高。脱敏证据见 `workbuddy-cliproxy/codebuddy-open-questions.md` §4 与 `~/cbcap/redacted/`。
 - **【A】/【C】** — 代码直读或双证，可直接实现。
+- **【E】** — 成熟反代的已提交对象，只作增量交叉证据；不覆盖官方 CLI/真实流量，也不进入构建或运行时依赖。
 - **【B】** — 仅官方文档声明，未经代码或流量交叉验证；实现时按文档写，但列入回归观察。
 - **【Un】** — 未证实，见 open-questions 文档对应条目。**U1–U15 已于 2026-08-31 全部关闭**；正文中残留的 `Un` 引用均已改写为对应的【D】结论。
 
@@ -282,6 +284,8 @@ POST {endpoint}/v2/chat/completions
 
 在注入固定非空 system 前，revision 2 会删除 content 缺失、null、空白字符串或空数组且不承载协议语义的 message，避免上游 `11151`。assistant 的有效 `tool_calls` 与带非空 `tool_call_id` 的 tool result 即使 content 为空也必须保留；清理后为空时只注入固定最小 system，不改写普通 prompt。该差分来自只读 `cli2api@e5893f0`，目标实现采用更严格的 tool-result 保留边界。
 
+2026-09-18 的 CB-N1 在这一步之前增加 CodeBuddy 专属历史 repair【E】：只有 assistant call ID 唯一、function name 合法、arguments 是完整 JSON，且紧随其后的 tool result ID 与 call 集合一一对应时，才原样保留完整轮次。缺 result、孤立 result、重复或错配 ID、截断 arguments 都只从历史中删除不可发送的协议片段；assistant 若仍有正文或 reasoning 则保留。实现不合成 tool result、不修改用户 tool output，也不把任何失败隐藏成成功，用于消除下一轮可复现的 `11148 tool_call_sequence_broken`。
+
 这是反代必须处理的强制项：下游若送来一个不以 system 开头的对话（Anthropic Messages 形态常见——system 是独立顶层字段），实现**必须**合成或前置一条 system 消息，否则请求必然失败。
 
 ### 5.5 请求体 gzip
@@ -318,9 +322,15 @@ POST {endpoint}/v2/chat/completions
 
 > **关键不对称【D】**：推理内容在响应里叫 **`delta.reasoning_content`**，但下一轮请求的 assistant 消息里叫 **`reasoning`**。做多轮工具循环的实现必须完成这层改名，否则思维链在回填时丢失。
 
+CB-N2 现在先把 assistant 的非空 `reasoning_content` 规范化为 `reasoning`，再做空消息过滤，因此 reasoning-only 历史不会被误删。Responses 的相邻 reasoning/message/function call 先由共享 transform 合并为一个逻辑 assistant turn，再统一执行一次 CodeBuddy history repair；Claude Messages 与 Chat Completions 也走同一 canonical Chat 边界。
+
+CB-N3 的差分结论是“共享 bridge 已覆盖”，没有增加 Provider 私有名字猜测。Responses namespace 声明会生成稳定、最长 64 byte 的完整扁平名，声明、历史 call、result 与返回恢复共用同一 request-local context；Claude/Chat 中本来就合法的完整名和普通 `user__literal` 名保持不变。CodeBuddy 不采用 Kiro 的唯一裸 child fallback，不能依据历史、Account、Share 或 session 猜 namespace。
+
 `tool_calls` 为标准增量（首帧 `id`+`name`，后续帧只递增 `arguments`）；**首帧的 `index` 是否存在随模型而变**，按 `index` 归并的实现须容忍首帧缺失。终帧 `finish_reason` ∈ `{tool_calls, stop, length}`，随后独立一帧携带 `usage`，最后 `data: [DONE]`。**U10 已关闭。**
 
 SSE 解码接受 CRLF/LF/单 CR event boundary、多条 `data:`（按规范用换行拼接）、comment、`event:`、`id:` 与 `retry:` 心跳字段；仍要求唯一 `[DONE]` 后到达 EOF 才提交终态，`[DONE]` 后数据、重复 terminal、缺 terminal 或超限 event 全部失败。
+
+CB-N5 已用 CodeBuddy loopback fixture 覆盖 `[DONE]` 前截断、重复/后置数据、`[DONE]` 后无 EOF，以及下游在 marker 前后取消。共享 stream guard 会关闭唯一上游 body 并释放 Account/Share 租约；专项差分为绿，因此没有复制 cli2api 的语言特定取消分支，也没有放宽“terminal + EOF”规则。
 
 revision 2 在 CodeBuddy decoder 内删除空 `content`、`reasoning_content`、`reasoning`、`refusal`、空 `tool_calls` 与 dummy `function_call`，重复 role 只保留第一次；若 chunk 随后不含 role、finish、usage、error、tool、reasoning 或 content 语义则整帧丢弃。finish、显式 usage（包括零）、真实 tool arguments 和合法首 role 不得丢失。该差分以 `cli2api@32aa108` 为只读交叉证据，严格 `[DONE]` + EOF 规则不变。
 
@@ -597,13 +607,15 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 
 ### 验收边界
 
-离线：站点 parse 与非法站点拒绝、identity 含 site 且跨站不碰撞、同站 domain 轮换不改 identity 与旧 ID 惰性复用、个人 rail 拒绝企业 identity、`X-No-*` 头齐备、cookie jar 复用、轮询 lease/容量/TTL/过期清理、refresh 身份冲突拒绝、header 最终覆盖、强制流式注入、named tool choice 与 reasoning effort 校验、SSE 多行/心跳/唯一终态、目录权威/空/stale/协议漂移、alias 按 site 投影、modern billing 合并与旧接口回退、官方用量分页/去重/prompt 不落盘、未知模型 400、单次 401 恢复与二次 401 终态、Provider/Account/token 三代际漂移。
+离线：站点 parse 与非法站点拒绝、identity 含 site 且跨站不碰撞、同站 domain 轮换不改 identity 与旧 ID 惰性复用、个人 rail 拒绝企业 identity、`X-No-*` 头齐备、cookie jar 复用、轮询 lease/容量/TTL/过期清理、refresh 身份冲突拒绝、header 最终覆盖、强制流式注入、named tool choice 与 reasoning effort 校验、完整/中断/孤立/重复/截断工具轮次、reasoning-only 与三 Surface namespace 闭环、SSE 多行/心跳/唯一终态、终态前后取消和租约释放、目录权威/空/stale/协议漂移、alias 按 site 投影、modern billing 合并与旧接口回退、官方用量分页/去重/prompt 不落盘、未知模型 400、单次 401 恢复与二次 401 终态、Provider/Account/token 三代际漂移。
 
 真实验收需要**国内与国际各一份**脱敏 receipt，覆盖：登录、refresh 轮换、`/v3/config` 目录、三 Surface 的非流与流式、tools、首个 401、第二个 401、429、中途断流、未知模型拒绝，以及日志/控制面/持久化文件不泄露 token。
 
 国际 site 的采集已完成（2026-08-31，个人账号），可支撑 `fixture_verified`；**升 live verified 仍需在本仓库内按上述清单重跑一遍并留存脱敏 receipt** —— 本次采集是在 workbuddy-cliproxy 侧做的探针式验证，不是本仓库的验收流水线产物。
 
 国内 site 至今**没有任何本仓库采集**，只能标 `live_pending`。
+
+`cli2api` 新增的 `deepseek-v4.1-flash` 精确 native ID、顶层 `reasoning_effort/reasoning_summary/verbosity` 与 300k/1M context-window 形状只作为 CB-N4 二级信号【E】。本仓库没有 CN 绑定账号 receipt 或冻结厂商目录，运行时 reviewed allowlist 仍不包含该 ID，状态保持 `live_pending` / `runtimeEnabled=false`；不得把它改写为 `deep-model`，也不得把这些模型专属字段泛化到其他 CodeBuddy 模型。
 
 ---
 

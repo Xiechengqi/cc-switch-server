@@ -35,6 +35,11 @@ assert(
   contract.policy?.externalSources === "read_only_optional_audit_input_never_runtime_dependency",
   "CodeBuddy external-source boundary changed",
 );
+assert(
+  contract.policy?.sourceWorktree?.includes("committed Git objects") &&
+    contract.policy.sourceWorktree.includes("untracked and modified files are excluded"),
+  "CodeBuddy committed-object evidence boundary changed",
+);
 for (const invariant of [
   "single bound Provider/Share/Account",
   "immutable site",
@@ -54,6 +59,7 @@ assert(
   "CodeBuddy live-evidence boundary changed",
 );
 
+const sourceDeltas = new Set();
 for (const source of contract.sources ?? []) {
   assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
   const root = path.resolve(repoRoot, process.env[source.rootEnv] || source.defaultRelativeRoot);
@@ -68,7 +74,55 @@ for (const source of contract.sources ?? []) {
       assert(digest(content) === file.sha256, `${source.id}:${file.path} source hash drifted`);
     }
   }
+  for (const delta of source.deltas ?? []) {
+    assert(delta.id && !sourceDeltas.has(delta.id), `${source.id} has a duplicate delta id`);
+    sourceDeltas.add(delta.id);
+    assert(
+      Array.isArray(delta.commits) &&
+        delta.commits.length > 0 &&
+        delta.commits.every((commit) => /^[a-f0-9]{40}$/.test(commit)),
+      `${source.id}:${delta.id} has invalid commits`,
+    );
+    assert(delta.files?.length > 0, `${source.id}:${delta.id} has no evidence files`);
+    for (const file of delta.files) {
+      safeRelative(file.path, `${source.id}:${delta.id} evidence path`);
+      assert(
+        delta.commits.includes(file.commit),
+        `${source.id}:${delta.id}:${file.path} references an unpinned commit`,
+      );
+      assert(
+        /^[a-f0-9]{64}$/.test(file.sha256),
+        `${source.id}:${delta.id}:${file.path} has an invalid hash`,
+      );
+      if (checkSources) {
+        const content = execFileSync(
+          "git",
+          ["-C", root, "show", `${file.commit}:${file.path}`],
+          { encoding: null, maxBuffer: 32 * 1024 * 1024 },
+        );
+        assert(
+          digest(content) === file.sha256,
+          `${source.id}:${delta.id}:${file.path} source hash drifted`,
+        );
+      }
+    }
+  }
 }
+assert(
+  contract.sources?.find((source) => source.id === "cli2api-current-review")?.commit ===
+    "624874a0331f5e8f012ef104b633e69826487458",
+  "CodeBuddy current cli2api review commit changed",
+);
+assert(
+  JSON.stringify([...sourceDeltas].sort()) ===
+    JSON.stringify([
+      "deepseek_v4_1_flash",
+      "interrupted_tool_round_11148",
+      "namespace_and_reasoning_history",
+      "stream_cancellation_fixture",
+    ]),
+  "CodeBuddy incremental source delta set changed",
+);
 
 const capabilities = new Map(contract.capabilities.map((item) => [item.id, item]));
 assert(capabilities.size === 4, "CodeBuddy contract must contain CB-01 through CB-04");
@@ -86,6 +140,65 @@ for (let index = 1; index <= 4; index += 1) {
     assert(local.includes(anchor), `${id} is missing local anchor ${anchor}`);
   }
 }
+
+const enhancements = new Map(
+  (contract.incrementalEnhancements ?? []).map((item) => [item.id, item]),
+);
+assert(enhancements.size === 5, "CodeBuddy contract must contain CB-N1 through CB-N5");
+for (let index = 1; index <= 5; index += 1) {
+  const id = `CB-N${index}`;
+  const enhancement = enhancements.get(id);
+  assert(enhancement, `CodeBuddy contract is missing ${id}`);
+  assert(
+    sourceDeltas.has(enhancement.referenceDelta),
+    `${id} references an unknown external delta`,
+  );
+  for (const evidence of enhancement.evidence ?? []) {
+    safeRelative(evidence.path, `${id} local path`);
+    const local = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+    for (const anchor of evidence.anchors ?? []) {
+      assert(local.includes(anchor), `${id} is missing local anchor ${anchor}`);
+    }
+  }
+}
+const toolRepair = enhancements.get("CB-N1");
+assert(
+  toolRepair.status === "fixture_verified" &&
+    toolRepair.fabricatesToolResults === false &&
+    toolRepair.validatesHistoricalArgumentsJson === true,
+  "CB-N1 tool-round repair boundary changed",
+);
+const reasoningHistory = enhancements.get("CB-N2");
+assert(
+  reasoningHistory.status === "fixture_verified" &&
+    reasoningHistory.upstreamAssistantReasoningField === "reasoning",
+  "CB-N2 reasoning-history contract changed",
+);
+const namespaceTools = enhancements.get("CB-N3");
+assert(
+  namespaceTools.status === "fixture_verified_existing_shared_bridge" &&
+    namespaceTools.bareChildFallback === false,
+  "CB-N3 namespace contract changed",
+);
+const deepseek = enhancements.get("CB-N4");
+assert(
+  deepseek.status === "live_pending" &&
+    deepseek.runtimeEnabled === false &&
+    deepseek.receipt === null,
+  "CB-N4 Deepseek gate opened without live evidence",
+);
+const cancellation = enhancements.get("CB-N5");
+assert(
+  cancellation.status === "fixture_verified_existing_shared_guard" &&
+    cancellation.providerBranchAdded === false,
+  "CB-N5 cancellation contract changed",
+);
+
+const fixtureChecks = contract.fixtureAcceptance?.checks ?? [];
+assert(
+  fixtureChecks.length === 12 && new Set(fixtureChecks).size === 12,
+  "CodeBuddy fixture acceptance matrix changed",
+);
 
 const registry = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "assets/contract/provider-registry.json"), "utf8"),
@@ -131,5 +244,5 @@ for (const site of ["intl", "cn"]) {
 }
 
 console.log(
-  `codebuddy reference delta audit ok (${capabilities.size} capabilities, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
+  `codebuddy reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancements, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
 );

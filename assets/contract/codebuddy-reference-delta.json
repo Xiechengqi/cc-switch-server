@@ -1,16 +1,18 @@
 {
   "format": "cc-switch-codebuddy-reference-delta",
   "schemaVersion": 1,
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "scope": "single bound Provider/Share/Account and immutable site; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no domain fallback, no cross-account fallback, no cross-Provider fallback",
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
+    "sourceWorktree": "only committed Git objects are evidence; untracked and modified files are excluded",
     "liveEvidence": "Intl and CN require separate complete real receipts; fixture success never upgrades either site"
   },
   "sources": [
     {
       "id": "cli2api-empty-messages",
       "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
-      "defaultRelativeRoot": "../proxy/cli2api",
+      "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
       "commit": "e5893f0864149caef4c3b9752454190e45875c33",
       "files": [
         {
@@ -26,7 +28,7 @@
     {
       "id": "cli2api-empty-deltas",
       "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
-      "defaultRelativeRoot": "../proxy/cli2api",
+      "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
       "commit": "32aa108b7442cf168c1606d19f9691feafbc116c",
       "files": [
         {
@@ -40,6 +42,117 @@
         {
           "path": "internal/providers/workbuddy/client_test.go",
           "sha256": "f8f9254e26ce0cc1f23be1ee060617c09b452e97979c8e999c985a569c4167e0"
+        }
+      ]
+    },
+    {
+      "id": "cli2api-current-review",
+      "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
+      "commit": "624874a0331f5e8f012ef104b633e69826487458",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/payload.go",
+          "sha256": "54a9c647edb5878d0e986f95f732e9e6a935d70fdd6d4938aff2ec7921cf4577"
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "0784dd39cd79bc1e106eda11d58148d1229f102536eb948b1c1152d39c68179f"
+        }
+      ],
+      "deltas": [
+        {
+          "id": "interrupted_tool_round_11148",
+          "commits": ["cdc80d6216d2cd074759843531b9229c925fd247"],
+          "files": [
+            {
+              "commit": "cdc80d6216d2cd074759843531b9229c925fd247",
+              "path": "internal/providers/workbuddy/payload.go",
+              "sha256": "c8c9556410fdbc25e153eba736b2c92f5c26c1828c0c3dd79e23d6f8dbab6c07"
+            },
+            {
+              "commit": "cdc80d6216d2cd074759843531b9229c925fd247",
+              "path": "internal/providers/workbuddy/client_test.go",
+              "sha256": "f1952ec2bce33cd0f2e2d78ab94891c5ee6f6a8997bc014e379fef2a693a0a6b"
+            }
+          ]
+        },
+        {
+          "id": "namespace_and_reasoning_history",
+          "commits": ["a9ae393d317c6907b3f3c85fcc3768755e0dde8f"],
+          "files": [
+            {
+              "commit": "a9ae393d317c6907b3f3c85fcc3768755e0dde8f",
+              "path": "internal/providers/workbuddy/payload.go",
+              "sha256": "54a9c647edb5878d0e986f95f732e9e6a935d70fdd6d4938aff2ec7921cf4577"
+            },
+            {
+              "commit": "a9ae393d317c6907b3f3c85fcc3768755e0dde8f",
+              "path": "internal/translate/compat.go",
+              "sha256": "6cbbbb29ed363e04287424c3af410803ff0456000aec6dc3108d599ba52c7942"
+            },
+            {
+              "commit": "a9ae393d317c6907b3f3c85fcc3768755e0dde8f",
+              "path": "internal/translate/tools.go",
+              "sha256": "ff9d92778bfe1728050785660459150c5f7e9b4f3b7e6f8cbeaaee656509bf46"
+            },
+            {
+              "commit": "a9ae393d317c6907b3f3c85fcc3768755e0dde8f",
+              "path": "internal/translate/tools_test.go",
+              "sha256": "a5fd21e2b8b5692634af7f3e4f3c695054cb470c7173f99a484e3fd511a93616"
+            }
+          ]
+        },
+        {
+          "id": "deepseek_v4_1_flash",
+          "commits": [
+            "6ac6f83563a5458b72f03f023a290d942f1d4c6d",
+            "d361559e61a5d270823c31fae7a96494b81cd6db",
+            "eef5b2ca0bc4de8da234f8cabd6e53111f7d3619"
+          ],
+          "files": [
+            {
+              "commit": "6ac6f83563a5458b72f03f023a290d942f1d4c6d",
+              "path": "internal/providers/workbuddy/catalog.go",
+              "sha256": "178f942ab6a9ff08e572c6f271515463dd1006ed34244a46ccd48fe8e9651b7c"
+            },
+            {
+              "commit": "6ac6f83563a5458b72f03f023a290d942f1d4c6d",
+              "path": "internal/providers/workbuddy/mapping.go",
+              "sha256": "602afcc2169fbcbdaa75ddfa0d169738b51071c4109174943413464b85407d21"
+            },
+            {
+              "commit": "6ac6f83563a5458b72f03f023a290d942f1d4c6d",
+              "path": "internal/providers/workbuddy/mapping_test.go",
+              "sha256": "de6a01b2a8fa816538f511e71e7c2da2acd9abe4567a1a01185ff8e64c3c2bd9"
+            },
+            {
+              "commit": "d361559e61a5d270823c31fae7a96494b81cd6db",
+              "path": "internal/providers/workbuddy/client.go",
+              "sha256": "d6841ee24b81e56f0a8b7afd510379fa039d0600fa57a8b9f880ba04c0412244"
+            },
+            {
+              "commit": "eef5b2ca0bc4de8da234f8cabd6e53111f7d3619",
+              "path": "internal/providers/workbuddy/client.go",
+              "sha256": "d7c52a1f55320f96803159229ad2c8655a3baf696e44f8f007b05ed46c284e90"
+            },
+            {
+              "commit": "eef5b2ca0bc4de8da234f8cabd6e53111f7d3619",
+              "path": "internal/providers/workbuddy/client_test.go",
+              "sha256": "55b3a169e4a672dfd6ec85976660aebe9b6a2f223e454518f5326b61e18194e6"
+            }
+          ]
+        },
+        {
+          "id": "stream_cancellation_fixture",
+          "commits": ["76c4dab3a1cd337107211c298e59c294e1c03312"],
+          "files": [
+            {
+              "commit": "76c4dab3a1cd337107211c298e59c294e1c03312",
+              "path": "internal/providers/workbuddy/client_test.go",
+              "sha256": "7b1000f439df8718d6024f645ec1d1d879c537629e5f1d02a100ac398d06d96b"
+            }
+          ]
         }
       ]
     }
@@ -100,6 +213,112 @@
       ]
     }
   ],
+  "incrementalEnhancements": [
+    {
+      "id": "CB-N1",
+      "status": "fixture_verified",
+      "referenceDelta": "interrupted_tool_round_11148",
+      "fabricatesToolResults": false,
+      "validatesHistoricalArgumentsJson": true,
+      "evidence": [
+        {
+          "path": "src/proxy/codebuddy_runtime.rs",
+          "anchors": [
+            "fn repair_codebuddy_tool_history(",
+            "fn codebuddy_tool_round_is_complete(",
+            "payload_repairs_only_incomplete_historical_tool_rounds"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CB-N2",
+      "status": "fixture_verified",
+      "referenceDelta": "namespace_and_reasoning_history",
+      "upstreamAssistantReasoningField": "reasoning",
+      "evidence": [
+        {
+          "path": "src/proxy/codebuddy_runtime.rs",
+          "anchors": [
+            "fn canonicalize_codebuddy_assistant_reasoning(",
+            "payload_keeps_complete_tool_round_byte_shape_and_reasoning_only_history",
+            "payload_closes_namespace_tool_rounds_across_claude_chat_and_responses"
+          ]
+        },
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "responses_reasoning_attaches_forward_and_backfills_trailing_summary"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CB-N3",
+      "status": "fixture_verified_existing_shared_bridge",
+      "referenceDelta": "namespace_and_reasoning_history",
+      "bareChildFallback": false,
+      "evidence": [
+        {
+          "path": "src/proxy/codebuddy_runtime.rs",
+          "anchors": [
+            "payload_closes_namespace_tool_rounds_across_claude_chat_and_responses"
+          ]
+        },
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "responses_namespace_tools_round_trip_through_chat_and_anthropic",
+            "long_namespace_tool_names_are_stable_and_byte_bounded"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CB-N4",
+      "status": "live_pending",
+      "referenceDelta": "deepseek_v4_1_flash",
+      "runtimeEnabled": false,
+      "receipt": null
+    },
+    {
+      "id": "CB-N5",
+      "status": "fixture_verified_existing_shared_guard",
+      "referenceDelta": "stream_cancellation_fixture",
+      "providerBranchAdded": false,
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+          "anchors": [
+            "codebuddy_truncation_before_done_is_never_reported_as_success",
+            "codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker"
+          ]
+        },
+        {
+          "path": "src/proxy/codebuddy.rs",
+          "anchors": [
+            "decoder_requires_one_done_and_rejects_post_terminal_data"
+          ]
+        }
+      ]
+    }
+  ],
+  "fixtureAcceptance": {
+    "checks": [
+      "incomplete_tool_round_11148_repair",
+      "complete_tool_round_byte_shape",
+      "duplicate_and_mismatched_tool_ids",
+      "truncated_tool_arguments",
+      "reasoning_only_assistant",
+      "responses_reasoning_turn_merge",
+      "claude_chat_responses_namespace_round_trip",
+      "long_and_double_underscore_tool_names",
+      "truncation_before_done_fails",
+      "duplicate_or_post_done_data_fails",
+      "cancel_before_done_releases_upstream",
+      "cancel_after_done_before_eof_releases_upstream"
+    ]
+  },
   "realAcceptance": {
     "receiptSchemaVersion": 1,
     "sites": [
