@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-18 Kiro tool names, profile fallback, and compaction gate freeze
+
+Kiro 增量证据追加在 `assets/contract/kiro-reference-delta.json`，保留 KI-01～KI-05 历史合同。只读来源为 `kiro.rs@f413e7de` 的裸 namespaced tool 恢复、`kiro.rs@3194bb29` 的 profileArn 兼容回退，以及 `kiro.rs@0b8c7dec/@d62054f5/@13763b69` 的 Responses Compact 结构；完整 commit、路径和提交态 SHA-256 可由 `node scripts/audit/audit-kiro-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时不读取外部 checkout。
+
+KI-N1 使用只含本次请求 `tools` 声明的注册表，依次执行实际上游名精确映射、完整原名精确匹配、唯一 `__` child 恢复和普通名保留。历史消息、Account、Share、session 与进程缓存均不能提供候选；同名普通工具优先，两个 namespace 的同 child 返回稳定 `KIRO_EVENT_STREAM_INVALID`，不猜测目标。fixture 覆盖 builtin、超长 hash、历史污染、分片参数及 Claude Messages、Codex Chat Completions、Codex Responses 三 Surface。
+
+KI-N2 只在带 profileArn 的请求收到 403，或收到正文明确包含 `Improperly formed request` / `Invalid profileArn` 的 400 时，才在同一 `q.{region}` host 去除 ARN 重试。401、429、5xx、timeout/TLS/transport、decode 和成功响应结构错误均保留原分类并停止；没有独立 receipt 的 q→CodeWhisperer host fallback 已关闭。模型目录沿用已冻结的 403 区域候选合同，但新增的 400 回退同样受正文与“原请求确实带 ARN”双重约束。
+
+KI-N3 当前只完成保守门禁：Kiro 与独立 Amazon Q 的 `/responses/compact` 或普通 Responses compaction trigger 在模型目录、凭据刷新和推理发网前稳定拒绝，decoy fixture 请求数为零。参考项目的 remote compaction 仅证明值得后续差分研究，不能替代本产品的绑定账号真实 receipt；`runtimeEnabled=false`、`live_pending` 和空 receipt 保持不变。
+
 ## 2026-09-18 Codex bootstrap, metadata, WebSocket fairness, and memory freeze
 
 Codex 增量证据追加在 `assets/contract/codex-reference-delta.json`，保留原有 CX-01～CX-06 历史合同。只读来源为 `CLIProxyAPI@cb73cd99` 的空 bootstrap announcement、`CLIProxyAPI@b5ba02c2` 的大帧写入公平性、`codex2api@dc47d131` 的 input-item metadata 层级和 `codex2api@19ee8db4` 的请求生命周期内存预算；完整 commit、文件路径与提交态 SHA-256 可由 `node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时均不读取外部 checkout。

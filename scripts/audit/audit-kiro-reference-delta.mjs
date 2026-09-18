@@ -83,6 +83,39 @@ for (const source of contract.sources ?? []) {
       );
     }
   }
+  for (const delta of source.deltas ?? []) {
+    assert(delta.id, `${source.id} has an unnamed delta`);
+    assert(
+      Array.isArray(delta.commits) &&
+        delta.commits.length > 0 &&
+        delta.commits.every((commit) => /^[a-f0-9]{40}$/.test(commit)),
+      `${source.id}:${delta.id} has invalid commits`,
+    );
+    assert(delta.files?.length > 0, `${source.id}:${delta.id} has no evidence files`);
+    for (const file of delta.files) {
+      safeRelative(file.path, `${source.id}:${delta.id} evidence path`);
+      assert(
+        delta.commits.includes(file.commit),
+        `${source.id}:${delta.id}:${file.path} references an unpinned commit`,
+      );
+      assert(
+        /^[a-f0-9]{64}$/.test(file.sha256),
+        `${source.id}:${delta.id}:${file.path} has invalid SHA-256`,
+      );
+      if (checkSources) {
+        assert(fs.existsSync(sourceRoot), `${source.id} source root is unavailable`);
+        const content = execFileSync(
+          "git",
+          ["-C", sourceRoot, "show", `${file.commit}:${file.path}`],
+          { encoding: null, maxBuffer: 64 * 1024 * 1024 },
+        );
+        assert(
+          sha256(content) === file.sha256,
+          `${source.id}:${delta.id}:${file.path} drifted from the reviewed Git object`,
+        );
+      }
+    }
+  }
 }
 
 const capabilities = new Map(
@@ -108,6 +141,94 @@ for (const id of ["KI-04", "KI-05"]) {
   assert(capabilities.get(id)?.status === "live_pending", `${id} must remain live_pending`);
 }
 assert(capabilities.get("KI-05")?.runtimeEnabled === false, "KI-05 runtime gate opened");
+
+const sourceDeltaIds = new Set(
+  (contract.sources ?? []).flatMap((source) =>
+    (source.deltas ?? []).map((delta) => delta.id),
+  ),
+);
+const incrementalEnhancements = new Map(
+  (contract.incrementalEnhancements ?? []).map((enhancement) => [
+    enhancement.id,
+    enhancement,
+  ]),
+);
+assert(
+  incrementalEnhancements.size === 3,
+  "Kiro incremental contract must contain KI-N1 through KI-N3",
+);
+for (let index = 1; index <= 3; index += 1) {
+  const id = `KI-N${index}`;
+  const enhancement = incrementalEnhancements.get(id);
+  assert(enhancement, `Kiro incremental contract is missing ${id}`);
+  assert(
+    sourceDeltaIds.has(enhancement.referenceDelta),
+    `${id} references an unknown source delta`,
+  );
+  assert(
+    Array.isArray(enhancement.evidence) && enhancement.evidence.length > 0,
+    `${id} must pin local evidence`,
+  );
+  for (const evidence of enhancement.evidence) {
+    safeRelative(evidence.path, `${id} local evidence path`);
+    const localPath = path.join(repoRoot, evidence.path);
+    assert(fs.existsSync(localPath), `${id} local evidence path is unavailable`);
+    const local = fs.readFileSync(localPath, "utf8");
+    for (const anchor of evidence.anchors ?? []) {
+      assert(local.includes(anchor), `${id} is missing local anchor ${anchor}`);
+    }
+  }
+}
+const toolNames = incrementalEnhancements.get("KI-N1");
+assert(toolNames?.status === "fixture_verified", "KI-N1 must remain fixture_verified");
+assert(
+  JSON.stringify(toolNames.resolutionOrder) ===
+    JSON.stringify([
+      "exact_upstream_mapping",
+      "exact_original_declaration",
+      "unique_namespaced_child",
+      "ordinary_unmatched_name",
+    ]) &&
+    toolNames.ambiguousChild === "KIRO_EVENT_STREAM_INVALID",
+  "KI-N1 tool-name resolution order or ambiguity contract changed",
+);
+for (const invariant of ["current request", "excludes history", "Account", "Share", "session"] ) {
+  assert(toolNames.registryScope?.includes(invariant), `KI-N1 registry scope lost ${invariant}`);
+}
+const fallback = incrementalEnhancements.get("KI-N2");
+assert(fallback?.status === "fixture_verified", "KI-N2 must remain fixture_verified");
+assert(
+  JSON.stringify(fallback.allowedProfilelessRetry) ===
+    JSON.stringify([
+      "403_with_profile_arn",
+      "400_Improperly_formed_request_with_profile_arn",
+      "400_Invalid_profileArn_with_profile_arn",
+    ]),
+  "KI-N2 allowed profileArn fallback set changed",
+);
+assert(
+  JSON.stringify(fallback.forbiddenFallbackClasses) ===
+    JSON.stringify([
+      "401",
+      "429",
+      "5xx",
+      "timeout",
+      "tls",
+      "transport",
+      "decode",
+      "invalid_success_contract",
+    ]) && fallback.usageHostFallbackEnabled === false,
+  "KI-N2 widened a failure or host fallback boundary",
+);
+const compact = incrementalEnhancements.get("KI-N3");
+assert(
+  compact?.status === "fixture_verified_fail_closed" &&
+    compact.runtimeEnabled === false &&
+    compact.liveStatus === "live_pending" &&
+    compact.receipt === null &&
+    compact.zeroUpstreamBeforeReject === true,
+  "KI-N3 remote compaction gate opened without live evidence",
+);
 
 const fixtureChecks = contract.fixtureAcceptance?.checks ?? [];
 assert(
@@ -210,7 +331,7 @@ assert(
 );
 
 console.log(
-  `kiro reference delta audit ok (${capabilities.size} capabilities, ${fixtureChecks.length} fixture checks, ${receipts.length} pending receipts${
+  `kiro reference delta audit ok (${capabilities.size} baseline capabilities, ${incrementalEnhancements.size} incremental enhancements, ${fixtureChecks.length} fixture checks, ${receipts.length} pending receipts${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

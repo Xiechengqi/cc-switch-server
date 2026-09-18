@@ -874,15 +874,10 @@ pub(crate) async fn fetch_usage_limits(
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-2.3.0-{machine_id}");
     let q_host = format!("q.{region}.amazonaws.com");
-    let mut urls = Vec::with_capacity(2);
-    if profile_arn.is_some() {
-        urls.push(usage_limits_url(&q_host, profile_arn));
-    }
-    urls.push(usage_limits_url(&q_host, None));
-    for url in urls {
+    if let Some(profile_arn) = profile_arn.filter(|value| !value.trim().is_empty()) {
         match send_usage_limits_get(
             http,
-            &url,
+            &usage_limits_url(&q_host, Some(profile_arn)),
             &q_host,
             &amz_user_agent,
             &user_agent,
@@ -892,21 +887,35 @@ pub(crate) async fn fetch_usage_limits(
         .await
         {
             Ok(value) => return Ok(value),
-            Err(error) if error.status == StatusCode::UNAUTHORIZED => return Err(error),
-            Err(_) => {}
+            Err(error) if should_retry_usage_without_profile_arn(&error, true) => {}
+            Err(error) => return Err(error),
         }
     }
-    let cw_host = format!("codewhisperer.{region}.amazonaws.com");
+
+    // No committed reference or live receipt proves that changing the host is
+    // safe for the same credential. A compatibility retry therefore removes
+    // only profileArn and stays on the exact q.{region} endpoint.
     send_usage_limits_get(
         http,
-        &usage_limits_url(&cw_host, None),
-        &cw_host,
+        &usage_limits_url(&q_host, None),
+        &q_host,
         &amz_user_agent,
         &user_agent,
         access_token,
         token_type,
     )
     .await
+}
+
+fn should_retry_usage_without_profile_arn(
+    error: &KiroDeviceError,
+    request_had_profile_arn: bool,
+) -> bool {
+    request_had_profile_arn
+        && (error.status == StatusCode::FORBIDDEN
+            || (error.status == StatusCode::BAD_REQUEST
+                && (error.message.contains("Improperly formed request")
+                    || error.message.contains("Invalid profileArn"))))
 }
 
 async fn send_usage_limits_get(
@@ -1589,6 +1598,33 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(usage_error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn usage_profile_fallback_only_accepts_evidenced_profile_rejections() {
+        for (status, message) in [
+            (StatusCode::FORBIDDEN, "profile denied"),
+            (StatusCode::BAD_REQUEST, "Improperly formed request."),
+            (StatusCode::BAD_REQUEST, "Invalid profileArn."),
+        ] {
+            let error = KiroDeviceError::remote(status, message);
+            assert!(should_retry_usage_without_profile_arn(&error, true));
+            assert!(!should_retry_usage_without_profile_arn(&error, false));
+        }
+
+        for (status, message) in [
+            (StatusCode::BAD_REQUEST, "invalid request"),
+            (StatusCode::UNAUTHORIZED, "expired"),
+            (StatusCode::TOO_MANY_REQUESTS, "slow down"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "retry later"),
+            (StatusCode::BAD_GATEWAY, "transport or decode failure"),
+        ] {
+            let error = KiroDeviceError::remote(status, message);
+            assert!(
+                !should_retry_usage_without_profile_arn(&error, true),
+                "unexpected fallback for {status} {message}"
+            );
+        }
     }
 
     #[test]

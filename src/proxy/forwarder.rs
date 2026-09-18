@@ -2131,6 +2131,7 @@ async fn forward_with_attempt(
             route,
             &body,
         )?;
+        kiro::enforce_disabled_compaction_contract(stored.provider_type, route, &body)?;
         let codex_request_intent = if execution.driver_is("oauth.openai_codex") {
             super::codex_request_policy::extract_intent_from_bytes(&body)
         } else {
@@ -21052,7 +21053,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             response_model,
             model_metadata,
             request_body,
-            tool_name_map: prepared.tool_name_map,
+            tool_name_registry: prepared.tool_name_registry,
             cache_namespace: prepared.cache_namespace,
             responses_tool_context: runtime_request.responses_tool_context.clone(),
             downstream_include_usage: runtime_request.downstream_include_usage,
@@ -21121,7 +21122,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     let message = match kiro::kiro_event_bytes_to_claude_json_scoped_with_context_window(
         &bytes,
         &response_model,
-        &prepared.tool_name_map,
+        &prepared.tool_name_registry,
         &request_body,
         &prepared.cache_namespace,
         prepared.context_window,
@@ -21223,7 +21224,7 @@ struct ClaudeKiroStreamOptions {
     response_model: String,
     model_metadata: UsageModelMetadata,
     request_body: Value,
-    tool_name_map: std::collections::HashMap<String, String>,
+    tool_name_registry: kiro::KiroToolNameRegistry,
     cache_namespace: String,
     responses_tool_context: super::transforms::ResponsesToolContext,
     downstream_include_usage: bool,
@@ -21250,7 +21251,7 @@ async fn forward_claude_kiro_stream(
         response_model,
         model_metadata,
         request_body,
-        tool_name_map,
+        tool_name_registry,
         cache_namespace,
         responses_tool_context,
         downstream_include_usage,
@@ -21284,7 +21285,7 @@ async fn forward_claude_kiro_stream(
     let stream = kiro::kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
         upstream.bytes_stream(),
         response_model,
-        tool_name_map,
+        tool_name_registry,
         &request_body,
         &cache_namespace,
         first_frame_deadline,
@@ -34739,6 +34740,31 @@ mod tests {
         .concat()
     }
 
+    fn kiro_fragmented_tool_eventstream(name: &str) -> Vec<u8> {
+        [
+            kiro::fixture_event_frame(
+                "toolUseEvent",
+                &json!({
+                    "toolUseId": "toolu_namespaced",
+                    "name": name,
+                    "input": "{\"query\":",
+                    "stop": false
+                }),
+            ),
+            kiro::fixture_event_frame(
+                "toolUseEvent",
+                &json!({
+                    "toolUseId": "toolu_namespaced",
+                    "name": name,
+                    "input": "\"needle\"}",
+                    "stop": true
+                }),
+            ),
+            kiro::fixture_event_frame("endEvent", &json!({})),
+        ]
+        .concat()
+    }
+
     #[tokio::test]
     async fn amazon_q_uses_cli_catalog_and_eventstream_on_claude_and_codex_with_one_bound_refresh()
     {
@@ -35219,6 +35245,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces() {
+        let (address, server) =
+            spawn_kiro_eventstream_upstream(kiro_fragmented_tool_eventstream("search")).await;
+        let endpoint = format!("http://{address}");
+        let declared_name = "mcp__repo__search";
+
+        let claude_state = forwarder_test_state("kiro-bare-tool-claude");
+        let claude_provider = install_kiro_test_provider_for_app(
+            &claude_state,
+            AppKind::Claude,
+            "kiro-bare-tool-claude",
+            endpoint.clone(),
+            "http://127.0.0.1:9/token".to_string(),
+        )
+        .await;
+        let claude = forward_for_test_surface(
+            claude_state,
+            ProxyRoute::ClaudeMessages,
+            claude_provider,
+            None,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "model": "claude-sonnet-4-8",
+                    "max_tokens": 32,
+                    "messages": [{"role":"user","content":"search"}],
+                    "tools": [{
+                        "name": declared_name,
+                        "description": "search",
+                        "input_schema": {"type":"object","properties":{"query":{"type":"string"}}}
+                    }],
+                    "stream": false
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        let claude: Value = serde_json::from_slice(&collect_response_body(claude).await).unwrap();
+        assert_eq!(
+            claude.pointer("/content/0/name"),
+            Some(&json!(declared_name))
+        );
+        assert_eq!(
+            claude.pointer("/content/0/input/query"),
+            Some(&json!("needle"))
+        );
+
+        let codex_state = forwarder_test_state("kiro-bare-tool-codex");
+        let codex_provider = install_kiro_test_provider_for_app(
+            &codex_state,
+            AppKind::Codex,
+            "kiro-bare-tool-codex",
+            endpoint,
+            "http://127.0.0.1:9/token".to_string(),
+        )
+        .await;
+        let chat = forward_for_test_surface(
+            codex_state.clone(),
+            ProxyRoute::CodexChatCompletions,
+            codex_provider.clone(),
+            None,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "model": "claude-sonnet-4-8",
+                    "messages": [{"role":"user","content":"search"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": declared_name,
+                            "description": "search",
+                            "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+                        }
+                    }],
+                    "stream": false
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        let chat: Value = serde_json::from_slice(&collect_response_body(chat).await).unwrap();
+        assert_eq!(
+            chat.pointer("/choices/0/message/tool_calls/0/function/name"),
+            Some(&json!(declared_name))
+        );
+
+        let responses = forward_for_test_surface(
+            codex_state,
+            ProxyRoute::CodexResponses,
+            codex_provider,
+            None,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "model": "claude-sonnet-4-8",
+                    "input": "search",
+                    "tools": [{
+                        "type": "function",
+                        "name": declared_name,
+                        "description": "search",
+                        "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+                    }],
+                    "stream": false
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        let responses: Value =
+            serde_json::from_slice(&collect_response_body(responses).await).unwrap();
+        assert_eq!(
+            responses.pointer("/output/0/name"),
+            Some(&json!(declared_name))
+        );
+        assert_eq!(
+            responses.pointer("/output/0/arguments"),
+            Some(&json!("{\"query\":\"needle\"}"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn kiro_stream_supports_claude_chat_and_responses_lifecycles() {
         let (address, server) =
             spawn_kiro_eventstream_upstream(kiro_text_eventstream("streamed from Kiro")).await;
@@ -35325,6 +35476,80 @@ mod tests {
             .as_i64()
             .is_some_and(|tokens| tokens > 0));
         assert!(inspection_state.usage_snapshot().await.logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kiro_and_amazon_q_compact_fail_before_any_upstream_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move || {
+            let requests = std::sync::Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}");
+        let body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-8","input":"compact this conversation"}"#,
+        );
+
+        let kiro_state = forwarder_test_state("kiro-compact-disabled");
+        let kiro_provider = install_kiro_test_provider_for_app(
+            &kiro_state,
+            AppKind::Codex,
+            "kiro-compact-disabled",
+            endpoint.clone(),
+            format!("{endpoint}/token"),
+        )
+        .await;
+        let kiro_error = forward_for_test_surface(
+            kiro_state,
+            ProxyRoute::CodexResponsesCompact,
+            kiro_provider,
+            None,
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(kiro_error.status, StatusCode::BAD_REQUEST);
+        assert!(kiro_error.message.contains("disabled pending"));
+
+        let amazon_q_state = forwarder_test_state("amazon-q-compact-disabled");
+        let (_, amazon_q_provider, _) = install_amazon_q_test_bundle(
+            &amazon_q_state,
+            "amazon-q-compact-disabled",
+            endpoint.clone(),
+            format!("{endpoint}/models"),
+            endpoint,
+        )
+        .await;
+        let amazon_q_error = forward_for_test_surface(
+            amazon_q_state,
+            ProxyRoute::CodexResponsesCompact,
+            amazon_q_provider,
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(amazon_q_error.status, StatusCode::BAD_REQUEST);
+        assert!(amazon_q_error.message.contains("disabled pending"));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "unsupported compact must not contact catalog, token, or inference decoys"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -35780,7 +36005,7 @@ mod tests {
                 "model": "claude-sonnet-4-6",
                 "messages": []
             }),
-            tool_name_map: Default::default(),
+            tool_name_registry: Default::default(),
             cache_namespace: "test".to_string(),
             responses_tool_context: Default::default(),
             downstream_include_usage: false,

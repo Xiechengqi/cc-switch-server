@@ -9,7 +9,7 @@ mod wire;
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::amazon_q::AMAZON_Q_RUNTIME_REGIONS;
 use crate::domain::providers::model::ProviderType;
-use crate::proxy::ProxyError;
+use crate::proxy::{ProxyError, ProxyRoute};
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -114,7 +114,64 @@ pub(crate) enum CodeWhispererProduct {
 struct KiroRequestBuild {
     body: Value,
     tool_name_map: HashMap<String, String>,
+    tool_name_registry: KiroToolNameRegistry,
     resolved_model: model::KiroResolvedModel,
+}
+
+/// Request-scoped tool declarations used to restore names returned by Kiro.
+///
+/// This registry is deliberately separate from `tool_name_map`: history
+/// conversion also writes that map, while a bare namespaced name may only be
+/// resolved against declarations from the current request.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KiroToolNameRegistry {
+    upstream_to_original: HashMap<String, String>,
+    original_names: HashSet<String>,
+    namespaced_children: HashMap<String, Vec<String>>,
+}
+
+impl KiroToolNameRegistry {
+    fn register(&mut self, upstream_name: &str, original_name: &str) {
+        self.upstream_to_original
+            .insert(upstream_name.to_string(), original_name.to_string());
+        if !self.original_names.insert(original_name.to_string()) {
+            return;
+        }
+        let Some((namespace, child)) = original_name.rsplit_once("__") else {
+            return;
+        };
+        if namespace.is_empty() || child.is_empty() {
+            return;
+        }
+        self.namespaced_children
+            .entry(child.to_string())
+            .or_default()
+            .push(original_name.to_string());
+    }
+
+    fn from_tool_name_map(tool_name_map: &HashMap<String, String>) -> Self {
+        let mut registry = Self::default();
+        for (upstream_name, original_name) in tool_name_map {
+            registry.register(upstream_name, original_name);
+        }
+        registry
+    }
+
+    fn resolve(&self, upstream_name: &str) -> Result<String, KiroToolJsonError> {
+        if let Some(original_name) = self.upstream_to_original.get(upstream_name) {
+            return Ok(original_name.clone());
+        }
+        if self.original_names.contains(upstream_name) {
+            return Ok(upstream_name.to_string());
+        }
+        match self.namespaced_children.get(upstream_name) {
+            Some(candidates) if candidates.len() == 1 => Ok(candidates[0].clone()),
+            Some(candidates) if candidates.len() > 1 => Err(kiro_wire_contract_error(format!(
+                "Kiro returned ambiguous bare tool name {upstream_name:?} for multiple current request declarations"
+            ))),
+            _ => Ok(upstream_name.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +181,7 @@ pub(crate) struct KiroPreparedRequest {
     pub headers: Vec<(&'static str, String)>,
     pub body: Value,
     pub tool_name_map: HashMap<String, String>,
+    pub tool_name_registry: KiroToolNameRegistry,
     pub cache_namespace: String,
     pub upstream_model_id: String,
     pub context_window: u64,
@@ -388,6 +446,7 @@ pub(crate) fn prepare_kiro_request_with_context(
         headers: prepared.headers,
         body: prepared.body,
         tool_name_map: request.tool_name_map,
+        tool_name_registry: request.tool_name_registry,
         cache_namespace: context.cache_namespace.clone(),
         upstream_model_id: request.resolved_model.upstream_model_id,
         context_window: request.resolved_model.context_window,
@@ -442,7 +501,13 @@ fn anthropic_to_kiro_request_with_catalog(
     let messages = &raw_messages[..=last_user_idx];
 
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(body.get("tools"), &mut tool_name_map, tool_mode)?;
+    let mut tool_name_registry = KiroToolNameRegistry::default();
+    let mut tools = convert_tools(
+        body.get("tools"),
+        &mut tool_name_map,
+        &mut tool_name_registry,
+        tool_mode,
+    )?;
     let (content, images, tool_results) =
         parse_user_content(messages[last_user_idx].get("content"));
     let mut history = build_history(body, messages, model_id, &mut tool_name_map, tool_mode);
@@ -487,6 +552,7 @@ fn anthropic_to_kiro_request_with_catalog(
     Ok(KiroRequestBuild {
         body: request_body,
         tool_name_map,
+        tool_name_registry,
         resolved_model,
     })
 }
@@ -638,6 +704,7 @@ fn looks_uuid_like(input: &str) -> bool {
 fn convert_tools(
     tools: Option<&Value>,
     tool_name_map: &mut HashMap<String, String>,
+    tool_name_registry: &mut KiroToolNameRegistry,
     tool_mode: ToolCompatibilityMode,
 ) -> Result<Vec<Value>, ProxyError> {
     let mut converted = Vec::new();
@@ -666,6 +733,7 @@ fn convert_tools(
             tracing::warn!(tool = %name, mapped_tool = %mapped_name, "dropping duplicate Kiro tool after name mapping");
             continue;
         }
+        tool_name_registry.register(&mapped_name, name);
         let mut description = tool
             .get("description")
             .and_then(|v| v.as_str())
@@ -870,11 +938,11 @@ fn map_tool_name(
     short
 }
 
-fn original_tool_name(name: &str, tool_name_map: &HashMap<String, String>) -> String {
-    tool_name_map
-        .get(name)
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
+fn original_tool_name(
+    name: &str,
+    tool_name_registry: &KiroToolNameRegistry,
+) -> Result<String, KiroToolJsonError> {
+    tool_name_registry.resolve(name)
 }
 
 fn build_history(
@@ -1580,7 +1648,7 @@ fn canonical_prompt_cache_value(value: &Value) -> Value {
 struct SseBuilder {
     message_id: String,
     model: String,
-    tool_name_map: HashMap<String, String>,
+    tool_name_registry: KiroToolNameRegistry,
     text_index: Option<i32>,
     text_stopped: bool,
     thinking_index: Option<i32>,
@@ -1601,7 +1669,11 @@ struct SseBuilder {
 impl SseBuilder {
     fn new(model: String, tool_name_map: HashMap<String, String>) -> Self {
         let context_window = context_window_size(&model);
-        Self::new_with_context_window(model, tool_name_map, context_window)
+        Self::new_with_registry(
+            model,
+            KiroToolNameRegistry::from_tool_name_map(&tool_name_map),
+            context_window,
+        )
     }
 
     fn new_with_context_window(
@@ -1609,10 +1681,22 @@ impl SseBuilder {
         tool_name_map: HashMap<String, String>,
         context_window: u64,
     ) -> Self {
+        Self::new_with_registry(
+            model,
+            KiroToolNameRegistry::from_tool_name_map(&tool_name_map),
+            context_window,
+        )
+    }
+
+    fn new_with_registry(
+        model: String,
+        tool_name_registry: KiroToolNameRegistry,
+        context_window: u64,
+    ) -> Self {
         Self {
             message_id: next_message_id(),
             model,
-            tool_name_map,
+            tool_name_registry,
             usage: KiroUsageAccumulator::with_context_window(context_window),
             ..Default::default()
         }
@@ -1762,9 +1846,10 @@ impl SseBuilder {
     ) -> Result<Vec<Bytes>, KiroToolJsonError> {
         let completed = match self
             .tool_json
-            .push(id, name, input, stop, &self.tool_name_map)
+            .push(id, name, input, stop, &self.tool_name_registry)
         {
             Ok(completed) => completed,
+            Err(error @ KiroToolJsonError::Wire { .. }) => return Err(error),
             Err(error) => {
                 self.tool_json.reject(&error);
                 self.tool_errors.push(error);
@@ -2065,7 +2150,7 @@ impl ToolJsonAccumulator {
         name: &str,
         input: &str,
         stop: bool,
-        tool_name_map: &HashMap<String, String>,
+        tool_name_registry: &KiroToolNameRegistry,
     ) -> Result<Option<(String, String, String, Value)>, KiroToolJsonError> {
         if self.rejected.contains(tool_use_id) {
             return Ok(None);
@@ -2097,6 +2182,7 @@ impl ToolJsonAccumulator {
             .remove(tool_use_id)
             .unwrap_or_else(|| (name.to_string(), input.to_string()));
         self.buffered_bytes = self.buffered_bytes.saturating_sub(input.len());
+        let original_name = original_tool_name(&kiro_name, tool_name_registry)?;
         let parsed = if input.trim().is_empty() {
             json!({})
         } else {
@@ -2109,7 +2195,7 @@ impl ToolJsonAccumulator {
         Ok(Some((
             tool_use_id.to_string(),
             kiro_name.clone(),
-            original_tool_name(&kiro_name, tool_name_map),
+            original_name,
             parsed,
         )))
     }
@@ -2226,10 +2312,11 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts(
     idle_timeout: Option<Duration>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let context_window = context_window_size(&model);
+    let tool_name_registry = KiroToolNameRegistry::from_tool_name_map(&tool_name_map);
     kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
         stream,
         model,
-        tool_name_map,
+        tool_name_registry,
         request_body,
         cache_namespace,
         first_frame_deadline,
@@ -2242,7 +2329,7 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts(
 pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: String,
-    tool_name_map: HashMap<String, String>,
+    tool_name_registry: KiroToolNameRegistry,
     request_body: &Value,
     cache_namespace: &str,
     first_frame_deadline: Option<tokio::time::Instant>,
@@ -2253,7 +2340,7 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_w
     kiro_event_stream_to_anthropic_sse(
         stream,
         model,
-        tool_name_map,
+        tool_name_registry,
         prompt_cache_usage,
         first_frame_deadline,
         idle_timeout,
@@ -2264,7 +2351,7 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_w
 fn kiro_event_stream_to_anthropic_sse(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: String,
-    tool_name_map: HashMap<String, String>,
+    tool_name_registry: KiroToolNameRegistry,
     prompt_cache_usage: KiroPromptCacheUsage,
     first_frame_deadline: Option<tokio::time::Instant>,
     idle_timeout: Option<Duration>,
@@ -2272,7 +2359,7 @@ fn kiro_event_stream_to_anthropic_sse(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut decoder = wire::EventStreamDecoder::strict();
-        let mut builder = SseBuilder::new_with_context_window(model, tool_name_map, context_window);
+        let mut builder = SseBuilder::new_with_registry(model, tool_name_registry, context_window);
         builder.set_prompt_cache_usage(prompt_cache_usage);
         yield Ok(builder.initial());
         tokio::pin!(stream);
@@ -2430,10 +2517,11 @@ pub(crate) fn kiro_event_bytes_to_claude_json_scoped(
     request_body: &Value,
     cache_namespace: &str,
 ) -> Result<Value, KiroToolJsonError> {
+    let tool_name_registry = KiroToolNameRegistry::from_tool_name_map(tool_name_map);
     kiro_event_bytes_to_claude_json_scoped_with_context_window(
         bytes,
         model,
-        tool_name_map,
+        &tool_name_registry,
         request_body,
         cache_namespace,
         context_window_size(model),
@@ -2443,7 +2531,7 @@ pub(crate) fn kiro_event_bytes_to_claude_json_scoped(
 pub(crate) fn kiro_event_bytes_to_claude_json_scoped_with_context_window(
     bytes: &[u8],
     model: &str,
-    tool_name_map: &HashMap<String, String>,
+    tool_name_registry: &KiroToolNameRegistry,
     request_body: &Value,
     cache_namespace: &str,
     context_window: u64,
@@ -2452,7 +2540,7 @@ pub(crate) fn kiro_event_bytes_to_claude_json_scoped_with_context_window(
     kiro_event_bytes_to_anthropic_json_with_context_window(
         bytes,
         model,
-        tool_name_map,
+        tool_name_registry,
         prompt_cache_usage,
         context_window,
     )
@@ -2464,10 +2552,11 @@ fn kiro_event_bytes_to_anthropic_json(
     tool_name_map: &HashMap<String, String>,
     prompt_cache_usage: KiroPromptCacheUsage,
 ) -> Result<Value, KiroToolJsonError> {
+    let tool_name_registry = KiroToolNameRegistry::from_tool_name_map(tool_name_map);
     kiro_event_bytes_to_anthropic_json_with_context_window(
         bytes,
         model,
-        tool_name_map,
+        &tool_name_registry,
         prompt_cache_usage,
         context_window_size(model),
     )
@@ -2476,7 +2565,7 @@ fn kiro_event_bytes_to_anthropic_json(
 fn kiro_event_bytes_to_anthropic_json_with_context_window(
     bytes: &[u8],
     model: &str,
-    tool_name_map: &HashMap<String, String>,
+    tool_name_registry: &KiroToolNameRegistry,
     prompt_cache_usage: KiroPromptCacheUsage,
     context_window: u64,
 ) -> Result<Value, KiroToolJsonError> {
@@ -2531,13 +2620,14 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
                 name,
                 input,
                 stop,
-            } => match tool_accumulator.push(&id, &name, &input, stop, tool_name_map) {
+            } => match tool_accumulator.push(&id, &name, &input, stop, tool_name_registry) {
                 Ok(Some((id, kiro_name, name, parsed_input))) => {
                     let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
                     seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
                     tools.push((id, name, parsed_input));
                 }
                 Ok(None) => {}
+                Err(error @ KiroToolJsonError::Wire { .. }) => return Err(error),
                 Err(error) => {
                     tool_accumulator.reject(&error);
                     tool_errors.push(error);
@@ -3047,6 +3137,31 @@ pub(crate) fn count_input_tokens(body: &Value) -> Result<i32, ProxyError> {
             )?);
     }
     Ok(tokens.min(i32::MAX as u64) as i32)
+}
+
+/// Kiro/Amazon Q compaction is not ordinary inference. Until a provider-specific
+/// request and response contract has both differential and live evidence, stop
+/// before any catalog, refresh, or inference request can be sent.
+pub(crate) fn enforce_disabled_compaction_contract(
+    provider_type: ProviderType,
+    route: ProxyRoute,
+    body: &Bytes,
+) -> Result<(), ProxyError> {
+    if !matches!(
+        provider_type,
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
+    ) {
+        return Ok(());
+    }
+    let compact_request = route == ProxyRoute::CodexResponsesCompact
+        || (route == ProxyRoute::CodexResponses
+            && super::forwarder::codex_responses_body_has_compaction_trigger(body));
+    if compact_request {
+        return Err(ProxyError::bad_request(
+            "Kiro/Amazon Q response compaction is disabled pending a verified provider receipt",
+        ));
+    }
+    Ok(())
 }
 
 fn count_value_tokens(value: &Value) -> Result<u64, ProxyError> {
@@ -3737,6 +3852,10 @@ mod tests {
             request.tool_name_map.get(mapped_name),
             Some(&long_tool_name)
         );
+        assert_eq!(
+            request.tool_name_registry.resolve(mapped_name).unwrap(),
+            long_tool_name
+        );
         assert_eq!(tool.get("description"), Some(&json!(long_tool_name)));
         let property = tool.pointer("/inputSchema/json/properties/count").unwrap();
         assert!(property.get("exclusiveMinimum").is_none());
@@ -3837,6 +3956,7 @@ mod tests {
     #[test]
     fn claude_code_tool_bridge_dedupes_mapped_names_and_rejects_read_pages() {
         let mut tool_name_map = HashMap::new();
+        let mut tool_name_registry = KiroToolNameRegistry::default();
         let tools = json!([
             {"name":"Read","input_schema":{"type":"object","properties":{}}},
             {"name":"read","input_schema":{"type":"object","properties":{}}},
@@ -3845,6 +3965,7 @@ mod tests {
         let converted = convert_tools(
             Some(&tools),
             &mut tool_name_map,
+            &mut tool_name_registry,
             ToolCompatibilityMode::ClaudeCode,
         )
         .unwrap();
@@ -3857,6 +3978,7 @@ mod tests {
         assert!(convert_tools(
             Some(&pages),
             &mut HashMap::new(),
+            &mut KiroToolNameRegistry::default(),
             ToolCompatibilityMode::ClaudeCode,
         )
         .is_err());
@@ -3930,6 +4052,98 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(bytes.contains("very_long_original_name"));
+    }
+
+    #[test]
+    fn request_tool_registry_prefers_exact_names_and_only_restores_unique_children() {
+        let mut unique = KiroToolNameRegistry::default();
+        unique.register("mcp__repo__search", "mcp__repo__search");
+        assert_eq!(unique.resolve("search").unwrap(), "mcp__repo__search");
+        assert_eq!(
+            unique.resolve("mcp__repo__search").unwrap(),
+            "mcp__repo__search"
+        );
+        assert_eq!(unique.resolve("ordinary").unwrap(), "ordinary");
+
+        let mut exact_plain = unique.clone();
+        exact_plain.register("search", "search");
+        assert_eq!(exact_plain.resolve("search").unwrap(), "search");
+
+        let mut ambiguous = unique;
+        ambiguous.register("mcp__other__search", "mcp__other__search");
+        let error = ambiguous.resolve("search").unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+        assert!(error.to_string().contains("ambiguous bare tool name"));
+
+        let mut builtin = KiroToolNameRegistry::default();
+        builtin.register("fs_write", "Write");
+        assert_eq!(builtin.resolve("fs_write").unwrap(), "Write");
+    }
+
+    #[test]
+    fn request_tool_registry_excludes_names_seen_only_in_history() {
+        let historical_name = format!("mcp__history__{}", "read".repeat(24));
+        let body = json!({
+            "model": "claude-sonnet-4-8",
+            "messages": [
+                {"role":"user","content":"earlier"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"toolu_history",
+                    "name":historical_name,
+                    "input":{}
+                }]},
+                {"role":"user","content":"now"}
+            ],
+            "tools": [{
+                "name":"mcp__current__read",
+                "input_schema":{"type":"object","properties":{}}
+            }]
+        });
+        let request =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::Raw).unwrap();
+        assert!(request
+            .tool_name_map
+            .values()
+            .any(|name| name == &historical_name));
+        assert_eq!(
+            request.tool_name_registry.resolve("read").unwrap(),
+            "mcp__current__read"
+        );
+        assert!(!request
+            .tool_name_registry
+            .original_names
+            .contains(&historical_name));
+    }
+
+    #[test]
+    fn fragmented_tool_json_uses_request_registry_and_ambiguity_fails_closed() {
+        let mut registry = KiroToolNameRegistry::default();
+        registry.register("mcp__repo__read", "mcp__repo__read");
+        let mut builder =
+            SseBuilder::new_with_registry("claude-sonnet-4-8".to_string(), registry, 200_000);
+        assert!(builder
+            .tool_delta("toolu_fragmented", "read", "{\"path\":", false)
+            .unwrap()
+            .is_empty());
+        let output = builder
+            .tool_delta("toolu_fragmented", "read", "\"src/lib.rs\"}", true)
+            .unwrap()
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("mcp__repo__read"), "{output}");
+        assert!(output.contains("src/lib.rs"), "{output}");
+
+        let mut ambiguous = KiroToolNameRegistry::default();
+        ambiguous.register("mcp__a__read", "mcp__a__read");
+        ambiguous.register("mcp__b__read", "mcp__b__read");
+        let mut builder =
+            SseBuilder::new_with_registry("claude-sonnet-4-8".to_string(), ambiguous, 200_000);
+        let error = builder
+            .tool_delta("toolu_ambiguous", "read", "{}", true)
+            .unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
     }
 
     #[test]
@@ -4673,11 +4887,23 @@ mod tests {
     fn tool_json_accumulator_bounds_fragments_across_frames() {
         let mut accumulator = ToolJsonAccumulator::with_max_buffered_bytes(8);
         assert!(accumulator
-            .push("toolu_limit", "Write", "{\"x\":", false, &HashMap::new())
+            .push(
+                "toolu_limit",
+                "Write",
+                "{\"x\":",
+                false,
+                &KiroToolNameRegistry::default(),
+            )
             .unwrap()
             .is_none());
         let error = accumulator
-            .push("toolu_limit", "Write", "1234", true, &HashMap::new())
+            .push(
+                "toolu_limit",
+                "Write",
+                "1234",
+                true,
+                &KiroToolNameRegistry::default(),
+            )
             .unwrap_err();
         assert!(matches!(
             error,
@@ -4845,6 +5071,35 @@ mod tests {
         assert!(!is_client_validation_error(
             br#"{"__type":"ValidationException","message":"temporary"}"#
         ));
+    }
+
+    #[test]
+    fn compact_contract_is_disabled_for_kiro_and_amazon_q_only() {
+        for provider_type in [ProviderType::KiroOAuth, ProviderType::AmazonQOAuth] {
+            let direct = enforce_disabled_compaction_contract(
+                provider_type,
+                ProxyRoute::CodexResponsesCompact,
+                &Bytes::from_static(br#"{"input":[]}"#),
+            )
+            .unwrap_err();
+            assert_eq!(direct.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(direct.message.contains("disabled pending"));
+
+            let marker = Bytes::from_static(br#"{"input":[{"type":"compaction_trigger"}]}"#);
+            assert!(enforce_disabled_compaction_contract(
+                provider_type,
+                ProxyRoute::CodexResponses,
+                &marker,
+            )
+            .is_err());
+        }
+
+        assert!(enforce_disabled_compaction_contract(
+            ProviderType::CodexOAuth,
+            ProxyRoute::CodexResponsesCompact,
+            &Bytes::from_static(br#"{"input":[]}"#),
+        )
+        .is_ok());
     }
 
     #[test]

@@ -42,4 +42,4 @@
 
 ## 只读来源
 
-差异证据冻结在 `assets/contract/kiro-reference-delta.json`：`kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 的 committed `src/anthropic/cache_metering.rs` 与 `src/anthropic/stream.rs`，以及 `f2cc574`、`19b7f4b`、`47633a4` 历史对象。外部工作树不是构建、测试、发布或运行时依赖；默认审计只验证本仓库合同，显式 `--check-sources` 才读取这些 Git objects。
+差异证据冻结在 `assets/contract/kiro-reference-delta.json`：`kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 的 committed prompt-cache 对象与 `f2cc574`、`19b7f4b`、`47633a4` 历史对象继续保留；2026-09-18 另追加 `f413e7de`、`3194bb29`、`0b8c7dec`、`d62054f5`、`13763b69` 的 tool/profile/compact 增量。外部工作树不是构建、测试、发布或运行时依赖；默认审计只验证本仓库合同，显式 `--check-sources` 才按 commit 与 SHA-256 读取这些 Git objects。

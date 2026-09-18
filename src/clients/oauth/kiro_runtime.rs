@@ -154,6 +154,7 @@ struct ModelDiscoveryFailure {
     kind: ModelDiscoveryFailureKind,
     message: String,
     status: Option<reqwest::StatusCode>,
+    profile_arn_compatibility_error: bool,
 }
 
 impl ModelDiscoveryFailure {
@@ -162,6 +163,7 @@ impl ModelDiscoveryFailure {
             kind: ModelDiscoveryFailureKind::Transient,
             message: message.into(),
             status: None,
+            profile_arn_compatibility_error: false,
         }
     }
 
@@ -170,6 +172,7 @@ impl ModelDiscoveryFailure {
             kind: ModelDiscoveryFailureKind::Unavailable,
             message: message.into(),
             status: None,
+            profile_arn_compatibility_error: false,
         }
     }
 
@@ -178,6 +181,7 @@ impl ModelDiscoveryFailure {
             kind: ModelDiscoveryFailureKind::Transient,
             message: message.into(),
             status: Some(status),
+            profile_arn_compatibility_error: false,
         }
     }
 
@@ -186,7 +190,13 @@ impl ModelDiscoveryFailure {
             kind: ModelDiscoveryFailureKind::Unavailable,
             message: message.into(),
             status: Some(status),
+            profile_arn_compatibility_error: false,
         }
+    }
+
+    fn with_profile_arn_compatibility_error(mut self, eligible: bool) -> Self {
+        self.profile_arn_compatibility_error = eligible;
+        self
     }
 }
 
@@ -506,10 +516,7 @@ async fn fetch_models(
             .await
             {
                 Ok(models) => return Ok(models),
-                Err(error)
-                    if error.status == Some(reqwest::StatusCode::FORBIDDEN)
-                        && profile_arn.is_some() =>
-                {
+                Err(error) if error.profile_arn_compatibility_error && profile_arn.is_some() => {
                     last_failure = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -543,10 +550,7 @@ async fn fetch_models(
             .await
             {
                 Ok(models) => return Ok(models),
-                Err(error)
-                    if error.status == Some(reqwest::StatusCode::FORBIDDEN)
-                        && profile_arn.is_some() =>
-                {
+                Err(error) if error.profile_arn_compatibility_error && profile_arn.is_some() => {
                     last_failure = Some(error);
                 }
                 Err(error) => {
@@ -632,22 +636,7 @@ async fn fetch_models_request(
             };
             ModelDiscoveryFailure::transient(format!("model discovery transport failed ({kind})"))
         })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let message = format!("model discovery returned {status}");
-        return Err(
-            if status.is_server_error()
-                || matches!(
-                    status,
-                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
-                )
-            {
-                ModelDiscoveryFailure::transient_with_status(message, status)
-            } else {
-                ModelDiscoveryFailure::unavailable_with_status(message, status)
-            },
-        );
-    }
+    let status = response.status();
     let payload = response.bytes().await.map_err(|error| {
         ModelDiscoveryFailure::transient(format!("model discovery response body failed: {error}"))
     })?;
@@ -655,6 +644,23 @@ async fn fetch_models_request(
         return Err(ModelDiscoveryFailure::unavailable(format!(
             "model discovery response exceeded {MAX_MODEL_CATALOG_BYTES} bytes"
         )));
+    }
+    if !status.is_success() {
+        let message = format!("model discovery returned {status}");
+        let failure = if status.is_server_error()
+            || matches!(
+                status,
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ) {
+            ModelDiscoveryFailure::transient_with_status(message, status)
+        } else {
+            ModelDiscoveryFailure::unavailable_with_status(message, status)
+        };
+        return Err(
+            failure.with_profile_arn_compatibility_error(profile_arn_compatibility_error(
+                status, &payload,
+            )),
+        );
     }
     let payload = serde_json::from_slice::<AvailableModelsResponse>(&payload).map_err(|_| {
         ModelDiscoveryFailure::unavailable(
@@ -693,6 +699,14 @@ async fn fetch_models_request(
             .or_insert(descriptor);
     }
     Ok(by_id.into_values().collect())
+}
+
+fn profile_arn_compatibility_error(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+        || (status == reqwest::StatusCode::BAD_REQUEST
+            && std::str::from_utf8(body).is_ok_and(|body| {
+                body.contains("Improperly formed request") || body.contains("Invalid profileArn")
+            }))
 }
 
 pub fn model_discovery_url(account: &Account) -> Result<String, String> {
@@ -1362,6 +1376,106 @@ mod tests {
         assert_eq!(catalog.source, "kiro_identity_unresolved");
         assert!(!catalog.stale);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn model_profile_fallback_only_accepts_evidenced_status_and_body_pairs() {
+        for (status, body) in [
+            (reqwest::StatusCode::FORBIDDEN, b"profile denied".as_slice()),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                br#"{"message":"Improperly formed request."}"#.as_slice(),
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                br#"{"message":"Invalid profileArn."}"#.as_slice(),
+            ),
+        ] {
+            assert!(profile_arn_compatibility_error(status, body));
+        }
+
+        for (status, body) in [
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                b"invalid request".as_slice(),
+            ),
+            (reqwest::StatusCode::UNAUTHORIZED, b"expired".as_slice()),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                b"slow down".as_slice(),
+            ),
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                b"retry later".as_slice(),
+            ),
+        ] {
+            assert!(
+                !profile_arn_compatibility_error(status, body),
+                "unexpected profile fallback for {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_retries_profileless_after_evidenced_bad_request_only() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_route = std::sync::Arc::clone(&observed);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let observed = std::sync::Arc::clone(&observed_for_route);
+                async move {
+                    let query = uri.query().unwrap_or_default().to_string();
+                    observed.lock().unwrap().push(query.clone());
+                    if query.contains("profileArn=") {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"message":"Invalid profileArn."})),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(json!({"models":[{"modelId":"profileless-model"}]}))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-profile-400-fallback-{}", crate::infra::time::now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "accessToken": "valid-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test"
+            }
+        }))
+        .unwrap();
+        let catalog = model_catalog(
+            &reqwest::Client::new(),
+            &account,
+            Some(&format!("http://{address}/models?origin=AI_EDITOR")),
+        )
+        .await;
+        assert_eq!(
+            catalog.model_ids().collect::<Vec<_>>(),
+            ["profileless-model"]
+        );
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].contains("profileArn="));
+        assert!(!observed[1].contains("profileArn="));
+        drop(observed);
         server.abort();
     }
 

@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-kiro-reference-delta",
   "schemaVersion": 1,
-  "capturedAt": "2026-09-11T00:00:00Z",
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
@@ -24,6 +24,55 @@
         {
           "path": "src/anthropic/stream.rs",
           "sha256": "ea907b7180553ff37fd2c39b68f10b873bb29fefdd3c24ebdd4f55df23b47847"
+        }
+      ],
+      "deltas": [
+        {
+          "id": "unique_bare_namespaced_tool",
+          "commits": ["f413e7de13108094cca7c59a57ca3c2c6cf1e40a"],
+          "files": [
+            {
+              "commit": "f413e7de13108094cca7c59a57ca3c2c6cf1e40a",
+              "path": "src/anthropic/responses.rs",
+              "sha256": "07f4936fbd35463e6023ed8d91cb7f0e0a78b079c422d446dc5ee7e88411ee40"
+            }
+          ]
+        },
+        {
+          "id": "profile_arn_compatibility_fallback",
+          "commits": ["3194bb29331e42d6c143bd3d35bae4e0aec80c7d"],
+          "files": [
+            {
+              "commit": "3194bb29331e42d6c143bd3d35bae4e0aec80c7d",
+              "path": "src/kiro/token_manager.rs",
+              "sha256": "a5dc2d573c2e092f13f5b5cd57448ba889994c81ea2465c2cc6e4ce037eb671d"
+            }
+          ]
+        },
+        {
+          "id": "remote_responses_compaction",
+          "commits": [
+            "0b8c7decf0f158cc3efc8314fac6419175cc4fc1",
+            "d62054f5ffb38f205378837cf6189b35e109419a",
+            "13763b69662b0bfd420885b6769190d6d183d6ea"
+          ],
+          "files": [
+            {
+              "commit": "0b8c7decf0f158cc3efc8314fac6419175cc4fc1",
+              "path": "src/anthropic/responses_compaction.rs",
+              "sha256": "a363f8e9867e1120049d3f4c1daa248b0028614318e836a32d9101ea158125df"
+            },
+            {
+              "commit": "d62054f5ffb38f205378837cf6189b35e109419a",
+              "path": "src/anthropic/responses_compaction.rs",
+              "sha256": "3537f691c31f26e02edf9caafb2d25d4c04ea769e798ef7809b2704bfb3082cd"
+            },
+            {
+              "commit": "13763b69662b0bfd420885b6769190d6d183d6ea",
+              "path": "src/anthropic/responses_compaction.rs",
+              "sha256": "af89e44eace9db1a7766b11f6cb546ae018353b09748b5be620df605ebbec6fc"
+            }
+          ]
         }
       ]
     }
@@ -72,6 +121,94 @@
       "runtimeEnabled": false,
       "path": "docs/provider/kiro-prompt-cache.md",
       "anchors": ["KI-05：共享缓存门禁", "runtimeEnabled=false"]
+    }
+  ],
+  "incrementalEnhancements": [
+    {
+      "id": "KI-N1",
+      "status": "fixture_verified",
+      "referenceDelta": "unique_bare_namespaced_tool",
+      "resolutionOrder": [
+        "exact_upstream_mapping",
+        "exact_original_declaration",
+        "unique_namespaced_child",
+        "ordinary_unmatched_name"
+      ],
+      "ambiguousChild": "KIRO_EVENT_STREAM_INVALID",
+      "registryScope": "current request declarations only; excludes history, Account, Share, session, and process caches",
+      "evidence": [
+        {
+          "path": "src/proxy/kiro.rs",
+          "anchors": [
+            "KiroToolNameRegistry",
+            "request_tool_registry_excludes_names_seen_only_in_history",
+            "fragmented_tool_json_uses_request_registry_and_ambiguity_fails_closed"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"]
+        }
+      ]
+    },
+    {
+      "id": "KI-N2",
+      "status": "fixture_verified",
+      "referenceDelta": "profile_arn_compatibility_fallback",
+      "allowedProfilelessRetry": [
+        "403_with_profile_arn",
+        "400_Improperly_formed_request_with_profile_arn",
+        "400_Invalid_profileArn_with_profile_arn"
+      ],
+      "forbiddenFallbackClasses": [
+        "401",
+        "429",
+        "5xx",
+        "timeout",
+        "tls",
+        "transport",
+        "decode",
+        "invalid_success_contract"
+      ],
+      "usageHostFallbackEnabled": false,
+      "evidence": [
+        {
+          "path": "src/clients/oauth/kiro_device.rs",
+          "anchors": [
+            "should_retry_usage_without_profile_arn",
+            "usage_profile_fallback_only_accepts_evidenced_profile_rejections"
+          ]
+        },
+        {
+          "path": "src/clients/oauth/kiro_runtime.rs",
+          "anchors": [
+            "profile_arn_compatibility_error",
+            "discovery_retries_profileless_after_evidenced_bad_request_only"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "KI-N3",
+      "status": "fixture_verified_fail_closed",
+      "referenceDelta": "remote_responses_compaction",
+      "runtimeEnabled": false,
+      "liveStatus": "live_pending",
+      "receipt": null,
+      "zeroUpstreamBeforeReject": true,
+      "evidence": [
+        {
+          "path": "src/proxy/kiro.rs",
+          "anchors": [
+            "enforce_disabled_compaction_contract",
+            "compact_contract_is_disabled_for_kiro_and_amazon_q_only"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["kiro_and_amazon_q_compact_fail_before_any_upstream_request"]
+        }
+      ]
     }
   ],
   "fixtureAcceptance": {
