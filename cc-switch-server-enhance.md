@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18。最终集成基线：cc-switch-server@4712ca063930fea507910c37749595c8d6acc073。
+> 分析日期：2026-09-18。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。本轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`；最终文档提交不改变下述生产行为。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -10,17 +10,45 @@
 
 2026-09-11 版计划已经由 9c128d2、e3a9ed2、da2ae48 和 ae7fc88 大体实施完毕，但旧文档仍把 reasoning replay、统一恢复边界、Kiro Prompt Cache、SQLite authority、迁移、备份和回滚写成未来工作。继续照旧计划执行会重复建设并破坏已经验证的边界，因此本文整体替换旧计划，只保留已完成基线，并为本次参考仓库增量建立新的 N 系列编号。
 
-当前最值得优先补强的不是增加 Provider，而是五组窄而深的问题：
+分析起点最值得优先补强的不是增加 Provider，而是五组窄而深的问题；它们已在 0.1 所列提交中完成本地实现或保守门禁：
 
-1. Antigravity 的 Gemini grounding/citation 尚未形成三 Surface、流式与非流式一致的完整映射；搜索模型选择、billing metadata 和少数会话边缘形状也缺少请求级证据。
-2. Claude 429 分类会把 overage-only、模型级或含糊的限流信号扩大为 Account cooldown，影响固定账号的可用性。
-3. Codex Responses 把语义为空的启动 announcement 当成业务提交，可能提前关闭 pre-commit 恢复；内部 metadata 也没有按精确层级清理。
-4. Kiro 对裸 namespaced tool 名、profileArn fallback 和 Responses Compact 缺少保守合同。
-5. CodeBuddy 对中断工具轮次、reasoning-only assistant 和新 CN 原生模型的处理落后于参考实现。
+1. Antigravity 的 Gemini grounding/citation 当时尚未形成三 Surface、流式与非流式一致的完整映射；搜索模型选择、billing metadata 和少数会话边缘形状也缺少请求级证据。
+2. Claude 429 分类当时会把 overage-only、模型级或含糊的限流信号扩大为 Account cooldown，影响固定账号的可用性。
+3. Codex Responses 当时把语义为空的启动 announcement 当成业务提交，可能提前关闭 pre-commit 恢复；内部 metadata 也没有按精确层级清理。
+4. Kiro 当时对裸 namespaced tool 名、profileArn fallback 和 Responses Compact 缺少保守合同。
+5. CodeBuddy 当时对中断工具轮次、reasoning-only assistant 和新 CN 原生模型的处理落后于参考实现。
 
 Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的新增质量重试属于启发式策略，误伤风险高，不直接采纳。它们的工作重点是保持证据新鲜度和关闭真实账号验收，而不是重写已有 executor。
 
-### 0.1 当前优先级摘要
+### 0.1 实施结果快照
+
+本轮已完成全部 P0 的本地实现/门禁与可离线判定的 P1/P3 差分；没有真实凭据的项目未被提升为 live verified。落地提交如下：
+
+| 提交 | 结果 |
+| --- | --- |
+| `407a5e3` | Antigravity grounding/citation、模型搜索 capability snapshot、精确 metadata 与 conversation edge |
+| `38af767` | Claude 429 作用域、CAQS opaque replay、初始 turn fingerprint、tool/terminal 边界 |
+| `cc4e263` | Codex bootstrap/metadata、WebSocket 公平性与 request-lifecycle memory budget |
+| `d80662b` | Kiro namespaced tool、profileArn fallback 与 Compact 零发网门禁 |
+| `466291c` | Grok 只读质量观察；不重试、不轮换、不改写响应 |
+| `56447b1` | Cursor/Qoder 提交态证据刷新；均无新生产 wire |
+| `db65188` | CodeBuddy 11148 历史修复、reasoning/namespace 与取消生命周期 |
+| `248e7c2` | 收口 Clippy、Phase-0 源码证据哈希与跨仓审计语法兼容；无 wire 行为变化 |
+
+| 类别 | 本轮已关闭 | 仍保持门禁/后续计划 |
+| --- | --- | --- |
+| Antigravity | AG-N1～N5 `fixture_verified` | AG-N6 与两条 OAuth rail `live_pending` |
+| Claude | CL-N1～N4 `fixture_verified` | 厂商 CAQS/限流/Fable 接受性 `live_pending` |
+| Codex | CX-N1～N4 `fixture_verified` | 既有 GPT Image 2.5、WS prewarm 等真实门禁不变 |
+| Cursor | CUR-N2 `reviewed_no_wire_delta` | CUR-N1 OAuth/API-key 两 rail独立 `live_pending` |
+| Grok | GR-N1 `fixture_verified`（观察-only） | GR-N2 推理/媒体/compaction receipt `live_pending` |
+| Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture | KI-N3 启用与 auth kind × region receipt `live_pending` |
+| Qoder | QD-N2 `reviewed_no_wire_delta` | QD-N1 三 rail 独立 `live_pending` |
+| CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖 | CB-N4 与 Intl/CN receipt `live_pending`，v4.1 runtime disabled |
+
+CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 巨型热路径拆分、完整 reference-delta v2 迁移和所有 LIVE-N1 真站验收不属于本轮已完成项。
+
+### 0.2 原始优先级摘要
 
 | 优先级 | 必做项 | 目标 |
 | --- | --- | --- |
@@ -64,6 +92,10 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | differential_first | 静态证据不足，或目标已有相邻通用能力 | 先跑目标/冻结参考差分；只有红灯才改生产代码 |
 | live_only | 离线无法证明厂商接受性、entitlement 或真实 wire | 缺真实凭据时保持 live_pending，不得用 mock 升级 |
 | not_adopted | 与固定绑定、Server 产品边界或证据标准冲突 | 不进入实现 backlog，保留拒绝理由防止回流 |
+| fixture_verified | 本仓库自包含 fixture 已验证实现或保守门禁 | 只代表离线合同，不得外推真实厂商接受性 |
+| fixture_verified_existing_shared_* | 专项差分证明共享 bridge/guard 已等价覆盖 | 补专项测试与证据，不复制 Provider 私有分支 |
+| reviewed_no_wire_delta | 推荐参考的提交态复核没有协议增量 | 只刷新 evidence，不修改生产 executor |
+| live_pending / runtime disabled | 缺独立真实 receipt，或能力在运行时关闭 | 保持关闭/待验收；一条 rail 成功不提升其他 rail |
 
 优先级与状态相互独立。P0 表示一旦差距成立会造成高风险，不表示可以跳过证据门禁；live_only 即使排在 P1，也不能在没有真实 receipt 时启用。
 
@@ -125,10 +157,10 @@ fixture_verified 只说明本仓库自包含合同已通过，不等价于真实
 
 | 文件 | 行数 | 当前风险 |
 | --- | ---: | --- |
-| src/proxy/forwarder.rs | 46,052 | 八类 Provider 编排、HTTP/SSE/WS、错误作用域和恢复分支仍高度集中 |
-| src/state.rs | 34,469 | 域门面、后台任务和持久化编排过大；并非 SQLite 未完成，而是实现边界仍难审查 |
-| src/proxy/transforms.rs | 10,620 | 多 Surface、多 Provider 转换共享文件，边缘语义容易横向回归 |
-| src/proxy/stream_transforms.rs | 8,758 | 多种流事件和终态交织，提交时机改动影响面大 |
+| src/proxy/forwarder.rs | 49,030 | 八类 Provider 编排、HTTP/SSE/WS、错误作用域和恢复分支仍高度集中 |
+| src/state.rs | 34,495 | 域门面、后台任务和持久化编排过大；并非 SQLite 未完成，而是实现边界仍难审查 |
+| src/proxy/transforms.rs | 11,136 | 多 Surface、多 Provider 转换共享文件，边缘语义容易横向回归 |
+| src/proxy/stream_transforms.rs | 9,603 | 多种流事件和终态交织，提交时机改动影响面大 |
 | src/repository/server_sqlite.rs | 3,107 | authority 已完成，但 schema、校验和迁移逻辑应继续按关注点拆分 |
 
 结构优化必须与协议行为修复分离。先用 fixture 锁定 wire，再移动代码；不以文件行数下降作为单独成功指标。
@@ -137,7 +169,7 @@ fixture_verified 只说明本仓库自包含合同已通过，不等价于真实
 
 ### 4.1 已有能力
 
-目标已实现 managed OAuth、项目/tier/quota、模型目录、Claude/Gemini/OpenAI 三 Surface 桥接、function tools 与 web search 共存、reasoning replay、session scope/rollover、schema/transport/Retry-After 合同和同账号 pre-commit 恢复。src/proxy/adapters.rs 已能识别搜索请求并设置 requestType=web_search，但当前会无条件切换到固定 Gemini fallback model；普通请求会设置 requestType=agent。
+目标在分析起点已实现 managed OAuth、项目/tier/quota、模型目录、Claude/Gemini/OpenAI 三 Surface 桥接、function tools 与 web search 共存、reasoning replay、session scope/rollover、schema/transport/Retry-After 合同和同账号 pre-commit 恢复。起点的 src/proxy/adapters.rs 会对搜索请求无条件切换固定 Gemini fallback；AG-N2 已把它收敛为请求级能力快照与受证 fallback。普通请求的 requestType=agent 因 AG-N6 缺真实证据而保持不变。
 
 ### 4.2 参考增量
 
@@ -155,12 +187,12 @@ fixture_verified 只说明本仓库自包含合同已通过，不等价于真实
 
 | ID | 状态 | 优先级 | 差距与目标 |
 | --- | --- | --- | --- |
-| AG-N1 | confirmed_gap | P0 | 建立 Gemini grounding 到 Responses、Chat、Claude 的完整 citation 映射，覆盖流式/非流式、Unicode offset、重复 chunk 和事件顺序 |
-| AG-N2 | confirmed_gap | P1 | 用 request-scoped、per-model capability snapshot 决定搜索模型；带 catalog/provider/auth generation fence，禁止请求中途漂移 |
-| AG-N3 | confirmed_gap | P0 | 仅在 Gemini 目标精确过滤独立单行 billing metadata；当前 Gemini 路径不滤，既有 helper 又会过宽删除多行首行 |
-| AG-N4 | differential_first | P1 | 差分中途 system/developer 与孤立 tool output；红灯后保序包装/降级，不得静默删除 |
-| AG-N5 | differential_first | P1 | 冻结空 text part 与活动 block 生命周期；目标若已等价则只留 fixture |
-| AG-N6 | live_only | P1 | 用真实 Antigravity 请求差分普通文本是否应省略 requestType=agent；两个参考实现存在冲突 |
+| AG-N1 | fixture_verified | P0 | 已建立 Gemini grounding 到 Responses、Chat、Claude 的 citation 映射，覆盖流/非流、Unicode、重复 chunk 与事件顺序 |
+| AG-N2 | fixture_verified | P1 | 已按请求冻结 per-model capability 与 Account generation；未知能力使用受证 fallback，漂移发网前冲突 |
+| AG-N3 | fixture_verified | P0 | 仅过滤 Gemini 目标的独立单行 billing metadata；多行正文、消息与参数保持 |
+| AG-N4 | fixture_verified | P1 | 中途 system/developer 保序包装；孤立/错配 output 可逆降级，不伪造 pairing |
+| AG-N5 | fixture_verified | P1 | 空 text part 与活动 block 生命周期已由 fixture 冻结 |
+| AG-N6 | live_pending_no_change | P1 | 两个参考结论冲突且无真实 receipt；保持现有 requestType 行为 |
 
 AG-N1 的验收矩阵必须至少包含：
 
@@ -203,12 +235,12 @@ AG-N6 必须分别验证纯文本、只带 tools、带历史 tool call/result、
 
 | ID | 状态 | 优先级 | 差距与目标 |
 | --- | --- | --- | --- |
-| CL-N1 | confirmed_gap | P0 | 重写 Claude 429 scope 分类：只有共享窗口明确耗尽才设置 Account cooldown；overage、模型和 entitlement 信号保持窄作用域 |
-| CL-N2 | differential_first | P1 | 冻结 CAQS v4 reasoning signature 接受/拒绝矩阵；只有目标确实无法透传或验证时增加实现 |
-| CL-N3 | differential_first | P1 | 差分初始 turn fingerprint 在多轮、cache 和重试中的稳定性，不迁入 cloaking |
-| CL-N4 | differential_first | P1 | 增加 standalone tool output 与成功终态后断连专项测试；通用逻辑等价时不复制 Provider 特例 |
+| CL-N1 | fixture_verified | P0 | 仅共享 5h/7d 窗口明确耗尽且 reset 合法时写 Account cooldown；其余保持 model/Fable/request scope |
+| CL-N2 | fixture_verified | P1 | CAQS v4 作为 opaque signature 原样往返，不解析、不生成、不记录 |
+| CL-N3 | fixture_verified | P1 | 初始 turn fingerprint 在 system migration、cache 与 retry rewrite 前冻结；未迁入 cloaking |
+| CL-N4 | fixture_verified | P1 | standalone/错配 tool output 可逆降级；合法 message_stop 后立即完成并释放上游 body |
 
-当前 claude_fable_only_rejected 只把 5h/7d 明确 allowed 或 allowed_warning 视为共享窗口健康；classify_claude_rate_limit 又会把 unified rejected、7d_oi rejected 的含糊组合提升到 Account。需要冻结如下决策表：
+实施前，claude_fable_only_rejected 只把 5h/7d 明确 allowed 或 allowed_warning 视为共享窗口健康；classify_claude_rate_limit 会把 unified rejected、7d_oi rejected 的含糊组合提升到 Account。CL-N1 已按如下决策表收窄并冻结：
 
 | 证据形状 | 允许的作用域 |
 | --- | --- |
@@ -248,12 +280,12 @@ CL-N2 只验证签名 wire 和跨 Surface 保真，不自造签名，不记录 o
 
 | ID | 状态 | 优先级 | 差距与目标 |
 | --- | --- | --- | --- |
-| CX-N1 | confirmed_gap | P0 | 把语义为空的启动 announcement 归类为 Lifecycle，避免过早 CommitGuard；HTTP JSON、SSE、WS 和 Lite 共用闭集规则 |
-| CX-N2 | confirmed_gap | P0 | 精确删除 input 数组每个 item 顶层的 internal_chat_message_metadata_passthrough，保留 content、arguments 和任意用户嵌套字段 |
-| CX-N3 | differential_first | P1 | 用大 payload + 高频 ping/pong 压测验证 WS 饥饿；复现后再拆 reader/writer 或增加 control-priority channel |
-| CX-N4 | confirmed_gap | P2 | 在现有离散上限之上建立统一 request-scoped resident-memory budget，覆盖完整请求生命周期 |
+| CX-N1 | fixture_verified | P0 | 空 startup announcement 仅在闭集且语义为空时为 Lifecycle；HTTP JSON/SSE/WS/Lite 共用分类器 |
+| CX-N2 | fixture_verified | P0 | 只删 `input[*]` 顶层内部 metadata；content、arguments、嵌套同名字段与顺序保持 |
+| CX-N3 | fixture_verified | P1 | 已拆单 reader/writer actor、有界队列与 32 KiB continuation；双向 ping/pong 和取消不被大上传饿死 |
+| CX-N4 | fixture_verified | P2 | request-scoped sticky memory budget 已覆盖 HTTP/WS 全生命周期，耗尽稳定 503/error+close 且禁止 replay |
 
-src/proxy/response_semantics.rs 的 classify_value 当前只把 response.created、response.in_progress 和 response.queued 判为 Lifecycle，其余非终态默认 Business。因此空 response.output_item.added、response.content_part.added 和 response.reasoning_summary_part.added 会提交下游，后续 overload 不能再进行 pre-commit 恢复。
+实施前，src/proxy/response_semantics.rs 的 classify_value 只把 response.created、response.in_progress 和 response.queued 判为 Lifecycle，其余非终态默认 Business，因此空 response.output_item.added、response.content_part.added 和 response.reasoning_summary_part.added 会过早提交。CX-N1 已用下述闭集语义替换该行为。
 
 CX-N1 必须采用闭集且检查载荷是否语义为空：
 
@@ -291,8 +323,8 @@ OmniRoute 工作树有 22 项本地修改，全部排除在证据之外。后续
 
 | ID | 状态 | 优先级 | 工作与退出条件 |
 | --- | --- | --- | --- |
-| CUR-N1 | live_only | P1 | OAuth 与 API-key rail 分别产生本仓库 receipt，覆盖模型目录、非流/流、tool、usage、session continuation 和取消；一条成功不得外推另一条 |
-| CUR-N2 | differential_first | P2 | 周期复核 OmniRoute 已提交 Cursor/open-sse/protobuf hash；无 wire 增量时只追加“无变化”证据，不改生产实现 |
+| CUR-N1 | live_pending | P1 | OAuth 与 API-key rail 仍需分别产生本仓库 receipt；一条成功不得外推另一条 |
+| CUR-N2 | reviewed_no_wire_delta | P2 | 已复核 OmniRoute@02c663c；六个 wire 对象无变化，22 项工作树修改排除，生产代码不变 |
 
 CUR-N1 继续保持 Account 固定绑定。credential kind、endpoint、session identity 和 model catalog 必须写入脱敏 receipt 的结构字段；token、machine identity 原值和 prompt 不得落盘。
 
@@ -310,8 +342,8 @@ CUR-N1 继续保持 Account 固定绑定。credential kind、endpoint、session 
 
 | ID | 状态 | 优先级 | 工作与退出条件 |
 | --- | --- | --- | --- |
-| GR-N1 | differential_first | P3 | 只增加脱敏的质量诊断 fixture/指标，观察空可见文本、纯工具、短答和异常 dump；不自动重试 |
-| GR-N2 | live_only | P1 | 关闭既有推理/媒体矩阵和 remote compaction 的真实 receipt；无证据能力继续关闭 |
+| GR-N1 | fixture_verified_observation_only | P3 | JSON/SSE/WS 已增加低基数质量形状指标；逐字节透传，不自动重试、轮换或改写 |
+| GR-N2 | live_pending | P1 | 推理/媒体矩阵和 remote compaction 仍缺真实 receipt；无证据能力继续关闭 |
 
 GR-N1 指标只能记录低基数 outcome kind、是否有 terminal/tool/visible text 和有界长度桶，不能记录 plaintext、reasoning 或比例对应的原文。如果未来厂商提供明确错误码或 receipt 证明某形状必然失败，也只能在同账号、pre-commit、总预算内 fail closed 或重试一次；不能换账号。
 
@@ -337,11 +369,11 @@ GR-N1 指标只能记录低基数 outcome kind、是否有 terminal/tool/visible
 
 | ID | 状态 | 优先级 | 差距与目标 |
 | --- | --- | --- | --- |
-| KI-N1 | confirmed_gap | P0 | 恢复唯一的裸 namespaced tool：精确映射优先，只有唯一 child name 才回退，歧义必须失败关闭 |
-| KI-N2 | confirmed_gap | P1 | 收窄 quota/model 的 profileArn fallback；401、429、5xx、网络和协议错误不得被宽泛 fallback 掩盖 |
-| KI-N3 | confirmed_gap + live_only | P0/P1 | 先让 Kiro 的 /responses/compact 明确 fail closed；差分和真实 receipt 后才实现并开放专属合同 |
+| KI-N1 | fixture_verified | P0 | 当前请求注册表按精确映射→完整名→唯一 child→普通名解析；歧义稳定失败关闭 |
+| KI-N2 | fixture_verified | P1 | 仅带 ARN 的 403 或两个明确 400 形状允许同 host 去 ARN；其他错误不 fallback |
+| KI-N3 | fixture_verified_fail_closed / live_pending | P0/P1 | Kiro/Amazon Q Compact 发网前稳定拒绝且 decoy 为零；启用仍需差分与真实 receipt |
 
-当前 map_tool_name 只为 builtin rename 和超长名称保存 tool_name_map。若声明 mcp__repo__search 而 Kiro 回裸 search，original_tool_name 精确查找失败，会把 namespace 丢掉。KI-N1 的解析顺序必须固定：
+实施前 map_tool_name 只为 builtin rename 和超长名称保存 tool_name_map；若声明 mcp__repo__search 而 Kiro 回裸 search，original_tool_name 精确查找会丢 namespace。KI-N1 已把解析顺序固定为：
 
 1. 精确匹配实际发给上游的名称映射；
 2. 精确匹配原始完整声明名；
@@ -350,7 +382,7 @@ GR-N1 指标只能记录低基数 outcome kind、是否有 terminal/tool/visible
 
 候选索引是 request-scoped，只含当前请求的工具声明，不跨 Account、Share、session 或请求缓存。覆盖 mcp__a__read 与 mcp__b__read 歧义、builtin 映射、超长 hash、同名普通工具、流式分块参数和三 Surface 输出。
 
-当前 fetch_usage_limits 除 401 外几乎任何错误都会从带 ARN 回退到无 ARN，再尝试 CodeWhisperer host，可能把 429、5xx、body decode 和网络故障伪装成成功。KI-N2 应先冻结参考的精确 status/body：
+实施前 fetch_usage_limits 除 401 外几乎任何错误都会从带 ARN 回退到无 ARN，再尝试 CodeWhisperer host，可能把 429、5xx、body decode 和网络故障伪装成成功。KI-N2 已冻结并实现以下精确 status/body 边界：
 
 - 401/403 的身份语义分别处理，401 不重放到其他 host；
 - 只有参考证据明确允许的 403 或特定 400 才去掉 profileArn；
@@ -358,7 +390,7 @@ GR-N1 指标只能记录低基数 outcome kind、是否有 terminal/tool/visible
 - 5xx、超时、TLS、decode 和结构不合法直接返回原始分类；
 - 是否允许 q host → CodeWhisperer host 必须单独有 auth kind/region 证据，且仍使用同一个 Account credential。
 
-当前 forward_claude_kiro 会接收 CodexResponsesCompact，经过普通 adapter、普通 Kiro inference 和 Claude/Responses 转换，没有专属 compact 请求/响应合同，也没有明确拒绝。KI-N3 分两步：
+实施前 forward_claude_kiro 会接收 CodexResponsesCompact 并误走普通 Kiro inference。KI-N3 的 P0 已完成，P1 仍保持真实门禁：
 
 - P0：在发网前识别 Kiro/Amazon Q + CodexResponsesCompact，返回稳定 unsupported/fail-closed 错误；增加 decoy upstream，证明零请求。
 - P1：冻结请求 capsule、cache usage、terminal、错误、stream/non-stream 和 context limit 的差分 fixture；再用绑定账号取得真实 receipt。全部通过后才加入独立 compact executor，不能复用普通生成响应“看起来能用”就开放。
@@ -379,8 +411,8 @@ TokenRouter 从 3488b4a9 到 7faf9469 的 Qoder/COSY 路径净变化仅是 qoder
 
 | ID | 状态 | 优先级 | 工作与退出条件 |
 | --- | --- | --- | --- |
-| QD-N1 | live_only | P1 | Global OAuth、Global PAT、CN OAuth 分别产生 receipt；覆盖 login/refresh、catalog、quota、三 Surface、tool、usage、401 和 terminal+EOF |
-| QD-N2 | differential_first | P2 | 官方 CLI 升级时先冻结 package integrity/bundle digest，再更新 oracle；TokenRouter 只做独立交叉核对 |
+| QD-N1 | live_pending | P1 | Global OAuth、Global PAT、CN OAuth 仍需分别产生 receipt；三条 rail 状态互不继承 |
+| QD-N2 | reviewed_no_wire_delta | P2 | TokenRouter@7faf946 仅共享 error helper 签名适配；官方 CLI oracle 仍为第一来源，生产代码不变 |
 
 三条 rail 的成功状态互不继承。升级 oracle 时必须用 mutation 证明 endpoint、header、body、signature、machine identity 任一单边漂移会红灯；禁止 fixture 与 Rust 同时“顺手修改”造成假绿。
 
@@ -408,15 +440,15 @@ TokenRouter 从 3488b4a9 到 7faf9469 的 Qoder/COSY 路径净变化仅是 qoder
 
 | ID | 状态 | 优先级 | 差距与目标 |
 | --- | --- | --- | --- |
-| CB-N1 | confirmed_gap | P0 | CodeBuddy 专属完整 tool round repair，冻结并消除可复现的 11148；只修历史，不伪造当前工具结果 |
-| CB-N2 | confirmed_gap | P0 | 在语义过滤前保留 reasoning-only assistant；Responses reasoning/message/function call 合并为同一逻辑 turn |
-| CB-N3 | differential_first | P1 | namespace tool 在 Claude、Chat、Responses 三 Surface 的声明、调用和结果闭环差分 |
-| CB-N4 | live_only | P1 | 以 CN 真实证据冻结 deepseek-v4.1-flash 精确 ID、capability、reasoning_summary、verbosity 和 context window |
-| CB-N5 | differential_first | P1 | 增加取消、截断、terminal 前/后断连专项 fixture；通用 guard 等价时不增加 Provider 分支 |
+| CB-N1 | fixture_verified | P0 | 完整轮次原样保留；中断/孤立/重复/错配/截断历史修复 11148，不伪造 result |
+| CB-N2 | fixture_verified | P0 | reasoning 先规范化后过滤；Responses reasoning/message/function call 合并为同一 turn |
+| CB-N3 | fixture_verified_existing_shared_bridge | P1 | Claude、Chat、Responses 声明/call/result 闭环通过；不采用裸 child fallback |
+| CB-N4 | live_pending_runtime_disabled | P1 | 缺 CN 目录/receipt；`deepseek-v4.1-flash` 不进入 reviewed allowlist，不泛化专属字段 |
+| CB-N5 | fixture_verified_existing_shared_guard | P1 | 截断、重复/后置 terminal、marker 前后取消通过；未增加 Provider 私有 guard |
 
-当前 build_codebuddy_payload 在把 reasoning_content 改名为 reasoning 之前先执行 messages.retain(codebuddy_message_is_semantic)，而 predicate 不识别 reasoning 字段，因此 content 为空但含 reasoning_content 的 assistant 会被删除。CB-N2 应先 canonicalize reasoning，再做语义判断；reasoning-only、tool-call-only 和 tool-result 必须视为有效，真正全空 message 仍按旧 CB-01 规则清理。
+实施前 build_codebuddy_payload 在把 reasoning_content 改名为 reasoning 之前先执行 messages.retain(codebuddy_message_is_semantic)，而 predicate 不识别 reasoning 字段，因此 content 为空但含 reasoning_content 的 assistant 会被删除。CB-N2 已改为先 canonicalize reasoning，再做语义判断；reasoning-only、tool-call-only 和 tool-result 视为有效，真正全空 message 仍按旧 CB-01 规则清理。
 
-CB-N1 需要明确“完整工具轮次”的边界：
+CB-N1 已按以下边界冻结“完整工具轮次”：
 
 - 保留 ID 唯一、assistant call 与后续 result 完整配对的轮次；
 - 对历史中断 call、缺 result、孤立 result、重复 ID、截断 arguments 和跨 turn 错配分别冻结 11148 fixture；
@@ -424,11 +456,11 @@ CB-N1 需要明确“完整工具轮次”的边界：
 - repair 后重新验证 tool name、ID 和顺序，并保持普通消息不变；
 - Chat、Responses 和 Claude 输入先归一为逻辑 turn，再执行一次 repair，避免三个适配器各有不同规则。
 
-CB-N3 对 namespace 的验收与 KI-N1 不同：它验证 CodeBuddy 自身是否保留完整声明名以及返回形状，不自动套用 Kiro 的裸 child fallback。歧义、超长名、built-in 相似名和用户普通双下划线名称都要覆盖。
+CB-N3 对 namespace 的验收与 KI-N1 不同：它验证 CodeBuddy 自身是否保留完整声明名以及返回形状，不自动套用 Kiro 的裸 child fallback。共享 transform 已覆盖 namespace 往返、超长稳定 hash、built-in 冲突和用户普通双下划线名称；CodeBuddy 专项 fixture 再覆盖三 Surface 进入上游前的声明/call/result 闭环。
 
 CB-N4 在没有 CN 绑定账号 receipt 或冻结 vendor catalog 前，不把 deepseek-v4.1-flash 加入公开 capability。证据成立后也只对精确 native ID 设置模型专属字段；reasoning_summary=auto、verbosity=high 和 context window 不得泛化到所有 CodeBuddy 模型，且不得把 deepseek-v4.1-flash 重写为 deep-model 或其他 alias。
 
-CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项测试若全绿，结论为“通用实现已覆盖”，不复制 cli2api 的语言/框架特定代码。
+CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项测试已覆盖终态前截断、`[DONE]` 后无 EOF 和 marker 前后取消，结论为“通用实现已覆盖”，未复制 cli2api 的语言/框架特定代码。
 
 ### 11.4 不采纳
 
@@ -438,7 +470,7 @@ CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项�
 
 ### 12.1 CORE-N1：渐进拆分巨型热路径
 
-状态：confirmed_gap；优先级：P2。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
+状态：pending；优先级：P2。这里的差距是可维护性和审查边界，不是 execution 原语缺失；本轮没有把协议修复与大规模纯移动混在同一批提交中。
 
 建议目标结构：
 
@@ -468,7 +500,7 @@ state.rs 保留 ServerStateInner 作为跨域门面，逐步把 Account lifecycl
 
 ### 12.2 CORE-N2：统一请求生命周期内存预算
 
-状态：confirmed_gap；优先级：P2；先在 CX-N4 落地，再抽象给其他大 payload Provider。
+状态：partially_completed；优先级：P2。CX-N4 已以 `src/proxy/request_memory.rs` 落地 Codex HTTP/WS 请求生命周期预算；抽象给其他大 payload Provider 仍待按各自 wire/owner 生命周期逐项验证。
 
 预算对象绑定 request，不绑定 Account 全局静态值；至少核算：
 
@@ -483,7 +515,7 @@ state.rs 保留 ServerStateInner 作为跨域门面，逐步把 Account lifecycl
 
 ### 12.3 EVID-N1：reference delta v2
 
-状态：confirmed_gap；优先级：P2。
+状态：partially_completed；优先级：P2。八类 delta 已追加本轮 commit/object digest、处置和本地测试映射，但文件仍使用各自 schema v1；统一 append-only schema v2 与历史不可变迁移尚未完成。
 
 现有八个 assets/contract/*-reference-delta.json 已冻结上一轮证据。新一轮不得覆盖旧 source commit 后假装历史从未存在；应扩展为 append-only observation 或新 revision，至少记录：
 
@@ -498,7 +530,7 @@ audit 必须验证 commit 格式、ID 唯一、目标文件存在、历史 obser
 
 ### 12.4 LIVE-N1：统一真实验收队列
 
-状态：live_only；优先级：P1。
+状态：live_pending；优先级：P1。本轮没有真实凭据输入，以下 rail 均未被 fixture 或参考项目结果错误提升。
 
 待关闭的 rail：
 
@@ -529,6 +561,8 @@ SQLite authority、迁移、备份和回滚不再列为新阶段。后续协议�
 
 ### Phase 0：冻结增量证据和失败形状
 
+状态：本轮完成。八类推荐参考均固定提交态来源；有修改的工作树只读取 Git object；adopt/differential/live gate/reject 已映射到本地合同与测试。
+
 | 顺序 | 工作 | 退出条件 |
 | --- | --- | --- |
 | 0.1 | 为全部 N 项建立 source commit/path/target symbol 映射 | 每项可追溯，not_adopted 也记录理由 |
@@ -539,6 +573,8 @@ SQLite authority、迁移、备份和回滚不再列为新阶段。后续协议�
 若 fixture 在当前 HEAD 已经通过，应把项目从 confirmed_gap 降为“已有覆盖/仅补测试”，不得为了匹配参考代码形状修改实现。
 
 ### Phase 1：P0 协议与作用域修复
+
+状态：本轮完成。下列顺序保留为实现审计记录；每项均有自包含 fixture，未引入跨账号/Provider/rail/site 恢复。
 
 推荐切片顺序：
 
@@ -565,6 +601,8 @@ Phase 1 总退出条件：
 
 ### Phase 2：P1 差分、能力与真实验收
 
+状态：离线可判定项已完成；所有需要真实凭据的条目仍为 `live_pending`，没有用 mock 或参考项目结果替代本仓库 receipt。
+
 | 组 | 工作 |
 | --- | --- |
 | Antigravity | AG-N2、AG-N4、AG-N5、AG-N6 |
@@ -581,6 +619,8 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
+状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、CUR-N2 与 QD-N2 已完成；CORE-N1、跨 Provider memory 推广和统一 reference-delta schema v2 留待后续独立变更。
+
 1. 先完成 CX-N4 的 request memory budget，再抽取 CORE-N2。
 2. 按 Provider 分批实施 CORE-N1，先拆新修复最集中的 Antigravity、Codex、Kiro、CodeBuddy。
 3. 实施 EVID-N1 append-only reference delta v2。
@@ -590,6 +630,8 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 Phase 3 退出条件是依赖方向、锁顺序、wire golden、故障测试和存储 audit 全部通过；文件变短本身不是退出条件。
 
 ### Phase 4：P3 观察项
+
+状态：GR-N1 已按 observation-only 完成；没有增加自动质量重试。
 
 只实施 GR-N1 的脱敏诊断与经数据证明的低收益优化。任何自动质量重试都需要厂商明确错误信号、真实 receipt、同账号 pre-commit 约束和误报评估，否则保持 not_adopted。
 
@@ -612,9 +654,22 @@ scripts/smoke/smoke-local.sh
 RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 ~~~
 
-本文档本身只需要 Markdown/diff 校验和 docs index；未来代码实施必须运行与改动范围相称的完整门禁。
+本轮包含生产代码、合同与审计修改，已运行完整门禁；以后只改本文档时才可缩减为 Markdown/diff 与 docs index，后续代码实施仍必须运行与风险相称的完整门禁。
 
-### 14.2 专项测试矩阵
+### 14.2 本轮最终验证快照
+
+| 门禁 | 2026-09-18 结果 | 判定 |
+| --- | --- | --- |
+| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3109 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
+| `scripts/static-checks.sh` | rustfmt、Clippy、JSON/Node/Shell、Provider/产品边界/依赖方向/文档审计全部通过；Provider audit 71 tests、Web 41 files/213 tests 通过 | 通过 |
+| 八类 reference delta `--check-sources` | Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 均按冻结 Git object 通过 | 通过；不构成 live receipt |
+| `scripts/smoke/smoke-local.sh` | health、Web fallback、setup、密码/API Token 登录、Provider/Share 创建通过 | 通过 |
+| `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh` | `failures=0`，但因主动跳过内置测试产生 1 个 internal blocker；缺 8 个真实环境输入且 deployment 未测，共 9 个 blocker | `decision=blocked` / `blocked_inputs`，符合预期 |
+| `git diff --check`、docs index | 无 whitespace 错误；文档索引完整 | 通过 |
+
+正式测试使用 64 MiB `RUST_MIN_STACK`；默认 2 MiB 线程栈的既有溢出不作为本轮回归。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
+
+### 14.3 专项测试矩阵
 
 | 范围 | 必测内容 |
 | --- | --- |
@@ -628,7 +683,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | Memory budget | 每阶段 reserve/release、压缩膨胀、fallback、取消、背压、并发隔离 |
 | Live receipt | rail/site/model/operation 独立，secret scan，通过与 blocked_inputs 都可审计 |
 
-### 14.3 差分判定纪律
+### 14.4 差分判定纪律
 
 - 比较协议语义，不要求不同 Surface 产生相同 JSON。
 - 参考实现与厂商证据冲突时，以厂商证据和本仓库真实 receipt 为高优先级。
@@ -636,7 +691,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 - 差分绿灯只补测试和 evidence，不做无意义代码同构。
 - 差分红灯后只修该失败形状，并用 decoy/mutation 防止规则扩大。
 
-### 14.4 发布阻断条件
+### 14.5 发布阻断条件
 
 出现以下任一情况不得提升 capability 或 live 状态：
 
@@ -732,3 +787,5 @@ CodeBuddy：
 10. SQLite authority、迁移、备份与回滚保持既有实现，不被重复建设或退回 JSON 双写。
 11. registry、合同源、生成 coverage、UI matrix、PROTOCOL_EVIDENCE 和 reference delta 一致；docs/provider/coverage.md 未被手改。
 12. 外部仓库没有进入构建、测试、CI、发布或运行时依赖。
+
+当前判定：第 1～7、9～12 项已在本轮本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。CORE-N1、CORE-N2 的跨 Provider 推广、EVID-N1 schema v2 也仍是明确后续项。因此可以关闭本轮静态差分与 P0/P1 离线实施，但不能把完整真实验收队列或后续架构计划标记为完成。
