@@ -4700,11 +4700,11 @@ fn anthropic_history_thinking_is_signed(block: &Value) -> bool {
         Some("thinking") => block
             .get("signature")
             .and_then(Value::as_str)
-            .is_some_and(|signature| !signature.is_empty()),
+            .is_some_and(|signature| !signature.trim().is_empty()),
         Some("redacted_thinking") => block
             .get("data")
             .and_then(Value::as_str)
-            .is_some_and(|data| !data.is_empty()),
+            .is_some_and(|data| !data.trim().is_empty()),
         _ => false,
     }
 }

@@ -59,8 +59,8 @@ pub(crate) fn parse_claude_quota_headers(
             let reset_header = format!("anthropic-ratelimit-unified-{}-reset", spec.header_window);
             let status_header =
                 format!("anthropic-ratelimit-unified-{}-status", spec.header_window);
-            let utilization =
-                parse_utilization_header(headers, &utilization_header).or_else(|| {
+            let utilization = parse_claude_utilization_header(headers, &utilization_header)
+                .or_else(|| {
                     (header_lower(headers, &status_header).as_deref() == Some("rejected"))
                         .then_some(1.0)
                 });
@@ -86,11 +86,13 @@ pub(crate) fn claude_fable_only_rejected(headers: &HeaderMap, fable_request: boo
     fable_request
         && header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status").as_deref()
             == Some("rejected")
-        && claude_shared_window_allowed(
+        && claude_shared_window_explicitly_healthy(
             header_lower(headers, "anthropic-ratelimit-unified-5h-status").as_deref(),
+            parse_claude_utilization_header(headers, "anthropic-ratelimit-unified-5h-utilization"),
         )
-        && claude_shared_window_allowed(
+        && claude_shared_window_explicitly_healthy(
             header_lower(headers, "anthropic-ratelimit-unified-7d-status").as_deref(),
+            parse_claude_utilization_header(headers, "anthropic-ratelimit-unified-7d-utilization"),
         )
 }
 
@@ -113,7 +115,7 @@ pub(crate) fn parse_anthropic_reset_header(
     parse_anthropic_reset_value(value, now_ms, max_future_ms)
 }
 
-fn parse_utilization_header(headers: &HeaderMap, name: &str) -> Option<f64> {
+pub(crate) fn parse_claude_utilization_header(headers: &HeaderMap, name: &str) -> Option<f64> {
     let value = headers
         .get(name)?
         .to_str()
@@ -156,8 +158,15 @@ fn parse_anthropic_reset_value(value: &str, now_ms: i64, max_future_ms: i64) -> 
     (parsed > now_ms && parsed <= now_ms.saturating_add(max_future_ms)).then_some(parsed)
 }
 
-fn claude_shared_window_allowed(status: Option<&str>) -> bool {
-    matches!(status, Some("allowed" | "allowed_warning"))
+pub(crate) fn claude_shared_window_explicitly_healthy(
+    status: Option<&str>,
+    utilization: Option<f64>,
+) -> bool {
+    match status {
+        Some("allowed" | "allowed_warning") => utilization.is_none_or(|value| value < 1.0),
+        None => utilization.is_some_and(|value| value < 1.0),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +259,25 @@ mod tests {
             fable.fable_entitlement_evidence,
             Some(ClaudeFableEntitlementEvidence::FableOnlyRateLimit)
         );
+    }
+
+    #[test]
+    fn fable_only_evidence_accepts_healthy_utilization_without_status_but_rejects_conflicts() {
+        let utilization_only = headers(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.25"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.75"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(claude_fable_only_rejected(&utilization_only, true));
+        assert!(!claude_fable_only_rejected(&utilization_only, false));
+
+        let conflicting = headers(&[
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(!claude_fable_only_rejected(&conflicting, true));
     }
 
     #[test]

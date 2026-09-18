@@ -223,11 +223,11 @@ fn anthropic_block_is_signed(block: &Value) -> bool {
         Some("thinking") => block
             .get("signature")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()),
+            .is_some_and(|value| !value.trim().is_empty()),
         Some("redacted_thinking") => block
             .get("data")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()),
+            .is_some_and(|value| !value.trim().is_empty()),
         _ => false,
     }
 }
@@ -421,6 +421,38 @@ mod tests {
             anthropic_block_from_responses_reasoning_item(&item),
             Some(block)
         );
+    }
+
+    #[test]
+    fn caqs_v4_signature_is_opaque_and_round_trips_without_local_synthesis() {
+        // Representative CAQS EnvelopeVersion 4 prefix. The bridge deliberately does not
+        // infer vendor validity; it only authenticates the cross-surface carrier it owns.
+        const CAQS_V4: &str = "CAQSwyAKEAgRGAI4AUIIdGhpbmtpbmcSDFt2zxT+tnYKOGXVWBoM";
+        let block = json!({
+            "type": "thinking",
+            "thinking": "check the tool result",
+            "signature": CAQS_V4
+        });
+
+        let item = responses_reasoning_item_from_anthropic_block("rs_caqs", &block).unwrap();
+        let carrier = item["encrypted_content"].as_str().unwrap();
+        assert!(carrier.starts_with(ENVELOPE_PREFIX));
+        assert_eq!(
+            anthropic_block_from_responses_reasoning_item(&item),
+            Some(block)
+        );
+
+        for invalid in [json!(""), json!("   "), Value::Null, json!(17)] {
+            let invalid_block = json!({
+                "type": "thinking",
+                "thinking": "visible but not replayable",
+                "signature": invalid
+            });
+            assert!(
+                responses_reasoning_item_from_anthropic_block("rs_invalid", &invalid_block)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

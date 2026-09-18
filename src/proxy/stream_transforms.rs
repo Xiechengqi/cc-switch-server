@@ -3013,13 +3013,13 @@ fn merge_json_value(target: &mut Value, incoming: &Value) {
 }
 
 fn attach_responses_thought_signature(item: &mut Value, signature: Option<&str>) {
-    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+    if let Some(signature) = signature.filter(|signature| !signature.trim().is_empty()) {
         item["thought_signature"] = Value::String(signature.to_string());
     }
 }
 
 fn attach_chat_thought_signature(tool_call: &mut Value, signature: Option<&str>) {
-    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+    if let Some(signature) = signature.filter(|signature| !signature.trim().is_empty()) {
         tool_call["extra_content"] = json!({"google": {"thought_signature": signature}});
     }
 }
@@ -9029,6 +9029,7 @@ mod tests {
 
     #[test]
     fn anthropic_signed_thinking_stream_gets_authenticated_responses_replay() {
+        const CAQS_V4: &str = "CAQSwyAKEAgRGAI4AUIIdGhpbmtpbmcSDFt2zxT+tnYKOGXVWBoM";
         let mut state = AnthropicResponsesState::default();
         state.transform(&json!({
             "type": "message_start",
@@ -9047,7 +9048,7 @@ mod tests {
         state.transform(&json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "signature_delta", "signature": "provider-signature"}
+            "delta": {"type": "signature_delta", "signature": CAQS_V4}
         }));
         let done = state.transform(&json!({"type": "content_block_stop", "index": 0}));
         let item = done
@@ -9057,6 +9058,14 @@ mod tests {
         assert!(item.payload_json()["item"]["encrypted_content"]
             .as_str()
             .is_some_and(|value| value.starts_with("ccswitch-server-reasoning-v1:")));
+        assert_eq!(item.payload_json()["item"]["thought_signature"], CAQS_V4);
+        assert_eq!(
+            crate::proxy::reasoning_bridge::anthropic_block_from_responses_reasoning_item(
+                &item.payload_json()["item"]
+            )
+            .unwrap()["signature"],
+            CAQS_V4
+        );
     }
 
     #[test]

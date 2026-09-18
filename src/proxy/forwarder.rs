@@ -72,8 +72,8 @@ use super::antigravity_replay::{
 };
 use super::claude_oauth::ClaudeBodyRetryStage;
 use super::claude_quota_headers::{
-    claude_fable_only_rejected, header_lower, parse_anthropic_reset_header,
-    parse_claude_quota_headers,
+    claude_shared_window_explicitly_healthy, header_lower, parse_anthropic_reset_header,
+    parse_claude_quota_headers, parse_claude_utilization_header,
 };
 use super::cursor;
 use super::deepseek;
@@ -14262,80 +14262,21 @@ async fn maybe_mark_upstream_rate_limited(
     }
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     if execution.stored.provider_type == ProviderType::ClaudeOAuth {
-        let effects = classify_claude_rate_limit(
+        let decision = classify_claude_rate_limit(
             headers,
             body,
             model.is_some_and(is_claude_fable_5_model),
             now,
         );
-        if effects.request_entitlement {
-            crate::metrics::record_claude_rate_limit_scope("request_entitlement");
-            return;
-        }
-        let identity = execution.managed_account_identity_target();
-        if let Some(until) = effects.fable_pool_until {
-            crate::metrics::record_claude_rate_limit_scope("fable_pool");
-            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
-                state
-                    .mark_account_capacity_pool_limit_if_current(
-                        account_id,
-                        provider_type,
-                        auth_identity_generation,
-                        CLAUDE_FABLE_CAPACITY_POOL,
-                        until,
-                        now,
-                        "Anthropic Fable 7d_oi capacity pool is exhausted",
-                        Some(1.0),
-                        "anthropic_ratelimit_7d_oi",
-                    )
-                    .await;
-            }
-            if let (Some(share_id), Some(model)) = (
-                share_id.map(str::trim).filter(|value| !value.is_empty()),
-                model.map(str::trim).filter(|value| !value.is_empty()),
-            ) {
-                state.mark_share_model_cooldown(
-                    share_id,
-                    &execution.plan.runtime_fingerprint,
-                    model,
-                    until,
-                    "anthropic_fable_7d_oi",
-                    now,
-                );
-            }
-        }
-        if let Some(until) = effects.account_unified_until {
-            crate::metrics::record_claude_rate_limit_scope("account_unified");
-            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
-                state
-                    .mark_account_rate_limited_until_if_current(
-                        account_id,
-                        provider_type,
-                        auth_identity_generation,
-                        until,
-                        Some(format!(
-                            "Anthropic unified subscription window is rate limited until {until}"
-                        )),
-                    )
-                    .await;
-            }
-        }
-        if let Some((until, reason)) = effects.exact_model_until {
-            crate::metrics::record_claude_rate_limit_scope("share_model");
-            if let (Some(share_id), Some(model)) = (
-                share_id.map(str::trim).filter(|value| !value.is_empty()),
-                model.map(str::trim).filter(|value| !value.is_empty()),
-            ) {
-                state.mark_share_model_cooldown(
-                    share_id,
-                    &execution.plan.runtime_fingerprint,
-                    model,
-                    until,
-                    reason,
-                    now,
-                );
-            }
-        }
+        crate::metrics::record_claude_rate_limit_scope(
+            decision.scope.metric_label(),
+            decision.reason,
+            decision.evidence.metric_label(),
+        );
+        Box::pin(apply_claude_rate_limit_decision(
+            state, execution, decision, share_id, model, now,
+        ))
+        .await;
         return;
     }
     if execution.stored.provider_type == ProviderType::CodexOAuth
@@ -14381,12 +14322,133 @@ async fn maybe_mark_upstream_rate_limited(
         .await;
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudeRateLimitEffects {
-    account_unified_until: Option<i64>,
-    fable_pool_until: Option<i64>,
-    exact_model_until: Option<(i64, &'static str)>,
-    request_entitlement: bool,
+async fn apply_claude_rate_limit_decision(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    decision: ClaudeRateLimitDecision,
+    share_id: Option<&str>,
+    model: Option<&str>,
+    now: i64,
+) {
+    let identity = execution.managed_account_identity_target();
+    match decision.scope {
+        ClaudeRateLimitScope::RequestEntitlement => {}
+        ClaudeRateLimitScope::FablePool => {
+            let Some(until) = decision.until else {
+                return;
+            };
+            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
+                state
+                    .mark_account_capacity_pool_limit_if_current(
+                        account_id,
+                        provider_type,
+                        auth_identity_generation,
+                        CLAUDE_FABLE_CAPACITY_POOL,
+                        until,
+                        now,
+                        "Anthropic Fable 7d_oi capacity pool is exhausted",
+                        Some(1.0),
+                        "anthropic_ratelimit_7d_oi",
+                    )
+                    .await;
+            }
+            if let (Some(share_id), Some(model)) = (
+                share_id.map(str::trim).filter(|value| !value.is_empty()),
+                model.map(str::trim).filter(|value| !value.is_empty()),
+            ) {
+                state.mark_share_model_cooldown(
+                    share_id,
+                    &execution.plan.runtime_fingerprint,
+                    model,
+                    until,
+                    decision.reason,
+                    now,
+                );
+            }
+        }
+        ClaudeRateLimitScope::AccountSharedWindow => {
+            let Some(until) = decision.until else {
+                return;
+            };
+            if let Some((provider_type, account_id, auth_identity_generation)) = identity {
+                state
+                    .mark_account_rate_limited_until_if_current(
+                        account_id,
+                        provider_type,
+                        auth_identity_generation,
+                        until,
+                        Some(format!(
+                            "Anthropic shared subscription window is rate limited until {until}"
+                        )),
+                    )
+                    .await;
+            }
+        }
+        ClaudeRateLimitScope::ExactModel => {
+            let Some(until) = decision.until else {
+                return;
+            };
+            if let (Some(share_id), Some(model)) = (
+                share_id.map(str::trim).filter(|value| !value.is_empty()),
+                model.map(str::trim).filter(|value| !value.is_empty()),
+            ) {
+                state.mark_share_model_cooldown(
+                    share_id,
+                    &execution.plan.runtime_fingerprint,
+                    model,
+                    until,
+                    decision.reason,
+                    now,
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeRateLimitScope {
+    AccountSharedWindow,
+    FablePool,
+    ExactModel,
+    RequestEntitlement,
+}
+
+impl ClaudeRateLimitScope {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::AccountSharedWindow => "account_shared_window",
+            Self::FablePool => "fable_pool",
+            Self::ExactModel => "share_model",
+            Self::RequestEntitlement => "request_entitlement",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeRateLimitEvidence {
+    Complete,
+    Partial,
+    Missing,
+    Conflicting,
+}
+
+impl ClaudeRateLimitEvidence {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Missing => "missing",
+            Self::Conflicting => "conflicting",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeRateLimitDecision {
+    scope: ClaudeRateLimitScope,
+    reason: &'static str,
+    evidence: ClaudeRateLimitEvidence,
+    until: Option<i64>,
 }
 
 fn classify_claude_rate_limit(
@@ -14394,81 +14456,201 @@ fn classify_claude_rate_limit(
     body: &[u8],
     fable_request: bool,
     now: i64,
-) -> ClaudeRateLimitEffects {
+) -> ClaudeRateLimitDecision {
     if claude_fast_credit_refusal(body) {
-        return ClaudeRateLimitEffects {
-            request_entitlement: true,
-            ..Default::default()
+        return ClaudeRateLimitDecision {
+            scope: ClaudeRateLimitScope::RequestEntitlement,
+            reason: "fast_credit_entitlement",
+            evidence: ClaudeRateLimitEvidence::Complete,
+            until: None,
         };
     }
     let unified = header_lower(headers, "anthropic-ratelimit-unified-status");
     let status_5h = header_lower(headers, "anthropic-ratelimit-unified-5h-status");
     let status_7d = header_lower(headers, "anthropic-ratelimit-unified-7d-status");
     let status_7d_oi = header_lower(headers, "anthropic-ratelimit-unified-7d_oi-status");
-    let account_window_rejected =
-        status_5h.as_deref() == Some("rejected") || status_7d.as_deref() == Some("rejected");
-    let fable_only_rejected = claude_fable_only_rejected(headers, fable_request);
-    let account_rejected = account_window_rejected
-        || (status_7d_oi.as_deref() == Some("rejected") && !fable_only_rejected)
-        || (unified.as_deref() == Some("rejected") && !fable_only_rejected);
-    let mut effects = ClaudeRateLimitEffects::default();
-    if account_rejected {
-        let until = [
-            (
-                "anthropic-ratelimit-unified-reset",
-                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
-            ),
-            (
-                "anthropic-ratelimit-unified-5h-reset",
-                CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
-            ),
-            (
-                "anthropic-ratelimit-unified-7d-reset",
-                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
-            ),
-            (
-                "anthropic-ratelimit-unified-7d_oi-reset",
-                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(name, max_future_ms)| {
-            parse_anthropic_reset_header(headers, name, now, max_future_ms)
-        })
-        .chain(super::grok::retry_after_until_ms(headers, now))
-        .max()
-        .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
-        effects.account_unified_until = Some(super::bounded_upstream_rate_limit_until(now, until));
+    let overage_status = header_lower(headers, "anthropic-ratelimit-unified-overage-status");
+    let overage_disabled_reason = header_lower(
+        headers,
+        "anthropic-ratelimit-unified-overage-disabled-reason",
+    );
+    let representative_claim =
+        header_lower(headers, "anthropic-ratelimit-unified-representative-claim");
+    if overage_disabled_reason.is_some() || claude_organization_entitlement_refusal(body) {
+        return ClaudeRateLimitDecision {
+            scope: ClaudeRateLimitScope::RequestEntitlement,
+            reason: "organization_or_overage_entitlement",
+            evidence: ClaudeRateLimitEvidence::Complete,
+            until: None,
+        };
     }
-
-    if fable_only_rejected {
-        let until = parse_anthropic_reset_header(
-            headers,
-            "anthropic-ratelimit-unified-7d_oi-reset",
+    let utilization_5h =
+        parse_claude_utilization_header(headers, "anthropic-ratelimit-unified-5h-utilization");
+    let utilization_7d =
+        parse_claude_utilization_header(headers, "anthropic-ratelimit-unified-7d-utilization");
+    let rejected_5h = status_5h.as_deref() == Some("rejected");
+    let rejected_7d = status_7d.as_deref() == Some("rejected");
+    let conflict_5h = claude_window_evidence_conflicts(status_5h.as_deref(), utilization_5h);
+    let conflict_7d = claude_window_evidence_conflicts(status_7d.as_deref(), utilization_7d);
+    let retry_after = super::grok::retry_after_until_ms(headers, now);
+    let exact_until = || {
+        super::bounded_upstream_rate_limit_until(
             now,
-            CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            retry_after
+                .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
         )
-        .or_else(|| super::grok::retry_after_until_ms(headers, now))
-        .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
-        effects.fable_pool_until = Some(super::bounded_upstream_rate_limit_until(now, until));
+    };
+
+    if conflict_5h || conflict_7d {
+        return ClaudeRateLimitDecision {
+            scope: ClaudeRateLimitScope::ExactModel,
+            reason: "anthropic_conflicting_window_evidence",
+            evidence: ClaudeRateLimitEvidence::Conflicting,
+            until: Some(exact_until()),
+        };
     }
 
-    if effects.account_unified_until.is_none() && effects.fable_pool_until.is_none() {
-        let retry_after = super::grok::retry_after_until_ms(headers, now);
-        effects.exact_model_until = Some((
-            super::bounded_upstream_rate_limit_until(
-                now,
-                retry_after
-                    .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
-            ),
-            if retry_after.is_some() {
-                "anthropic_model_rate_limit"
-            } else {
-                "anthropic_unknown_429"
-            },
-        ));
+    if rejected_5h || rejected_7d {
+        let reset_5h = rejected_5h
+            .then(|| {
+                parse_anthropic_reset_header(
+                    headers,
+                    "anthropic-ratelimit-unified-5h-reset",
+                    now,
+                    CLAUDE_FIVE_HOUR_OBSERVATION_MAX_FUTURE_MS,
+                )
+            })
+            .flatten();
+        let reset_7d = rejected_7d
+            .then(|| {
+                parse_anthropic_reset_header(
+                    headers,
+                    "anthropic-ratelimit-unified-7d-reset",
+                    now,
+                    CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+                )
+            })
+            .flatten();
+        let resets_complete =
+            (!rejected_5h || reset_5h.is_some()) && (!rejected_7d || reset_7d.is_some());
+        if resets_complete {
+            let shared_reset = [reset_5h, reset_7d]
+                .into_iter()
+                .flatten()
+                .max()
+                .expect("a rejected shared window has a reset");
+            let until = retry_after.map_or(shared_reset, |retry| retry.max(shared_reset));
+            return ClaudeRateLimitDecision {
+                scope: ClaudeRateLimitScope::AccountSharedWindow,
+                reason: match (rejected_5h, rejected_7d) {
+                    (true, true) => "anthropic_shared_5h_7d_rejected",
+                    (true, false) => "anthropic_shared_5h_rejected",
+                    (false, true) => "anthropic_shared_7d_rejected",
+                    (false, false) => unreachable!(),
+                },
+                evidence: ClaudeRateLimitEvidence::Complete,
+                until: Some(super::bounded_upstream_rate_limit_until(now, until)),
+            };
+        }
+        return ClaudeRateLimitDecision {
+            scope: ClaudeRateLimitScope::ExactModel,
+            reason: "anthropic_shared_window_reset_missing",
+            evidence: ClaudeRateLimitEvidence::Partial,
+            until: Some(exact_until()),
+        };
     }
-    effects
+
+    let shared_5h_healthy =
+        claude_shared_window_explicitly_healthy(status_5h.as_deref(), utilization_5h);
+    let shared_7d_healthy =
+        claude_shared_window_explicitly_healthy(status_7d.as_deref(), utilization_7d);
+    let overage_rejected = status_7d_oi.as_deref() == Some("rejected")
+        || overage_status.as_deref() == Some("rejected")
+        || representative_claim
+            .as_deref()
+            .is_some_and(|claim| claim.contains("overage"));
+    if shared_5h_healthy && shared_7d_healthy {
+        if fable_request && status_7d_oi.as_deref() == Some("rejected") {
+            let until = parse_anthropic_reset_header(
+                headers,
+                "anthropic-ratelimit-unified-7d_oi-reset",
+                now,
+                CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
+            )
+            .or(retry_after)
+            .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
+            return ClaudeRateLimitDecision {
+                scope: ClaudeRateLimitScope::FablePool,
+                reason: "anthropic_fable_7d_oi",
+                evidence: ClaudeRateLimitEvidence::Complete,
+                until: Some(super::bounded_upstream_rate_limit_until(now, until)),
+            };
+        }
+        return ClaudeRateLimitDecision {
+            scope: ClaudeRateLimitScope::ExactModel,
+            reason: if overage_rejected {
+                "anthropic_overage_model_scope"
+            } else if unified.as_deref() == Some("rejected") {
+                "anthropic_unified_rejected_shared_healthy"
+            } else {
+                "anthropic_model_rate_limit"
+            },
+            evidence: ClaudeRateLimitEvidence::Complete,
+            until: Some(exact_until()),
+        };
+    }
+
+    let has_partial_evidence = unified.is_some()
+        || status_5h.is_some()
+        || status_7d.is_some()
+        || status_7d_oi.is_some()
+        || utilization_5h.is_some()
+        || utilization_7d.is_some()
+        || overage_status.is_some()
+        || representative_claim.is_some();
+    ClaudeRateLimitDecision {
+        scope: ClaudeRateLimitScope::ExactModel,
+        reason: if overage_rejected {
+            "anthropic_overage_evidence_incomplete"
+        } else if retry_after.is_some() {
+            "anthropic_model_rate_limit"
+        } else {
+            "anthropic_unknown_429"
+        },
+        evidence: if has_partial_evidence {
+            ClaudeRateLimitEvidence::Partial
+        } else {
+            ClaudeRateLimitEvidence::Missing
+        },
+        until: Some(exact_until()),
+    }
+}
+
+fn claude_window_evidence_conflicts(status: Option<&str>, utilization: Option<f64>) -> bool {
+    matches!(status, Some("rejected")) && utilization.is_some_and(|value| value < 1.0)
+        || matches!(status, Some("allowed" | "allowed_warning"))
+            && utilization.is_some_and(|value| value >= 1.0)
+}
+
+fn claude_organization_entitlement_refusal(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let is_entitlement = [
+        value.pointer("/error/code").and_then(Value::as_str),
+        value.pointer("/error/type").and_then(Value::as_str),
+        value.pointer("/error/reason").and_then(Value::as_str),
+        value.pointer("/error/message").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_ascii_lowercase)
+    .any(|value| {
+        value.contains("org_spend_cap_reached")
+            || value.contains("organization_spend_cap_reached")
+            || value.contains("overage_disabled")
+    });
+    is_entitlement
 }
 
 fn claude_fast_credit_refusal(body: &[u8]) -> bool {
@@ -25704,7 +25886,7 @@ mod tests {
     };
 
     #[test]
-    fn claude_rate_limit_scope_distinguishes_account_model_and_entitlement() {
+    fn claude_rate_limit_scope_decision_table_is_fail_closed() {
         fn build_headers(values: &[(&'static str, &'static str)]) -> HeaderMap {
             let mut headers = HeaderMap::new();
             for (name, value) in values {
@@ -25714,47 +25896,122 @@ mod tests {
         }
 
         let now = 1_700_000_000_000_i64;
-        let mut headers = build_headers(&[
-            ("anthropic-ratelimit-unified-5h-status", "rejected"),
-            ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
-        ]);
-        let effects = classify_claude_rate_limit(&headers, b"{}", false, now);
-        assert_eq!(effects.account_unified_until, Some(1_700_003_600_000));
-        assert!(effects.fable_pool_until.is_none());
-
-        // A rejected Fable window is ambiguous without explicit healthy shared windows.
-        headers.insert(
-            "anthropic-ratelimit-unified-status",
-            HeaderValue::from_static("rejected"),
+        let five_hour = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+            ]),
+            b"{}",
+            false,
+            now,
         );
-        headers.insert(
-            "anthropic-ratelimit-unified-7d_oi-status",
-            HeaderValue::from_static("rejected"),
+        assert_eq!(
+            five_hour,
+            ClaudeRateLimitDecision {
+                scope: ClaudeRateLimitScope::AccountSharedWindow,
+                reason: "anthropic_shared_5h_rejected",
+                evidence: ClaudeRateLimitEvidence::Complete,
+                until: Some(1_700_003_600_000),
+            }
         );
-        headers.remove("anthropic-ratelimit-unified-5h-status");
-        headers.remove("anthropic-ratelimit-unified-7d-status");
-        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
-        assert!(effects.account_unified_until.is_some());
-        assert!(effects.fable_pool_until.is_none());
 
-        let mut headers = build_headers(&[
-            ("anthropic-ratelimit-unified-status", "rejected"),
-            ("anthropic-ratelimit-unified-5h-status", "allowed"),
-            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
-            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
-        ]);
-        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
-        assert!(effects.account_unified_until.is_none());
-        assert!(effects.fable_pool_until.is_some());
-        assert!(effects.exact_model_until.is_none());
-
-        headers.insert(
-            "anthropic-ratelimit-unified-7d-status",
-            HeaderValue::from_static("rejected"),
+        let seven_day = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-7d-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d-reset", "1700007200"),
+            ]),
+            b"{}",
+            false,
+            now,
         );
-        let effects = classify_claude_rate_limit(&headers, b"{}", true, now);
-        assert!(effects.account_unified_until.is_some());
-        assert!(effects.fable_pool_until.is_none());
+        assert_eq!(seven_day.scope, ClaudeRateLimitScope::AccountSharedWindow);
+        assert_eq!(seven_day.reason, "anthropic_shared_7d_rejected");
+        assert_eq!(seven_day.evidence, ClaudeRateLimitEvidence::Complete);
+        assert_eq!(seven_day.until, Some(1_700_007_200_000));
+
+        for headers in [
+            build_headers(&[("anthropic-ratelimit-unified-5h-status", "rejected")]),
+            build_headers(&[
+                ("anthropic-ratelimit-unified-7d-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d-reset", "not-a-reset"),
+            ]),
+            build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+                ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ]),
+        ] {
+            let decision = classify_claude_rate_limit(&headers, b"{}", false, now);
+            assert_eq!(decision.scope, ClaudeRateLimitScope::ExactModel);
+            assert_eq!(decision.reason, "anthropic_shared_window_reset_missing");
+            assert_eq!(decision.evidence, ClaudeRateLimitEvidence::Partial);
+            assert_eq!(
+                decision.until,
+                Some(now + DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+            );
+        }
+
+        let conflicting = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-utilization", "0.5"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert_eq!(conflicting.scope, ClaudeRateLimitScope::ExactModel);
+        assert_eq!(conflicting.evidence, ClaudeRateLimitEvidence::Conflicting);
+        assert_eq!(conflicting.reason, "anthropic_conflicting_window_evidence");
+
+        let unified_only = classify_claude_rate_limit(
+            &build_headers(&[("anthropic-ratelimit-unified-status", "rejected")]),
+            b"{}",
+            true,
+            now,
+        );
+        assert_eq!(unified_only.scope, ClaudeRateLimitScope::ExactModel);
+        assert_eq!(unified_only.evidence, ClaudeRateLimitEvidence::Partial);
+
+        let unified_with_healthy_shared = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert_eq!(
+            unified_with_healthy_shared.scope,
+            ClaudeRateLimitScope::ExactModel
+        );
+        assert_eq!(
+            unified_with_healthy_shared.reason,
+            "anthropic_unified_rejected_shared_healthy"
+        );
+        assert_eq!(
+            unified_with_healthy_shared.evidence,
+            ClaudeRateLimitEvidence::Complete
+        );
+
+        let fable = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d_oi-reset", "1700007200"),
+            ]),
+            b"{}",
+            true,
+            now,
+        );
+        assert_eq!(fable.scope, ClaudeRateLimitScope::FablePool);
+        assert_eq!(fable.reason, "anthropic_fable_7d_oi");
+        assert_eq!(fable.evidence, ClaudeRateLimitEvidence::Complete);
+        assert_eq!(fable.until, Some(1_700_007_200_000));
 
         let non_fable = classify_claude_rate_limit(
             &build_headers(&[
@@ -25766,31 +26023,103 @@ mod tests {
             false,
             now,
         );
-        assert!(non_fable.account_unified_until.is_some());
-        assert!(non_fable.fable_pool_until.is_none());
+        assert_eq!(non_fable.scope, ClaudeRateLimitScope::ExactModel);
+        assert_eq!(non_fable.reason, "anthropic_overage_model_scope");
+        assert_eq!(non_fable.evidence, ClaudeRateLimitEvidence::Complete);
 
-        let unified_only = classify_claude_rate_limit(
-            &build_headers(&[("anthropic-ratelimit-unified-status", "rejected")]),
+        let fable_with_utilization_only = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.9"),
+                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ]),
             b"{}",
             true,
             now,
         );
-        assert!(unified_only.account_unified_until.is_some());
-        assert!(unified_only.fable_pool_until.is_none());
+        assert_eq!(
+            fable_with_utilization_only.scope,
+            ClaudeRateLimitScope::FablePool
+        );
 
-        let ordinary = classify_claude_rate_limit(&HeaderMap::new(), b"{}", true, now);
-        assert!(ordinary.account_unified_until.is_none());
-        assert!(ordinary.fable_pool_until.is_none());
-        assert!(ordinary.exact_model_until.is_some());
-
-        assert!(
-            classify_claude_rate_limit(
-                &HeaderMap::new(),
+        let entitlement_cases: [(HeaderMap, &'static [u8]); 3] = [
+            (
+                build_headers(&[(
+                    "anthropic-ratelimit-unified-overage-disabled-reason",
+                    "organization_policy",
+                )]),
+                b"{}",
+            ),
+            (
+                HeaderMap::new(),
+                br#"{"error":{"code":"org_spend_cap_reached"}}"#,
+            ),
+            (
+                HeaderMap::new(),
                 br#"{"error":{"message":"Fast request rejected: usage credits are required"}}"#,
-                true,
-                now,
-            )
-            .request_entitlement
+            ),
+        ];
+        for (headers, body) in entitlement_cases {
+            let entitlement = classify_claude_rate_limit(&headers, body, true, now);
+            assert_eq!(entitlement.scope, ClaudeRateLimitScope::RequestEntitlement);
+            assert_eq!(entitlement.evidence, ClaudeRateLimitEvidence::Complete);
+            assert_eq!(entitlement.until, None);
+        }
+
+        let missing = classify_claude_rate_limit(&HeaderMap::new(), b"{}", true, now);
+        assert_eq!(missing.scope, ClaudeRateLimitScope::ExactModel);
+        assert_eq!(missing.reason, "anthropic_unknown_429");
+        assert_eq!(missing.evidence, ClaudeRateLimitEvidence::Missing);
+        assert_eq!(
+            missing.until,
+            Some(now + DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+        );
+
+        let bounded = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+                ("retry-after", "999999999"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert_eq!(bounded.scope, ClaudeRateLimitScope::AccountSharedWindow);
+        assert_eq!(
+            bounded.until,
+            Some(now + super::super::MAX_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+        );
+
+        let invalid_reset_with_retry = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", "9999999999999"),
+                ("retry-after", "120"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert_eq!(
+            invalid_reset_with_retry.scope,
+            ClaudeRateLimitScope::ExactModel
+        );
+        assert_eq!(invalid_reset_with_retry.until, Some(now + 120_000));
+
+        // Explicit entitlement evidence remains narrow even if generic quota headers disagree.
+        let entitlement_beats_shared = classify_claude_rate_limit(
+            &build_headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", "1700003600"),
+            ]),
+            br#"{"error":{"reason":"overage_disabled"}}"#,
+            false,
+            now,
+        );
+        assert_eq!(
+            entitlement_beats_shared.scope,
+            ClaudeRateLimitScope::RequestEntitlement
         );
     }
 
@@ -28405,6 +28734,88 @@ mod tests {
             1,
             "compressed SSE must stay on the single bound Provider/account without replay"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_message_stop_completes_before_upstream_eof_or_late_disconnect() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_cancelled = Arc::new(AtomicBool::new(false));
+        let upstream_cancelled_for_route = Arc::clone(&upstream_cancelled);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let upstream_cancelled = Arc::clone(&upstream_cancelled_for_route);
+                async move {
+                    struct CancelGuard(Arc<AtomicBool>);
+                    impl Drop for CancelGuard {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+
+                    let stream = async_stream::stream! {
+                        let _cancel_guard = CancelGuard(upstream_cancelled);
+                        yield Ok::<_, std::convert::Infallible>(claude_success_sse());
+                        std::future::pending::<()>().await;
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = forwarder_test_state("claude-terminal-before-eof");
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-terminal-before-eof",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ping"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("message_stop must complete without waiting for upstream EOF")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("streaming usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("completed"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !upstream_cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the upstream body must be cancelled after message_stop");
         server.abort();
     }
 

@@ -417,8 +417,18 @@ pub fn record_claude_client_class(class: &'static str, operation: &'static str) 
     .increment(1);
 }
 
-pub fn record_claude_rate_limit_scope(scope: &'static str) {
-    metrics::counter!("cc_switch_claude_rate_limit_scope_total", "scope" => scope).increment(1);
+pub fn record_claude_rate_limit_scope(
+    scope: &'static str,
+    reason: &'static str,
+    evidence: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_claude_rate_limit_scope_total",
+        "scope" => scope,
+        "reason" => reason,
+        "evidence" => evidence
+    )
+    .increment(1);
 }
 
 pub fn record_claude_quota_header_observation(outcome: &'static str) {

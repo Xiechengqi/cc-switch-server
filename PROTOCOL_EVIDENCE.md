@@ -31,6 +31,16 @@ Server 的独立 grounding 合同只读取选中候选，按 URL 去重 web chun
 
 `requestType` 的两个成熟参考结论互相冲突，因此 AG-N6 没有生产行为变更。当前合同继续固定普通文本、仅 function tools 和历史 functionCall/functionResponse 为 `agent`，含 web search（包括 function + search 混合）为 `web_search`。`antigravity_oauth` 与 `agy_oauth` 均无真实 receipt，故该决策和 compaction 继续为 `live_pending`，fixture 不得升级为厂商接受性证据。
 
+## 2026-09-18 Claude rate-limit, reasoning replay, and terminal freeze
+
+Claude 增量证据追加在 `assets/contract/claude-reference-delta.json`。只读来源为 `CLIProxyAPI@44eaef00/@75ce6352/@377c315f/@2bcebaa8/@7c32971b`；实现与测试 Git object 的提交态 SHA-256 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 复核，默认构建、测试和运行时不读取外部 checkout。没有采纳账号池、跨账号/Provider fallback、credential cloaking、organization-hash 身份迁移或浏览器指纹模拟。
+
+429 分类只在 5h/7d 子窗口明确 `rejected`、利用率证据不冲突且每个被拒窗口均有合法 reset 时写当前 Account generation 的共享窗口 cooldown。`unified` 单独拒绝、缺失/非法 reset、冲突 header 和未知 429 只允许精确 model cooldown；健康共享窗口下的 `7d_oi` 只影响 Fable pool 或精确 model；fast-credit、overage-disabled 与 organization spend-cap 明确信号只记 request entitlement。reset/Retry-After 继续受时间范围和全局上限保护，指标只包含固定 scope/reason/evidence，不记录 header 原值。
+
+CAQS EnvelopeVersion 4 仍视为厂商 opaque signature：Server 不解析、不生成、不截断，也不把内容写入日志或指标。native Claude 初次出站逐字保留非空字符串；Responses 流/非流通过本仓库带 MAC 的 reasoning carrier 往返恢复原块，空白、空值和非字符串不能被误认作可重放签名。初始 turn 的 billing/session fingerprint 在 system migration、cache metadata、后续轮次和 retry rewrite 前取值；后续历史变化不改变该初始锚点。
+
+standalone、错配和部分 tool output 继续用版本化 user 文本可逆保留，不伪造 tool pairing。通用流终态 guard 在收到唯一合法 `message_stop` 后立即完成、结算 usage 并释放上游 body；终态后的无 EOF、取消或断连不再反记为 upstream failure，终态前断连仍严格失败。以上只证明本地 `fixture_verified`；真实 Claude rail、Fable entitlement、CAQS 接受性和限流 header 仍为 `live_pending`。
+
 ## 2026-09-11 Antigravity replay, session, schema, and transport freeze
 
 本次只读差异研究冻结于 `assets/contract/antigravity-reference-delta.json`，对应 `CLIProxyAPI` commit `09a29bd345bc44c473abe7fd07859e32df2ea543` 与 `Antigravity-Manager` commit `85fb4fe688997d3a0c2930b7a202cf22f617b092`。外部源码只提供协议缺陷和边界的交叉证据，不进入本仓库构建、测试或运行时；默认审计只核对本地合同，人工运行 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才读取外部 Git object。冻结文件摘要为：

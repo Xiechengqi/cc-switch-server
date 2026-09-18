@@ -2767,6 +2767,101 @@ mod tests {
     }
 
     #[test]
+    fn initial_turn_fingerprint_is_stable_across_later_history_and_retry_rewrites() {
+        let first = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "initial request", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "first answer"}]},
+                {"role": "user", "content": "follow-up A"}
+            ]
+        });
+        let second = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "initial request"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "later reasoning", "signature": "CAQS-opaque"},
+                    {"type": "text", "text": "different answer"}
+                ]},
+                {"role": "user", "content": "follow-up B"}
+            ]
+        });
+
+        let first_text = first_user_text_for_billing(&first).unwrap();
+        let second_text = first_user_text_for_billing(&second).unwrap();
+        assert_eq!(first_text, second_text);
+        assert_eq!(
+            claude_billing_header_text_for_prompt(first_text),
+            claude_billing_header_text_for_prompt(second_text)
+        );
+        assert_eq!(
+            synth_session_id("account-1", &first),
+            synth_session_id("account-1", &second)
+        );
+
+        let retry = apply_body_retry_stage(second, ClaudeBodyRetryStage::Thinking);
+        assert_eq!(first_user_text_for_billing(&retry), Some("initial request"));
+        assert_ne!(
+            synth_session_id(
+                "account-1",
+                &json!({"messages": [{"role": "user", "content": "another initial request"}]})
+            ),
+            synth_session_id("account-1", &first)
+        );
+    }
+
+    #[test]
+    fn caqs_signatures_survive_initial_claude_oauth_preparation_byte_for_byte() {
+        const CAQS_V4: &str = "CAQSwyAKEAgRGAI4AUIIdGhpbmtpbmcSDFt2zxT+tnYKOGXVWBoM";
+        let signatures = [
+            CAQS_V4,
+            "CAQS/with+padding==and\"quotes\"and\\backslashes",
+            "CAQS-unicode-中文-😀-\u{200b}",
+        ];
+        let thinking = signatures
+            .iter()
+            .map(|signature| {
+                json!({
+                    "type": "thinking",
+                    "thinking": "reasoning step",
+                    "signature": signature
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-fable-5-1",
+                "max_tokens": 4096,
+                "thinking": {"type": "adaptive"},
+                "messages": [
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "content": thinking},
+                    {"role": "user", "content": "continue"}
+                ]
+            }))
+            .unwrap(),
+        );
+
+        apply_forward_contract(
+            &mut url,
+            &mut body,
+            &HeaderMap::new(),
+            "account-1",
+            false,
+            None,
+        )
+        .unwrap();
+        let prepared: Value = serde_json::from_slice(&body).unwrap();
+        let actual = prepared["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["signature"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, signatures);
+    }
+
+    #[test]
     fn haiku_non_cc_client_still_gets_full_mimicry() {
         let result = ensure_claude_oauth_billing_header_system(json!({
             "model": "claude-haiku-4-5-20251001",

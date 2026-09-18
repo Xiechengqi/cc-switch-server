@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-claude-reference-delta",
   "schemaVersion": 1,
-  "capturedAt": "2026-09-11T00:00:00Z",
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
@@ -103,6 +103,76 @@
               "sha256": "f0720f160c366f09091542de44d1d0599deee6cb8f35d38df5b8cb84daa31ec2"
             }
           ]
+        },
+        {
+          "id": "rate_limit_scope",
+          "commit": "44eaef0009f8464fd04db7ce4747a61244b7922e",
+          "files": [
+            {
+              "path": "internal/runtime/executor/helps/claude_ratelimit.go",
+              "sha256": "3bc625648aeb8b716f2f4b165a4ac1812a2880a6b590c15cc1d605b55da5f972"
+            },
+            {
+              "path": "internal/runtime/executor/helps/claude_ratelimit_test.go",
+              "sha256": "012ad2957879ce70d6bfddd7758bc9f144f16dfd8e4a290c238a9077624bbe4a"
+            }
+          ]
+        },
+        {
+          "id": "caqs_signature_replay",
+          "commit": "75ce6352939fe9b7b5b5c52efe34d330bd078868",
+          "files": [
+            {
+              "path": "internal/signature/claude_validation.go",
+              "sha256": "886a02e62638e6565645c5745002ad6e070c2d26ffbd3d6642ccd958399d951a"
+            },
+            {
+              "path": "internal/signature/claude_test.go",
+              "sha256": "866119019bf966d20bd68e41b9e81abfa11f8096bb0861c1e0f64b6be68c147c"
+            }
+          ]
+        },
+        {
+          "id": "initial_turn_billing_fingerprint",
+          "commit": "377c315fd71f94158d957c99d083b08da7fbca51",
+          "files": [
+            {
+              "path": "internal/runtime/executor/claude_executor_cloaking.go",
+              "sha256": "5c52d7ef2b762d0ecbaf7614ecf2c54e522f5e0e02d3f59dd673ea4c984afa8e"
+            },
+            {
+              "path": "internal/runtime/executor/claude_cloaked_cache_repro_test.go",
+              "sha256": "a1a3d4f5a3511110a1239a4c487ca9cdb568bb739ea6bab51ee71a5aaab4fcb9"
+            }
+          ]
+        },
+        {
+          "id": "standalone_tool_output",
+          "commit": "2bcebaa89c98871bded27cc8a8c1c4c97be25623",
+          "files": [
+            {
+              "path": "internal/translator/claude/openai/responses/claude_openai-responses_request.go",
+              "sha256": "be1e42a8083889994262f8b7b14e4bcb5f6057fe7c859ea277a05507b74924ce"
+            },
+            {
+              "path": "internal/translator/claude/openai/responses/claude_openai-responses_request_test.go",
+              "sha256": "cd5bb00450702e57a6fc4ef640148c5606b61210dee167c3e1ffa75263be6e32"
+            }
+          ]
+        },
+        {
+          "id": "terminal_disconnect",
+          "commit": "7c32971b91c8bce3a199833d1e738bd883e6b92f",
+          "files": [
+            {
+              "path": "internal/runtime/executor/claude_executor_stream.go",
+              "sha256": "73dfab1c45dd64fa4ac52eb62015ebc39b2251d4232ac5678b5b50f44b1c4c30"
+            },
+            {
+              "path": "internal/runtime/executor/claude_executor_stream_terminal_test.go",
+              "sha256": "d5c7f0121acafc082fd3e23f3de0e543b3f955b456b59862f9253eb199b5cb39"
+            }
+          ]
         }
       ]
     }
@@ -143,6 +213,36 @@
       "status": "fixture_verified",
       "path": "src/proxy/claude_oauth.rs",
       "anchors": ["is_first_party_anthropic_url", "helper_request_id_follows_the_actual_upstream_base"]
+    },
+    {
+      "id": "rate_limit_scope",
+      "status": "fixture_verified",
+      "path": "src/proxy/forwarder.rs",
+      "anchors": ["classify_claude_rate_limit", "claude_rate_limit_scope_decision_table_is_fail_closed", "mark_account_rate_limited_until_if_current"]
+    },
+    {
+      "id": "caqs_signature_replay",
+      "status": "fixture_verified",
+      "path": "src/proxy/reasoning_bridge.rs",
+      "anchors": ["anthropic_block_is_signed", "caqs_v4_signature_is_opaque_and_round_trips_without_local_synthesis"]
+    },
+    {
+      "id": "initial_turn_billing_fingerprint",
+      "status": "fixture_verified",
+      "path": "src/proxy/claude_oauth.rs",
+      "anchors": ["first_user_text_for_billing", "initial_turn_fingerprint_is_stable_across_later_history_and_retry_rewrites"]
+    },
+    {
+      "id": "standalone_tool_output",
+      "status": "fixture_verified",
+      "path": "src/proxy/transforms.rs",
+      "anchors": ["demote_unpaired_tool_results", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]
+    },
+    {
+      "id": "terminal_disconnect",
+      "status": "fixture_verified",
+      "path": "src/proxy/forwarder.rs",
+      "anchors": ["semantic_terminal_seen", "claude_message_stop_completes_before_upstream_eof_or_late_disconnect"]
     }
   ]
 }
