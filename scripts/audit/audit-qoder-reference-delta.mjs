@@ -77,6 +77,11 @@ assert(
 for (const source of contract.sources ?? []) {
   assert(source.id && source.rootEnv, "Qoder source metadata is incomplete");
   assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
+  assert(
+    source.previousReviewedCommit === "3488b4a9208c41e4f9db4108ef5133cb3710648c",
+    `${source.id} previous review point changed`,
+  );
+  assert(Array.isArray(source.files) && source.files.length === 3, `${source.id} evidence files changed`);
   const sourceRoot = path.resolve(
     repoRoot,
     process.env[source.rootEnv] || source.defaultRelativeRoot,
@@ -100,6 +105,65 @@ for (const source of contract.sources ?? []) {
     }
   }
 }
+
+const incrementalReview = contract.incrementalReview;
+assert(incrementalReview?.id === "QD-N2", "Qoder incremental review id changed");
+assert(
+  incrementalReview.fromCommit === "3488b4a9208c41e4f9db4108ef5133cb3710648c" &&
+    incrementalReview.toCommit === "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+  "Qoder incremental review range changed",
+);
+assert(
+  incrementalReview.qoderWireDelta === "none" &&
+    incrementalReview.observedChange === "shared_error_helper_signature_adaptation_only" &&
+    incrementalReview.reviewedDiffSha256 ===
+      "384062fd869020540b945f654179f250ad75650f3fb5427c7e355b710b824eb2" &&
+    incrementalReview.oracleRemainsPrimary === true &&
+    incrementalReview.productionCodeChanged === false,
+  "QD-N2 no-wire-delta conclusion changed",
+);
+if (checkSources) {
+  const source = contract.sources.find((candidate) => candidate.id === "tokenrouter");
+  assert(source, "Qoder TokenRouter source is missing");
+  const sourceRoot = path.resolve(
+    repoRoot,
+    process.env[source.rootEnv] || source.defaultRelativeRoot,
+  );
+  const reviewedDiff = execFileSync(
+    "git",
+    [
+      "-C",
+      sourceRoot,
+      "diff",
+      `${incrementalReview.fromCommit}..${incrementalReview.toCommit}`,
+      "--",
+      "backend/internal/handler/qoder_gateway_handler.go",
+    ],
+    { encoding: null, maxBuffer: 16 * 1024 * 1024 },
+  );
+  assert(
+    sha256(reviewedDiff) === incrementalReview.reviewedDiffSha256,
+    "Qoder reviewed helper-only diff changed",
+  );
+}
+
+const enhancements = new Map(
+  (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),
+);
+assert(enhancements.size === 2, "Qoder enhancement set changed");
+assert(
+  enhancements.get("QD-N1")?.status === "live_pending" &&
+    JSON.stringify(enhancements.get("QD-N1")?.rails) ===
+      JSON.stringify(["global_oauth", "global_pat", "cn_oauth"]) &&
+    enhancements.get("QD-N1")?.receiptsIndependent === true,
+  "QD-N1 three-rail live gate changed",
+);
+assert(
+  enhancements.get("QD-N2")?.status === "reviewed_no_wire_delta" &&
+    enhancements.get("QD-N2")?.oracleRemainsPrimary === true &&
+    enhancements.get("QD-N2")?.productionCodeChanged === false,
+  "QD-N2 oracle-first conclusion changed",
+);
 
 const capabilities = new Map(
   (contract.capabilities ?? []).map((capability) => [capability.id, capability]),

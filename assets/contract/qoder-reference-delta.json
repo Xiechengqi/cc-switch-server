@@ -1,6 +1,7 @@
 {
   "format": "cc-switch-qoder-reference-delta",
   "schemaVersion": 1,
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "scope": "single bound Provider/Share/Account; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no cross-site fallback, no cross-account fallback, no cross-Provider fallback",
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
@@ -10,8 +11,9 @@
     {
       "id": "tokenrouter",
       "rootEnv": "QODER_REFERENCE_ROOT",
-      "defaultRelativeRoot": "../proxy/TokenRouter",
-      "commit": "3488b4a9208c41e4f9db4108ef5133cb3710648c",
+      "defaultRelativeRoot": "../proxy/Qoder/TokenRouter",
+      "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+      "previousReviewedCommit": "3488b4a9208c41e4f9db4108ef5133cb3710648c",
       "files": [
         {
           "path": "docs/interfaces/qoder_upstream.md",
@@ -20,10 +22,24 @@
         {
           "path": "docs/operations/account_maintenance.md",
           "sha256": "94fa521a816ac61853752782cda0db1be2837ea8f3c619db9f57421370fab3ed"
+        },
+        {
+          "path": "backend/internal/handler/qoder_gateway_handler.go",
+          "sha256": "f5c19c5756c0eef81be0ae525c9badde49b32c4a7db9a671c521b6984868b525"
         }
       ]
     }
   ],
+  "incrementalReview": {
+    "id": "QD-N2",
+    "fromCommit": "3488b4a9208c41e4f9db4108ef5133cb3710648c",
+    "toCommit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+    "qoderWireDelta": "none",
+    "observedChange": "shared_error_helper_signature_adaptation_only",
+    "reviewedDiffSha256": "384062fd869020540b945f654179f250ad75650f3fb5427c7e355b710b824eb2",
+    "oracleRemainsPrimary": true,
+    "productionCodeChanged": false
+  },
   "contractMap": {
     "providerType": "qoder_cosy",
     "driverId": "special.qoder_cosy",
@@ -134,6 +150,20 @@
           ]
         }
       ]
+    }
+  ],
+  "enhancements": [
+    {
+      "id": "QD-N1",
+      "status": "live_pending",
+      "rails": ["global_oauth", "global_pat", "cn_oauth"],
+      "receiptsIndependent": true
+    },
+    {
+      "id": "QD-N2",
+      "status": "reviewed_no_wire_delta",
+      "oracleRemainsPrimary": true,
+      "productionCodeChanged": false
     }
   ],
   "upgradeWorkflow": {

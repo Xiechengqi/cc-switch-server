@@ -93,13 +93,13 @@ Server 独立实现只吸收已能证明的正确性合同：工具 schema walke
 
 GPT Image 2.5 三个 variant 不从外部项目的静态声明推导真实 entitlement。当前没有真实 receipt，因此 `gpt-image-2.5`、`-flare`、`-sunburst` 分别保持 `live_pending`，不发布到 registry/UI，Dedicated Images 在发网前失败关闭。WS prewarm 也因缺 upstream receipt 和 TTFB 基准保持未实现；2.5 专属 quota/cache 治理依赖同一真实门禁。没有迁入 codex2api 的商业计价、账号池、轮换、跨账号或跨 Provider fallback。
 
-## 2026-09-11 Cursor OmniRoute differential freeze
+## 2026-09-18 Cursor OmniRoute differential refresh
 
-Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。一次性只读证据只取 OmniRoute 提交 `a3ca33fa6442b59adc42976c795709eaf5351109` 的六个已提交 Git object；其工作树未提交内容明确排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。
+Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。2026-09-18 从旧点 `a3ca33fa6442b59adc42976c795709eaf5351109` 复核到 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`：六个 Cursor protobuf/session/executor 提交对象的 SHA-256 均未变化，提交区间没有 Cursor wire、protobuf、auth 或 session 增量，因此 CUR-N2 结论为 `reviewed_no_wire_delta`，不修改生产 executor。参考仓库当时 22 项未提交/未跟踪内容全部排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。
 
 Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段语义、重复 field 27/URL 失败关闭、Connect frame 任意分片与 partial EOF、成功/错误 terminal envelope、plain EOF 失败关闭，以及 fresh `composer-2.5-fast` 必须保留完整 wire ID。公开模型选择入口已经存在，因此 registry `special.cursor` revision 4 将 discovery 与 forward/test 一并标为 supported/`fixture_verified`；OAuth 返回静态 aliases，API-key 目录保持 exact Provider/runtime/credential scope，成功空目录权威，transient stale 只用于展示。
 
-CUR-02 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识，receipt 只允许 rail、SHA-256 scope digest、状态、时间和 16 项完整 pass map。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
+CUR-02/CUR-N1 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识，receipt 只允许 rail、SHA-256 scope digest、状态、时间和 16 项完整 pass map。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
 
 ## 2026-09-18 Grok reasoning replay/root-union/quality-observation differential freeze
 
@@ -152,6 +152,8 @@ OpenAI Chat Completions 的流式 `chat.completion.chunk.created` 是 Unix 秒�
 `qoder_cosy` 的 native Rust 实现以一次性、只读的官方 CLI 审计作为漂移 oracle，不在构建或运行时加载 CLI。证据冻结于 `assets/contract/qoder-cli-oracle.json`：Global `@qoder-ai/qodercli@1.1.32` bundle SHA-256 为 `24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf`，CN `@qodercn-ai/qoderclicn@1.1.32` bundle SHA-256 为 `5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b`。`cli2api` commit `9b18f2de06c53f12bf2c5112c7a71e3e64755b97` 仅提供带文件摘要的 capture/plaintext projection 交叉样本，不是依赖、同步源或生产 executor。
 
 2026-09-11 将已落地的动态 entitlement/capability、三 rail、严格 EOF terminal、generation fencing 与同账号单次恢复统一确认为 `special.qoder_cosy` Driver contract revision 2。`assets/contract/qoder-reference-delta.json` 与对应审计把 Registry、三个 Profile、oracle、coverage、生产入口和 `live_pending` 状态交叉闭合，并冻结“先官方包 digest/独立 wire，后 oracle mutation，最后 Rust”的 CLI 升级顺序。TokenRouter 当前文档提交 `3488b4a9208c41e4f9db4108ef5133cb3710648c` 仅作为可选只读 source audit 输入。
+
+2026-09-18 的 QD-N2 只读复核将 TokenRouter 提交态推进到 `7faf9469bc6957716923b5b4a98665c0fb9715e0`。两份 Qoder 文档对象摘要未变；`qoder_gateway_handler.go` 的净变化仅适配共享 error helper 新增返回值/参数，冻结 diff 摘要为 `384062fd869020540b945f654179f250ad75650f3fb5427c7e355b710b824eb2`，没有 Qoder origin、header、签名、payload、terminal 或恢复 wire 增量。因此官方 CLI oracle 继续优先，不修改 Server 生产实现。QD-N1 的 Global OAuth、Global PAT、CN OAuth receipt 仍三条独立 `live_pending`，任一 rail 或站点的成功不得继承给另一条。
 
 两份官方 bundle 共同确认：Device authorization 使用 `/device/selectAccounts`、UUID v4 nonce 与 S256；poll 为 OpenAPI `GET /api/v1/deviceToken/poll`，1 秒间隔、300 秒 TTL、404 pending 且不发送 Authorization/COSY/User-Agent；refresh 为 OpenAPI `POST /api/v1/deviceToken/refresh`，只发送 JSON body `refresh_token` 与 `User-Agent: qoder/1.1.32`，响应主字段为 `device_token`、轮换 `refresh_token`、`expires_at`。Global 36 位小写 hex machine ID 与 CN UUID v4 machine ID 是独立站点事实。Qoder CLI `1.1.32` 和 COSY wire `1.24.2` 属于不同版本空间；旧 Global center job-token endpoint 不可作为 Device refresh fallback。
 

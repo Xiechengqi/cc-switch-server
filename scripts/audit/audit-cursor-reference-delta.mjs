@@ -56,6 +56,10 @@ assert(
 for (const source of contract.sources ?? []) {
   assert(source.id && source.rootEnv, "Cursor source metadata is incomplete");
   assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
+  assert(
+    source.previousReviewedCommit === "a3ca33fa6442b59adc42976c795709eaf5351109",
+    `${source.id} previous review point changed`,
+  );
   assert(Array.isArray(source.files) && source.files.length >= 2, `${source.id} lacks evidence files`);
   const sourceRoot = path.resolve(
     repoRoot,
@@ -78,6 +82,59 @@ for (const source of contract.sources ?? []) {
     }
   }
 }
+
+const incrementalReview = contract.incrementalReview;
+assert(incrementalReview?.id === "CUR-N2", "Cursor incremental review id changed");
+assert(
+  incrementalReview.fromCommit === "a3ca33fa6442b59adc42976c795709eaf5351109" &&
+    incrementalReview.toCommit === "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+  "Cursor incremental review range changed",
+);
+assert(
+  incrementalReview.reviewedCommittedObjects === 6 &&
+    incrementalReview.excludedWorktreeEntries === 22 &&
+    incrementalReview.wireDelta === "none" &&
+    incrementalReview.productionCodeChanged === false,
+  "Cursor no-wire-delta conclusion changed",
+);
+if (checkSources) {
+  const source = contract.sources.find((candidate) => candidate.id === "omniroute");
+  assert(source, "Cursor OmniRoute source is missing");
+  const sourceRoot = path.resolve(
+    repoRoot,
+    process.env[source.rootEnv] || source.defaultRelativeRoot,
+  );
+  const changedReviewedPaths = execFileSync(
+    "git",
+    [
+      "-C",
+      sourceRoot,
+      "diff",
+      "--name-only",
+      `${incrementalReview.fromCommit}..${incrementalReview.toCommit}`,
+      "--",
+      ...source.files.map((file) => file.path),
+    ],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  ).trim();
+  assert(changedReviewedPaths === "", "Cursor reviewed wire objects changed in the frozen range");
+}
+
+const enhancements = new Map(
+  (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),
+);
+assert(enhancements.size === 2, "Cursor enhancement set changed");
+assert(
+  enhancements.get("CUR-N1")?.status === "live_pending" &&
+    JSON.stringify(enhancements.get("CUR-N1")?.rails) === JSON.stringify(["oauth", "api_key"]) &&
+    enhancements.get("CUR-N1")?.receiptsIndependent === true,
+  "CUR-N1 dual-rail live gate changed",
+);
+assert(
+  enhancements.get("CUR-N2")?.status === "reviewed_no_wire_delta" &&
+    enhancements.get("CUR-N2")?.productionCodeChanged === false,
+  "CUR-N2 no-wire-delta conclusion changed",
+);
 
 const capabilities = new Map(
   (contract.capabilities ?? []).map((capability) => [capability.id, capability]),

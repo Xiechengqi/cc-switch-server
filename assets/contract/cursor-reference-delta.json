@@ -1,7 +1,7 @@
 {
   "format": "cc-switch-cursor-reference-delta",
   "schemaVersion": 1,
-  "capturedAt": "2026-09-11T00:00:00Z",
+  "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
@@ -13,7 +13,8 @@
       "id": "omniroute",
       "rootEnv": "CC_SWITCH_CURSOR_OMNIROUTE_AUDIT_ROOT",
       "defaultRelativeRoot": "../proxy/Cursor/OmniRoute",
-      "commit": "a3ca33fa6442b59adc42976c795709eaf5351109",
+      "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+      "previousReviewedCommit": "a3ca33fa6442b59adc42976c795709eaf5351109",
       "files": [
         {
           "path": "open-sse/utils/cursorAgentProtobuf.ts",
@@ -42,6 +43,15 @@
       ]
     }
   ],
+  "incrementalReview": {
+    "id": "CUR-N2",
+    "fromCommit": "a3ca33fa6442b59adc42976c795709eaf5351109",
+    "toCommit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+    "reviewedCommittedObjects": 6,
+    "excludedWorktreeEntries": 22,
+    "wireDelta": "none",
+    "productionCodeChanged": false
+  },
   "registryTruth": {
     "driverId": "special.cursor",
     "driverContractRevision": 4,
@@ -76,6 +86,19 @@
       "status": "fixture_verified",
       "path": "src/proxy/cursor/agent_proto.rs",
       "anchors": ["cursor_reference_fixture_preserves_known_semantics_around_unknown_fields"]
+    }
+  ],
+  "enhancements": [
+    {
+      "id": "CUR-N1",
+      "status": "live_pending",
+      "rails": ["oauth", "api_key"],
+      "receiptsIndependent": true
+    },
+    {
+      "id": "CUR-N2",
+      "status": "reviewed_no_wire_delta",
+      "productionCodeChanged": false
     }
   ],
   "realAcceptance": {

@@ -54,6 +54,8 @@ oracle `verification` 是验证计数单源：63 项离线 Rust Qoder 聚焦测�
 
 真实验收仍需分别提供 Global OAuth、CN OAuth 与 Global PAT 的脱敏 receipt，覆盖 login/import、refresh/job-token exchange、catalog、non-stream/stream、tools、reasoning、quota、首个/第二个 401 和 generation rotation。当前没有真实凭据或 receipt，只能标记 `fixture_verified` / `live_pending`，不能标记 live verified。
 
+QD-N2 已把只读 TokenRouter 交叉核对刷新到 `7faf9469bc6957716923b5b4a98665c0fb9715e0`。已提交 Qoder 文档没有变化，handler 差异只适配共享错误 helper 的签名，没有新增 origin、header、签名、payload、terminal 或恢复 wire，因此本轮不修改生产实现；官方 CLI oracle 继续是第一来源。参考仓库的其他 Provider、调度、计费和 UI 增量不属于 Qoder wire 证据。
+
 ## CLI 升级门禁
 
 升级 Global 或 CN CLI 时必须保持以下顺序：先冻结包名、版本、npm integrity 与 bundle digest；再从不可变官方包独立提取稳定 wire，并用只读第二来源交叉核对；随后先更新 oracle 和使旧合同失败的 mutation，再改 Rust；最后重新生成合同映射与 coverage，运行离线和 loopback 门禁。任何 rail 都只能由自身独立 receipt 从 `live_pending` 提升。
