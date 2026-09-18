@@ -950,6 +950,9 @@ pub struct ServerStateInner {
     /// 启动时定格的本地请求体上限。路由层的 `DefaultBodyLimit` 是静态 layer，
     /// 因此这份快照不跟随 `config` 热更新；改动需要重启进程。
     pub request_body_limits: RequestBodyLimits,
+    // Serializes every filesystem operation under backups/ before persistent
+    // store locks are acquired for a consistent snapshot or restore.
+    backup_operations: AsyncMutex<()>,
     // Persistent store locks and commit gates follow:
     // config -> providers -> accounts -> usage -> shares -> ui_settings.
     config_persistence: StorePersistenceCoordinator,
@@ -1046,6 +1049,7 @@ pub struct ServerStateInner {
     provider_health_probe_locks: Mutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
     router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
     router_request_log_sync_wakeup: Notify,
+    periodic_backup_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
     // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
@@ -5941,12 +5945,30 @@ impl ServerStateInner {
         &self,
         reason: Option<String>,
     ) -> anyhow::Result<crate::infra::backup::BackupManifest> {
+        self.create_consistent_backup_if_policy_current(reason, None)
+            .await?
+            .context("unconditional backup was unexpectedly skipped")
+    }
+
+    async fn create_consistent_backup_if_policy_current(
+        &self,
+        reason: Option<String>,
+        expected_policy: Option<ui_settings::BackupPolicy>,
+    ) -> anyhow::Result<Option<crate::infra::backup::BackupManifest>> {
+        let _backup_operation = self.backup_operations.lock().await;
         let _config_commit = self.config_persistence.gate.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let _accounts_commit = self.accounts_persistence.gate.lock().await;
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let _shares_commit = self.shares_persistence.gate.lock().await;
         let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
+        let backup_policy = {
+            let ui_settings = self.ui_settings.read().await;
+            ui_settings::backup_policy(&ui_settings)
+        };
+        if expected_policy.is_some_and(|expected| expected != backup_policy) {
+            return Ok(None);
+        }
 
         if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
             crate::repository::server_sqlite::checkpoint_authority(&self.config_dir)
@@ -5974,7 +5996,63 @@ impl ServerStateInner {
             &self.config_dir,
             &backup_targets(&self.config_dir),
             reason,
+            backup_policy.retain_count,
         )
+        .map(Some)
+    }
+
+    async fn configured_backup_policy(&self) -> ui_settings::BackupPolicy {
+        let ui_settings = self.ui_settings.read().await;
+        ui_settings::backup_policy(&ui_settings)
+    }
+
+    async fn prune_backups_to_configured_retention(
+        &self,
+    ) -> anyhow::Result<(ui_settings::BackupPolicy, usize)> {
+        let _backup_operation = self.backup_operations.lock().await;
+        let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
+        let policy = self.configured_backup_policy().await;
+        let config_dir = self.config_dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::infra::backup::prune_backups(&config_dir, policy.retain_count)
+        })
+        .await
+        .context("backup retention task panicked")??;
+        Ok((policy, removed))
+    }
+
+    pub(crate) async fn list_backups_command(
+        &self,
+    ) -> anyhow::Result<Vec<crate::infra::backup::BackupManifest>> {
+        let _backup_operation = self.backup_operations.lock().await;
+        let config_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || crate::infra::backup::list_backups(&config_dir))
+            .await
+            .context("backup list task panicked")?
+    }
+
+    pub(crate) async fn delete_backup_command(&self, backup_id: String) -> anyhow::Result<()> {
+        let _backup_operation = self.backup_operations.lock().await;
+        let config_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::infra::backup::delete_backup(&config_dir, &backup_id)
+        })
+        .await
+        .context("backup delete task panicked")?
+    }
+
+    pub(crate) async fn rename_backup_command(
+        &self,
+        backup_id: String,
+        display_name: String,
+    ) -> anyhow::Result<crate::infra::backup::BackupManifest> {
+        let _backup_operation = self.backup_operations.lock().await;
+        let config_dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::infra::backup::rename_backup(&config_dir, &backup_id, &display_name)
+        })
+        .await
+        .context("backup rename task panicked")?
     }
 
     pub(crate) fn accept_router_ingress_request(
@@ -6898,6 +6976,7 @@ impl ServerStateInner {
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
             request_body_limits,
+            backup_operations: AsyncMutex::new(()),
             config_persistence: StorePersistenceCoordinator::default(),
             config: RwLock::new(config),
             providers: RwLock::new(providers),
@@ -6999,6 +7078,7 @@ impl ServerStateInner {
             provider_health_probe_locks: Mutex::new(BTreeMap::new()),
             router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
             router_request_log_sync_wakeup: Notify::new(),
+            periodic_backup_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
             credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
@@ -8127,6 +8207,7 @@ impl ServerStateInner {
         self.usage_persistence.mark_published();
         self.shares_persistence.mark_published();
         self.ui_settings_persistence.mark_published();
+        self.periodic_backup_wakeup.notify_one();
         crate::proxy::reasoning_bridge::rotate(&reasoning_root_key.key)?;
         self.tunnels.reload_statuses().await?;
         Ok(())
@@ -8151,6 +8232,7 @@ impl ServerStateInner {
         &self,
         backup_id: String,
     ) -> anyhow::Result<crate::infra::backup::BackupRestoreResult> {
+        let _backup_operation = self.backup_operations.lock().await;
         let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
@@ -18347,7 +18429,14 @@ impl ServerStateInner {
     pub async fn mutate_ui_settings<R>(&self, mutate: impl FnOnce(&mut UiSettingsStore) -> R) -> R {
         let _commit = self.ui_settings_persistence.gate.lock().await;
         let mut ui_settings = self.ui_settings.write().await;
-        mutate(&mut ui_settings)
+        let previous_policy = ui_settings::backup_policy(&ui_settings);
+        let result = mutate(&mut ui_settings);
+        let backup_policy_changed = ui_settings::backup_policy(&ui_settings) != previous_policy;
+        drop(ui_settings);
+        if backup_policy_changed {
+            self.periodic_backup_wakeup.notify_one();
+        }
+        result
     }
 
     pub async fn mutate_ui_settings_immediate<R>(
@@ -18356,7 +18445,9 @@ impl ServerStateInner {
     ) -> anyhow::Result<R> {
         let _commit = self.ui_settings_persistence.gate.lock().await;
         let mut candidate = self.ui_settings.read().await.clone();
+        let previous_policy = ui_settings::backup_policy(&candidate);
         let result = mutate(&mut candidate);
+        let backup_policy_changed = ui_settings::backup_policy(&candidate) != previous_policy;
         #[cfg(test)]
         self.ui_settings_persistence
             .apply_test_persist_delay()
@@ -18364,6 +18455,9 @@ impl ServerStateInner {
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
         *self.ui_settings.write().await = candidate;
         self.ui_settings_persistence.mark_published();
+        if backup_policy_changed {
+            self.periodic_backup_wakeup.notify_one();
+        }
         Ok(result)
     }
 
@@ -18970,18 +19064,57 @@ async fn reconnect_after_client_subdomain_adoption(state: ServerState, reason: &
 pub fn spawn_periodic_backups(state: ServerState) {
     tokio::spawn(async move {
         loop {
-            sleep(Duration::from_secs(6 * 60 * 60)).await;
+            let policy = match state.prune_backups_to_configured_retention().await {
+                Ok((policy, removed)) => {
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            retain_count = policy.retain_count,
+                            "pruned backups to configured retention"
+                        );
+                    }
+                    policy
+                }
+                Err(error) => {
+                    let policy = state.configured_backup_policy().await;
+                    tracing::warn!(
+                        error = %error,
+                        retain_count = policy.retain_count,
+                        "failed to enforce configured backup retention"
+                    );
+                    policy
+                }
+            };
+
+            if policy.interval_hours == 0 {
+                state.periodic_backup_wakeup.notified().await;
+                continue;
+            }
+
+            let interval = Duration::from_secs(policy.interval_hours * 60 * 60);
+            let elapsed = tokio::select! {
+                _ = sleep(interval) => true,
+                _ = state.periodic_backup_wakeup.notified() => false,
+            };
+            if !elapsed {
+                continue;
+            }
+
             match state
-                .create_consistent_backup(Some("periodic".to_string()))
+                .create_consistent_backup_if_policy_current(
+                    Some("periodic".to_string()),
+                    Some(policy),
+                )
                 .await
             {
-                Ok(manifest) => {
+                Ok(Some(manifest)) => {
                     state.emit_event(
                         ServerEvent::new("backup.created", "backup")
                             .id(manifest.id)
                             .message("periodic"),
                     );
                 }
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(error = %error, "periodic backup failed");
                 }
@@ -31814,6 +31947,7 @@ mod tests {
             &config_dir,
             &[providers_path(&config_dir), key_path.clone()],
             Some("s2 restore validation".to_string()),
+            ui_settings::DEFAULT_BACKUP_RETAIN_COUNT,
         )
         .unwrap();
 
@@ -31871,6 +32005,90 @@ mod tests {
         fs::remove_dir_all(config_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn consistent_backup_enforces_live_ui_retention_policy() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let source = config_dir.join("custom.json");
+        for revision in 0..5 {
+            fs::write(&source, format!(r#"{{"revision":{revision}}}"#)).unwrap();
+            crate::infra::backup::create_backup(
+                &config_dir,
+                std::slice::from_ref(&source),
+                Some("retention fixture".to_string()),
+                10,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            crate::infra::backup::list_backups(&config_dir)
+                .unwrap()
+                .len(),
+            5
+        );
+
+        state
+            .create_consistent_backup(Some("default retention".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::infra::backup::list_backups(&config_dir)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let stale_periodic_attempt = state
+            .create_consistent_backup_if_policy_current(
+                Some("stale periodic policy".to_string()),
+                Some(ui_settings::BackupPolicy {
+                    interval_hours: 6,
+                    retain_count: 3,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(stale_periodic_attempt.is_none());
+        assert_eq!(
+            crate::infra::backup::list_backups(&config_dir)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let policy_changed = state.periodic_backup_wakeup.notified();
+        state
+            .apply_ui_settings_patch_immediate(json!({ "backupRetainCount": 5 }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), policy_changed)
+            .await
+            .expect("backup scheduler was not notified about the live policy change");
+        for revision in 5..8 {
+            fs::write(&source, format!(r#"{{"revision":{revision}}}"#)).unwrap();
+            crate::infra::backup::create_backup(
+                &config_dir,
+                std::slice::from_ref(&source),
+                Some("retention fixture".to_string()),
+                10,
+            )
+            .unwrap();
+        }
+        state
+            .create_consistent_backup(Some("configured retention".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::infra::backup::list_backups(&config_dir)
+                .unwrap()
+                .len(),
+            5
+        );
+
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[test]
     fn s2_provider_only_backup_without_matching_key_fails_before_live_replacement() {
         let config_dir = provider_restore_test_dir("s2-missing-key");
@@ -31883,6 +32101,7 @@ mod tests {
             &config_dir,
             &[providers_path(&config_dir)],
             Some("provider-only S2 restore".to_string()),
+            ui_settings::DEFAULT_BACKUP_RETAIN_COUNT,
         )
         .unwrap();
         let live_provider = fs::read(providers_path(&config_dir)).unwrap();

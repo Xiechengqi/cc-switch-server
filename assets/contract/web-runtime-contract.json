@@ -1818,7 +1818,7 @@
       "implemented": true,
       "feature": "settings",
       "endpoint": "ui-settings.json",
-      "notes": "Persists legacy-compatible UI settings for Server Web administration."
+      "notes": "Persists legacy-compatible UI settings for Server Web administration. backupIntervalHours (default 12, 0 disables creation) and backupRetainCount (default 3) drive the live Server backup scheduler and retention policy without restart."
     },
     {
       "name": "save_provider_health_check_config",

@@ -1373,14 +1373,18 @@ async fn web_invoke_dispatch(
         "set_proxy_takeover_for_app" => Ok(json!(true)),
         "delete_db_backup" => {
             let id = web_arg_string_any(&args, &["filename", "id", "backupId"])?;
-            crate::infra::backup::delete_backup(&state.config_dir, &id)
+            state
+                .delete_backup_command(id)
+                .await
                 .map_err(ApiError::bad_request)?;
             Ok(Value::Null)
         }
         "rename_db_backup" => {
             let id = web_arg_string_any(&args, &["oldFilename", "filename", "id"])?;
             let new_name = web_arg_string_any(&args, &["newName", "new_name"])?;
-            let manifest = crate::infra::backup::rename_backup(&state.config_dir, &id, &new_name)
+            let manifest = state
+                .rename_backup_command(id, new_name)
+                .await
                 .map_err(ApiError::bad_request)?;
             Ok(json!(manifest.id))
         }

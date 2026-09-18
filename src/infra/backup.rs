@@ -11,7 +11,6 @@ use crate::infra::time::now_ms;
 
 const BACKUPS_DIR_NAME: &str = "backups";
 const BACKUP_MANIFEST_FILE_NAME: &str = "manifest.json";
-const DEFAULT_BACKUP_KEEP: usize = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,81 +41,114 @@ pub fn create_backup(
     config_dir: &Path,
     targets: &[PathBuf],
     reason: Option<String>,
+    retain_count: usize,
 ) -> anyhow::Result<BackupManifest> {
-    create_backup_inner(config_dir, targets, reason, true)
+    anyhow::ensure!(
+        retain_count > 0,
+        "backup retention must keep at least one backup"
+    );
+    create_backup_inner(config_dir, targets, reason, Some(retain_count))
 }
 
 fn create_backup_inner(
     config_dir: &Path,
     targets: &[PathBuf],
     reason: Option<String>,
-    prune_after_create: bool,
+    retain_count: Option<usize>,
 ) -> anyhow::Result<BackupManifest> {
-    fs::create_dir_all(backups_dir(config_dir))
-        .with_context(|| format!("create backups dir {}", backups_dir(config_dir).display()))?;
-    set_private_directory_permissions(&backups_dir(config_dir))?;
+    let backups_dir = backups_dir(config_dir);
+    fs::create_dir_all(&backups_dir)
+        .with_context(|| format!("create backups dir {}", backups_dir.display()))?;
+    set_private_directory_permissions(&backups_dir)?;
     let id = generate_backup_id();
     let backup_dir = backup_dir(config_dir, &id)?;
-    fs::create_dir_all(&backup_dir)
-        .with_context(|| format!("create backup dir {}", backup_dir.display()))?;
-    set_private_directory_permissions(&backup_dir)?;
-
-    let mut files = Vec::new();
-    for source in expand_backup_sources(targets)? {
-        let relative = source.strip_prefix(config_dir).with_context(|| {
-            format!(
-                "backup source {} must be inside {}",
-                source.display(),
-                config_dir.display()
-            )
-        })?;
-        let file_name = relative
-            .to_str()
-            .context("backup source path must be valid UTF-8")?;
-        validate_backup_file_name(file_name)?;
-        if is_legacy_token_market_archive_path(relative) {
-            continue;
-        }
-        let destination = backup_dir.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create backup directory {}", parent.display()))?;
-            set_private_directory_permissions(parent)?;
-        }
-        fs::copy(&source, &destination).with_context(|| {
-            format!(
-                "copy backup file {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-        set_private_file_permissions(&destination)?;
-        fs::File::open(&destination)
-            .with_context(|| format!("open backup file {} for sync", destination.display()))?
-            .sync_all()
-            .with_context(|| format!("sync backup file {}", destination.display()))?;
-        let size_bytes = fs::metadata(&destination)
-            .with_context(|| format!("stat backup file {}", destination.display()))?
-            .len();
-        files.push(BackupFile {
-            file_name: file_name.to_string(),
-            size_bytes,
-        });
+    let staging_dir = backups_dir.join(format!(".{id}.creating"));
+    anyhow::ensure!(
+        !backup_dir.exists() && !staging_dir.exists(),
+        "backup destination already exists: {}",
+        backup_dir.display()
+    );
+    fs::create_dir(&staging_dir)
+        .with_context(|| format!("create backup staging dir {}", staging_dir.display()))?;
+    if let Err(error) = set_private_directory_permissions(&staging_dir) {
+        cleanup_incomplete_backup_dir(&staging_dir);
+        return Err(error);
     }
 
-    let manifest = BackupManifest {
-        id,
-        created_at_ms: now_ms(),
-        reason: reason.filter(|value| !value.trim().is_empty()),
-        files,
+    let staged = (|| -> anyhow::Result<BackupManifest> {
+        let mut files = Vec::new();
+        for source in expand_backup_sources(targets)? {
+            let relative = source.strip_prefix(config_dir).with_context(|| {
+                format!(
+                    "backup source {} must be inside {}",
+                    source.display(),
+                    config_dir.display()
+                )
+            })?;
+            let file_name = relative
+                .to_str()
+                .context("backup source path must be valid UTF-8")?;
+            validate_backup_file_name(file_name)?;
+            if is_legacy_token_market_archive_path(relative) {
+                continue;
+            }
+            let destination = staging_dir.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create backup directory {}", parent.display()))?;
+                set_private_directory_permissions(parent)?;
+            }
+            fs::copy(&source, &destination).with_context(|| {
+                format!(
+                    "copy backup file {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            set_private_file_permissions(&destination)?;
+            fs::File::open(&destination)
+                .with_context(|| format!("open backup file {} for sync", destination.display()))?
+                .sync_all()
+                .with_context(|| format!("sync backup file {}", destination.display()))?;
+            let size_bytes = fs::metadata(&destination)
+                .with_context(|| format!("stat backup file {}", destination.display()))?
+                .len();
+            files.push(BackupFile {
+                file_name: file_name.to_string(),
+                size_bytes,
+            });
+        }
+
+        let manifest = BackupManifest {
+            id,
+            created_at_ms: now_ms(),
+            reason: reason.filter(|value| !value.trim().is_empty()),
+            files,
+        };
+        crate::infra::storage::write_json_pretty(
+            &staging_dir.join(BACKUP_MANIFEST_FILE_NAME),
+            &manifest,
+        )
+        .with_context(|| format!("write backup manifest {}", manifest.id))?;
+        crate::infra::storage::sync_directory(&staging_dir)?;
+        Ok(manifest)
+    })();
+    let manifest = match staged {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            cleanup_incomplete_backup_dir(&staging_dir);
+            return Err(error);
+        }
     };
-    crate::infra::storage::write_json_pretty(
-        &backup_dir.join(BACKUP_MANIFEST_FILE_NAME),
-        &manifest,
-    )
-    .with_context(|| format!("write backup manifest {}", manifest.id))?;
-    if prune_after_create {
-        prune_backups(config_dir, DEFAULT_BACKUP_KEEP)?;
+    if let Err(error) = fs::rename(&staging_dir, &backup_dir)
+        .with_context(|| format!("commit backup directory {}", backup_dir.display()))
+    {
+        cleanup_incomplete_backup_dir(&staging_dir);
+        return Err(error);
+    }
+    crate::infra::storage::sync_directory(&backups_dir)?;
+    if let Some(retain_count) = retain_count {
+        prune_backups(config_dir, retain_count)?;
     }
     Ok(manifest)
 }
@@ -169,7 +201,7 @@ pub fn restore_backup_with_validator(
         config_dir,
         &pre_restore_targets,
         Some(format!("pre-restore {backup_id}")),
-        false,
+        None,
     )
     .ok();
     for directory in replacement_directories(config_dir, &restored)? {
@@ -280,12 +312,65 @@ fn set_private_file_permissions(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn prune_backups(config_dir: &Path, keep: usize) -> anyhow::Result<usize> {
-    let backups = list_backups(config_dir)?;
-    if backups.len() <= keep {
+fn cleanup_incomplete_backup_dir(path: &Path) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to remove incomplete backup directory"
+            );
+        }
+    }
+}
+
+fn prune_incomplete_backup_dirs(config_dir: &Path) -> anyhow::Result<usize> {
+    let dir = backups_dir(config_dir);
+    if !dir.exists() {
         return Ok(0);
     }
     let mut pruned = 0;
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("read backups dir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read backups entry {}", dir.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("read backup entry type {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_stale_staging = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".creating"))
+            .is_some_and(is_generated_backup_id);
+        let is_incomplete_committed = is_generated_backup_id(&name)
+            && !entry.path().join(BACKUP_MANIFEST_FILE_NAME).is_file();
+        if is_stale_staging || is_incomplete_committed {
+            fs::remove_dir_all(entry.path()).with_context(|| {
+                format!(
+                    "remove incomplete backup directory {}",
+                    entry.path().display()
+                )
+            })?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+pub fn prune_backups(config_dir: &Path, keep: usize) -> anyhow::Result<usize> {
+    let mut pruned = prune_incomplete_backup_dirs(config_dir)?;
+    let backups = list_backups(config_dir)?;
+    if backups.len() <= keep {
+        return Ok(pruned);
+    }
     for backup in backups.into_iter().skip(keep) {
         let dir = backup_dir(config_dir, &backup.id)?;
         if dir.exists() {
@@ -434,6 +519,19 @@ fn generate_backup_id() -> String {
     format!("backup-{}-{suffix}", now_ms())
 }
 
+fn is_generated_backup_id(value: &str) -> bool {
+    let Some((timestamp, suffix)) = value
+        .strip_prefix("backup-")
+        .and_then(|value| value.rsplit_once('-'))
+    else {
+        return false;
+    };
+    !timestamp.is_empty()
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.len() == 8
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn validate_backup_id(value: &str) -> anyhow::Result<()> {
     let valid = !value.is_empty()
         && value
@@ -459,7 +557,10 @@ fn validate_backup_file_name(value: &str) -> anyhow::Result<()> {
         && !path.is_absolute()
         && normal_components
         && allowed_nested_path
-        && (value.ends_with(".json") || value.ends_with(".jsonl") || value == "accounts.key");
+        && (value.ends_with(".json")
+            || value.ends_with(".jsonl")
+            || value == "accounts.key"
+            || value == "server-store.sqlite3");
     if !valid {
         bail!("invalid backup file name");
     }
@@ -511,6 +612,7 @@ mod tests {
             &dir,
             std::slice::from_ref(&config_path),
             Some("test".to_string()),
+            3,
         )
         .unwrap();
         crate::infra::storage::write_json_pretty(
@@ -523,6 +625,71 @@ mod tests {
 
         let content = fs::read_to_string(config_path).unwrap();
         assert!(content.contains("before@example.com"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_creation_enforces_configured_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-backup-retention-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("custom.json");
+
+        for revision in 0..6 {
+            fs::write(&source, format!(r#"{{"revision":{revision}}}"#)).unwrap();
+            create_backup(&dir, std::slice::from_ref(&source), None, 3).unwrap();
+        }
+
+        assert_eq!(list_backups(&dir).unwrap().len(), 3);
+        assert!(create_backup(&dir, std::slice::from_ref(&source), None, 0).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_backup_creation_removes_staging_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-backup-failure-cleanup-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let unsupported = dir.join("unsupported.txt");
+        fs::write(&unsupported, b"not a supported backup file").unwrap();
+
+        assert!(create_backup(&dir, &[unsupported], None, 3).is_err());
+        assert_eq!(fs::read_dir(backups_dir(&dir)).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retention_prunes_legacy_incomplete_backup_directories() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-backup-incomplete-prune-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let backups = backups_dir(&dir);
+        let incomplete = backups.join("backup-123-abcdef12");
+        let staging = backups.join(".backup-124-abcdef12.creating");
+        let unrelated = backups.join("operator-notes");
+        fs::create_dir_all(&incomplete).unwrap();
+        fs::write(incomplete.join("accounts.key"), b"partial").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+
+        assert_eq!(prune_backups(&dir, 3).unwrap(), 2);
+        assert!(!incomplete.exists());
+        assert!(!staging.exists());
+        assert!(unrelated.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -542,7 +709,7 @@ mod tests {
         fs::write(usage.join("requests.json"), br#"{"logs":["before"]}"#).unwrap();
         fs::write(events.join("2026-08-10.jsonl"), b"before\n").unwrap();
 
-        let backup = create_backup(&dir, std::slice::from_ref(&usage), None).unwrap();
+        let backup = create_backup(&dir, std::slice::from_ref(&usage), None, 3).unwrap();
         assert!(backup
             .files
             .iter()
@@ -582,7 +749,7 @@ mod tests {
         let shares = dir.join("shares.json");
         fs::write(&shares, br#"{"shares":[]}"#).unwrap();
 
-        let backup = create_backup(&dir, &[shares.clone(), archive_root.clone()], None).unwrap();
+        let backup = create_backup(&dir, &[shares.clone(), archive_root.clone()], None, 3).unwrap();
         assert_eq!(
             backup
                 .files
@@ -622,7 +789,7 @@ mod tests {
         let path = dir.join("providers.json");
         let live = br#"{"providers":[]}"#;
         fs::write(&path, live).unwrap();
-        let backup = create_backup(&dir, std::slice::from_ref(&path), None).unwrap();
+        let backup = create_backup(&dir, std::slice::from_ref(&path), None, 3).unwrap();
         let backup_file = backup_dir(&dir, &backup.id).unwrap().join("providers.json");
         let malformed = br#"{"providers":"bad"}"#;
         fs::write(&backup_file, malformed).unwrap();
@@ -684,7 +851,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(file_name);
         fs::write(&path, live).unwrap();
-        let backup = create_backup(&dir, std::slice::from_ref(&path), None).unwrap();
+        let backup = create_backup(&dir, std::slice::from_ref(&path), None, 3).unwrap();
         let backup_file = backup_dir(&dir, &backup.id).unwrap().join(file_name);
         fs::write(&backup_file, malformed).unwrap();
         let mut manifest = read_manifest(&dir, &backup.id).unwrap();
@@ -729,7 +896,7 @@ mod tests {
         let path = dir.join("accounts.key");
         let before = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]);
         fs::write(&path, format!("{before}\n")).unwrap();
-        let backup = create_backup(&dir, std::slice::from_ref(&path), None).unwrap();
+        let backup = create_backup(&dir, std::slice::from_ref(&path), None, 3).unwrap();
         let after = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([8_u8; 32]);
         fs::write(&path, format!("{after}\n")).unwrap();
 
@@ -755,7 +922,7 @@ mod tests {
         let source = dir.join("custom.json");
         fs::write(&source, b"{}").unwrap();
 
-        let backup = create_backup(&dir, std::slice::from_ref(&source), None).unwrap();
+        let backup = create_backup(&dir, std::slice::from_ref(&source), None, 3).unwrap();
         let root = backups_dir(&dir);
         let backup_path = backup_dir(&dir, &backup.id).unwrap();
 

@@ -10,6 +10,26 @@ use crate::domain::sharing::share_router_domain::resolve_share_router_domain;
 const UI_SETTINGS_FILE_NAME: &str = "ui-settings.json";
 pub const DEFAULT_OAUTH_QUOTA_REFRESH_INTERVAL_MINUTES: u64 = 30;
 pub const DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS: u64 = 10;
+pub const DEFAULT_BACKUP_INTERVAL_HOURS: u64 = 12;
+pub const DEFAULT_BACKUP_RETAIN_COUNT: usize = 3;
+
+const SUPPORTED_BACKUP_INTERVAL_HOURS: &[u64] = &[0, 6, 12, 24, 48, 168];
+const SUPPORTED_BACKUP_RETAIN_COUNTS: &[usize] = &[3, 5, 10, 15, 20, 30, 50];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupPolicy {
+    pub interval_hours: u64,
+    pub retain_count: usize,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            interval_hours: DEFAULT_BACKUP_INTERVAL_HOURS,
+            retain_count: DEFAULT_BACKUP_RETAIN_COUNT,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct UiSettingsStore {
@@ -135,6 +155,63 @@ pub fn default_oauth_quota_refresh_timeout_ms() -> i64 {
     DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS as i64 * 1000
 }
 
+pub fn backup_policy_from_value(value: &Value) -> BackupPolicy {
+    let interval_hours = value
+        .get("backupIntervalHours")
+        .and_then(Value::as_u64)
+        .filter(|hours| SUPPORTED_BACKUP_INTERVAL_HOURS.contains(hours))
+        .unwrap_or(DEFAULT_BACKUP_INTERVAL_HOURS);
+    let retain_count = value
+        .get("backupRetainCount")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .filter(|count| SUPPORTED_BACKUP_RETAIN_COUNTS.contains(count))
+        .unwrap_or(DEFAULT_BACKUP_RETAIN_COUNT);
+    BackupPolicy {
+        interval_hours,
+        retain_count,
+    }
+}
+
+pub fn backup_policy(store: &UiSettingsStore) -> BackupPolicy {
+    backup_policy_from_value(&store.for_frontend())
+}
+
+fn validate_backup_policy_patch(patch: &Value) -> Result<(), String> {
+    if let Some(value) = patch.get("backupIntervalHours") {
+        let hours = value
+            .as_u64()
+            .ok_or_else(|| "backupIntervalHours must be an integer".to_string())?;
+        if !SUPPORTED_BACKUP_INTERVAL_HOURS.contains(&hours) {
+            return Err(format!(
+                "backupIntervalHours must be one of {}",
+                SUPPORTED_BACKUP_INTERVAL_HOURS
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if let Some(value) = patch.get("backupRetainCount") {
+        let count = value
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| "backupRetainCount must be an integer".to_string())?;
+        if !SUPPORTED_BACKUP_RETAIN_COUNTS.contains(&count) {
+            return Err(format!(
+                "backupRetainCount must be one of {}",
+                SUPPORTED_BACKUP_RETAIN_COUNTS
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn default_ui_settings() -> Value {
     json!({
         "showInTray": false,
@@ -166,8 +243,8 @@ pub fn default_ui_settings() -> Value {
             "openclaw": false,
             "hermes": false
         },
-        "backupIntervalHours": 12,
-        "backupRetainCount": 3,
+        "backupIntervalHours": DEFAULT_BACKUP_INTERVAL_HOURS,
+        "backupRetainCount": DEFAULT_BACKUP_RETAIN_COUNT,
         "rectifierConfig": default_rectifier_config(),
         "optimizerConfig": default_optimizer_config(),
         "logConfig": default_log_config(),
@@ -410,6 +487,7 @@ pub fn settings_patch_from_args(args: &Value) -> Result<Value, String> {
     if let Some(log_config) = patch.get("logConfig") {
         validate_log_config(log_config)?;
     }
+    validate_backup_policy_patch(&patch)?;
     Ok(patch)
 }
 
@@ -511,6 +589,58 @@ mod tests {
             oauth_quota_refresh_timeout_seconds_from_value(&json!(0)),
             DEFAULT_OAUTH_QUOTA_REFRESH_TIMEOUT_SECONDS
         );
+    }
+
+    #[test]
+    fn backup_policy_reads_supported_values_or_defaults() {
+        assert_eq!(
+            backup_policy(&UiSettingsStore::default()),
+            BackupPolicy::default()
+        );
+
+        let configured = UiSettingsStore {
+            value: json!({
+                "backupIntervalHours": 0,
+                "backupRetainCount": 50
+            }),
+        };
+        assert_eq!(
+            backup_policy(&configured),
+            BackupPolicy {
+                interval_hours: 0,
+                retain_count: 50,
+            }
+        );
+
+        let malformed = json!({
+            "backupIntervalHours": 7,
+            "backupRetainCount": 0
+        });
+        assert_eq!(
+            backup_policy_from_value(&malformed),
+            BackupPolicy::default()
+        );
+    }
+
+    #[test]
+    fn generic_settings_patch_validates_backup_policy() {
+        assert!(settings_patch_from_args(&json!({
+            "settings": {
+                "backupIntervalHours": 12,
+                "backupRetainCount": 3
+            }
+        }))
+        .is_ok());
+        assert!(settings_patch_from_args(&json!({
+            "settings": { "backupIntervalHours": 7 }
+        }))
+        .unwrap_err()
+        .contains("backupIntervalHours"));
+        assert!(settings_patch_from_args(&json!({
+            "settings": { "backupRetainCount": 0 }
+        }))
+        .unwrap_err()
+        .contains("backupRetainCount"));
     }
 
     #[test]

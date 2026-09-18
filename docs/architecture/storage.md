@@ -81,7 +81,14 @@
 实现见 `src/infra/backup.rs`：
 
 - 目录 `backups/`，每个备份带 `manifest.json`
-- 默认保留 `DEFAULT_BACKUP_KEEP = 24` 份，超出由 `prune_backups` 清理
+- 自动备份策略来自 `ui-settings.json`：默认每 12 小时执行一次并保留 3 份；`backupIntervalHours = 0`
+  表示停用自动创建，但仍执行保留数清理。设置保存后运行时立即重新计算，无需重启
+- 手动与自动备份都按当前 `backupRetainCount` 裁剪；服务启动时会立即清理超额备份，以及历史版本
+  遗留的、符合 Server 生成 ID 格式但缺少 `manifest.json` 的不完整目录
+- 新备份先写入同文件系统的私有 staging 目录，文件与 manifest 落盘后再原子 rename；创建失败不会
+  暴露新的 `backup-*` 目录。SQLite 权威模式同时包含 `server-store.sqlite3` 与 migration marker
+- 创建、列出、裁剪、删除、重命名与恢复由 `ServerState` 的备份协调器串行化，避免保留清理与
+  pre-restore 安全备份并发修改同一目录
 - 恢复为两阶段：先 stage 再 validate，校验不过不落地
 - 目录 `0700`、文件 `0600`
 

@@ -96,6 +96,7 @@ Run the checks manually at:
 ## Settings, Auth, Router, Backup
 
 - First setup, password login, API token, email code flow, router config, client tunnel, read-only routing status, and backup/restore are reachable.
+- Settings → Advanced → Backup defaults to a 12-hour interval and 3 retained backups; changing either value takes effect without restart, and selecting Disabled stops automatic creation while retention cleanup remains active.
 - Server Web has no standalone Routing tab; Settings → Advanced starts with the API Routing card, which is collapsed by default and retains the same status/actions when expanded.
 - Client Tunnel Owner is read-only; saving tunnel settings changes only tunnel fields and cannot bypass verified Client Owner change.
 - Settings → Share → Payout Information persists one EVM address, explicit USDC/USDT selection, and one or more BSC/Base/Arbitrum One networks; warnings prohibit secrets and identify the address as public/self-declared.

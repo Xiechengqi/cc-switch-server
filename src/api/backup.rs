@@ -5,8 +5,10 @@ pub(in crate::api) async fn list_backups(
     headers: HeaderMap,
 ) -> Result<Json<BackupListResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let backups =
-        crate::infra::backup::list_backups(&state.config_dir).map_err(ApiError::internal)?;
+    let backups = state
+        .list_backups_command()
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(BackupListResponse { ok: true, backups }))
 }
 
