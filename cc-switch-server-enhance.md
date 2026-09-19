@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口，八个 Provider 切片现已全部完成。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -49,6 +49,9 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | `7526159` | Kiro CORE-N2：精确 Kiro/Amazon Q binding 的 sticky request-memory budget 覆盖 canonical/wire、图片工作集、EventStream 与下游 transform；容量耗尽稳定终止且不重放或记为网络故障 |
 | `3485571` | Qoder CORE-N2：三条 credential rail、三 Surface 的 sticky request-memory budget 覆盖 canonical/runtime/catalog/payload、COSY 编码签名、响应/decoder/aggregator 与下游 transform；容量耗尽不重放且按 capacity shed 分类 |
 | `573dc47` | CodeBuddy CORE-N2：Intl/CN、三 Surface 的 sticky request-memory budget 覆盖 canonical/runtime/catalog/payload、JSON wire/headers、响应/decoder/aggregator 与下游 transform；容量耗尽不重放、不刷新且按 capacity shed 分类 |
+| `7f2c531` | SQLite repository 纯结构拆分：schema、加密 payload 投影/秘密校验和 WAL envelope/checksum 下沉到私有模块；authority、SQL、错误文本和外部 API 不变 |
+| `4237756` | state 并发准入纯结构拆分：Share/Account in-flight tracker、RAII guard、快照和容量错误下沉，原 `crate::state` 公共路径不变 |
+| `a0ec1ea` | state 后台调度纯结构拆分：备份、升级、审计上传、Router 心跳、公网 IP、Share 重试和 Account refresh 循环下沉；锁、持久化与 wire 不变 |
 
 | 类别 | 本轮已关闭 | 仍保持门禁/后续计划 |
 | --- | --- | --- |
@@ -61,7 +64,7 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | Qoder | QD-N2 `reviewed_no_wire_delta`、CORE-N2 `fixture_verified`；CORE-N1 Provider facade 与 reference-delta v2 已完成 | QD-N1 三 rail 独立 `live_pending` |
 | CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖；CORE-N1 Provider facade、CORE-N2、Intl/CN schema-v2 私有 receipt gate 与 reference-delta v2 已完成 | CB-N4 与两站真实 receipt `live_pending`，v4.1 runtime disabled |
 
-CORE-N2、CORE-N1 与 EVID-N1 均已完成八个 Provider 切片。所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁；本地容量合同完成不等于任何真实订阅状态提升。
+CORE-N2、CORE-N1 与 EVID-N1 均已完成八个 Provider 切片，Phase 3 的 `state.rs` / `server_sqlite.rs` 本地纯结构拆分也已完成。所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁；本地容量合同或结构验收完成不等于任何真实订阅状态提升。
 
 ### 0.2 原始优先级摘要
 
@@ -576,6 +579,8 @@ src/proxy/execution/
 
 state.rs 保留 ServerStateInner 作为跨域门面，逐步把 Account lifecycle、Provider runtime snapshot、Share mutation、Usage、cache/session 和 background scheduler 实现下沉。不得暴露内部锁或数据库连接给 proxy，也不得绕过现有域方法。
 
+`4237756` 已把 Share/Account 请求并发准入、RAII guard、负载快照和容量错误下沉到 `src/state/in_flight.rs`，保持 `crate::state` 的公共类型路径不变；`a0ec1ea` 随后把周期备份、升级状态、审计上传、Router 心跳、公网 IP、Share 重试、quota/native token refresh 等循环下沉到 `src/state/background.rs`。`ServerStateInner` 仍是跨域门面，子模块没有直接持有数据库连接，也没有新增对存储锁的 `.write().await`，原锁顺序、持久化方法、调度间隔、重试和 wire 均未改变。
+
 ### 12.2 CORE-N2：统一请求生命周期内存预算
 
 状态：completed；优先级：P2。CX-N4 已以 `src/proxy/request_memory.rs` 落地 Codex HTTP/WS 请求生命周期预算，Antigravity 随后完成两条精确 Provider rail 的 HTTP 切片，Claude 完成精确 `claude_oauth` 的 body/压缩 SSE/retained stream-state 切片，Cursor 再完成双 rail、三 Surface 及 parked-session transfer 切片，Grok 完成精确 `grok_oauth` 的 HTTP/SSE/WS/media 切片，Kiro 完成精确 `kiro_oauth` / `amazon_q_oauth` 的 canonical/wire、图片与 EventStream retained-state 切片，Qoder 完成三 rail、三 Surface 的 canonical/COSY/decoder/transform 切片，CodeBuddy 最后完成 Intl/CN、三 Surface 的 canonical/wire/header/decoder/aggregator/transform 切片。八类 Provider 的 CORE-N2 均已完成本地 `fixture_verified`，真实 receipt 状态不随之提升。
@@ -634,6 +639,8 @@ SQLite authority、迁移、备份和回滚不再列为新阶段。后续协议�
 - 默认 shadow 安全策略不回退；
 - 不恢复 JSON 双写或请求路径同步整表写；
 - 不手改 docs/provider/coverage.md。
+
+`7f2c531` 已将固定 schema、加密 legacy payload 投影/秘密校验和 WAL envelope/checksum 校验分别下沉到 `src/repository/server_sqlite/{schema,payload,wal}.rs`。主 repository 继续独占 authority 状态机、transactional writer、backup/restore 和连接策略；SQLite contract audit 会分别验证主模块声明及三个权威子模块的锚点，避免拆分后靠文本拼接形成假绿。
 
 ## 13. 分阶段路线图
 
@@ -697,15 +704,15 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
-状态：部分完成。CX-N4/CORE-N2、CORE-N1 与 EVID-N1 的八类 Provider 切片、Qoder 与 CodeBuddy LIVE-N1 gate、CUR-N2 与 QD-N2 已完成；剩余项是独立的 `state.rs` / `server_sqlite.rs` 纯结构拆分和真实验收，不再有 Provider memory 推广欠项。
+状态：本地可实施项完成。CX-N4/CORE-N2、CORE-N1 与 EVID-N1 的八类 Provider 切片、Qoder 与 CodeBuddy LIVE-N1 gate、CUR-N2、QD-N2，以及独立的 `state.rs` / `server_sqlite.rs` 纯结构拆分均已完成；只剩不能靠离线输入关闭的 LIVE-N1 真实验收。
 
 1. 先完成 CX-N4 的 request memory budget 并抽取 CORE-N2；Codex、Antigravity、Claude、Cursor、Grok、Kiro、Qoder、CodeBuddy 八个切片均已完成。
 2. 按 Provider 分批实施 CORE-N1；八类 Provider 已全部完成。
 3. 实施 EVID-N1 append-only reference delta v2。
 4. 执行 CUR-N2、QD-N2 的周期复核。
-5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority。
+5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority；已由 `7f2c531`、`4237756`、`a0ec1ea` 完成。
 
-Phase 3 退出条件是依赖方向、锁顺序、wire golden、故障测试和存储 audit 全部通过；文件变短本身不是退出条件。
+Phase 3 的本地退出条件已满足：依赖方向、锁顺序、wire golden、故障测试和存储 audit 全部通过；结论来自行为与审计门禁，而不是文件行数下降。LIVE-N1 仍按独立真实输入继续排队，不因 Phase 3 本地关闭而提升。
 
 ### Phase 4：P3 观察项
 
@@ -738,8 +745,8 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 
 | 门禁 | 2026-09-19 结果 | 判定 |
 | --- | --- | --- |
-| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3153 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
-| 默认线程栈 `cargo test --lib` | lib 3153 passed/1 ignored；原 Codex stream-state 栈溢出用例通过 | 通过；全套默认栈仍受既有 API contract 测试线程栈限制 |
+| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3181 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
+| Phase 3 结构专项 | 默认线程栈 `state::tests` 179 passed；SQLite 19 passed；in-flight 关键词 7 passed；Router selection 22 passed | 通过；authority、锁、后台恢复与固定绑定无回归 |
 | `scripts/static-checks.sh` | rustfmt、Clippy、JSON/Node/Shell、Provider/产品边界/依赖方向/文档审计全部通过；Provider audit 142 tests、smoke 13 tests、Web 41 files/213 tests 通过 | 通过 |
 | 八类 reference delta `--check-sources` | Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 均按冻结 Git object 通过 | 通过；不构成 live receipt |
 | `scripts/smoke/smoke-local.sh` | health、Web fallback、setup、密码/API Token 登录、Provider/Share 创建通过 | 通过 |
@@ -754,7 +761,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | Qoder 后续专项 | 74 个 Rust Qoder 关键词测试、24 个 request-memory 关键词测试通过；9 个 Node oracle mutation 与 7 个三 rail loopback harness fixture 通过；11 条 v2 observation、`CORE-N2-QODER`、默认审计及 TokenRouter committed-object `--check-sources` 通过 | CORE-N2 `fixture_verified`；Global OAuth、Global PAT、CN OAuth 仍各自为 `live_pending` |
 | CodeBuddy 后续专项 | 66 个 Rust CodeBuddy 关键词测试、26 个 request-memory 与 15 个 memory-exhaustion 关键词测试通过；6 个双站 receipt fixture 与 11 个环境门禁测试保持通过；11 个 legacy 字段摘要、1 个 dirty-worktree-excluded snapshot、15 条 v2 observation、`CORE-N2-CODEBUDDY` 与 3 条 reject 边界的默认及 `--check-sources` audit 均通过 | CORE-N2 `fixture_verified`；Intl/CN 两站 receipt 与 CB-N4 仍为 `live_pending`/disabled |
 
-正式全套测试使用仓库 release gate 规定的 64 MiB `RUST_MIN_STACK`。本次已让默认 2 MiB 栈上的完整 lib 套件通过；默认栈运行全套时仍会在既有 `api_contract::provider_share_settings_are_saved_atomically` 溢出，因此没有把该基础设施限制误写成通过。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
+正式全套测试使用仓库 release gate 规定的 64 MiB `RUST_MIN_STACK`；Phase 3 结构专项另在默认测试线程栈运行。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。本轮按约束没有运行 UI 自动化或部署测试，也没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
 
 ### 14.3 专项测试矩阵
 
@@ -880,4 +887,4 @@ CodeBuddy：
 11. registry、合同源、生成 coverage、UI matrix、PROTOCOL_EVIDENCE 和 reference delta 一致；docs/provider/coverage.md 未被手改。
 12. 外部仓库没有进入构建、测试、CI、发布或运行时依赖。
 
-当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。八类 Provider 已全部完成 CORE-N1、CORE-N2 与 EVID-N1。因此可以关闭首轮静态差分、P0/P1 离线实施、八类 Provider lifecycle/request-memory 拆分及证据迁移，不能把完整真实验收队列或整体架构计划标记为完成。
+当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。八类 Provider 已全部完成 CORE-N1、CORE-N2 与 EVID-N1，Phase 3 的 state/SQLite 纯结构拆分也已通过完整本地门禁。因此可以关闭首轮静态差分、P0/P1 离线实施、八类 Provider lifecycle/request-memory 拆分、证据迁移及本地架构切片；完整计划仍不能标记为全部完成，唯一剩余类别是必须由真实环境输入逐 rail 关闭的 LIVE-N1。
