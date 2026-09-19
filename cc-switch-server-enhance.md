@@ -52,7 +52,7 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | Qoder | QD-N2 `reviewed_no_wire_delta` | QD-N1 三 rail 独立 `live_pending` |
 | CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖 | CB-N4 与 Intl/CN receipt `live_pending`，v4.1 runtime disabled |
 
-CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 已完成 Antigravity、Claude、Codex、Cursor、Grok、Kiro 六个切片；Qoder、CodeBuddy 的结构拆分与 reference delta v2 仍待推进，所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
+CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 已完成 Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 七个切片，EVID-N1 已完成前六个切片；Qoder 的 reference delta v2 与 CodeBuddy 的结构/证据拆分仍待推进，所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
 
 ### 0.2 原始优先级摘要
 
@@ -450,6 +450,8 @@ TokenRouter 从 3488b4a9 到 7faf9469 的 Qoder/COSY 路径净变化仅是 qoder
 
 三条 rail 的成功状态互不继承。升级 oracle 时必须用 mutation 证明 endpoint、header、body、signature、machine identity 任一单边漂移会红灯；禁止 fixture 与 Rust 同时“顺手修改”造成假绿。
 
+CORE-N1 已将 exact Account binding、Share/用户/session conversation scope、live catalog model/payload preparation、generation fence 与 Qoder throttle 收敛到 `src/proxy/providers/qoder/`；codec/runtime primitive 仍分别位于 `proxy::qoder` / `proxy::qoder_runtime`，Share/Account lease、usage、terminal、共享 attempt budget 与同账号 pre-commit 401 replay 决策继续由 forwarder 持有。LIVE-N1 的三条 rail receipt 已升级为 schema v2，分别绑定 target commit/harness、Account auth/token generation、三个 Surface Provider revision/runtime digest、Share revision、site/rail、exact model、三份 fresh catalog snapshot 和六个 body hash。当前 harness 未观察 login/rotation、权威空目录与受控两段 401，所以真实 happy-path 仍只可标记 `partial_live_verified/live_pending`，fixture 仍为 `contract_verified/live_pending`。
+
 ### 10.3 不采纳
 
 不纳入 TokenRouter 的商业计费、Key 管理、渠道配置、账号维护调度和多租户管理后台。
@@ -504,7 +506,7 @@ CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项�
 
 ### 12.1 CORE-N1：渐进拆分巨型热路径
 
-状态：partially_completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok、Kiro 六个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；Qoder、CodeBuddy 仍待逐类实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
+状态：partially_completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 七个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；CodeBuddy 仍待实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
 
 建议目标结构：
 
@@ -653,10 +655,10 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
-状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex/Cursor/Grok/Kiro 的 CORE-N1/EVID-N1 切片、CUR-N2 与 QD-N2 已完成；其余 CORE-N1、跨 Provider memory 推广和 Qoder/CodeBuddy 两类 reference-delta schema v2 留待后续独立变更。
+状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex/Cursor/Grok/Kiro 的 CORE-N1/EVID-N1 切片、Qoder CORE-N1/LIVE-N1、CUR-N2 与 QD-N2 已完成；CodeBuddy CORE-N1、跨 Provider memory 推广和 Qoder/CodeBuddy 两类 reference-delta schema v2 留待后续独立变更。
 
 1. 先完成 CX-N4 的 request memory budget，再抽取 CORE-N2。
-2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok、Kiro 已完成，后续依次处理 Qoder、CodeBuddy。
+2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 已完成，后续处理 CodeBuddy。
 3. 实施 EVID-N1 append-only reference delta v2。
 4. 执行 CUR-N2、QD-N2 的周期复核。
 5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority。
@@ -694,7 +696,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 
 | 门禁 | 2026-09-19 结果 | 判定 |
 | --- | --- | --- |
-| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3113 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
+| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3115 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
 | `scripts/static-checks.sh` | rustfmt、Clippy、JSON/Node/Shell、Provider/产品边界/依赖方向/文档审计全部通过；Provider audit 135 tests、smoke 13 tests、Web 41 files/213 tests 通过 | 通过 |
 | 八类 reference delta `--check-sources` | Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 均按冻结 Git object 通过 | 通过；不构成 live receipt |
 | `scripts/smoke/smoke-local.sh` | health、Web fallback、setup、密码/API Token 登录、Provider/Share 创建通过 | 通过 |
@@ -706,6 +708,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | Cursor 后续专项 | 295 个 Rust Cursor 关键词测试通过；7 个顶层 Node receipt gate/21 个断言通过；10 个 legacy 字段摘要、1 个 dirty-worktree-excluded snapshot、7 条 v2 observation audit 通过 | 通过；OAuth/API-key 两条 rail 仍为 `live_pending` |
 | Grok 后续专项 | 8 个 Rust replay/HTTP/WS 专项通过；6 个顶层 Node receipt gate/11 个断言通过；10 个 legacy 字段摘要、2 个 committed-object snapshot、10 条 v2 observation 的默认与 `--check-sources` audit 均通过 | 通过；inference/media/remote_compaction 三个 operation 仍为 `live_pending` |
 | Kiro 后续专项 | 97 个 Rust Kiro 关键词测试通过；5 个顶层 Node receipt gate 覆盖八个 scope；10 个 legacy 字段摘要、1 个干净 committed-object snapshot、13 条 v2 observation 与 3 条 reject 边界的默认及 `--check-sources` audit 均通过 | 通过；八个 auth-kind × region receipt、remote compaction 与 shared cache 仍为 `live_pending`/disabled |
+| Qoder 后续专项 | 65 个 Rust Qoder 关键词测试通过；9 个 Node oracle mutation 与 7 个三 rail loopback harness fixture 通过；TokenRouter committed-object `--check-sources` 通过 | 通过；Global OAuth、Global PAT、CN OAuth 仍各自为 `live_pending`，reference delta v2 待独立提交 |
 
 正式测试使用 64 MiB `RUST_MIN_STACK`；默认 2 MiB 线程栈的既有溢出不作为本轮回归。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
 

@@ -148,14 +148,17 @@ function runEnvCheck(overrides) {
       CC_SWITCH_QODER_GLOBAL_OAUTH_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_QODER_GLOBAL_OAUTH_CODEX_PROVIDER_ID: "",
       CC_SWITCH_QODER_GLOBAL_OAUTH_GEMINI_PROVIDER_ID: "",
+      CC_SWITCH_QODER_GLOBAL_OAUTH_SHARE_ID: "",
       QODER_GLOBAL_PAT_TEST_ACCOUNT: "",
       CC_SWITCH_QODER_GLOBAL_PAT_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_QODER_GLOBAL_PAT_CODEX_PROVIDER_ID: "",
       CC_SWITCH_QODER_GLOBAL_PAT_GEMINI_PROVIDER_ID: "",
+      CC_SWITCH_QODER_GLOBAL_PAT_SHARE_ID: "",
       QODER_CN_OAUTH_TEST_ACCOUNT: "",
       CC_SWITCH_QODER_CN_OAUTH_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_QODER_CN_OAUTH_CODEX_PROVIDER_ID: "",
       CC_SWITCH_QODER_CN_OAUTH_GEMINI_PROVIDER_ID: "",
+      CC_SWITCH_QODER_CN_OAUTH_SHARE_ID: "",
       AMAZON_Q_TEST_ACCOUNT: "",
       CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID: "",
@@ -469,6 +472,7 @@ test("Qoder external gates keep the three credential rails independent", () => {
     CC_SWITCH_QODER_GLOBAL_OAUTH_CLAUDE_PROVIDER_ID: "qoder-global-oauth-claude",
     CC_SWITCH_QODER_GLOBAL_OAUTH_CODEX_PROVIDER_ID: "qoder-global-oauth-codex",
     CC_SWITCH_QODER_GLOBAL_OAUTH_GEMINI_PROVIDER_ID: "qoder-global-oauth-gemini",
+    CC_SWITCH_QODER_GLOBAL_OAUTH_SHARE_ID: "qoder-global-oauth-share",
   });
   assert.equal(globalOauth.checks.qoderGlobalOauthGateStatus, "inputs-ready");
   assert.equal(globalOauth.checks.qoderGlobalPatGateStatus, "blocked-inputs");
@@ -480,10 +484,12 @@ test("Qoder external gates keep the three credential rails independent", () => {
     CC_SWITCH_QODER_GLOBAL_PAT_CLAUDE_PROVIDER_ID: "qoder-global-pat-claude",
     CC_SWITCH_QODER_GLOBAL_PAT_CODEX_PROVIDER_ID: "qoder-global-pat-codex",
     CC_SWITCH_QODER_GLOBAL_PAT_GEMINI_PROVIDER_ID: "qoder-global-pat-gemini",
+    CC_SWITCH_QODER_GLOBAL_PAT_SHARE_ID: "qoder-global-pat-share",
     QODER_CN_OAUTH_TEST_ACCOUNT: "qoder-cn-oauth-account",
     CC_SWITCH_QODER_CN_OAUTH_CLAUDE_PROVIDER_ID: "qoder-cn-oauth-claude",
     CC_SWITCH_QODER_CN_OAUTH_CODEX_PROVIDER_ID: "qoder-cn-oauth-codex",
     CC_SWITCH_QODER_CN_OAUTH_GEMINI_PROVIDER_ID: "qoder-cn-oauth-gemini",
+    CC_SWITCH_QODER_CN_OAUTH_SHARE_ID: "qoder-cn-oauth-share",
   });
   assert.equal(globalPatAndCn.checks.qoderGlobalOauthGateStatus, "blocked-inputs");
   assert.equal(globalPatAndCn.checks.qoderGlobalPatGateStatus, "inputs-ready");

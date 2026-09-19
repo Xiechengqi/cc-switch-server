@@ -4,6 +4,8 @@
 
 当前 `special.qoder_cosy` Driver contract revision 为 **2**。`assets/contract/qoder-reference-delta.json` 把该 revision 与三个 Registry Profile、生产入口、官方 CLI oracle、生成 coverage、三 rail conformance 和真实验收状态映射在一起；`scripts/audit/audit-qoder-reference-delta.mjs` 对这些来源做交叉校验。`supported` 只表示实现入口存在，`fixture_verified` 与 `live_pending` 仍分别表达离线合同证据和缺失的真实证据，三者不得互相替代。
 
+Provider 生命周期边界已收敛到 `src/proxy/providers/qoder/`：它持有精确 `qoder_cosy` Account 绑定、Share/用户/session conversation scope、live catalog model、payload preparation、generation fence 与 Qoder throttle 分类。COSY codec/terminal 仍由 `proxy::qoder` 持有，runtime cache/payload primitive 仍由 `proxy::qoder_runtime` 持有；Share/Account lease、usage、共享 attempt budget、终态和是否执行同账号 pre-commit 401 replay 继续由 forwarder 持有。该结构迁移不改变 endpoint、header、签名、wire、恢复次数或跨边界 fail-closed 规则。
+
 ## 站点与凭据 rail
 
 - Global 与 China 是账号身份的一部分，分别固定到经过审计的 origin。请求中的模型、403、quota 或网络错误不能改变站点。
@@ -48,9 +50,9 @@ Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发�
 
 ## 验收边界
 
-oracle `verification` 是验证计数单源：63 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、响应 envelope、工具历史、Device Flow 容量、session/provider/account generation fencing、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；9 项 Node mutation 还冻结 bounded compatibility、安全边界、coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 63/9/7，不再维护手写副本。
+oracle `verification` 是验证计数单源：65 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、响应 envelope、工具历史、Device Flow 容量、session/provider/account generation fencing、Provider facade scope、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；9 项 Node mutation 还冻结 bounded compatibility、安全边界、coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 65/9/7，不再维护手写副本。
 
-`scripts/smoke/qoder-real.mjs` 按 `global_oauth`、`global_pat`、`cn_oauth` 一次只运行一条 rail。它先核对三个 Surface Provider 固定同一 Account generation，再验收 fresh catalog、quota、三 Surface non-stream/stream/tool/usage/唯一终态，并把 commit、site/rail、generation、摘要与三个 decoy 绑定结果写入仓库外 0600 receipt。receipt 的 `acceptanceChecks` 对每项分别写 `pass`、`binding_only` 或 `not_observed`；当前 harness 没有实际执行登录/轮换、权威空目录和受控两段 401，因此即使连接真实服务也只能写 `partial_live_verified/live_pending`，不能单独提升整条 rail。`scripts/audit/qoder-real.test.mjs` 的 loopback 结果固定为 `contract_verified/live_pending`，同样不能替代真实 receipt。
+`scripts/smoke/qoder-real.mjs` 按 `global_oauth`、`global_pat`、`cn_oauth` 一次只运行一条 rail。schema-v2 receipt 绑定当前 target commit/harness、Account auth/token generation、三个 Surface Provider revision/runtime digest、Share revision、site/rail、exact model、三份 fresh catalog snapshot 和六个请求 body hash，再验收 quota、三 Surface non-stream/stream/tool/usage/唯一终态；文件写在仓库外并强制为 0600。`acceptanceChecks` 对每项分别写 `pass`、`binding_only` 或 `not_observed`；当前 harness 没有实际执行登录/轮换、权威空目录和受控两段 401，因此即使连接真实服务也只能写 `partial_live_verified/live_pending`，不能单独提升整条 rail。`scripts/audit/qoder-real.test.mjs` 的 loopback 结果固定为 `contract_verified/live_pending`，同样不能替代真实 receipt。
 
 真实验收仍需分别提供 Global OAuth、CN OAuth 与 Global PAT 的脱敏 receipt，覆盖 login/import、refresh/job-token exchange、catalog、non-stream/stream、tools、reasoning、quota、首个/第二个 401 和 generation rotation。当前没有真实凭据或 receipt，只能标记 `fixture_verified` / `live_pending`，不能标记 live verified。
 

@@ -95,6 +95,16 @@
           ]
         },
         {
+          "path": "src/proxy/providers/qoder/mod.rs",
+          "anchors": [
+            "pub(crate) fn bound_account_identity(",
+            "pub(crate) async fn prepare_runtime(",
+            "pub(crate) fn prepare_canonical_request(",
+            "pub(crate) fn prepare_generation(",
+            "pub(crate) async fn runtime_is_current("
+          ]
+        },
+        {
           "path": "src/state.rs",
           "anchors": [
             "pub(crate) async fn prepare_qoder_runtime(",
@@ -185,6 +195,18 @@
     ]
   },
   "realAcceptance": {
+    "receiptSchemaVersion": 2,
+    "harnessRevision": 2,
+    "scopeBindings": [
+      "target_commit",
+      "credential_rail_and_site",
+      "account_auth_and_token_generations",
+      "three_surface_provider_revisions_and_runtime_digests",
+      "share_revision_and_binding_digest",
+      "exact_model",
+      "three_fresh_catalog_snapshots",
+      "six_request_body_hashes"
+    ],
     "rails": [
       {
         "rail": "cn_oauth",

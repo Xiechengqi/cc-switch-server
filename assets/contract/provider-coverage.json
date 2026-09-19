@@ -10,7 +10,7 @@
   },
   "verification": {
     "qoder": {
-      "rustQoderTests": 63,
+      "rustQoderTests": 65,
       "nodeOracleMutationTests": 9,
       "nodeRealHarnessFixtureTests": 7
     }

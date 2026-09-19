@@ -108,6 +108,7 @@ use super::providers::claude::{
 };
 use super::providers::{
     antigravity, claude, codex, cursor, grok as grok_provider, kiro as kiro_provider,
+    qoder as qoder_provider,
 };
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
@@ -18206,77 +18207,23 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         share_invocation_guard,
         started,
     } = options;
-    let (ProviderType::QoderCosy, account_id, expected_identity_generation) =
-        execution.managed_account_identity_target().ok_or_else(|| {
-            ProxyError::bad_request(
-                "Qoder COSY Provider must bind one explicit qoder_cosy managed account",
-            )
-        })?
-    else {
-        return Err(ProxyError::bad_request(
-            "Qoder COSY Provider account type does not match its runtime contract",
-        ));
-    };
-    let share_id = request_context
-        .share_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ProxyError::bad_request("Qoder COSY inference requires a Router Share"))?
-        .to_string();
-    let user_namespace = opaque_ref(
-        "qoder_user",
-        request_context
-            .user_email
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("anonymous"),
-    );
-    let downstream_session_id = request_context
-        .session_id
-        .clone()
-        .or_else(|| request_context.request_id.clone())
-        .unwrap_or_else(|| {
-            opaque_ref(
-                "qoder_request",
-                std::str::from_utf8(&adapter_request.body).unwrap_or("non_utf8_request"),
-            )
-        });
-    request_context.session_id = Some(downstream_session_id.clone());
-    let requested_model = match adapter_request
-        .actual_model
-        .clone()
-        .or_else(|| adapter_request.model.clone())
-        .or_else(|| qoder_model_from_canonical_chat(&adapter_request.body))
-    {
-        Some(model) => model,
-        None => {
-            return qoder_fail_before_commit(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                ProxyError::bad_request("Qoder COSY request is missing a model"),
-            )
-            .await;
-        }
-    };
-    let canonical_chat_request = match serde_json::from_slice::<Value>(&adapter_request.body) {
-        Ok(request) => request,
-        Err(error) => {
-            return qoder_fail_before_commit(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                ProxyError::bad_request(format!("invalid Qoder Chat request: {error}")),
-            )
-            .await;
-        }
-    };
+    let bound = qoder_provider::bound_account_identity(&execution)?;
+    let canonical =
+        match qoder_provider::prepare_canonical_request(&adapter_request, &mut request_context) {
+            Ok(canonical) => canonical,
+            Err(qoder_provider::CanonicalRequestError::Binding(error)) => return Err(error),
+            Err(qoder_provider::CanonicalRequestError::Request(error)) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error,
+                )
+                .await;
+            }
+        };
 
     let mut recovery_attempt = ForwardAttemptContext::default();
     let binding_accounts = state.accounts_snapshot().await;
@@ -18284,18 +18231,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
     let (runtime, model_key, wire) = loop {
-        let runtime = match state
-            .prepare_qoder_runtime(
-                stored.app,
-                &stored.provider.id,
-                execution.plan.provider_revision,
-                &execution.plan.runtime_fingerprint,
-                account_id,
-                expected_identity_generation,
-                execution.request_timeout(),
-            )
-            .await
-        {
+        let runtime = match qoder_provider::prepare_runtime(&state, &execution, &bound).await {
             Ok(runtime) => runtime,
             Err(error)
                 if error.is_authentication_failure()
@@ -18344,113 +18280,31 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 return Err(error);
             }
         };
-        let model_key = match super::qoder_runtime::resolve_qoder_model_key(
-            runtime.session.session.site,
-            &requested_model,
-        ) {
-            Ok(model_key) => model_key,
-            Err(message) => {
-                return qoder_fail_before_commit(
-                    &state,
-                    &stored,
-                    &adapter_request,
-                    &request_context,
-                    started,
-                    ProxyError::bad_request(message),
-                )
-                .await;
-            }
-        };
-        if !runtime
-            .catalog
-            .enabled_models
-            .iter()
-            .any(|enabled| enabled == &model_key)
-        {
-            let error = ProxyError {
-                status: StatusCode::FORBIDDEN,
-                message: format!(
-                    "Qoder model {model_key} is not enabled in the bound account's live catalog"
-                ),
-            };
-            record_qoder_nonstream_failure(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                &error,
-            )
-            .await;
-            return Err(error);
-        }
-        let exact_model_config = match runtime.exact_model_config(&model_key) {
-            Some(config) => config,
-            None => {
-                return qoder_fail_before_commit(
-                    &state,
-                    &stored,
-                    &adapter_request,
-                    &request_context,
-                    started,
-                    ProxyError {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        message: format!(
-                            "Qoder live catalog has no exact model_config for enabled model {model_key}"
-                        ),
-                    },
-                )
-                .await;
-            }
-        };
-        let conversation_session_id =
-            match super::qoder_runtime::derive_qoder_conversation_session_id(
-                &runtime.scope,
-                &share_id,
-                &user_namespace,
-                &downstream_session_id,
-                &model_key,
-            ) {
-                Ok(session_id) => session_id,
-                Err(message) => {
-                    return qoder_fail_before_commit(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        ProxyError::bad_request(message),
-                    )
-                    .await;
-                }
-            };
         let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-        let payload = match super::qoder_runtime::build_qoder_payload(
-            &canonical_chat_request,
-            exact_model_config,
-            runtime.session.session.site,
-            &model_key,
-            &conversation_session_id,
-            &runtime.session.session.identity.user_type,
-            now_ms,
-        ) {
-            Ok(payload) => payload,
-            Err(message) => {
+        let prepared = match qoder_provider::prepare_generation(&runtime, &canonical, now_ms) {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return qoder_fail_before_commit(
                     &state,
                     &stored,
                     &adapter_request,
                     &request_context,
                     started,
-                    ProxyError::bad_request(message),
+                    error,
                 )
                 .await;
             }
         };
-        let wire =
-            send_qoder_generation(&state, &execution, &runtime, &payload, exact_model_config).await;
+        let wire = send_qoder_generation(
+            &state,
+            &execution,
+            &runtime,
+            &prepared.payload,
+            &prepared.model_source,
+        )
+        .await;
         match wire {
-            Ok(wire) => break (runtime, model_key, wire),
+            Ok(wire) => break (runtime, prepared.model_key, wire),
             Err(QoderForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure()
                     && !recovery_attempt.auth_refresh_attempted() =>
@@ -18484,7 +18338,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 .await?;
             }
             Err(QoderForwardAttemptError::Upstream(error)) => {
-                record_qoder_limit_if_needed(&state, &execution, &error).await;
+                qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
                 let error = error.into_proxy_error();
                 record_qoder_nonstream_failure(
                     &state,
@@ -18552,7 +18406,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             match aggregate_qoder_nonstream(&state, &execution, &runtime, wire, &model_key).await {
                 Ok(canonical) => canonical,
                 Err(QoderForwardAttemptError::Upstream(error)) => {
-                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
                     let error = error.into_proxy_error();
                     record_qoder_nonstream_failure(
                         &state,
@@ -18594,24 +18448,14 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
     }
 }
 
-fn qoder_model_from_canonical_chat(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("model")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 async fn send_qoder_generation(
     state: &ServerState,
     execution: &ProviderExecution,
     runtime: &super::qoder_runtime::PreparedQoderRuntime,
     payload: &super::qoder_runtime::PreparedQoderPayload,
-    exact_model_config: &Value,
+    model_source: &str,
 ) -> Result<PreparedQoderWireResponse, QoderForwardAttemptError> {
-    if !qoder_runtime_is_current(state, execution, runtime).await {
+    if !qoder_provider::runtime_is_current(state, execution, runtime).await {
         return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
             "Qoder Provider or bound account changed before inference",
         )));
@@ -18661,16 +18505,7 @@ async fn send_qoder_generation(
         .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
     target_headers.extend([
         ("x-model-key".to_string(), payload.model_key.clone()),
-        (
-            "x-model-source".to_string(),
-            exact_model_config
-                .get("source")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("system")
-                .to_string(),
-        ),
+        ("x-model-source".to_string(), model_source.to_string()),
         (
             "user-agent".to_string(),
             crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
@@ -18703,7 +18538,7 @@ async fn send_qoder_generation(
             .await
             .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
     };
-    if !qoder_runtime_is_current(state, execution, runtime).await {
+    if !qoder_provider::runtime_is_current(state, execution, runtime).await {
         return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
             "Qoder Provider or bound account changed while inference was starting",
         )));
@@ -18764,7 +18599,7 @@ async fn send_qoder_generation(
                 }
             })?;
         if !canonical.is_empty() || decoder.is_terminal() {
-            if !qoder_runtime_is_current(state, execution, runtime).await {
+            if !qoder_provider::runtime_is_current(state, execution, runtime).await {
                 return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
                     "Qoder Provider or bound account changed before response commit",
                 )));
@@ -18797,24 +18632,6 @@ async fn qoder_next_wire_chunk(
         None => inner.try_next().await,
     };
     next.map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))
-}
-
-async fn qoder_runtime_is_current(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    runtime: &super::qoder_runtime::PreparedQoderRuntime,
-) -> bool {
-    state
-        .qoder_runtime_generation_matches(
-            execution.stored.app,
-            &execution.stored.provider.id,
-            execution.plan.provider_revision,
-            &execution.plan.runtime_fingerprint,
-            &runtime.account_id,
-            runtime.auth_identity_generation,
-            runtime.token_refresh_generation,
-        )
-        .await
 }
 
 async fn recover_qoder_auth(
@@ -18918,42 +18735,6 @@ async fn qoder_fail_before_commit(
     Err(error)
 }
 
-async fn record_qoder_limit_if_needed(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    error: &super::qoder::QoderUpstreamError,
-) {
-    if !error.is_agent_limited() && error.downstream_status() != StatusCode::TOO_MANY_REQUESTS {
-        return;
-    }
-    let Some((ProviderType::QoderCosy, account_id, auth_identity_generation)) =
-        execution.managed_account_identity_target()
-    else {
-        return;
-    };
-    let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let until_ms = super::bounded_upstream_rate_limit_until(
-        now_ms,
-        error
-            .agent_limit_reset_at_ms
-            .or_else(|| {
-                error
-                    .retry_after_ms
-                    .map(|delay| now_ms.saturating_add(delay))
-            })
-            .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
-    );
-    state
-        .mark_account_rate_limited_until_if_current(
-            account_id,
-            ProviderType::QoderCosy,
-            auth_identity_generation,
-            until_ms,
-            Some(format!("Qoder rate limit is active until {until_ms}")),
-        )
-        .await;
-}
-
 async fn record_qoder_nonstream_failure(
     state: &ServerState,
     stored: &StoredProvider,
@@ -19049,7 +18830,7 @@ async fn aggregate_qoder_nonstream(
                 return Err(QoderForwardAttemptError::Proxy(error));
             }
         };
-        if !qoder_runtime_is_current(state, execution, runtime).await {
+        if !qoder_provider::runtime_is_current(state, execution, runtime).await {
             return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
                 "Qoder Provider or bound account changed during inference",
             )));
@@ -19058,7 +18839,7 @@ async fn aggregate_qoder_nonstream(
             .push(canonical)
             .map_err(QoderForwardAttemptError::Proxy)?;
     }
-    if !qoder_runtime_is_current(state, execution, runtime).await {
+    if !qoder_provider::runtime_is_current(state, execution, runtime).await {
         return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
             "Qoder Provider or bound account changed before response commit",
         )));
@@ -19283,7 +19064,8 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                     let canonical = match wire.decoder.finish_classified() {
                         Ok(canonical) => canonical,
                         Err(super::qoder::QoderSseDecodeError::Upstream(error)) => {
-                            record_qoder_limit_if_needed(&state, &execution, &error).await;
+                            qoder_provider::record_limit_if_needed(&state, &execution, &error)
+                                .await;
                             let error = error.into_proxy_error();
                             if let Some(frame) = finish_qoder_stream_failure(
                                 &mut interrupt_guard,
@@ -19305,7 +19087,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                             return;
                         }
                     };
-                    if !qoder_runtime_is_current(&state, &execution, &runtime).await {
+                    if !qoder_provider::runtime_is_current(&state, &execution, &runtime).await {
                         let error = ProxyError::conflict(
                             "Qoder Provider or bound account changed before response commit",
                         );
@@ -19378,7 +19160,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                     return;
                 }
                 Err(QoderForwardAttemptError::Upstream(error)) => {
-                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
                     let error = error.into_proxy_error();
                     if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard,
@@ -19393,7 +19175,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             let canonical = match wire.decoder.push_classified(chunk) {
                 Ok(canonical) => canonical,
                 Err(super::qoder::QoderSseDecodeError::Upstream(error)) => {
-                    record_qoder_limit_if_needed(&state, &execution, &error).await;
+                    qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
                     let error = error.into_proxy_error();
                     if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard,
@@ -19415,7 +19197,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                     return;
                 }
             };
-            if !qoder_runtime_is_current(&state, &execution, &runtime).await {
+            if !qoder_provider::runtime_is_current(&state, &execution, &runtime).await {
                 let error = ProxyError::conflict(
                     "Qoder Provider or bound account changed during inference",
                 );

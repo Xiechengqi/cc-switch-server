@@ -106,7 +106,7 @@ const requiredHooks = Object.freeze([
 ]);
 
 const expectedVerification = Object.freeze({
-  rustQoderTests: 63,
+  rustQoderTests: 65,
   nodeOracleMutationTests: 9,
   nodeRealHarnessFixtureTests: 7,
 });
@@ -505,6 +505,10 @@ function auditDifferential(canonicalCase) {
 
 function auditReceipt(receipt) {
   assert(receipt && typeof receipt === "object", "receipt schema is required");
+  assert(
+    receipt.schemaVersion === 2 && receipt.harnessRevision === 2,
+    "receipt schema and harness revision must stay at v2",
+  );
   const required = uniqueSortedStrings(receipt.requiredFields, "receipt.requiredFields");
   const forbidden = uniqueSortedStrings(receipt.forbiddenFields, "receipt.forbiddenFields");
   const zero = uniqueSortedStrings(receipt.successRequiresZero, "receipt.successRequiresZero");
@@ -514,6 +518,14 @@ function auditReceipt(receipt) {
     "credentialRail",
     "authIdentityGeneration",
     "tokenRefreshGeneration",
+    "targetCommit",
+    "harnessRevision",
+    "scopeDigest",
+    "shareBindingDigest",
+    "shareRevision",
+    "surfaceBindings",
+    "catalogs",
+    "bodyHashes",
     "pathHeaderSchemaDigest",
     "surfaceChecks",
     "terminalChecks",

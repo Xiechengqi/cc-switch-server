@@ -22,6 +22,7 @@ const specs = Object.freeze({
     site: "global",
     accountEnv: "QODER_GLOBAL_OAUTH_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_GLOBAL_OAUTH_MODEL",
+    shareEnv: "CC_SWITCH_QODER_GLOBAL_OAUTH_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_GLOBAL_OAUTH_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_GLOBAL_OAUTH_CODEX_PROVIDER_ID",
@@ -32,6 +33,7 @@ const specs = Object.freeze({
     site: "global",
     accountEnv: "QODER_GLOBAL_PAT_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_GLOBAL_PAT_MODEL",
+    shareEnv: "CC_SWITCH_QODER_GLOBAL_PAT_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_GLOBAL_PAT_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_GLOBAL_PAT_CODEX_PROVIDER_ID",
@@ -42,6 +44,7 @@ const specs = Object.freeze({
     site: "cn",
     accountEnv: "QODER_CN_OAUTH_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_CN_OAUTH_MODEL",
+    shareEnv: "CC_SWITCH_QODER_CN_OAUTH_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_CN_OAUTH_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_CN_OAUTH_CODEX_PROVIDER_ID",
@@ -55,6 +58,7 @@ function runScript(rail, overrides = {}) {
   for (const spec of Object.values(specs)) {
     cleared[spec.accountEnv] = "";
     cleared[spec.modelEnv] = "";
+    cleared[spec.shareEnv] = "";
     for (const name of Object.values(spec.providerEnvs)) cleared[name] = "";
   }
   return new Promise((resolve, reject) => {
@@ -133,10 +137,15 @@ function providerIdsFor(rail) {
   );
 }
 
+function shareIdFor(rail) {
+  return `${rail}-share`;
+}
+
 function providerView(rail, app, { bindingMismatch = false } = {}) {
   const account = accountFor(rail);
   return {
     app,
+    providerRevision: { claude: 17, codex: 19, gemini: 23 }[app],
     providerType: "qoder_cosy",
     providerTypeId: "qoder_cosy",
     provider: { id: providerIdsFor(rail)[app] },
@@ -205,6 +214,35 @@ async function startMockServer(rail, { bindingMismatch = false, failAccountsWith
               ...providerView(rail, "claude"),
               app: "claude",
               provider: { id: "decoy-provider" },
+            },
+          ],
+        });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/shares") {
+        sendJson(response, 200, {
+          ok: true,
+          shares: [
+            {
+              id: shareIdFor(rail),
+              enabled: true,
+              status: "active",
+              configRevision: 29,
+              app: "claude",
+              providerId: providerIds.claude,
+              providerType: "qoder_cosy",
+              bindings: [
+                {
+                  app: "codex",
+                  providerId: providerIds.codex,
+                  providerType: "qoder_cosy",
+                },
+                {
+                  app: "gemini",
+                  providerId: providerIds.gemini,
+                  providerType: "qoder_cosy",
+                },
+              ],
             },
           ],
         });
@@ -352,6 +390,7 @@ function fullEnv(rail, url, receiptFile) {
     QODER_REAL_RECEIPT_FILE: receiptFile,
     [spec.accountEnv]: accountFor(rail).id,
     [spec.modelEnv]: model,
+    [spec.shareEnv]: shareIdFor(rail),
     ...Object.fromEntries(
       Object.entries(spec.providerEnvs).map(([app, name]) => [name, providerIds[app]]),
     ),
@@ -381,6 +420,8 @@ test("Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts i
         assert.match(result.stdout, /verificationState=contract_verified, liveState=live_pending/);
         assert.equal(result.stderr, "");
         const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+        assert.equal(receipt.schemaVersion, 2);
+        assert.equal(receipt.harnessRevision, 2);
         assert.equal(receipt.verificationState, "contract_verified");
         assert.equal(receipt.liveState, "live_pending");
         assert.equal(receipt.acceptanceChecks.fresh_catalog, "pass");
@@ -395,6 +436,39 @@ test("Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts i
           assert.equal(receipt.acceptanceChecks[pending], "not_observed", pending);
         }
         assert.equal(receipt.site, specs[rail].site);
+        assert.match(receipt.targetCommit, /^[a-f0-9]{40}$/);
+        assert.equal(receipt.commit, receipt.targetCommit);
+        assert.match(receipt.scopeDigest, /^[a-f0-9]{64}$/);
+        assert.match(receipt.shareIdentityDigest, /^[a-f0-9]{64}$/);
+        assert.match(receipt.shareBindingDigest, /^[a-f0-9]{64}$/);
+        assert.equal(receipt.shareRevision, 29);
+        assert.deepEqual(
+          Object.fromEntries(
+            Object.entries(receipt.surfaceBindings).map(([app, binding]) => [
+              app,
+              [binding.providerRevision, /^[a-f0-9]{64}$/.test(binding.runtimeFingerprintDigest)],
+            ]),
+          ),
+          { claude: [17, true], codex: [19, true], gemini: [23, true] },
+        );
+        assert.deepEqual(Object.keys(receipt.catalogs).sort(), ["claude", "codex", "gemini"]);
+        for (const snapshot of Object.values(receipt.catalogs)) {
+          assert.equal(snapshot.source, "qoder_live_model_catalog");
+          assert.equal(snapshot.stale, false);
+          assert.ok(Number.isSafeInteger(snapshot.fetchedAtMs));
+          assert.match(snapshot.digest, /^[a-f0-9]{64}$/);
+        }
+        assert.deepEqual(Object.keys(receipt.bodyHashes).sort(), [
+          "claude_nonstream",
+          "claude_stream",
+          "codex_nonstream",
+          "codex_stream",
+          "gemini_nonstream",
+          "gemini_stream",
+        ]);
+        for (const value of Object.values(receipt.bodyHashes)) {
+          assert.match(value, /^[a-f0-9]{64}$/);
+        }
         assert.equal(
           receipt.credentialRail,
           rail === "global_pat" ? "pat_job_token" : rail,
@@ -447,6 +521,7 @@ test("Qoder real harness reports missing inputs as blocked_inputs/live_pending",
   assert.equal(output.liveState, "live_pending");
   assert.ok(output.missingInputs.includes("RUN_REAL=1"));
   assert.ok(output.missingInputs.includes("QODER_REAL_RECEIPT_FILE"));
+  assert.ok(output.missingInputs.includes("CC_SWITCH_QODER_GLOBAL_OAUTH_SHARE_ID"));
   assert.doesNotMatch(result.stdout, /live_verified/);
   assert.equal(result.stderr, "");
   const source = fs.readFileSync(script, "utf8");

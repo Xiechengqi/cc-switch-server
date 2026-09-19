@@ -6,7 +6,7 @@
   "liveState": "live_pending",
   "scope": "single_bound_account_only",
   "verification": {
-    "rustQoderTests": 63,
+    "rustQoderTests": 65,
     "nodeOracleMutationTests": 9,
     "nodeRealHarnessFixtureTests": 7
   },
@@ -946,27 +946,43 @@
     ]
   },
   "receiptSchema": {
+    "schemaVersion": 2,
+    "harnessRevision": 2,
     "requiredFields": [
       "acceptanceChecks",
       "accountIdentityDigest",
       "authIdentityGeneration",
+      "bodyHashes",
       "catalogSource",
       "catalogStale",
+      "catalogs",
       "commit",
       "credentialRail",
+      "harnessRevision",
+      "liveState",
       "model",
       "otherAccountRequests",
       "otherProviderRequests",
       "otherSiteRequests",
       "pathHeaderSchemaDigest",
       "providerBindingDigest",
+      "providerType",
       "quotaState",
+      "recoveryDecisions",
+      "schemaVersion",
+      "scopeDigest",
       "sensitiveScan",
+      "shareBindingDigest",
+      "shareIdentityDigest",
+      "shareRevision",
       "site",
+      "surfaceBindings",
       "surfaceChecks",
+      "targetCommit",
       "terminalChecks",
       "timestamp",
-      "tokenRefreshGeneration"
+      "tokenRefreshGeneration",
+      "verificationState"
     ],
     "forbiddenFields": [
       "accessToken",

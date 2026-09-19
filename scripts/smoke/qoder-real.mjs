@@ -10,12 +10,15 @@ const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const oracle = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "assets/contract/qoder-cli-oracle.json"), "utf8"),
 );
+const HARNESS_REVISION = 2;
+const CATALOG_MAX_AGE_MS = 2 * 60 * 60 * 1_000;
 
 const railSpecs = Object.freeze({
   global_oauth: Object.freeze({
     site: "global",
     accountEnv: "QODER_GLOBAL_OAUTH_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_GLOBAL_OAUTH_MODEL",
+    shareEnv: "CC_SWITCH_QODER_GLOBAL_OAUTH_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_GLOBAL_OAUTH_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_GLOBAL_OAUTH_CODEX_PROVIDER_ID",
@@ -26,6 +29,7 @@ const railSpecs = Object.freeze({
     site: "global",
     accountEnv: "QODER_GLOBAL_PAT_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_GLOBAL_PAT_MODEL",
+    shareEnv: "CC_SWITCH_QODER_GLOBAL_PAT_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_GLOBAL_PAT_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_GLOBAL_PAT_CODEX_PROVIDER_ID",
@@ -36,6 +40,7 @@ const railSpecs = Object.freeze({
     site: "cn",
     accountEnv: "QODER_CN_OAUTH_TEST_ACCOUNT",
     modelEnv: "CC_SWITCH_QODER_CN_OAUTH_MODEL",
+    shareEnv: "CC_SWITCH_QODER_CN_OAUTH_SHARE_ID",
     providerEnvs: Object.freeze({
       claude: "CC_SWITCH_QODER_CN_OAUTH_CLAUDE_PROVIDER_ID",
       codex: "CC_SWITCH_QODER_CN_OAUTH_CODEX_PROVIDER_ID",
@@ -80,13 +85,15 @@ function digest(domain, value) {
 
 function gitCommit() {
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
+    if (!/^[a-f0-9]{40}$/.test(commit)) fail("current target commit is invalid");
+    return commit;
   } catch {
-    return "unknown";
+    fail("current target commit is unavailable");
   }
 }
 
@@ -117,6 +124,7 @@ const serverToken = env("CC_SWITCH_SERVER_TOKEN");
 const routerToken = env("ROUTER_API_TOKEN");
 const routerTokenHeader = env("ROUTER_API_TOKEN_HEADER", "Authorization");
 const accountSelector = env(spec.accountEnv);
+const shareId = env(spec.shareEnv);
 const providerIds = Object.fromEntries(
   Object.entries(spec.providerEnvs).map(([app, name]) => [app, env(name)]),
 );
@@ -134,6 +142,7 @@ const requiredInputs = [
   ["CC_SWITCH_SHARE_URL", shareUrl],
   ["ROUTER_API_TOKEN", routerToken],
   [spec.accountEnv, accountSelector],
+  [spec.shareEnv, shareId],
   ...Object.entries(spec.providerEnvs).map(([app, name]) => [name, providerIds[app]]),
   ["QODER_REAL_RECEIPT_FILE", receiptFile],
 ];
@@ -349,6 +358,7 @@ async function validateBindings(account) {
     fail("Qoder Provider list violated the control-plane contract");
   }
   const bindings = [];
+  const surfaceBindings = {};
   for (const [app, providerId] of Object.entries(providerIds)) {
     const matches = response.providers.filter(
       (view) => view?.app === app && view?.provider?.id === providerId,
@@ -368,15 +378,89 @@ async function validateBindings(account) {
     ) {
       fail(`${app} Qoder Provider is not fixed to the selected Account generation`);
     }
+    const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
+    const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
+    if (
+      !Number.isSafeInteger(providerRevision) ||
+      providerRevision < 0 ||
+      !runtimeFingerprint
+    ) {
+      fail(`${app} Qoder Provider runtime scope is incomplete`);
+    }
     bindings.push({
       app,
       providerId,
-      runtimeFingerprint: view.runtime.runtimeFingerprint || "",
+      providerRevision,
+      runtimeFingerprint,
       accountId: authRef.accountId,
       authIdentityGeneration: authRef.authIdentityGeneration,
     });
+    surfaceBindings[app] = {
+      providerRevision,
+      runtimeFingerprintDigest: digest(
+        `cc-switch-server:qoder-${app}-runtime:v1`,
+        runtimeFingerprint,
+      ),
+    };
   }
-  return digest("cc-switch-server:qoder-provider-bindings:v1", bindings);
+  return {
+    digest: digest("cc-switch-server:qoder-provider-bindings:v2", bindings),
+    surfaceBindings,
+  };
+}
+
+async function validateShareBinding() {
+  const response = await requireJson(
+    serverUrl,
+    "/api/shares",
+    { method: "GET" },
+    "Qoder Share list",
+    { admin: true },
+  );
+  if (response?.ok !== true || !Array.isArray(response.shares)) {
+    fail("Qoder Share list violated the control-plane contract");
+  }
+  const matches = response.shares.filter((share) => share?.id === shareId);
+  if (matches.length !== 1) fail(`${spec.shareEnv} did not select exactly one Share`);
+  const share = matches[0];
+  if (share.enabled === false || (share.status && share.status !== "active")) {
+    fail("selected Qoder Share is not active");
+  }
+  const bindings = [
+    {
+      app: share.app,
+      providerId: share.providerId,
+      providerType: share.providerType,
+    },
+    ...(Array.isArray(share.bindings) ? share.bindings : []),
+  ];
+  for (const [app, providerId] of Object.entries(providerIds)) {
+    if (
+      !bindings.some(
+        (binding) =>
+          binding?.app === app &&
+          binding?.providerId === providerId &&
+          binding?.providerType === "qoder_cosy",
+      )
+    ) {
+      fail(`Qoder Share is not fixed to the selected ${app} Provider`);
+    }
+  }
+  const shareRevision = share.configRevision ?? 0;
+  if (!Number.isSafeInteger(shareRevision) || shareRevision < 0) {
+    fail("Qoder Share revision scope is incomplete");
+  }
+  return {
+    shareRevision,
+    shareIdentityDigest: digest("cc-switch-server:qoder-share-identity:v1", shareId),
+    shareBindingDigest: digest("cc-switch-server:qoder-share-binding:v2", {
+      shareId,
+      shareRevision,
+      bindings: Object.entries(providerIds)
+        .map(([app, providerId]) => ({ app, providerId, providerType: "qoder_cosy" }))
+        .sort((left, right) => left.app.localeCompare(right.app)),
+    }),
+  };
 }
 
 async function validateCatalogs() {
@@ -394,7 +478,8 @@ async function validateCatalogs() {
       catalog.source !== "qoder_live_model_catalog" ||
       catalog.stale !== false ||
       !Number.isSafeInteger(catalog.fetchedAtMs) ||
-      catalog.fetchedAtMs <= 0
+      catalog.fetchedAtMs < Date.now() - CATALOG_MAX_AGE_MS ||
+      catalog.fetchedAtMs > Date.now() + 5 * 60_000
     ) {
       fail(`${app} Qoder model catalog is not a fresh bound-account catalog`);
     }
@@ -404,7 +489,14 @@ async function validateCatalogs() {
         .filter(Boolean),
     );
     if (models.size === 0) fail(`${app} Qoder model catalog is empty`);
-    catalogs.push({ app, source: catalog.source, models });
+    catalogs.push({
+      app,
+      source: catalog.source,
+      stale: false,
+      fetchedAtMs: catalog.fetchedAtMs,
+      digest: digest(`cc-switch-server:qoder-${app}-catalog:v1`, catalog.data),
+      models,
+    });
   }
   const commonModels = [...catalogs[0].models].filter((model) =>
     catalogs.slice(1).every((catalog) => catalog.models.has(model)),
@@ -413,7 +505,12 @@ async function validateCatalogs() {
   if (!model || !catalogs.every((catalog) => catalog.models.has(model))) {
     fail("Qoder Provider catalogs have no common selected model");
   }
-  return { model, source: catalogs[0].source, stale: false };
+  return {
+    model,
+    snapshots: Object.fromEntries(
+      catalogs.map(({ app, models: _models, ...snapshot }) => [app, snapshot]),
+    ),
+  };
 }
 
 async function validateQuota(account) {
@@ -531,13 +628,15 @@ async function validateClaude(model) {
     tools: [{ name: toolName, description: toolDescription, input_schema: toolSchema }],
     tool_choice: { type: "tool", name: toolName },
   };
+  const nonstreamBody = { ...base, stream: false };
+  const streamBody = { ...base, stream: true };
   const nonstream = await requireJson(
     shareUrl,
     "/v1/messages",
     {
       method: "POST",
       headers: { "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ ...base, stream: false }),
+      body: JSON.stringify(nonstreamBody),
     },
     "Qoder Claude non-stream",
   );
@@ -550,7 +649,7 @@ async function validateClaude(model) {
   requireUsage(nonstream.usage, "Qoder Claude non-stream response");
   const frames = await collectSse(
     "/v1/messages",
-    { ...base, stream: true },
+    streamBody,
     "Qoder Claude stream",
     { "anthropic-version": "2023-06-01" },
   );
@@ -566,7 +665,14 @@ async function validateClaude(model) {
   ) {
     fail("Qoder Claude stream is missing the lookup tool lifecycle");
   }
-  return { terminalCount: terminals.length, eof: true };
+  return {
+    terminalCount: terminals.length,
+    eof: true,
+    bodyHashes: {
+      nonstream: digest("cc-switch-server:qoder-claude-nonstream-body:v1", nonstreamBody),
+      stream: digest("cc-switch-server:qoder-claude-stream-body:v1", streamBody),
+    },
+  };
 }
 
 async function validateCodex(model) {
@@ -585,10 +691,12 @@ async function validateCodex(model) {
     ],
     tool_choice: { type: "function", name: toolName },
   };
+  const nonstreamBody = { ...base, stream: false };
+  const streamBody = { ...base, stream: true };
   const nonstream = await requireJson(
     shareUrl,
     "/v1/responses",
-    { method: "POST", body: JSON.stringify({ ...base, stream: false }) },
+    { method: "POST", body: JSON.stringify(nonstreamBody) },
     "Qoder Codex non-stream",
   );
   if (nonstream?.object !== "response" || nonstream.status !== "completed") {
@@ -600,7 +708,7 @@ async function validateCodex(model) {
   requireUsage(nonstream.usage, "Qoder Codex non-stream response");
   const frames = await collectSse(
     "/v1/responses",
-    { ...base, stream: true },
+    streamBody,
     "Qoder Codex stream",
   );
   const terminals = frames.filter((frame) => frame.payload?.type === "response.completed");
@@ -615,7 +723,14 @@ async function validateCodex(model) {
   ) {
     fail("Qoder Codex stream is missing the lookup tool lifecycle");
   }
-  return { terminalCount: terminals.length, eof: true };
+  return {
+    terminalCount: terminals.length,
+    eof: true,
+    bodyHashes: {
+      nonstream: digest("cc-switch-server:qoder-codex-nonstream-body:v1", nonstreamBody),
+      stream: digest("cc-switch-server:qoder-codex-stream-body:v1", streamBody),
+    },
+  };
 }
 
 function geminiBody() {
@@ -637,10 +752,11 @@ function geminiBody() {
 
 async function validateGemini(model) {
   const modelPath = encodeURIComponent(model);
+  const body = geminiBody();
   const nonstream = await requireJson(
     shareUrl,
     `/v1beta/models/${modelPath}:generateContent`,
-    { method: "POST", body: JSON.stringify(geminiBody()) },
+    { method: "POST", body: JSON.stringify(body) },
     "Qoder Gemini non-stream",
   );
   if (!Array.isArray(nonstream?.candidates) || nonstream.candidates.length === 0) {
@@ -656,7 +772,7 @@ async function validateGemini(model) {
   requireUsage(nonstream.usageMetadata, "Qoder Gemini non-stream response");
   const frames = await collectSse(
     `/v1beta/models/${modelPath}:streamGenerateContent?alt=sse`,
-    geminiBody(),
+    body,
     "Qoder Gemini stream",
   );
   const terminals = frames.filter((frame) =>
@@ -672,7 +788,14 @@ async function validateGemini(model) {
   ) {
     fail("Qoder Gemini stream is missing the lookup tool lifecycle");
   }
-  return { terminalCount: terminals.length, eof: true };
+  return {
+    terminalCount: terminals.length,
+    eof: true,
+    bodyHashes: {
+      nonstream: digest("cc-switch-server:qoder-gemini-nonstream-body:v1", body),
+      stream: digest("cc-switch-server:qoder-gemini-stream-body:v1", body),
+    },
+  };
 }
 
 function assertReceiptSafe(receipt) {
@@ -694,6 +817,12 @@ function assertReceiptSafe(receipt) {
   for (const field of oracle.receiptSchema.requiredFields) {
     if (!own(receipt, field)) fail(`receipt is missing required field ${field}`);
   }
+  if (
+    receipt.schemaVersion !== oracle.receiptSchema.schemaVersion ||
+    receipt.harnessRevision !== oracle.receiptSchema.harnessRevision
+  ) {
+    fail("receipt schema or harness revision drifted");
+  }
 }
 
 function writeReceipt(receipt) {
@@ -712,15 +841,28 @@ function writeReceipt(receipt) {
 }
 
 async function main() {
+  const targetCommit = gitCommit();
   const initialAccount = await accountSnapshot();
-  const providerBindingDigest = await validateBindings(initialAccount);
+  const providerBindings = await validateBindings(initialAccount);
+  const shareBinding = await validateShareBinding();
   const catalog = await validateCatalogs();
   const quotaState = await validateQuota(initialAccount);
-  const terminalChecks = {
+  const surfaceResults = {
     claude: await validateClaude(catalog.model),
     codex: await validateCodex(catalog.model),
     gemini: await validateGemini(catalog.model),
   };
+  const terminalChecks = Object.fromEntries(
+    Object.entries(surfaceResults).map(([app, result]) => [
+      app,
+      { terminalCount: result.terminalCount, eof: result.eof },
+    ]),
+  );
+  const bodyHashes = Object.fromEntries(
+    Object.entries(surfaceResults).flatMap(([app, result]) =>
+      Object.entries(result.bodyHashes).map(([mode, value]) => [`${app}_${mode}`, value]),
+    ),
+  );
   const finalAccount = await accountSnapshot();
   if (
     finalAccount.id !== initialAccount.id ||
@@ -736,8 +878,27 @@ async function main() {
   // whole rail by itself.
   const verificationState = fixtureMode ? "contract_verified" : "partial_live_verified";
   const liveState = "live_pending";
+  const accountIdentityDigest = digest("cc-switch-server:qoder-account:v2", {
+    id: finalAccount.id,
+    site: spec.site,
+    rail,
+    authIdentityGeneration: finalAccount.authIdentityGeneration,
+    tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
+  });
+  const scopeDigest = digest("cc-switch-server:qoder-real-scope:v2", {
+    targetCommit,
+    harnessRevision: HARNESS_REVISION,
+    rail,
+    site: spec.site,
+    model: catalog.model,
+    accountIdentityDigest,
+    providerBindingDigest: providerBindings.digest,
+    shareBindingDigest: shareBinding.shareBindingDigest,
+    catalogs: catalog.snapshots,
+  });
   const receipt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    harnessRevision: HARNESS_REVISION,
     providerType: "qoder_cosy",
     verificationState,
     liveState,
@@ -757,16 +918,13 @@ async function main() {
       site_rail_and_generation_digest: "pass",
       secret_scan: "pass",
     },
-    accountIdentityDigest: digest("cc-switch-server:qoder-account:v1", {
-      id: finalAccount.id,
-      site: spec.site,
-      rail,
-      authIdentityGeneration: finalAccount.authIdentityGeneration,
-    }),
+    accountIdentityDigest,
     authIdentityGeneration: finalAccount.authIdentityGeneration,
-    catalogSource: catalog.source,
-    catalogStale: catalog.stale,
-    commit: gitCommit(),
+    bodyHashes,
+    catalogs: catalog.snapshots,
+    catalogSource: catalog.snapshots.claude.source,
+    catalogStale: false,
+    commit: targetCommit,
     credentialRail: rail === "global_pat" ? "pat_job_token" : rail,
     model: catalog.model,
     otherAccountRequests: 0,
@@ -781,20 +939,35 @@ async function main() {
       catalog: oracleRail.catalog,
       quota: oracleRail.quota,
     }),
-    providerBindingDigest,
+    providerBindingDigest: providerBindings.digest,
     quotaState,
+    recoveryDecisions: {
+      sameAccountFirst401: "not_observed",
+      second401: "not_observed",
+      crossRailFallback: "disabled",
+      crossSiteFallback: "disabled",
+      crossAccountFallback: "disabled",
+      crossProviderFallback: "disabled",
+      postCommitReplay: "disabled",
+    },
     sensitiveScan: {
       status: "pass",
       matches: sensitiveMatches,
       scannedBytes: sensitiveBytes,
     },
+    scopeDigest,
+    shareBindingDigest: shareBinding.shareBindingDigest,
+    shareIdentityDigest: shareBinding.shareIdentityDigest,
+    shareRevision: shareBinding.shareRevision,
     site: spec.site,
+    surfaceBindings: providerBindings.surfaceBindings,
     surfaceChecks: {
       claude: { nonstream: "pass", stream: "pass", tool: "pass" },
       codex: { nonstream: "pass", stream: "pass", tool: "pass" },
       gemini: { nonstream: "pass", stream: "pass", tool: "pass" },
     },
     terminalChecks,
+    targetCommit,
     timestamp: new Date().toISOString(),
     tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
   };

@@ -274,6 +274,29 @@ exact(
 
 const acceptance = contract.realAcceptance;
 assert(
+  acceptance?.receiptSchemaVersion === 2 && acceptance.harnessRevision === 2,
+  "Qoder real receipt schema/harness revision changed",
+);
+exact(
+  acceptance.scopeBindings,
+  [
+    "target_commit",
+    "credential_rail_and_site",
+    "account_auth_and_token_generations",
+    "three_surface_provider_revisions_and_runtime_digests",
+    "share_revision_and_binding_digest",
+    "exact_model",
+    "three_fresh_catalog_snapshots",
+    "six_request_body_hashes",
+  ],
+  "Qoder real receipt scope bindings",
+);
+assert(
+  oracle.receiptSchema?.schemaVersion === acceptance.receiptSchemaVersion &&
+    oracle.receiptSchema?.harnessRevision === acceptance.harnessRevision,
+  "Qoder oracle/reference receipt revisions diverged",
+);
+assert(
   Array.isArray(acceptance?.requiredChecks) &&
     acceptance.requiredChecks.length === 14 &&
     new Set(acceptance.requiredChecks).size === 14,
