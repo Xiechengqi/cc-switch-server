@@ -34,7 +34,7 @@ pub(super) struct StreamEventTransformer {
 }
 
 impl StreamEventTransformer {
-    pub(super) fn retained_antigravity_bytes(&self) -> usize {
+    pub(super) fn retained_bytes(&self) -> usize {
         let bridge = self
             .bridge
             .as_ref()
@@ -54,6 +54,10 @@ impl StreamEventTransformer {
             .saturating_add(bridge)
             .saturating_add(chat_compat)
             .saturating_add(gemini_terminal)
+    }
+
+    pub(super) fn retained_antigravity_bytes(&self) -> usize {
+        self.retained_bytes()
     }
 
     pub(super) fn new<T>(

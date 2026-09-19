@@ -67,6 +67,14 @@ impl UpstreamTerminalDetector {
         self.terminal
     }
 
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.pending.capacity().saturating_add(
+            self.responses
+                .as_ref()
+                .map_or(0, ResponsesTransportDecoder::retained_bytes),
+        )
+    }
+
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<(), TerminalDetectorError> {
         if self.terminal.is_some() {
             return Ok(());

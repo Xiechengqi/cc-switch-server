@@ -119,6 +119,31 @@ impl AnthropicTerminal {
 }
 
 impl AnthropicSseInspector {
+    pub(super) fn retained_bytes(&self) -> usize {
+        let seen_blocks = self.seen_block_indices.len().saturating_mul(
+            std::mem::size_of::<u64>().saturating_add(std::mem::size_of::<usize>() * 3),
+        );
+        let open_blocks = self.open_blocks.iter().fold(0usize, |bytes, (_, block)| {
+            bytes
+                .saturating_add(std::mem::size_of::<u64>())
+                .saturating_add(std::mem::size_of::<AnthropicContentBlockState>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(block.partial_json.capacity())
+        });
+        let terminal = match self.terminal.as_ref() {
+            Some(AnthropicTerminal::Error(error)) => error
+                .error_type
+                .capacity()
+                .saturating_add(error.message.as_ref().map_or(0, String::capacity)),
+            _ => 0,
+        };
+        self.pending
+            .capacity()
+            .saturating_add(seen_blocks)
+            .saturating_add(open_blocks)
+            .saturating_add(terminal)
+    }
+
     pub(super) fn push(
         &mut self,
         chunk: &[u8],

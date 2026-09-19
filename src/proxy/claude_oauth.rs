@@ -283,10 +283,10 @@ fn apply_forward_contract_inner(
             crate::metrics::record_claude_optional_rewrite("leading_system_hoist");
         }
         value = finalize_claude_cch(value);
-        body_shape = Some(value.clone());
         *body = Bytes::from(serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_request(format!("claude oauth request body encode failed: {error}"))
         })?);
+        body_shape = Some(value);
     }
     let mut headers = claude_forward_headers(
         client_class,
@@ -629,6 +629,17 @@ impl ClaudeToolNameStreamPatcher {
             aliases,
             buffer: Vec::new(),
         }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let aliases = self.aliases.iter().fold(0usize, |bytes, (wire, original)| {
+            bytes
+                .saturating_add(std::mem::size_of::<String>() * 2)
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(wire.capacity())
+                .saturating_add(original.capacity())
+        });
+        aliases.saturating_add(self.buffer.capacity())
     }
 
     pub(crate) fn push(&mut self, chunk: Bytes) -> Bytes {

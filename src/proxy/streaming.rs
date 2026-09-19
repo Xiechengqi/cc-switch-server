@@ -43,6 +43,10 @@ impl SseLineBuffer {
             Some(tail)
         }
     }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.buffer.capacity()
+    }
 }
 
 #[derive(Debug)]
@@ -177,6 +181,14 @@ impl JsonStreamEventDecoder {
     fn reset(&mut self) {
         let max_event_bytes = self.max_event_bytes;
         *self = Self::new(max_event_bytes);
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.pending_line
+            .capacity()
+            .saturating_add(self.event_name.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.event_data.capacity())
+            .saturating_add(self.json_data.capacity())
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<JsonStreamEvent>, String> {
@@ -388,6 +400,23 @@ pub struct ClaudeSseError {
 }
 
 impl ClaudeSseErrorDetector {
+    pub fn retained_bytes(&self) -> usize {
+        self.lines
+            .retained_bytes()
+            .saturating_add(self.current_event.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                self.current_data
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.current_data
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Option<ClaudeSseError> {
         for line in self.lines.push_chunk(chunk) {
             if let Some(error) = self.push_line(&line) {
@@ -471,6 +500,10 @@ impl StreamUsageAccumulator {
             }
         }
         self.usage
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.decoder.retained_bytes()
     }
 
     pub fn finish(self) -> TokenUsage {

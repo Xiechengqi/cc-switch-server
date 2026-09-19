@@ -1987,7 +1987,10 @@ async fn summarize_codex_overflow(
 }
 
 fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<ProviderType>) -> bool {
-    app == AppKind::Codex || provider_type.is_some_and(antigravity::is_provider)
+    app == AppKind::Codex
+        || provider_type.is_some_and(|provider_type| {
+            provider_type == ProviderType::ClaudeOAuth || antigravity::is_provider(provider_type)
+        })
 }
 
 async fn request_memory_provider_type_for_request(
@@ -2099,7 +2102,7 @@ async fn forward_with_attempt(
                 ));
             }
         };
-        if antigravity::is_provider(execution.stored.provider_type)
+        if request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
             && attempt_context.request_memory().is_none()
         {
             attempt_context.initialize_request_memory(
@@ -3502,6 +3505,7 @@ async fn forward_with_attempt(
                     timeouts,
                     stream_first_event_deadline,
                     PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                    attempt_context.request_memory(),
                 )
                 .await
                 {
@@ -3519,6 +3523,10 @@ async fn forward_with_attempt(
                             response_headers.remove(CONTENT_LENGTH);
                         }
                         prepared.inner
+                    }
+                    Err(StreamingResponsePreparationError::Memory(error)) => {
+                        crate::metrics::record_claude_response_decoding("sse", "memory_exhausted");
+                        return Err(error);
                     }
                     Err(StreamingResponsePreparationError::Transport(error)) => {
                         crate::metrics::record_claude_response_decoding("sse", "transport_error");
@@ -3613,6 +3621,25 @@ async fn forward_with_attempt(
             let mut anthropic_semantics =
                 inspect_anthropic_semantics.then(AnthropicSseInspector::default);
             let stream_request_memory = attempt_context.request_memory().cloned();
+            let claude_stream_memory = if stored.provider_type == ProviderType::ClaudeOAuth {
+                stream_request_memory
+                    .as_ref()
+                    .map(|budget| {
+                        budget
+                            .reserve(
+                                RequestMemoryComponent::StreamRetainedState,
+                                claude_prime_retained_bytes(
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                ),
+                            )
+                            .map_err(|error| error.into_proxy_error())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let semantic_prelude_memory = stream_request_memory
                 .as_ref()
                 .map(|budget| {
@@ -3682,9 +3709,36 @@ async fn forward_with_attempt(
                     };
                     match next {
                         Ok(Some(upstream_chunk)) => {
-                            detected_error = sse_error_detector
-                                .as_mut()
-                                .and_then(|detector| detector.push(&upstream_chunk));
+                            let _transport_pending_memory = stream_request_memory
+                                .as_ref()
+                                .map(|budget| {
+                                    budget
+                                        .reserve(
+                                            RequestMemoryComponent::TransportPending,
+                                            upstream_chunk.len(),
+                                        )
+                                        .map_err(|error| error.into_proxy_error())
+                                })
+                                .transpose()?;
+                            if sse_error_detector.is_some() {
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    upstream_chunk.len(),
+                                )?;
+                                detected_error = sse_error_detector
+                                    .as_mut()
+                                    .and_then(|detector| detector.push(&upstream_chunk));
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    0,
+                                )?;
+                            }
                             let mut downstream_chunk = upstream_chunk.clone();
                             if let Some(inspector) = responses_semantics.as_mut() {
                                 let inspected = if normalize_responses_transport {
@@ -3729,12 +3783,12 @@ async fn forward_with_attempt(
                                     }
                                 }
                             }
-                            prelude.extend_from_slice(&downstream_chunk);
                             if let Some(reservation) = semantic_prelude_memory.as_ref() {
                                 reservation
-                                    .resize(prelude.len())
+                                    .resize(prelude.len().saturating_add(downstream_chunk.len()))
                                     .map_err(|error| error.into_proxy_error())?;
                             }
+                            prelude.extend_from_slice(&downstream_chunk);
                             if let (Some(reservation), Some(inspector)) = (
                                 semantic_transport_memory.as_ref(),
                                 responses_semantics.as_ref(),
@@ -3744,7 +3798,22 @@ async fn forward_with_attempt(
                                     .map_err(|error| error.into_proxy_error())?;
                             }
                             if semantic_protocol_error.is_none() {
-                                if let Err(error) = terminal_detector.push(&downstream_chunk) {
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    downstream_chunk.len(),
+                                )?;
+                                let terminal_result = terminal_detector.push(&downstream_chunk);
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    0,
+                                )?;
+                                if let Err(error) = terminal_result {
                                     semantic_protocol_error = Some(
                                         error.proxy_message(terminal_detector.max_event_bytes()),
                                     );
@@ -3788,8 +3857,25 @@ async fn forward_with_attempt(
                                     }
                                 }
                             }
+                            if anthropic_semantics.is_some() {
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    upstream_chunk.len(),
+                                )?;
+                            }
                             if let Some(inspector) = anthropic_semantics.as_mut() {
-                                match inspector.push(&upstream_chunk) {
+                                let inspected = inspector.push(&upstream_chunk);
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    0,
+                                )?;
+                                match inspected {
                                     Ok(observations) => {
                                         for observation in &observations {
                                             crate::metrics::record_proxy_semantic_guard(
@@ -3898,7 +3984,15 @@ async fn forward_with_attempt(
                                 }
                             }
                             if let Some(inspector) = anthropic_semantics.as_mut() {
-                                if let Err(error) = inspector.finish() {
+                                let finish_result = inspector.finish();
+                                resize_claude_prime_memory(
+                                    claude_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    sse_error_detector.as_ref(),
+                                    anthropic_semantics.as_ref(),
+                                    0,
+                                )?;
+                                if let Err(error) = finish_result {
                                     record_claude_semantic_failure_for(
                                         &stored,
                                         "prime_finish",
@@ -4208,6 +4302,25 @@ async fn forward_with_attempt(
             } else {
                 None
             };
+            let usage =
+                StreamUsageAccumulator::new(adapters::usage_input_semantics_for(&stored, route));
+            let claude_tool_name_stream_patcher =
+                super::claude_oauth::ClaudeToolNameStreamPatcher::new(std::mem::take(
+                    &mut adapter_request.claude_tool_name_map,
+                ));
+            if let Some(reservation) = claude_stream_memory.as_ref() {
+                let retained = claude_prime_retained_bytes(
+                    &terminal_detector,
+                    sse_error_detector.as_ref(),
+                    anthropic_semantics.as_ref(),
+                )
+                .saturating_add(usage.retained_bytes())
+                .saturating_add(claude_tool_name_stream_patcher.retained_bytes())
+                .saturating_add(stream_transform.retained_bytes());
+                reservation
+                    .resize(retained)
+                    .map_err(|error| error.into_proxy_error())?;
+            }
             if pending_chunk_committed_output {
                 attempt_context.mark_downstream_committed();
             }
@@ -4230,9 +4343,7 @@ async fn forward_with_attempt(
                 started,
                 first_token_ms: None,
                 received_any_chunk: false,
-                usage: StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
-                    &stored, route,
-                )),
+                usage,
                 codex_completed_output_patcher: CodexCompletedOutputPatcher::new(
                     &stored,
                     route,
@@ -4262,10 +4373,7 @@ async fn forward_with_attempt(
                 }),
                 stream_transform,
                 terminal_detector,
-                claude_tool_name_stream_patcher:
-                    super::claude_oauth::ClaudeToolNameStreamPatcher::new(
-                        adapter_request.claude_tool_name_map.clone(),
-                    ),
+                claude_tool_name_stream_patcher,
                 timeouts,
                 pending_chunk,
                 pending_chunk_already_inspected,
@@ -4312,6 +4420,7 @@ async fn forward_with_attempt(
                 tool_argument_memory,
                 downstream_pending_memory,
                 antigravity_transform_memory,
+                claude_stream_memory,
             };
             let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
                 stream_state.downstream_pending_memory.take();
@@ -4523,8 +4632,17 @@ async fn forward_with_attempt(
                             }
                         }
                         if !chunk_already_inspected {
+                            if let Err(error) =
+                                stream_state.preflight_claude_stream_growth(chunk.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
-                            if let Err(error) = stream_state.terminal_detector.push(&chunk) {
+                            let terminal_result = stream_state.terminal_detector.push(&chunk);
+                            if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            if let Err(error) = terminal_result {
                                 let message = error.proxy_message(max_event_bytes);
                                 return stream_state
                                     .terminate_transform_error(ProxyError::bad_gateway(message))
@@ -4540,7 +4658,14 @@ async fn forward_with_attempt(
                         stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
                         let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
+                        if let Err(error) = stream_state.preflight_claude_stream_growth(chunk.len())
+                        {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         stream_state.usage.push(&chunk);
+                        if let Err(error) = stream_state.resize_claude_stream_memory() {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         let (mut saw_business_output, mut committed_output) =
                             if chunk_already_inspected {
                                 let saw_business = stream_state.pending_chunk_saw_business_output;
@@ -4590,9 +4715,23 @@ async fn forward_with_attempt(
                             } else {
                                 (!chunk.is_empty(), !chunk.is_empty())
                             };
+                        if !chunk_already_inspected && stream_state.anthropic_semantics.is_some() {
+                            if let Err(error) =
+                                stream_state.preflight_claude_stream_growth(chunk.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                        }
                         if !chunk_already_inspected {
-                            if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
-                                let observations = match inspector.push(&chunk) {
+                            let inspected = stream_state
+                                .anthropic_semantics
+                                .as_mut()
+                                .map(|inspector| inspector.push(&chunk));
+                            if let Some(inspected) = inspected {
+                                if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let observations = match inspected {
                                     Ok(observations) => observations,
                                     Err(error) => {
                                         record_claude_semantic_failure_for(
@@ -4645,10 +4784,19 @@ async fn forward_with_attempt(
                             .observe_text_upstream_event(saw_business_output || committed_output);
                         stream_state.observe_image_upstream_chunk();
                         if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded {
-                            let sse_error_outcome = stream_state
+                            if let Err(error) =
+                                stream_state.preflight_claude_stream_growth(chunk.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            let detected_error = stream_state
                                 .sse_error_detector
                                 .as_mut()
-                                .and_then(|detector| detector.push(&chunk))
+                                .and_then(|detector| detector.push(&chunk));
+                            if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            let sse_error_outcome = detected_error
                                 .and_then(|error| claude_sse_error_outcome(&error.error_type));
                             if let Some(outcome) = sse_error_outcome {
                                 record_provider_outcome(
@@ -4685,9 +4833,12 @@ async fn forward_with_attempt(
                                 return stream_state.terminate_transform_error(error).await
                             }
                         };
-                        let transformed = stream_state
-                            .claude_tool_name_stream_patcher
-                            .push(transformed);
+                        let transformed = match stream_state.patch_claude_tool_names(transformed) {
+                            Ok(transformed) => transformed,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
                         let transformed = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(transformed);
@@ -4766,8 +4917,16 @@ async fn forward_with_attempt(
                             ));
                             let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
                             if let Err(error) =
-                                stream_state.terminal_detector.push(&batch.normalized)
+                                stream_state.preflight_claude_stream_growth(batch.normalized.len())
                             {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            let terminal_result =
+                                stream_state.terminal_detector.push(&batch.normalized);
+                            if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            if let Err(error) = terminal_result {
                                 let message = error.proxy_message(max_event_bytes);
                                 return stream_state
                                     .terminate_transform_error(ProxyError::bad_gateway(message))
@@ -4794,7 +4953,15 @@ async fn forward_with_attempt(
                             Bytes::from(joined)
                         };
                         if !chunk.is_empty() {
+                            if let Err(error) =
+                                stream_state.preflight_claude_stream_growth(chunk.len())
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             stream_state.usage.push(&chunk);
+                            if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             let (saw_business_output, committed_output) =
                                 if let Some(observed) = normalized_finish_semantics {
                                     observed
@@ -4869,9 +5036,13 @@ async fn forward_with_attempt(
                                 }
                             };
                             let transformed = join_bytes(transformed, tail);
-                            let transformed = stream_state
-                                .claude_tool_name_stream_patcher
-                                .push(transformed);
+                            let transformed =
+                                match stream_state.patch_claude_tool_names(transformed) {
+                                    Ok(transformed) => transformed,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
                             let transformed = stream_state
                                 .codex_custom_tool_stream_patcher
                                 .push(transformed);
@@ -4928,7 +5099,11 @@ async fn forward_with_attempt(
                             }
                         }
                         if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
-                            if let Err(error) = inspector.finish() {
+                            let finish_result = inspector.finish();
+                            if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
+                            if let Err(error) = finish_result {
                                 record_claude_semantic_failure_for(
                                     &stream_state.stored,
                                     "stream_finish",
@@ -4958,13 +5133,20 @@ async fn forward_with_attempt(
                             }
                         };
                         let transform_tail = join_bytes(transformed_grok_tail, transform_tail);
-                        let claude_tail = stream_state
-                            .claude_tool_name_stream_patcher
-                            .push(transform_tail);
-                        let claude_tail = join_bytes(
-                            claude_tail,
-                            stream_state.claude_tool_name_stream_patcher.finish(),
-                        );
+                        let claude_tail = match stream_state.patch_claude_tool_names(transform_tail)
+                        {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
+                        let claude_finish = match stream_state.finish_claude_tool_name_patcher() {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                return stream_state.terminate_transform_error(error).await
+                            }
+                        };
+                        let claude_tail = join_bytes(claude_tail, claude_finish);
                         let transformed_tail = stream_state
                             .codex_custom_tool_stream_patcher
                             .push(claude_tail);
@@ -23812,6 +23994,35 @@ fn kimi_replay_now_ms() -> i64 {
     current_time_ms().min(i64::MAX as u128) as i64
 }
 
+fn claude_prime_retained_bytes(
+    terminal_detector: &UpstreamTerminalDetector,
+    sse_error_detector: Option<&ClaudeSseErrorDetector>,
+    anthropic_semantics: Option<&AnthropicSseInspector>,
+) -> usize {
+    terminal_detector
+        .retained_bytes()
+        .saturating_add(sse_error_detector.map_or(0, ClaudeSseErrorDetector::retained_bytes))
+        .saturating_add(anthropic_semantics.map_or(0, AnthropicSseInspector::retained_bytes))
+}
+
+fn resize_claude_prime_memory(
+    reservation: Option<&RequestMemoryReservation>,
+    terminal_detector: &UpstreamTerminalDetector,
+    sse_error_detector: Option<&ClaudeSseErrorDetector>,
+    anthropic_semantics: Option<&AnthropicSseInspector>,
+    additional_bytes: usize,
+) -> Result<(), ProxyError> {
+    let Some(reservation) = reservation else {
+        return Ok(());
+    };
+    reservation
+        .resize(
+            claude_prime_retained_bytes(terminal_detector, sse_error_detector, anthropic_semantics)
+                .saturating_add(additional_bytes),
+        )
+        .map_err(|error| error.into_proxy_error())
+}
+
 struct StreamForwardState {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     stored: StoredProvider,
@@ -23865,6 +24076,7 @@ struct StreamForwardState {
     tool_argument_memory: Option<RequestMemoryReservation>,
     downstream_pending_memory: Option<RequestMemoryReservation>,
     antigravity_transform_memory: Option<RequestMemoryReservation>,
+    claude_stream_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Clone)]
@@ -23875,7 +24087,47 @@ struct CodexRateLimitContext {
 }
 
 impl StreamForwardState {
+    fn retained_claude_stream_bytes(&self) -> usize {
+        self.terminal_detector
+            .retained_bytes()
+            .saturating_add(self.usage.retained_bytes())
+            .saturating_add(
+                self.sse_error_detector
+                    .as_ref()
+                    .map_or(0, ClaudeSseErrorDetector::retained_bytes),
+            )
+            .saturating_add(
+                self.anthropic_semantics
+                    .as_ref()
+                    .map_or(0, AnthropicSseInspector::retained_bytes),
+            )
+            .saturating_add(self.claude_tool_name_stream_patcher.retained_bytes())
+            .saturating_add(self.stream_transform.retained_bytes())
+    }
+
+    fn preflight_claude_stream_growth(&self, additional_bytes: usize) -> Result<(), ProxyError> {
+        let Some(reservation) = self.claude_stream_memory.as_ref() else {
+            return Ok(());
+        };
+        reservation
+            .resize(
+                self.retained_claude_stream_bytes()
+                    .saturating_add(additional_bytes),
+            )
+            .map_err(|error| error.into_proxy_error())
+    }
+
+    fn resize_claude_stream_memory(&self) -> Result<(), ProxyError> {
+        let Some(reservation) = self.claude_stream_memory.as_ref() else {
+            return Ok(());
+        };
+        reservation
+            .resize(self.retained_claude_stream_bytes())
+            .map_err(|error| error.into_proxy_error())
+    }
+
     fn transform_stream_chunk(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
+        self.preflight_claude_stream_growth(chunk.len())?;
         if let Some(reservation) = self.antigravity_transform_memory.as_ref() {
             reservation
                 .resize(
@@ -23886,14 +24138,29 @@ impl StreamForwardState {
                 .map_err(|error| error.into_proxy_error())?;
         }
         let transformed = self.stream_transform.push(chunk);
+        self.resize_claude_stream_memory()?;
         self.resize_antigravity_transform_memory()?;
         transformed
     }
 
     fn finish_stream_transform(&mut self) -> Result<Bytes, ProxyError> {
         let transformed = self.stream_transform.finish();
+        self.resize_claude_stream_memory()?;
         self.resize_antigravity_transform_memory()?;
         transformed
+    }
+
+    fn patch_claude_tool_names(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
+        self.preflight_claude_stream_growth(chunk.len())?;
+        let transformed = self.claude_tool_name_stream_patcher.push(chunk);
+        self.resize_claude_stream_memory()?;
+        Ok(transformed)
+    }
+
+    fn finish_claude_tool_name_patcher(&mut self) -> Result<Bytes, ProxyError> {
+        let transformed = self.claude_tool_name_stream_patcher.finish();
+        self.resize_claude_stream_memory()?;
+        Ok(transformed)
     }
 
     fn resize_antigravity_transform_memory(&self) -> Result<(), ProxyError> {
@@ -25091,6 +25358,7 @@ struct PreparedStreamingResponse {
 }
 
 enum StreamingResponsePreparationError {
+    Memory(ProxyError),
     Transport(StreamReadError),
     Protocol(ProxyError),
 }
@@ -25101,6 +25369,7 @@ async fn prepare_claude_streaming_response(
     timeouts: StreamTimeoutConfig,
     first_event_deadline: Option<tokio::time::Instant>,
     decoded_limit: usize,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<PreparedStreamingResponse, StreamingResponsePreparationError> {
     let mut inner = upstream.bytes_stream().boxed();
     let mut invalid_declared_encoding = false;
@@ -25167,6 +25436,15 @@ async fn prepare_claude_streaming_response(
     }
 
     let mut wire_body = prefix;
+    let wire_memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(RequestMemoryComponent::TransportPending, wire_body.len())
+                .map_err(|error| {
+                    StreamingResponsePreparationError::Memory(error.into_proxy_error())
+                })
+        })
+        .transpose()?;
     if let Some(remainder) = prefetched_remainder {
         if remainder.len() > decoded_limit.saturating_sub(wire_body.len()) {
             return Err(StreamingResponsePreparationError::Protocol(
@@ -25174,6 +25452,13 @@ async fn prepare_claude_streaming_response(
                     "compressed upstream SSE response exceeds the {decoded_limit} byte limit"
                 )),
             ));
+        }
+        if let Some(reservation) = wire_memory.as_ref() {
+            reservation
+                .resize(wire_body.len().saturating_add(remainder.len()))
+                .map_err(|error| {
+                    StreamingResponsePreparationError::Memory(error.into_proxy_error())
+                })?;
         }
         wire_body.extend_from_slice(&remainder);
     }
@@ -25196,15 +25481,44 @@ async fn prepare_claude_streaming_response(
                 )),
             ));
         }
+        if let Some(reservation) = wire_memory.as_ref() {
+            reservation
+                .resize(wire_body.len().saturating_add(chunk.len()))
+                .map_err(|error| {
+                    StreamingResponsePreparationError::Memory(error.into_proxy_error())
+                })?;
+        }
         wire_body.extend_from_slice(&chunk);
     }
 
-    let decoded = decode_response_body_for_proxy_with_limit(
+    let effective_decoded_limit = request_memory
+        .map(RequestMemoryBudget::remaining_bytes)
+        .map_or(decoded_limit, |remaining| decoded_limit.min(remaining));
+    let decoded = match decode_response_body_for_proxy_with_limit(
         response_headers,
         Bytes::from(wire_body),
-        decoded_limit,
-    )
-    .map_err(StreamingResponsePreparationError::Protocol)?;
+        effective_decoded_limit,
+    ) {
+        Ok(decoded) => decoded,
+        Err(error)
+            if effective_decoded_limit < decoded_limit
+                && error.status == StatusCode::BAD_GATEWAY
+                && error
+                    .client_message()
+                    .starts_with("decoded upstream response body exceeds") =>
+        {
+            let budget = request_memory.expect("reduced decode limit requires request budget");
+            return Err(StreamingResponsePreparationError::Memory(
+                budget
+                    .reject(
+                        RequestMemoryComponent::DecodedBody,
+                        effective_decoded_limit.saturating_add(1),
+                    )
+                    .into_proxy_error(),
+            ));
+        }
+        Err(error) => return Err(StreamingResponsePreparationError::Protocol(error)),
+    };
     if decoded.preserve_content_encoding {
         return Err(StreamingResponsePreparationError::Protocol(
             ProxyError::bad_gateway(
@@ -25212,7 +25526,13 @@ async fn prepare_claude_streaming_response(
             ),
         ));
     }
-    let body = decoded.body;
+    let body = match request_memory {
+        Some(budget) => budget
+            .retain_bytes(RequestMemoryComponent::DecodedBody, decoded.body)
+            .map_err(|error| StreamingResponsePreparationError::Memory(error.into_proxy_error()))?,
+        None => decoded.body,
+    };
+    drop(wire_memory);
     Ok(PreparedStreamingResponse {
         inner: stream::once(async move { Ok::<Bytes, reqwest::Error>(body) }).boxed(),
         decoded: true,
@@ -28401,6 +28721,7 @@ mod tests {
         base_url: String,
     ) -> String {
         let account_id = format!("{name}-account");
+        let account_uuid = format!("{name}-uuid");
         let provider_id = format!("{name}-provider");
         let account_id_for_state = account_id.clone();
         state
@@ -28414,7 +28735,10 @@ mod tests {
                         "refreshToken": "compressed-sse-refresh",
                         "tokenType": "Bearer",
                         "expiresAt": i64::MAX / 2,
-                        "profile": {"credentialCapability": "refreshable_oauth"}
+                        "profile": {
+                            "credentialCapability": "refreshable_oauth",
+                            "accountUUID": account_uuid
+                        }
                     }))
                     .unwrap(),
                 );
@@ -28480,6 +28804,68 @@ mod tests {
         )
     }
 
+    fn claude_message_start_sse() -> Bytes {
+        Bytes::from_static(
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_memory\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn claude_success_sse_with_text(text: &str) -> Vec<u8> {
+        [
+            format!(
+                "event: message_start\ndata: {}\n\n",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_memory_expansion",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "usage": {"input_tokens": 2, "output_tokens": 0}
+                    }
+                })
+            ),
+            format!(
+                "event: content_block_start\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                })
+            ),
+            format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text}
+                })
+            ),
+            format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                json!({"type": "content_block_stop", "index": 0})
+            ),
+            format!(
+                "event: message_delta\ndata: {}\n\n",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 2}
+                })
+            ),
+            format!(
+                "event: message_stop\ndata: {}\n\n",
+                json!({"type": "message_stop"})
+            ),
+        ]
+        .concat()
+        .into_bytes()
+    }
+
     fn gzip_bytes(body: &[u8]) -> Vec<u8> {
         use std::io::Write;
 
@@ -28511,7 +28897,7 @@ mod tests {
     }
 
     #[test]
-    fn request_memory_scope_is_exact_to_codex_and_antigravity_provider_types() {
+    fn request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth() {
         assert!(request_memory_enabled_for_provider(AppKind::Codex, None));
         assert!(request_memory_enabled_for_provider(
             AppKind::Claude,
@@ -28521,14 +28907,175 @@ mod tests {
             AppKind::Gemini,
             Some(ProviderType::AgyOAuth)
         ));
-        assert!(!request_memory_enabled_for_provider(
+        assert!(request_memory_enabled_for_provider(
             AppKind::Claude,
             Some(ProviderType::ClaudeOAuth)
+        ));
+        assert!(!request_memory_enabled_for_provider(
+            AppKind::Claude,
+            Some(ProviderType::Claude)
+        ));
+        assert!(!request_memory_enabled_for_provider(
+            AppKind::Claude,
+            Some(ProviderType::ClaudeAuth)
         ));
         assert!(!request_memory_enabled_for_provider(
             AppKind::Gemini,
             Some(ProviderType::GeminiCli)
         ));
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion()
+    {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"reject before network"}]}"#,
+        );
+
+        let mut share_state = forwarder_test_state("claude-share-request-memory");
+        Arc::get_mut(&mut share_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len() + 1;
+        let share_provider_id = install_claude_oauth_forwarder_test_provider(
+            &share_state,
+            "claude-share-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "claude-request-memory-share";
+        install_antigravity_test_share(
+            &share_state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::ClaudeOAuth,
+            &share_provider_id,
+        )
+        .await;
+        let mut share_headers = HeaderMap::new();
+        share_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        share_headers.insert("x-cc-switch-share-id", HeaderValue::from_static(share_id));
+        share_headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let share_error = forward(
+            share_state,
+            ProxyRoute::ClaudeMessages,
+            None,
+            share_headers,
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            share_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+
+        let mut pinned_state = forwarder_test_state("claude-pinned-request-memory");
+        Arc::get_mut(&mut pinned_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len() + 1;
+        let pinned_provider_id = install_claude_oauth_forwarder_test_provider(
+            &pinned_state,
+            "claude-pinned-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut pinned_headers = HeaderMap::new();
+        pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let pinned_error = forward_for_test_surface(
+            pinned_state,
+            ProxyRoute::ClaudeMessages,
+            pinned_provider_id,
+            None,
+            pinned_headers,
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            pinned_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_request_memory_combines_raw_decoded_and_normalized_bodies() {
+        let plain = Bytes::from(
+            json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "z".repeat(2 * 1024)}]
+            })
+            .to_string(),
+        );
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut state = forwarder_test_state("claude-compressed-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = compressed.len() + plain.len() + 1;
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-compressed-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            compressed,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]
@@ -28827,6 +29374,7 @@ mod tests {
                 },
                 None,
                 1024 * 1024,
+                None,
             )
             .await
             .unwrap_or_else(|_| panic!("{name} should decode"));
@@ -28857,6 +29405,7 @@ mod tests {
                 },
                 None,
                 1024 * 1024,
+                None,
             )
             .await,
             Err(StreamingResponsePreparationError::Protocol(_))
@@ -28878,10 +29427,71 @@ mod tests {
                 },
                 None,
                 1024,
+                None,
             )
             .await,
             Err(StreamingResponsePreparationError::Protocol(_))
         ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_streaming_decoder_budgets_wire_and_decoded_bytes_until_last_view_drop() {
+        let expected = claude_success_sse();
+        let wire_body = gzip_bytes(&expected);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let budget = RequestMemoryBudget::new(wire_body.len() + expected.len() + 64);
+        let (response, server) = streaming_test_response(headers.clone(), wire_body).await;
+        let prepared = prepare_claude_streaming_response(
+            response,
+            &headers,
+            StreamTimeoutConfig {
+                first_byte: None,
+                idle: None,
+            },
+            None,
+            1024 * 1024,
+            Some(&budget),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("budgeted Claude SSE should decode"));
+        assert!(prepared.decoded);
+        let chunks = prepared.inner.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], expected);
+        let view = chunks[0].slice(..8);
+        assert_eq!(budget.snapshot().used_bytes, expected.len());
+        drop(chunks);
+        assert_eq!(budget.snapshot().used_bytes, expected.len());
+        drop(view);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        server.abort();
+
+        let expanded = vec![b'x'; 32 * 1024];
+        let compressed = gzip_bytes(&expanded);
+        let budget = RequestMemoryBudget::new(compressed.len() + 1024);
+        let (response, server) = streaming_test_response(headers.clone(), compressed).await;
+        let result = prepare_claude_streaming_response(
+            response,
+            &headers,
+            StreamTimeoutConfig {
+                first_byte: None,
+                idle: None,
+            },
+            None,
+            1024 * 1024,
+            Some(&budget),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StreamingResponsePreparationError::Memory(ref error))
+                if error.is_request_memory_exhausted()
+        ));
+        assert!(budget.is_exhausted());
+        assert_eq!(budget.snapshot().used_bytes, 0);
         server.abort();
     }
 
@@ -28948,6 +29558,170 @@ mod tests {
             1,
             "compressed SSE must stay on the single bound Provider/account without replay"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_compressed_sse_expansion_exhaustion_is_sticky_and_not_retried() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let expanded = claude_success_sse_with_text(&"x".repeat(64 * 1024));
+        let wire_body = gzip_bytes(&expanded);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let wire_body = wire_body.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .header(CONTENT_ENCODING, "gzip")
+                        .body(Body::from(wire_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut state = forwarder_test_state("claude-compressed-sse-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 8 * 1024;
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-compressed-sse-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"expand"}]}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_retained_tool_json_exhaustion_terminates_committed_stream_without_retry()
+    {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let mut chunks = vec![claude_message_start_sse()];
+        chunks.push(Bytes::from(format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_memory",
+                    "name": "memory_tool",
+                    "input": {}
+                }
+            })
+        )));
+        for _ in 0..32 {
+            chunks.push(Bytes::from(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "x".repeat(1024)
+                    }
+                })
+            )));
+        }
+        let chunks = Arc::new(chunks);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let chunks = Arc::clone(&chunks);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let body = async_stream::stream! {
+                        for (index, chunk) in chunks.iter().cloned().enumerate() {
+                            yield Ok::<Bytes, std::convert::Infallible>(chunk);
+                            if index == 0 {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            } else {
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut state = forwarder_test_state("claude-stream-state-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 24 * 1024;
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-stream-state-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = forward_for_test_surface(
+            state,
+            ProxyRoute::ClaudeMessages,
+            provider_id,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"bounded tool input"}],"tools":[{"name":"memory_tool","description":"memory fixture","input_schema":{"type":"object"}}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let downstream = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let downstream = String::from_utf8_lossy(&downstream);
+        assert!(
+            downstream.contains("cc_switch_request_memory_exhausted"),
+            "{downstream}"
+        );
+        assert!(downstream.contains("\"status\":503"), "{downstream}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
