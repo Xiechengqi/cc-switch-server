@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,6 +22,17 @@ use crate::domain::providers::runtime::managed_account_binding_with_generation;
 use crate::domain::providers::store::{providers_path, ProviderStore};
 use crate::domain::sharing::shares::{shares_path, ShareStore};
 use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
+
+mod payload;
+mod schema;
+mod wal;
+
+use payload::{
+    encrypted_account_payloads, encrypted_provider_payloads,
+    ensure_account_payload_secrets_are_encrypted, share_payloads,
+};
+use schema::initialize_schema;
+use wal::validate_wal_if_present;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
@@ -964,126 +974,6 @@ fn verify_committed_database(config_dir: &Path, marker: &MigrationMarker) -> any
     Ok(())
 }
 
-/// SQLite treats an invalid WAL tail as an incomplete crash write and may
-/// silently ignore it. At an authority/restore boundary every durable frame is
-/// part of the repository, so validate the complete envelope and rolling
-/// checksums before allowing SQLite to recover it.
-fn validate_wal_if_present(database: &Path) -> anyhow::Result<()> {
-    let wal_path = database.with_file_name(format!(
-        "{}-wal",
-        database
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("SQLite database filename must be UTF-8")?
-    ));
-    let file = match fs::File::open(&wal_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("open SQLite WAL {}", wal_path.display()))
-        }
-    };
-    let length = file
-        .metadata()
-        .with_context(|| format!("stat SQLite WAL {}", wal_path.display()))?
-        .len();
-    if length == 0 {
-        return Ok(());
-    }
-    ensure!(length >= 32, "SQLite WAL is truncated before its header");
-    let mut reader = BufReader::new(file);
-    let mut header = [0_u8; 32];
-    reader
-        .read_exact(&mut header)
-        .with_context(|| format!("read SQLite WAL header {}", wal_path.display()))?;
-    let magic = u32::from_be_bytes(header[0..4].try_into()?);
-    let checksum_little_endian = match magic {
-        0x377f_0682 => true,
-        0x377f_0683 => false,
-        _ => anyhow::bail!("SQLite WAL has an invalid magic value"),
-    };
-    ensure!(
-        u32::from_be_bytes(header[4..8].try_into()?) == 3_007_000,
-        "SQLite WAL format version is unsupported"
-    );
-    let encoded_page_size = u32::from_be_bytes(header[8..12].try_into()?);
-    let page_size = if encoded_page_size == 1 {
-        65_536_u32
-    } else {
-        encoded_page_size
-    };
-    ensure!(
-        (512..=65_536).contains(&page_size) && page_size.is_power_of_two(),
-        "SQLite WAL page size is invalid"
-    );
-    let frame_size = 24_u64.saturating_add(u64::from(page_size));
-    ensure!(
-        (length - 32) % frame_size == 0,
-        "SQLite WAL ends with a partial frame"
-    );
-
-    let mut checksum = wal_checksum(checksum_little_endian, [0, 0], &header[..24])?;
-    let expected_header = [
-        u32::from_be_bytes(header[24..28].try_into()?),
-        u32::from_be_bytes(header[28..32].try_into()?),
-    ];
-    ensure!(
-        checksum == expected_header,
-        "SQLite WAL header checksum mismatch"
-    );
-    let salt = &header[16..24];
-    let mut frame = vec![0_u8; usize::try_from(frame_size)?];
-    let frame_count = (length - 32) / frame_size;
-    for index in 0..frame_count {
-        reader
-            .read_exact(&mut frame)
-            .with_context(|| format!("read SQLite WAL frame {}", index + 1))?;
-        ensure!(
-            frame[8..16] == salt[..],
-            "SQLite WAL frame salt mismatch at frame {}",
-            index + 1
-        );
-        checksum = wal_checksum(checksum_little_endian, checksum, &frame[..8])?;
-        checksum = wal_checksum(checksum_little_endian, checksum, &frame[24..])?;
-        let expected = [
-            u32::from_be_bytes(frame[16..20].try_into()?),
-            u32::from_be_bytes(frame[20..24].try_into()?),
-        ];
-        ensure!(
-            checksum == expected,
-            "SQLite WAL checksum mismatch at frame {}",
-            index + 1
-        );
-    }
-    Ok(())
-}
-
-fn wal_checksum(
-    little_endian: bool,
-    mut state: [u32; 2],
-    bytes: &[u8],
-) -> anyhow::Result<[u32; 2]> {
-    ensure!(
-        bytes.len().is_multiple_of(8),
-        "SQLite WAL checksum input is misaligned"
-    );
-    for pair in bytes.chunks_exact(8) {
-        let first = if little_endian {
-            u32::from_le_bytes(pair[..4].try_into()?)
-        } else {
-            u32::from_be_bytes(pair[..4].try_into()?)
-        };
-        let second = if little_endian {
-            u32::from_le_bytes(pair[4..].try_into()?)
-        } else {
-            u32::from_be_bytes(pair[4..].try_into()?)
-        };
-        state[0] = state[0].wrapping_add(first).wrapping_add(state[1]);
-        state[1] = state[1].wrapping_add(second).wrapping_add(state[0]);
-    }
-    Ok(state)
-}
-
 fn validate_payload_digests(connection: &Connection) -> anyhow::Result<()> {
     for table in ["providers", "shares", "usage_records"] {
         let mut statement =
@@ -1650,90 +1540,6 @@ fn open_database(path: &Path, read_only: bool) -> anyhow::Result<Connection> {
     Ok(connection)
 }
 
-fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
-    connection
-        .execute_batch(
-            "BEGIN IMMEDIATE;
-         CREATE TABLE schema_migrations(
-           version INTEGER PRIMARY KEY,
-           name TEXT NOT NULL,
-           applied_at_ms INTEGER NOT NULL,
-           checksum TEXT NOT NULL
-         ) STRICT;
-         CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-         CREATE TABLE legacy_blobs(
-           relative_path TEXT PRIMARY KEY,
-           payload BLOB NOT NULL,
-           sha256 TEXT NOT NULL,
-           byte_length INTEGER NOT NULL CHECK(byte_length >= 0)
-         ) STRICT;
-         CREATE TABLE providers(
-           app TEXT NOT NULL,
-           provider_id TEXT NOT NULL,
-           provider_type TEXT NOT NULL,
-           revision INTEGER NOT NULL CHECK(revision >= 0),
-           credential_generation INTEGER NOT NULL CHECK(credential_generation >= 0),
-           payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-           payload_sha256 TEXT NOT NULL,
-           PRIMARY KEY(app, provider_id)
-         ) STRICT;
-         CREATE TABLE accounts(
-           provider_type TEXT NOT NULL,
-           account_id TEXT NOT NULL,
-           auth_identity_generation INTEGER NOT NULL CHECK(auth_identity_generation >= 0),
-           token_refresh_generation INTEGER NOT NULL CHECK(token_refresh_generation >= 0),
-           payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-           payload_sha256 TEXT NOT NULL,
-           PRIMARY KEY(provider_type, account_id)
-         ) STRICT;
-         CREATE TABLE provider_accounts(
-           app TEXT NOT NULL,
-           provider_id TEXT NOT NULL,
-           provider_type TEXT NOT NULL,
-           account_id TEXT NOT NULL,
-           auth_identity_generation INTEGER NOT NULL,
-           PRIMARY KEY(app, provider_id),
-           FOREIGN KEY(app, provider_id) REFERENCES providers(app, provider_id),
-           FOREIGN KEY(provider_type, account_id) REFERENCES accounts(provider_type, account_id)
-         ) STRICT;
-         CREATE TABLE shares(
-           share_id TEXT PRIMARY KEY,
-           app TEXT NOT NULL,
-           provider_id TEXT NOT NULL,
-           provider_type TEXT NOT NULL,
-           config_revision INTEGER NOT NULL CHECK(config_revision >= 0),
-           payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-           payload_sha256 TEXT NOT NULL,
-           FOREIGN KEY(app, provider_id) REFERENCES providers(app, provider_id)
-         ) STRICT;
-         CREATE TABLE share_bindings(
-           share_id TEXT NOT NULL,
-           app TEXT NOT NULL,
-           provider_id TEXT NOT NULL,
-           provider_type TEXT NOT NULL,
-           PRIMARY KEY(share_id, app),
-           FOREIGN KEY(share_id) REFERENCES shares(share_id) ON DELETE CASCADE,
-           FOREIGN KEY(app, provider_id) REFERENCES providers(app, provider_id)
-         ) STRICT;
-         CREATE TABLE usage_records(
-           request_id TEXT PRIMARY KEY,
-           created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-           share_id TEXT,
-           provider_id TEXT,
-           usage_revision INTEGER NOT NULL CHECK(usage_revision >= 0),
-           payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-           payload_sha256 TEXT NOT NULL
-         ) STRICT;
-         CREATE INDEX usage_records_created_idx ON usage_records(created_at_ms, request_id);
-         CREATE INDEX usage_records_share_idx ON usage_records(share_id, created_at_ms);
-         INSERT INTO schema_migrations(version,name,applied_at_ms,checksum)
-         VALUES(1,'initial_server_store',0,'sha256:server-store-schema-v1');
-         PRAGMA user_version=1;
-         COMMIT;",
-        )
-        .context("initialize Server SQLite schema")
-}
-
 fn import_sources(transaction: &Transaction<'_>, sources: &[SourceFile]) -> anyhow::Result<()> {
     let mut statement = transaction.prepare(
         "INSERT INTO legacy_blobs(relative_path,payload,sha256,byte_length) VALUES(?1,?2,?3,?4)",
@@ -1950,155 +1756,6 @@ fn verify_connection(
     Ok(())
 }
 
-fn encrypted_provider_payloads(
-    root: Option<&Value>,
-    providers: &ProviderStore,
-) -> anyhow::Result<BTreeMap<(String, String), Value>> {
-    if providers.providers.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let root = root.context("providers.json is missing")?;
-    ensure!(
-        root.get("format").and_then(Value::as_str) == Some("cc-switch-provider-store"),
-        "non-empty legacy Provider S1 store must be migrated to encrypted S2 before SQLite shadow import"
-    );
-    let records = root
-        .get("records")
-        .and_then(Value::as_object)
-        .context("Provider S2 records are missing")?;
-    let mut output = BTreeMap::new();
-    for (app, values) in records {
-        let values = values
-            .as_object()
-            .context("Provider S2 app records must be an object")?;
-        for (provider_id, payload) in values {
-            output.insert((app.clone(), provider_id.clone()), payload.clone());
-        }
-    }
-    Ok(output)
-}
-
-fn encrypted_account_payloads(
-    root: Option<&Value>,
-    accounts: &AccountStore,
-) -> anyhow::Result<BTreeMap<(String, String), Value>> {
-    if accounts.accounts.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let values = root
-        .and_then(|root| root.get("accounts"))
-        .and_then(Value::as_array)
-        .context("accounts.json entries are missing")?;
-    let mut output = BTreeMap::new();
-    for payload in values {
-        let provider_type = json_string(payload, &["providerType", "provider_type"])?;
-        let id = json_string(payload, &["id"])?;
-        ensure!(
-            output
-                .insert((provider_type, id), payload.clone())
-                .is_none(),
-            "duplicate Account source key"
-        );
-    }
-    Ok(output)
-}
-
-fn share_payloads(
-    root: Option<&Value>,
-    shares: &ShareStore,
-) -> anyhow::Result<BTreeMap<String, Value>> {
-    if shares.shares.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let values = root
-        .and_then(|root| root.get("shares"))
-        .and_then(Value::as_array)
-        .context("shares.json entries are missing")?;
-    let mut output = BTreeMap::new();
-    for payload in values {
-        let id = json_string(payload, &["id"])?;
-        ensure!(
-            output.insert(id, payload.clone()).is_none(),
-            "duplicate Share source key"
-        );
-    }
-    Ok(output)
-}
-
-fn ensure_account_payload_secrets_are_encrypted(value: &Value) -> anyhow::Result<()> {
-    fn visit(value: &Value, parent: Option<&str>) -> anyhow::Result<()> {
-        match value {
-            Value::Object(object) => {
-                for (key, value) in object {
-                    let compact = key
-                        .chars()
-                        .filter(|character| character.is_ascii_alphanumeric())
-                        .map(|character| character.to_ascii_lowercase())
-                        .collect::<String>();
-                    let secret = matches!(
-                        compact.as_str(),
-                        "token"
-                            | "key"
-                            | "secret"
-                            | "authorization"
-                            | "proxyauthorization"
-                            | "cookie"
-                            | "password"
-                            | "sessiontoken"
-                            | "githubtoken"
-                            | "copilottoken"
-                            | "devicecode"
-                            | "usercode"
-                            | "codeverifier"
-                            | "authorizationcode"
-                            | "clientassertion"
-                            | "machinetoken"
-                            | "securityoauthtoken"
-                            | "personaltoken"
-                    ) || [
-                        "accesstoken",
-                        "refreshtoken",
-                        "idtoken",
-                        "apikey",
-                        "clientsecret",
-                        "kiroapikey",
-                        "secretaccesskey",
-                        "privatekey",
-                        "signingkey",
-                    ]
-                    .iter()
-                    .any(|suffix| compact.ends_with(suffix))
-                        || parent.is_some_and(|parent| {
-                            parent
-                                .chars()
-                                .filter(|character| character.is_ascii_alphanumeric())
-                                .map(|character| character.to_ascii_lowercase())
-                                .collect::<String>()
-                                == "extraheaders"
-                        });
-                    if secret {
-                        if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
-                            ensure!(
-                                text.starts_with("ccenc:v1:") || text.starts_with("ccenc:v2:"),
-                                "refusing to place plaintext Account credentials in SQLite"
-                            );
-                        }
-                    }
-                    visit(value, Some(key))?;
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    visit(value, parent)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    visit(value, None)
-}
-
 fn collect_sources(config_dir: &Path) -> anyhow::Result<Vec<SourceFile>> {
     let mut paths = Vec::new();
     for path in [
@@ -2260,13 +1917,6 @@ fn read_json_if_exists(path: &Path) -> anyhow::Result<Option<Value>> {
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse {}", path.display()))
         .map(Some)
-}
-
-fn json_string(value: &Value, keys: &[&str]) -> anyhow::Result<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
-        .context("required JSON identity field is missing")
 }
 
 fn safe_relative_path(value: &str) -> anyhow::Result<PathBuf> {

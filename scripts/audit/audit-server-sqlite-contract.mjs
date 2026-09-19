@@ -10,17 +10,35 @@ const assert = (condition, message) => {
 };
 
 const repository = read("src/repository/server_sqlite.rs");
+const schema = read("src/repository/server_sqlite/schema.rs");
+const payload = read("src/repository/server_sqlite/payload.rs");
+const wal = read("src/repository/server_sqlite/wal.rs");
 const state = read("src/state.rs");
 const cli = read("src/cli.rs");
 const admin = read("src/admin.rs");
 const metrics = read("src/metrics.rs");
 const storageDoc = read("docs/architecture/storage.md");
 
+for (const moduleName of ["payload", "schema", "wal"]) {
+  assert(
+    repository.includes(`mod ${moduleName};`),
+    `SQLite repository must declare its private ${moduleName} module`,
+  );
+}
+
 for (const fragment of [
   "PRAGMA foreign_keys=ON",
   "PRAGMA trusted_schema=OFF",
   "PRAGMA journal_mode=WAL",
   "PRAGMA synchronous=FULL",
+  "PRAGMA integrity_check",
+  "foreign_key_check",
+  "validate_wal_if_present",
+  "refusing to rebuild a committed SQLite authority",
+]) {
+  assert(repository.includes(fragment), `SQLite repository contract lost: ${fragment}`);
+}
+for (const fragment of [
   "BEGIN IMMEDIATE",
   "CREATE TABLE providers",
   "CREATE TABLE accounts",
@@ -29,15 +47,18 @@ for (const fragment of [
   "CREATE TABLE share_bindings",
   "CREATE TABLE usage_records",
   "CREATE TABLE legacy_blobs",
-  "PRAGMA integrity_check",
-  "foreign_key_check",
-  "validate_wal_if_present",
-  "SQLite WAL checksum mismatch",
-  "refusing to place plaintext Account credentials in SQLite",
-  "refusing to rebuild a committed SQLite authority",
 ]) {
-  assert(repository.includes(fragment), `SQLite repository contract lost: ${fragment}`);
+  assert(schema.includes(fragment), `SQLite schema contract lost: ${fragment}`);
 }
+assert(
+  payload.includes("refusing to place plaintext Account credentials in SQLite"),
+  "SQLite encrypted-payload guard is missing",
+);
+assert(
+  wal.includes("validate_wal_if_present") &&
+    wal.includes("SQLite WAL checksum mismatch"),
+  "SQLite WAL envelope validation is missing",
+);
 
 assert(
   repository.includes("rusqlite::backup::Backup::new"),
