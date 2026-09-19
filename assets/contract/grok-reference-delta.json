@@ -1029,6 +1029,138 @@
         "fixtureIds": []
       },
       "reason": "Reject sub2api account selection, priority/load/LRU rotation, composite commercial routing, billing projection and local soft quota gates; they conflict with the fixed binding and authoritative upstream evidence model."
+    },
+    {
+      "id": "GR-OBS-0011",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "reasoning_cache_count_ttl_memory_signal",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/conversation/reasoning_cache.go",
+          "backend/internal/infra/provider/conversation/reasoning_cache_test.go"
+        ],
+        "symbols": [
+          "defaultReasoningCacheCapacity",
+          "defaultReasoningCacheTTL",
+          "removeExpiredOrOldestLocked",
+          "TestReasoningCacheScopesAndLRU"
+        ],
+        "sourceDigest": "772b323ef03853b48446706a85c79e88459a2038fc01b7a31e62d59e30b54bd8"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N2"
+      ],
+      "target": {
+        "baselineCommit": "43b88a4acdc11b305c4cfba5452c5aef7b35edd5",
+        "baselineTree": "fc50386abc04ae1612c43ef70532785a6fb99400",
+        "implementationCommit": "2eca08a97fcf3c2059d1ffa9a15782d95a98b073",
+        "implementationTree": "098e4fe6df005d3623601cbdf6f8863c016b0cad",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "grok_oauth_request_memory_scope_is_provider_exact",
+              "grok_http_reasoning_replay_memory_exhaustion_stops_before_network",
+              "grok_sse_inspector_memory_exhaustion_terminates_without_retry",
+              "grok_image_edit_base64_expansion_exhausts_before_network",
+              "grok_media_response_decode_expansion_is_capacity_shed_without_retry",
+              "grok_image_stream_memory_exhaustion_emits_stable_terminal",
+              "grok_websocket_reasoning_replay_memory_exhaustion_sends_error_and_close"
+            ]
+          },
+          {
+            "path": "src/proxy/grok_replay.rs",
+            "anchors": [
+              "cache_read_reserves_before_returning_a_proof_clone",
+              "replay_proof_and_stream_retained_bytes_are_bounded_and_releasable"
+            ]
+          },
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "responses_search_retained_state_is_capacity_bounded"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "grok_oauth_request_memory_scope_is_provider_exact",
+          "grok_http_reasoning_replay_memory_exhaustion_stops_before_network",
+          "grok_sse_inspector_memory_exhaustion_terminates_without_retry",
+          "grok_image_edit_base64_expansion_exhausts_before_network",
+          "grok_media_response_decode_expansion_is_capacity_shed_without_retry",
+          "grok_image_stream_memory_exhaustion_emits_stable_terminal",
+          "grok_websocket_reasoning_replay_memory_exhaustion_sends_error_and_close",
+          "cache_read_reserves_before_returning_a_proof_clone",
+          "replay_proof_and_stream_retained_bytes_are_bounded_and_releasable",
+          "responses_search_retained_state_is_capacity_bounded"
+        ]
+      },
+      "reason": "grok2api proves count-, TTL-, scope- and LRU-bounded reasoning cache state, but not a byte ceiling per proof or one request-lifecycle budget. Adopt that bounded-state signal while independently accounting exact Grok OAuth HTTP, SSE, WebSocket and media body/parse/replay/retained state under one sticky budget with stable capacity terminals and no retry, rotation or NetworkFailure classification after exhaustion."
+    }
+  ],
+  "evidenceExtensions": [
+    {
+      "id": "CORE-N2-GROK",
+      "status": "fixture_verified",
+      "rails": [
+        "oauth"
+      ],
+      "transports": [
+        "http_json",
+        "sse",
+        "websocket",
+        "media_json",
+        "media_sse"
+      ],
+      "stickyExhaustion": true,
+      "reasoningReplayAccounted": true,
+      "mediaExpansionBounded": true,
+      "capacityShedNotNetworkFailure": true,
+      "liveReceiptState": "live_pending",
+      "localEvidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "grok_oauth_request_memory_scope_is_provider_exact",
+            "grok_http_reasoning_replay_memory_exhaustion_stops_before_network",
+            "grok_sse_inspector_memory_exhaustion_terminates_without_retry",
+            "grok_image_edit_base64_expansion_exhausts_before_network",
+            "grok_media_response_decode_expansion_is_capacity_shed_without_retry",
+            "grok_image_stream_memory_exhaustion_emits_stable_terminal",
+            "grok_websocket_reasoning_replay_memory_exhaustion_sends_error_and_close"
+          ]
+        },
+        {
+          "path": "src/proxy/grok_replay.rs",
+          "anchors": [
+            "get_accounted",
+            "cache_read_reserves_before_returning_a_proof_clone",
+            "replay_proof_and_stream_retained_bytes_are_bounded_and_releasable"
+          ]
+        },
+        {
+          "path": "src/proxy/grok.rs",
+          "anchors": [
+            "GROK_SSE_MAX_COMPLETED_SEARCHES",
+            "responses_search_retained_state_is_capacity_bounded"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/grok/mod.rs",
+          "anchors": [
+            "capture_response",
+            "ReplayStreamWrite",
+            "RequestMemoryComponent::ReasoningReplay"
+          ]
+        }
+      ]
     }
   ]
 }

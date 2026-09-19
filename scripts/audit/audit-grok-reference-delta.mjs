@@ -311,6 +311,7 @@ const immutableObservationDigests = new Map([
   ["GR-OBS-0008", "924cc1ce48eff0a0b43265211e9c2ad865890f2fb9a96e8481c8bce6592187af"],
   ["GR-OBS-0009", "af09e7c34cff0d9699e8956fb58a766c186e3dfb93f4e4a39ae83193c3adbc75"],
   ["GR-OBS-0010", "f4c6f439470de9db744c0387d56679aeb3d1b70d40424a56221b456211d47404"],
+  ["GR-OBS-0011", "eaab1e5d64f900ad0b23344ec5a0bbd5b7ed9e6aad34f25db43b908af9dd9116"],
 ]);
 const expectedEnhancementIds = new Set([
   "GR-01",
@@ -320,6 +321,7 @@ const expectedEnhancementIds = new Set([
   "GR-05",
   "GR-N1",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
   "GR-R1",
 ]);
@@ -334,6 +336,7 @@ const expectedDispositions = new Map([
   ["GR-OBS-0008", "differential"],
   ["GR-OBS-0009", "live_gate"],
   ["GR-OBS-0010", "reject"],
+  ["GR-OBS-0011", "differential"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -500,6 +503,42 @@ assert(
     JSON.stringify([...expectedEnhancementIds].sort()),
   "Grok enhancement observation coverage is incomplete",
 );
+
+assert(
+  objectDigest(contract.evidenceExtensions) ===
+    "facc1d19b75c002cbadb1d333bcbd57b68a195c5dc0c23515f951c27fd11a919",
+  "Grok evidence extension history changed",
+);
+const evidenceExtensions = new Map(
+  (contract.evidenceExtensions ?? []).map((extension) => [extension.id, extension]),
+);
+const requestMemoryExtension = evidenceExtensions.get("CORE-N2-GROK");
+assert(
+  evidenceExtensions.size === 1 &&
+    requestMemoryExtension?.status === "fixture_verified" &&
+    JSON.stringify(requestMemoryExtension.rails) === JSON.stringify(["oauth"]) &&
+    JSON.stringify(requestMemoryExtension.transports) ===
+      JSON.stringify(["http_json", "sse", "websocket", "media_json", "media_sse"]) &&
+    requestMemoryExtension.stickyExhaustion === true &&
+    requestMemoryExtension.reasoningReplayAccounted === true &&
+    requestMemoryExtension.mediaExpansionBounded === true &&
+    requestMemoryExtension.capacityShedNotNetworkFailure === true &&
+    requestMemoryExtension.liveReceiptState === "live_pending" &&
+    requestMemoryExtension.localEvidence?.length === 4,
+  "CORE-N2-GROK evidence boundary changed",
+);
+for (const evidence of requestMemoryExtension.localEvidence) {
+  safeRelative(evidence.path, "CORE-N2-GROK local path");
+  const localPath = path.join(repoRoot, evidence.path);
+  assert(fs.existsSync(localPath), `CORE-N2-GROK local path is unavailable: ${evidence.path}`);
+  const source = fs.readFileSync(localPath, "utf8");
+  assert(
+    Array.isArray(evidence.anchors) &&
+      evidence.anchors.length > 0 &&
+      evidence.anchors.every((anchor) => source.includes(anchor)),
+    `CORE-N2-GROK is missing a local anchor in ${evidence.path}`,
+  );
+}
 
 const capabilities = new Map(
   (contract.capabilities ?? []).map((capability) => [capability.id, capability]),

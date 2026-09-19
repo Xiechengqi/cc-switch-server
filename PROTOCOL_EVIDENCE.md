@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-19 Grok request-lifecycle memory freeze
+
+CORE-N2 的 Grok 切片冻结在 `assets/contract/grok-reference-delta.json` 的 `GR-OBS-0011` 与 `CORE-N2-GROK` evidence extension。一次性只读证据继续只取 `grok2api@906b9493b099d192381c698d4e320fafeccb851c`（tree `eca3a45c482375fad636578b28d73c1186d2bef4`）的 committed object：reasoning cache 默认以 4096 entry、30 分钟 TTL、scope key 与 LRU 淘汰约束状态。该参考只证明 replay retained state 必须有界，没有单 proof 字节上限，也没有统一 request-lifecycle budget；`sub2api@ab99d56e9626e6cd731592dae8553c9758a0efa2` 的 6 项工作树修改继续全部排除。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核冻结 Git object。
+
+生产实现冻结在 `2eca08a97fcf3c2059d1ffa9a15782d95a98b073`（tree `098e4fe6df005d3623601cbdf6f8863c016b0cad`）。它只为精确的 `ProviderType::GrokOAuth` 启用 sticky budget，并让 HTTP JSON/SSE、Responses WebSocket turn 与 Grok media 共用同一容量语义；同一请求的 401、reasoning rejection recovery、WS→HTTP fallback 和 terminal 都不能重置预算。replay cache 在复制 proof 前先 reserve，request parse/apply、capture、stream accumulator、retry payload 与 WS 读写继续使用原请求预算；binding drift 重新准备时也不创建未核算副本。
+
+核算范围还包括 SSE terminal/usage/transform state、completed-search set 与长 ID 摘要、multipart/base64 image-edit 扩张、媒体 raw/decoded/normalized body、响应 wire/解压 body，以及图片 JSON/SSE stream buffer。耗尽后 HTTP 返回稳定 `503 / cc_switch_request_memory_exhausted`，已提交 SSE 发同码 terminal，WebSocket 发 error 后 Close；当前上游被取消，不再 replay、换 Account/Provider/rail，也不记为普通 `NetworkFailure`。流状态本身改为堆上持有，避免大型 `try_unfold` state 按值穿过 `Poll` 层造成测试线程栈溢出。
+
+专项验证为 Grok 184/184；完整 Rust lib 为 3153 passed、1 ignored、0 failed，Clippy `-D warnings`、格式与差异检查均通过。11 条 append-only observation 与 `CORE-N2-GROK=fixture_verified` 只证明本地容量合同，不是 inference、media 或 remote-compaction 的真实 OAuth/长流/内存压力 receipt；GR-N2 三个 operation 继续分别保持 `receipt=null`、`live_pending`，remote compaction 仍为 `runtimeEnabled=false`。
+
 ## 2026-09-19 Cursor request-lifecycle memory freeze
 
 CORE-N2 的 Cursor 切片冻结在 `assets/contract/cursor-reference-delta.json` 的 `CUR-OBS-0008`。一次性只读证据仍只取 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`（tree `25b36e4993a8cc52da22b3d0b0aa26bd4c60426b`）的 committed object：executor 对单个 Connect frame 设 16 MiB 上限并在消费后 splice rolling buffer；session manager 默认以 5 分钟 TTL、100 个 session 上限及 close cleanup 约束 parked h2 state。该参考只证明 transport/session retained state 必须有界，既没有统一 request-lifecycle budget，也没有约束 gzip expansion；22 项工作树内容继续全部排除。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才复核冻结 Git object。
@@ -159,7 +169,7 @@ CUR-N2 的 `reviewed_no_wire_delta` 结论保持不变：冻结区间没有新�
 
 Grok 差异合同冻结在 `assets/contract/grok-reference-delta.json`。一次性只读证据只取 `grok2api@906b9493b099d192381c698d4e320fafeccb851c` 的十个已提交 Git object，并以 SHA-256 固定 conversation reasoning cache、明确 decode rejection recovery、Build tool root-union adapter，以及 `7f3f3d3ce030d5cf946b0bbe994f3026775fa308` 引入的启发式 quality hold/retry；历史 reasoning delta 仅记录 `8641a782`、`ca392e68`、`7d1b4246`、`3de758e7`、`22ac653a`、`72a3a347`、`5d19ccff`、`e5285ebe`。外部工作树未提交内容和 `sub2api` 的账号池、路由、fallback 都被排除；默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核只读 Git object。
 
-EVID-N1 将合同提升为 append-only schema v2：`269850a` 中原始 schema-v1 文件的 SHA-256、target commit/tree、全部十个历史字段的 canonical digest 和逐字段 digest 均被冻结。新增的 `grok2api@906b9493` 干净 snapshot 与 `sub2api@ab99d56e` dirty-worktree-excluded snapshot 固定提交态 tree；后者的 6 项本地修改全部排除，只追加四个已提交 object 作为拒绝证据。10 条不可变 observation 完整映射 GR-01～05、GR-N1、CORE-N1、LIVE-N1 与 GR-R1，绑定 source path/symbol/digest、处置理由以及本仓库 committed baseline/implementation object。GR-R1 明确拒绝 visible/plaintext 启发式重试、账号池/轮换、商业复合路由/计价和本地 soft quota gate；reject 记录不声明 implementation 或 fixture。
+EVID-N1 将合同提升为 append-only schema v2：`269850a` 中原始 schema-v1 文件的 SHA-256、target commit/tree、全部十个历史字段的 canonical digest 和逐字段 digest 均被冻结。新增的 `grok2api@906b9493` 干净 snapshot 与 `sub2api@ab99d56e` dirty-worktree-excluded snapshot 固定提交态 tree；后者的 6 项本地修改全部排除，只追加四个已提交 object 作为拒绝证据。当前 11 条不可变 observation 完整映射 GR-01～05、GR-N1、CORE-N1、CORE-N2、LIVE-N1 与 GR-R1，绑定 source path/symbol/digest、处置理由以及本仓库 committed baseline/implementation object。GR-R1 明确拒绝 visible/plaintext 启发式重试、账号池/轮换、商业复合路由/计价和本地 soft quota gate；reject 记录不声明 implementation 或 fixture。
 
 Server 的独立实现把 replay scope 固定到 Provider revision/runtime、Account auth/token generation、Share、签名用户、session/turn、model family、HTTP/WS rail 和 upstream plane；有界 cache 使用 CAS/tombstone，只从成功 completed 终态提交，并在重复/编辑 call、协议/容量/代际漂移时 fail closed。Grok Build root union 在通用 sanitizer 后解析有界 local `$ref`，只投影可证明的 object root，循环、混合 union、全非 object 与歧义 schema 在网络前明确拒绝。HTTP、CRLF/分片 SSE 与 WebSocket loopback 验证 capture/replay、parallel calls、一次 pre-commit 明确拒绝恢复及 post-commit 禁止恢复。
 
@@ -169,7 +179,7 @@ CORE-N1 将 Grok reasoning replay 的 scope 派生、snapshot ownership、CAS �
 
 LIVE-N1 把真实门禁拆成 `inference`、`media`、`remote_compaction` 三个互不外推的 operation。每份仓库外 `0600` 私有 receipt 必须绑定当前 target commit、Provider revision/runtime、Account auth/token generation、Share revision、签名用户 namespace、精确 model/session/turn 和 fresh catalog，并精确匹配 checks、body hashes、measurements、固定恢复决策、零 decoy 请求与 secret scan。`grok-oauth-real.mjs` 仅为 `probe_only/live_pending`；fixture 只能产生 `contract_verified/live_pending`。当前没有真实 receipt，三项继续为 `receipt=null`、`live_pending`。
 
-这些 fixture 只支持 GR-01..03 与 CORE-N1 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog 仍待 operation receipt；GR-05 remote compaction 明确 `runtimeEnabled=false`，即使未来 receipt 证明上游协议也不能自动启用，必须另行完成 scope、versioned AEAD、TTL、失败语义和降级设计评审。不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
+这些 fixture 只支持 GR-01..03、CORE-N1 与 CORE-N2 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog 仍待 operation receipt；GR-05 remote compaction 明确 `runtimeEnabled=false`，即使未来 receipt 证明上游协议也不能自动启用，必须另行完成 scope、versioned AEAD、TTL、失败语义和降级设计评审。不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
 
 ## 2026-09-11 Kiro prompt-cache differential freeze
 
