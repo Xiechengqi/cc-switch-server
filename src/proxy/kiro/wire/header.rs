@@ -22,6 +22,14 @@ impl HeaderValue {
             _ => None,
         }
     }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::ByteArray(value) => value.capacity(),
+            Self::String(value) => value.capacity(),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -50,6 +58,20 @@ impl Headers {
 
     pub(super) fn error_code(&self) -> Option<&str> {
         self.string(":error-code")
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.0
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<(String, HeaderValue)>()
+                    .saturating_add(std::mem::size_of::<usize>() * 3),
+            )
+            .saturating_add(self.0.iter().fold(0_usize, |bytes, (name, value)| {
+                bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(value.retained_bytes())
+            }))
     }
 }
 

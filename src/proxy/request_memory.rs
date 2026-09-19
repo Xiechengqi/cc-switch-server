@@ -71,6 +71,48 @@ pub(super) fn retained_json_bytes(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(dynamic_bytes(value))
 }
 
+/// Computes the exact compact JSON byte length without materializing another
+/// serialized copy. Callers use it to reserve request memory before
+/// `serde_json::to_vec` allocates the wire representation.
+pub(super) fn serialized_json_bytes(value: &Value) -> usize {
+    fn quoted_bytes(value: &str) -> usize {
+        value.chars().fold(2_usize, |bytes, character| {
+            let escaped = match character {
+                '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+                character if character <= '\u{001f}' => 6,
+                character => character.len_utf8(),
+            };
+            bytes.saturating_add(escaped)
+        })
+    }
+
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(value) => quoted_bytes(value),
+        Value::Array(values) => values
+            .iter()
+            .fold(2_usize, |bytes, value| {
+                bytes
+                    .saturating_add(serialized_json_bytes(value))
+                    .saturating_add(1)
+            })
+            .saturating_sub(usize::from(!values.is_empty())),
+        Value::Object(values) => values
+            .iter()
+            .fold(2_usize, |bytes, (key, value)| {
+                bytes
+                    .saturating_add(quoted_bytes(key))
+                    .saturating_add(1)
+                    .saturating_add(serialized_json_bytes(value))
+                    .saturating_add(1)
+            })
+            .saturating_sub(usize::from(!values.is_empty())),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RequestMemorySnapshot {
     pub(super) limit_bytes: usize,
@@ -544,5 +586,22 @@ mod tests {
         assert!(budget
             .reserve(RequestMemoryComponent::NormalizedBody, 1)
             .is_err());
+    }
+
+    #[test]
+    fn serialized_json_size_matches_compact_serde_output() {
+        let values = [
+            serde_json::json!(null),
+            serde_json::json!({"plain": [true, false, 42, 1.25]}),
+            serde_json::json!({"escaped\nkey": "quote=\" slash=\\ control=\u{0001}"}),
+            serde_json::json!({"unicode": "你好🙂"}),
+        ];
+        for value in values {
+            assert_eq!(
+                serialized_json_bytes(&value),
+                serde_json::to_vec(&value).unwrap().len(),
+                "value={value}"
+            );
+        }
     }
 }

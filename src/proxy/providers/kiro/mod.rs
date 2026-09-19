@@ -23,6 +23,9 @@ use crate::state::ServerState;
 use super::super::adapters::{self, AdapterRequest, GenericForwardingAdapter};
 use super::super::kiro as driver;
 use super::super::provider_ops::ProviderExecution;
+use super::super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::router::ProxyRoute;
 #[cfg(test)]
 use super::super::setting;
@@ -152,6 +155,7 @@ pub(crate) struct BoundPreparedRequest {
     pub(crate) account_id: String,
     pub(crate) replay_allowed: bool,
     pub(crate) prepared: driver::KiroPreparedRequest,
+    pub(crate) prepared_memory: Option<RequestMemoryReservation>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -166,6 +170,7 @@ pub(crate) async fn prepare_bound_request(
     actual_model: &str,
     ide_version: &str,
     claude_code_tools: bool,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<BoundPreparedRequest, ProxyError> {
     let product = product_boundary(stored)?;
     execution.materialize_auth(accounts)?;
@@ -318,15 +323,34 @@ pub(crate) async fn prepare_bound_request(
         catalog_max_input_tokens,
         session_id: Some(cache_session.to_string()),
     };
-    let mut prepared =
-        driver::prepare_kiro_request_with_context(&account, request_body, &call_context)?;
+    let prepared_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                retained_json_bytes(request_body),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    let mut prepared = driver::prepare_kiro_request_with_context_and_memory(
+        &account,
+        request_body,
+        &call_context,
+        request_memory,
+    )?;
     if let Some(base_url) = api_base_override(stored) {
         prepared.url = url_with_base_override(&base_url, &prepared.url)?;
+    }
+    if let Some(memory) = prepared_memory.as_ref() {
+        memory
+            .resize(prepared.retained_bytes())
+            .map_err(|error| error.into_proxy_error())?;
     }
     Ok(BoundPreparedRequest {
         account_id: account_id.to_string(),
         replay_allowed,
         prepared,
+        prepared_memory,
     })
 }
 
@@ -377,7 +401,9 @@ pub(crate) fn downstream_keepalive_frame(route: ProxyRoute) -> Bytes {
 }
 
 pub(crate) fn stream_failure_status(error: &std::io::Error) -> StatusCode {
-    if error
+    if driver::is_request_memory_stream_error(error) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if error
         .to_string()
         .starts_with("[KIRO_EVENT_STREAM_TIMEOUT] ")
     {

@@ -11,6 +11,7 @@ pub(crate) use error::WireError;
 pub(crate) use event::{parse_event, Event};
 #[cfg(test)]
 pub(crate) use frame::crc32;
+pub(crate) use frame::Frame;
 
 #[cfg(test)]
 mod tests {

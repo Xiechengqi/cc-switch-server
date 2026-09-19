@@ -11,6 +11,14 @@ pub(crate) struct Frame {
     pub(super) payload: Vec<u8>,
 }
 
+impl Frame {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.headers
+            .retained_bytes()
+            .saturating_add(self.payload.capacity())
+    }
+}
+
 pub(super) enum ParseOutcome {
     Incomplete,
     Complete { frame: Frame, consumed: usize },

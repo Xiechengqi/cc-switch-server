@@ -86,6 +86,10 @@ impl EventStreamDecoder {
         }
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buffer.capacity()
+    }
+
     fn drain(&mut self) -> Result<Vec<Frame>, WireError> {
         let mut frames = Vec::new();
         loop {

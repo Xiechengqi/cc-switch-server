@@ -112,11 +112,11 @@ use super::providers::{
 };
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
-    decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
-    response_decoding_required, ResponseDecodeResult,
+    decode_response_body_for_proxy_with_limit, response_decoding_required, ResponseDecodeResult,
 };
 use super::request_memory::{
-    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+    retained_json_bytes, serialized_json_bytes, RequestMemoryBudget, RequestMemoryComponent,
+    RequestMemoryReservation,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
@@ -1996,6 +1996,8 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
                     ProviderType::CursorOAuth
                         | ProviderType::CursorApiKey
                         | ProviderType::GrokOAuth
+                        | ProviderType::KiroOAuth
+                        | ProviderType::AmazonQOAuth
                 )
         })
 }
@@ -2225,6 +2227,7 @@ async fn forward_with_attempt(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                request_memory: attempt_context.request_memory().cloned(),
             })
             .await;
         }
@@ -20347,6 +20350,59 @@ async fn finish_qoder_stream_failure(
     stream_terminal_error_frame(route, &error.message, error.status.as_u16())
 }
 
+async fn finish_kiro_stream_failure(
+    guard: &mut ShareStreamInterruptGuard,
+    route: ProxyRoute,
+    error: &ProxyError,
+    stream_status: &'static str,
+) -> Option<Bytes> {
+    let usage_result = std::mem::take(&mut guard.usage).finish_with_status();
+    let usage = usage_result.usage;
+    update_stream_usage_result(
+        &guard.state,
+        &guard.stored,
+        &guard.request_id,
+        error.status.as_u16(),
+        guard.started.elapsed().as_millis(),
+        guard.first_token_ms,
+        usage_result,
+        Some(stream_status),
+    )
+    .await;
+    update_terminal_usage_error(
+        &guard.state,
+        &guard.request_id,
+        error.client_message().to_string(),
+    )
+    .await;
+    record_share_invocation_result(
+        &guard.state,
+        guard.share_id.as_deref(),
+        guard.user_email.as_deref(),
+        usage,
+    )
+    .await;
+    let outcome = kiro_failure_provider_outcome(error);
+    record_provider_outcome(&guard.state, &guard.stored, outcome).await;
+    guard.disarm();
+    let message = if error.is_request_memory_exhausted() {
+        error.client_message()
+    } else {
+        &error.message
+    };
+    stream_terminal_error_frame(route, message, error.status.as_u16())
+}
+
+fn kiro_failure_provider_outcome(error: &ProxyError) -> ProviderOutcome {
+    if error.is_request_memory_exhausted() {
+        capacity_shed_provider_outcome()
+    } else {
+        ProviderOutcome::Failure {
+            status_code: error.status.as_u16(),
+        }
+    }
+}
+
 struct ClaudeKiroForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -20359,6 +20415,7 @@ struct ClaudeKiroForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 struct ClaudeDeepSeekForwardOptions {
@@ -20708,7 +20765,66 @@ fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> Proxy
     }
 }
 
+async fn record_kiro_memory_exhaustion(
+    state: &ServerState,
+    stored: &StoredProvider,
+    started: Instant,
+    request_context: &UsageLogContext,
+    model: UsageModelMetadata,
+    error: &ProxyError,
+) {
+    record_provider_outcome(state, stored, capacity_shed_provider_outcome()).await;
+    if !request_context.is_health_check {
+        record_share_invocation_result(
+            state,
+            request_context.share_id.as_deref(),
+            request_context.user_email.as_deref(),
+            TokenUsage::default(),
+        )
+        .await;
+    }
+    let mut context = request_context.clone();
+    context.stream_status = Some("memory_capacity".to_string());
+    context.outcome = Some(UsageOutcome::InternalError);
+    context.failure_kind = Some("memory_capacity".to_string());
+    context.error_message = Some(error.client_message().to_string());
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model,
+        TokenUsage::default(),
+        context,
+    )
+    .await;
+}
+
 async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Response, ProxyError> {
+    let state = options.state.clone();
+    let stored = options.stored.clone();
+    let request_context = options.request_context.clone();
+    let started = options.started;
+    let result = forward_claude_kiro_inner(options).await;
+    if let Err(error) = &result {
+        if error.is_request_memory_exhausted() {
+            record_kiro_memory_exhaustion(
+                &state,
+                &stored,
+                started,
+                &request_context,
+                UsageModelMetadata::default(),
+                error,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+async fn forward_claude_kiro_inner(
+    options: ClaudeKiroForwardOptions,
+) -> Result<Response, ProxyError> {
     let ClaudeKiroForwardOptions {
         state,
         execution,
@@ -20721,11 +20837,22 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        request_memory,
     } = options;
     let product = kiro_provider::product_boundary(&stored)?;
     let expected_provider_type = product.provider_type;
     let mut audit_attempt = ForwardAttemptContext::default();
     let mut request_context = request_context;
+    let canonical_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                body.len().saturating_mul(2),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let canonical = kiro_provider::prepare_canonical_request(
         &execution,
         &stored,
@@ -20735,6 +20862,17 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         body,
         &mut request_context,
     )?;
+    if let Some(memory) = canonical_memory.as_ref() {
+        memory
+            .resize(
+                canonical
+                    .runtime_request
+                    .body
+                    .len()
+                    .saturating_add(retained_json_bytes(&canonical.request_body)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let kiro_provider::CanonicalRequest {
         adapter,
         runtime_request,
@@ -20747,6 +20885,11 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
     } = canonical;
 
     if let Some(response_bytes) = kiro_provider::local_count_tokens_body(route, &request_body)? {
+        let response_bytes = retain_request_bytes(
+            response_bytes,
+            request_memory.as_ref(),
+            RequestMemoryComponent::NormalizedEvent,
+        )?;
         drop(account_in_flight_guard);
         drop(share_invocation_guard);
         let mut response = Response::new(Body::from(response_bytes));
@@ -20763,7 +20906,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .map_err(binding_snapshot_error_to_proxy_error)?;
     let http_client = forward_http_client(&state, &execution).await?;
     let ide_version = kiro_provider::runtime_client_version(&state, expected_provider_type).await;
-    let (upstream, prepared, first_frame_deadline) = loop {
+    let (mut upstream, prepared, prepared_memory, first_frame_deadline) = loop {
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
         let bound = kiro_provider::prepare_bound_request(
             &state,
@@ -20776,14 +20919,36 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             &actual_model,
             &ide_version,
             claude_code_tools,
+            request_memory.as_ref(),
         )
         .await?;
         let replay_allowed = bound.replay_allowed;
         let _bound_account_id = bound.account_id;
         let prepared = bound.prepared;
+        let prepared_memory = bound.prepared_memory;
+        let serialized_body_bytes = serialized_json_bytes(&prepared.body);
+        let target_header_bytes = prepared
+            .headers
+            .iter()
+            .fold(0_usize, |bytes, (name, value)| {
+                bytes
+                    .saturating_add(name.len())
+                    .saturating_add(value.capacity())
+            });
+        if let Some(memory) = prepared_memory.as_ref() {
+            memory
+                .resize(
+                    prepared
+                        .retained_bytes()
+                        .saturating_add(serialized_body_bytes)
+                        .saturating_add(target_header_bytes),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         let serialized_body = serde_json::to_vec(&prepared.body)
             .map(Bytes::from)
             .map_err(|error| ProxyError::bad_request(format!("encode Kiro request: {error}")))?;
+        debug_assert_eq!(serialized_body.len(), serialized_body_bytes);
         let target_headers = prepared
             .headers
             .iter()
@@ -20862,7 +21027,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                     "auth",
                     "kiro_unauthorized",
                 ) {
-                    break (upstream, prepared, first_frame_deadline);
+                    break (upstream, prepared, prepared_memory, first_frame_deadline);
                 }
                 drop(upstream);
                 if let Err(error) = state
@@ -20897,9 +21062,9 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
                     )
                     .await;
                 }
-                break (upstream, prepared, first_frame_deadline);
+                break (upstream, prepared, prepared_memory, first_frame_deadline);
             }
-            None => break (upstream, prepared, first_frame_deadline),
+            None => break (upstream, prepared, prepared_memory, first_frame_deadline),
         }
     };
     let model_metadata = routed_model_metadata(
@@ -20936,18 +21101,43 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             idle_timeout: execution.stream_idle_timeout(),
             context_window: prepared.context_window,
             keepalive_interval: kiro_provider::text_keepalive_interval(&execution),
+            request_memory,
+            prepared_memory,
+            canonical_memory,
         })
         .await;
     }
 
-    let bytes = match upstream.bytes().await {
-        Ok(bytes) => bytes,
+    let (bytes, response_transport_memory) = match read_response_body_limited_with_memory(
+        &mut upstream,
+        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        request_memory.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) if error.is_memory_exhausted() => {
+            return Err(error.into_proxy_error());
+        }
         Err(error) => {
             record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
-            return Err(ProxyError::bad_gateway(error));
+            return Err(error.into_proxy_error());
         }
     };
-    let decoded = decode_response_body_for_proxy(&response_headers, bytes);
+    let decoded = match decode_response_body_with_memory(
+        &response_headers,
+        bytes,
+        response_transport_memory,
+        PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        request_memory.as_ref(),
+    ) {
+        Ok(decoded) => decoded,
+        Err(error) if error.is_request_memory_exhausted() => return Err(error),
+        Err(error) => {
+            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            return Err(error);
+        }
+    };
     let bytes = decoded.body;
     if !status.is_success() {
         maybe_mark_upstream_rate_limited(
@@ -20988,6 +21178,16 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         return Ok(response);
     }
 
+    let response_semantic_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::SemanticPrelude,
+                bytes.len().saturating_mul(4),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let message = match kiro::kiro_event_bytes_to_claude_json_scoped_with_context_window(
         &bytes,
         &response_model,
@@ -21037,20 +21237,50 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             return Err(proxy_error);
         }
     };
+    if let Some(memory) = response_semantic_memory.as_ref() {
+        memory
+            .resize(retained_json_bytes(&message))
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let cache_usage_estimated = message
         .pointer("/usage/cache_usage_source")
         .and_then(Value::as_str)
         == Some("local_prompt_cache_estimate");
     let usage = crate::domain::usage::store::usage_from_json(&message);
+    let canonical_response_size = serialized_json_bytes(&message);
+    let response_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedEvent,
+                canonical_response_size,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let canonical_response_bytes = serde_json::to_vec(&message)
         .map(Bytes::from)
         .map_err(ProxyError::bad_gateway)?;
+    debug_assert_eq!(canonical_response_bytes.len(), canonical_response_size);
+    if let Some(memory) = response_memory.as_ref() {
+        memory
+            .resize(canonical_response_bytes.len().saturating_mul(2))
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let response_bytes = adapter.transform_response_for_request(
         canonical_response_bytes,
         &stored,
         route,
         &runtime_request,
     )?;
+    let response_bytes = if let Some(memory) = response_memory {
+        memory
+            .resize(response_bytes.len())
+            .map_err(|error| error.into_proxy_error())?;
+        memory.retain_bytes(response_bytes)
+    } else {
+        response_bytes
+    };
     let share_id_for_record = request_context.share_id.clone();
     let user_email_for_record = request_context.user_email.clone();
     log_usage(
@@ -21107,6 +21337,9 @@ struct ClaudeKiroStreamOptions {
     idle_timeout: Option<Duration>,
     context_window: u64,
     keepalive_interval: Option<Duration>,
+    request_memory: Option<RequestMemoryBudget>,
+    prepared_memory: Option<RequestMemoryReservation>,
+    canonical_memory: Option<RequestMemoryReservation>,
 }
 
 async fn forward_claude_kiro_stream(
@@ -21134,7 +21367,27 @@ async fn forward_claude_kiro_stream(
         idle_timeout,
         context_window,
         keepalive_interval,
+        request_memory,
+        prepared_memory,
+        canonical_memory,
     } = options;
+    let stream_transform =
+        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+            &stored,
+            route,
+            responses_tool_context,
+            downstream_include_usage,
+        );
+    let stream_retained_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::StreamRetainedState,
+                stream_transform.retained_bytes(),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let request_id = log_usage(
         &state,
         &stored,
@@ -21151,7 +21404,7 @@ async fn forward_claude_kiro_stream(
     .await;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
-    let stream = kiro::kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_window(
+    let stream = Box::pin(kiro::kiro_event_stream_to_claude_sse_with_request_memory(
         upstream.bytes_stream(),
         response_model,
         tool_name_registry,
@@ -21160,17 +21413,14 @@ async fn forward_claude_kiro_stream(
         first_frame_deadline,
         idle_timeout,
         context_window,
-    );
-    let stream_transform =
-        super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
-            &stored,
-            route,
-            responses_tool_context,
-            downstream_include_usage,
-        );
-    let stream = async_stream::stream! {
+        request_memory.clone(),
+    ));
+    let stream = Box::pin(async_stream::stream! {
         let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
+        let _prepared_memory = prepared_memory;
+        let _canonical_memory = canonical_memory;
+        let _request_memory_owner = request_memory.clone();
         let mut interrupt_guard = ShareStreamInterruptGuard {
             armed: true,
             state: state.clone(),
@@ -21185,12 +21435,12 @@ async fn forward_claude_kiro_stream(
         };
         let mut first_token_ms = None;
         let mut stream_transform = stream_transform;
+        let mut stream = stream;
         let mut downstream_keepalive = keepalive_interval
             .and_then(super::downstream_keepalive::DownstreamKeepalive::new);
         if let Some(keepalive) = downstream_keepalive.as_mut() {
             keepalive.commit(tokio::time::Instant::now());
         }
-        tokio::pin!(stream);
         loop {
             let next = if let Some(deadline) = downstream_keepalive
                 .as_ref()
@@ -21220,39 +21470,26 @@ async fn forward_claude_kiro_stream(
                 Ok(chunk) => chunk,
                 Err(error) => {
                     let failure_status = kiro_provider::stream_failure_status(&error);
-                    let usage_result = std::mem::take(&mut interrupt_guard.usage)
-                        .finish_with_status();
-                    let usage = usage_result.usage;
-                    update_stream_usage_result(
-                        &state,
-                        &stored,
-                        &request_id,
-                        failure_status.as_u16(),
-                        started.elapsed().as_millis(),
-                        first_token_ms,
-                        usage_result,
-                        Some("upstream_error"),
-                    )
-                    .await;
-                    record_share_invocation_result(
-                        &state,
-                        share_id.as_deref(),
-                        user_email.as_deref(),
-                        usage,
-                    ).await;
-                    record_provider_outcome(
-                        &state,
-                        &stored,
-                        ProviderOutcome::Failure {
-                            status_code: failure_status.as_u16(),
-                        },
-                    ).await;
-                    interrupt_guard.disarm();
-                    if let Some(frame) = stream_terminal_error_frame(
+                    let memory_exhausted = kiro::is_request_memory_stream_error(&error);
+                    let proxy_error = if memory_exhausted {
+                        ProxyError::request_memory_exhausted()
+                    } else {
+                        ProxyError {
+                            status: failure_status,
+                            message: error.to_string(),
+                        }
+                    };
+                    let stream_status = if memory_exhausted {
+                        "memory_capacity"
+                    } else {
+                        "upstream_error"
+                    };
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
                         route,
-                        &error.to_string(),
-                        failure_status.as_u16(),
-                    ) {
+                        &proxy_error,
+                        stream_status,
+                    ).await {
                         yield Ok::<Bytes, std::io::Error>(frame);
                     } else {
                         yield Err::<Bytes, std::io::Error>(error);
@@ -21266,51 +21503,88 @@ async fn forward_claude_kiro_stream(
             {
                 interrupt_guard.usage.mark_estimated();
             }
+            if let Some(memory) = stream_retained_memory.as_ref() {
+                if let Err(error) = memory.resize(
+                    stream_transform
+                        .retained_bytes()
+                        .saturating_add(interrupt_guard.usage.retained_bytes())
+                        .saturating_add(canonical_chunk.len()),
+                ) {
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                        "memory_capacity",
+                    ).await {
+                        yield Ok::<Bytes, std::io::Error>(frame);
+                    }
+                    return;
+                }
+            }
             let chunk = match stream_transform.push(canonical_chunk) {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let message = error.to_string();
-                    let usage_result = std::mem::take(&mut interrupt_guard.usage)
-                        .finish_with_status();
-                    let usage = usage_result.usage;
-                    update_stream_usage_result(
-                        &state,
-                        &stored,
-                        &request_id,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                        started.elapsed().as_millis(),
-                        first_token_ms,
-                        usage_result,
-                        Some("transform_error"),
-                    ).await;
-                    record_share_invocation_result(
-                        &state,
-                        share_id.as_deref(),
-                        user_email.as_deref(),
-                        usage,
-                    ).await;
-                    record_provider_outcome(
-                        &state,
-                        &stored,
-                        ProviderOutcome::Failure { status_code: 502 },
-                    ).await;
-                    interrupt_guard.disarm();
-                    if let Some(frame) = stream_terminal_error_frame(
+                    let stream_status = if error.is_request_memory_exhausted() {
+                        "memory_capacity"
+                    } else {
+                        "transform_error"
+                    };
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
                         route,
-                        &message,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                    ) {
+                        &error,
+                        stream_status,
+                    ).await {
                         yield Ok::<Bytes, std::io::Error>(frame);
                     } else {
-                        yield Err::<Bytes, std::io::Error>(std::io::Error::other(message));
+                        yield Err::<Bytes, std::io::Error>(std::io::Error::other(error.to_string()));
                     }
                     return;
                 }
             };
+            if !chunk.is_empty() {
+                interrupt_guard.usage.push(&chunk);
+            }
+            if let Some(memory) = stream_retained_memory.as_ref() {
+                if let Err(error) = memory.resize(
+                    stream_transform
+                        .retained_bytes()
+                        .saturating_add(interrupt_guard.usage.retained_bytes()),
+                ) {
+                    let error = error.into_proxy_error();
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                        "memory_capacity",
+                    ).await {
+                        yield Ok::<Bytes, std::io::Error>(frame);
+                    }
+                    return;
+                }
+            }
             if chunk.is_empty() {
                 continue;
             }
-            interrupt_guard.usage.push(&chunk);
+            let chunk = match retain_request_bytes(
+                chunk,
+                request_memory.as_ref(),
+                RequestMemoryComponent::NormalizedEvent,
+            ) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                        "memory_capacity",
+                    ).await {
+                        yield Ok::<Bytes, std::io::Error>(frame);
+                    }
+                    return;
+                }
+            };
             if first_token_ms.is_none() && !chunk.is_empty() {
                 let elapsed = started.elapsed().as_millis();
                 first_token_ms = Some(elapsed);
@@ -21329,49 +21603,86 @@ async fn forward_claude_kiro_stream(
             }
             yield Ok::<Bytes, std::io::Error>(chunk);
         }
+        if let Some(memory) = stream_retained_memory.as_ref() {
+            if let Err(error) = memory.resize(
+                stream_transform
+                    .retained_bytes()
+                    .saturating_add(interrupt_guard.usage.retained_bytes())
+                    .saturating_mul(2),
+            ) {
+                let error = error.into_proxy_error();
+                if let Some(frame) = finish_kiro_stream_failure(
+                    &mut interrupt_guard,
+                    route,
+                    &error,
+                    "memory_capacity",
+                ).await {
+                    yield Ok::<Bytes, std::io::Error>(frame);
+                }
+                return;
+            }
+        }
         let tail = match stream_transform.finish() {
             Ok(tail) => tail,
             Err(error) => {
-                let message = error.to_string();
-                let usage_result = std::mem::take(&mut interrupt_guard.usage)
-                    .finish_with_status();
-                let usage = usage_result.usage;
-                update_stream_usage_result(
-                    &state,
-                    &stored,
-                    &request_id,
-                    StatusCode::BAD_GATEWAY.as_u16(),
-                    started.elapsed().as_millis(),
-                    first_token_ms,
-                    usage_result,
-                    Some("transform_error"),
-                ).await;
-                record_share_invocation_result(
-                    &state,
-                    share_id.as_deref(),
-                    user_email.as_deref(),
-                    usage,
-                ).await;
-                record_provider_outcome(
-                    &state,
-                    &stored,
-                    ProviderOutcome::Failure { status_code: 502 },
-                ).await;
-                interrupt_guard.disarm();
-                if let Some(frame) = stream_terminal_error_frame(
+                let stream_status = if error.is_request_memory_exhausted() {
+                    "memory_capacity"
+                } else {
+                    "transform_error"
+                };
+                if let Some(frame) = finish_kiro_stream_failure(
+                    &mut interrupt_guard,
                     route,
-                    &message,
-                    StatusCode::BAD_GATEWAY.as_u16(),
-                ) {
+                    &error,
+                    stream_status,
+                ).await {
                     yield Ok::<Bytes, std::io::Error>(frame);
                 } else {
-                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(message));
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::other(error.to_string()));
                 }
                 return;
             }
         };
         if !tail.is_empty() {
             interrupt_guard.usage.push(&tail);
+        }
+        if let Some(memory) = stream_retained_memory.as_ref() {
+            if let Err(error) = memory.resize(
+                stream_transform
+                    .retained_bytes()
+                    .saturating_add(interrupt_guard.usage.retained_bytes()),
+            ) {
+                let error = error.into_proxy_error();
+                if let Some(frame) = finish_kiro_stream_failure(
+                    &mut interrupt_guard,
+                    route,
+                    &error,
+                    "memory_capacity",
+                ).await {
+                    yield Ok::<Bytes, std::io::Error>(frame);
+                }
+                return;
+            }
+        }
+        if !tail.is_empty() {
+            let tail = match retain_request_bytes(
+                tail,
+                request_memory.as_ref(),
+                RequestMemoryComponent::NormalizedEvent,
+            ) {
+                Ok(tail) => tail,
+                Err(error) => {
+                    if let Some(frame) = finish_kiro_stream_failure(
+                        &mut interrupt_guard,
+                        route,
+                        &error,
+                        "memory_capacity",
+                    ).await {
+                        yield Ok::<Bytes, std::io::Error>(frame);
+                    }
+                    return;
+                }
+            };
             yield Ok::<Bytes, std::io::Error>(tail);
         }
         let usage_result = std::mem::take(&mut interrupt_guard.usage)
@@ -21396,7 +21707,7 @@ async fn forward_claude_kiro_stream(
         ).await;
         record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
         interrupt_guard.disarm();
-    };
+    });
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
     response
@@ -29949,6 +30260,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kiro_and_amazon_q_request_memory_scope_is_provider_exact() {
+        for app in [AppKind::Claude, AppKind::Codex] {
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::KiroOAuth)
+            ));
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::AmazonQOAuth)
+            ));
+        }
+        for provider_type in [
+            ProviderType::Claude,
+            ProviderType::ClaudeAuth,
+            ProviderType::DeepSeekApi,
+            ProviderType::GeminiCli,
+        ] {
+            assert!(!request_memory_enabled_for_provider(
+                AppKind::Claude,
+                Some(provider_type)
+            ));
+        }
+    }
+
+    #[test]
+    fn kiro_memory_exhaustion_is_capacity_shed_not_network_failure() {
+        let error = ProxyError::request_memory_exhausted();
+        assert_eq!(
+            kiro_failure_provider_outcome(&error),
+            ProviderOutcome::CapacityShed { status_code: 503 }
+        );
+    }
+
     #[tokio::test]
     async fn grok_share_and_pinned_provider_fail_before_upstream_network() {
         let body = Bytes::from_static(
@@ -35020,6 +35365,48 @@ mod tests {
         (address, server)
     }
 
+    async fn spawn_counted_kiro_eventstream_upstream(
+        response_chunks: Vec<Bytes>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let response_chunks = std::sync::Arc::new(response_chunks);
+        let app = axum::Router::new().route(
+            "/generateAssistantResponse",
+            axum::routing::post(move || {
+                let requests = std::sync::Arc::clone(&requests_for_route);
+                let response_chunks = std::sync::Arc::clone(&response_chunks);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let chunks = response_chunks.as_ref().clone();
+                    let stream = async_stream::stream! {
+                        for chunk in chunks {
+                            yield Ok::<Bytes, std::convert::Infallible>(chunk);
+                            tokio::task::yield_now().await;
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, requests, server)
+    }
+
     async fn spawn_kiro_partial_frame_upstream(
         frame: Vec<u8>,
     ) -> (
@@ -35817,6 +36204,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kiro_and_amazon_q_request_memory_exhaust_before_any_upstream_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_for_route = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move || {
+            let requests = std::sync::Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}");
+        let body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-8","max_tokens":32,"messages":[{"role":"user","content":"reject before network"}]}"#,
+        );
+
+        let mut kiro_state = forwarder_test_state("kiro-request-memory-pre-network");
+        std::sync::Arc::get_mut(&mut kiro_state)
+            .expect("Kiro test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len().saturating_add(1);
+        let kiro_provider = install_kiro_test_provider_for_app(
+            &kiro_state,
+            AppKind::Claude,
+            "kiro-request-memory-pre-network",
+            endpoint.clone(),
+            format!("{endpoint}/token"),
+        )
+        .await;
+        let mut kiro_headers = HeaderMap::new();
+        kiro_headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_kiro_memory_pre_network"),
+        );
+        let kiro_error = forward_for_test_surface(
+            kiro_state.clone(),
+            ProxyRoute::ClaudeMessages,
+            kiro_provider,
+            None,
+            kiro_headers,
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(kiro_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            kiro_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+        let kiro_logs = kiro_state.usage_snapshot().await;
+        let kiro_logs = kiro_logs
+            .logs
+            .iter()
+            .filter(|log| log.request_id == "req_kiro_memory_pre_network")
+            .collect::<Vec<_>>();
+        assert_eq!(kiro_logs.len(), 1);
+        assert_eq!(
+            kiro_logs[0].status_code,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        assert_eq!(
+            kiro_logs[0].failure_kind.as_deref(),
+            Some("memory_capacity")
+        );
+
+        let mut amazon_q_state = forwarder_test_state("amazon-q-request-memory-pre-network");
+        std::sync::Arc::get_mut(&mut amazon_q_state)
+            .expect("Amazon Q test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len().saturating_add(1);
+        let (amazon_q_provider, _, _) = install_amazon_q_test_bundle(
+            &amazon_q_state,
+            "amazon-q-request-memory-pre-network",
+            endpoint.clone(),
+            format!("{endpoint}/models"),
+            endpoint.clone(),
+        )
+        .await;
+        let mut amazon_q_headers = HeaderMap::new();
+        amazon_q_headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_amazon_q_memory_pre_network"),
+        );
+        let amazon_q_error = forward_for_test_surface(
+            amazon_q_state.clone(),
+            ProxyRoute::ClaudeMessages,
+            amazon_q_provider,
+            None,
+            amazon_q_headers,
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(amazon_q_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            amazon_q_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+        let amazon_q_logs = amazon_q_state.usage_snapshot().await;
+        let amazon_q_logs = amazon_q_logs
+            .logs
+            .iter()
+            .filter(|log| log.request_id == "req_amazon_q_memory_pre_network")
+            .collect::<Vec<_>>();
+        assert_eq!(amazon_q_logs.len(), 1);
+        assert_eq!(
+            amazon_q_logs[0].status_code,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        assert_eq!(
+            amazon_q_logs[0].failure_kind.as_deref(),
+            Some("memory_capacity")
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Kiro and Amazon Q memory rejection must precede catalog, token, and inference I/O"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_non_stream_response_memory_exhaustion_is_stable_and_not_retried() {
+        let response_body = [
+            kiro::fixture_event_frame(
+                "assistantResponseEvent",
+                &json!({"content": "x".repeat(128 * 1024)}),
+            ),
+            kiro::fixture_event_frame("endEvent", &json!({})),
+        ]
+        .concat();
+        let (address, requests, server) =
+            spawn_counted_kiro_eventstream_upstream(vec![Bytes::from(response_body)]).await;
+        let mut state = forwarder_test_state("kiro-non-stream-response-memory");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("Kiro test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 64 * 1024;
+        let provider = install_kiro_test_provider_for_app(
+            &state,
+            AppKind::Claude,
+            "kiro-non-stream-response-memory",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_kiro_non_stream_response_memory"),
+        );
+
+        let error = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider,
+            None,
+            headers,
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-8","max_tokens":32,"messages":[{"role":"user","content":"bounded response"}],"stream":false}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let usage = state.usage_snapshot().await;
+        let logs = usage
+            .logs
+            .iter()
+            .filter(|log| log.request_id == "req_kiro_non_stream_response_memory")
+            .collect::<Vec<_>>();
+        assert_eq!(logs.len(), 1, "memory exhaustion must create one usage row");
+        assert_eq!(
+            logs[0].status_code,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        assert_eq!(logs[0].stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(logs[0].failure_kind.as_deref(), Some("memory_capacity"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_tool_state_memory_exhaustion_emits_one_stable_terminal() {
+        let mut response_chunks = Vec::new();
+        for _ in 0..256 {
+            response_chunks.push(Bytes::from(kiro::fixture_event_frame(
+                "toolUseEvent",
+                &json!({
+                    "toolUseId": "toolu_memory",
+                    "name": "memory_tool",
+                    "input": "x".repeat(1024),
+                    "stop": false
+                }),
+            )));
+        }
+        response_chunks.push(Bytes::from(kiro::fixture_event_frame(
+            "endEvent",
+            &json!({}),
+        )));
+        let (address, requests, server) =
+            spawn_counted_kiro_eventstream_upstream(response_chunks).await;
+        let mut state = forwarder_test_state("kiro-stream-tool-memory");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("Kiro test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 96 * 1024;
+        let provider = install_kiro_test_provider_for_app(
+            &state,
+            AppKind::Claude,
+            "kiro-stream-tool-memory",
+            format!("http://{address}"),
+            "http://127.0.0.1:9/token".to_string(),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_kiro_stream_tool_memory"),
+        );
+        let request_body = Bytes::from(
+            json!({
+                "model": "claude-sonnet-4-8",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"use bounded tool state"}],
+                "tools": [{
+                    "name": "memory_tool",
+                    "description": "memory fixture",
+                    "input_schema": {"type":"object"}
+                }],
+                "stream": true
+            })
+            .to_string(),
+        );
+
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider,
+            None,
+            headers,
+            request_body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let downstream = String::from_utf8(collect_response_body(response).await).unwrap();
+        assert!(
+            downstream.contains("\"code\":\"cc_switch_request_memory_exhausted\""),
+            "{downstream}"
+        );
+        assert!(downstream.contains("\"status\":503"), "{downstream}");
+        assert_eq!(
+            downstream
+                .matches("cc_switch_request_memory_exhausted")
+                .count(),
+            1,
+            "the committed stream must receive one terminal memory error"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let usage = state.usage_snapshot().await;
+        let logs = usage
+            .logs
+            .iter()
+            .filter(|log| log.request_id == "req_kiro_stream_tool_memory")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logs.len(),
+            1,
+            "stream failure must update its pending usage row"
+        );
+        assert_eq!(
+            logs[0].status_code,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        assert_eq!(logs[0].stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(logs[0].failure_kind.as_deref(), Some("memory_capacity"));
+        assert_eq!(
+            logs[0].error_message.as_deref(),
+            Some("Request resident-memory capacity exhausted; retry later")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn kiro_and_amazon_q_compact_fail_before_any_upstream_request() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -36357,6 +37037,9 @@ mod tests {
             idle_timeout: None,
             context_window: 200_000,
             keepalive_interval: None,
+            request_memory: None,
+            prepared_memory: None,
+            canonical_memory: None,
         })
         .await
         .unwrap();

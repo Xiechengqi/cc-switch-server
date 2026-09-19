@@ -9,6 +9,10 @@ mod wire;
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::amazon_q::AMAZON_Q_RUNTIME_REGIONS;
 use crate::domain::providers::model::ProviderType;
+use crate::proxy::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
+    RequestMemoryReservation,
+};
 use crate::proxy::{ProxyError, ProxyRoute};
 use base64::Engine;
 use bytes::Bytes;
@@ -172,6 +176,58 @@ impl KiroToolNameRegistry {
             _ => Ok(upstream_name.to_string()),
         }
     }
+
+    fn retained_bytes(&self) -> usize {
+        fn map_bytes(map: &HashMap<String, String>) -> usize {
+            map.capacity()
+                .saturating_mul(
+                    std::mem::size_of::<(String, String)>()
+                        .saturating_add(std::mem::size_of::<usize>() * 2),
+                )
+                .saturating_add(
+                    map.iter()
+                        .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                        .sum::<usize>(),
+                )
+        }
+
+        map_bytes(&self.upstream_to_original)
+            .saturating_add(
+                self.original_names
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<String>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(
+                        self.original_names
+                            .iter()
+                            .map(String::capacity)
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(
+                self.namespaced_children
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<(String, Vec<String>)>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(self.namespaced_children.iter().fold(
+                        0_usize,
+                        |bytes, (child, names)| {
+                            bytes
+                                .saturating_add(child.capacity())
+                                .saturating_add(
+                                    names
+                                        .capacity()
+                                        .saturating_mul(std::mem::size_of::<String>()),
+                                )
+                                .saturating_add(names.iter().map(String::capacity).sum::<usize>())
+                        },
+                    )),
+            )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +241,43 @@ pub(crate) struct KiroPreparedRequest {
     pub cache_namespace: String,
     pub upstream_model_id: String,
     pub context_window: u64,
+}
+
+impl KiroPreparedRequest {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.url
+            .capacity()
+            .saturating_add(self.host.capacity())
+            .saturating_add(
+                self.headers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(&'static str, String)>())
+                    .saturating_add(
+                        self.headers
+                            .iter()
+                            .map(|(_, value)| value.capacity())
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(retained_json_bytes(&self.body))
+            .saturating_add(
+                self.tool_name_map
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<(String, String)>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(
+                        self.tool_name_map
+                            .iter()
+                            .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(self.tool_name_registry.retained_bytes())
+            .saturating_add(self.cache_namespace.capacity())
+            .saturating_add(self.upstream_model_id.capacity())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +496,15 @@ pub(crate) fn prepare_kiro_request_with_context(
     body: &Value,
     context: &KiroCallContext,
 ) -> Result<KiroPreparedRequest, ProxyError> {
+    prepare_kiro_request_with_context_and_memory(account, body, context, None)
+}
+
+pub(crate) fn prepare_kiro_request_with_context_and_memory(
+    account: &Account,
+    body: &Value,
+    context: &KiroCallContext,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<KiroPreparedRequest, ProxyError> {
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
     let mut body = body.clone();
@@ -412,7 +514,7 @@ pub(crate) fn prepare_kiro_request_with_context(
         }
         body["metadata"]["session_id"] = json!(session_id);
     }
-    image::prepare_anthropic_images(&mut body)?;
+    image::prepare_anthropic_images_with_memory(&mut body, request_memory)?;
     let tool_mode = if context.claude_code_tools {
         ToolCompatibilityMode::ClaudeCode
     } else {
@@ -1502,6 +1604,21 @@ impl ToolLeakFilter {
         }
         out
     }
+
+    fn retained_bytes(&self) -> usize {
+        self.carry
+            .capacity()
+            .saturating_add(
+                self.leaked_tools
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<LeakedToolUse>()),
+            )
+            .saturating_add(self.leaked_tools.iter().fold(0_usize, |bytes, leaked| {
+                bytes
+                    .saturating_add(leaked.name.capacity())
+                    .saturating_add(retained_json_bytes(&leaked.input))
+            }))
+    }
 }
 
 fn parse_leaked_invoke(value: &str) -> Option<LeakedToolUse> {
@@ -2002,6 +2119,64 @@ impl SseBuilder {
         self.usage.set_prompt_cache_usage(usage);
     }
 
+    fn retained_bytes(&self) -> usize {
+        fn string_map_bytes<T>(map: &HashMap<String, T>) -> usize {
+            map.capacity()
+                .saturating_mul(
+                    std::mem::size_of::<(String, T)>()
+                        .saturating_add(std::mem::size_of::<usize>() * 2),
+                )
+                .saturating_add(map.keys().map(String::capacity).sum::<usize>())
+        }
+
+        self.message_id
+            .capacity()
+            .saturating_add(self.model.capacity())
+            .saturating_add(self.tool_name_registry.retained_bytes())
+            .saturating_add(
+                self.pending_thinking_signature
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(string_map_bytes(&self.tool_indices))
+            .saturating_add(
+                string_map_bytes(&self.tool_names).saturating_add(
+                    self.tool_names
+                        .values()
+                        .map(String::capacity)
+                        .sum::<usize>(),
+                ),
+            )
+            .saturating_add(self.tool_json.retained_bytes())
+            .saturating_add(
+                self.tool_errors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<KiroToolJsonError>())
+                    .saturating_add(
+                        self.tool_errors
+                            .iter()
+                            .map(KiroToolJsonError::retained_bytes)
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(
+                self.seen_tool_signatures
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<String>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(
+                        self.seen_tool_signatures
+                            .iter()
+                            .map(String::capacity)
+                            .sum::<usize>(),
+                    ),
+            )
+            .saturating_add(self.tool_leak_filter.retained_bytes())
+            .saturating_add(self.usage.retained_bytes())
+    }
+
     fn stop_thinking_block(&mut self) -> Vec<Bytes> {
         if self.thinking_index.is_none() || self.thinking_stopped {
             return Vec::new();
@@ -2069,6 +2244,26 @@ impl KiroToolJsonError {
             Self::Incomplete { .. } => "TOOL_JSON_INCOMPLETE",
             Self::Limit { .. } => "TOOL_JSON_LIMIT",
             Self::Wire { code, .. } => code,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Invalid {
+                tool_use_id,
+                name,
+                message,
+            } => tool_use_id
+                .capacity()
+                .saturating_add(name.capacity())
+                .saturating_add(message.capacity()),
+            Self::Incomplete {
+                tool_use_id, name, ..
+            }
+            | Self::Limit {
+                tool_use_id, name, ..
+            } => tool_use_id.capacity().saturating_add(name.capacity()),
+            Self::Wire { message, .. } => message.capacity(),
         }
     }
 }
@@ -2230,6 +2425,33 @@ impl ToolJsonAccumulator {
             bytes,
         })
     }
+
+    fn retained_bytes(&self) -> usize {
+        self.pending
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<(String, (String, String))>()
+                    .saturating_add(std::mem::size_of::<usize>() * 2),
+            )
+            .saturating_add(self.pending.iter().fold(
+                0_usize,
+                |bytes, (tool_use_id, (name, input))| {
+                    bytes
+                        .saturating_add(tool_use_id.capacity())
+                        .saturating_add(name.capacity())
+                        .saturating_add(input.capacity())
+                },
+            ))
+            .saturating_add(
+                self.rejected
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<String>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(self.rejected.iter().map(String::capacity).sum::<usize>()),
+            )
+    }
 }
 
 fn split_inline_thinking(text: &str, in_thinking: &mut bool) -> Vec<InlineThinkingSegment> {
@@ -2273,6 +2495,151 @@ fn split_inline_thinking(text: &str, in_thinking: &mut bool) -> Vec<InlineThinki
         }
     }
     segments
+}
+
+const REQUEST_MEMORY_STREAM_ERROR_PREFIX: &str = "[CC_REQUEST_MEMORY_EXHAUSTED] ";
+
+fn request_memory_stream_error(error: RequestMemoryError) -> std::io::Error {
+    let error = error.into_proxy_error();
+    std::io::Error::other(format!(
+        "{REQUEST_MEMORY_STREAM_ERROR_PREFIX}{}",
+        error.client_message()
+    ))
+}
+
+pub(crate) fn is_request_memory_stream_error(error: &std::io::Error) -> bool {
+    error
+        .to_string()
+        .starts_with(REQUEST_MEMORY_STREAM_ERROR_PREFIX)
+}
+
+struct KiroStreamMemory {
+    budget: RequestMemoryBudget,
+    transport: RequestMemoryReservation,
+    retained: RequestMemoryReservation,
+    semantic: RequestMemoryReservation,
+}
+
+impl KiroStreamMemory {
+    fn new(
+        budget: RequestMemoryBudget,
+        decoder: &wire::EventStreamDecoder,
+        builder: &SseBuilder,
+    ) -> Result<Self, std::io::Error> {
+        let transport = budget
+            .reserve(
+                RequestMemoryComponent::TransportPending,
+                decoder.retained_bytes(),
+            )
+            .map_err(request_memory_stream_error)?;
+        let retained = budget
+            .reserve(
+                RequestMemoryComponent::StreamRetainedState,
+                builder.retained_bytes(),
+            )
+            .map_err(request_memory_stream_error)?;
+        let semantic = budget
+            .reserve(RequestMemoryComponent::SemanticPrelude, 0)
+            .map_err(request_memory_stream_error)?;
+        Ok(Self {
+            budget,
+            transport,
+            retained,
+            semantic,
+        })
+    }
+
+    fn preflight_feed(
+        &self,
+        decoder: &wire::EventStreamDecoder,
+        incoming_bytes: usize,
+    ) -> Result<(), std::io::Error> {
+        self.transport
+            .resize(
+                decoder
+                    .retained_bytes()
+                    .saturating_add(incoming_bytes.saturating_mul(3)),
+            )
+            .map_err(request_memory_stream_error)
+    }
+
+    fn preflight_finish(&self, decoder: &wire::EventStreamDecoder) -> Result<(), std::io::Error> {
+        self.transport
+            .resize(decoder.retained_bytes().saturating_mul(2))
+            .map_err(request_memory_stream_error)
+    }
+
+    fn after_decode(
+        &self,
+        decoder: &wire::EventStreamDecoder,
+        incoming_bytes: usize,
+        frames: &[wire::Frame],
+    ) -> Result<(), std::io::Error> {
+        let frames = frames.iter().fold(0_usize, |bytes, frame| {
+            bytes.saturating_add(frame.retained_bytes())
+        });
+        self.transport
+            .resize(
+                decoder
+                    .retained_bytes()
+                    .saturating_add(incoming_bytes)
+                    .saturating_add(frames),
+            )
+            .map_err(request_memory_stream_error)
+    }
+
+    fn preflight_event(&self, frame: &wire::Frame) -> Result<(), std::io::Error> {
+        self.semantic
+            .resize(frame.retained_bytes().saturating_mul(4))
+            .map_err(request_memory_stream_error)
+    }
+
+    fn after_event(&self, builder: &SseBuilder) -> Result<(), std::io::Error> {
+        self.retained
+            .resize(builder.retained_bytes())
+            .map_err(request_memory_stream_error)?;
+        self.semantic.resize(0).map_err(request_memory_stream_error)
+    }
+
+    fn preflight_builder_finish(&self, builder: &SseBuilder) -> Result<(), std::io::Error> {
+        self.semantic
+            .resize(builder.retained_bytes().saturating_mul(2))
+            .map_err(request_memory_stream_error)
+    }
+
+    fn release_decoded_frames(
+        &self,
+        decoder: &wire::EventStreamDecoder,
+    ) -> Result<(), std::io::Error> {
+        self.transport
+            .resize(decoder.retained_bytes())
+            .map_err(request_memory_stream_error)
+    }
+
+    fn retain_output(&self, bytes: Bytes) -> Result<Bytes, std::io::Error> {
+        self.budget
+            .retain_bytes(RequestMemoryComponent::NormalizedEvent, bytes)
+            .map_err(request_memory_stream_error)
+    }
+}
+
+fn compute_kiro_prompt_cache_usage_with_memory(
+    body: &Value,
+    cache_namespace: &str,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<KiroPromptCacheUsage, std::io::Error> {
+    let working_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::SemanticPrelude,
+                retained_json_bytes(body).saturating_mul(2),
+            )
+        })
+        .transpose()
+        .map_err(request_memory_stream_error)?;
+    let usage = compute_kiro_prompt_cache_usage(body, cache_namespace);
+    drop(working_memory);
+    Ok(usage)
 }
 
 pub(crate) fn kiro_event_stream_to_claude_sse(
@@ -2336,7 +2703,36 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_w
     idle_timeout: Option<Duration>,
     context_window: u64,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
+    kiro_event_stream_to_claude_sse_with_request_memory(
+        stream,
+        model,
+        tool_name_registry,
+        request_body,
+        cache_namespace,
+        first_frame_deadline,
+        idle_timeout,
+        context_window,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kiro_event_stream_to_claude_sse_with_request_memory(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    model: String,
+    tool_name_registry: KiroToolNameRegistry,
+    request_body: &Value,
+    cache_namespace: &str,
+    first_frame_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Option<Duration>,
+    context_window: u64,
+    request_memory: Option<RequestMemoryBudget>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let prompt_cache_usage = compute_kiro_prompt_cache_usage_with_memory(
+        request_body,
+        cache_namespace,
+        request_memory.as_ref(),
+    );
     kiro_event_stream_to_anthropic_sse(
         stream,
         model,
@@ -2345,23 +2741,35 @@ pub(crate) fn kiro_event_stream_to_claude_sse_scoped_with_timeouts_and_context_w
         first_frame_deadline,
         idle_timeout,
         context_window,
+        request_memory,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn kiro_event_stream_to_anthropic_sse(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     model: String,
     tool_name_registry: KiroToolNameRegistry,
-    prompt_cache_usage: KiroPromptCacheUsage,
+    prompt_cache_usage: Result<KiroPromptCacheUsage, std::io::Error>,
     first_frame_deadline: Option<tokio::time::Instant>,
     idle_timeout: Option<Duration>,
     context_window: u64,
+    request_memory: Option<RequestMemoryBudget>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
+        let prompt_cache_usage = prompt_cache_usage?;
         let mut decoder = wire::EventStreamDecoder::strict();
         let mut builder = SseBuilder::new_with_registry(model, tool_name_registry, context_window);
         builder.set_prompt_cache_usage(prompt_cache_usage);
-        yield Ok(builder.initial());
+        let stream_memory = request_memory
+            .map(|budget| KiroStreamMemory::new(budget, &decoder, &builder))
+            .transpose()?;
+        let initial = builder.initial();
+        let initial = match stream_memory.as_ref() {
+            Some(memory) => memory.retain_output(initial)?,
+            None => initial,
+        };
+        yield Ok(initial);
         tokio::pin!(stream);
         let mut read_deadline = first_frame_deadline;
         let mut saw_complete_frame = false;
@@ -2382,14 +2790,23 @@ fn kiro_event_stream_to_anthropic_sse(
                 break;
             };
             let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
+            if let Some(memory) = stream_memory.as_ref() {
+                memory.preflight_feed(&decoder, chunk.len())?;
+            }
             let frames = decoder
                 .feed(&chunk)
                 .map_err(|error| kiro_stream_io_error(error.into()))?;
+            if let Some(memory) = stream_memory.as_ref() {
+                memory.after_decode(&decoder, chunk.len(), &frames)?;
+            }
             if !frames.is_empty() {
                 saw_complete_frame = true;
                 read_deadline = idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
             }
             for frame in frames {
+                if let Some(memory) = stream_memory.as_ref() {
+                    memory.preflight_event(&frame)?;
+                }
                 if saw_end {
                     Err(kiro_stream_io_error(kiro_wire_contract_error(
                         "Kiro EventStream contained a frame after endEvent",
@@ -2397,27 +2814,53 @@ fn kiro_event_stream_to_anthropic_sse(
                 }
                 let event = wire::parse_event(frame)
                     .map_err(|error| kiro_stream_io_error(error.into()))?;
-                if matches!(&event, wire::Event::End) {
+                let output = if matches!(&event, wire::Event::End) {
                     saw_end = true;
+                    Vec::new()
                 } else {
-                    for bytes in process_event_to_sse(&mut builder, event)
-                        .map_err(kiro_stream_io_error)?
-                    {
-                        yield Ok(bytes);
-                    }
+                    process_event_to_sse(&mut builder, event).map_err(kiro_stream_io_error)?
+                };
+                if let Some(memory) = stream_memory.as_ref() {
+                    memory.after_event(&builder)?;
+                }
+                for bytes in output {
+                    let bytes = match stream_memory.as_ref() {
+                        Some(memory) => memory.retain_output(bytes)?,
+                        None => bytes,
+                    };
+                    yield Ok(bytes);
                 }
             }
+            if let Some(memory) = stream_memory.as_ref() {
+                memory.release_decoded_frames(&decoder)?;
+            }
             if saw_end {
-                decoder
+                if let Some(memory) = stream_memory.as_ref() {
+                    memory.preflight_finish(&decoder)?;
+                }
+                let trailing = decoder
                     .finish()
                     .map_err(|error| kiro_stream_io_error(error.into()))?;
+                if let Some(memory) = stream_memory.as_ref() {
+                    memory.after_decode(&decoder, 0, &trailing)?;
+                    memory.release_decoded_frames(&decoder)?;
+                }
                 break;
             }
         }
-        for frame in decoder
+        if let Some(memory) = stream_memory.as_ref() {
+            memory.preflight_finish(&decoder)?;
+        }
+        let trailing_frames = decoder
             .finish()
-            .map_err(|error| kiro_stream_io_error(error.into()))?
-        {
+            .map_err(|error| kiro_stream_io_error(error.into()))?;
+        if let Some(memory) = stream_memory.as_ref() {
+            memory.after_decode(&decoder, 0, &trailing_frames)?;
+        }
+        for frame in trailing_frames {
+            if let Some(memory) = stream_memory.as_ref() {
+                memory.preflight_event(&frame)?;
+            }
             if saw_end {
                 Err(kiro_stream_io_error(kiro_wire_contract_error(
                     "Kiro EventStream contained a frame after endEvent",
@@ -2425,25 +2868,45 @@ fn kiro_event_stream_to_anthropic_sse(
             }
             let event = wire::parse_event(frame)
                 .map_err(|error| kiro_stream_io_error(error.into()))?;
-            if matches!(&event, wire::Event::End) {
+            let output = if matches!(&event, wire::Event::End) {
                 saw_end = true;
+                Vec::new()
             } else {
-                for bytes in process_event_to_sse(&mut builder, event)
-                    .map_err(kiro_stream_io_error)?
-                {
-                    yield Ok(bytes);
-                }
+                process_event_to_sse(&mut builder, event).map_err(kiro_stream_io_error)?
+            };
+            if let Some(memory) = stream_memory.as_ref() {
+                memory.after_event(&builder)?;
             }
+            for bytes in output {
+                let bytes = match stream_memory.as_ref() {
+                    Some(memory) => memory.retain_output(bytes)?,
+                    None => bytes,
+                };
+                yield Ok(bytes);
+            }
+        }
+        if let Some(memory) = stream_memory.as_ref() {
+            memory.release_decoded_frames(&decoder)?;
         }
         if !saw_end {
             Err(kiro_stream_io_error(kiro_wire_contract_error(
                 "Kiro EventStream ended before endEvent",
             )))?;
         }
-        for bytes in builder
+        if let Some(memory) = stream_memory.as_ref() {
+            memory.preflight_builder_finish(&builder)?;
+        }
+        let final_events = builder
             .finish_events()
-            .map_err(kiro_stream_io_error)?
-        {
+            .map_err(kiro_stream_io_error)?;
+        if let Some(memory) = stream_memory.as_ref() {
+            memory.after_event(&builder)?;
+        }
+        for bytes in final_events {
+            let bytes = match stream_memory.as_ref() {
+                Some(memory) => memory.retain_output(bytes)?,
+                None => bytes,
+            };
             yield Ok(bytes);
         }
     }
@@ -2816,6 +3279,13 @@ impl KiroUsageAccumulator {
     }
     fn set_prompt_cache_usage(&mut self, usage: KiroPromptCacheUsage) {
         self.prompt_cache_usage = usage;
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.credit_unit
+            .as_ref()
+            .map_or(0, String::capacity)
+            .saturating_add(self.credit_unit_plural.as_ref().map_or(0, String::capacity))
     }
 
     fn apply_event(&mut self, event_type: &str, payload: &Value) {

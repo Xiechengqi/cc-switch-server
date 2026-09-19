@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+use crate::proxy::request_memory::{RequestMemoryBudget, RequestMemoryComponent};
 use crate::proxy::ProxyError;
 
 const MAX_IMAGES: usize = 20;
@@ -23,7 +24,15 @@ struct PreparedImage {
     decoded_bytes: usize,
 }
 
+#[cfg(test)]
 pub(super) fn prepare_anthropic_images(body: &mut Value) -> Result<(), ProxyError> {
+    prepare_anthropic_images_with_memory(body, None)
+}
+
+pub(super) fn prepare_anthropic_images_with_memory(
+    body: &mut Value,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<(), ProxyError> {
     let mut hashes = Vec::new();
     visit_image_blocks(body, &mut |block| {
         let data = image_data(block).ok_or_else(|| {
@@ -59,7 +68,7 @@ pub(super) fn prepare_anthropic_images(body: &mut Value) -> Result<(), ProxyErro
             });
             return Ok(());
         }
-        let prepared = prepare_image(&data)?;
+        let prepared = prepare_image(&data, request_memory)?;
         total_bytes = total_bytes.saturating_add(prepared.decoded_bytes);
         if total_bytes > MAX_TOTAL_OUTPUT_BYTES {
             return Err(ProxyError::bad_request(format!(
@@ -79,13 +88,34 @@ pub(super) fn prepare_anthropic_images(body: &mut Value) -> Result<(), ProxyErro
     })
 }
 
-fn prepare_image(data: &str) -> Result<PreparedImage, ProxyError> {
+fn prepare_image(
+    data: &str,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<PreparedImage, ProxyError> {
     if data.len() > MAX_ENCODED_INPUT_BYTES.saturating_mul(4) / 3 + 8 {
         return Err(ProxyError::bad_request(format!(
             "Kiro image exceeds {} MiB encoded input limit",
             MAX_ENCODED_INPUT_BYTES / (1024 * 1024)
         )));
     }
+    let decoded_upper_bound = data
+        .len()
+        .saturating_add(3)
+        .checked_div(4)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(3);
+    let initial_output_bound = base64_encoded_len(decoded_upper_bound);
+    let working_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::DecodedBody,
+                data.len()
+                    .saturating_add(decoded_upper_bound)
+                    .saturating_add(initial_output_bound),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let decoded = BASE64
         .decode(data.as_bytes())
         .map_err(|_| ProxyError::bad_request("Anthropic image source is not valid base64"))?;
@@ -111,6 +141,16 @@ fn prepare_image(data: &str) -> Result<PreparedImage, ProxyError> {
     if format == "image/gif"
         || (decoded.len() <= RESIZE_THRESHOLD_BYTES && long_side <= MAX_LONG_SIDE)
     {
+        let output_len = base64_encoded_len(decoded.len());
+        if let Some(memory) = working_memory.as_ref() {
+            memory
+                .resize(
+                    data.len()
+                        .saturating_add(decoded.len())
+                        .saturating_add(output_len),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         return Ok(PreparedImage {
             media_type: format,
             data: BASE64.encode(&decoded),
@@ -118,6 +158,24 @@ fn prepare_image(data: &str) -> Result<PreparedImage, ProxyError> {
         });
     }
 
+    let source_pixels = dimensions.width.saturating_mul(dimensions.height);
+    let (resized_width, resized_height) =
+        scaled_dimensions(dimensions.width, dimensions.height, MAX_LONG_SIDE as usize);
+    let resized_pixels = resized_width.saturating_mul(resized_height);
+    let encoded_upper_bound = resized_pixels.saturating_mul(3);
+    let image_working_bytes = data
+        .len()
+        .saturating_add(decoded.len())
+        .saturating_add(source_pixels.saturating_mul(4))
+        .saturating_add(resized_pixels.saturating_mul(4))
+        .saturating_add(resized_pixels.saturating_mul(3))
+        .saturating_add(encoded_upper_bound)
+        .saturating_add(base64_encoded_len(encoded_upper_bound));
+    if let Some(memory) = working_memory.as_ref() {
+        memory
+            .resize(image_working_bytes)
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let image = image::load_from_memory(&decoded)
         .map_err(|_| ProxyError::bad_request("Anthropic image could not be decoded"))?;
     let resized = if image.width().max(image.height()) > MAX_LONG_SIDE {
@@ -140,6 +198,30 @@ fn prepare_image(data: &str) -> Result<PreparedImage, ProxyError> {
         data: BASE64.encode(&encoded),
         decoded_bytes: encoded.len(),
     })
+}
+
+fn base64_encoded_len(bytes: usize) -> usize {
+    bytes
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4)
+}
+
+fn scaled_dimensions(width: usize, height: usize, max_long_side: usize) -> (usize, usize) {
+    let long_side = width.max(height);
+    if long_side <= max_long_side || long_side == 0 {
+        return (width, height);
+    }
+    let scaled_width = width
+        .saturating_mul(max_long_side)
+        .saturating_add(long_side - 1)
+        / long_side;
+    let scaled_height = height
+        .saturating_mul(max_long_side)
+        .saturating_add(long_side - 1)
+        / long_side;
+    (scaled_width.max(1), scaled_height.max(1))
 }
 
 fn magic_format(bytes: &[u8]) -> Option<&'static str> {
@@ -252,6 +334,29 @@ mod tests {
             "messages": [{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"not base64"}}]}]
         });
         assert!(prepare_anthropic_images(&mut body).is_err());
+    }
+
+    #[test]
+    fn image_decode_working_set_obeys_request_memory_budget() {
+        let mut body = json!({
+            "messages": [{
+                "role":"user",
+                "content":[{
+                    "type":"image",
+                    "source":{
+                        "type":"base64",
+                        "media_type":"image/png",
+                        "data":PNG_1X1
+                    }
+                }]
+            }]
+        });
+        let budget = RequestMemoryBudget::new(PNG_1X1.len().saturating_add(1));
+
+        let error = prepare_anthropic_images_with_memory(&mut body, Some(&budget)).unwrap_err();
+
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert!(budget.is_exhausted());
     }
 
     #[test]
