@@ -116,7 +116,7 @@ use super::request_governance::{
     response_decoding_required, ResponseDecodeResult,
 };
 use super::request_memory::{
-    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
 };
 use super::response_semantics::{
     self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
@@ -1993,7 +1993,9 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
                 || antigravity::is_provider(provider_type)
                 || matches!(
                     provider_type,
-                    ProviderType::CursorOAuth | ProviderType::CursorApiKey
+                    ProviderType::CursorOAuth
+                        | ProviderType::CursorApiKey
+                        | ProviderType::GrokOAuth
                 )
         })
 }
@@ -2641,6 +2643,7 @@ async fn forward_with_attempt(
             &url,
             attempt_context.grok_reasoning_recovery_attempted,
             &mut adapter_request.body,
+            attempt_context.request_memory(),
         )
         .await?;
 
@@ -3654,6 +3657,24 @@ async fn forward_with_attempt(
             } else {
                 None
             };
+            let grok_stream_memory = if stored.provider_type == ProviderType::GrokOAuth {
+                stream_request_memory
+                    .as_ref()
+                    .map(|budget| {
+                        budget
+                            .reserve(
+                                RequestMemoryComponent::StreamRetainedState,
+                                grok_prime_retained_bytes(
+                                    &terminal_detector,
+                                    grok_responses_sse.as_deref(),
+                                ),
+                            )
+                            .map_err(|error| error.into_proxy_error())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let semantic_prelude_memory = stream_request_memory
                 .as_ref()
                 .map(|budget| {
@@ -3812,6 +3833,12 @@ async fn forward_with_attempt(
                                     .map_err(|error| error.into_proxy_error())?;
                             }
                             if semantic_protocol_error.is_none() {
+                                resize_grok_prime_memory(
+                                    grok_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    grok_responses_sse.as_deref(),
+                                    downstream_chunk.len(),
+                                )?;
                                 resize_claude_prime_memory(
                                     claude_stream_memory.as_ref(),
                                     &terminal_detector,
@@ -3820,6 +3847,12 @@ async fn forward_with_attempt(
                                     downstream_chunk.len(),
                                 )?;
                                 let terminal_result = terminal_detector.push(&downstream_chunk);
+                                resize_grok_prime_memory(
+                                    grok_stream_memory.as_ref(),
+                                    &terminal_detector,
+                                    grok_responses_sse.as_deref(),
+                                    0,
+                                )?;
                                 resize_claude_prime_memory(
                                     claude_stream_memory.as_ref(),
                                     &terminal_detector,
@@ -3967,6 +4000,12 @@ async fn forward_with_attempt(
                                                     )?;
                                                 }
                                                 if semantic_protocol_error.is_none() {
+                                                    resize_grok_prime_memory(
+                                                        grok_stream_memory.as_ref(),
+                                                        &terminal_detector,
+                                                        grok_responses_sse.as_deref(),
+                                                        batch.normalized.len(),
+                                                    )?;
                                                     if let Err(error) =
                                                         terminal_detector.push(&batch.normalized)
                                                     {
@@ -3975,6 +4014,12 @@ async fn forward_with_attempt(
                                                                 terminal_detector.max_event_bytes(),
                                                             ));
                                                     }
+                                                    resize_grok_prime_memory(
+                                                        grok_stream_memory.as_ref(),
+                                                        &terminal_detector,
+                                                        grok_responses_sse.as_deref(),
+                                                        0,
+                                                    )?;
                                                 }
                                             }
                                             let observations = batch.observations;
@@ -4335,10 +4380,20 @@ async fn forward_with_attempt(
                     .resize(retained)
                     .map_err(|error| error.into_proxy_error())?;
             }
+            if let Some(reservation) = grok_stream_memory.as_ref() {
+                let retained =
+                    grok_prime_retained_bytes(&terminal_detector, grok_responses_sse.as_deref())
+                        .saturating_add(usage.retained_bytes())
+                        .saturating_add(claude_tool_name_stream_patcher.retained_bytes())
+                        .saturating_add(stream_transform.retained_bytes());
+                reservation
+                    .resize(retained)
+                    .map_err(|error| error.into_proxy_error())?;
+            }
             if pending_chunk_committed_output {
                 attempt_context.mark_downstream_committed();
             }
-            let stream_state = StreamForwardState {
+            let stream_state = Box::new(StreamForwardState {
                 inner,
                 stored: stream_stored,
                 state: state.clone(),
@@ -4372,7 +4427,8 @@ async fn forward_with_attempt(
                 grok_search_evidence_recorded: false,
                 grok_reasoning_replay: grok_reasoning_replay
                     .clone()
-                    .map(grok_provider::ReplayStreamWrite::new),
+                    .map(grok_provider::ReplayStreamWrite::new)
+                    .transpose()?,
                 antigravity_reasoning_replay: antigravity_reasoning_replay
                     .clone()
                     .map(|context| {
@@ -4435,8 +4491,10 @@ async fn forward_with_attempt(
                 downstream_pending_memory,
                 antigravity_transform_memory,
                 claude_stream_memory,
-            };
-            let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
+                grok_stream_memory,
+                pending_grok_stream_error: None,
+            });
+            let stream_step = |mut stream_state: Box<StreamForwardState>| async move {
                 stream_state.downstream_pending_memory.take();
                 if stream_state.terminal_frame_sent {
                     return Ok(None);
@@ -4574,128 +4632,44 @@ async fn forward_with_attempt(
 
                 match next_chunk {
                     Ok(Some(upstream_chunk)) => {
-                        let _transport_pending_memory = match stream_state.reserve_request_memory(
-                            RequestMemoryComponent::TransportPending,
-                            upstream_chunk.len(),
-                        ) {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let mut chunk = upstream_chunk;
-                        let normalized_event_memory = match stream_state.reserve_request_memory(
-                            RequestMemoryComponent::NormalizedEvent,
-                            chunk.len(),
-                        ) {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let mut normalized_semantics = None;
-                        if !chunk_already_inspected && stream_state.normalize_responses_transport {
-                            let batch = match stream_state
-                                .responses_semantics
-                                .as_mut()
-                                .expect("Responses normalization requires semantic state")
-                                .push_normalized(&chunk)
-                            {
-                                Ok(batch) => batch,
+                        Box::pin(async move {
+                            let _transport_pending_memory = match stream_state
+                                .reserve_request_memory(
+                                    RequestMemoryComponent::TransportPending,
+                                    upstream_chunk.len(),
+                                ) {
+                                Ok(reservation) => reservation,
                                 Err(error) => {
-                                    crate::metrics::record_proxy_semantic_guard(
-                                        "http_stream",
-                                        "protocol_error",
-                                    );
-                                    crate::metrics::record_responses_sse_transport(
-                                        "http_stream",
-                                        "protocol_error",
-                                    );
-                                    return stream_state
-                                        .terminate_transform_error(ProxyError::bad_gateway(error))
-                                        .await;
+                                    return stream_state.terminate_transform_error(error).await
                                 }
                             };
-                            if let Err(error) = stream_state.resize_semantic_transport_memory() {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            batch.record_transport_metrics("http_stream");
-                            for observation in &batch.observations {
-                                crate::metrics::record_proxy_semantic_guard(
-                                    "http_stream",
-                                    observation.metric_kind(),
-                                );
-                            }
-                            normalized_semantics = Some((
-                                batch
-                                    .observations
-                                    .iter()
-                                    .any(SemanticObservation::counts_as_business_output),
-                                batch
-                                    .observations
-                                    .iter()
-                                    .any(SemanticObservation::commits_downstream),
-                            ));
-                            chunk = batch.normalized;
-                            if let Some(reservation) = normalized_event_memory.as_ref() {
-                                if let Err(error) = reservation.resize(chunk.len()) {
-                                    return stream_state
-                                        .terminate_transform_error(error.into_proxy_error())
-                                        .await;
+                            let mut chunk = upstream_chunk;
+                            let normalized_event_memory = match stream_state.reserve_request_memory(
+                                RequestMemoryComponent::NormalizedEvent,
+                                chunk.len(),
+                            ) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    return stream_state.terminate_transform_error(error).await
                                 }
-                            }
-                        }
-                        if !chunk_already_inspected {
-                            if let Err(error) =
-                                stream_state.preflight_claude_stream_growth(chunk.len())
+                            };
+                            let mut normalized_semantics = None;
+                            if !chunk_already_inspected
+                                && stream_state.normalize_responses_transport
                             {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
-                            let terminal_result = stream_state.terminal_detector.push(&chunk);
-                            if let Err(error) = stream_state.resize_claude_stream_memory() {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            if let Err(error) = terminal_result {
-                                let message = error.proxy_message(max_event_bytes);
-                                return stream_state
-                                    .terminate_transform_error(ProxyError::bad_gateway(message))
-                                    .await;
-                            }
-                        }
-                        if let Err(error) =
-                            stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk)
-                        {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        stream_state.inspect_grok_reasoning_replay_chunk(&chunk);
-                        stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
-                        let chunk = stream_state.codex_completed_output_patcher.push(chunk);
-                        let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
-                        if let Err(error) = stream_state.preflight_claude_stream_growth(chunk.len())
-                        {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        stream_state.usage.push(&chunk);
-                        if let Err(error) = stream_state.resize_claude_stream_memory() {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        let (mut saw_business_output, mut committed_output) =
-                            if chunk_already_inspected {
-                                let saw_business = stream_state.pending_chunk_saw_business_output;
-                                let committed = stream_state.pending_chunk_committed_output;
-                                stream_state.pending_chunk_saw_business_output = false;
-                                stream_state.pending_chunk_committed_output = false;
-                                (saw_business, committed)
-                            } else if let Some(observed) = normalized_semantics {
-                                observed
-                            } else if let Some(inspector) =
-                                stream_state.responses_semantics.as_mut()
-                            {
-                                let observations = match inspector.push(&chunk) {
-                                    Ok(observations) => observations,
+                                let batch = match stream_state
+                                    .responses_semantics
+                                    .as_mut()
+                                    .expect("Responses normalization requires semantic state")
+                                    .push_normalized(&chunk)
+                                {
+                                    Ok(batch) => batch,
                                     Err(error) => {
                                         crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            "protocol_error",
+                                        );
+                                        crate::metrics::record_responses_sse_transport(
                                             "http_stream",
                                             "protocol_error",
                                         );
@@ -4706,267 +4680,65 @@ async fn forward_with_attempt(
                                             .await;
                                     }
                                 };
-                                for observation in &observations {
-                                    crate::metrics::record_proxy_semantic_guard(
-                                        "http_stream",
-                                        observation.metric_kind(),
-                                    );
-                                }
                                 if let Err(error) = stream_state.resize_semantic_transport_memory()
                                 {
                                     return stream_state.terminate_transform_error(error).await;
                                 }
-                                (
-                                    observations
+                                batch.record_transport_metrics("http_stream");
+                                for observation in &batch.observations {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "http_stream",
+                                        observation.metric_kind(),
+                                    );
+                                }
+                                normalized_semantics = Some((
+                                    batch
+                                        .observations
                                         .iter()
                                         .any(SemanticObservation::counts_as_business_output),
-                                    observations
+                                    batch
+                                        .observations
                                         .iter()
                                         .any(SemanticObservation::commits_downstream),
-                                )
-                            } else if stream_state.anthropic_semantics.is_some() {
-                                (false, false)
-                            } else {
-                                (!chunk.is_empty(), !chunk.is_empty())
-                            };
-                        if !chunk_already_inspected && stream_state.anthropic_semantics.is_some() {
-                            if let Err(error) =
-                                stream_state.preflight_claude_stream_growth(chunk.len())
-                            {
-                                return stream_state.terminate_transform_error(error).await;
+                                ));
+                                chunk = batch.normalized;
+                                if let Some(reservation) = normalized_event_memory.as_ref() {
+                                    if let Err(error) = reservation.resize(chunk.len()) {
+                                        return stream_state
+                                            .terminate_transform_error(error.into_proxy_error())
+                                            .await;
+                                    }
+                                }
                             }
-                        }
-                        if !chunk_already_inspected {
-                            let inspected = stream_state
-                                .anthropic_semantics
-                                .as_mut()
-                                .map(|inspector| inspector.push(&chunk));
-                            if let Some(inspected) = inspected {
+                            if !chunk_already_inspected {
+                                if let Err(error) =
+                                    stream_state.preflight_claude_stream_growth(chunk.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let max_event_bytes =
+                                    stream_state.terminal_detector.max_event_bytes();
+                                let terminal_result = stream_state.terminal_detector.push(&chunk);
                                 if let Err(error) = stream_state.resize_claude_stream_memory() {
                                     return stream_state.terminate_transform_error(error).await;
                                 }
-                                let observations = match inspected {
-                                    Ok(observations) => observations,
-                                    Err(error) => {
-                                        record_claude_semantic_failure_for(
-                                            &stream_state.stored,
-                                            "stream",
-                                            &error,
-                                        );
-                                        crate::metrics::record_proxy_semantic_guard(
-                                            "anthropic_stream",
-                                            "protocol_error",
-                                        );
-                                        return stream_state
-                                            .terminate_transform_error(ProxyError::bad_gateway(
-                                                error,
-                                            ))
-                                            .await;
-                                    }
-                                };
-                                for observation in &observations {
-                                    crate::metrics::record_proxy_semantic_guard(
-                                        "anthropic_stream",
-                                        observation.metric_kind(),
-                                    );
-                                    if let AnthropicObservation::Error(error) = observation {
-                                        if !stream_state.sse_error_outcome_recorded {
-                                            if let Some(outcome) =
-                                                claude_sse_error_outcome(&error.error_type)
-                                            {
-                                                record_provider_outcome(
-                                                    &stream_state.state,
-                                                    &stream_state.stored,
-                                                    outcome,
-                                                )
-                                                .await;
-                                                stream_state.sse_error_outcome_recorded = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                saw_business_output |= observations
-                                    .iter()
-                                    .any(AnthropicObservation::counts_as_business_output);
-                                committed_output |= observations
-                                    .iter()
-                                    .any(AnthropicObservation::commits_downstream);
-                            }
-                        }
-                        stream_state.received_any_chunk |= committed_output;
-                        stream_state
-                            .observe_text_upstream_event(saw_business_output || committed_output);
-                        stream_state.observe_image_upstream_chunk();
-                        if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded {
-                            if let Err(error) =
-                                stream_state.preflight_claude_stream_growth(chunk.len())
-                            {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            let detected_error = stream_state
-                                .sse_error_detector
-                                .as_mut()
-                                .and_then(|detector| detector.push(&chunk));
-                            if let Err(error) = stream_state.resize_claude_stream_memory() {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            let sse_error_outcome = detected_error
-                                .and_then(|error| claude_sse_error_outcome(&error.error_type));
-                            if let Some(outcome) = sse_error_outcome {
-                                record_provider_outcome(
-                                    &stream_state.state,
-                                    &stream_state.stored,
-                                    outcome,
-                                )
-                                .await;
-                                stream_state.sse_error_outcome_recorded = true;
-                            }
-                        }
-                        if stream_state.first_token_ms.is_none() && saw_business_output {
-                            let first_token_ms = stream_state.started.elapsed().as_millis();
-                            stream_state.first_token_ms = Some(first_token_ms);
-                            if stream_state.stored.provider_type == ProviderType::ClaudeOAuth {
-                                crate::metrics::record_claude_ttfb(stream_state.started.elapsed());
-                            }
-                            update_stream_usage(
-                                &stream_state.state,
-                                &stream_state.stored,
-                                &stream_state.request_id,
-                                stream_state.status_code,
-                                stream_state.started.elapsed().as_millis(),
-                                Some(first_token_ms),
-                                Default::default(),
-                                Some("streaming"),
-                            )
-                            .await;
-                        }
-                        let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
-                        let transformed = match stream_state.transform_stream_chunk(chunk) {
-                            Ok(transformed) => transformed,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let transformed = match stream_state.patch_claude_tool_names(transformed) {
-                            Ok(transformed) => transformed,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let transformed = stream_state
-                            .codex_custom_tool_stream_patcher
-                            .push(transformed);
-                        if let Err(error) = stream_state.resize_tool_argument_memory() {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        let transformed =
-                            stream_state.sanitize_openai_capacity_shed_chunk(transformed);
-                        if let Some(reservation) = normalized_event_memory.as_ref() {
-                            if let Err(error) = reservation.resize(transformed.len()) {
-                                return stream_state
-                                    .terminate_transform_error(error.into_proxy_error())
-                                    .await;
-                            }
-                        }
-                        if committed_output && !transformed.is_empty() {
-                            stream_state.commit_text_downstream();
-                        }
-                        stream_state.record_image_transport_emit(&transformed, false);
-                        if let Err(error) = stream_state
-                            .commit_antigravity_reasoning_replay_stream()
-                            .await
-                        {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        stream_state.commit_kimi_thinking_replay_stream().await;
-                        stream_state.finalize_terminal_usage(false).await;
-                        stream_state.downstream_pending_memory = normalized_event_memory;
-                        Ok(Some((transformed, stream_state)))
-                    }
-                    Ok(None) => {
-                        let mut responses_transport_finished = false;
-                        let mut normalized_finish_semantics = None;
-                        let transport_tail = if stream_state.normalize_responses_transport {
-                            responses_transport_finished = true;
-                            let batch = match stream_state
-                                .responses_semantics
-                                .as_mut()
-                                .expect("Responses normalization requires semantic state")
-                                .finish_normalized()
-                            {
-                                Ok(batch) => batch,
-                                Err(error) => {
-                                    crate::metrics::record_proxy_semantic_guard(
-                                        "http_stream",
-                                        "protocol_error",
-                                    );
-                                    crate::metrics::record_responses_sse_transport(
-                                        "http_stream",
-                                        "protocol_error",
-                                    );
+                                if let Err(error) = terminal_result {
+                                    let message = error.proxy_message(max_event_bytes);
                                     return stream_state
-                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .terminate_transform_error(ProxyError::bad_gateway(message))
                                         .await;
                                 }
-                            };
-                            if let Err(error) = stream_state.resize_semantic_transport_memory() {
-                                return stream_state.terminate_transform_error(error).await;
                             }
-                            batch.record_transport_metrics("http_stream");
-                            for observation in &batch.observations {
-                                crate::metrics::record_proxy_semantic_guard(
-                                    "http_stream",
-                                    observation.metric_kind(),
-                                );
-                            }
-                            normalized_finish_semantics = Some((
-                                batch
-                                    .observations
-                                    .iter()
-                                    .any(SemanticObservation::counts_as_business_output),
-                                batch
-                                    .observations
-                                    .iter()
-                                    .any(SemanticObservation::commits_downstream),
-                            ));
-                            let max_event_bytes = stream_state.terminal_detector.max_event_bytes();
                             if let Err(error) =
-                                stream_state.preflight_claude_stream_growth(batch.normalized.len())
+                                stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk)
                             {
                                 return stream_state.terminate_transform_error(error).await;
                             }
-                            let terminal_result =
-                                stream_state.terminal_detector.push(&batch.normalized);
-                            if let Err(error) = stream_state.resize_claude_stream_memory() {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            if let Err(error) = terminal_result {
-                                let message = error.proxy_message(max_event_bytes);
-                                return stream_state
-                                    .terminate_transform_error(ProxyError::bad_gateway(message))
-                                    .await;
-                            }
-                            batch.normalized
-                        } else {
-                            Bytes::new()
-                        };
-                        let chunk = stream_state
-                            .codex_completed_output_patcher
-                            .push(transport_tail);
-                        let chunk =
-                            join_bytes(chunk, stream_state.codex_completed_output_patcher.finish());
-                        let chunk = stream_state.codex_pending_function_call_patcher.push(chunk);
-                        let tail = stream_state.codex_pending_function_call_patcher.finish();
-                        let chunk = if tail.is_empty() {
-                            chunk
-                        } else if chunk.is_empty() {
-                            tail
-                        } else {
-                            let mut joined = chunk.to_vec();
-                            joined.extend_from_slice(&tail);
-                            Bytes::from(joined)
-                        };
-                        if !chunk.is_empty() {
+                            stream_state.inspect_grok_reasoning_replay_chunk(&chunk);
+                            stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
+                            let chunk = stream_state.codex_completed_output_patcher.push(chunk);
+                            let chunk =
+                                stream_state.codex_pending_function_call_patcher.push(chunk);
                             if let Err(error) =
                                 stream_state.preflight_claude_stream_growth(chunk.len())
                             {
@@ -4976,8 +4748,15 @@ async fn forward_with_attempt(
                             if let Err(error) = stream_state.resize_claude_stream_memory() {
                                 return stream_state.terminate_transform_error(error).await;
                             }
-                            let (saw_business_output, committed_output) =
-                                if let Some(observed) = normalized_finish_semantics {
+                            let (mut saw_business_output, mut committed_output) =
+                                if chunk_already_inspected {
+                                    let saw_business =
+                                        stream_state.pending_chunk_saw_business_output;
+                                    let committed = stream_state.pending_chunk_committed_output;
+                                    stream_state.pending_chunk_saw_business_output = false;
+                                    stream_state.pending_chunk_committed_output = false;
+                                    (saw_business, committed)
+                                } else if let Some(observed) = normalized_semantics {
                                     observed
                                 } else if let Some(inspector) =
                                     stream_state.responses_semantics.as_mut()
@@ -5002,6 +4781,11 @@ async fn forward_with_attempt(
                                             observation.metric_kind(),
                                         );
                                     }
+                                    if let Err(error) =
+                                        stream_state.resize_semantic_transport_memory()
+                                    {
+                                        return stream_state.terminate_transform_error(error).await;
+                                    }
                                     (
                                         observations
                                             .iter()
@@ -5010,10 +4794,108 @@ async fn forward_with_attempt(
                                             .iter()
                                             .any(SemanticObservation::commits_downstream),
                                     )
+                                } else if stream_state.anthropic_semantics.is_some() {
+                                    (false, false)
                                 } else {
-                                    (true, true)
+                                    (!chunk.is_empty(), !chunk.is_empty())
                                 };
+                            if !chunk_already_inspected
+                                && stream_state.anthropic_semantics.is_some()
+                            {
+                                if let Err(error) =
+                                    stream_state.preflight_claude_stream_growth(chunk.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                            }
+                            if !chunk_already_inspected {
+                                let inspected = stream_state
+                                    .anthropic_semantics
+                                    .as_mut()
+                                    .map(|inspector| inspector.push(&chunk));
+                                if let Some(inspected) = inspected {
+                                    if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                        return stream_state.terminate_transform_error(error).await;
+                                    }
+                                    let observations = match inspected {
+                                        Ok(observations) => observations,
+                                        Err(error) => {
+                                            record_claude_semantic_failure_for(
+                                                &stream_state.stored,
+                                                "stream",
+                                                &error,
+                                            );
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "anthropic_stream",
+                                                "protocol_error",
+                                            );
+                                            return stream_state
+                                                .terminate_transform_error(ProxyError::bad_gateway(
+                                                    error,
+                                                ))
+                                                .await;
+                                        }
+                                    };
+                                    for observation in &observations {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "anthropic_stream",
+                                            observation.metric_kind(),
+                                        );
+                                        if let AnthropicObservation::Error(error) = observation {
+                                            if !stream_state.sse_error_outcome_recorded {
+                                                if let Some(outcome) =
+                                                    claude_sse_error_outcome(&error.error_type)
+                                                {
+                                                    record_provider_outcome(
+                                                        &stream_state.state,
+                                                        &stream_state.stored,
+                                                        outcome,
+                                                    )
+                                                    .await;
+                                                    stream_state.sse_error_outcome_recorded = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    saw_business_output |= observations
+                                        .iter()
+                                        .any(AnthropicObservation::counts_as_business_output);
+                                    committed_output |= observations
+                                        .iter()
+                                        .any(AnthropicObservation::commits_downstream);
+                                }
+                            }
                             stream_state.received_any_chunk |= committed_output;
+                            stream_state.observe_text_upstream_event(
+                                saw_business_output || committed_output,
+                            );
+                            stream_state.observe_image_upstream_chunk();
+                            if !chunk_already_inspected && !stream_state.sse_error_outcome_recorded
+                            {
+                                if let Err(error) =
+                                    stream_state.preflight_claude_stream_growth(chunk.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let detected_error = stream_state
+                                    .sse_error_detector
+                                    .as_mut()
+                                    .and_then(|detector| detector.push(&chunk));
+                                if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let sse_error_outcome = detected_error
+                                    .and_then(|error| claude_sse_error_outcome(&error.error_type));
+                                if let Some(outcome) = sse_error_outcome {
+                                    record_provider_outcome(
+                                        &stream_state.state,
+                                        &stream_state.stored,
+                                        outcome,
+                                    )
+                                    .await;
+                                    stream_state.sse_error_outcome_recorded = true;
+                                }
+                            }
                             if stream_state.first_token_ms.is_none() && saw_business_output {
                                 let first_token_ms = stream_state.started.elapsed().as_millis();
                                 stream_state.first_token_ms = Some(first_token_ms);
@@ -5035,21 +4917,12 @@ async fn forward_with_attempt(
                                 .await;
                             }
                             let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
-                            let grok_tail = stream_state.finish_grok_responses_inspection().await;
-                            let chunk = join_bytes(chunk, grok_tail);
                             let transformed = match stream_state.transform_stream_chunk(chunk) {
                                 Ok(transformed) => transformed,
                                 Err(error) => {
                                     return stream_state.terminate_transform_error(error).await
                                 }
                             };
-                            let tail = match stream_state.finish_stream_transform() {
-                                Ok(tail) => tail,
-                                Err(error) => {
-                                    return stream_state.terminate_transform_error(error).await
-                                }
-                            };
-                            let transformed = join_bytes(transformed, tail);
                             let transformed =
                                 match stream_state.patch_claude_tool_names(transformed) {
                                     Ok(transformed) => transformed,
@@ -5065,12 +4938,16 @@ async fn forward_with_attempt(
                             }
                             let transformed =
                                 stream_state.sanitize_openai_capacity_shed_chunk(transformed);
-                            let synthesized =
-                                stream_state.maybe_synthesize_codex_responses_failed_frame();
-                            if !synthesized.is_empty() {
-                                stream_state.terminal_frame_sent = true;
+                            if let Some(reservation) = normalized_event_memory.as_ref() {
+                                if let Err(error) = reservation.resize(transformed.len()) {
+                                    return stream_state
+                                        .terminate_transform_error(error.into_proxy_error())
+                                        .await;
+                                }
                             }
-                            let transformed = join_bytes(transformed, synthesized);
+                            if committed_output && !transformed.is_empty() {
+                                stream_state.commit_text_downstream();
+                            }
                             stream_state.record_image_transport_emit(&transformed, false);
                             if let Err(error) = stream_state
                                 .commit_antigravity_reasoning_replay_stream()
@@ -5078,22 +4955,32 @@ async fn forward_with_attempt(
                             {
                                 return stream_state.terminate_transform_error(error).await;
                             }
-                            stream_state.finish_grok_reasoning_replay_stream().await;
                             stream_state.commit_kimi_thinking_replay_stream().await;
-                            stream_state.finalize_terminal_usage(true).await;
-                            if let Err(error) =
-                                stream_state.retain_downstream_chunk(transformed.len())
-                            {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            return Ok(Some((transformed, stream_state)));
-                        }
-                        if !responses_transport_finished {
-                            if let Some(inspector) = stream_state.responses_semantics.as_mut() {
-                                let observations = match inspector.finish() {
-                                    Ok(observations) => observations,
+                            stream_state.finalize_terminal_usage(false).await;
+                            stream_state.downstream_pending_memory = normalized_event_memory;
+                            Ok(Some((transformed, stream_state)))
+                        })
+                        .await
+                    }
+                    Ok(None) => {
+                        Box::pin(async move {
+                            let mut responses_transport_finished = false;
+                            let mut normalized_finish_semantics = None;
+                            let transport_tail = if stream_state.normalize_responses_transport {
+                                responses_transport_finished = true;
+                                let batch = match stream_state
+                                    .responses_semantics
+                                    .as_mut()
+                                    .expect("Responses normalization requires semantic state")
+                                    .finish_normalized()
+                                {
+                                    Ok(batch) => batch,
                                     Err(error) => {
                                         crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            "protocol_error",
+                                        );
+                                        crate::metrics::record_responses_sse_transport(
                                             "http_stream",
                                             "protocol_error",
                                         );
@@ -5104,157 +4991,379 @@ async fn forward_with_attempt(
                                             .await;
                                     }
                                 };
-                                for observation in &observations {
+                                if let Err(error) = stream_state.resize_semantic_transport_memory()
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                batch.record_transport_metrics("http_stream");
+                                for observation in &batch.observations {
                                     crate::metrics::record_proxy_semantic_guard(
                                         "http_stream",
                                         observation.metric_kind(),
                                     );
                                 }
-                            }
-                        }
-                        if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
-                            let finish_result = inspector.finish();
-                            if let Err(error) = stream_state.resize_claude_stream_memory() {
-                                return stream_state.terminate_transform_error(error).await;
-                            }
-                            if let Err(error) = finish_result {
-                                record_claude_semantic_failure_for(
-                                    &stream_state.stored,
-                                    "stream_finish",
-                                    &error,
-                                );
-                                crate::metrics::record_proxy_semantic_guard(
-                                    "anthropic_stream",
-                                    "protocol_error",
-                                );
-                                return stream_state
-                                    .terminate_transform_error(ProxyError::bad_gateway(error))
+                                normalized_finish_semantics = Some((
+                                    batch
+                                        .observations
+                                        .iter()
+                                        .any(SemanticObservation::counts_as_business_output),
+                                    batch
+                                        .observations
+                                        .iter()
+                                        .any(SemanticObservation::commits_downstream),
+                                ));
+                                let max_event_bytes =
+                                    stream_state.terminal_detector.max_event_bytes();
+                                if let Err(error) = stream_state
+                                    .preflight_claude_stream_growth(batch.normalized.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let terminal_result =
+                                    stream_state.terminal_detector.push(&batch.normalized);
+                                if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                if let Err(error) = terminal_result {
+                                    let message = error.proxy_message(max_event_bytes);
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(message))
+                                        .await;
+                                }
+                                batch.normalized
+                            } else {
+                                Bytes::new()
+                            };
+                            let chunk = stream_state
+                                .codex_completed_output_patcher
+                                .push(transport_tail);
+                            let chunk = join_bytes(
+                                chunk,
+                                stream_state.codex_completed_output_patcher.finish(),
+                            );
+                            let chunk =
+                                stream_state.codex_pending_function_call_patcher.push(chunk);
+                            let tail = stream_state.codex_pending_function_call_patcher.finish();
+                            let chunk = if tail.is_empty() {
+                                chunk
+                            } else if chunk.is_empty() {
+                                tail
+                            } else {
+                                let mut joined = chunk.to_vec();
+                                joined.extend_from_slice(&tail);
+                                Bytes::from(joined)
+                            };
+                            if !chunk.is_empty() {
+                                if let Err(error) =
+                                    stream_state.preflight_claude_stream_growth(chunk.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                stream_state.usage.push(&chunk);
+                                if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let (saw_business_output, committed_output) =
+                                    if let Some(observed) = normalized_finish_semantics {
+                                        observed
+                                    } else if let Some(inspector) =
+                                        stream_state.responses_semantics.as_mut()
+                                    {
+                                        let observations = match inspector.push(&chunk) {
+                                            Ok(observations) => observations,
+                                            Err(error) => {
+                                                crate::metrics::record_proxy_semantic_guard(
+                                                    "http_stream",
+                                                    "protocol_error",
+                                                );
+                                                return stream_state
+                                                    .terminate_transform_error(
+                                                        ProxyError::bad_gateway(error),
+                                                    )
+                                                    .await;
+                                            }
+                                        };
+                                        for observation in &observations {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream",
+                                                observation.metric_kind(),
+                                            );
+                                        }
+                                        (
+                                            observations.iter().any(
+                                                SemanticObservation::counts_as_business_output,
+                                            ),
+                                            observations
+                                                .iter()
+                                                .any(SemanticObservation::commits_downstream),
+                                        )
+                                    } else {
+                                        (true, true)
+                                    };
+                                stream_state.received_any_chunk |= committed_output;
+                                if stream_state.first_token_ms.is_none() && saw_business_output {
+                                    let first_token_ms = stream_state.started.elapsed().as_millis();
+                                    stream_state.first_token_ms = Some(first_token_ms);
+                                    if stream_state.stored.provider_type
+                                        == ProviderType::ClaudeOAuth
+                                    {
+                                        crate::metrics::record_claude_ttfb(
+                                            stream_state.started.elapsed(),
+                                        );
+                                    }
+                                    update_stream_usage(
+                                        &stream_state.state,
+                                        &stream_state.stored,
+                                        &stream_state.request_id,
+                                        stream_state.status_code,
+                                        stream_state.started.elapsed().as_millis(),
+                                        Some(first_token_ms),
+                                        Default::default(),
+                                        Some("streaming"),
+                                    )
                                     .await;
+                                }
+                                let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
+                                let grok_tail =
+                                    stream_state.finish_grok_responses_inspection().await;
+                                let chunk = join_bytes(chunk, grok_tail);
+                                let transformed = match stream_state.transform_stream_chunk(chunk) {
+                                    Ok(transformed) => transformed,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
+                                let tail = match stream_state.finish_stream_transform() {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
+                                let transformed = join_bytes(transformed, tail);
+                                let transformed = match stream_state
+                                    .patch_claude_tool_names(transformed)
+                                {
+                                    Ok(transformed) => transformed,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
+                                let transformed = stream_state
+                                    .codex_custom_tool_stream_patcher
+                                    .push(transformed);
+                                if let Err(error) = stream_state.resize_tool_argument_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                let transformed =
+                                    stream_state.sanitize_openai_capacity_shed_chunk(transformed);
+                                let synthesized =
+                                    stream_state.maybe_synthesize_codex_responses_failed_frame();
+                                if !synthesized.is_empty() {
+                                    stream_state.terminal_frame_sent = true;
+                                }
+                                let transformed = join_bytes(transformed, synthesized);
+                                stream_state.record_image_transport_emit(&transformed, false);
+                                if let Err(error) = stream_state
+                                    .commit_antigravity_reasoning_replay_stream()
+                                    .await
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                if let Err(error) =
+                                    stream_state.finish_grok_reasoning_replay_stream().await
+                                {
+                                    return stream_state
+                                        .terminate_transform_error_boxed(error)
+                                        .await;
+                                }
+                                stream_state.commit_kimi_thinking_replay_stream().await;
+                                stream_state.finalize_terminal_usage(true).await;
+                                if let Err(error) =
+                                    stream_state.retain_downstream_chunk(transformed.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                return Ok(Some((transformed, stream_state)));
                             }
-                        }
-                        let grok_tail = stream_state.finish_grok_responses_inspection().await;
-                        let transformed_grok_tail =
-                            match stream_state.transform_stream_chunk(grok_tail) {
+                            if !responses_transport_finished {
+                                if let Some(inspector) = stream_state.responses_semantics.as_mut() {
+                                    let observations = match inspector.finish() {
+                                        Ok(observations) => observations,
+                                        Err(error) => {
+                                            crate::metrics::record_proxy_semantic_guard(
+                                                "http_stream",
+                                                "protocol_error",
+                                            );
+                                            return stream_state
+                                                .terminate_transform_error(ProxyError::bad_gateway(
+                                                    error,
+                                                ))
+                                                .await;
+                                        }
+                                    };
+                                    for observation in &observations {
+                                        crate::metrics::record_proxy_semantic_guard(
+                                            "http_stream",
+                                            observation.metric_kind(),
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(inspector) = stream_state.anthropic_semantics.as_mut() {
+                                let finish_result = inspector.finish();
+                                if let Err(error) = stream_state.resize_claude_stream_memory() {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                if let Err(error) = finish_result {
+                                    record_claude_semantic_failure_for(
+                                        &stream_state.stored,
+                                        "stream_finish",
+                                        &error,
+                                    );
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "anthropic_stream",
+                                        "protocol_error",
+                                    );
+                                    return stream_state
+                                        .terminate_transform_error(ProxyError::bad_gateway(error))
+                                        .await;
+                                }
+                            }
+                            let grok_tail = stream_state.finish_grok_responses_inspection().await;
+                            let transformed_grok_tail =
+                                match stream_state.transform_stream_chunk(grok_tail) {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
+                            let transform_tail = match stream_state.finish_stream_transform() {
                                 Ok(tail) => tail,
                                 Err(error) => {
                                     return stream_state.terminate_transform_error(error).await
                                 }
                             };
-                        let transform_tail = match stream_state.finish_stream_transform() {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
+                            let transform_tail = join_bytes(transformed_grok_tail, transform_tail);
+                            let claude_tail =
+                                match stream_state.patch_claude_tool_names(transform_tail) {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        return stream_state.terminate_transform_error(error).await
+                                    }
+                                };
+                            let claude_finish = match stream_state.finish_claude_tool_name_patcher()
+                            {
+                                Ok(tail) => tail,
+                                Err(error) => {
+                                    return stream_state.terminate_transform_error(error).await
+                                }
+                            };
+                            let claude_tail = join_bytes(claude_tail, claude_finish);
+                            let transformed_tail = stream_state
+                                .codex_custom_tool_stream_patcher
+                                .push(claude_tail);
+                            let custom_tail = join_bytes(
+                                transformed_tail,
+                                stream_state.codex_custom_tool_stream_patcher.finish(),
+                            );
+                            if let Err(error) = stream_state.resize_tool_argument_memory() {
+                                return stream_state.terminate_transform_error(error).await;
                             }
-                        };
-                        let transform_tail = join_bytes(transformed_grok_tail, transform_tail);
-                        let claude_tail = match stream_state.patch_claude_tool_names(transform_tail)
-                        {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let claude_finish = match stream_state.finish_claude_tool_name_patcher() {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                return stream_state.terminate_transform_error(error).await
-                            }
-                        };
-                        let claude_tail = join_bytes(claude_tail, claude_finish);
-                        let transformed_tail = stream_state
-                            .codex_custom_tool_stream_patcher
-                            .push(claude_tail);
-                        let custom_tail = join_bytes(
-                            transformed_tail,
-                            stream_state.codex_custom_tool_stream_patcher.finish(),
-                        );
-                        if let Err(error) = stream_state.resize_tool_argument_memory() {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        if let Err(error) = stream_state
-                            .commit_antigravity_reasoning_replay_stream()
-                            .await
-                        {
-                            return stream_state.terminate_transform_error(error).await;
-                        }
-                        stream_state.finish_grok_reasoning_replay_stream().await;
-                        stream_state.commit_kimi_thinking_replay_stream().await;
-                        let synthesized =
-                            stream_state.maybe_synthesize_codex_responses_failed_frame();
-                        if !synthesized.is_empty() {
-                            stream_state.terminal_frame_sent = true;
-                        }
-                        let custom_tail = join_bytes(custom_tail, synthesized);
-                        stream_state.finalize_terminal_usage(true).await;
-                        if !custom_tail.is_empty() {
-                            if let Err(error) =
-                                stream_state.retain_downstream_chunk(custom_tail.len())
+                            if let Err(error) = stream_state
+                                .commit_antigravity_reasoning_replay_stream()
+                                .await
                             {
                                 return stream_state.terminate_transform_error(error).await;
                             }
-                            return Ok(Some((custom_tail, stream_state)));
-                        }
-                        Ok(None)
+                            if let Err(error) =
+                                stream_state.finish_grok_reasoning_replay_stream().await
+                            {
+                                return stream_state.terminate_transform_error_boxed(error).await;
+                            }
+                            stream_state.commit_kimi_thinking_replay_stream().await;
+                            let synthesized =
+                                stream_state.maybe_synthesize_codex_responses_failed_frame();
+                            if !synthesized.is_empty() {
+                                stream_state.terminal_frame_sent = true;
+                            }
+                            let custom_tail = join_bytes(custom_tail, synthesized);
+                            stream_state.finalize_terminal_usage(true).await;
+                            if !custom_tail.is_empty() {
+                                if let Err(error) =
+                                    stream_state.retain_downstream_chunk(custom_tail.len())
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
+                                return Ok(Some((custom_tail, stream_state)));
+                            }
+                            Ok(None)
+                        })
+                        .await
                     }
                     Err(error) => {
-                        let usage_result =
-                            std::mem::take(&mut stream_state.usage).finish_with_status();
-                        let usage = usage_result.usage;
-                        let status = error.status_code();
-                        let stream_status = error.stream_status();
-                        let message = error.to_string();
-                        update_stream_usage_result(
-                            &stream_state.state,
-                            &stream_state.stored,
-                            &stream_state.request_id,
-                            status,
-                            stream_state.started.elapsed().as_millis(),
-                            stream_state.first_token_ms,
-                            usage_result,
-                            Some(stream_status),
-                        )
-                        .await;
-                        update_terminal_usage_error(
-                            &stream_state.state,
-                            &stream_state.request_id,
-                            message.clone(),
-                        )
-                        .await;
-                        record_share_invocation_result(
-                            &stream_state.state,
-                            stream_state.share_id.as_deref(),
-                            stream_state.user_email.as_deref(),
-                            usage,
-                        )
-                        .await;
-                        record_provider_outcome(
-                            &stream_state.state,
-                            &stream_state.stored,
-                            ProviderOutcome::NetworkFailure,
-                        )
-                        .await;
-                        if stream_state.stored.provider_type == ProviderType::ClaudeOAuth {
-                            crate::metrics::record_claude_stream_duration(
-                                stream_status,
-                                stream_state.started.elapsed(),
-                            );
-                        }
-                        stream_state.terminal_usage_published = true;
-                        stream_state
-                            .interrupted_update_armed
-                            .store(false, Ordering::Relaxed);
-                        stream_state.terminal_frame_sent = true;
-                        if let Some(frame) =
-                            stream_terminal_error_frame(stream_state.route, &message, status)
-                        {
-                            stream_state.record_image_transport_emit(&frame, false);
-                            Ok(Some((frame, stream_state)))
-                        } else {
-                            Err(std::io::Error::other(message))
-                        }
+                        Box::pin(async move {
+                            let usage_result =
+                                std::mem::take(&mut stream_state.usage).finish_with_status();
+                            let usage = usage_result.usage;
+                            let status = error.status_code();
+                            let stream_status = error.stream_status();
+                            let message = error.to_string();
+                            update_stream_usage_result(
+                                &stream_state.state,
+                                &stream_state.stored,
+                                &stream_state.request_id,
+                                status,
+                                stream_state.started.elapsed().as_millis(),
+                                stream_state.first_token_ms,
+                                usage_result,
+                                Some(stream_status),
+                            )
+                            .await;
+                            update_terminal_usage_error(
+                                &stream_state.state,
+                                &stream_state.request_id,
+                                message.clone(),
+                            )
+                            .await;
+                            record_share_invocation_result(
+                                &stream_state.state,
+                                stream_state.share_id.as_deref(),
+                                stream_state.user_email.as_deref(),
+                                usage,
+                            )
+                            .await;
+                            record_provider_outcome(
+                                &stream_state.state,
+                                &stream_state.stored,
+                                ProviderOutcome::NetworkFailure,
+                            )
+                            .await;
+                            if stream_state.stored.provider_type == ProviderType::ClaudeOAuth {
+                                crate::metrics::record_claude_stream_duration(
+                                    stream_status,
+                                    stream_state.started.elapsed(),
+                                );
+                            }
+                            stream_state.terminal_usage_published = true;
+                            stream_state
+                                .interrupted_update_armed
+                                .store(false, Ordering::Relaxed);
+                            stream_state.terminal_frame_sent = true;
+                            if let Some(frame) =
+                                stream_terminal_error_frame(stream_state.route, &message, status)
+                            {
+                                stream_state.record_image_transport_emit(&frame, false);
+                                Ok(Some((frame, stream_state)))
+                            } else {
+                                Err(std::io::Error::other(message))
+                            }
+                        })
+                        .await
                     }
                 }
-            });
+            };
+            let stream =
+                stream::try_unfold(stream_state, move |state| Box::pin(stream_step(state)));
             let mut response = Response::new(Body::from_stream(stream));
             *response.status_mut() = status;
             if let Some(content_type) = content_type {
@@ -5615,10 +5724,11 @@ async fn forward_with_attempt(
             &bytes,
             status.is_success(),
         )?;
-        let grok_replay_proof = status
-            .is_success()
-            .then(|| super::grok_replay::capture_document(&bytes))
-            .flatten();
+        let grok_replay_capture = grok_provider::capture_response(
+            grok_reasoning_replay.as_ref(),
+            &bytes,
+            status.is_success(),
+        )?;
         let usage = if is_count_tokens_request {
             TokenUsage::default()
         } else {
@@ -5688,7 +5798,12 @@ async fn forward_with_attempt(
                 kimi_thinking_replay_content,
             )
             .await;
-            grok_provider::commit(&state, grok_reasoning_replay.as_ref(), grok_replay_proof).await;
+            grok_provider::commit_captured_response(
+                &state,
+                grok_reasoning_replay.as_ref(),
+                grok_replay_capture,
+            )
+            .await;
         }
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
@@ -6378,11 +6493,15 @@ async fn forward_grok_media_for_test_surface(
 ) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
     let wire_body_len = body.len();
-    let body = decode_request_body_for_proxy_with_limit(
+    let mut request_memory =
+        GrokMediaRequestMemory::new(state.request_body_limits.memory_budget_bytes, wire_body_len)?;
+    let (body, decoded_memory) = decode_request_body_with_memory(
         &headers,
         body,
         state.request_body_limits.media_bytes,
+        Some(request_memory.budget()),
     )?;
+    request_memory.set_decoded(decoded_memory);
     ensure_grok_request_body_limit(
         "media",
         state.request_body_limits.media_bytes,
@@ -6441,6 +6560,7 @@ async fn forward_grok_media_for_test_surface(
         request_context,
         account_in_flight_guard,
         None,
+        request_memory,
     )
     .await
 }
@@ -6463,6 +6583,8 @@ pub(crate) async fn forward_grok_media_provider_test(
     let snapshot = state.account_in_flight.snapshot();
     let account_in_flight_guard =
         acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    let request_memory =
+        GrokMediaRequestMemory::new(state.request_body_limits.memory_budget_bytes, body.len())?;
     forward_grok_media_with_execution(
         state,
         execution,
@@ -6474,6 +6596,7 @@ pub(crate) async fn forward_grok_media_provider_test(
         request_context,
         account_in_flight_guard,
         None,
+        request_memory,
     )
     .await
 }
@@ -6487,11 +6610,15 @@ pub async fn forward_grok_media(
 ) -> Result<Response, ProxyError> {
     super::grok::validate_media_request(&method, &upstream_path)?;
     let wire_body_len = body.len();
-    let body = decode_request_body_for_proxy_with_limit(
+    let mut request_memory =
+        GrokMediaRequestMemory::new(state.request_body_limits.memory_budget_bytes, wire_body_len)?;
+    let (body, decoded_memory) = decode_request_body_with_memory(
         &headers,
         body,
         state.request_body_limits.media_bytes,
+        Some(request_memory.budget()),
     )?;
+    request_memory.set_decoded(decoded_memory);
     ensure_grok_request_body_limit(
         "media",
         state.request_body_limits.media_bytes,
@@ -6573,6 +6700,7 @@ pub async fn forward_grok_media(
         request_context,
         account_in_flight_guard,
         share_invocation_guard,
+        request_memory,
     )
     .await
 }
@@ -6583,14 +6711,7 @@ pub async fn forward_images_generations(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
-    let body = decode_request_body_for_proxy_with_limit(
-        &headers,
-        body,
-        state.request_body_limits.image_bytes,
-    )?;
     let mut request_context = request_context_from_headers(&headers);
-    request_context.session_id =
-        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -6607,36 +6728,60 @@ pub async fn forward_images_generations(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let (execution, account_in_flight_guard) =
-        if let Some(share_id) = request_context.share_id.as_deref() {
-            let (execution, _share_name) = select_share_image_generation_execution(
-                &providers,
-                &shares,
-                &accounts_for_selection,
-                share_id,
-            )?;
-            let snapshot = state.account_in_flight.snapshot();
-            let guard = acquire_account_in_flight(
-                &state,
-                &execution.stored,
-                &accounts_for_selection,
-                &snapshot,
-            )?;
-            (execution, guard)
-        } else {
-            return Err(ProxyError::bad_request(
-                "image requests require a Router Share binding",
-            ));
-        };
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (execution, _share_name) = select_share_image_generation_execution(
+            &providers,
+            &shares,
+            &accounts_for_selection,
+            share_id,
+        )?;
+        execution
+    } else {
+        return Err(ProxyError::bad_request(
+            "image requests require a Router Share binding",
+        ));
+    };
     drop(providers);
 
-    if execution.driver_is("oauth.grok_responses") {
+    let mut grok_request_memory = None;
+    let body = if execution.driver_is("oauth.grok_responses") {
+        let mut request_memory = GrokMediaRequestMemory::new(
+            state.request_body_limits.memory_budget_bytes,
+            wire_body_len,
+        )?;
+        let (body, decoded_memory) = decode_request_body_with_memory(
+            &headers,
+            body,
+            state.request_body_limits.image_bytes,
+            Some(request_memory.budget()),
+        )?;
+        request_memory.set_decoded(decoded_memory);
         ensure_grok_request_body_limit(
             "image",
             state.request_body_limits.image_bytes,
             wire_body_len,
             body.len(),
         )?;
+        grok_request_memory = Some(request_memory);
+        body
+    } else {
+        decode_request_body_for_proxy_with_limit(
+            &headers,
+            body,
+            state.request_body_limits.image_bytes,
+        )?
+    };
+    request_context.session_id =
+        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
+    let snapshot = state.account_in_flight.snapshot();
+    let account_in_flight_guard = acquire_account_in_flight(
+        &state,
+        &execution.stored,
+        &accounts_for_selection,
+        &snapshot,
+    )?;
+
+    if execution.driver_is("oauth.grok_responses") {
         forward_grok_media_with_execution(
             state,
             execution,
@@ -6648,6 +6793,7 @@ pub async fn forward_images_generations(
             request_context,
             account_in_flight_guard,
             share_invocation_guard,
+            grok_request_memory.expect("Grok image requests initialize request memory"),
         )
         .await
     } else if execution.driver_is("oauth.openai_codex") {
@@ -6675,14 +6821,7 @@ pub async fn forward_images_edits(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let wire_body_len = body.len();
-    let body = decode_request_body_for_proxy_with_limit(
-        &headers,
-        body,
-        state.request_body_limits.image_bytes,
-    )?;
     let mut request_context = request_context_from_headers(&headers);
-    request_context.session_id =
-        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
         let (share_name, guard) = validate_and_acquire_share_invocation(
             &state,
@@ -6699,36 +6838,60 @@ pub async fn forward_images_edits(
     let shares = state.shares.read().await.clone();
     let accounts_for_selection = state.accounts_snapshot().await;
     let providers = state.providers.read().await;
-    let (execution, account_in_flight_guard) =
-        if let Some(share_id) = request_context.share_id.as_deref() {
-            let (execution, _share_name) = select_share_image_generation_execution(
-                &providers,
-                &shares,
-                &accounts_for_selection,
-                share_id,
-            )?;
-            let snapshot = state.account_in_flight.snapshot();
-            let guard = acquire_account_in_flight(
-                &state,
-                &execution.stored,
-                &accounts_for_selection,
-                &snapshot,
-            )?;
-            (execution, guard)
-        } else {
-            return Err(ProxyError::bad_request(
-                "image requests require a Router Share binding",
-            ));
-        };
+    let execution = if let Some(share_id) = request_context.share_id.as_deref() {
+        let (execution, _share_name) = select_share_image_generation_execution(
+            &providers,
+            &shares,
+            &accounts_for_selection,
+            share_id,
+        )?;
+        execution
+    } else {
+        return Err(ProxyError::bad_request(
+            "image requests require a Router Share binding",
+        ));
+    };
     drop(providers);
 
-    if execution.driver_is("oauth.grok_responses") {
+    let mut grok_request_memory = None;
+    let body = if execution.driver_is("oauth.grok_responses") {
+        let mut request_memory = GrokMediaRequestMemory::new(
+            state.request_body_limits.memory_budget_bytes,
+            wire_body_len,
+        )?;
+        let (body, decoded_memory) = decode_request_body_with_memory(
+            &headers,
+            body,
+            state.request_body_limits.image_bytes,
+            Some(request_memory.budget()),
+        )?;
+        request_memory.set_decoded(decoded_memory);
         ensure_grok_request_body_limit(
             "image",
             state.request_body_limits.image_bytes,
             wire_body_len,
             body.len(),
         )?;
+        grok_request_memory = Some(request_memory);
+        body
+    } else {
+        decode_request_body_for_proxy_with_limit(
+            &headers,
+            body,
+            state.request_body_limits.image_bytes,
+        )?
+    };
+    request_context.session_id =
+        session_id_from_request(ProxyRoute::CodexResponses, &headers, &body);
+    let snapshot = state.account_in_flight.snapshot();
+    let account_in_flight_guard = acquire_account_in_flight(
+        &state,
+        &execution.stored,
+        &accounts_for_selection,
+        &snapshot,
+    )?;
+
+    if execution.driver_is("oauth.grok_responses") {
         forward_grok_media_with_execution(
             state,
             execution,
@@ -6740,6 +6903,7 @@ pub async fn forward_images_edits(
             request_context,
             account_in_flight_guard,
             share_invocation_guard,
+            grok_request_memory.expect("Grok image requests initialize request memory"),
         )
         .await
     } else if execution.driver_is("oauth.openai_codex") {
@@ -6776,6 +6940,55 @@ fn ensure_grok_request_body_limit(
     Ok(())
 }
 
+#[derive(Debug)]
+struct GrokMediaRequestMemory {
+    budget: RequestMemoryBudget,
+    _raw: RequestMemoryReservation,
+    decoded: Option<RequestMemoryReservation>,
+    normalized: Option<RequestMemoryReservation>,
+}
+
+impl GrokMediaRequestMemory {
+    fn new(limit_bytes: usize, raw_body_bytes: usize) -> Result<Self, ProxyError> {
+        let budget = RequestMemoryBudget::new(limit_bytes);
+        let raw = budget
+            .reserve(RequestMemoryComponent::InboundRaw, raw_body_bytes)
+            .map_err(|error| error.into_proxy_error())?;
+        Ok(Self {
+            budget,
+            _raw: raw,
+            decoded: None,
+            normalized: None,
+        })
+    }
+
+    fn budget(&self) -> &RequestMemoryBudget {
+        &self.budget
+    }
+
+    fn set_decoded(&mut self, reservation: Option<RequestMemoryReservation>) {
+        self.decoded = reservation;
+    }
+
+    fn reserve_normalized(&mut self, bytes: usize) -> Result<(), ProxyError> {
+        self.normalized = Some(
+            self.budget
+                .reserve(RequestMemoryComponent::NormalizedBody, bytes)
+                .map_err(|error| error.into_proxy_error())?,
+        );
+        Ok(())
+    }
+
+    fn resize_normalized(&self, bytes: usize) -> Result<(), ProxyError> {
+        if let Some(reservation) = self.normalized.as_ref() {
+            reservation
+                .resize(bytes)
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Media forwarding carries the full request/accounting context.
 async fn forward_grok_media_with_execution(
     state: ServerState,
@@ -6788,8 +7001,10 @@ async fn forward_grok_media_with_execution(
     mut request_context: UsageLogContext,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+    mut request_memory: GrokMediaRequestMemory,
 ) -> Result<Response, ProxyError> {
     let stored = execution.runtime_stored_view();
+    let started = Instant::now();
     let mut audit_attempt = ForwardAttemptContext::default();
     audit_forward_attempt(
         &state,
@@ -6866,6 +7081,25 @@ async fn forward_grok_media_with_execution(
                 grok_tenant_scope_parts(share_id.as_deref(), user_email.as_deref(), &stored);
             super::grok::namespace_session_id(tenant_scope.as_deref(), &session_id)
         });
+    let normalized_preflight_bytes = if upstream_path.contains("/images/edits") {
+        body.len().saturating_mul(2).saturating_add(64 * 1024)
+    } else {
+        body.len()
+    };
+    if let Err(error) = request_memory.reserve_normalized(normalized_preflight_bytes) {
+        record_grok_media_memory_exhaustion(
+            &state,
+            &stored,
+            share_id.as_deref(),
+            user_email.as_deref(),
+            started,
+            &request_context,
+            UsageModelMetadata::default(),
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let (body, content_type) = if upstream_path.contains("/images/edits") {
         (
             super::grok::image_edit_body(&headers, body)?,
@@ -6879,9 +7113,22 @@ async fn forward_grok_media_with_execution(
                 .unwrap_or_else(|| "application/json".to_string()),
         )
     };
+    if let Err(error) = request_memory.resize_normalized(body.len()) {
+        record_grok_media_memory_exhaustion(
+            &state,
+            &stored,
+            share_id.as_deref(),
+            user_email.as_deref(),
+            started,
+            &request_context,
+            grok_media_usage_model(&body),
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let media_model = grok_media_usage_model(&body);
     let http_client = forward_http_client(&state, &execution).await?;
-    let started = Instant::now();
     let mut upstream = loop {
         ensure_managed_credential_persistence_available(&state, &execution)?;
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
@@ -7070,46 +7317,80 @@ async fn forward_grok_media_with_execution(
             media_model,
             account_in_flight_guard,
             share_invocation_guard,
+            request_memory,
         }));
     }
-    let bytes = match crate::infra::http::read_response_body_limited(
+    let (bytes, response_transport_memory) = match read_response_body_limited_with_memory(
         &mut upstream,
         super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+        Some(request_memory.budget()),
     )
     .await
     {
-        Ok(bytes) => bytes,
+        Ok(result) => result,
         Err(error) => {
-            record_grok_media_terminal(
-                &state,
-                &stored,
-                share_id.as_deref(),
-                user_email.as_deref(),
-                request_context.is_health_check,
-                ProviderOutcome::NetworkFailure,
-            )
-            .await;
-            return Err(ProxyError::bad_gateway(error));
+            let memory_exhausted = error.is_memory_exhausted();
+            let error = error.into_proxy_error();
+            if memory_exhausted {
+                record_grok_media_memory_exhaustion(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    started,
+                    &request_context,
+                    media_model.clone(),
+                    &error,
+                )
+                .await;
+            } else {
+                record_grok_media_terminal(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    request_context.is_health_check,
+                    ProviderOutcome::NetworkFailure,
+                )
+                .await;
+            }
+            return Err(error);
         }
     };
-    let decoded = match decode_response_body_for_proxy_with_limit(
+    let decoded = match decode_response_body_with_memory(
         &response_headers,
         bytes,
+        response_transport_memory,
         super::MEDIA_RESPONSE_BODY_LIMIT_BYTES,
+        Some(request_memory.budget()),
     ) {
         Ok(decoded) => decoded,
         Err(error) => {
-            record_grok_media_terminal(
-                &state,
-                &stored,
-                share_id.as_deref(),
-                user_email.as_deref(),
-                request_context.is_health_check,
-                ProviderOutcome::Failure {
-                    status_code: error.status.as_u16(),
-                },
-            )
-            .await;
+            if error.is_request_memory_exhausted() {
+                record_grok_media_memory_exhaustion(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    started,
+                    &request_context,
+                    media_model.clone(),
+                    &error,
+                )
+                .await;
+            } else {
+                record_grok_media_terminal(
+                    &state,
+                    &stored,
+                    share_id.as_deref(),
+                    user_email.as_deref(),
+                    request_context.is_health_check,
+                    ProviderOutcome::Failure {
+                        status_code: error.status.as_u16(),
+                    },
+                )
+                .await;
+            }
             return Err(error);
         }
     };
@@ -7124,6 +7405,27 @@ async fn forward_grok_media_with_execution(
         preserve_content_encoding = false;
         content_type = Some("application/json".to_string());
     }
+    response_body = match retain_request_bytes(
+        response_body,
+        Some(request_memory.budget()),
+        RequestMemoryComponent::NormalizedEvent,
+    ) {
+        Ok(body) => body,
+        Err(error) => {
+            record_grok_media_memory_exhaustion(
+                &state,
+                &stored,
+                share_id.as_deref(),
+                user_email.as_deref(),
+                started,
+                &request_context,
+                media_model.clone(),
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     maybe_mark_upstream_rate_limited(
         &state,
         &execution,
@@ -7277,6 +7579,7 @@ struct GrokImageHeartbeatArgs {
     media_model: UsageModelMetadata,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+    request_memory: GrokMediaRequestMemory,
 }
 
 enum GrokImageReadStep {
@@ -7302,6 +7605,7 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
         media_model,
         account_in_flight_guard,
         share_invocation_guard,
+        request_memory,
     } = args;
     let upstream_is_sse = content_type
         .as_deref()
@@ -7320,6 +7624,7 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
         media_model,
         account_in_flight_guard,
         share_invocation_guard,
+        request_memory,
     };
     let stream = async_stream::stream! {
         let mut transport = ImageTransportMetrics::new("grok_images", mode, started);
@@ -7333,6 +7638,11 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
 
         let mut inner = upstream.bytes_stream();
         let mut buffer = Vec::new();
+        let buffer_memory = lifecycle
+            .request_memory
+            .budget()
+            .reserve(RequestMemoryComponent::StreamRetainedState, 0)
+            .expect("zero-byte Grok image buffer reservation must succeed");
         let mut total_bytes = 0usize;
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + keepalive_interval,
@@ -7368,6 +7678,21 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
                     return;
                 }
                 GrokImageReadStep::Upstream(Ok(Some(chunk))) => {
+                    let _transport_pending = match lifecycle
+                        .request_memory
+                        .budget()
+                        .reserve(RequestMemoryComponent::TransportPending, chunk.len())
+                    {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            let error = error.into_proxy_error();
+                            lifecycle.finish_memory_exhausted(&error).await;
+                            let body = grok_image_memory_error(upstream_is_sse, &error);
+                            transport.emit(false);
+                            yield Ok(body);
+                            return;
+                        }
+                    };
                     total_bytes = total_bytes.saturating_add(chunk.len());
                     if total_bytes > super::MEDIA_RESPONSE_BODY_LIMIT_BYTES {
                         let message = format!(
@@ -7382,7 +7707,29 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
                         yield Ok(body);
                         return;
                     }
+                    let required = buffer.len().saturating_add(chunk.len());
+                    let anticipated_capacity = if required > buffer.capacity() {
+                        buffer.capacity().saturating_mul(2).max(required)
+                    } else {
+                        buffer.capacity()
+                    };
+                    if let Err(error) = buffer_memory.resize(anticipated_capacity) {
+                        let error = error.into_proxy_error();
+                        lifecycle.finish_memory_exhausted(&error).await;
+                        let body = grok_image_memory_error(upstream_is_sse, &error);
+                        transport.emit(false);
+                        yield Ok(body);
+                        return;
+                    }
                     buffer.extend_from_slice(&chunk);
+                    if let Err(error) = buffer_memory.resize(buffer.capacity()) {
+                        let error = error.into_proxy_error();
+                        lifecycle.finish_memory_exhausted(&error).await;
+                        let body = grok_image_memory_error(upstream_is_sse, &error);
+                        transport.emit(false);
+                        yield Ok(body);
+                        return;
+                    }
                     if upstream_is_sse {
                         while let Some((event_end, delimiter_len)) =
                             next_sse_event_boundary_bytes(&buffer)
@@ -7390,22 +7737,82 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
                             let end = event_end + delimiter_len;
                             let remaining = buffer.split_off(end);
                             let frame = Bytes::from(std::mem::replace(&mut buffer, remaining));
+                            let frame = match lifecycle.request_memory.budget().retain_bytes(
+                                RequestMemoryComponent::NormalizedEvent,
+                                frame,
+                            ) {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    let error = error.into_proxy_error();
+                                    lifecycle.finish_memory_exhausted(&error).await;
+                                    let body = grok_image_memory_error(upstream_is_sse, &error);
+                                    transport.emit(false);
+                                    yield Ok(body);
+                                    return;
+                                }
+                            };
+                            if let Err(error) = buffer_memory.resize(buffer.capacity()) {
+                                let error = error.into_proxy_error();
+                                lifecycle.finish_memory_exhausted(&error).await;
+                                let body = grok_image_memory_error(upstream_is_sse, &error);
+                                transport.emit(false);
+                                yield Ok(body);
+                                return;
+                            }
                             transport.emit(false);
                             yield Ok(frame);
                         }
                     }
                 }
                 GrokImageReadStep::Upstream(Ok(None)) => {
-                    if !upstream_is_sse && serde_json::from_slice::<Value>(&buffer).is_err() {
-                        let message = "Grok Images upstream returned invalid JSON";
-                        lifecycle
-                            .finish_failure(ProviderOutcome::Failure { status_code: 502 })
-                            .await;
-                        let body = grok_image_transport_error(false, message);
-                        transport.emit(false);
-                        yield Ok(body);
-                        return;
-                    }
+                    let json_parse_memory = if upstream_is_sse {
+                        None
+                    } else {
+                        match lifecycle.request_memory.budget().reserve(
+                            RequestMemoryComponent::StreamRetainedState,
+                            buffer.len().saturating_mul(2),
+                        ) {
+                            Ok(reservation) => Some(reservation),
+                            Err(error) => {
+                                let error = error.into_proxy_error();
+                                lifecycle.finish_memory_exhausted(&error).await;
+                                let body = grok_image_memory_error(false, &error);
+                                transport.emit(false);
+                                yield Ok(body);
+                                return;
+                            }
+                        }
+                    };
+                    let parsed_json = if upstream_is_sse {
+                        None
+                    } else {
+                        let value = match serde_json::from_slice::<Value>(&buffer) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                let message = "Grok Images upstream returned invalid JSON";
+                                lifecycle
+                                    .finish_failure(ProviderOutcome::Failure { status_code: 502 })
+                                    .await;
+                                let body = grok_image_transport_error(false, message);
+                                transport.emit(false);
+                                yield Ok(body);
+                                return;
+                            }
+                        };
+                        if let Some(reservation) = json_parse_memory.as_ref() {
+                            if let Err(error) = reservation.resize(retained_json_bytes(&value)) {
+                                let error = error.into_proxy_error();
+                                lifecycle.finish_memory_exhausted(&error).await;
+                                let body = grok_image_memory_error(false, &error);
+                                transport.emit(false);
+                                yield Ok(body);
+                                return;
+                            }
+                        }
+                        Some(value)
+                    };
+                    drop(parsed_json);
+                    drop(json_parse_memory);
                     let tail = if buffer.is_empty() {
                         None
                     } else if upstream_is_sse
@@ -7417,6 +7824,24 @@ fn grok_image_heartbeat_response(args: GrokImageHeartbeatArgs) -> Response {
                     } else {
                         Some(Bytes::from(buffer))
                     };
+                    let tail = match tail {
+                        Some(tail) => match lifecycle.request_memory.budget().retain_bytes(
+                            RequestMemoryComponent::NormalizedEvent,
+                            tail,
+                        ) {
+                            Ok(tail) => Some(tail),
+                            Err(error) => {
+                                let error = error.into_proxy_error();
+                                lifecycle.finish_memory_exhausted(&error).await;
+                                let body = grok_image_memory_error(upstream_is_sse, &error);
+                                transport.emit(false);
+                                yield Ok(body);
+                                return;
+                            }
+                        },
+                        None => None,
+                    };
+                    let _ = buffer_memory.resize(0);
                     lifecycle.finish_success().await;
                     if let Some(tail) = tail {
                         transport.emit(false);
@@ -7465,6 +7890,23 @@ fn grok_image_transport_error(upstream_is_sse: bool, message: &str) -> Bytes {
     }
 }
 
+fn grok_image_memory_error(upstream_is_sse: bool, error: &ProxyError) -> Bytes {
+    let payload = json!({
+        "error": {
+            "type": "server_error",
+            "code": error.error_code(),
+            "message": error.client_message(),
+        }
+    });
+    if upstream_is_sse {
+        Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+    } else {
+        serde_json::to_vec(&payload)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::from_static(b"{\"error\":{\"type\":\"server_error\",\"code\":\"cc_switch_request_memory_exhausted\",\"message\":\"request memory capacity exhausted\"}}"))
+    }
+}
+
 struct GrokImageLifecycleGuard {
     armed: bool,
     state: ServerState,
@@ -7478,6 +7920,7 @@ struct GrokImageLifecycleGuard {
     media_model: UsageModelMetadata,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
+    request_memory: GrokMediaRequestMemory,
 }
 
 async fn record_grok_media_terminal(
@@ -7492,6 +7935,43 @@ async fn record_grok_media_terminal(
     if !is_health_check {
         record_share_invocation_result(state, share_id, user_email, TokenUsage::default()).await;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_grok_media_memory_exhaustion(
+    state: &ServerState,
+    stored: &StoredProvider,
+    share_id: Option<&str>,
+    user_email: Option<&str>,
+    started: Instant,
+    request_context: &UsageLogContext,
+    model: UsageModelMetadata,
+    error: &ProxyError,
+) {
+    record_grok_media_terminal(
+        state,
+        stored,
+        share_id,
+        user_email,
+        request_context.is_health_check,
+        capacity_shed_provider_outcome(),
+    )
+    .await;
+    let mut context = request_context.clone();
+    context.stream_status = Some("memory_capacity".to_string());
+    context.outcome = Some(UsageOutcome::InternalError);
+    context.failure_kind = Some("memory_capacity".to_string());
+    context.error_message = Some(error.client_message().to_string());
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model,
+        TokenUsage::default(),
+        context,
+    )
+    .await;
 }
 
 impl GrokImageLifecycleGuard {
@@ -7529,6 +8009,35 @@ impl GrokImageLifecycleGuard {
         };
         self.finish_usage(status, Some("Grok image response failed"), "failed")
             .await;
+        self.disarm();
+    }
+
+    async fn finish_memory_exhausted(&mut self, error: &ProxyError) {
+        record_grok_media_terminal(
+            &self.state,
+            &self.stored,
+            self.share_id.as_deref(),
+            self.user_email.as_deref(),
+            self.request_context.is_health_check,
+            capacity_shed_provider_outcome(),
+        )
+        .await;
+        let mut context = self.request_context.clone();
+        context.is_streaming = true;
+        context.stream_status = Some("memory_capacity".to_string());
+        context.outcome = Some(UsageOutcome::InternalError);
+        context.failure_kind = Some("memory_capacity".to_string());
+        context.error_message = Some(error.client_message().to_string());
+        log_usage(
+            &self.state,
+            &self.stored,
+            error.status.as_u16(),
+            self.started.elapsed().as_millis(),
+            self.media_model.clone(),
+            TokenUsage::default(),
+            context,
+        )
+        .await;
         self.disarm();
     }
 
@@ -10857,6 +11366,7 @@ async fn bridge_responses_websocket_inner(
     let mut active_grok_reasoning_replay: Option<grok_provider::ReplayStreamWrite> = None;
     let mut active_grok_quality_observer: Option<Box<super::grok::GrokQualityObserver>> = None;
     let mut active_grok_reasoning_retry_message: Option<TungsteniteMessage> = None;
+    let mut active_grok_reasoning_retry_memory: Option<RequestMemoryReservation> = None;
     let mut active_grok_reasoning_recovery_attempted = false;
     let mut active_response_started_at: Option<Instant> = None;
     let mut active_usage_turn: Option<ResponsesWebsocketUsageTurn> = None;
@@ -11087,10 +11597,50 @@ async fn bridge_responses_websocket_inner(
                 };
                 let mut message = message;
                 if starts_response {
+                    let grok_reasoning_retry_memory = if matches!(mode, ResponsesWebsocketMode::Grok)
+                    {
+                        let budget = incoming_turn_memory
+                            .as_ref()
+                            .map(|(budget, _)| budget)
+                            .ok_or_else(|| {
+                                ProxyError::bad_gateway(
+                                    "Grok websocket turn memory was not initialized",
+                                )
+                            })?;
+                        match budget.reserve(
+                            RequestMemoryComponent::ReasoningReplay,
+                            websocket_message_payload_len(&message),
+                        ) {
+                            Ok(reservation) => Some(reservation),
+                            Err(error) => {
+                                let error = error.into_proxy_error();
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("memory_capacity"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let grok_reasoning_retry_message =
                         matches!(mode, ResponsesWebsocketMode::Grok).then(|| message.clone());
                     let grok_reasoning_replay = if matches!(mode, ResponsesWebsocketMode::Grok) {
-                        prepare_grok_reasoning_replay_websocket(
+                        match prepare_grok_reasoning_replay_websocket(
                             state,
                             &execution,
                             &request_context,
@@ -11098,8 +11648,33 @@ async fn bridge_responses_websocket_inner(
                             grok_session_id.as_deref(),
                             &ws_url,
                             &mut message,
+                            incoming_turn_memory.as_ref().map(|(budget, _)| budget),
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(replay) => replay,
+                            Err(error) if error.is_request_memory_exhausted() => {
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("memory_capacity"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         None
                     };
@@ -11137,8 +11712,35 @@ async fn bridge_responses_websocket_inner(
                     active_grok_reasoning_retry_message = grok_reasoning_replay
                         .as_ref()
                         .and(grok_reasoning_retry_message);
-                    active_grok_reasoning_replay =
-                        grok_reasoning_replay.map(grok_provider::ReplayStreamWrite::new);
+                    active_grok_reasoning_retry_memory = grok_reasoning_replay
+                        .as_ref()
+                        .and(grok_reasoning_retry_memory);
+                    active_grok_reasoning_replay = match grok_reasoning_replay
+                        .map(grok_provider::ReplayStreamWrite::new)
+                        .transpose()
+                    {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                    };
                     active_grok_quality_observer = matches!(mode, ResponsesWebsocketMode::Grok)
                         .then(|| Box::new(super::grok::GrokQualityObserver::new(true)));
                     active_grok_reasoning_recovery_attempted = false;
@@ -11356,6 +11958,9 @@ async fn bridge_responses_websocket_inner(
                                     &mut active_normalized_memory,
                                     &mut active_semantic_prelude_memory,
                                     &mut active_tool_argument_memory,
+                                    &mut active_grok_reasoning_replay,
+                                    &mut active_grok_reasoning_retry_message,
+                                    &mut active_grok_reasoning_retry_memory,
                                 );
                                 refresh_target_before_connect = true;
                                 continue;
@@ -11377,16 +11982,13 @@ async fn bridge_responses_websocket_inner(
                         .binding_is_current(state)
                         .await
                 {
-                    let original = active_grok_reasoning_retry_message
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| {
+                    let original = active_grok_reasoning_retry_message.take().ok_or_else(|| {
                             ProxyError::conflict(
                                 "Grok replay binding changed before the request was sent",
                             )
                         })?;
                     message = original.clone();
-                    let refreshed = prepare_grok_reasoning_replay_websocket(
+                    let refreshed = match prepare_grok_reasoning_replay_websocket(
                         state,
                         &execution,
                         &request_context,
@@ -11394,8 +11996,34 @@ async fn bridge_responses_websocket_inner(
                         grok_session_id.as_deref(),
                         &ws_url,
                         &mut message,
+                        active_attempt.request_memory(),
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(replay) => replay,
+                        Err(error) if error.is_request_memory_exhausted() => {
+                            let _failed_entry = entry.take();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     .ok_or_else(|| {
                         ProxyError::conflict(
                             "Grok replay scope changed before the request was sent",
@@ -11408,7 +12036,7 @@ async fn bridge_responses_websocket_inner(
                     }
                     active_response_body = Some(responses_websocket_http_body(&message)?);
                     active_grok_reasoning_replay =
-                        Some(grok_provider::ReplayStreamWrite::new(refreshed));
+                        Some(grok_provider::ReplayStreamWrite::new(refreshed)?);
                     active_grok_reasoning_retry_message = Some(original);
                     crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
                 }
@@ -11527,6 +12155,9 @@ async fn bridge_responses_websocket_inner(
                             &mut active_normalized_memory,
                             &mut active_semantic_prelude_memory,
                             &mut active_tool_argument_memory,
+                            &mut active_grok_reasoning_replay,
+                            &mut active_grok_reasoning_retry_message,
+                            &mut active_grok_reasoning_retry_memory,
                         );
                         refresh_target_before_connect = true;
                         continue;
@@ -11611,6 +12242,9 @@ async fn bridge_responses_websocket_inner(
                                 &mut active_normalized_memory,
                                 &mut active_semantic_prelude_memory,
                                 &mut active_tool_argument_memory,
+                                &mut active_grok_reasoning_replay,
+                                &mut active_grok_reasoning_retry_message,
+                                &mut active_grok_reasoning_retry_memory,
                             );
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
@@ -11697,6 +12331,9 @@ async fn bridge_responses_websocket_inner(
                             &mut active_normalized_memory,
                             &mut active_semantic_prelude_memory,
                             &mut active_tool_argument_memory,
+                            &mut active_grok_reasoning_replay,
+                            &mut active_grok_reasoning_retry_message,
+                            &mut active_grok_reasoning_retry_memory,
                         );
                         refresh_target_before_connect = true;
                         continue;
@@ -11798,6 +12435,9 @@ async fn bridge_responses_websocket_inner(
                             &mut active_normalized_memory,
                             &mut active_semantic_prelude_memory,
                             &mut active_tool_argument_memory,
+                            &mut active_grok_reasoning_replay,
+                            &mut active_grok_reasoning_retry_message,
+                            &mut active_grok_reasoning_retry_memory,
                         );
                         refresh_target_before_connect = true;
                         continue;
@@ -11917,6 +12557,9 @@ async fn bridge_responses_websocket_inner(
                             &mut active_normalized_memory,
                             &mut active_semantic_prelude_memory,
                             &mut active_tool_argument_memory,
+                            &mut active_grok_reasoning_replay,
+                            &mut active_grok_reasoning_retry_message,
+                            &mut active_grok_reasoning_retry_memory,
                         );
                         refresh_target_before_connect = true;
                         continue;
@@ -12004,6 +12647,9 @@ async fn bridge_responses_websocket_inner(
                                         &mut active_normalized_memory,
                                         &mut active_semantic_prelude_memory,
                                         &mut active_tool_argument_memory,
+                                        &mut active_grok_reasoning_replay,
+                                        &mut active_grok_reasoning_retry_message,
+                                        &mut active_grok_reasoning_retry_memory,
                                     );
                                     upstream_read_deadline = None;
                                     refresh_target_before_connect = true;
@@ -12036,7 +12682,27 @@ async fn bridge_responses_websocket_inner(
                 if response_in_flight {
                     if let Some(bytes) = websocket_message_payload(&message) {
                         if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                            replay.inspect(bytes);
+                            if let Err(error) = replay.inspect(bytes) {
+                                let _failed_entry = entry.take();
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("memory_capacity"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -12063,9 +12729,31 @@ async fn bridge_responses_websocket_inner(
                             "Grok reasoning recovery request was not retained",
                         ));
                     };
+                    let grok_reasoning_retry_memory =
+                        active_grok_reasoning_retry_memory.take();
                     let retry_body = responses_websocket_http_body(&retry_message)?;
                     if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                        replay.clear_rejected_and_reset(state).await;
+                        if let Err(error) = replay.clear_rejected_and_reset(state).await {
+                            let _failed_entry = entry.take();
+                            let error_body = websocket_stream_error_body(
+                                error.client_message(),
+                                error.error_code(),
+                            );
+                            return terminate_responses_websocket_with_error(
+                                &mut downstream,
+                                &mut output_patcher,
+                                mode,
+                                state,
+                                &execution,
+                                &mut pending_lifecycle_messages,
+                                error,
+                                Some("memory_capacity"),
+                                error_body,
+                                None,
+                                &mut active_usage_turn,
+                            )
+                            .await;
+                        }
                     }
                     pending_lifecycle_messages.clear();
                     if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
@@ -12101,6 +12789,7 @@ async fn bridge_responses_websocket_inner(
                         active_attempt.request_memory(),
                     )
                     .await;
+                    drop(grok_reasoning_retry_memory);
                     let error = match retry_send {
                         Ok(ResponsesWebsocketSendOutcome::Sent) => None,
                         Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
@@ -12314,6 +13003,9 @@ async fn bridge_responses_websocket_inner(
                                 &mut active_normalized_memory,
                                 &mut active_semantic_prelude_memory,
                                 &mut active_tool_argument_memory,
+                                &mut active_grok_reasoning_replay,
+                                &mut active_grok_reasoning_retry_message,
+                                &mut active_grok_reasoning_retry_memory,
                             );
                             upstream_read_deadline = None;
                             refresh_target_before_connect = true;
@@ -12397,7 +13089,6 @@ async fn bridge_responses_websocket_inner(
                     let usage_terminal = semantic_terminal
                         .clone()
                         .unwrap_or(SemanticTerminal::Success);
-                    finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
                     let completed_success =
                         matches!(semantic_terminal, Some(SemanticTerminal::Success))
                             || (semantic_observation.is_none()
@@ -12417,13 +13108,35 @@ async fn bridge_responses_websocket_inner(
                             );
                         }
                         if let Some(replay) = active_grok_reasoning_replay.take() {
-                            replay.commit(state).await;
+                            if let Err(error) = replay.commit(state).await {
+                                let _failed_entry = entry.take();
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("memory_capacity"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
                         }
                     } else {
                         active_grok_reasoning_replay = None;
                     }
+                    finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
                     active_grok_quality_observer = None;
                     active_grok_reasoning_retry_message = None;
+                    active_grok_reasoning_retry_memory = None;
                     active_response_started_at = None;
                     response_in_flight = false;
                     response_create_committed = false;
@@ -12515,6 +13228,9 @@ async fn bridge_responses_websocket_inner(
                         &mut active_normalized_memory,
                         &mut active_semantic_prelude_memory,
                         &mut active_tool_argument_memory,
+                        &mut active_grok_reasoning_replay,
+                        &mut active_grok_reasoning_retry_message,
+                        &mut active_grok_reasoning_retry_memory,
                     );
                 }
                 if closes || upstream_closed {
@@ -12566,12 +13282,18 @@ fn reserve_responses_websocket_turn_memory(
     Ok((normalized, semantic_prelude, tool_arguments))
 }
 
+// Keep every turn-scoped reservation visible at the release boundary. Grouping
+// them would make it easier to leave retained state behind on fallback paths.
+#[allow(clippy::too_many_arguments)]
 fn release_responses_websocket_turn_memory(
     entry: Option<&CachedResponsesWebSocket>,
     active_attempt: &mut ForwardAttemptContext,
     normalized: &mut Option<RequestMemoryReservation>,
     semantic_prelude: &mut Option<RequestMemoryReservation>,
     tool_arguments: &mut Option<RequestMemoryReservation>,
+    grok_reasoning_replay: &mut Option<grok_provider::ReplayStreamWrite>,
+    grok_reasoning_retry_message: &mut Option<TungsteniteMessage>,
+    grok_reasoning_retry_memory: &mut Option<RequestMemoryReservation>,
 ) {
     if let Some(entry) = entry {
         entry.socket.set_request_memory(None);
@@ -12579,6 +13301,9 @@ fn release_responses_websocket_turn_memory(
     normalized.take();
     semantic_prelude.take();
     tool_arguments.take();
+    grok_reasoning_replay.take();
+    grok_reasoning_retry_message.take();
+    grok_reasoning_retry_memory.take();
     active_attempt.raw_body_memory.take();
     active_attempt.request_memory.take();
 }
@@ -14306,6 +15031,9 @@ fn grok_websocket_completed_success(message: &TungsteniteMessage) -> bool {
             .is_none_or(|status| status == "completed")
 }
 
+// The WebSocket replay boundary deliberately carries the complete binding and
+// the shared request-memory budget used by the HTTP replay implementation.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_grok_reasoning_replay_websocket(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -14314,12 +15042,73 @@ async fn prepare_grok_reasoning_replay_websocket(
     session_id: Option<&str>,
     upstream_url: &str,
     message: &mut TungsteniteMessage,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<Option<grok_provider::ReplayWriteContext>, ProxyError> {
-    let body = responses_websocket_http_body(message)?;
-    let original = serde_json::to_vec(&body).map_err(|error| {
-        ProxyError::bad_request(format!("encode Grok response.create body: {error}"))
+    let binary = matches!(message, TungsteniteMessage::Binary(_));
+    let payload_len = websocket_message_payload_len(message);
+    let transform_memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    payload_len.saturating_mul(2),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
+    let bytes = websocket_message_payload(message).ok_or_else(|| {
+        ProxyError::bad_request("response.create must be a text or binary JSON frame")
     })?;
-    let mut encoded = Bytes::from(original.clone());
+    let mut frame = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+        ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
+    })?;
+    if frame.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err(ProxyError::bad_request(
+            "Responses HTTP fallback requires a response.create frame",
+        ));
+    }
+    if let Some(reservation) = transform_memory.as_ref() {
+        reservation
+            .resize(retained_json_bytes(&frame).saturating_add(payload_len))
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    let nested = frame.get("response").is_some();
+    let body = if nested {
+        frame
+            .as_object_mut()
+            .expect("response.create frame was validated as an object")
+            .remove("response")
+            .filter(Value::is_object)
+            .ok_or_else(|| ProxyError::bad_request("response.create.response must be an object"))?
+    } else {
+        let object = frame
+            .as_object_mut()
+            .ok_or_else(|| ProxyError::bad_request("response.create payload must be an object"))?;
+        object.remove("type");
+        std::mem::take(&mut frame)
+    };
+    if let Some(reservation) = transform_memory.as_ref() {
+        reservation
+            .resize(
+                retained_json_bytes(&frame)
+                    .saturating_add(retained_json_bytes(&body))
+                    .saturating_add(payload_len),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    let original = Bytes::from(serde_json::to_vec(&body).map_err(|error| {
+        ProxyError::bad_request(format!("encode Grok response.create body: {error}"))
+    })?);
+    if let Some(reservation) = transform_memory.as_ref() {
+        reservation
+            .resize(
+                retained_json_bytes(&frame)
+                    .saturating_add(retained_json_bytes(&body))
+                    .saturating_add(original.len()),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    let mut encoded = original.clone();
     let context = grok_provider::prepare_transport_replay(
         state,
         execution,
@@ -14330,59 +15119,77 @@ async fn prepare_grok_reasoning_replay_websocket(
         "websocket",
         false,
         &mut encoded,
+        request_memory,
     )
     .await?;
-    if encoded.as_ref() != original.as_slice() {
-        replace_responses_websocket_http_body(message, &encoded)?;
+    if encoded != original {
+        if let Some(reservation) = transform_memory.as_ref() {
+            reservation
+                .resize(
+                    retained_json_bytes(&frame)
+                        .saturating_add(retained_json_bytes(&body))
+                        .saturating_add(original.len())
+                        .saturating_add(encoded.len().saturating_mul(2)),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        let replay_body = serde_json::from_slice::<Value>(&encoded).map_err(|error| {
+            ProxyError::bad_request(format!("invalid Grok replay response body: {error}"))
+        })?;
+        if !replay_body.is_object() {
+            return Err(ProxyError::bad_request(
+                "Grok replay response body must be an object",
+            ));
+        }
+        let rebuilt = if nested {
+            frame
+                .as_object_mut()
+                .expect("response.create frame was validated as an object")
+                .insert("response".to_string(), replay_body);
+            frame
+        } else {
+            let mut object = replay_body
+                .as_object()
+                .expect("Grok replay response body was validated as an object")
+                .clone();
+            object.insert(
+                "type".to_string(),
+                Value::String("response.create".to_string()),
+            );
+            Value::Object(object)
+        };
+        if let Some(reservation) = transform_memory.as_ref() {
+            reservation
+                .resize(
+                    retained_json_bytes(&rebuilt)
+                        .saturating_add(original.len())
+                        .saturating_add(encoded.len())
+                        .saturating_add(payload_len),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        let rebuilt = serde_json::to_vec(&rebuilt).map_err(|error| {
+            ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
+        })?;
+        if let Some(reservation) = transform_memory.as_ref() {
+            reservation
+                .resize(
+                    original
+                        .len()
+                        .saturating_add(encoded.len())
+                        .saturating_add(rebuilt.len()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        *message = if binary {
+            TungsteniteMessage::Binary(rebuilt)
+        } else {
+            TungsteniteMessage::Text(String::from_utf8(rebuilt).map_err(|error| {
+                ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
+            })?)
+        };
     }
     Ok(context)
-}
-
-fn replace_responses_websocket_http_body(
-    message: &mut TungsteniteMessage,
-    body: &[u8],
-) -> Result<(), ProxyError> {
-    let binary = matches!(message, TungsteniteMessage::Binary(_));
-    let bytes = websocket_message_payload(message).ok_or_else(|| {
-        ProxyError::bad_request("response.create must be a text or binary JSON frame")
-    })?;
-    let mut frame = serde_json::from_slice::<Value>(bytes).map_err(|error| {
-        ProxyError::bad_request(format!("invalid response.create JSON: {error}"))
-    })?;
-    let body = serde_json::from_slice::<Value>(body).map_err(|error| {
-        ProxyError::bad_request(format!("invalid Grok replay response body: {error}"))
-    })?;
-    if !body.is_object() {
-        return Err(ProxyError::bad_request(
-            "Grok replay response body must be an object",
-        ));
-    }
-    if frame.get("response").is_some() {
-        frame
-            .as_object_mut()
-            .expect("response.create frame was validated as an object")
-            .insert("response".to_string(), body);
-    } else {
-        let mut object = body
-            .as_object()
-            .expect("Grok replay response body was validated as an object")
-            .clone();
-        object.insert(
-            "type".to_string(),
-            Value::String("response.create".to_string()),
-        );
-        frame = Value::Object(object);
-    }
-    *message = if binary {
-        TungsteniteMessage::Binary(serde_json::to_vec(&frame).map_err(|error| {
-            ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
-        })?)
-    } else {
-        TungsteniteMessage::Text(serde_json::to_string(&frame).map_err(|error| {
-            ProxyError::bad_request(format!("encode Grok replay response.create: {error}"))
-        })?)
-    };
-    Ok(())
 }
 
 fn inject_previous_response_context_into_websocket_message(
@@ -15521,85 +16328,94 @@ async fn terminate_responses_websocket_without_terminal(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn terminate_responses_websocket_with_error(
-    downstream: &mut WebSocket,
-    output_patcher: &mut CodexWebsocketOutputPatcher,
+fn terminate_responses_websocket_with_error<'a>(
+    downstream: &'a mut WebSocket,
+    output_patcher: &'a mut CodexWebsocketOutputPatcher,
     mode: ResponsesWebsocketMode,
-    state: &ServerState,
-    execution: &ProviderExecution,
-    pending_lifecycle_messages: &mut Vec<TungsteniteMessage>,
+    state: &'a ServerState,
+    execution: &'a ProviderExecution,
+    pending_lifecycle_messages: &'a mut Vec<TungsteniteMessage>,
     error: ProxyError,
     metric_kind: Option<&'static str>,
     error_body: String,
     provider_outcome: Option<ProviderOutcome>,
-    active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
-) -> Result<(), ProxyError> {
-    if error.is_request_memory_exhausted() {
-        pending_lifecycle_messages.clear();
-        output_patcher.clear_output_items();
-    }
-    if let Some(metric_kind) = metric_kind {
-        crate::metrics::record_proxy_semantic_guard("websocket", metric_kind);
-    }
-    if let Some(outcome) = provider_outcome {
-        record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
-    }
-    let stream_status = if error.is_request_memory_exhausted() {
-        "memory_capacity"
-    } else if error.is_protocol_incompatible() {
-        "protocol_incompatible"
-    } else if error.status.is_client_error() {
-        "client_error"
-    } else {
-        "interrupted"
-    };
-    finish_active_websocket_usage(
-        active_usage_turn,
-        error.status.as_u16(),
-        stream_status,
-        Some(error.client_message().to_string()),
-    )
-    .await;
+    active_usage_turn: &'a mut Option<ResponsesWebsocketUsageTurn>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + 'a>> {
+    Box::pin(async move {
+        if error.is_request_memory_exhausted() {
+            pending_lifecycle_messages.clear();
+            output_patcher.clear_output_items();
+        }
+        if let Some(metric_kind) = metric_kind {
+            crate::metrics::record_proxy_semantic_guard("websocket", metric_kind);
+        }
+        if let Some(outcome) = provider_outcome {
+            record_provider_outcome(state, &execution.runtime_stored_view(), outcome).await;
+        }
+        let stream_status = if error.is_request_memory_exhausted() {
+            "memory_capacity"
+        } else if error.is_protocol_incompatible() {
+            "protocol_incompatible"
+        } else if error.status.is_client_error() {
+            "client_error"
+        } else {
+            "interrupted"
+        };
+        finish_active_websocket_usage(
+            active_usage_turn,
+            error.status.as_u16(),
+            stream_status,
+            Some(error.client_message().to_string()),
+        )
+        .await;
 
-    for pending in pending_lifecycle_messages.drain(..) {
-        if send_responses_websocket_message(downstream, output_patcher, mode, pending, None, None)
+        for pending in pending_lifecycle_messages.drain(..) {
+            if send_responses_websocket_message(
+                downstream,
+                output_patcher,
+                mode,
+                pending,
+                None,
+                None,
+            )
             .await?
+            {
+                return Ok(());
+            }
+        }
+        if send_responses_websocket_message(
+            downstream,
+            output_patcher,
+            mode,
+            TungsteniteMessage::Text(error_body),
+            None,
+            None,
+        )
+        .await?
         {
             return Ok(());
         }
-    }
-    if send_responses_websocket_message(
-        downstream,
-        output_patcher,
-        mode,
-        TungsteniteMessage::Text(error_body),
-        None,
-        None,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let close_reason = if error.is_request_memory_exhausted() {
-        "request memory capacity exhausted"
-    } else if error.status.is_client_error() {
-        "request rejected by protocol adapter"
-    } else {
-        "upstream response ended without terminal event"
-    };
-    let _ = send_responses_websocket_message(
-        downstream,
-        output_patcher,
-        mode,
-        TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
-            code: CloseCode::Error,
-            reason: close_reason.into(),
-        })),
-        None,
-        None,
-    )
-    .await?;
-    Err(error)
+        let close_reason = if error.is_request_memory_exhausted() {
+            "request memory capacity exhausted"
+        } else if error.status.is_client_error() {
+            "request rejected by protocol adapter"
+        } else {
+            "upstream response ended without terminal event"
+        };
+        let _ = send_responses_websocket_message(
+            downstream,
+            output_patcher,
+            mode,
+            TungsteniteMessage::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: CloseCode::Error,
+                reason: close_reason.into(),
+            })),
+            None,
+            None,
+        )
+        .await?;
+        Err(error)
+    })
 }
 
 async fn responses_websocket_connect_error(
@@ -24037,6 +24853,32 @@ fn resize_claude_prime_memory(
         .map_err(|error| error.into_proxy_error())
 }
 
+fn grok_prime_retained_bytes(
+    terminal_detector: &UpstreamTerminalDetector,
+    grok_responses_sse: Option<&super::grok::GrokResponsesSseInspector>,
+) -> usize {
+    terminal_detector
+        .retained_bytes()
+        .saturating_add(grok_responses_sse.map_or(0, |inspector| inspector.retained_bytes()))
+}
+
+fn resize_grok_prime_memory(
+    reservation: Option<&RequestMemoryReservation>,
+    terminal_detector: &UpstreamTerminalDetector,
+    grok_responses_sse: Option<&super::grok::GrokResponsesSseInspector>,
+    additional_bytes: usize,
+) -> Result<(), ProxyError> {
+    let Some(reservation) = reservation else {
+        return Ok(());
+    };
+    reservation
+        .resize(
+            grok_prime_retained_bytes(terminal_detector, grok_responses_sse)
+                .saturating_add(additional_bytes),
+        )
+        .map_err(|error| error.into_proxy_error())
+}
+
 struct StreamForwardState {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     stored: StoredProvider,
@@ -24091,6 +24933,8 @@ struct StreamForwardState {
     downstream_pending_memory: Option<RequestMemoryReservation>,
     antigravity_transform_memory: Option<RequestMemoryReservation>,
     claude_stream_memory: Option<RequestMemoryReservation>,
+    grok_stream_memory: Option<RequestMemoryReservation>,
+    pending_grok_stream_error: Option<ProxyError>,
 }
 
 #[derive(Clone)]
@@ -24100,7 +24944,49 @@ struct CodexRateLimitContext {
     model: Option<String>,
 }
 
+type BoxedStreamForwardStep = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Option<(Bytes, Box<StreamForwardState>)>, std::io::Error>,
+            > + Send,
+    >,
+>;
+
 impl StreamForwardState {
+    fn retained_grok_stream_bytes(&self) -> usize {
+        self.terminal_detector
+            .retained_bytes()
+            .saturating_add(self.usage.retained_bytes())
+            .saturating_add(
+                self.grok_responses_sse
+                    .as_deref()
+                    .map_or(0, |inspector| inspector.retained_bytes()),
+            )
+            .saturating_add(self.claude_tool_name_stream_patcher.retained_bytes())
+            .saturating_add(self.stream_transform.retained_bytes())
+    }
+
+    fn preflight_grok_stream_growth(&self, additional_bytes: usize) -> Result<(), ProxyError> {
+        let Some(reservation) = self.grok_stream_memory.as_ref() else {
+            return Ok(());
+        };
+        reservation
+            .resize(
+                self.retained_grok_stream_bytes()
+                    .saturating_add(additional_bytes),
+            )
+            .map_err(|error| error.into_proxy_error())
+    }
+
+    fn resize_grok_stream_memory(&self) -> Result<(), ProxyError> {
+        let Some(reservation) = self.grok_stream_memory.as_ref() else {
+            return Ok(());
+        };
+        reservation
+            .resize(self.retained_grok_stream_bytes())
+            .map_err(|error| error.into_proxy_error())
+    }
+
     fn retained_claude_stream_bytes(&self) -> usize {
         self.terminal_detector
             .retained_bytes()
@@ -24120,27 +25006,30 @@ impl StreamForwardState {
     }
 
     fn preflight_claude_stream_growth(&self, additional_bytes: usize) -> Result<(), ProxyError> {
-        let Some(reservation) = self.claude_stream_memory.as_ref() else {
-            return Ok(());
-        };
-        reservation
-            .resize(
-                self.retained_claude_stream_bytes()
-                    .saturating_add(additional_bytes),
-            )
-            .map_err(|error| error.into_proxy_error())
+        if let Some(reservation) = self.claude_stream_memory.as_ref() {
+            reservation
+                .resize(
+                    self.retained_claude_stream_bytes()
+                        .saturating_add(additional_bytes),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        self.preflight_grok_stream_growth(additional_bytes)
     }
 
     fn resize_claude_stream_memory(&self) -> Result<(), ProxyError> {
-        let Some(reservation) = self.claude_stream_memory.as_ref() else {
-            return Ok(());
-        };
-        reservation
-            .resize(self.retained_claude_stream_bytes())
-            .map_err(|error| error.into_proxy_error())
+        if let Some(reservation) = self.claude_stream_memory.as_ref() {
+            reservation
+                .resize(self.retained_claude_stream_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        self.resize_grok_stream_memory()
     }
 
     fn transform_stream_chunk(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
+        if let Some(error) = self.pending_grok_stream_error.take() {
+            return Err(error);
+        }
         self.preflight_claude_stream_growth(chunk.len())?;
         if let Some(reservation) = self.antigravity_transform_memory.as_ref() {
             reservation
@@ -24307,13 +25196,37 @@ async fn update_terminal_usage_error(state: &ServerState, request_id: &str, mess
 }
 
 impl StreamForwardState {
+    fn terminate_transform_error_boxed(
+        self: Box<Self>,
+        error: ProxyError,
+    ) -> BoxedStreamForwardStep {
+        Box::pin(self.terminate_transform_error(error))
+    }
+
     async fn inspect_grok_responses_chunk(&mut self, chunk: Bytes) -> Bytes {
-        let Some(inspector) = self.grok_responses_sse.as_mut() else {
+        if self.grok_responses_sse.is_none() {
             return chunk;
+        }
+        if let Err(error) = self.preflight_grok_stream_growth(chunk.len()) {
+            self.pending_grok_stream_error = Some(error);
+            return Bytes::new();
+        }
+        let (output, observed_search, quality_observation) = {
+            let inspector = self
+                .grok_responses_sse
+                .as_mut()
+                .expect("Grok inspector was checked");
+            let output = inspector.push(chunk);
+            (
+                output,
+                inspector.take_search_observation(),
+                inspector.take_quality_observation(),
+            )
         };
-        let output = inspector.push(chunk);
-        let observed_search = inspector.take_search_observation();
-        let quality_observation = inspector.take_quality_observation();
+        if let Err(error) = self.resize_grok_stream_memory() {
+            self.pending_grok_stream_error = Some(error);
+            return Bytes::new();
+        }
         self.record_grok_search_observation(observed_search).await;
         if let Some(observation) = quality_observation {
             crate::metrics::record_grok_quality_observation(
@@ -24346,15 +25259,17 @@ impl StreamForwardState {
 
     fn inspect_grok_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
         if let Some(replay) = self.grok_reasoning_replay.as_mut() {
-            replay.inspect(chunk);
+            if let Err(error) = replay.inspect(chunk) {
+                self.pending_grok_stream_error = Some(error);
+            }
         }
     }
 
-    async fn finish_grok_reasoning_replay_stream(&mut self) {
+    async fn finish_grok_reasoning_replay_stream(&mut self) -> Result<(), ProxyError> {
         let Some(replay) = self.grok_reasoning_replay.take() else {
-            return;
+            return Ok(());
         };
-        replay.commit(&self.state).await;
+        replay.commit(&self.state).await
     }
 
     async fn commit_antigravity_reasoning_replay_stream(&mut self) -> Result<(), ProxyError> {
@@ -24382,12 +25297,33 @@ impl StreamForwardState {
     }
 
     async fn finish_grok_responses_inspection(&mut self) -> Bytes {
-        let Some(inspector) = self.grok_responses_sse.as_mut() else {
+        let Some(retained) = self
+            .grok_responses_sse
+            .as_deref()
+            .map(super::grok::GrokResponsesSseInspector::retained_bytes)
+        else {
             return Bytes::new();
         };
-        let output = inspector.finish();
-        let observed_search = inspector.take_search_observation();
-        let quality_observation = inspector.finish_quality_observation();
+        if let Err(error) = self.preflight_grok_stream_growth(retained) {
+            self.pending_grok_stream_error = Some(error);
+            return Bytes::new();
+        }
+        let (output, observed_search, quality_observation) = {
+            let inspector = self
+                .grok_responses_sse
+                .as_mut()
+                .expect("Grok inspector was checked");
+            let output = inspector.finish();
+            (
+                output,
+                inspector.take_search_observation(),
+                inspector.finish_quality_observation(),
+            )
+        };
+        if let Err(error) = self.resize_grok_stream_memory() {
+            self.pending_grok_stream_error = Some(error);
+            return Bytes::new();
+        }
         self.record_grok_search_observation(observed_search).await;
         if let Some(observation) = quality_observation {
             crate::metrics::record_grok_quality_observation(
@@ -24678,16 +25614,17 @@ impl StreamForwardState {
     }
 
     async fn terminate_transform_error(
-        mut self,
+        mut self: Box<Self>,
         error: ProxyError,
-    ) -> Result<Option<(Bytes, Self)>, std::io::Error> {
+    ) -> Result<Option<(Bytes, Box<Self>)>, std::io::Error> {
         let message = error.client_message().to_string();
-        let stream_status =
-            if stream_error_code_and_message(&message).0 == "upstream_stream_protocol_error" {
-                "protocol_error"
-            } else {
-                "transform_error"
-            };
+        let stream_status = if error.is_request_memory_exhausted() {
+            "memory_capacity"
+        } else if stream_error_code_and_message(&message).0 == "upstream_stream_protocol_error" {
+            "protocol_error"
+        } else {
+            "transform_error"
+        };
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
         let usage = usage_result.usage;
         let status = error.status.as_u16();
@@ -28142,9 +29079,9 @@ mod tests {
                                 "data: {\"backend_uuid\":\"pplx-session\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"fixture-\"]}}]}\n\n",
                                 "data: {\"status\":\"COMPLETED\",\"backend_uuid\":\"pplx-session\",\"blocks\":[{\"intended_usage\":\"ask_text\",\"markdown_block\":{\"chunks\":[\"fixture-answer\"]}}]}\n\n",
                                 "event: end_of_stream\n\n"
-                            ),
-                        )
-                    };
+            ),
+        )
+    };
                     let chunks = wire
                         .as_bytes()
                         .chunks(3)
@@ -28989,6 +29926,110 @@ mod tests {
             AppKind::Gemini,
             Some(ProviderType::GeminiCli)
         ));
+    }
+
+    #[test]
+    fn grok_oauth_request_memory_scope_is_provider_exact() {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::GrokOAuth)
+            ));
+        }
+        for provider_type in [
+            ProviderType::DeepSeekApi,
+            ProviderType::Claude,
+            ProviderType::ClaudeAuth,
+            ProviderType::GeminiCli,
+        ] {
+            assert!(!request_memory_enabled_for_provider(
+                AppKind::Claude,
+                Some(provider_type)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_share_and_pinned_provider_fail_before_upstream_network() {
+        let body = Bytes::from_static(
+            br#"{"model":"grok-4.6","stream":false,"input":"reject before Grok network"}"#,
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"status":"completed","output":[]}))
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut state = forwarder_test_state("grok-request-memory-pre-network");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len().saturating_add(1);
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-request-memory-pre-network",
+            format!("http://{address}/v1"),
+            None,
+            "grok-request-memory-access",
+            None,
+            &[],
+        )
+        .await;
+        let share_id = "grok-request-memory-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
+        let mut pinned_headers = HeaderMap::new();
+        pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        pinned_headers.insert(
+            "x-cc-switch-session-id",
+            HeaderValue::from_static("grok-memory-session"),
+        );
+
+        let pinned_error = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            pinned_headers.clone(),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            pinned_error.is_request_memory_exhausted(),
+            "{pinned_error:?}"
+        );
+
+        let mut share_headers = pinned_headers;
+        share_headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        share_headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let share_error = forward(state, ProxyRoute::CodexResponses, None, share_headers, body)
+            .await
+            .unwrap_err();
+        assert!(share_error.is_request_memory_exhausted(), "{share_error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]
@@ -41428,6 +42469,11 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let state = forwarder_test_state("grok-image-json-heartbeat");
         let execution =
             grok_image_test_execution(&state, "grok-image-json-heartbeat", upstream.address).await;
+        let request_memory = GrokMediaRequestMemory::new(
+            state.request_body_limits.memory_budget_bytes,
+            br#"{"model":"grok-imagine","prompt":"draw"}"#.len(),
+        )
+        .unwrap();
         let response = forward_grok_media_with_execution(
             state.clone(),
             execution,
@@ -41442,6 +42488,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             },
             None,
             None,
+            request_memory,
         )
         .await
         .unwrap();
@@ -41502,6 +42549,11 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let state = forwarder_test_state("grok-image-sse-heartbeat");
         let execution =
             grok_image_test_execution(&state, "grok-image-sse-heartbeat", upstream.address).await;
+        let request_memory = GrokMediaRequestMemory::new(
+            state.request_body_limits.memory_budget_bytes,
+            br#"{"model":"grok-imagine","prompt":"draw","stream":true}"#.len(),
+        )
+        .unwrap();
         let response = forward_grok_media_with_execution(
             state,
             execution,
@@ -41513,6 +42565,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             UsageLogContext::default(),
             None,
             None,
+            request_memory,
         )
         .await
         .unwrap();
@@ -41544,6 +42597,295 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     }
 
     #[tokio::test]
+    async fn grok_shared_image_route_rejects_decode_expansion_before_network() {
+        let plain = Bytes::from(
+            json!({
+                "model":"grok-imagine",
+                "prompt":"x".repeat(32 * 1024)
+            })
+            .to_string(),
+        );
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = axum::Router::new().fallback(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut state = forwarder_test_state("grok-shared-image-decode-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = compressed.len().saturating_add(1024);
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-shared-image-decode-memory",
+            format!("http://{address}/v1"),
+            None,
+            "grok-shared-image-decode-memory-access",
+            None,
+            &[GrokAccountCapability::ImageGeneration],
+        )
+        .await;
+        let share_id = "grok-shared-image-decode-memory-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_str(share_id).unwrap(),
+        );
+        headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+
+        let error = forward_images_generations(state, headers, compressed)
+            .await
+            .unwrap_err();
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_image_edit_base64_expansion_exhausts_before_network() {
+        let boundary = "grok-memory-boundary";
+        let mut multipart = Vec::new();
+        multipart.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nreplace sky\r\n"
+            )
+            .as_bytes(),
+        );
+        multipart.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        multipart.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        multipart.extend(std::iter::repeat_n(7_u8, 2048));
+        multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let body = Bytes::from(multipart);
+
+        let mut state = forwarder_test_state("grok-image-edit-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len().saturating_add(32);
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-image-edit-memory",
+            "http://127.0.0.1:9".to_string(),
+            None,
+            "grok-image-edit-memory-access",
+            None,
+            &[GrokAccountCapability::ImageEdit],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+        headers.insert("x-cc-switch-health-check", HeaderValue::from_static("1"));
+        headers.insert(
+            "x-cc-switch-share-id",
+            HeaderValue::from_static("test-share:grok-image-edit-memory"),
+        );
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_grok_image_edit_memory"),
+        );
+
+        let error = forward_grok_media_provider_test(
+            state.clone(),
+            execution,
+            Method::POST,
+            "/images/edits".to_string(),
+            headers,
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_request_memory_exhausted());
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_image_edit_memory")
+            .unwrap();
+        assert_eq!(log.status_code, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(log.failure_kind.as_deref(), Some("memory_capacity"));
+    }
+
+    #[tokio::test]
+    async fn grok_media_response_decode_expansion_is_capacity_shed_without_retry() {
+        let expanded = Bytes::from(
+            json!({
+                "request_id":"video-memory-response",
+                "status":"queued",
+                "padding":"x".repeat(64 * 1024)
+            })
+            .to_string(),
+        );
+        let compressed = Bytes::from(gzip_bytes(&expanded));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let response_body = compressed.clone();
+        let upstream = axum::Router::new().route(
+            "/v1/videos/generations",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                let response_body = response_body.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(CONTENT_ENCODING, "gzip")
+                        .body(Body::from(response_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut state = forwarder_test_state("grok-media-response-decode-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 8 * 1024;
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-media-response-decode-memory",
+            format!("http://{address}/v1"),
+            None,
+            "grok-media-response-decode-memory-access",
+            None,
+            &[GrokAccountCapability::VideoGeneration],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_grok_media_response_decode_memory"),
+        );
+        let body =
+            Bytes::from_static(br#"{"model":"grok-imagine-video","prompt":"bounded response"}"#);
+
+        let error = forward_grok_media_provider_test(
+            state.clone(),
+            execution,
+            Method::POST,
+            "/videos/generations".to_string(),
+            headers,
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_media_response_decode_memory")
+            .unwrap();
+        assert_eq!(log.status_code, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(log.failure_kind.as_deref(), Some("memory_capacity"));
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_image_stream_memory_exhaustion_emits_stable_terminal() {
+        let upstream_payload = Bytes::from(
+            json!({"created":1,"data":[{"b64_json":"x".repeat(8 * 1024)}]}).to_string(),
+        );
+        let upstream = spawn_test_grok_image_upstream(
+            "application/json",
+            vec![(Duration::ZERO, upstream_payload.clone())],
+        )
+        .await;
+        let state = forwarder_test_state("grok-image-stream-memory");
+        let execution =
+            grok_image_test_execution(&state, "grok-image-stream-memory", upstream.address).await;
+        let request_body = Bytes::from_static(br#"{"model":"grok-imagine","prompt":"draw"}"#);
+        let request_memory = GrokMediaRequestMemory::new(
+            request_body
+                .len()
+                .saturating_mul(2)
+                .saturating_add(upstream_payload.len())
+                .saturating_add(128),
+            request_body.len(),
+        )
+        .unwrap();
+        let response = forward_grok_media_with_execution(
+            state.clone(),
+            execution,
+            Method::POST,
+            "/images/generations".to_string(),
+            HeaderMap::new(),
+            request_body,
+            None,
+            UsageLogContext {
+                request_id: Some("req_grok_image_stream_memory".to_string()),
+                ..UsageLogContext::default()
+            },
+            None,
+            None,
+            request_memory,
+        )
+        .await
+        .unwrap();
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value.pointer("/error/code").and_then(Value::as_str),
+            Some("cc_switch_request_memory_exhausted")
+        );
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_image_stream_memory")
+            .unwrap();
+        assert_eq!(log.status_code, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        assert_eq!(log.stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(log.failure_kind.as_deref(), Some("memory_capacity"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
     async fn grok_image_cancel_holds_account_and_share_leases_through_accounting() {
         let name = "grok-image-cancel-leases";
         let upstream = spawn_test_grok_image_upstream("application/json", Vec::new()).await;
@@ -41556,6 +42898,11 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .unwrap();
         let share_id = "test-share:grok-image-cancel-share";
         let share_guard = state.share_in_flight.try_acquire(share_id, None).unwrap();
+        let request_memory = GrokMediaRequestMemory::new(
+            state.request_body_limits.memory_budget_bytes,
+            br#"{"model":"grok-imagine","prompt":"draw"}"#.len(),
+        )
+        .unwrap();
         let response = forward_grok_media_with_execution(
             state.clone(),
             execution,
@@ -41570,6 +42917,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             },
             Some(account_guard),
             Some(share_guard),
+            request_memory,
         )
         .await
         .unwrap();
@@ -46032,6 +47380,141 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .count()
     }
 
+    async fn seed_large_grok_reasoning_replay(
+        state: &ServerState,
+        execution: &ProviderExecution,
+        share_id: &str,
+        session_id: &str,
+        turn_index: u64,
+        rail: &str,
+        upstream_plane: &str,
+    ) {
+        let (_, account_id, auth_identity_generation) =
+            execution.managed_account_identity_target().unwrap();
+        let account = state
+            .find_account_for_provider(ProviderType::GrokOAuth, account_id)
+            .await
+            .unwrap();
+        let scope = GrokReplayScope::derive(
+            execution.plan.provider_key.app.as_str(),
+            &execution.stored.provider.id,
+            execution.plan.provider_revision,
+            &execution.plan.runtime_fingerprint,
+            account_id,
+            auth_identity_generation,
+            account.token_refresh_generation,
+            share_id,
+            &super::super::grok_replay::user_namespace("owner@example.com").unwrap(),
+            session_id,
+            turn_index,
+            &super::super::grok_replay::model_family("grok-4.6").unwrap(),
+            rail,
+            upstream_plane,
+        )
+        .unwrap();
+        let proof = super::super::grok_replay::capture_document(
+            &serde_json::to_vec(&json!({
+                "status":"completed",
+                "output":[
+                    {
+                        "type":"reasoning",
+                        "encrypted_content":format!("opaque-{}", "x".repeat(16 * 1024))
+                    },
+                    {
+                        "type":"function_call",
+                        "call_id":"call_1",
+                        "name":"lookup",
+                        "arguments":"{\"x\":1}"
+                    },
+                    {
+                        "type":"function_call",
+                        "call_id":"call_2",
+                        "name":"lookup",
+                        "arguments":"{\"x\":2}"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let now_ms = current_time_ms().min(i64::MAX as u128) as i64;
+        let (_, snapshot) = state.grok_reasoning_replays.get(&scope, now_ms).await;
+        assert!(
+            state
+                .grok_reasoning_replays
+                .replace_if_unchanged(scope, snapshot, proof, now_ms)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_http_reasoning_replay_memory_exhaustion_stops_before_network() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = axum::Router::new().fallback(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let continuation = grok_replay_continuation_body(false);
+        let mut state = forwarder_test_state("grok-http-replay-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = continuation.len().saturating_mul(6);
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-http-replay-memory",
+            format!("http://{address}/v1"),
+            None,
+            "grok-http-replay-memory-access",
+            None,
+            &[],
+        )
+        .await;
+        let share_id = "grok-http-replay-memory-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            ProviderType::GrokOAuth,
+            &execution.stored.provider.id,
+        )
+        .await;
+        seed_large_grok_reasoning_replay(
+            &state,
+            &execution,
+            share_id,
+            "grok-http-replay-memory-session",
+            0,
+            "http",
+            "127.0.0.1",
+        )
+        .await;
+
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            grok_reasoning_replay_headers(share_id, "grok-http-replay-memory-session", 1),
+            continuation,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        upstream_server.abort();
+    }
+
     #[tokio::test]
     async fn grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -46691,6 +48174,99 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             assert_eq!(pair[0].2, pair[1].2);
         }
         token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_sse_inspector_memory_exhaustion_terminates_without_retry() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let body = async_stream::stream! {
+                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-memory\",\"status\":\"in_progress\"}}\n\n",
+                        ));
+                        for index in 0..256 {
+                            let event = json!({
+                                "type":"response.output_item.done",
+                                "output_index":index,
+                                "item":{
+                                    "type":"web_search_call",
+                                    "id":format!("search-{index}-{}", "x".repeat(192)),
+                                    "status":"completed"
+                                }
+                            });
+                            yield Ok(Bytes::from(format!("data: {event}\n\n")));
+                            tokio::task::yield_now().await;
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut state = forwarder_test_state("grok-sse-inspector-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 16 * 1024;
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-sse-inspector-memory",
+            format!("http://{address}/v1"),
+            None,
+            "grok-sse-inspector-memory-access",
+            None,
+            &[],
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-cc-switch-request-id",
+            HeaderValue::from_static("req_grok_sse_inspector_memory"),
+        );
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            execution.stored.provider.id.clone(),
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"grok-4.6","input":"search","stream":true}"#),
+        )
+        .await
+        .unwrap();
+        let downstream = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let downstream = String::from_utf8_lossy(&downstream);
+        assert!(
+            downstream.contains("cc_switch_request_memory_exhausted"),
+            "{downstream}"
+        );
+        assert!(downstream.contains("\"status\":503"), "{downstream}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_grok_sse_inspector_memory")
+            .unwrap();
+        assert_eq!(log.stream_status.as_deref(), Some("memory_capacity"));
         upstream_server.abort();
     }
 
@@ -47467,6 +49043,80 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(http[0].2, "23");
         bridge_server.abort();
         token_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_websocket_reasoning_replay_memory_exhaustion_sends_error_and_close() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let upstream = axum::Router::new().route(
+            "/ws",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let requests = Arc::clone(&requests_for_route);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    ws.on_upgrade(
+                        |mut socket| async move { while socket.recv().await.is_some() {} },
+                    )
+                }
+            }),
+        );
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let continuation: Value =
+            serde_json::from_slice(&grok_replay_continuation_body(false)).unwrap();
+        let request = json!({"type":"response.create","response":continuation});
+        let mut state = forwarder_test_state("grok-ws-replay-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = request.to_string().len().saturating_mul(6);
+        let execution = install_grok_test_execution(
+            &state,
+            "grok-ws-replay-memory",
+            format!("http://{address}/v1"),
+            Some(format!("ws://{address}/ws")),
+            "grok-ws-replay-memory-access",
+            None,
+            &[GrokAccountCapability::Websocket],
+        )
+        .await;
+        let share_id = format!("{}-share", execution.stored.provider.id);
+        seed_large_grok_reasoning_replay(
+            &state,
+            &execution,
+            &share_id,
+            "grok-ws-replay-memory-session",
+            0,
+            "websocket",
+            "127.0.0.1",
+        )
+        .await;
+        let (bridge_address, bridge_server) = spawn_test_grok_responses_bridge(
+            state,
+            execution,
+            "grok-ws-replay-memory-session",
+            Some(1),
+        )
+        .await;
+
+        let (events, close) = send_test_bridge_value_with_close(bridge_address, request).await;
+        assert!(
+            events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("error")
+                    && event.pointer("/error/code").and_then(Value::as_str)
+                        == Some("cc_switch_request_memory_exhausted")
+            }),
+            "{events:?}"
+        );
+        assert_eq!(close, Some(CloseCode::Error));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        bridge_server.abort();
         upstream_server.abort();
     }
 

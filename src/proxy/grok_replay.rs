@@ -7,6 +7,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
+    RequestMemoryReservation,
+};
 use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
 
 const MAX_ENTRIES: usize = 2_048;
@@ -108,6 +112,26 @@ pub(crate) struct GrokReplayProof {
     calls: BTreeMap<String, GrokCallProof>,
 }
 
+impl GrokReplayProof {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.calls.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.calls.len().saturating_mul(
+                    std::mem::size_of::<String>()
+                        .saturating_add(std::mem::size_of::<GrokCallProof>())
+                        .saturating_add(std::mem::size_of::<usize>() * 4),
+                ),
+            ),
+            |bytes, (call_id, call)| {
+                bytes
+                    .saturating_add(call_id.capacity())
+                    .saturating_add(call.fingerprint.capacity())
+                    .saturating_add(retained_json_bytes(&call.reasoning))
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GrokCallProof {
     fingerprint: String,
@@ -115,11 +139,18 @@ struct GrokCallProof {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GrokReplaySnapshot(u64);
+pub(crate) struct GrokReplaySnapshot {
+    generation: u64,
+    bytes: usize,
+}
 
 impl GrokReplaySnapshot {
     pub(crate) fn generation(self) -> u64 {
-        self.0
+        self.generation
+    }
+
+    pub(crate) fn retained_bytes(self) -> usize {
+        self.bytes
     }
 }
 
@@ -151,11 +182,11 @@ impl fmt::Debug for GrokReplayCache {
 }
 
 impl GrokReplayCache {
-    pub(crate) async fn get(
+    pub(crate) async fn snapshot(
         &self,
         scope: &GrokReplayScope,
         now_ms: i64,
-    ) -> (Option<GrokReplayProof>, GrokReplaySnapshot) {
+    ) -> GrokReplaySnapshot {
         let mut store = self.store.lock().await;
         prune(&mut store, now_ms);
         if !store.entries.contains_key(scope) {
@@ -164,7 +195,61 @@ impl GrokReplayCache {
         let entry = store.entries.get_mut(scope).expect("scope is reserved");
         entry.touched_at_ms = now_ms;
         entry.expires_at_ms = now_ms.saturating_add(TTL_MS);
-        (entry.proof.clone(), GrokReplaySnapshot(entry.generation))
+        GrokReplaySnapshot {
+            generation: entry.generation,
+            bytes: entry.bytes,
+        }
+    }
+
+    pub(crate) async fn get_accounted(
+        &self,
+        scope: &GrokReplayScope,
+        now_ms: i64,
+        request_memory: Option<&RequestMemoryBudget>,
+    ) -> Result<
+        (
+            Option<GrokReplayProof>,
+            GrokReplaySnapshot,
+            Option<RequestMemoryReservation>,
+        ),
+        RequestMemoryError,
+    > {
+        let mut store = self.store.lock().await;
+        prune(&mut store, now_ms);
+        if !store.entries.contains_key(scope) {
+            reserve(&mut store, scope.clone(), now_ms);
+        }
+        let entry = store.entries.get_mut(scope).expect("scope is reserved");
+        entry.touched_at_ms = now_ms;
+        entry.expires_at_ms = now_ms.saturating_add(TTL_MS);
+        let snapshot = GrokReplaySnapshot {
+            generation: entry.generation,
+            bytes: entry.bytes,
+        };
+        // Reserve while the cache entry is still borrowed so a rejected
+        // request never clones the retained proof first.
+        let reservation = request_memory
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    snapshot.retained_bytes(),
+                )
+            })
+            .transpose()?;
+        Ok((entry.proof.clone(), snapshot, reservation))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get(
+        &self,
+        scope: &GrokReplayScope,
+        now_ms: i64,
+    ) -> (Option<GrokReplayProof>, GrokReplaySnapshot) {
+        let (proof, snapshot, _) = self
+            .get_accounted(scope, now_ms, None)
+            .await
+            .expect("unbudgeted test cache read cannot fail");
+        (proof, snapshot)
     }
 
     pub(crate) async fn replace_if_unchanged(
@@ -174,12 +259,16 @@ impl GrokReplayCache {
         proof: GrokReplayProof,
         now_ms: i64,
     ) -> bool {
-        let Some(bytes) = valid_proof_bytes(&proof) else {
+        if valid_proof_bytes(&proof).is_none() {
             return false;
-        };
+        }
+        let bytes = proof.retained_bytes();
+        if bytes > MAX_ENTRY_BYTES {
+            return false;
+        }
         let mut store = self.store.lock().await;
         prune(&mut store, now_ms);
-        if store.entries.get(&scope).map(|entry| entry.generation) != Some(snapshot.0) {
+        if store.entries.get(&scope).map(|entry| entry.generation) != Some(snapshot.generation) {
             return false;
         }
         remove(&mut store, &scope);
@@ -206,7 +295,7 @@ impl GrokReplayCache {
         now_ms: i64,
     ) -> bool {
         let mut store = self.store.lock().await;
-        if store.entries.get(scope).map(|entry| entry.generation) != Some(snapshot.0) {
+        if store.entries.get(scope).map(|entry| entry.generation) != Some(snapshot.generation) {
             return false;
         }
         remove(&mut store, scope);
@@ -529,6 +618,19 @@ impl Default for GrokReplayStreamAccumulator {
 }
 
 impl GrokReplayStreamAccumulator {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let output = self.output.iter().fold(
+            self.output
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>()),
+            |bytes, value| bytes.saturating_add(retained_json_bytes(value)),
+        );
+        self.decoder
+            .retained_bytes()
+            .saturating_add(output)
+            .saturating_add(self.terminal.as_ref().map_or(0, retained_json_bytes))
+    }
+
     pub(crate) fn push(&mut self, chunk: &[u8]) {
         if self.invalid {
             return;
@@ -612,8 +714,10 @@ impl GrokReplayStreamAccumulator {
     }
 
     fn clear(&mut self) {
-        self.output.clear();
+        self.decoder = ResponsesTransportDecoder::new(MAX_ITEM_BYTES, MAX_STREAM_BYTES);
+        self.output = Vec::new();
         self.terminal = None;
+        self.bytes = 0;
     }
 }
 
@@ -725,6 +829,25 @@ mod tests {
         assert!(websocket.finish().is_some());
     }
 
+    #[test]
+    fn replay_proof_and_stream_retained_bytes_are_bounded_and_releasable() {
+        let proof = proof();
+        assert!(proof.retained_bytes() > 0);
+        assert!(proof.retained_bytes() <= MAX_ENTRY_BYTES);
+
+        let mut accumulator = GrokReplayStreamAccumulator::default();
+        assert_eq!(accumulator.retained_bytes(), 0);
+        accumulator.push(
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-reasoning-proof-1234567890\"}}\n\n",
+        );
+        assert!(accumulator.retained_bytes() > 0);
+        accumulator.invalid = true;
+        accumulator.clear();
+        assert!(accumulator.output.is_empty());
+        assert!(accumulator.terminal.is_none());
+        assert_eq!(accumulator.retained_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn cache_cas_ttl_and_scope_are_bounded() {
         let cache = GrokReplayCache::default();
@@ -741,12 +864,45 @@ mod tests {
                 .await
         );
         assert!(cache.get(&scope, 3).await.0.is_some());
-        assert!(cache.get(&scope, 3 + TTL_MS).await.0.is_none());
+        let (_, retained_snapshot) = cache.get(&scope, 4).await;
+        assert_eq!(retained_snapshot.retained_bytes(), proof().retained_bytes());
+        assert!(cache.get(&scope, 4 + TTL_MS).await.0.is_none());
         assert!(cache
             .get(&GrokReplayScope("scope-b".into()), 3)
             .await
             .0
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_read_reserves_before_returning_a_proof_clone() {
+        let cache = GrokReplayCache::default();
+        let scope = GrokReplayScope("scope-accounted".into());
+        let snapshot = cache.snapshot(&scope, 1).await;
+        let proof = proof();
+        let retained = proof.retained_bytes();
+        assert!(
+            cache
+                .replace_if_unchanged(scope.clone(), snapshot, proof, 2)
+                .await
+        );
+
+        let exhausted = RequestMemoryBudget::new(retained.saturating_sub(1));
+        assert!(cache
+            .get_accounted(&scope, 3, Some(&exhausted))
+            .await
+            .is_err());
+        assert!(exhausted.is_exhausted());
+        assert_eq!(exhausted.snapshot().used_bytes, 0);
+
+        let exact = RequestMemoryBudget::new(retained);
+        let (cloned, cloned_snapshot, reservation) =
+            cache.get_accounted(&scope, 4, Some(&exact)).await.unwrap();
+        assert!(cloned.is_some());
+        assert_eq!(cloned_snapshot.retained_bytes(), retained);
+        assert_eq!(exact.snapshot().used_bytes, retained);
+        drop(reservation);
+        assert_eq!(exact.snapshot().used_bytes, 0);
     }
 
     #[test]

@@ -22,6 +22,8 @@ const GROK_WS_URL: &str = "wss://api.x.ai/v1/responses";
 const GROK_VIDEO_REQUEST_ID_MAX_LEN: usize = 128;
 const GROK_SSE_INSPECTION_MAX_FRAME_BYTES: usize = 64 * 1024;
 const GROK_SSE_INSPECTION_MAX_FRAME_LINES: usize = 128;
+const GROK_SSE_MAX_COMPLETED_SEARCHES: usize = 256;
+const GROK_SSE_MAX_SEARCH_KEY_BYTES: usize = 512;
 const GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +318,19 @@ impl GrokResponsesSseInspector {
         }
     }
 
+    pub(super) fn retained_bytes(&self) -> usize {
+        let search_keys = self.completed_searches.iter().fold(
+            self.completed_searches.len().saturating_mul(
+                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<usize>() * 4),
+            ),
+            |bytes, key| bytes.saturating_add(key.capacity()),
+        );
+        self.buffer
+            .capacity()
+            .saturating_add(self.passthrough_tail.capacity())
+            .saturating_add(search_keys)
+    }
+
     pub(super) fn push(&mut self, chunk: Bytes) -> Bytes {
         let mut output = Vec::with_capacity(chunk.len());
         let mut remaining = chunk.as_ref();
@@ -560,7 +575,14 @@ fn record_completed_search(
         .or_else(|| item.get("call_id"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(|id| format!("id:{id}"))
+        .map(|id| {
+            if id.len().saturating_add(3) <= GROK_SSE_MAX_SEARCH_KEY_BYTES {
+                format!("id:{id}")
+            } else {
+                let digest = Sha256::digest(id.as_bytes());
+                format!("id-sha256:{}", hex::encode(&digest[..16]))
+            }
+        })
         .or_else(|| output_index.map(|index| format!("index:{index}:{kind}")))
         .unwrap_or_else(|| {
             let stable = json!({
@@ -572,7 +594,9 @@ fn record_completed_search(
             let digest = Sha256::digest(stable.to_string().as_bytes());
             format!("synthetic:{kind}:{}", hex::encode(&digest[..12]))
         });
-    completed.insert(key);
+    if completed.contains(&key) || completed.len() < GROK_SSE_MAX_COMPLETED_SEARCHES {
+        completed.insert(key);
+    }
 }
 
 fn grok_completed_search_kind(item: &Value) -> Option<&'static str> {
@@ -2889,6 +2913,34 @@ mod tests {
         inspector.push(Bytes::from(frame));
         assert!(!inspector.take_search_observation());
         assert_eq!(inspector.completed_search_count(), 1);
+    }
+
+    #[test]
+    fn responses_search_retained_state_is_capacity_bounded() {
+        let mut inspector = GrokResponsesSseInspector::default();
+        for index in 0..(GROK_SSE_MAX_COMPLETED_SEARCHES + 32) {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":index,
+                    "item":{
+                        "type":"web_search_call",
+                        "id":format!("search-{index}-{}", "x".repeat(GROK_SSE_MAX_SEARCH_KEY_BYTES)),
+                        "status":"completed"
+                    }
+                })
+            );
+            assert_eq!(inspector.push(Bytes::from(frame.clone())), frame);
+        }
+        assert_eq!(
+            inspector.completed_search_count(),
+            GROK_SSE_MAX_COMPLETED_SEARCHES
+        );
+        assert!(
+            inspector.retained_bytes()
+                < GROK_SSE_MAX_COMPLETED_SEARCHES.saturating_mul(GROK_SSE_MAX_SEARCH_KEY_BYTES)
+        );
     }
 
     #[test]

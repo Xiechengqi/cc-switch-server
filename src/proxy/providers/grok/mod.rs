@@ -19,6 +19,9 @@ use super::super::grok_replay::{
     self, GrokReplayProof, GrokReplayScope, GrokReplaySnapshot, GrokReplayStreamAccumulator,
 };
 use super::super::provider_ops::ProviderExecution;
+use super::super::request_memory::{
+    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::ProxyError;
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,7 @@ pub(crate) struct ReplayWriteContext {
     auth_identity_generation: u64,
     token_refresh_generation: u64,
     share_id: String,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 impl ReplayWriteContext {
@@ -49,6 +53,9 @@ impl ReplayWriteContext {
     }
 }
 
+// The transport boundary keeps the request identity, replay binding, mutable body,
+// and request-scoped memory budget explicit so none can drift across a retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_http_replay(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -57,6 +64,7 @@ pub(crate) async fn prepare_http_replay(
     upstream_url: &str,
     suppress_replay: bool,
     body: &mut Bytes,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<Option<ReplayWriteContext>, ProxyError> {
     prepare_transport_replay(
         state,
@@ -68,6 +76,7 @@ pub(crate) async fn prepare_http_replay(
         "http",
         suppress_replay,
         body,
+        request_memory,
     )
     .await
 }
@@ -83,6 +92,7 @@ pub(crate) async fn prepare_transport_replay(
     rail: &'static str,
     suppress_replay: bool,
     body: &mut Bytes,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<Option<ReplayWriteContext>, ProxyError> {
     if !execution.driver_is("oauth.grok_responses") {
         return Ok(None);
@@ -112,15 +122,32 @@ pub(crate) async fn prepare_transport_replay(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a session"))?;
-    let document = serde_json::from_slice::<Value>(body)
-        .map_err(|_| ProxyError::bad_request("Grok reasoning replay request is invalid"))?;
-    let model_family = grok_replay::model_family(
-        document
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a model"))?,
-    )
-    .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay model is invalid"))?;
+    let model_family = {
+        let parse_memory = request_memory
+            .map(|budget| {
+                budget
+                    .reserve(
+                        RequestMemoryComponent::ReasoningReplay,
+                        body.len().saturating_mul(2),
+                    )
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?;
+        let document = serde_json::from_slice::<Value>(body)
+            .map_err(|_| ProxyError::bad_request("Grok reasoning replay request is invalid"))?;
+        if let Some(reservation) = parse_memory.as_ref() {
+            reservation
+                .resize(super::super::request_memory::retained_json_bytes(&document))
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        grok_replay::model_family(
+            document
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a model"))?,
+        )
+        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay model is invalid"))?
+    };
     let upstream_plane = reqwest::Url::parse(upstream_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
@@ -156,13 +183,20 @@ pub(crate) async fn prepare_transport_replay(
     let write_scope = derive(turn_index)
         .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
     let now_ms = replay_now_ms();
-    let (_, write_snapshot) = state.grok_reasoning_replays.get(&write_scope, now_ms).await;
+    let write_snapshot = state
+        .grok_reasoning_replays
+        .snapshot(&write_scope, now_ms)
+        .await;
     let mut read = None;
     let mut replay_applied = false;
     if turn_index > 0 && !suppress_replay {
         let read_scope = derive(turn_index - 1)
             .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
-        let (proof, snapshot) = state.grok_reasoning_replays.get(&read_scope, now_ms).await;
+        let (proof, snapshot, _proof_memory) = state
+            .grok_reasoning_replays
+            .get_accounted(&read_scope, now_ms, request_memory)
+            .await
+            .map_err(|error| error.into_proxy_error())?;
         let ownership = CacheSnapshotOwnership::from_hit(
             "grok_reasoning_read",
             read_scope.ownership_digest(),
@@ -170,6 +204,18 @@ pub(crate) async fn prepare_transport_replay(
         );
         read = Some((read_scope.clone(), snapshot, ownership.clone()));
         if let Some(proof) = proof {
+            let _apply_memory = request_memory
+                .map(|budget| {
+                    budget
+                        .reserve(
+                            RequestMemoryComponent::ReasoningReplay,
+                            body.len()
+                                .saturating_mul(2)
+                                .saturating_add(proof.retained_bytes()),
+                        )
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
             let result = grok_replay::apply(body, &proof);
             if result.context_mismatch {
                 crate::metrics::record_grok_reasoning_replay("context_mismatch", 1);
@@ -216,6 +262,7 @@ pub(crate) async fn prepare_transport_replay(
         auth_identity_generation,
         token_refresh_generation,
         share_id: share_id.to_string(),
+        request_memory: request_memory.cloned(),
     }))
 }
 
@@ -297,6 +344,55 @@ pub(crate) async fn commit(
     );
 }
 
+#[derive(Debug)]
+pub(crate) struct ReplayCapture {
+    proof: Option<GrokReplayProof>,
+    _proof_memory: Option<RequestMemoryReservation>,
+}
+
+pub(crate) fn capture_response(
+    context: Option<&ReplayWriteContext>,
+    response_body: &[u8],
+    successful: bool,
+) -> Result<ReplayCapture, ProxyError> {
+    let proof_memory = context
+        .and_then(|context| context.request_memory.as_ref())
+        .filter(|_| successful)
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    response_body.len().saturating_mul(2),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
+    let proof = (successful && context.is_some())
+        .then(|| grok_replay::capture_document(response_body))
+        .flatten();
+    if let Some(reservation) = proof_memory.as_ref() {
+        reservation
+            .resize(
+                proof
+                    .as_ref()
+                    .map_or(0, |proof| proof.retained_bytes().saturating_mul(2)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    Ok(ReplayCapture {
+        proof,
+        _proof_memory: proof_memory,
+    })
+}
+
+pub(crate) async fn commit_captured_response(
+    state: &ServerState,
+    context: Option<&ReplayWriteContext>,
+    capture: ReplayCapture,
+) {
+    commit(state, context, capture.proof).await;
+}
+
 pub(crate) async fn binding_is_current(state: &ServerState, context: &ReplayWriteContext) -> bool {
     if state.credential_persistence_degraded() {
         return false;
@@ -351,18 +447,44 @@ pub(crate) async fn binding_is_current(state: &ServerState, context: &ReplayWrit
 pub(crate) struct ReplayStreamWrite {
     context: ReplayWriteContext,
     accumulator: GrokReplayStreamAccumulator,
+    accumulator_memory: Option<RequestMemoryReservation>,
 }
 
 impl ReplayStreamWrite {
-    pub(crate) fn new(context: ReplayWriteContext) -> Self {
-        Self {
+    pub(crate) fn new(context: ReplayWriteContext) -> Result<Self, ProxyError> {
+        let accumulator_memory = context
+            .request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve(RequestMemoryComponent::ReasoningReplay, 0)
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?;
+        Ok(Self {
             context,
             accumulator: GrokReplayStreamAccumulator::default(),
-        }
+            accumulator_memory,
+        })
     }
 
-    pub(crate) fn inspect(&mut self, chunk: &[u8]) {
+    pub(crate) fn inspect(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
+        if let Some(reservation) = self.accumulator_memory.as_ref() {
+            reservation
+                .resize(
+                    self.accumulator
+                        .retained_bytes()
+                        .saturating_add(chunk.len()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         self.accumulator.push(chunk);
+        if let Some(reservation) = self.accumulator_memory.as_ref() {
+            reservation
+                .resize(self.accumulator.retained_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn replay_applied(&self) -> bool {
@@ -373,15 +495,48 @@ impl ReplayStreamWrite {
         binding_is_current(state, &self.context).await
     }
 
-    pub(crate) async fn clear_rejected_and_reset(&mut self, state: &ServerState) {
+    pub(crate) async fn clear_rejected_and_reset(
+        &mut self,
+        state: &ServerState,
+    ) -> Result<(), ProxyError> {
         clear_rejected(state, Some(&self.context)).await;
         self.context.reset_after_rejection();
         self.accumulator = GrokReplayStreamAccumulator::default();
+        if let Some(reservation) = self.accumulator_memory.as_ref() {
+            reservation
+                .resize(0)
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
     }
 
-    pub(crate) async fn commit(self, state: &ServerState) {
-        let proof = self.accumulator.finish();
-        commit(state, Some(&self.context), proof).await;
+    pub(crate) async fn commit(self, state: &ServerState) -> Result<(), ProxyError> {
+        let Self {
+            context,
+            accumulator,
+            accumulator_memory,
+        } = self;
+        let proof_memory = context
+            .request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve(
+                        RequestMemoryComponent::ReasoningReplay,
+                        accumulator.retained_bytes(),
+                    )
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?;
+        let proof = accumulator.finish();
+        if let (Some(reservation), Some(proof)) = (proof_memory.as_ref(), proof.as_ref()) {
+            reservation
+                .resize(proof.retained_bytes().saturating_mul(2))
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        drop(accumulator_memory);
+        commit(state, Some(&context), proof).await;
+        Ok(())
     }
 }
 
