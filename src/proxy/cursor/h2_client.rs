@@ -13,6 +13,9 @@
 //! through `ConnectFrameParser`.
 
 use super::agent_proto::{is_end_stream, ConnectFrame, ConnectFrameParser, ProtoError};
+use crate::proxy::request_memory::{
+    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError, RequestMemoryReservation,
+};
 use crate::proxy::ProxyError;
 use async_stream::stream;
 use axum::http::StatusCode;
@@ -48,6 +51,9 @@ pub struct CursorH2Stream {
     received_any_frame: bool,
     output_phase: CursorOutputPhase,
     connect_end_stream: Option<Result<(), String>>,
+    request_memory: Option<RequestMemoryBudget>,
+    parser_memory: Option<RequestMemoryReservation>,
+    pending_memory: Option<RequestMemoryReservation>,
 }
 
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(1);
@@ -139,11 +145,12 @@ impl CursorH2Stream {
     /// write the first Connect-RPC frame containing the encoded RunRequest,
     /// and return the live stream handle. Additional frames can be written
     /// via [`send_frame`].
-    pub async fn open(
+    pub(crate) async fn open(
         base_url: &str,
         headers: Vec<(String, String)>,
         first_frame: Bytes,
         timeouts: CursorH2Timeouts,
+        request_memory: Option<RequestMemoryBudget>,
     ) -> Result<Self, ProxyError> {
         let uri = base_url.trim().parse::<http::Uri>().map_err(|e| {
             cursor_forward_error(format!(
@@ -164,8 +171,29 @@ impl CursorH2Stream {
         builder.http2_only(true);
         builder.http2_adaptive_window(true);
 
+        let parser_memory = request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::TransportPending, 0))
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
+        let pending_memory = request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::DecodedBody, 0))
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
         let (tx, rx) = unbounded_channel::<Bytes>();
-        let initial = first_frame;
+        let initial = request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .retain_bytes(
+                        RequestMemoryComponent::TransportPending,
+                        first_frame.clone(),
+                    )
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?
+            .unwrap_or(first_frame);
         // Convert the mpsc receiver to a stream of body Frames. The initial
         // frame is enqueued before we await — guarantees the first byte hits
         // the wire as soon as hyper opens the stream.
@@ -236,6 +264,9 @@ impl CursorH2Stream {
             received_any_frame: false,
             output_phase,
             connect_end_stream: None,
+            request_memory,
+            parser_memory,
+            pending_memory,
         })
     }
 
@@ -254,6 +285,16 @@ impl CursorH2Stream {
             .writer
             .as_ref()
             .ok_or_else(|| cursor_forward_error("Cursor h2 stream 已关闭，无法继续写入"))?;
+        let frame = self
+            .request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .retain_bytes(RequestMemoryComponent::TransportPending, frame.clone())
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?
+            .unwrap_or(frame);
         tx.send(frame)
             .map_err(|_| cursor_forward_error("Cursor h2 stream 已关闭，无法继续写入"))
     }
@@ -262,6 +303,36 @@ impl CursorH2Stream {
     /// H2 END_STREAM on the request body. After this, [`send_frame`] fails fast.
     pub fn close_writer(&mut self) {
         self.writer = None;
+    }
+
+    /// Move retained parser/pending state to the request that reacquires a
+    /// parked session. New reservations are established before old ones are
+    /// released, and pending payload backing is copied so it cannot keep the
+    /// previous request budget alive through a shared Bytes owner.
+    pub(crate) fn transfer_request_memory(
+        &mut self,
+        budget: &RequestMemoryBudget,
+    ) -> Result<(), RequestMemoryError> {
+        let parser_memory = budget.reserve(
+            RequestMemoryComponent::TransportPending,
+            self.parser.retained_bytes(),
+        )?;
+        let pending_memory = budget.reserve(
+            RequestMemoryComponent::DecodedBody,
+            self.pending
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ConnectFrame>()),
+        )?;
+        for frame in &mut self.pending {
+            let reservation =
+                budget.reserve(RequestMemoryComponent::DecodedBody, frame.payload.len())?;
+            let payload = Bytes::copy_from_slice(&frame.payload);
+            frame.payload = reservation.retain_bytes(payload);
+        }
+        self.request_memory = Some(budget.clone());
+        self.parser_memory = Some(parser_memory);
+        self.pending_memory = Some(pending_memory);
+        Ok(())
     }
 
     /// Confirm that the driver decoded a client-visible/business event.
@@ -278,6 +349,12 @@ impl CursorH2Stream {
 
     pub async fn read_body_limited(&mut self, max_bytes: usize) -> Result<Bytes, ProxyError> {
         let mut out = bytes::BytesMut::new();
+        let memory = self
+            .request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::DecodedBody, 0))
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
         let read = async {
             while out.len() < max_bytes {
                 let Some(frame) = self.response.body_mut().frame().await else {
@@ -298,14 +375,23 @@ impl CursorH2Stream {
                 }
                 if let Ok(data) = frame.into_data() {
                     let remaining = max_bytes.saturating_sub(out.len());
-                    out.extend_from_slice(&data[..data.len().min(remaining)]);
+                    let append = data.len().min(remaining);
+                    if let Some(memory) = memory.as_ref() {
+                        memory
+                            .resize(out.len().saturating_add(append))
+                            .map_err(|error| error.into_proxy_error())?;
+                    }
+                    out.extend_from_slice(&data[..append]);
                 }
             }
             Ok::<Bytes, ProxyError>(out.freeze())
         };
-        tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, read)
+        let body = tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, read)
             .await
-            .map_err(|_| cursor_forward_error("Cursor error body read timed out"))?
+            .map_err(|_| cursor_forward_error("Cursor error body read timed out"))??;
+        Ok(memory
+            .map(|reservation| reservation.retain_bytes(body.clone()))
+            .unwrap_or(body))
     }
 
     /// Pull the next decoded Connect-RPC frame from the response body. Returns
@@ -314,6 +400,7 @@ impl CursorH2Stream {
     /// and don't surface as frames.
     pub async fn next_frame(&mut self) -> Result<Option<ConnectFrame>, ProxyError> {
         if let Some(frame) = self.pending.pop_front() {
+            self.sync_pending_memory()?;
             self.note_complete_protocol_frame();
             return Ok(Some(frame));
         }
@@ -354,8 +441,45 @@ impl CursorH2Stream {
                 continue;
             }
             if let Ok(data) = body_frame.into_data() {
-                let new_frames = self.parser.feed(&data).map_err(map_proto_err)?;
+                if let Some(memory) = self.parser_memory.as_ref() {
+                    memory
+                        .resize(self.parser.anticipated_retained_bytes(data.len()))
+                        .map_err(|error| error.into_proxy_error())?;
+                }
+                let decoded_limit = self
+                    .request_memory
+                    .as_ref()
+                    .map(RequestMemoryBudget::remaining_bytes)
+                    .unwrap_or(usize::MAX);
+                let mut new_frames = match self.parser.feed_with_decoded_limit(&data, decoded_limit)
+                {
+                    Ok(frames) => frames,
+                    Err(ProtoError::DecodedLimit { size, .. }) => {
+                        let error = self
+                            .request_memory
+                            .as_ref()
+                            .expect("decoded limit is only narrowed when a budget exists")
+                            .reject(RequestMemoryComponent::DecodedBody, size);
+                        return Err(error.into_proxy_error());
+                    }
+                    Err(error) => return Err(map_proto_err(error)),
+                };
+                if let Some(memory) = self.parser_memory.as_ref() {
+                    memory
+                        .resize(self.parser.retained_bytes())
+                        .map_err(|error| error.into_proxy_error())?;
+                }
+                if let Some(budget) = self.request_memory.as_ref() {
+                    for frame in &mut new_frames {
+                        let reservation = budget
+                            .reserve(RequestMemoryComponent::DecodedBody, frame.payload.len())
+                            .map_err(|error| error.into_proxy_error())?;
+                        let payload = Bytes::copy_from_slice(&frame.payload);
+                        frame.payload = reservation.retain_bytes(payload);
+                    }
+                }
                 ingest_connect_frames(&mut self.pending, &mut self.connect_end_stream, new_frames)?;
+                self.sync_pending_memory()?;
                 // A Connect end-stream envelope is the protocol terminal. Do
                 // not wait for a separate HTTP EOF that some upstreams keep
                 // open after the envelope has already completed the RPC.
@@ -363,6 +487,7 @@ impl CursorH2Stream {
                     self.closed = true;
                 }
                 if let Some(f) = self.pending.pop_front() {
+                    self.sync_pending_memory()?;
                     self.note_complete_protocol_frame();
                     return Ok(Some(f));
                 }
@@ -373,6 +498,21 @@ impl CursorH2Stream {
                 continue;
             }
         }
+    }
+
+    fn sync_pending_memory(&self) -> Result<(), ProxyError> {
+        let Some(memory) = self.pending_memory.as_ref() else {
+            return Ok(());
+        };
+        let bytes = self.pending.iter().fold(
+            self.pending
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ConnectFrame>()),
+            |total, _frame| total,
+        );
+        memory
+            .resize(bytes)
+            .map_err(|error| error.into_proxy_error())
     }
 
     /// Whether we have received at least one server frame on this stream.

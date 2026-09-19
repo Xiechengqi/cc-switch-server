@@ -13,9 +13,13 @@
 
 use super::agent_proto::McpToolDef;
 use super::h2_client::CursorH2Stream;
+use super::memory::session_retained_bytes;
 use super::profile::CursorProtocolRail;
 use super::request_builder::ResponseToolNamespace;
 use super::response_state::CursorLocalTaskState;
+use crate::proxy::request_memory::{
+    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError, RequestMemoryReservation,
+};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -203,11 +207,61 @@ pub struct CursorSession {
     pub blob_store: HashMap<String, Bytes>,
     pub state: SessionState,
     pub last_activity: Instant,
+    /// Reservation for request-owned state retained while this session is
+    /// running or parked. A continuation reserves against its new request
+    /// before releasing the previous request's reservation.
+    pub(crate) request_memory: Option<RequestMemoryReservation>,
 }
 
 impl CursorSession {
     fn touch(&mut self) {
         self.last_activity = Instant::now();
+    }
+
+    pub(crate) fn attach_request_memory(
+        &mut self,
+        budget: &RequestMemoryBudget,
+    ) -> Result<(), RequestMemoryError> {
+        let bytes = session_retained_bytes(self);
+        let next = budget.reserve(RequestMemoryComponent::StreamRetainedState, bytes)?;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.transfer_request_memory(budget)?;
+        }
+        self.request_memory = Some(next);
+        Ok(())
+    }
+
+    pub(crate) fn refresh_request_memory(&self) -> Result<(), RequestMemoryError> {
+        let bytes = session_retained_bytes(self);
+        if let Some(reservation) = self.request_memory.as_ref() {
+            reservation.resize(bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::proxy) fn reserve_transient_memory(
+        &self,
+        component: RequestMemoryComponent,
+        bytes: usize,
+    ) -> Result<Option<RequestMemoryReservation>, RequestMemoryError> {
+        self.request_memory
+            .as_ref()
+            .map(|reservation| reservation.budget().reserve(component, bytes))
+            .transpose()
+    }
+
+    fn clear_retained_state(&mut self) {
+        self.stream = None;
+        self.declared_tool_names.clear();
+        self.declared_tools.clear();
+        self.custom_tool_names.clear();
+        self.response_tool_namespaces.clear();
+        self.semantic_items.clear();
+        self.working_directory.clear();
+        self.pending_tool_calls.clear();
+        self.cold_resume_completed_calls.clear();
+        self.blob_store.clear();
+        self.request_memory = None;
     }
 }
 
@@ -397,6 +451,7 @@ impl CursorSessionManager {
             blob_store,
             state: SessionState::Running,
             last_activity: Instant::now(),
+            request_memory: None,
         };
         let entry = Arc::new(Mutex::new(session));
         self.insert_new_entry(key, entry.clone()).await?;
@@ -452,7 +507,6 @@ impl CursorSessionManager {
                 }
                 SessionState::Closed | SessionState::Running => {
                     session.state = SessionState::Closed;
-                    session.stream = None;
                     session.key.clone()
                 }
             }
@@ -472,6 +526,7 @@ impl CursorSessionManager {
         if removed {
             self.remove_indexes_for_session(&entry).await;
         }
+        entry.lock().await.clear_retained_state();
     }
 
     pub async fn bind_response_id(
@@ -624,7 +679,7 @@ impl CursorSessionManager {
             return false;
         }
         session.state = SessionState::Closed;
-        session.stream = None;
+        session.clear_retained_state();
         drop(session);
         self.remove_indexes_for_session(entry).await;
         true
@@ -673,7 +728,7 @@ impl CursorSessionManager {
             };
             if removed {
                 session.state = SessionState::Closed;
-                session.stream = None;
+                session.clear_retained_state();
                 drop(session);
                 self.remove_indexes_for_session(&entry).await;
             }
@@ -715,6 +770,7 @@ mod tests {
             blob_store: HashMap::new(),
             state,
             last_activity: Instant::now(),
+            request_memory: None,
         }))
     }
 
@@ -724,6 +780,73 @@ mod tests {
         let key = session_key(&CursorSessionScope::fixture("share-a"));
         assert_eq!(mgr.size().await, 0);
         assert!(!mgr.has(&key).await);
+    }
+
+    #[tokio::test]
+    async fn parked_session_reservation_transfers_and_releases_on_close() {
+        let mgr = CursorSessionManager::default();
+        let key = session_key(&CursorSessionScope::fixture("memory-transfer"));
+        let original_budget = RequestMemoryBudget::new(128 * 1024);
+        let next_budget = RequestMemoryBudget::new(128 * 1024);
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![serde_json::json!({"type":"message","content":"x".repeat(4096)})],
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut session = entry.lock().await;
+            session.attach_request_memory(&original_budget).unwrap();
+        }
+        let original_used = original_budget.snapshot().used_bytes;
+        assert!(original_used > 4_096);
+
+        mgr.release(entry.clone(), SessionState::AwaitingToolResult)
+            .await;
+        assert_eq!(original_budget.snapshot().used_bytes, original_used);
+
+        let acquired = mgr.acquire(&key).await.unwrap();
+        {
+            let mut session = acquired.lock().await;
+            session.attach_request_memory(&next_budget).unwrap();
+        }
+        assert_eq!(original_budget.snapshot().used_bytes, 0);
+        assert!(next_budget.snapshot().used_bytes > 4_096);
+
+        mgr.release(acquired, SessionState::Closed).await;
+        assert_eq!(next_budget.snapshot().used_bytes, 0);
+        assert_eq!(next_budget.snapshot().active_reservations, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_parked_session_releases_request_memory() {
+        let mgr = CursorSessionManager::new(Duration::from_millis(1), 4);
+        let key = session_key(&CursorSessionScope::fixture("memory-expiry"));
+        let budget = RequestMemoryBudget::new(64 * 1024);
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![serde_json::json!({"content":"parked".repeat(128)})],
+                String::new(),
+            )
+            .await
+            .unwrap();
+        entry.lock().await.attach_request_memory(&budget).unwrap();
+        mgr.release(entry, SessionState::AwaitingToolResult).await;
+        assert!(budget.snapshot().used_bytes > 0);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(mgr.acquire(&key).await.is_none());
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().active_reservations, 0);
     }
 
     #[tokio::test]

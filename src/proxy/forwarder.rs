@@ -1989,7 +1989,12 @@ async fn summarize_codex_overflow(
 fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<ProviderType>) -> bool {
     app == AppKind::Codex
         || provider_type.is_some_and(|provider_type| {
-            provider_type == ProviderType::ClaudeOAuth || antigravity::is_provider(provider_type)
+            provider_type == ProviderType::ClaudeOAuth
+                || antigravity::is_provider(provider_type)
+                || matches!(
+                    provider_type,
+                    ProviderType::CursorOAuth | ProviderType::CursorApiKey
+                )
         })
 }
 
@@ -2159,13 +2164,21 @@ async fn forward_with_attempt(
         )?;
         let started = Instant::now();
         if execution.driver_is("special.cursor") && cursor::agentservice_driver_requested(&stored) {
-            let prepared = cursor::prepare_agentservice_request(
+            let mut prepared = cursor::prepare_agentservice_request(
                 &execution,
                 &stored,
                 route,
                 gemini_path.as_deref(),
                 body,
             )?;
+            if let Some(request_memory) = attempt_context.request_memory() {
+                prepared.adapter_request.body = request_memory
+                    .retain_bytes(
+                        RequestMemoryComponent::NormalizedBody,
+                        prepared.adapter_request.body,
+                    )
+                    .map_err(|error| error.into_proxy_error())?;
+            }
             ensure_share_model_available(
                 &state,
                 &execution,
@@ -2188,6 +2201,7 @@ async fn forward_with_attempt(
                 request_timeout: execution.request_timeout(),
                 first_frame_timeout: execution.stream_first_byte_timeout(),
                 inter_frame_timeout: execution.stream_idle_timeout(),
+                request_memory: attempt_context.request_memory().cloned(),
             })
             .await;
         }
@@ -28784,6 +28798,48 @@ mod tests {
         provider_id
     }
 
+    async fn install_cursor_api_key_forwarder_test_provider(
+        state: &ServerState,
+        name: &str,
+        app: AppKind,
+    ) -> String {
+        let provider_id = format!("{name}-provider");
+        let mut stored = stored_provider(
+            app,
+            ProviderType::CursorApiKey,
+            json!({
+                "apiKey": "cursor-fixture-api-key",
+                "env": {
+                    "CURSOR_API_KEY": "cursor-fixture-api-key",
+                    "CURSOR_APIKEY_AGENT_SERVICE": "1",
+                    "CURSOR_APIKEY_AGENT_ENDPOINT": "https://127.0.0.1:9/agent.v1.AgentService/Run"
+                }
+            }),
+            None,
+        );
+        stored.provider.id = provider_id.clone();
+        stored.provider.meta = Some(ProviderMeta {
+            provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+            ..ProviderMeta::default()
+        });
+        stored.resource.profile_id = Some(
+            crate::domain::providers::registry::ProfileId::parse(format!(
+                "{}.cursor_api_key",
+                app.as_str()
+            ))
+            .unwrap(),
+        );
+        stored.resource.profile_schema_revision = Some(1);
+        let accounts = state.accounts_snapshot().await;
+        let mut providers = ProviderStore {
+            providers: vec![stored],
+            ..ProviderStore::default()
+        };
+        providers.rebuild_runtime_index(&accounts).unwrap();
+        state.replace_provider_store_for_test(providers).await;
+        provider_id
+    }
+
     fn claude_success_sse() -> Bytes {
         Bytes::from_static(
             concat!(
@@ -28911,6 +28967,16 @@ mod tests {
             AppKind::Claude,
             Some(ProviderType::ClaudeOAuth)
         ));
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::CursorOAuth)
+            ));
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::CursorApiKey)
+            ));
+        }
         assert!(!request_memory_enabled_for_provider(
             AppKind::Claude,
             Some(ProviderType::Claude)
@@ -28923,6 +28989,92 @@ mod tests {
             AppKind::Gemini,
             Some(ProviderType::GeminiCli)
         ));
+    }
+
+    #[tokio::test]
+    async fn cursor_share_and_pinned_provider_test_fail_before_agentservice_network() {
+        let body = Bytes::from_static(
+            br#"{"model":"composer-2.5","max_tokens":16,"messages":[{"role":"user","content":"reject before Cursor AgentService"}]}"#,
+        );
+
+        let mut share_state = forwarder_test_state("cursor-share-request-memory");
+        Arc::get_mut(&mut share_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len() + 1;
+        let share_provider_id = install_cursor_api_key_forwarder_test_provider(
+            &share_state,
+            "cursor-share-request-memory",
+            AppKind::Claude,
+        )
+        .await;
+        let share_id = "cursor-request-memory-share";
+        install_antigravity_test_share(
+            &share_state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::CursorApiKey,
+            &share_provider_id,
+        )
+        .await;
+        let mut share_headers = HeaderMap::new();
+        share_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        share_headers.insert("x-cc-switch-share-id", HeaderValue::from_static(share_id));
+        share_headers.insert(
+            "x-cc-switch-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        let share_error = forward(
+            share_state,
+            ProxyRoute::ClaudeMessages,
+            None,
+            share_headers,
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            share_error.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{share_error:?}"
+        );
+        assert_eq!(
+            share_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+
+        let mut pinned_state = forwarder_test_state("cursor-pinned-request-memory");
+        Arc::get_mut(&mut pinned_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = body.len() + 1;
+        let pinned_provider_id = install_cursor_api_key_forwarder_test_provider(
+            &pinned_state,
+            "cursor-pinned-request-memory",
+            AppKind::Claude,
+        )
+        .await;
+        let mut pinned_headers = HeaderMap::new();
+        pinned_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let pinned_error = forward_for_test_surface(
+            pinned_state,
+            ProxyRoute::ClaudeMessages,
+            pinned_provider_id,
+            None,
+            pinned_headers,
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            pinned_error.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{pinned_error:?}"
+        );
+        assert_eq!(
+            pinned_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
     }
 
     #[tokio::test]

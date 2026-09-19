@@ -81,7 +81,7 @@ pub(super) struct RequestMemorySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestMemoryError {
+pub(crate) struct RequestMemoryError {
     component: RequestMemoryComponent,
     requested_bytes: usize,
     used_bytes: usize,
@@ -117,7 +117,7 @@ impl fmt::Display for RequestMemoryError {
 impl std::error::Error for RequestMemoryError {}
 
 #[derive(Clone)]
-pub(super) struct RequestMemoryBudget {
+pub(crate) struct RequestMemoryBudget {
     inner: Arc<RequestMemoryBudgetInner>,
 }
 
@@ -328,7 +328,7 @@ impl Drop for RequestMemoryBudgetInner {
 }
 
 #[derive(Clone)]
-pub(super) struct RequestMemoryReservation {
+pub(crate) struct RequestMemoryReservation {
     inner: Arc<RequestMemoryReservationInner>,
 }
 
@@ -383,6 +383,10 @@ impl RequestMemoryReservation {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .bytes
+    }
+
+    pub(crate) fn budget(&self) -> RequestMemoryBudget {
+        self.inner.budget.clone()
     }
 
     /// Transfers this reservation to the allocation backing `bytes`. This is

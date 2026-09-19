@@ -40,6 +40,9 @@ use super::super::forwarder::{
     managed_credential_accounts_snapshot, mark_managed_account_auth_cooldown_for_stored,
     record_provider_outcome, record_share_invocation_result,
 };
+use super::super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::router::ProxyRoute;
 use super::super::usage::{log_usage, update_stream_usage};
 use super::super::{setting, ProxyError};
@@ -66,7 +69,10 @@ use super::identity::{
     cursor_account_for_api_key, cursor_account_from_managed_account, cursor_agentservice_headers,
     CursorAccountData,
 };
-use super::image::load_images;
+use super::image::load_images_with_memory;
+use super::memory::{
+    agent_run_plan_bytes, session_retained_bytes, string_set_bytes, CursorResponseMemory,
+};
 use super::profile::CursorProtocolRail;
 use super::request_builder::{
     estimate_agent_plan_input_tokens, local_task_turn_signal, prepare_response_compaction,
@@ -130,6 +136,7 @@ pub struct AgentServiceForwardOptions {
     pub share_invocation_guard: Option<ShareInFlightGuard>,
     pub runtime_fingerprint: String,
     pub timeouts: CursorH2Timeouts,
+    pub request_memory: Option<RequestMemoryBudget>,
 }
 
 enum CursorCredential {
@@ -202,6 +209,7 @@ struct CursorAttemptContext {
     commit: CommitGuard,
     binding: BindingSnapshot,
     rail: String,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 impl CursorAttemptContext {
@@ -210,6 +218,7 @@ impl CursorAttemptContext {
         stored: &StoredProvider,
         runtime_fingerprint: &str,
         request_timeout: Duration,
+        request_memory: Option<RequestMemoryBudget>,
     ) -> Result<Self, ProxyError> {
         let rail = cursor_attempt_rail(stored, runtime_fingerprint)?;
         let accounts = cursor_binding_accounts_snapshot(state, stored).await?;
@@ -227,6 +236,7 @@ impl CursorAttemptContext {
             commit: CommitGuard::default(),
             binding,
             rail,
+            request_memory,
         })
     }
 
@@ -237,6 +247,24 @@ impl CursorAttemptContext {
         stage: RecoveryStage,
         reason: &'static str,
     ) -> Result<RetryDecision, ProxyError> {
+        if self
+            .request_memory
+            .as_ref()
+            .is_some_and(RequestMemoryBudget::is_exhausted)
+        {
+            crate::metrics::record_recovery_decision(
+                stored.provider_type.as_str(),
+                stage.as_str(),
+                if self.commit.is_committed() {
+                    "committed"
+                } else {
+                    "pre_commit"
+                },
+                RetryDecision::DeniedBudget.as_str(),
+                DelaySource::Immediate.as_str(),
+            );
+            return Ok(RetryDecision::DeniedBudget);
+        }
         let accounts = cursor_binding_accounts_snapshot(state, stored).await?;
         let current = BindingSnapshot::capture_stored(stored, &accounts, self.rail.clone()).ok();
         let decision = self.budget.reserve(
@@ -368,6 +396,7 @@ enum DriveOutcome {
         usage: TokenUsage,
         buffered_events: Vec<String>,
         observation: SemanticAttemptObservation,
+        memory: Option<CursorResponseMemory>,
     },
     Parked {
         body: Bytes,
@@ -375,6 +404,7 @@ enum DriveOutcome {
         buffered_events: Vec<String>,
         tool_name: String,
         observation: SemanticAttemptObservation,
+        memory: Option<CursorResponseMemory>,
     },
 }
 
@@ -612,13 +642,29 @@ async fn drive_semantic_attempts(
     timeouts: CursorH2Timeouts,
     started: Instant,
     mut attempt_context: CursorAttemptContext,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<SemanticDriveSuccess, ProxyError> {
     let rail = CursorProtocolRail::for_provider(stored.provider_type).ok_or_else(|| {
         ProxyError::bad_request("Cursor AgentService driver requires a Cursor provider")
     })?;
     let mut reservation_guard =
         CursorSessionReservationGuard::new(state.cursor_sessions.clone(), session_entry.clone());
+    let active_plan_memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::StreamRetainedState,
+                    agent_run_plan_bytes(plan).saturating_mul(2),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
     let mut active_plan = plan.clone();
+    if let Some(memory) = active_plan_memory.as_ref() {
+        memory
+            .resize(agent_run_plan_bytes(&active_plan))
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let mut semantic_attempt = 1usize;
     let mut conversation_generation = 1usize;
     if let Some(choice) = semantic_tool_choice.as_ref() {
@@ -661,6 +707,7 @@ async fn drive_semantic_attempts(
                 response_format,
                 response_model.clone(),
                 input_tokens,
+                request_memory,
             ),
         )
         .await
@@ -746,6 +793,8 @@ async fn drive_semantic_attempts(
             Some(&rejection),
             Some(StatusCode::OK),
         );
+        let rejected_observation = outcome.observation();
+        drop(outcome);
         let retry_decision = attempt_context
             .reserve(
                 state,
@@ -779,6 +828,11 @@ async fn drive_semantic_attempts(
         )
         .increment(1);
         if semantic_attempt >= MAX_SEMANTIC_ATTEMPTS || retry_decision != RetryDecision::Reserved {
+            let exhausted_status = if retry_decision == RetryDecision::DeniedBudget {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
             emit_cursor_tool_constraint_event(
                 state,
                 stored,
@@ -787,10 +841,13 @@ async fn drive_semantic_attempts(
                 choice,
                 semantic_attempt,
                 conversation_generation,
-                outcome.observation(),
+                rejected_observation,
                 Some(&rejection),
-                Some(StatusCode::BAD_GATEWAY),
+                Some(exhausted_status),
             );
+            if retry_decision == RetryDecision::DeniedBudget {
+                return Err(ProxyError::request_memory_exhausted());
+            }
             return Err(ProxyError {
                 status: StatusCode::BAD_GATEWAY,
                 message: match choice {
@@ -804,6 +861,15 @@ async fn drive_semantic_attempts(
             });
         }
         semantic_attempt += 1;
+        if let Some(memory) = active_plan_memory.as_ref() {
+            memory
+                .resize(
+                    agent_run_plan_bytes(&active_plan)
+                        .saturating_add(plan.user_text.len())
+                        .saturating_add(4 * 1024),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         active_plan.user_text = match choice {
             SemanticToolConstraint::Required | SemanticToolConstraint::LocalIntent => {
                 retry_prompt_after_missing_tool(
@@ -825,6 +891,11 @@ async fn drive_semantic_attempts(
                 MAX_SEMANTIC_ATTEMPTS,
             ),
         };
+        if let Some(memory) = active_plan_memory.as_ref() {
+            memory
+                .resize(agent_run_plan_bytes(&active_plan))
+                .map_err(|error| error.into_proxy_error())?;
+        }
         let retry_timeouts =
             remaining_cursor_timeouts(timeouts, started.elapsed()).ok_or_else(|| ProxyError {
                 status: StatusCode::GATEWAY_TIMEOUT,
@@ -837,6 +908,7 @@ async fn drive_semantic_attempts(
             plan: &active_plan,
             request_context,
             timeouts: retry_timeouts,
+            request_memory,
         };
         conversation_generation = conversation_generation.saturating_add(1);
         let retry_session_key = new_semantic_retry_session_key(&session_key, rail);
@@ -883,6 +955,57 @@ impl ExecDedup {
     fn track(&mut self, event: &ExecServerEvent) -> bool {
         self.seen.insert(event.dedup_key())
     }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(string_set_bytes(&self.seen))
+    }
+}
+
+fn sync_cursor_response_memory(
+    memory: Option<&CursorResponseMemory>,
+    writer: &AgentSseWriter,
+    filter: &ComposerMarkerFilter,
+    exec_dedup: &ExecDedup,
+    buffered_events: &[String],
+) -> Result<(), ProxyError> {
+    let Some(memory) = memory else {
+        return Ok(());
+    };
+    memory
+        .sync_retained(
+            writer
+                .retained_bytes()
+                .saturating_add(filter.retained_bytes())
+                .saturating_add(exec_dedup.retained_bytes()),
+        )
+        .and_then(|()| memory.sync_buffered_events(buffered_events))
+        .map_err(|error| error.into_proxy_error())
+}
+
+fn cursor_stream_error_events(writer: &mut AgentSseWriter, error: &ProxyError) -> Vec<String> {
+    if error.is_request_memory_exhausted() {
+        writer.error_events_with_code(error.client_message(), "cc_switch_request_memory_exhausted")
+    } else {
+        writer.error_events(&error.message)
+    }
+}
+
+fn cursor_stream_status_for_error(error: &ProxyError) -> &'static str {
+    if error.is_request_memory_exhausted() {
+        "memory_capacity"
+    } else {
+        "failed"
+    }
+}
+
+fn cursor_stream_provider_outcome(status_code: u16, stream_status: &str) -> ProviderOutcome {
+    match stream_status {
+        "memory_capacity" => ProviderOutcome::CapacityShed {
+            status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        },
+        "failed" => ProviderOutcome::NetworkFailure,
+        _ => ProviderOutcome::from_status(status_code),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -908,6 +1031,7 @@ pub async fn forward_agentservice(
         share_invocation_guard,
         runtime_fingerprint,
         timeouts,
+        request_memory,
     } = options;
     let mut request_context = request_context;
     request_context.usage_estimated = true;
@@ -920,18 +1044,57 @@ pub async fn forward_agentservice(
             message: "Cursor AgentService driver does not support this route yet".to_string(),
         });
     };
+    let request_state_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::StreamRetainedState,
+                    adapter_request.body.len().saturating_mul(2),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
     let mut body_value =
         serde_json::from_slice::<Value>(&adapter_request.body).map_err(|error| {
             ProxyError::bad_request(format!("invalid cursor AgentService request JSON: {error}"))
         })?;
+    if let Some(memory) = request_state_memory.as_ref() {
+        memory
+            .resize(retained_json_bytes(&body_value))
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let compact = route == ProxyRoute::CodexResponsesCompact;
     validate_request_contract(inbound_protocol, &body_value, compact)
         .map_err(ProxyError::bad_request)?;
     if compact {
+        if let Some(memory) = request_state_memory.as_ref() {
+            memory
+                .resize(retained_json_bytes(&body_value).saturating_add(adapter_request.body.len()))
+                .map_err(|error| error.into_proxy_error())?;
+        }
         prepare_response_compaction(&mut body_value).map_err(ProxyError::bad_request)?;
+        if let Some(memory) = request_state_memory.as_ref() {
+            memory
+                .resize(retained_json_bytes(&body_value))
+                .map_err(|error| error.into_proxy_error())?;
+        }
+    }
+    if let Some(memory) = request_state_memory.as_ref() {
+        memory
+            .resize(retained_json_bytes(&body_value).saturating_mul(2))
+            .map_err(|error| error.into_proxy_error())?;
     }
     let preliminary_plan =
         try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
+    if let Some(memory) = request_state_memory.as_ref() {
+        memory
+            .resize(
+                retained_json_bytes(&body_value)
+                    .saturating_add(agent_run_plan_bytes(&preliminary_plan)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let current_turn_signal =
         local_task_turn_signal(inbound_protocol, &body_value, &preliminary_plan.tools);
     let response_scope = if inbound_protocol == InboundProtocol::OpenAiResponses {
@@ -956,11 +1119,16 @@ pub async fn forward_agentservice(
             response_scope.as_ref(),
             preliminary_plan.previous_response_id.as_deref(),
         ) {
-            let previous = match state.cursor_completed_responses.get(
-                scope,
-                previous_response_id,
-                crate::infra::time::now_ms() as i64,
-            ) {
+            let (previous, _previous_memory) = match state
+                .cursor_completed_responses
+                .get_accounted(
+                    scope,
+                    previous_response_id,
+                    crate::infra::time::now_ms() as i64,
+                    request_memory.as_ref(),
+                )
+                .map_err(|error| error.into_proxy_error())?
+            {
                 Some(previous) => {
                     metrics::counter!("cursor_response_cache_total", "outcome" => "hit")
                         .increment(1);
@@ -978,8 +1146,32 @@ pub async fn forward_agentservice(
             inherited_local_task_state = previous.local_task_state;
             prepend_response_context(&mut body_value, &previous.items)
                 .map_err(ProxyError::bad_request)?;
+            if let Some(memory) = request_state_memory.as_ref() {
+                memory
+                    .resize(
+                        retained_json_bytes(&body_value)
+                            .saturating_add(agent_run_plan_bytes(&preliminary_plan))
+                            .saturating_add(
+                                previous
+                                    .items
+                                    .iter()
+                                    .map(retained_json_bytes)
+                                    .sum::<usize>(),
+                            ),
+                    )
+                    .map_err(|error| error.into_proxy_error())?;
+            }
             response_context_prepended = true;
         }
+    }
+    if let Some(memory) = request_state_memory.as_ref() {
+        memory
+            .resize(
+                retained_json_bytes(&body_value)
+                    .saturating_add(agent_run_plan_bytes(&preliminary_plan))
+                    .saturating_add(retained_json_bytes(&body_value)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
     }
     let mut plan =
         try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
@@ -993,6 +1185,15 @@ pub async fn forward_agentservice(
     );
     if plan.tool_results.is_empty() && local_task_state.tool_commit_required {
         plan.local_tool_required_by_intent = true;
+    }
+    if let Some(memory) = request_state_memory.as_ref() {
+        memory
+            .resize(
+                retained_json_bytes(&body_value)
+                    .saturating_add(agent_run_plan_bytes(&preliminary_plan))
+                    .saturating_add(agent_run_plan_bytes(&plan)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
     }
     validate_tool_result_context(&plan).map_err(|message| {
         ProxyError::bad_request(format!("invalid cursor tool result context: {message}"))
@@ -1031,6 +1232,7 @@ pub async fn forward_agentservice(
         rail,
         completed_conversation_id.as_deref(),
         affinity_conversation_id.as_deref(),
+        request_memory.as_ref(),
     )
     .await?;
     if !resolved_session.replay_items.is_empty() {
@@ -1040,6 +1242,15 @@ pub async fn forward_agentservice(
             try_build_plan(inbound_protocol, &body_value).map_err(ProxyError::bad_request)?;
         preserve_current_continuation(&mut replay_plan, &plan);
         plan = replay_plan;
+        if let Some(memory) = request_state_memory.as_ref() {
+            memory
+                .resize(
+                    retained_json_bytes(&body_value)
+                        .saturating_add(agent_run_plan_bytes(&preliminary_plan))
+                        .saturating_add(agent_run_plan_bytes(&plan)),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         local_task_state = resolve_local_task_state(
             &plan,
             current_turn_signal,
@@ -1059,9 +1270,14 @@ pub async fn forward_agentservice(
     let mut session_key = resolved_session.key.clone();
     let response_model = response_model(&adapter_request, &plan.model_id);
     let input_tokens = estimate_agent_plan_input_tokens(&plan);
-    let mut attempt_context =
-        CursorAttemptContext::capture(&state, &stored, &runtime_fingerprint, timeouts.request)
-            .await?;
+    let mut attempt_context = CursorAttemptContext::capture(
+        &state,
+        &stored,
+        &runtime_fingerprint,
+        timeouts.request,
+        request_memory.clone(),
+    )
+    .await?;
     let session_open_context = CursorSessionOpenContext {
         state: &state,
         stored: &stored,
@@ -1069,6 +1285,7 @@ pub async fn forward_agentservice(
         plan: &plan,
         request_context: &request_context,
         timeouts,
+        request_memory: request_memory.as_ref(),
     };
     let opened = acquire_ready_session(
         &session_open_context,
@@ -1079,13 +1296,21 @@ pub async fn forward_agentservice(
     .await?;
     let session_entry = opened.entry;
     session_key = opened.key;
-    {
+    let session_memory_result = {
         let mut session = session_entry.lock().await;
         if resolved_session.parked.is_some() {
             local_task_state =
                 resolve_local_task_state(&plan, current_turn_signal, &session.local_task_state);
         }
         session.local_task_state = local_task_state.clone();
+        session.refresh_request_memory()
+    };
+    if let Err(error) = session_memory_result {
+        state
+            .cursor_sessions
+            .release(session_entry, SessionState::Closed)
+            .await;
+        return Err(error.into_proxy_error());
     }
     let response_state = (!compact)
         .then(|| {
@@ -1099,7 +1324,7 @@ pub async fn forward_agentservice(
     let model = usage_model_metadata(&adapter_request);
     let semantic_tool_choice = semantic_tool_constraint_for_plan(&plan);
     if adapter_request.stream_requested && semantic_tool_choice.is_none() {
-        return Ok(stream_response(
+        return stream_response(
             state,
             stored,
             session_entry,
@@ -1113,8 +1338,9 @@ pub async fn forward_agentservice(
             account_in_flight_guard,
             share_invocation_guard,
             response_state,
+            request_memory,
         )
-        .await);
+        .await;
     }
     if adapter_request.stream_requested {
         return Ok(stream_semantic_response(
@@ -1136,6 +1362,8 @@ pub async fn forward_agentservice(
             account_in_flight_guard,
             share_invocation_guard,
             response_state,
+            request_memory,
+            request_state_memory,
         )
         .await);
     }
@@ -1159,12 +1387,21 @@ pub async fn forward_agentservice(
         timeouts,
         started,
         attempt_context,
+        request_memory.as_ref(),
     )
     .await
     {
         Ok(success) => success,
         Err(error) => {
-            record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
+            record_provider_outcome(
+                &state,
+                &stored,
+                cursor_stream_provider_outcome(
+                    error.status.as_u16(),
+                    cursor_stream_status_for_error(&error),
+                ),
+            )
+            .await;
             return Err(error);
         }
     };
@@ -1175,12 +1412,12 @@ pub async fn forward_agentservice(
         }
     };
     if completed {
-        let semantic_items = session_entry.lock().await.semantic_items.clone();
+        let session = session_entry.lock().await;
         cache_completed_response(
             &state,
             response_state.as_ref(),
             &session_key,
-            &semantic_items,
+            &session.semantic_items,
             &body,
         );
     }
@@ -1189,7 +1426,16 @@ pub async fn forward_agentservice(
         .release(session_entry.clone(), final_state)
         .await;
     if compact && completed {
-        body = response_compaction_body(&body)?;
+        let compacted = response_compaction_body(&body)?;
+        body = request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .retain_bytes(RequestMemoryComponent::NormalizedEvent, compacted.clone())
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?
+            .unwrap_or(compacted);
     }
     let status_code = StatusCode::OK.as_u16();
     log_usage(
@@ -1241,7 +1487,25 @@ async fn ensure_cursor_success_status(
         rail,
         "Cursor AgentService rejected a request before business output"
     );
-    let upstream_error = read_cursor_upstream_error(session_entry).await;
+    let upstream_error = match read_cursor_upstream_error(session_entry).await {
+        Ok(upstream_error) => upstream_error,
+        Err(error) => {
+            record_provider_outcome(
+                state,
+                stored,
+                cursor_stream_provider_outcome(
+                    error.status.as_u16(),
+                    cursor_stream_status_for_error(&error),
+                ),
+            )
+            .await;
+            state
+                .cursor_sessions
+                .release(session_entry.clone(), SessionState::Closed)
+                .await;
+            return Err(error);
+        }
+    };
     maybe_mark_cursor_rate_limited(
         state,
         stored,
@@ -1354,18 +1618,44 @@ async fn stream_response(
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     response_state: Option<CursorResponseStateContext>,
-) -> Response {
-    let (rail, custom_tool_names, response_tool_namespaces) = {
+    request_memory: Option<RequestMemoryBudget>,
+) -> Result<Response, ProxyError> {
+    let (rail, custom_tool_names, response_tool_namespaces, _session_clone_memory) = {
         let session = session_entry.lock().await;
+        let clone_memory = session
+            .reserve_transient_memory(
+                RequestMemoryComponent::StreamRetainedState,
+                session_retained_bytes(&session),
+            )
+            .map_err(|error| error.into_proxy_error())?;
         (
             session.rail,
             session.custom_tool_names.clone(),
             session.response_tool_namespaces.clone(),
+            clone_memory,
         )
     };
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
         .with_custom_tool_names(custom_tool_names)
         .with_response_tool_namespaces(response_tool_namespaces);
+    let start_events = writer.start_events();
+    let response_memory = request_memory
+        .map(CursorResponseMemory::new)
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    if let Some(memory) = response_memory.as_ref() {
+        memory
+            .sync_retained(
+                writer
+                    .retained_bytes()
+                    .saturating_add(ComposerMarkerFilter::default().retained_bytes())
+                    .saturating_add(ExecDedup::default().retained_bytes()),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+        memory
+            .sync_buffered_events(&start_events)
+            .map_err(|error| error.into_proxy_error())?;
+    }
     state
         .cursor_sessions
         .bind_response_id(&session_key, &session_entry, writer.message_id())
@@ -1414,8 +1704,11 @@ async fn stream_response(
         let mut session_preclosed = false;
         let mut completed_response = false;
 
-        for event in writer.start_events() {
+        for event in start_events {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
+        }
+        if let Some(memory) = response_memory.as_ref() {
+            let _ = memory.sync_buffered_events(&[]);
         }
 
         let mut downstream_keepalive = cursor_downstream_keepalive_frame(response_format)
@@ -1456,10 +1749,10 @@ async fn stream_response(
                 Ok(None) => {
                     let error = cursor_incomplete_response_error(rail);
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
@@ -1471,10 +1764,39 @@ async fn stream_response(
                         rail.label(),
                     );
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
+                        yield Ok::<_, std::io::Error>(Bytes::from(event));
+                    }
+                    break;
+                }
+            };
+            let frame_memory = response_memory
+                .as_ref()
+                .map(|memory| {
+                    memory
+                        .sync_retained(
+                            writer
+                                .retained_bytes()
+                                .saturating_add(filter.retained_bytes())
+                                .saturating_add(exec_dedup.retained_bytes()),
+                        )
+                        .and_then(|()| {
+                            memory.reserve_transient(frame.payload.len().saturating_mul(2))
+                        })
+                })
+                .transpose()
+                .map_err(|error| error.into_proxy_error());
+            let _frame_memory = match frame_memory {
+                Ok(memory) => memory,
+                Err(error) => {
+                    final_status = error.status.as_u16();
+                    final_stream_status = "memory_capacity";
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
@@ -1486,10 +1808,10 @@ async fn stream_response(
                 Ok(event) => event,
                 Err(error) => {
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
@@ -1498,10 +1820,10 @@ async fn stream_response(
             let kv_terminal_candidate = kv_event.is_some();
             if let Err(error) = handle_kv_event(&session_entry, kv_event).await {
                 final_status = error.status.as_u16();
-                final_stream_status = "failed";
+                final_stream_status = cursor_stream_status_for_error(&error);
                 close_failed_cursor_stream_session(&state, &session_entry).await;
                 session_preclosed = true;
-                for event in writer.error_events(&error.message) {
+                for event in cursor_stream_error_events(&mut writer, &error) {
                     yield Ok::<_, std::io::Error>(Bytes::from(event));
                 }
                 break;
@@ -1512,10 +1834,10 @@ async fn stream_response(
                 Ok(event) => event,
                 Err(error) => {
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
@@ -1533,15 +1855,31 @@ async fn stream_response(
                 Ok(ExecHandling::ToolCall(tool_call)) => {
                     if let Err(error) = mark_session_business_output(&session_entry).await {
                         final_status = error.status.as_u16();
-                        final_stream_status = "failed";
+                        final_stream_status = cursor_stream_status_for_error(&error);
                         close_failed_cursor_stream_session(&state, &session_entry).await;
                         session_preclosed = true;
-                        for event in writer.error_events(&error.message) {
+                        for event in cursor_stream_error_events(&mut writer, &error) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
                         break;
                     }
                     let events = writer.event(&AgentEvent::ToolCall(tool_call));
+                    if let Err(error) = sync_cursor_response_memory(
+                        response_memory.as_ref(),
+                        &writer,
+                        &filter,
+                        &exec_dedup,
+                        &events,
+                    ) {
+                        final_status = error.status.as_u16();
+                        final_stream_status = cursor_stream_status_for_error(&error);
+                        close_failed_cursor_stream_session(&state, &session_entry).await;
+                        session_preclosed = true;
+                        for event in cursor_stream_error_events(&mut writer, &error) {
+                            yield Ok::<_, std::io::Error>(Bytes::from(event));
+                        }
+                        break;
+                    }
                     // Park the h2 stream before the first client-visible tool
                     // event. Claude/Codex may submit the result immediately
                     // and may close this SSE without waiting for its terminal
@@ -1575,19 +1913,38 @@ async fn stream_response(
                     for event in events {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
+                    if let Some(memory) = response_memory.as_ref() {
+                        let _ = memory.sync_buffered_events(&[]);
+                    }
                     final_session_state = SessionState::AwaitingToolResult;
                     break;
                 }
                 Err(error) => {
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
                 }
+            }
+            if let Err(error) = sync_cursor_response_memory(
+                response_memory.as_ref(),
+                &writer,
+                &filter,
+                &exec_dedup,
+                &[],
+            ) {
+                final_status = error.status.as_u16();
+                final_stream_status = cursor_stream_status_for_error(&error);
+                close_failed_cursor_stream_session(&state, &session_entry).await;
+                session_preclosed = true;
+                for event in cursor_stream_error_events(&mut writer, &error) {
+                    yield Ok::<_, std::io::Error>(Bytes::from(event));
+                }
+                break;
             }
             let deltas = match decode_agent_server_message(&frame.payload)
                 .map_err(|error| cursor_proto_error(rail, error))
@@ -1595,10 +1952,10 @@ async fn stream_response(
                 Ok(deltas) => deltas,
                 Err(error) => {
                     final_status = error.status.as_u16();
-                    final_stream_status = "failed";
+                    final_stream_status = cursor_stream_status_for_error(&error);
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
-                    for event in writer.error_events(&error.message) {
+                    for event in cursor_stream_error_events(&mut writer, &error) {
                         yield Ok::<_, std::io::Error>(Bytes::from(event));
                     }
                     break;
@@ -1612,7 +1969,7 @@ async fn stream_response(
             for delta in deltas {
                 let content_delta = cursor_delta_is_business_output(&delta);
                 let had_response_content = writer.has_response_content();
-                let (events, valid_output) = match cursor_delta_events(delta, &mut writer, &mut filter) {
+                let (mut events, mut valid_output) = match cursor_delta_events(delta, &mut writer, &mut filter) {
                     Ok(CursorDeltaOutcome::Events(events)) => (events, true),
                     Ok(CursorDeltaOutcome::TurnEnded(events)) => {
                         if writer.has_response_content() {
@@ -1622,17 +1979,33 @@ async fn stream_response(
                         } else {
                             let error = cursor_empty_response_error(rail);
                             final_status = error.status.as_u16();
-                            final_stream_status = "failed";
+                            final_stream_status = cursor_stream_status_for_error(&error);
                             ended = true;
                             (writer.error_events(&error.message), false)
                         }
                     }
                     Err(error) => {
                         final_status = error.status.as_u16();
-                        final_stream_status = "failed";
+                        final_stream_status = cursor_stream_status_for_error(&error);
                         (writer.error_events(&error.message), false)
                     }
                 };
+                if let Err(error) = sync_cursor_response_memory(
+                    response_memory.as_ref(),
+                    &writer,
+                    &filter,
+                    &exec_dedup,
+                    &events,
+                ) {
+                    final_status = error.status.as_u16();
+                    final_stream_status = cursor_stream_status_for_error(&error);
+                    ended = true;
+                    completed_response = false;
+                    valid_output = false;
+                    close_failed_cursor_stream_session(&state, &session_entry).await;
+                    session_preclosed = true;
+                    events = cursor_stream_error_events(&mut writer, &error);
+                }
                 let business_output = cursor_events_are_business_output(
                     valid_output,
                     content_delta,
@@ -1642,11 +2015,11 @@ async fn stream_response(
                 if business_output {
                     if let Err(error) = mark_session_business_output(&session_entry).await {
                         final_status = error.status.as_u16();
-                        final_stream_status = "failed";
+                        final_stream_status = cursor_stream_status_for_error(&error);
                         ended = true;
                         close_failed_cursor_stream_session(&state, &session_entry).await;
                         session_preclosed = true;
-                        for event in writer.error_events(&error.message) {
+                        for event in cursor_stream_error_events(&mut writer, &error) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
                         break;
@@ -1667,14 +2040,17 @@ async fn stream_response(
                     )
                     .await;
                 }
-                if final_stream_status == "failed" && !session_preclosed {
+                if final_stream_status != "completed" && !session_preclosed {
                     close_failed_cursor_stream_session(&state, &session_entry).await;
                     session_preclosed = true;
                 }
                 for event in events {
                     yield Ok::<_, std::io::Error>(Bytes::from(event));
                 }
-                if final_stream_status == "failed" {
+                if let Some(memory) = response_memory.as_ref() {
+                    let _ = memory.sync_buffered_events(&[]);
+                }
+                if final_stream_status != "completed" {
                     ended = true;
                 }
             }
@@ -1686,12 +2062,26 @@ async fn stream_response(
                     &mut filter,
                 ) {
                     Ok(Some(events)) => {
-                        if let Err(error) = mark_session_business_output(&session_entry).await {
+                        if let Err(error) = sync_cursor_response_memory(
+                            response_memory.as_ref(),
+                            &writer,
+                            &filter,
+                            &exec_dedup,
+                            &events,
+                        ) {
                             final_status = error.status.as_u16();
-                            final_stream_status = "failed";
+                            final_stream_status = cursor_stream_status_for_error(&error);
                             close_failed_cursor_stream_session(&state, &session_entry).await;
                             session_preclosed = true;
-                            for event in writer.error_events(&error.message) {
+                            for event in cursor_stream_error_events(&mut writer, &error) {
+                                yield Ok::<_, std::io::Error>(Bytes::from(event));
+                            }
+                        } else if let Err(error) = mark_session_business_output(&session_entry).await {
+                            final_status = error.status.as_u16();
+                            final_stream_status = cursor_stream_status_for_error(&error);
+                            close_failed_cursor_stream_session(&state, &session_entry).await;
+                            session_preclosed = true;
+                            for event in cursor_stream_error_events(&mut writer, &error) {
                                 yield Ok::<_, std::io::Error>(Bytes::from(event));
                             }
                         } else {
@@ -1699,17 +2089,20 @@ async fn stream_response(
                             for event in events {
                                 yield Ok::<_, std::io::Error>(Bytes::from(event));
                             }
+                            if let Some(memory) = response_memory.as_ref() {
+                                let _ = memory.sync_buffered_events(&[]);
+                            }
                         }
                         ended = true;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         final_status = error.status.as_u16();
-                        final_stream_status = "failed";
+                        final_stream_status = cursor_stream_status_for_error(&error);
                         ended = true;
                         close_failed_cursor_stream_session(&state, &session_entry).await;
                         session_preclosed = true;
-                        for event in writer.error_events(&error.message) {
+                        for event in cursor_stream_error_events(&mut writer, &error) {
                             yield Ok::<_, std::io::Error>(Bytes::from(event));
                         }
                     }
@@ -1720,21 +2113,41 @@ async fn stream_response(
             }
         }
 
-        let done_events = writer.done_events();
+        let mut done_events = writer.done_events();
+        if let Err(error) = sync_cursor_response_memory(
+            response_memory.as_ref(),
+            &writer,
+            &filter,
+            &exec_dedup,
+            &done_events,
+        ) {
+            final_status = error.status.as_u16();
+            final_stream_status = cursor_stream_status_for_error(&error);
+            completed_response = false;
+            if !session_preclosed && !session_preparked {
+                close_failed_cursor_stream_session(&state, &session_entry).await;
+                session_preclosed = true;
+            }
+            done_events = cursor_stream_error_events(&mut writer, &error);
+            done_events.extend(writer.done_events());
+        }
         for event in done_events {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
         }
+        if let Some(memory) = response_memory.as_ref() {
+            let _ = memory.sync_buffered_events(&[]);
+        }
         let usage = writer_usage(&writer);
-        if completed_response && final_stream_status != "failed" {
+        if completed_response && final_stream_status == "completed" {
             let response = serde_json::to_vec(&writer.json_response())
                 .map(Bytes::from)
                 .unwrap_or_default();
-            let semantic_items = session_entry.lock().await.semantic_items.clone();
+            let session = session_entry.lock().await;
             cache_completed_response(
                 &state,
                 response_state.as_ref(),
                 &session_key,
-                &semantic_items,
+                &session.semantic_items,
                 &response,
             );
         }
@@ -1751,13 +2164,9 @@ async fn stream_response(
         .await;
         record_share_invocation_result(&state, share_id.as_deref(), user_email.as_deref(), usage)
             .await;
-        let outcome = if final_stream_status == "failed" {
-            ProviderOutcome::NetworkFailure
-        } else {
-            ProviderOutcome::from_status(final_status)
-        };
+        let outcome = cursor_stream_provider_outcome(final_status, final_stream_status);
         record_provider_outcome(&state, &stored, outcome).await;
-        if final_stream_status == "failed" {
+        if final_stream_status != "completed" {
             final_session_state = SessionState::Closed;
         }
         if !session_preparked && !session_preclosed {
@@ -1773,7 +2182,7 @@ async fn stream_response(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    response
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1796,6 +2205,8 @@ async fn stream_semantic_response(
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     response_state: Option<CursorResponseStateContext>,
+    request_memory: Option<RequestMemoryBudget>,
+    request_state_memory: Option<RequestMemoryReservation>,
 ) -> Response {
     let request_id = log_usage(
         &state,
@@ -1832,6 +2243,7 @@ async fn stream_semantic_response(
         parked_handoff: false,
     };
     let stream = stream! {
+        let _request_state_memory = request_state_memory;
         let mut interrupted_guard = interrupted_guard;
         let mut account_in_flight_guard = account_in_flight_guard;
         let mut share_invocation_guard = share_invocation_guard;
@@ -1850,6 +2262,7 @@ async fn stream_semantic_response(
             timeouts,
             started,
             attempt_context,
+            request_memory.as_ref(),
         );
         tokio::pin!(drive);
         let mut keepalive = tokio::time::interval_at(
@@ -1870,23 +2283,25 @@ async fn stream_semantic_response(
             }
         };
 
-        let (events, final_status, final_stream_status, usage) = match driven {
+        let (events, final_status, final_stream_status, usage, response_memory) = match driven {
             Ok(SemanticDriveSuccess {
                 outcome,
                 session_entry,
                 session_key,
             }) => {
-                let (body, usage, events, final_state, completed) = match outcome {
+                let (body, usage, events, final_state, completed, response_memory) = match outcome {
                     DriveOutcome::Completed {
                         body,
                         usage,
                         buffered_events,
+                        memory,
                         ..
-                    } => (body, usage, buffered_events, SessionState::Closed, true),
+                    } => (body, usage, buffered_events, SessionState::Closed, true, memory),
                     DriveOutcome::Parked {
                         body,
                         usage,
                         buffered_events,
+                        memory,
                         ..
                     } => (
                         body,
@@ -1894,15 +2309,16 @@ async fn stream_semantic_response(
                         buffered_events,
                         SessionState::AwaitingToolResult,
                         false,
+                        memory,
                     ),
                 };
                 if completed {
-                    let semantic_items = session_entry.lock().await.semantic_items.clone();
+                    let session = session_entry.lock().await;
                     cache_completed_response(
                         &state,
                         response_state.as_ref(),
                         &session_key,
-                        &semantic_items,
+                        &session.semantic_items,
                         &body,
                     );
                 }
@@ -1913,7 +2329,7 @@ async fn stream_semantic_response(
                 if !completed {
                     interrupted_guard.hand_off_parked_session();
                 }
-                (events, StatusCode::OK.as_u16(), "completed", usage)
+                (events, StatusCode::OK.as_u16(), "completed", usage, response_memory)
             }
             Err(error) => {
                 let mut writer = AgentSseWriter::new(
@@ -1921,19 +2337,35 @@ async fn stream_semantic_response(
                     response_format,
                     input_tokens,
                 );
-                let mut events = writer.error_events(&error.message);
+                let mut events = if error.is_request_memory_exhausted() {
+                    writer.error_events_with_code(
+                        error.client_message(),
+                        "cc_switch_request_memory_exhausted",
+                    )
+                } else {
+                    writer.error_events(&error.message)
+                };
                 events.extend(writer.done_events());
                 (
                     events,
                     error.status.as_u16(),
-                    "failed",
+                    if error.is_request_memory_exhausted() {
+                        "memory_capacity"
+                    } else {
+                        "failed"
+                    },
                     TokenUsage::default(),
+                    None,
                 )
             }
         };
 
         for event in events {
-            yield Ok::<_, std::io::Error>(Bytes::from(event));
+            let bytes = match response_memory.as_ref() {
+                Some(memory) => memory.own_buffered_event(event),
+                None => Bytes::from(event),
+            };
+            yield Ok::<_, std::io::Error>(bytes);
         }
 
         // A constrained attempt is intentionally buffered until it commits a
@@ -1960,11 +2392,7 @@ async fn stream_semantic_response(
         record_provider_outcome(
             &state,
             &stored,
-            if final_stream_status == "failed" {
-                ProviderOutcome::NetworkFailure
-            } else {
-                ProviderOutcome::from_status(final_status)
-            },
+            cursor_stream_provider_outcome(final_status, final_stream_status),
         )
         .await;
         drop(account_in_flight_guard.take());
@@ -1986,13 +2414,21 @@ async fn drive_non_stream(
     response_format: super::protocol::CursorResponseFormat,
     response_model: String,
     input_tokens: u32,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<DriveOutcome, ProxyError> {
-    let (rail, custom_tool_names, response_tool_namespaces) = {
+    let (rail, custom_tool_names, response_tool_namespaces, _session_clone_memory) = {
         let session = session_entry.lock().await;
+        let clone_memory = session
+            .reserve_transient_memory(
+                RequestMemoryComponent::StreamRetainedState,
+                session_retained_bytes(&session),
+            )
+            .map_err(|error| error.into_proxy_error())?;
         (
             session.rail,
             session.custom_tool_names.clone(),
             session.response_tool_namespaces.clone(),
+            clone_memory,
         )
     };
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
@@ -2005,6 +2441,18 @@ async fn drive_non_stream(
     let mut buffered_events = writer.start_events();
     let mut filter = ComposerMarkerFilter::default();
     let mut exec_dedup = ExecDedup::default();
+    let response_memory = request_memory
+        .cloned()
+        .map(CursorResponseMemory::new)
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    sync_cursor_response_memory(
+        response_memory.as_ref(),
+        &writer,
+        &filter,
+        &exec_dedup,
+        &buffered_events,
+    )?;
     let mut observation = SemanticAttemptObservation::default();
     loop {
         let Some(frame) = next_session_frame(&session_entry)
@@ -2019,6 +2467,20 @@ async fn drive_non_stream(
         else {
             return Err(cursor_incomplete_response_error(rail));
         };
+        let _frame_memory = response_memory
+            .as_ref()
+            .map(|memory| {
+                memory
+                    .sync_retained(
+                        writer
+                            .retained_bytes()
+                            .saturating_add(filter.retained_bytes())
+                            .saturating_add(exec_dedup.retained_bytes()),
+                    )
+                    .and_then(|()| memory.reserve_transient(frame.payload.len().saturating_mul(2)))
+            })
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
         let kv_event = decode_kv_server_event(&frame.payload)
             .map_err(|error| cursor_proto_error(rail, error))?;
         let kv_terminal_candidate = kv_event.is_some();
@@ -2040,17 +2502,32 @@ async fn drive_non_stream(
                 }
                 buffered_events.extend(writer.event(&AgentEvent::ToolCall(tool_call)));
                 buffered_events.extend(writer.done_events());
+                sync_cursor_response_memory(
+                    response_memory.as_ref(),
+                    &writer,
+                    &filter,
+                    &exec_dedup,
+                    &buffered_events,
+                )?;
                 let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                     ProxyError::bad_request(format!(
                         "Cursor AgentService JSON response encode failed: {error}"
                     ))
                 })?;
+                let body = Bytes::from(body);
+                let body = response_memory
+                    .as_ref()
+                    .map(|memory| memory.retain_body(body.clone()))
+                    .transpose()
+                    .map_err(|error| error.into_proxy_error())?
+                    .unwrap_or(body);
                 return Ok(DriveOutcome::Parked {
-                    body: Bytes::from(body),
+                    body,
                     usage: writer_usage(&writer),
                     buffered_events,
                     tool_name,
                     observation,
+                    memory: response_memory,
                 });
             }
         }
@@ -2076,6 +2553,13 @@ async fn drive_non_stream(
             match outcome {
                 CursorDeltaOutcome::Events(events) => {
                     buffered_events.extend(events);
+                    sync_cursor_response_memory(
+                        response_memory.as_ref(),
+                        &writer,
+                        &filter,
+                        &exec_dedup,
+                        &buffered_events,
+                    )?;
                     if business_output {
                         mark_session_business_output(&session_entry).await?;
                     }
@@ -2087,16 +2571,31 @@ async fn drive_non_stream(
                     }
                     mark_session_business_output(&session_entry).await?;
                     buffered_events.extend(writer.done_events());
+                    sync_cursor_response_memory(
+                        response_memory.as_ref(),
+                        &writer,
+                        &filter,
+                        &exec_dedup,
+                        &buffered_events,
+                    )?;
                     let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                         ProxyError::bad_request(format!(
                             "Cursor AgentService JSON response encode failed: {error}"
                         ))
                     })?;
+                    let body = Bytes::from(body);
+                    let body = response_memory
+                        .as_ref()
+                        .map(|memory| memory.retain_body(body.clone()))
+                        .transpose()
+                        .map_err(|error| error.into_proxy_error())?
+                        .unwrap_or(body);
                     return Ok(DriveOutcome::Completed {
-                        body: Bytes::from(body),
+                        body,
                         usage: writer_usage(&writer),
                         buffered_events,
                         observation,
+                        memory: response_memory,
                     });
                 }
             }
@@ -2107,16 +2606,31 @@ async fn drive_non_stream(
             buffered_events.extend(events);
             mark_session_business_output(&session_entry).await?;
             buffered_events.extend(writer.done_events());
+            sync_cursor_response_memory(
+                response_memory.as_ref(),
+                &writer,
+                &filter,
+                &exec_dedup,
+                &buffered_events,
+            )?;
             let body = serde_json::to_vec(&writer.json_response()).map_err(|error| {
                 ProxyError::bad_request(format!(
                     "Cursor AgentService JSON response encode failed: {error}"
                 ))
             })?;
+            let body = Bytes::from(body);
+            let body = response_memory
+                .as_ref()
+                .map(|memory| memory.retain_body(body.clone()))
+                .transpose()
+                .map_err(|error| error.into_proxy_error())?
+                .unwrap_or(body);
             return Ok(DriveOutcome::Completed {
-                body: Bytes::from(body),
+                body,
                 usage: writer_usage(&writer),
                 buffered_events,
                 observation,
+                memory: response_memory,
             });
         }
     }
@@ -2353,6 +2867,9 @@ async fn handle_kv_event(
             {
                 let mut session = session_entry.lock().await;
                 session.blob_store.insert(key, blob_data);
+                session
+                    .refresh_request_memory()
+                    .map_err(|error| error.into_proxy_error())?;
             }
             send_session_frame(
                 session_entry,
@@ -2667,6 +3184,7 @@ struct CursorSessionOpenContext<'a> {
     plan: &'a AgentRunPlan,
     request_context: &'a UsageLogContext,
     timeouts: CursorH2Timeouts,
+    request_memory: Option<&'a RequestMemoryBudget>,
 }
 
 struct OpenedCursorSession {
@@ -2817,6 +3335,20 @@ async fn acquire_or_open_session(
                     session_key.conversation_id()
                 ))
             })?;
+        if let Some(request_memory) = context.request_memory {
+            let transfer = {
+                let mut session = entry.lock().await;
+                session.attach_request_memory(request_memory)
+            };
+            if let Err(error) = transfer {
+                context
+                    .state
+                    .cursor_sessions
+                    .release(entry, SessionState::Closed)
+                    .await;
+                return Err(error.into_proxy_error());
+            }
+        }
         if let Err(error) = resume_tool_results(&entry, &context.plan.tool_results).await {
             context
                 .state
@@ -2842,17 +3374,7 @@ async fn acquire_or_open_session(
         )
         .await?;
         let access_token = credential.access_token().to_string();
-        match open_agent_stream(
-            context.state,
-            &credential,
-            context.stored,
-            context.runtime_fingerprint,
-            context.plan,
-            &active_session_key,
-            context.timeouts,
-        )
-        .await
-        {
+        match open_agent_stream(context, &credential, &active_session_key).await {
             Ok(entry) => {
                 return Ok(OpenedCursorSession {
                     entry,
@@ -3024,6 +3546,9 @@ async fn resume_tool_results(
         })?;
         stream.rearm_business_output_phase();
     }
+    session
+        .refresh_request_memory()
+        .map_err(|error| error.into_proxy_error())?;
     Ok(())
 }
 
@@ -3046,34 +3571,35 @@ struct CursorUpstreamError {
 
 async fn read_cursor_upstream_error(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
-) -> CursorUpstreamError {
+) -> Result<CursorUpstreamError, ProxyError> {
     let (headers, body) = {
         let mut session = session_entry.lock().await;
         let Some(stream) = session.stream.as_mut() else {
-            return CursorUpstreamError {
+            return Ok(CursorUpstreamError {
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
                 message: None,
-            };
+            });
         };
         let headers = stream.headers().clone();
         stream.close_writer();
         let body = if cursor_error_body_is_json_like(&headers) {
-            stream
-                .read_body_limited(MAX_CURSOR_ERROR_BODY_BYTES)
-                .await
-                .unwrap_or_else(|_| Bytes::new())
+            match stream.read_body_limited(MAX_CURSOR_ERROR_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(error) if error.is_request_memory_exhausted() => return Err(error),
+                Err(_) => Bytes::new(),
+            }
         } else {
             Bytes::new()
         };
         (headers, body)
     };
     let message = cursor_error_message_from_body(&body);
-    CursorUpstreamError {
+    Ok(CursorUpstreamError {
         headers,
         body,
         message,
-    }
+    })
 }
 
 fn cursor_error_body_is_json_like(headers: &HeaderMap) -> bool {
@@ -3277,13 +3803,20 @@ async fn surface_mcp_tool_call(
     tool_call_id: &str,
     args: Value,
 ) -> Result<ExecHandling, ProxyError> {
-    let (declared_tools, session_key, custom_tool_names, response_tool_namespaces) = {
+    let (declared_tools, session_key, custom_tool_names, response_tool_namespaces, _clone_memory) = {
         let session = session_entry.lock().await;
+        let clone_memory = session
+            .reserve_transient_memory(
+                RequestMemoryComponent::StreamRetainedState,
+                session_retained_bytes(&session),
+            )
+            .map_err(|error| error.into_proxy_error())?;
         (
             session.declared_tools.clone(),
             session.key.clone(),
             session.custom_tool_names.clone(),
             session.response_tool_namespaces.clone(),
+            clone_memory,
         )
     };
     let resolved = match resolve_tool_call(&declared_tools, tool_name, args) {
@@ -3394,6 +3927,9 @@ async fn surface_mcp_tool_call(
                 session.semantic_items.push(item);
             }
         }
+        session
+            .refresh_request_memory()
+            .map_err(|error| error.into_proxy_error())?;
     }
     state
         .cursor_sessions
@@ -3414,6 +3950,7 @@ async fn resolve_session_key(
     rail: CursorProtocolRail,
     completed_conversation_id: Option<&str>,
     affinity_conversation_id: Option<&str>,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<ResolvedCursorSession, ProxyError> {
     if !plan.tool_results.is_empty() {
         // Cursor's parked stream accepts Claude-style inline tool results, but
@@ -3428,6 +3965,7 @@ async fn resolve_session_key(
                 scope,
                 &plan.tool_results,
                 plan.previous_response_id.as_deref(),
+                request_memory,
             )
             .await?;
             metrics::counter!(
@@ -3436,14 +3974,19 @@ async fn resolve_session_key(
                 "rail" => rail.label()
             )
             .increment(1);
-            let (replay_items, replay_local_task_state) = match closed {
-                Some(session) => (session.semantic_items, Some(session.local_task_state)),
-                None => (Vec::new(), None),
+            let (replay_items, replay_local_task_state, replay_memory) = match closed {
+                Some(session) => (
+                    session.semantic_items,
+                    Some(session.local_task_state),
+                    session.memory,
+                ),
+                None => (Vec::new(), None, None),
             };
             return Ok(ResolvedCursorSession::with_replay_items(
                 CursorSessionKey::new(scope.clone(), new_cursor_conversation_id(rail)),
                 replay_items,
                 replay_local_task_state,
+                replay_memory,
             ));
         }
         if plan.continuation_kind == ToolContinuationKind::PureToolResults {
@@ -3504,6 +4047,7 @@ async fn resolve_session_key(
                 scope,
                 &plan.tool_results,
                 plan.previous_response_id.as_deref(),
+                request_memory,
             )
             .await?;
             metrics::counter!(
@@ -3572,6 +4116,7 @@ struct ClosedContinuationSession {
     conversation_id: String,
     semantic_items: Vec<Value>,
     local_task_state: CursorLocalTaskState,
+    memory: Option<RequestMemoryReservation>,
 }
 
 async fn close_unusable_continuation_session(
@@ -3579,6 +4124,7 @@ async fn close_unusable_continuation_session(
     scope: &CursorSessionScope,
     tool_results: &[super::request_builder::ToolResultBlock],
     previous_response_id: Option<&str>,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<Option<ClosedContinuationSession>, ProxyError> {
     let mut continuation_ids = tool_results
         .iter()
@@ -3626,25 +4172,42 @@ async fn close_unusable_continuation_session(
     if let Some(reference) = candidate {
         let conversation_id = reference.key().conversation_id().to_string();
         if let Some(entry) = state.cursor_sessions.acquire_resolved(&reference).await {
+            let mut reservation_guard =
+                CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
             state
                 .cursor_sessions
                 .claim_continuation_ids(scope, &continuation_ids)
                 .await;
-            let (semantic_items, local_task_state) = {
-                let session = entry.lock().await;
+            let snapshot = {
+                let mut session = entry.lock().await;
+                if let Some(request_memory) = request_memory {
+                    session
+                        .attach_request_memory(request_memory)
+                        .map_err(|error| error.into_proxy_error())?;
+                }
+                let memory = session
+                    .reserve_transient_memory(
+                        RequestMemoryComponent::StreamRetainedState,
+                        session_retained_bytes(&session),
+                    )
+                    .map_err(|error| error.into_proxy_error())?;
                 (
                     session.semantic_items.clone(),
                     session.local_task_state.clone(),
+                    memory,
                 )
             };
+            let (semantic_items, local_task_state, memory) = snapshot;
             state
                 .cursor_sessions
                 .release(entry, SessionState::Closed)
                 .await;
+            reservation_guard.disarm();
             return Ok(Some(ClosedContinuationSession {
                 conversation_id,
                 semantic_items,
                 local_task_state,
+                memory,
             }));
         } else {
             // This request already resolved an exact parked owner. If the
@@ -3683,6 +4246,7 @@ struct ResolvedCursorSession {
     parked: Option<CursorSessionReference>,
     replay_items: Vec<Value>,
     replay_local_task_state: Option<CursorLocalTaskState>,
+    replay_memory: Option<RequestMemoryReservation>,
 }
 
 impl ResolvedCursorSession {
@@ -3692,6 +4256,7 @@ impl ResolvedCursorSession {
             parked: None,
             replay_items: Vec::new(),
             replay_local_task_state: None,
+            replay_memory: None,
         }
     }
 
@@ -3699,12 +4264,14 @@ impl ResolvedCursorSession {
         key: CursorSessionKey,
         replay_items: Vec<Value>,
         replay_local_task_state: Option<CursorLocalTaskState>,
+        replay_memory: Option<RequestMemoryReservation>,
     ) -> Self {
         Self {
             key,
             parked: None,
             replay_items,
             replay_local_task_state,
+            replay_memory,
         }
     }
 
@@ -3714,20 +4281,33 @@ impl ResolvedCursorSession {
             parked: Some(reference),
             replay_items: Vec::new(),
             replay_local_task_state: None,
+            replay_memory: None,
         }
     }
 }
 
 async fn open_agent_stream(
-    state: &ServerState,
+    context: &CursorSessionOpenContext<'_>,
     credential: &CursorCredential,
-    stored: &StoredProvider,
-    runtime_fingerprint: &str,
-    plan: &super::request_builder::AgentRunPlan,
     session_key: &CursorSessionKey,
-    timeouts: CursorH2Timeouts,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
-    let images = load_images(plan.images.clone()).await?;
+    let state = context.state;
+    let stored = context.stored;
+    let runtime_fingerprint = context.runtime_fingerprint;
+    let plan = context.plan;
+    let timeouts = context.timeouts;
+    let request_memory = context.request_memory;
+    let open_memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::StreamRetainedState,
+                    agent_run_plan_bytes(plan),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
+    let images = load_images_with_memory(plan.images.clone(), request_memory).await?;
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     let live_catalog_ids = match credential.model_catalog_scope() {
         Some(scope) => state
@@ -3753,6 +4333,15 @@ async fn open_agent_stream(
     let body = encode_agent_run_request(&mut input).map_err(|message| {
         ProxyError::bad_request(format!("invalid Cursor AgentService model: {message}"))
     })?;
+    let body = match open_memory {
+        Some(memory) => {
+            memory
+                .resize(body.len())
+                .map_err(|error| error.into_proxy_error())?;
+            memory.retain_bytes(body)
+        }
+        None => body,
+    };
     let endpoint = cursor_agentservice_url(
         state,
         stored,
@@ -3784,6 +4373,8 @@ async fn open_agent_stream(
                 conflict.state
             ))
         })?;
+    let mut reservation_guard =
+        CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
     {
         let mut session = entry.lock().await;
         session.custom_tool_names = plan.custom_tool_names.clone();
@@ -3795,9 +4386,12 @@ async fn open_agent_stream(
                 .map(|call| (call.name.clone(), call.arguments.clone()))
                 .collect();
         }
+        if let Some(request_memory) = request_memory {
+            session
+                .attach_request_memory(request_memory)
+                .map_err(|error| error.into_proxy_error())?;
+        }
     }
-    let mut reservation_guard =
-        CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
     let stream = match CursorH2Stream::open(
         &endpoint,
         cursor_agentservice_headers(
@@ -3807,6 +4401,7 @@ async fn open_agent_stream(
         ),
         wrap_connect_frame(&body),
         timeouts,
+        request_memory.cloned(),
     )
     .await
     {
@@ -4513,6 +5108,7 @@ mod tests {
             CursorProtocolRail::OAuthCli,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4620,6 +5216,7 @@ mod tests {
                 CursorProtocolRail::OAuthCli,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4683,6 +5280,7 @@ mod tests {
             CursorProtocolRail::OAuthCli,
             None,
             None,
+            None,
         )
         .await
         .expect("first continuation consumes the parked session");
@@ -4694,6 +5292,7 @@ mod tests {
             &plan,
             &scope,
             CursorProtocolRail::OAuthCli,
+            None,
             None,
             None,
         )
@@ -4736,6 +5335,7 @@ mod tests {
                 saw_text: true,
                 ..Default::default()
             },
+            memory: None,
         };
         for attempt in 1..=MAX_SEMANTIC_ATTEMPTS {
             assert_eq!(
@@ -4755,6 +5355,7 @@ mod tests {
                 saw_custom_tool_call: true,
                 ..Default::default()
             },
+            memory: None,
         };
         assert!(
             semantic_attempt_rejection(&tool_call, &SemanticToolConstraint::LocalIntent,).is_none()
@@ -4940,9 +5541,35 @@ mod tests {
             &stored,
             "cursor-budget-runtime",
             Duration::from_secs(60),
+            None,
         )
         .await
         .unwrap();
+
+        let exhausted = RequestMemoryBudget::new(8);
+        let _ = exhausted.reject(RequestMemoryComponent::StreamRetainedState, 9);
+        let mut exhausted_context = CursorAttemptContext::capture(
+            &state,
+            &stored,
+            "cursor-budget-runtime",
+            Duration::from_secs(60),
+            Some(exhausted),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            exhausted_context
+                .reserve(
+                    &state,
+                    &stored,
+                    RecoveryStage::Auth,
+                    "fixture_memory_exhausted",
+                )
+                .await
+                .unwrap(),
+            RetryDecision::DeniedBudget
+        );
+        assert_eq!(exhausted_context.budget.retries_used(), 0);
 
         assert_eq!(
             context
@@ -5025,6 +5652,7 @@ mod tests {
             blob_store: HashMap::new(),
             state: SessionState::Running,
             last_activity: Instant::now(),
+            request_memory: None,
         }));
         let response = stream_response(
             state.clone(),
@@ -5043,8 +5671,10 @@ mod tests {
             Some(account_in_flight_guard),
             None,
             None,
+            None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(
             state
@@ -5125,8 +5755,10 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(state.cursor_sessions.has(&key).await);
         let mut body = response.into_body().into_data_stream();
@@ -5209,6 +5841,7 @@ mod tests {
             &stored,
             "cursor-auth-runtime",
             Duration::from_secs(60),
+            None,
         )
         .await
         .unwrap();
@@ -5355,6 +5988,7 @@ mod tests {
             &stored,
             "cursor-api-key-runtime",
             Duration::from_secs(60),
+            None,
         )
         .await
         .unwrap();
@@ -5798,6 +6432,18 @@ mod tests {
         assert_eq!(
             cursor_stream_drop_classification(false, 200),
             ("interrupted", ProviderOutcome::NetworkFailure)
+        );
+    }
+
+    #[test]
+    fn cursor_memory_exhaustion_is_capacity_shed_not_network_failure() {
+        let error = ProxyError::request_memory_exhausted();
+        let stream_status = cursor_stream_status_for_error(&error);
+
+        assert_eq!(stream_status, "memory_capacity");
+        assert_eq!(
+            cursor_stream_provider_outcome(error.status.as_u16(), stream_status),
+            ProviderOutcome::CapacityShed { status_code: 503 }
         );
     }
 }

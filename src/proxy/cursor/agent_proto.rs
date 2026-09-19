@@ -280,6 +280,8 @@ pub enum ProtoError {
     Gzip(String),
     #[error("connect frame exceeds max size ({size} > {max})")]
     FrameTooLarge { size: usize, max: usize },
+    #[error("connect gzip payload exceeds request memory ({size} > {max})")]
+    DecodedLimit { size: usize, max: usize },
     #[error("invalid connect frame flags 0x{0:02x}")]
     InvalidFrameFlags(u8),
     #[error("connect stream ended with {buffered} buffered bytes from an incomplete frame")]
@@ -711,8 +713,17 @@ impl ConnectFrameParser {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> ProtoResult<Vec<ConnectFrame>> {
+        self.feed_with_decoded_limit(chunk, CONNECT_MAX_FRAME_BYTES)
+    }
+
+    pub(crate) fn feed_with_decoded_limit(
+        &mut self,
+        chunk: &[u8],
+        decoded_limit: usize,
+    ) -> ProtoResult<Vec<ConnectFrame>> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let mut decoded_bytes = 0usize;
         loop {
             if self.buf.len() < 5 {
                 break;
@@ -735,7 +746,10 @@ impl ConnectFrameParser {
             self.buf.advance(5);
             let raw = self.buf.split_to(length).freeze();
             let payload = if flags & FLAG_GZIP != 0 {
-                gunzip(&raw)?
+                let remaining = decoded_limit.saturating_sub(decoded_bytes);
+                let decoded = gunzip_limited(&raw, remaining)?;
+                decoded_bytes = decoded_bytes.saturating_add(decoded.len());
+                decoded
             } else {
                 raw
             };
@@ -745,6 +759,24 @@ impl ConnectFrameParser {
             // flag set so it can extract grpc-status / grpc-message.
         }
         Ok(out)
+    }
+
+    /// Conservative capacity needed before appending `additional` bytes.
+    /// BytesMut currently grows geometrically; rounding up prevents the
+    /// request budget from lagging behind an allocation during parser growth.
+    pub(crate) fn anticipated_retained_bytes(&self, additional: usize) -> usize {
+        let required = self.buf.len().saturating_add(additional);
+        if required <= self.buf.capacity() {
+            return self.buf.capacity();
+        }
+        required
+            .max(self.buf.capacity().saturating_mul(2))
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buf.capacity()
     }
 
     pub fn finish(&self) -> ProtoResult<()> {
@@ -758,15 +790,22 @@ impl ConnectFrameParser {
     }
 }
 
-fn gunzip(src: &[u8]) -> ProtoResult<Bytes> {
+fn gunzip_limited(src: &[u8], decoded_limit: usize) -> ProtoResult<Bytes> {
     use std::io::Read;
+    let limit = decoded_limit.min(CONNECT_MAX_FRAME_BYTES);
     let mut decoder = flate2::read::GzDecoder::new(src);
     let mut out = Vec::new();
     decoder
         .by_ref()
-        .take((CONNECT_MAX_FRAME_BYTES + 1) as u64)
+        .take(limit.saturating_add(1) as u64)
         .read_to_end(&mut out)
         .map_err(|e| ProtoError::Gzip(e.to_string()))?;
+    if out.len() > decoded_limit {
+        return Err(ProtoError::DecodedLimit {
+            size: out.len(),
+            max: decoded_limit,
+        });
+    }
     if out.len() > CONNECT_MAX_FRAME_BYTES {
         return Err(ProtoError::FrameTooLarge {
             size: out.len(),
@@ -2231,6 +2270,39 @@ mod tests {
         let invalid = [FLAG_GZIP, 0, 0, 0, 3, 1, 2, 3];
         let error = ConnectFrameParser::new().feed(&invalid).unwrap_err();
         assert!(matches!(error, ProtoError::Gzip(_)));
+    }
+
+    #[test]
+    fn gzip_expansion_honors_request_memory_limit() {
+        use std::io::Write;
+
+        let payload = vec![b'x'; 8 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut frame = BytesMut::with_capacity(5 + compressed.len());
+        frame.put_u8(FLAG_GZIP);
+        frame.put_u32(compressed.len() as u32);
+        frame.extend_from_slice(&compressed);
+
+        let error = ConnectFrameParser::new()
+            .feed_with_decoded_limit(&frame, 1024)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProtoError::DecodedLimit { size, max: 1024 } if size == 1025
+        ));
+    }
+
+    #[test]
+    fn partial_frame_preflight_accounts_for_parser_growth() {
+        let frame = wrap_connect_frame(&vec![b'p'; 4096]);
+        let mut parser = ConnectFrameParser::new();
+        let anticipated = parser.anticipated_retained_bytes(64);
+        assert!(anticipated >= 64);
+        assert!(parser.feed(&frame[..64]).unwrap().is_empty());
+        assert!(parser.retained_bytes() >= 64);
+        assert!(parser.anticipated_retained_bytes(frame.len() - 64) >= frame.len());
     }
 
     #[test]

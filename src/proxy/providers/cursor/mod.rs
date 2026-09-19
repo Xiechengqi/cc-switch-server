@@ -17,6 +17,7 @@ use crate::state::{AccountInFlightGuard, ServerState, ShareInFlightGuard};
 use super::super::adapters::{self, AdapterRequest};
 use super::super::cursor as driver;
 use super::super::provider_ops::ProviderExecution;
+use super::super::request_memory::RequestMemoryBudget;
 use super::super::router::ProxyRoute;
 use super::super::ProxyError;
 
@@ -66,6 +67,7 @@ pub(crate) struct AgentServiceForwardOptions {
     pub(crate) request_timeout: Duration,
     pub(crate) first_frame_timeout: Option<Duration>,
     pub(crate) inter_frame_timeout: Option<Duration>,
+    pub(crate) request_memory: Option<RequestMemoryBudget>,
 }
 
 pub(crate) async fn forward_agentservice(
@@ -85,6 +87,7 @@ pub(crate) async fn forward_agentservice(
             first_frame: options.first_frame_timeout,
             inter_frame: options.inter_frame_timeout,
         },
+        request_memory: options.request_memory,
     })
     .await
 }

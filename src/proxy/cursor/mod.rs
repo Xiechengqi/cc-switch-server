@@ -12,6 +12,7 @@ pub mod event_emitter;
 pub mod h2_client;
 pub mod identity;
 pub mod image;
+pub(crate) mod memory;
 pub mod model;
 pub mod profile;
 pub mod protocol;

@@ -97,6 +97,10 @@ pub enum MarkerEvent {
 }
 
 impl ComposerMarkerFilter {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.buffer.capacity())
+    }
+
     pub fn push(&mut self, delta: &str) -> Vec<MarkerEvent> {
         self.buffer.push_str(delta);
         self.drain(false)
@@ -379,6 +383,78 @@ impl AgentSseWriter {
 
     pub fn message_id(&self) -> &str {
         &self.msg_id
+    }
+
+    /// Allocation-sized estimate of state retained between upstream frames.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let output_ref_bytes = |value: &OutputRef| {
+            std::mem::size_of::<OutputRef>().saturating_add(value.item_id.capacity())
+        };
+        let tool_items = self.tool_items.iter().fold(
+            self.tool_items.capacity().saturating_mul(
+                std::mem::size_of::<String>()
+                    .saturating_add(std::mem::size_of::<OutputRef>())
+                    .saturating_add(std::mem::size_of::<usize>()),
+            ),
+            |total, (key, value)| {
+                total
+                    .saturating_add(key.capacity())
+                    .saturating_add(output_ref_bytes(value))
+            },
+        );
+        let custom_names = self.custom_tool_names.iter().fold(
+            self.custom_tool_names.capacity().saturating_mul(
+                std::mem::size_of::<String>().saturating_add(std::mem::size_of::<usize>()),
+            ),
+            |total, value| total.saturating_add(value.capacity()),
+        );
+        let namespaces = self.response_tool_namespaces.iter().fold(
+            self.response_tool_namespaces.capacity().saturating_mul(
+                std::mem::size_of::<String>()
+                    .saturating_add(std::mem::size_of::<ResponseToolNamespace>())
+                    .saturating_add(std::mem::size_of::<usize>()),
+            ),
+            |total, (key, value)| {
+                total
+                    .saturating_add(key.capacity())
+                    .saturating_add(value.internal_name.capacity())
+                    .saturating_add(value.namespace.capacity())
+                    .saturating_add(value.name.capacity())
+            },
+        );
+        let tool_calls = self.aggregate_tool_calls.iter().fold(
+            self.aggregate_tool_calls
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CapturedToolCall>()),
+            |total, call| {
+                total
+                    .saturating_add(call.id.capacity())
+                    .saturating_add(call.name.capacity())
+                    .saturating_add(call.arguments_json.capacity())
+            },
+        );
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.model.capacity())
+            .saturating_add(self.msg_id.capacity())
+            .saturating_add(
+                self.reasoning_item
+                    .as_ref()
+                    .map(output_ref_bytes)
+                    .unwrap_or_default(),
+            )
+            .saturating_add(
+                self.text_item
+                    .as_ref()
+                    .map(output_ref_bytes)
+                    .unwrap_or_default(),
+            )
+            .saturating_add(tool_items)
+            .saturating_add(custom_names)
+            .saturating_add(namespaces)
+            .saturating_add(self.aggregate_text.capacity())
+            .saturating_add(self.aggregate_reasoning.capacity())
+            .saturating_add(tool_calls)
     }
 
     /// Current estimated input token count (set at construction, updated by
@@ -823,6 +899,57 @@ impl AgentSseWriter {
                             "message": message,
                             "type": "upstream_error",
                             "code": "cc_switch_stream_error"
+                        }
+                    })
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        }
+    }
+
+    /// Emit the stable downstream terminal used after an already-committed
+    /// Cursor stream exhausts its request memory budget.
+    pub fn error_events_with_code(&mut self, message: &str, code: &str) -> Vec<String> {
+        self.error_mode = true;
+        match self.format {
+            CursorResponseFormat::AnthropicMessages => vec![anthropic_event(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": { "type": code, "message": message }
+                }),
+            )],
+            CursorResponseFormat::OpenAiResponses => vec![event(
+                "response.failed",
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": self.msg_id,
+                        "object": "response",
+                        "model": self.model,
+                        "status": "failed",
+                        "error": { "code": code, "message": message }
+                    }
+                }),
+            )],
+            CursorResponseFormat::OpenAiChatCompletions => vec![format!(
+                "data: {}\n\n",
+                json!({
+                    "error": {
+                        "message": message,
+                        "type": "server_error",
+                        "code": code
+                    }
+                })
+            )],
+            CursorResponseFormat::GeminiGenerateContent => vec![
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": message,
+                            "type": "server_error",
+                            "code": code
                         }
                     })
                 ),
@@ -1929,5 +2056,31 @@ mod tests {
         assert!(joined.contains("\"finish_reason\":\"error\""));
         assert!(!joined.contains("\"finish_reason\":\"stop\""));
         assert!(joined.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn request_memory_terminal_keeps_the_stable_code_on_every_surface() {
+        for format in [
+            CursorResponseFormat::AnthropicMessages,
+            CursorResponseFormat::OpenAiResponses,
+            CursorResponseFormat::OpenAiChatCompletions,
+            CursorResponseFormat::GeminiGenerateContent,
+        ] {
+            let mut writer = AgentSseWriter::new("fixture-model".to_string(), format, 0);
+            let mut events = writer.error_events_with_code(
+                "Request resident-memory capacity exhausted; retry later",
+                "cc_switch_request_memory_exhausted",
+            );
+            events.extend(writer.done_events());
+            let joined = events.join("");
+            assert!(
+                joined.contains("cc_switch_request_memory_exhausted"),
+                "format={format:?}: {joined}"
+            );
+            assert!(joined.contains("Request resident-memory capacity exhausted"));
+            if !matches!(format, CursorResponseFormat::AnthropicMessages) {
+                assert_eq!(joined.matches("data: [DONE]\n\n").count(), 1);
+            }
+        }
     }
 }

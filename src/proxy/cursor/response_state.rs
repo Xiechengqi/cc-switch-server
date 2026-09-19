@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::proxy::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
+    RequestMemoryReservation,
+};
+
 const TTL_MS: i64 = 10 * 60 * 1_000;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
@@ -136,6 +141,56 @@ impl CursorCompletedResponseStore {
             conversation_id: entry.conversation_id.clone(),
             local_task_state: entry.local_task_state.clone(),
         })
+    }
+
+    pub(crate) fn get_accounted(
+        &self,
+        scope: &CursorResponseScope,
+        response_id: &str,
+        now_ms: i64,
+        request_memory: Option<&RequestMemoryBudget>,
+    ) -> Result<
+        Option<(CursorCompletedResponse, Option<RequestMemoryReservation>)>,
+        RequestMemoryError,
+    > {
+        let Some(key) = cache_key(scope, response_id) else {
+            return Ok(None);
+        };
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cleanup(&mut inner, now_ms);
+        inner.access_sequence = inner.access_sequence.wrapping_add(1);
+        let sequence = inner.access_sequence;
+        let Some(entry) = inner.entries.get_mut(&key) else {
+            return Ok(None);
+        };
+        entry.access_sequence = sequence;
+        let retained = entry
+            .items
+            .iter()
+            .fold(
+                entry
+                    .items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+                |total, item| total.saturating_add(retained_json_bytes(item)),
+            )
+            .saturating_add(entry.conversation_id.capacity())
+            .saturating_add(entry.local_task_state.origin_turn_digest.capacity())
+            .saturating_add(std::mem::size_of::<CursorCompletedResponse>());
+        let reservation = request_memory
+            .map(|budget| budget.reserve(RequestMemoryComponent::StreamRetainedState, retained))
+            .transpose()?;
+        Ok(Some((
+            CursorCompletedResponse {
+                items: entry.items.clone(),
+                conversation_id: entry.conversation_id.clone(),
+                local_task_state: entry.local_task_state.clone(),
+            },
+            reservation,
+        )))
     }
 
     pub fn insert(

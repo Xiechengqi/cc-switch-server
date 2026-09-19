@@ -6,6 +6,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use rand::RngCore;
 
 use super::agent_proto::EncodedImage;
+use crate::proxy::request_memory::{RequestMemoryBudget, RequestMemoryComponent};
 use crate::proxy::ProxyError;
 
 pub const MAX_IMAGE_BYTES: usize = crate::proxy::remote_image::MAX_IMAGE_BYTES;
@@ -19,6 +20,13 @@ pub enum ImageRef {
 }
 
 pub async fn load_images(refs: Vec<ImageRef>) -> Result<Vec<EncodedImage>, ProxyError> {
+    load_images_with_memory(refs, None).await
+}
+
+pub(crate) async fn load_images_with_memory(
+    refs: Vec<ImageRef>,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<Vec<EncodedImage>, ProxyError> {
     if refs.len() > crate::proxy::remote_image::MAX_IMAGES_PER_REQUEST {
         return Err(invalid_image(format!(
             "Cursor request exceeds {} image limit",
@@ -26,7 +34,7 @@ pub async fn load_images(refs: Vec<ImageRef>) -> Result<Vec<EncodedImage>, Proxy
         )));
     }
 
-    tokio::time::timeout(
+    let mut images = tokio::time::timeout(
         crate::proxy::remote_image::BATCH_FETCH_TIMEOUT,
         stream::iter(refs.into_iter().map(|reference| async move {
             match reference {
@@ -55,7 +63,15 @@ pub async fn load_images(refs: Vec<ImageRef>) -> Result<Vec<EncodedImage>, Proxy
     .map_err(|_| ProxyError {
         status: StatusCode::BAD_GATEWAY,
         message: "Cursor image batch timed out".to_string(),
-    })?
+    })??;
+    if let Some(budget) = request_memory {
+        for image in &mut images {
+            image.data = budget
+                .retain_bytes(RequestMemoryComponent::DecodedBody, image.data.clone())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+    }
+    Ok(images)
 }
 
 fn decode_data_uri(uri: &str) -> Result<EncodedImage, ProxyError> {

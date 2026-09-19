@@ -72,6 +72,7 @@ pub(in crate::proxy) enum RetryDecision {
     DeniedElapsedLimit,
     DeniedCommitted,
     DeniedBindingDrift,
+    DeniedBudget,
 }
 
 impl RetryDecision {
@@ -83,6 +84,7 @@ impl RetryDecision {
             Self::DeniedElapsedLimit => "denied_elapsed_limit",
             Self::DeniedCommitted => "denied_committed",
             Self::DeniedBindingDrift => "denied_binding_drift",
+            Self::DeniedBudget => "denied_budget",
         }
     }
 }
