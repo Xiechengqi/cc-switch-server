@@ -58,6 +58,8 @@ oracle `verification` 是验证计数单源：65 项离线 Rust Qoder 聚焦测�
 
 QD-N2 已把只读 TokenRouter 交叉核对刷新到 `7faf9469bc6957716923b5b4a98665c0fb9715e0`。已提交 Qoder 文档没有变化，handler 差异只适配共享错误 helper 的签名，没有新增 origin、header、签名、payload、terminal 或恢复 wire，因此本轮不修改生产实现；官方 CLI oracle 继续是第一来源。参考仓库的其他 Provider、调度、计费和 UI 增量不属于 Qoder wire 证据。
 
+Qoder reference delta 已迁为 append-only schema v2：原 schema-v1 文件及 11 个内容字段分别由不可变摘要固定；TokenRouter snapshot 绑定 `7faf9469bc6957716923b5b4a98665c0fb9715e0` 与 tree `b205061c4f0d9b53fbffb0242f34796e10b18251`，并声明只读取干净工作树的 committed Git objects。10 条 observation 把 QD-01～03、QD-N1/N2、CORE-N1、LIVE-N1 和 QD-R1～R3 映射到 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object。QD-R1～R3 明确拒绝账号池/轮换/affinity 或跨边界 fallback、商业控制面，以及外仓运行时依赖、伪 live 与宽松 terminal；默认 audit 自包含，`--check-sources` 才读取 TokenRouter 冻结对象。
+
 ## CLI 升级门禁
 
 升级 Global 或 CN CLI 时必须保持以下顺序：先冻结包名、版本、npm integrity 与 bundle digest；再从不可变官方包独立提取稳定 wire，并用只读第二来源交叉核对；随后先更新 oracle 和使旧合同失败的 mutation，再改 Rust；最后重新生成合同映射与 coverage，运行离线和 loopback 门禁。任何 rail 都只能由自身独立 receipt 从 `live_pending` 提升。

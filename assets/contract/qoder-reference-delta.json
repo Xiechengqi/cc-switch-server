@@ -1,7 +1,16 @@
 {
   "format": "cc-switch-qoder-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
+  "observationPolicy": {
+    "history": "append_only; every schema v1 content field is immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "sourceDigest": "canonical sha256 over sourceId, deltaId, commit, tree and the ordered frozen file records",
+    "externalVerification": "optional explicit --check-sources only; never a build, test, release or runtime dependency"
+  },
   "policy": {
     "scope": "single bound Provider/Share/Account; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no cross-site fallback, no cross-account fallback, no cross-Provider fallback",
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
@@ -28,6 +37,19 @@
           "sha256": "f5c19c5756c0eef81be0ae525c9badde49b32c4a7db9a671c521b6984868b525"
         }
       ]
+    }
+  ],
+  "sourceSnapshots": [
+    {
+      "id": "tokenrouter-2026-09-19",
+      "sourceId": "tokenrouter",
+      "repository": "TokenRouter",
+      "headCommit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+      "headTree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "excludedWorktreeEntries": 0,
+      "readMode": "read_only_committed_git_objects"
     }
   ],
   "incrementalReview": {
@@ -243,5 +265,491 @@
       "site_rail_and_generation_digest",
       "secret_scan"
     ]
+  },
+  "evidenceExtensions": [
+    {
+      "id": "CORE-N1",
+      "status": "fixture_verified",
+      "wireChanged": false,
+      "bindingChanged": false,
+      "attemptBudgetChanged": false,
+      "localEvidence": [
+        {
+          "path": "src/proxy/providers/qoder/mod.rs",
+          "anchors": [
+            "pub(crate) fn bound_account_identity(",
+            "pub(crate) fn prepare_generation(",
+            "pub(crate) async fn runtime_is_current(",
+            "conversation_identity_changes_with_share_and_never_falls_back"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "qoder_provider::bound_account_identity",
+            "qoder_provider::prepare_generation",
+            "qoder_provider::runtime_is_current"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "LIVE-N1",
+      "status": "live_pending",
+      "siteRailScoped": true,
+      "receiptCount": 3,
+      "receiptsIndependent": true,
+      "livePromotionBlockedByUnobservedChecks": true,
+      "localEvidence": [
+        {
+          "path": "scripts/smoke/qoder-real.mjs",
+          "anchors": [
+            "const verificationState = fixtureMode ? \"contract_verified\" : \"partial_live_verified\"",
+            "const liveState = \"live_pending\"",
+            "accountIdentityDigest",
+            "providerBindingDigest"
+          ]
+        },
+        {
+          "path": "scripts/audit/qoder-real.test.mjs",
+          "anchors": [
+            "Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent",
+            "fails closed on a mismatched bound Account"
+          ]
+        },
+        {
+          "path": "scripts/smoke/real-acceptance-env-check.sh",
+          "anchors": [
+            "AB7 Qoder Global OAuth bound-account three-surface smoke",
+            "AB7 Qoder Global PAT bound-account three-surface smoke",
+            "AB7 Qoder CN OAuth bound-account three-surface smoke"
+          ]
+        }
+      ]
+    }
+  ],
+  "reviewedRejections": [
+    {
+      "id": "QD-R1",
+      "status": "rejected",
+      "behaviors": [
+        "account_pool_selection_or_rotation",
+        "cross_account_rail_site_or_provider_fallback",
+        "session_affinity_or_model_driven_account_selection"
+      ],
+      "boundary": "A Qoder request remains fixed to one Provider, Share, Account, credential rail and site; only one same-account same-rail pre-commit recovery is permitted."
+    },
+    {
+      "id": "QD-R2",
+      "status": "rejected",
+      "behaviors": [
+        "commercial_billing_or_key_management",
+        "channel_configuration",
+        "account_maintenance_scheduling",
+        "multi_tenant_admin_backend"
+      ],
+      "boundary": "TokenRouter commercial control-plane and maintenance features are outside the single-account subscription proxy product boundary and are not implementation gaps."
+    },
+    {
+      "id": "QD-R3",
+      "status": "rejected",
+      "behaviors": [
+        "external_repository_or_cli_bundle_runtime_dependency",
+        "fixture_or_reference_success_promotes_local_live_rail",
+        "missing_unique_terminal_or_eof_counts_as_success"
+      ],
+      "boundary": "External objects remain optional audit evidence; each rail needs its own complete local receipt, and success requires one authoritative terminal followed by EOF."
+    }
+  ],
+  "observations": [
+    {
+      "id": "QD-OBS-0001",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "bound_cosy_account_contract",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md", "backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["qoder_account_contract", "credentials.site", "QoderGatewayHandler", "prepareQoderRequestContext"],
+        "sourceDigest": "1ecbc3e3d8a526345e4ee354101b34b13c40f53ec4f57c05763dc422f0bffbb4"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["QD-01"],
+      "target": {
+        "baselineCommit": "84c1450053687d39b647329dd3585f7d5d8ee05d",
+        "baselineTree": "241fa078006abe761a584a073299e45f188f2aab",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "assets/contract/qoder-reference-delta.json",
+            "anchors": ["\"id\": \"QD-01\"", "\"driverId\": \"special.qoder_cosy\""]
+          },
+          {
+            "path": "src/proxy/forwarder/qoder_http_tests.rs",
+            "anchors": ["qoder_http_fixture_covers_all_credential_rails_and_client_surfaces"]
+          }
+        ],
+        "fixtureIds": ["qoder_http_fixture_covers_all_credential_rails_and_client_surfaces"]
+      },
+      "reason": "Keep the Server-native fixed Provider/Share/Account contract and use TokenRouter only to differentially review Qoder account, site and surface behavior."
+    },
+    {
+      "id": "QD-OBS-0002",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "quota_and_entitlement_live_gate",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md", "docs/operations/account_maintenance.md"],
+        "symbols": ["qoder_quota_snapshot", "agentLimitResetTime", "Qoder Credits", "实时探测失败时保留最近成功快照"],
+        "sourceDigest": "8f3dc8cd89b4f97ab626d8197e15403850cefcbe9f29fe2ef3d416921c908d28"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["QD-02"],
+      "target": {
+        "baselineCommit": "84c1450053687d39b647329dd3585f7d5d8ee05d",
+        "baselineTree": "241fa078006abe761a584a073299e45f188f2aab",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "scripts/smoke/qoder-real.mjs",
+            "anchors": ["partial_live_verified", "const liveState = \"live_pending\""]
+          },
+          {
+            "path": "scripts/audit/qoder-real.test.mjs",
+            "anchors": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+          }
+        ],
+        "fixtureIds": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+      },
+      "reason": "Quota, entitlement, catalog and recovery behavior require the selected local Account and real upstream; reference documentation and loopback fixtures cannot close the live gate."
+    },
+    {
+      "id": "QD-OBS-0003",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "three_surface_protocol_projection",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md", "backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["ChatCompletions", "Messages", "Responses", "qoderEndpointResponses"],
+        "sourceDigest": "36b4d679afea0037f0492521be7a790c78085ba7c99d1ae6dab6f758ae77681c"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["QD-03"],
+      "target": {
+        "baselineCommit": "42dc63de63999d5367ebc4dabfad4a1b2f4719e1",
+        "baselineTree": "14c8825dbf783382dad966e092f12939cac6b50d",
+        "implementationCommit": "c4e1058521eb483e130be0b7512b293958643ac0",
+        "implementationTree": "e8a455c00ee8dc59d8e59843d356ac5cf11a20a8",
+        "contracts": [
+          {
+            "path": "src/proxy/qoder_runtime.rs",
+            "anchors": ["frozen_qoder_cli_oracle_matches_native_payload_headers_and_catalog"]
+          },
+          {
+            "path": "scripts/audit/qoder-cli-oracle.test.mjs",
+            "anchors": ["oracle rejects unexplained projection drift"]
+          }
+        ],
+        "fixtureIds": ["frozen_qoder_cli_oracle_matches_native_payload_headers_and_catalog", "oracle rejects unexplained projection drift"]
+      },
+      "reason": "Use the immutable official CLI oracle as primary wire truth and the reference handler only as a secondary three-surface differential."
+    },
+    {
+      "id": "QD-OBS-0004",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "three_credential_rail_receipts",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md"],
+        "symbols": ["qodercn20", "security_oauth_token", "refresh_token", "pat"],
+        "sourceDigest": "acc0f959fae85bbb2c8e0f247c6900b3d8304d40ed73f20c38ec60d12002af8c"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["QD-N1"],
+      "target": {
+        "baselineCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "baselineTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "implementationCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "implementationTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "contracts": [
+          {
+            "path": "assets/contract/qoder-reference-delta.json",
+            "anchors": ["\"id\": \"QD-N1\"", "\"receiptsIndependent\": true"]
+          },
+          {
+            "path": "scripts/audit/qoder-real.test.mjs",
+            "anchors": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+          }
+        ],
+        "fixtureIds": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+      },
+      "reason": "Global OAuth, Global PAT and CN OAuth remain three independent live gates; no rail or site may inherit another rail's result."
+    },
+    {
+      "id": "QD-OBS-0005",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "committed_helper_only_refresh",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["concurrencyErrorResponse", "writeResponsesFailedSSE"],
+        "sourceDigest": "5c24d8a15f3e95766d3aea9eedf2a007b03efb9749e0988a499f42cea373456e"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["QD-N2"],
+      "target": {
+        "baselineCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "baselineTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "implementationCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "implementationTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "contracts": [
+          {
+            "path": "assets/contract/qoder-reference-delta.json",
+            "anchors": ["\"id\": \"QD-N2\"", "\"qoderWireDelta\": \"none\""]
+          },
+          {
+            "path": "scripts/audit/audit-qoder-reference-delta.mjs",
+            "anchors": ["Qoder reviewed helper-only diff changed"]
+          }
+        ],
+        "fixtureIds": ["Qoder reviewed helper-only diff changed"]
+      },
+      "reason": "The reviewed committed diff only adapts shared error-helper signatures; it does not justify a Qoder production wire change."
+    },
+    {
+      "id": "QD-OBS-0006",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "provider_lifecycle_facade",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["QoderGatewayHandler", "prepareQoderRequestContext", "ForwardMessages", "ForwardResponses"],
+        "sourceDigest": "8ee7298b062dc32c05e757e2f3339dc30156a0a1ea5794e01c3c529ec2528af5"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CORE-N1"],
+      "target": {
+        "baselineCommit": "0d5379baa3e1b0a85296ceaca7b1c17975230739",
+        "baselineTree": "21cd08b60a3a42bbfb7ad97cc4faa0d679970a46",
+        "implementationCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+        "implementationTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/qoder/mod.rs",
+            "anchors": ["pub(crate) fn bound_account_identity(", "live_catalog_selection_is_exact_and_site_scoped", "conversation_identity_changes_with_share_and_never_falls_back"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["qoder_provider::prepare_generation", "qoder_provider::runtime_is_current"]
+          }
+        ],
+        "fixtureIds": ["live_catalog_selection_is_exact_and_site_scoped", "conversation_identity_changes_with_share_and_never_falls_back"]
+      },
+      "reason": "Adopt a Qoder lifecycle facade for fixed binding, catalog preparation, conversation scope, generation fencing and throttle classification while shared orchestration retains lease, usage, terminal and attempt ownership."
+    },
+    {
+      "id": "QD-OBS-0007",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "site_rail_scoped_live_acceptance",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md", "docs/operations/account_maintenance.md"],
+        "symbols": ["credentials.refresh_mode", "QODER_PAT", "qodercn20", "一个模型测试成功只证明该路径当时可用"],
+        "sourceDigest": "b9388d7293ba7b78aeb7e6ca502163e8b9c9ac153878a05fe0c588f5d83a8c44"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["LIVE-N1"],
+      "target": {
+        "baselineCommit": "0d5379baa3e1b0a85296ceaca7b1c17975230739",
+        "baselineTree": "21cd08b60a3a42bbfb7ad97cc4faa0d679970a46",
+        "implementationCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+        "implementationTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+        "contracts": [
+          {
+            "path": "scripts/smoke/qoder-real.mjs",
+            "anchors": ["schemaVersion: 2", "harnessRevision: HARNESS_REVISION", "partial_live_verified", "const liveState = \"live_pending\""]
+          },
+          {
+            "path": "scripts/audit/qoder-real.test.mjs",
+            "anchors": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+          }
+        ],
+        "fixtureIds": ["Qoder real harness keeps Global OAuth, Global PAT, and CN OAuth receipts independent"]
+      },
+      "reason": "Bind every private receipt to the exact Account generations, three Provider runtimes, Share, site, rail, model, catalogs and request bodies; unobserved destructive checks keep the rail live-pending."
+    },
+    {
+      "id": "QD-OBS-0008",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "pool_rotation_and_affinity_rejected",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["maxAccountSwitches", "NewFailoverState", "SelectAccountWithLoadAwareness", "FailedAccountIDs"],
+        "sourceDigest": "288253f9e48550859c31ded37892c47e5a3b01e75c0d9f0ef153568fc5680f3f"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["QD-R1"],
+      "target": {
+        "baselineCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+        "baselineTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "docs/provider/qoder-cosy.md",
+            "anchors": ["一个 Qoder Provider 固定绑定一个 Qoder Account", "Server 不实现账号池、轮询、权重"]
+          },
+          {
+            "path": "assets/contract/qoder-reference-delta.json",
+            "anchors": ["no pool", "no rotation", "no cross-account fallback", "no cross-Provider fallback"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject pool selection, rotation, sticky account affinity and model-driven account switching because the Server request is already bound to one Provider, Share, Account, rail and site."
+    },
+    {
+      "id": "QD-OBS-0009",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "commercial_control_plane_rejected",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/operations/account_maintenance.md", "backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["scheduled-test-plans", "billingCacheService", "usageRecordWorkerPool", "APIKeyService"],
+        "sourceDigest": "c276379a7a6aecb51c9f304c82b76a5c7ef56dd9587b8a1cd57dfdea416eb04a"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["QD-R2"],
+      "target": {
+        "baselineCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+        "baselineTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["不纳入 TokenRouter 的商业计费、Key 管理、渠道配置、账号维护调度和多租户管理后台。"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject TokenRouter billing, API-key, channel, account-maintenance scheduler and multi-tenant administration features as a materially different product scope."
+    },
+    {
+      "id": "QD-OBS-0010",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "external_runtime_and_weak_terminal_rejected",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": ["docs/interfaces/qoder_upstream.md", "backend/internal/handler/qoder_gateway_handler.go"],
+        "symbols": ["ForwardMessages", "ForwardResponses", "streamingAwareError", "流式输出开始后只返回符合流语义的错误"],
+        "sourceDigest": "d68d473fe05faf3587116c7cc4ace26ca92541c1912d2347dff9f3e5df3cc0cf"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["QD-R3"],
+      "target": {
+        "baselineCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+        "baselineTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/qoder-reference-delta.json",
+            "anchors": ["runtime_dependency_on_external_repository_or_npm_bundle", "one_rail_receipt_promotes_another_rail"]
+          },
+          {
+            "path": "docs/provider/qoder-cosy.md",
+            "anchors": ["只有 EOF 验证通过后才向下游输出唯一一次完成事件", "不能标记 live verified"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject external runtime dependencies, reference or fixture promotion of local live state, and any success path that lacks a unique authoritative terminal followed by EOF."
+    }
+  ],
+  "legacyV1": {
+    "path": "assets/contract/qoder-reference-delta.json",
+    "targetCommit": "2cc8a017dee0f5ca1ab4189ad87db35c391669ea",
+    "targetTree": "251c191c0ec4bcaec6ab1659b9a9e39ddafa8587",
+    "fileSha256": "20fb3bcaa7e7b20543c567329b4f84dbcf52d0d4f18d6f88bc5f6bba1bdf6208",
+    "canonicalDigest": "72599461d33f31e448619b4b1efcc6b8767b8544e14e8534be11d20911fa121d",
+    "fields": [
+      "format",
+      "schemaVersion",
+      "capturedAt",
+      "policy",
+      "sources",
+      "incrementalReview",
+      "contractMap",
+      "capabilities",
+      "enhancements",
+      "upgradeWorkflow",
+      "realAcceptance"
+    ],
+    "fieldDigests": {
+      "format": "8188172f4ce7eed6c09ea32b3ef2d648a343d40c6956542b09d0a86183749df5",
+      "schemaVersion": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "capturedAt": "18aca4884d737a6e7c2c3ee61b8abd0b8d19239c34d2385637cd99769060390e",
+      "policy": "8965b639a4b2e78e86bc39c2c57b5b1bbce4b56b8c9fee87bf14d01ab4e5ec0f",
+      "sources": "bad408f132faf773c2b9e333171db87f74faa3b433b9f5c2f36f6d08863a62a4",
+      "incrementalReview": "0762431f2022f62bb93857c4c9e82cffe1e708eee15ab5d4cca0e1b60dbc96f7",
+      "contractMap": "5bfb62f6954b77d21fcc74d66e7b69931a69936022eb0b0860a54f37d7d5a42a",
+      "capabilities": "65d603a25c78322816c48fd6c755848397270447952964f4ba7c5fcf60d4d4b0",
+      "enhancements": "5d73fd38ed898fcdac10bb759cfc5090613db4ff38e43a7d2c64431dc14feecd",
+      "upgradeWorkflow": "1c12f1ea9a89fe2161c016ded746614ee24222e8b3e33864ed40d72a52331364",
+      "realAcceptance": "40b4266efb714b7bb9c62284c3c96ed18168b4d8f8431928702bef23c9f6d80a"
+    }
   }
 }
