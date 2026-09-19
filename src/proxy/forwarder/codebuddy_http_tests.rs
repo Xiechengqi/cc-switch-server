@@ -23,7 +23,10 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 enum CodeBuddyGenerationReply {
     Success,
     HttpUnauthorized,
+    OversizedHttpUnauthorized,
     LateUnauthorized,
+    LargeAggregate,
+    LargeToolStream,
     DuplicateDone,
     DataAfterDone,
     TruncatedBeforeDone,
@@ -308,6 +311,47 @@ fn success_response() -> Response {
     sse_response(chunks)
 }
 
+fn large_memory_response(include_text: bool) -> Response {
+    let fragment = "x".repeat(1_024);
+    let mut chunks = Vec::with_capacity(98);
+    for index in 0..96 {
+        chunks.push(Bytes::from(format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-codebuddy-memory",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": if include_text { fragment.as_str() } else { "" },
+                        "reasoning_content": if include_text { fragment.as_str() } else { "" },
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call-memory",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": if index == 0 {
+                                    "{\"payload\":\""
+                                } else if index == 95 {
+                                    "\"}"
+                                } else {
+                                    fragment.as_str()
+                                }
+                            }
+                        }]
+                    },
+                    "finish_reason": if index == 95 { Some("tool_calls") } else { None }
+                }]
+            })
+        )));
+    }
+    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    sse_response(chunks)
+}
+
 async fn codebuddy_generation(
     State(state): State<CodeBuddyFixtureState>,
     uri: Uri,
@@ -338,10 +382,19 @@ async fn codebuddy_generation(
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(json!({"message": "expired"}).to_string()))
             .unwrap(),
+        CodeBuddyGenerationReply::OversizedHttpUnauthorized => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"message": "x".repeat(256 * 1024)}).to_string(),
+            ))
+            .unwrap(),
         CodeBuddyGenerationReply::LateUnauthorized => sse_response(vec![
             chat_chunk("discard-me", None),
             Bytes::from_static(b"data: {\"code\":12005,\"message\":\"expired\"}\n\n"),
         ]),
+        CodeBuddyGenerationReply::LargeAggregate => large_memory_response(true),
+        CodeBuddyGenerationReply::LargeToolStream => large_memory_response(false),
         CodeBuddyGenerationReply::DuplicateDone => {
             let mut chunks = tool_chunks();
             chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -813,6 +866,265 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
                     server.abort();
                 }
             }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_request_memory_rejects_all_surfaces_before_any_upstream_request() {
+    run_codebuddy_async_test(async {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            let name = format!("codebuddy-memory-pre-network-{}", app.as_str());
+            let (address, fixture, server) = spawn_codebuddy_upstream(
+                CodeBuddySite::Intl,
+                vec![CodeBuddyGenerationReply::Success],
+            )
+            .await;
+            let (_, _, body) = surface_request(app, false);
+            let mut state = codebuddy_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("CodeBuddy test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = body.len().saturating_add(1);
+            let (provider_id, _) = install_codebuddy_provider(
+                &state,
+                &name,
+                app,
+                CodeBuddySite::Intl,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                .await;
+
+            let error = forward_codebuddy_surface(state, app, provider_id, &share_id, false)
+                .await
+                .unwrap_err();
+            assert!(error.is_request_memory_exhausted(), "{app:?}: {error:?}");
+            assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+            assert_eq!(fixture.count(&fixture.config_requests), 0, "{app:?}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 0, "{app:?}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn codebuddy_nonstream_content_reasoning_and_tool_aggregate_is_memory_bounded() {
+    run_codebuddy_async_test(async {
+        let name = "codebuddy-memory-nonstream-aggregate";
+        let (address, fixture, server) = spawn_codebuddy_upstream(
+            CodeBuddySite::Intl,
+            vec![CodeBuddyGenerationReply::LargeAggregate],
+        )
+        .await;
+        let mut state = codebuddy_test_state(name);
+        Arc::get_mut(&mut state)
+            .expect("CodeBuddy test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 192 * 1024;
+        let (provider_id, _) = install_codebuddy_provider(
+            &state,
+            name,
+            AppKind::Claude,
+            CodeBuddySite::Intl,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = format!("{name}-share");
+        install_codebuddy_share(
+            &state,
+            &share_id,
+            AppKind::Claude,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+
+        let error = forward_codebuddy_surface(
+            state.clone(),
+            AppKind::Claude,
+            provider_id,
+            &share_id,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(fixture.count(&fixture.config_requests), 1);
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        let usage = state.usage.read().await.logs.last().cloned().unwrap();
+        assert_eq!(usage.stream_status, None);
+        assert_eq!(usage.failure_kind.as_deref(), Some("memory_capacity"));
+        assert_eq!(usage.outcome, UsageOutcome::InternalError);
+        server.abort();
+    });
+}
+
+#[test]
+fn codebuddy_stream_bridge_memory_exhaustion_emits_one_redacted_terminal() {
+    run_codebuddy_async_test(async {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            let name = format!("codebuddy-memory-stream-tools-{}", app.as_str());
+            let (address, fixture, server) = spawn_codebuddy_upstream(
+                CodeBuddySite::Intl,
+                vec![if app == AppKind::Claude {
+                    CodeBuddyGenerationReply::LargeAggregate
+                } else {
+                    CodeBuddyGenerationReply::LargeToolStream
+                }],
+            )
+            .await;
+            let mut state = codebuddy_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("CodeBuddy test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = 128 * 1024;
+            let (provider_id, _) = install_codebuddy_provider(
+                &state,
+                &name,
+                app,
+                CodeBuddySite::Intl,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                .await;
+
+            let response =
+                forward_codebuddy_surface(state.clone(), app, provider_id, &share_id, true)
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{app:?}");
+            let body = String::from_utf8(collect(response).await).unwrap();
+            assert_eq!(
+                body.matches("cc_switch_request_memory_exhausted").count(),
+                1,
+                "{app:?}: {body}"
+            );
+            match app {
+                AppKind::Claude => assert_eq!(body.matches("event: error").count(), 1, "{body}"),
+                AppKind::Codex => {
+                    assert_eq!(body.matches("event: response.failed").count(), 1, "{body}")
+                }
+                AppKind::Gemini => assert_eq!(body.matches("\"error\"").count(), 1, "{body}"),
+            }
+            assert!(
+                !body.contains("resident-memory budget exhausted for"),
+                "{app:?}: {body}"
+            );
+            assert_eq!(fixture.count(&fixture.generation_requests), 1, "{app:?}");
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{app:?}");
+            let usage = state.usage.read().await.logs.last().cloned().unwrap();
+            assert_eq!(
+                usage.stream_status.as_deref(),
+                Some("memory_capacity"),
+                "{app:?}"
+            );
+            assert_eq!(
+                usage.failure_kind.as_deref(),
+                Some("memory_capacity"),
+                "{app:?}"
+            );
+            assert_eq!(usage.outcome, UsageOutcome::InternalError, "{app:?}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            let name = format!("codebuddy-memory-auth-no-replay-{}", site.as_str());
+            let (address, fixture, server) = spawn_codebuddy_upstream(
+                site,
+                vec![CodeBuddyGenerationReply::OversizedHttpUnauthorized],
+            )
+            .await;
+            let mut state = codebuddy_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("CodeBuddy test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = 128 * 1024;
+            let (provider_id, _) = install_codebuddy_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                site,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+
+            let error =
+                forward_codebuddy_surface(state, AppKind::Codex, provider_id, &share_id, false)
+                    .await
+                    .unwrap_err();
+            assert!(error.is_request_memory_exhausted(), "{site:?}: {error:?}");
+            assert_eq!(fixture.count(&fixture.config_requests), 1, "{site:?}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1, "{site:?}");
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{site:?}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_keep_one_request_budget_across_401_recovery() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            let name = format!("codebuddy-memory-auth-recovery-{}", site.as_str());
+            let (address, fixture, server) = spawn_codebuddy_upstream(
+                site,
+                vec![
+                    CodeBuddyGenerationReply::HttpUnauthorized,
+                    CodeBuddyGenerationReply::Success,
+                ],
+            )
+            .await;
+            let mut state = codebuddy_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("CodeBuddy test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = 512 * 1024;
+            let (provider_id, _) = install_codebuddy_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                site,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+
+            let response =
+                forward_codebuddy_surface(state, AppKind::Codex, provider_id, &share_id, false)
+                    .await
+                    .unwrap();
+            let body = String::from_utf8(collect(response).await).unwrap();
+            assert!(body.contains("ready"), "{site:?}: {body}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 2, "{site:?}");
+            assert_eq!(fixture.count(&fixture.refresh_requests), 1, "{site:?}");
+            server.abort();
         }
     });
 }

@@ -17,6 +17,9 @@ use crate::state::{CodeBuddyRuntimeError, ServerState};
 use super::super::adapters::AdapterRequest;
 use super::super::codebuddy_runtime::{self as runtime, PreparedCodeBuddyRuntime};
 use super::super::provider_ops::ProviderExecution;
+use super::super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::ProxyError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +73,14 @@ pub(crate) struct CanonicalRequest {
     pub(crate) body: Value,
 }
 
+impl CanonicalRequest {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.requested_model
+            .capacity()
+            .saturating_add(retained_json_bytes(&self.body))
+    }
+}
+
 pub(crate) fn prepare_canonical_request(
     request: &AdapterRequest,
 ) -> Result<CanonicalRequest, ProxyError> {
@@ -112,12 +123,34 @@ pub(crate) enum GenerationPreparationError {
 pub(crate) struct PreparedGeneration {
     pub(crate) model_id: String,
     pub(crate) payload: Value,
+    pub(crate) prepared_memory: Option<RequestMemoryReservation>,
+}
+
+impl PreparedGeneration {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.model_id
+            .capacity()
+            .saturating_add(retained_json_bytes(&self.payload))
+    }
 }
 
 pub(crate) fn prepare_generation(
     prepared_runtime: &PreparedCodeBuddyRuntime,
     canonical: &CanonicalRequest,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<PreparedGeneration, GenerationPreparationError> {
+    // Payload construction clones and normalizes the canonical Chat object.
+    // Reserve that transient working set before any request-owned JSON or
+    // model strings are allocated.
+    let prepared_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                canonical.retained_bytes().saturating_mul(3),
+            )
+        })
+        .transpose()
+        .map_err(|error| GenerationPreparationError::FailBeforeCommit(error.into_proxy_error()))?;
     let model_id = runtime::resolve_codebuddy_model_id(
         prepared_runtime.profile.site,
         &canonical.requested_model,
@@ -168,7 +201,17 @@ pub(crate) fn prepare_generation(
     }
     let payload = runtime::build_codebuddy_payload(&canonical.body, &model_id, capability)
         .map_err(|error| GenerationPreparationError::Direct(ProxyError::bad_request(error)))?;
-    Ok(PreparedGeneration { model_id, payload })
+    let prepared = PreparedGeneration {
+        model_id,
+        payload,
+        prepared_memory,
+    };
+    if let Some(memory) = prepared.prepared_memory.as_ref() {
+        memory.resize(prepared.retained_bytes()).map_err(|error| {
+            GenerationPreparationError::FailBeforeCommit(error.into_proxy_error())
+        })?;
+    }
+    Ok(prepared)
 }
 
 pub(crate) async fn runtime_is_current(
@@ -277,17 +320,18 @@ mod tests {
     #[tokio::test]
     async fn generation_uses_exact_site_bound_live_catalog() {
         let intl = prepared_runtime(CodeBuddySite::Intl, "default-model", true, true).await;
-        let intl_generation = prepare_generation(&intl, &canonical("auto", json!({}))).unwrap();
+        let intl_generation =
+            prepare_generation(&intl, &canonical("auto", json!({})), None).unwrap();
         assert_eq!(intl_generation.model_id, "default-model");
         assert_eq!(intl_generation.payload["model"], "default-model");
 
         let cn = prepared_runtime(CodeBuddySite::Cn, "default", true, true).await;
-        let cn_generation = prepare_generation(&cn, &canonical("auto", json!({}))).unwrap();
+        let cn_generation = prepare_generation(&cn, &canonical("auto", json!({})), None).unwrap();
         assert_eq!(cn_generation.model_id, "default");
         assert_eq!(cn_generation.payload["model"], "default");
 
-        let missing =
-            prepare_generation(&cn, &canonical("deepseek-v4.1-flash", json!({}))).unwrap_err();
+        let missing = prepare_generation(&cn, &canonical("deepseek-v4.1-flash", json!({})), None)
+            .unwrap_err();
         assert!(matches!(
             missing,
             GenerationPreparationError::RecordFailure(ProxyError {
@@ -306,6 +350,7 @@ mod tests {
                 "default-model",
                 json!({"tools":[{"type":"function","function":{"name":"lookup"}}]}),
             ),
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -315,6 +360,7 @@ mod tests {
         let reasoning = prepare_generation(
             &runtime,
             &canonical("default-model", json!({"reasoning":{"effort":"high"}})),
+            None,
         )
         .unwrap_err();
         assert!(matches!(

@@ -150,6 +150,53 @@ impl CodeBuddyModelCatalog {
         stale.stale = true;
         stale
     }
+
+    fn retained_bytes(&self) -> usize {
+        let enabled_models = self.enabled_models.iter().fold(
+            self.enabled_models
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+            |bytes, model| bytes.saturating_add(model.capacity()),
+        );
+        let raw_configs = self
+            .raw_configs
+            .iter()
+            .fold(0_usize, |bytes, (key, value)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, Value)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(key.capacity())
+                    .saturating_add(super::request_memory::retained_json_bytes(value))
+            });
+        let capabilities = self
+            .capabilities
+            .iter()
+            .fold(0_usize, |bytes, (key, capability)| {
+                let reasoning = capability.reasoning_efforts.iter().fold(
+                    capability
+                        .reasoning_efforts
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, effort| bytes.saturating_add(effort.capacity()),
+                );
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, CodeBuddyModelCapability)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(key.capacity())
+                    .saturating_add(capability.id.capacity())
+                    .saturating_add(capability.display_name.as_ref().map_or(0, String::capacity))
+                    .saturating_add(reasoning)
+                    .saturating_add(
+                        capability
+                            .default_reasoning_effort
+                            .as_ref()
+                            .map_or(0, String::capacity),
+                    )
+            });
+        enabled_models
+            .saturating_add(raw_configs)
+            .saturating_add(capabilities)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +216,27 @@ pub struct PreparedCodeBuddyRuntime {
     pub account_id: String,
     pub auth_identity_generation: u64,
     pub token_refresh_generation: u64,
+}
+
+impl PreparedCodeBuddyRuntime {
+    pub fn retained_bytes(&self) -> usize {
+        self.scope
+            .0
+            .capacity()
+            .saturating_add(self.profile.domain.capacity())
+            .saturating_add(self.profile.uid.capacity())
+            .saturating_add(self.profile.enterprise_id.capacity())
+            .saturating_add(self.profile.name.capacity())
+            .saturating_add(self.profile.email.capacity())
+            .saturating_add(self.profile.nickname.capacity())
+            .saturating_add(self.profile.account_type.capacity())
+            .saturating_add(self.profile.client_version.capacity())
+            .saturating_add(self.profile.product_platform.capacity())
+            .saturating_add(self.access_token.len())
+            .saturating_add(self.base_url.capacity())
+            .saturating_add(self.catalog.retained_bytes())
+            .saturating_add(self.account_id.capacity())
+    }
 }
 
 impl std::fmt::Debug for PreparedCodeBuddyRuntime {

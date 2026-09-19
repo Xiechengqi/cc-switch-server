@@ -4,6 +4,9 @@ use bytes::Bytes;
 use rand::RngCore;
 use serde_json::{json, Value};
 
+use super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::ProxyError;
 
 const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
@@ -148,9 +151,30 @@ pub struct CodeBuddySseDecoder {
     saw_done: bool,
     complete: bool,
     sent_role: bool,
+    request_memory: Option<RequestMemoryBudget>,
+    buffer_memory: Option<RequestMemoryReservation>,
 }
 
 impl CodeBuddySseDecoder {
+    pub(crate) fn with_request_memory(
+        request_memory: Option<RequestMemoryBudget>,
+    ) -> Result<Self, ProxyError> {
+        let buffer_memory = request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::StreamRetainedState, 0))
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
+        Ok(Self {
+            request_memory,
+            buffer_memory,
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buffer.capacity()
+    }
+
     /// True only after upstream EOF validated the single previously observed
     /// `[DONE]`. Merely receiving `[DONE]` does not commit a successful
     /// terminal because a later network chunk may still contain a duplicate
@@ -168,8 +192,17 @@ impl CodeBuddySseDecoder {
         if chunk.is_empty() {
             return Ok(Bytes::new());
         }
+        let _transport_memory = self
+            .request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::TransportPending, chunk.len()))
+            .transpose()
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        self.reserve_buffer_append(chunk.len())?;
         self.buffer.extend_from_slice(&chunk);
-        self.drain(false)
+        let output = self.drain(false)?;
+        self.sync_buffer_memory()?;
+        Ok(output)
     }
 
     pub fn finish_classified(&mut self) -> Result<Bytes, CodeBuddySseDecodeError> {
@@ -178,43 +211,83 @@ impl CodeBuddySseDecoder {
                 ProxyError::bad_gateway("CodeBuddy SSE was finalized more than once").into(),
             );
         }
-        let mut output = self.drain(true)?.to_vec();
+        let canonical = self.drain(true)?;
         if !self.saw_done {
             return Err(
                 ProxyError::bad_gateway("CodeBuddy SSE ended without exactly one [DONE]").into(),
             );
         }
         self.complete = true;
+        let output_capacity = projected_vec_capacity(
+            0,
+            0,
+            canonical.len().saturating_add(b"data: [DONE]\n\n".len()),
+        );
+        let output_memory = self
+            .request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, output_capacity))
+            .transpose()
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        let mut output = Vec::with_capacity(output_capacity);
+        output.extend_from_slice(&canonical);
         output.extend_from_slice(b"data: [DONE]\n\n");
-        Ok(Bytes::from(output))
+        self.sync_buffer_memory()?;
+        let output = Bytes::from(output);
+        Ok(match output_memory {
+            Some(memory) => memory.retain_bytes(output),
+            None => output,
+        })
     }
 
     fn drain(&mut self, finish: bool) -> Result<Bytes, CodeBuddySseDecodeError> {
         let mut output = Vec::new();
+        let output_memory = self
+            .request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, 0))
+            .transpose()
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
         while let Some((end, delimiter)) = next_event_boundary(&self.buffer) {
             if end > MAX_SSE_EVENT_BYTES {
                 return Err(
                     ProxyError::bad_gateway("CodeBuddy SSE event exceeds the limit").into(),
                 );
             }
+            let working_memory = self.reserve_event_working_set(end)?;
             let event = self.buffer[..end].to_vec();
             self.buffer.drain(..end + delimiter);
-            self.decode_event(&event, &mut output)?;
+            self.decode_event(&event, &mut output, output_memory.as_ref())?;
+            drop(working_memory);
         }
         if self.buffer.len() > MAX_SSE_EVENT_BYTES {
             return Err(ProxyError::bad_gateway("CodeBuddy SSE event exceeds the limit").into());
         }
         if finish && !self.buffer.is_empty() {
-            let event = std::mem::take(&mut self.buffer);
-            self.decode_event(&event, &mut output)?;
+            let event_len = self.buffer.len();
+            let working_memory = self.reserve_event_working_set(event_len)?;
+            let event = self.buffer[..event_len].to_vec();
+            self.buffer.clear();
+            self.decode_event(&event, &mut output, output_memory.as_ref())?;
+            drop(working_memory);
         }
-        Ok(Bytes::from(output))
+        if let Some(memory) = output_memory.as_ref() {
+            memory
+                .resize(output.capacity())
+                .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        }
+        let output = Bytes::from(output);
+        Ok(match output_memory {
+            Some(memory) => memory.retain_bytes(output),
+            None => output,
+        })
     }
 
     fn decode_event(
         &mut self,
         event: &[u8],
         output: &mut Vec<u8>,
+        output_memory: Option<&RequestMemoryReservation>,
     ) -> Result<(), CodeBuddySseDecodeError> {
         let text = std::str::from_utf8(event)
             .map_err(|_| ProxyError::bad_gateway("CodeBuddy SSE event is not UTF-8"))?;
@@ -271,11 +344,83 @@ impl CodeBuddySseDecoder {
         let canonical = serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_gateway(format!("encode CodeBuddy SSE chunk: {error}"))
         })?;
+        reserve_vec_append(
+            output_memory,
+            output,
+            b"data: "
+                .len()
+                .saturating_add(canonical.len())
+                .saturating_add(b"\n\n".len()),
+        )?;
         output.extend_from_slice(b"data: ");
         output.extend_from_slice(&canonical);
         output.extend_from_slice(b"\n\n");
         Ok(())
     }
+
+    fn reserve_buffer_append(&self, additional: usize) -> Result<(), CodeBuddySseDecodeError> {
+        if let Some(memory) = self.buffer_memory.as_ref() {
+            memory
+                .resize(projected_vec_capacity(
+                    self.buffer.capacity(),
+                    self.buffer.len(),
+                    additional,
+                ))
+                .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        }
+        Ok(())
+    }
+
+    fn sync_buffer_memory(&self) -> Result<(), CodeBuddySseDecodeError> {
+        if let Some(memory) = self.buffer_memory.as_ref() {
+            memory
+                .resize(self.retained_bytes())
+                .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        }
+        Ok(())
+    }
+
+    fn reserve_event_working_set(
+        &self,
+        event_bytes: usize,
+    ) -> Result<Option<RequestMemoryReservation>, CodeBuddySseDecodeError> {
+        self.request_memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::NormalizedEvent,
+                    event_bytes.saturating_mul(8),
+                )
+            })
+            .transpose()
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))
+    }
+}
+
+fn projected_vec_capacity(current_capacity: usize, current_len: usize, additional: usize) -> usize {
+    let required = current_len.saturating_add(additional);
+    if required <= current_capacity {
+        current_capacity
+    } else {
+        current_capacity.saturating_mul(2).max(required).max(8)
+    }
+}
+
+fn reserve_vec_append(
+    memory: Option<&RequestMemoryReservation>,
+    output: &Vec<u8>,
+    additional: usize,
+) -> Result<(), CodeBuddySseDecodeError> {
+    if let Some(memory) = memory {
+        memory
+            .resize(projected_vec_capacity(
+                output.capacity(),
+                output.len(),
+                additional,
+            ))
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+    }
+    Ok(())
 }
 
 fn sanitize_codebuddy_stream_chunk(
@@ -387,6 +532,8 @@ pub struct CodeBuddyChatSseAggregator {
     finish_reason: Option<Value>,
     usage: Option<Value>,
     terminal: bool,
+    request_memory: Option<RequestMemoryBudget>,
+    retained_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Debug, Default)]
@@ -397,7 +544,54 @@ struct AggregatedToolCall {
     arguments: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct CodeBuddyAggregatedResponse {
+    pub(crate) value: Value,
+    pub(crate) memory: Option<RequestMemoryReservation>,
+}
+
 impl CodeBuddyChatSseAggregator {
+    pub(crate) fn with_request_memory(
+        request_memory: Option<RequestMemoryBudget>,
+    ) -> Result<Self, ProxyError> {
+        let retained_memory = request_memory
+            .as_ref()
+            .map(|budget| budget.reserve(RequestMemoryComponent::StreamRetainedState, 0))
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
+        Ok(Self {
+            request_memory,
+            retained_memory,
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let tool_calls = self.tool_calls.iter().fold(0_usize, |bytes, (_, call)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(usize, AggregatedToolCall)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(call.id.capacity())
+                .saturating_add(call.call_type.capacity())
+                .saturating_add(call.name.capacity())
+                .saturating_add(call.arguments.capacity())
+        });
+        self.buffer
+            .capacity()
+            .saturating_add(self.id.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.model.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.content.capacity())
+            .saturating_add(self.reasoning_content.capacity())
+            .saturating_add(tool_calls)
+            .saturating_add(
+                self.fallback_tool_order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(self.finish_reason.as_ref().map_or(0, retained_json_bytes))
+            .saturating_add(self.usage.as_ref().map_or(0, retained_json_bytes))
+    }
+
     pub fn push(&mut self, chunk: Bytes) -> Result<(), ProxyError> {
         if chunk.is_empty() {
             return Ok(());
@@ -408,20 +602,32 @@ impl CodeBuddyChatSseAggregator {
                 "CodeBuddy Chat response exceeds the aggregate limit",
             ));
         }
+        self.reserve_buffer_append(chunk.len())?;
         self.buffer.extend_from_slice(&chunk);
-        self.drain(false)
+        self.drain(false)?;
+        self.sync_retained_memory()
     }
 
-    pub fn finish(
+    pub fn finish(self, fallback_model: &str, now_unix_seconds: i64) -> Result<Value, ProxyError> {
+        self.finish_with_memory(fallback_model, now_unix_seconds)
+            .map(|response| response.value)
+    }
+
+    pub(crate) fn finish_with_memory(
         mut self,
         fallback_model: &str,
         now_unix_seconds: i64,
-    ) -> Result<Value, ProxyError> {
+    ) -> Result<CodeBuddyAggregatedResponse, ProxyError> {
         self.drain(true)?;
         if !self.terminal {
             return Err(ProxyError::bad_gateway(
                 "CodeBuddy Chat SSE ended without exactly one [DONE]",
             ));
+        }
+        if let Some(memory) = self.retained_memory.as_ref() {
+            memory
+                .resize(self.retained_bytes().saturating_mul(3))
+                .map_err(|error| error.into_proxy_error())?;
         }
         let mut message = serde_json::Map::new();
         message.insert("role".to_string(), Value::String("assistant".to_string()));
@@ -474,7 +680,15 @@ impl CodeBuddyChatSseAggregator {
         if let Some(usage) = self.usage {
             response["usage"] = usage;
         }
-        Ok(response)
+        if let Some(memory) = self.retained_memory.as_ref() {
+            memory
+                .resize(retained_json_bytes(&response))
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(CodeBuddyAggregatedResponse {
+            value: response,
+            memory: self.retained_memory.take(),
+        })
     }
 
     fn drain(&mut self, finish: bool) -> Result<(), ProxyError> {
@@ -484,9 +698,12 @@ impl CodeBuddyChatSseAggregator {
                     "CodeBuddy Chat SSE event exceeds the limit",
                 ));
             }
+            let working_memory = self.reserve_event_working_set(end)?;
             let event = self.buffer[..end].to_vec();
             self.buffer.drain(..end + delimiter);
             self.consume_event(&event)?;
+            drop(working_memory);
+            self.sync_retained_memory()?;
         }
         if self.buffer.len() > MAX_SSE_EVENT_BYTES {
             return Err(ProxyError::bad_gateway(
@@ -494,8 +711,13 @@ impl CodeBuddyChatSseAggregator {
             ));
         }
         if finish && !self.buffer.is_empty() {
-            let event = std::mem::take(&mut self.buffer);
+            let event_len = self.buffer.len();
+            let working_memory = self.reserve_event_working_set(event_len)?;
+            let event = self.buffer[..event_len].to_vec();
+            self.buffer.clear();
             self.consume_event(&event)?;
+            drop(working_memory);
+            self.sync_retained_memory()?;
         }
         Ok(())
     }
@@ -663,6 +885,46 @@ impl CodeBuddyChatSseAggregator {
             }
         }
         Ok(())
+    }
+
+    fn reserve_buffer_append(&self, additional: usize) -> Result<(), ProxyError> {
+        if let Some(memory) = self.retained_memory.as_ref() {
+            let next_buffer_capacity =
+                projected_vec_capacity(self.buffer.capacity(), self.buffer.len(), additional);
+            memory
+                .resize(
+                    self.retained_bytes()
+                        .saturating_sub(self.buffer.capacity())
+                        .saturating_add(next_buffer_capacity),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+
+    fn sync_retained_memory(&self) -> Result<(), ProxyError> {
+        if let Some(memory) = self.retained_memory.as_ref() {
+            memory
+                .resize(self.retained_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+
+    fn reserve_event_working_set(
+        &self,
+        event_bytes: usize,
+    ) -> Result<Option<RequestMemoryReservation>, ProxyError> {
+        self.request_memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::NormalizedEvent,
+                    event_bytes.saturating_mul(8),
+                )
+            })
+            .transpose()
+            .map_err(|error| error.into_proxy_error())
     }
 }
 
@@ -1011,5 +1273,90 @@ mod tests {
             .push(Bytes::from_static(b"data: [DONE]\n\n"))
             .unwrap();
         assert!(aggregator.finish("model", 1).is_err());
+    }
+
+    #[test]
+    fn decoder_reservations_follow_canonical_bytes_and_release_on_drop() {
+        let budget = RequestMemoryBudget::new(2 * 1024 * 1024);
+        let mut decoder = CodeBuddySseDecoder::with_request_memory(Some(budget.clone())).unwrap();
+        let canonical = decoder
+            .push_classified(chunk(json!({
+                "id":"chat-memory","model":"default-model","choices":[{"index":0,"delta":{"content":"bounded"},"finish_reason":"stop"}]
+            })))
+            .unwrap();
+        assert!(!canonical.is_empty());
+        assert!(budget.snapshot().used_bytes > 0);
+
+        drop(decoder);
+        assert!(
+            budget.snapshot().used_bytes > 0,
+            "canonical Bytes must retain its owner reservation"
+        );
+        drop(canonical);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn aggregator_reservation_follows_finished_value_and_releases_on_drop() {
+        let budget = RequestMemoryBudget::new(2 * 1024 * 1024);
+        let mut aggregator =
+            CodeBuddyChatSseAggregator::with_request_memory(Some(budget.clone())).unwrap();
+        aggregator
+            .push(Bytes::from_static(
+                b"data: {\"id\":\"chat-memory\",\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"bounded\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ))
+            .unwrap();
+        let response = aggregator.finish_with_memory("default-model", 1).unwrap();
+        assert_eq!(
+            response.value["choices"][0]["message"]["content"],
+            "bounded"
+        );
+        assert!(response.memory.is_some());
+        assert!(budget.snapshot().used_bytes > 0);
+
+        drop(response);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn aggregate_content_reasoning_and_tool_arguments_share_one_sticky_budget() {
+        let budget = RequestMemoryBudget::new(48 * 1024);
+        let mut aggregator =
+            CodeBuddyChatSseAggregator::with_request_memory(Some(budget.clone())).unwrap();
+        let fragment = "x".repeat(1_024);
+        let mut exhausted = None;
+        for index in 0..32 {
+            let event = chunk(json!({
+                "choices":[{"index":0,"delta":{
+                    "content":fragment,
+                    "reasoning_content":fragment,
+                    "tool_calls":[{"index":0,"id":"call-memory","type":"function","function":{
+                        "name":"lookup","arguments":fragment
+                    }}]
+                },"finish_reason":null}]
+            }));
+            if let Err(error) = aggregator.push(event) {
+                exhausted = Some((index, error));
+                break;
+            }
+        }
+        let (index, error) = exhausted.expect("retained aggregate state must exhaust the budget");
+        assert!(index > 0, "the first event working set should fit");
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn decoder_capacity_exhaustion_is_sticky_and_content_free() {
+        let budget = RequestMemoryBudget::new(64);
+        let mut decoder = CodeBuddySseDecoder::with_request_memory(Some(budget.clone())).unwrap();
+        let error = decoder
+            .push_classified(Bytes::from(vec![b'x'; 65]))
+            .unwrap_err()
+            .into_proxy_error();
+        assert!(error.is_request_memory_exhausted());
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert!(budget.is_exhausted());
     }
 }
