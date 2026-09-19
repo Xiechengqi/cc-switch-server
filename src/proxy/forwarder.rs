@@ -96,11 +96,10 @@ use super::kimi_runtime::{
 use super::kiro;
 use super::openai_capacity_shed::{
     capacity_shed_retry_source, is_openai_capacity_shed_failure, omit_openai_responses_done_events,
-    openai_capacity_shed_failure_from_bytes, openai_payload_values,
-    openai_stream_bytes_start_client_output, provider_stream_failure,
-    sanitize_openai_capacity_shed_json_bytes, sanitize_openai_capacity_shed_json_text,
-    sanitize_openai_capacity_shed_sse_bytes, synthesize_openai_capacity_shed_failed_json,
-    synthesize_openai_capacity_shed_failed_sse,
+    openai_capacity_shed_failure_from_bytes, openai_stream_bytes_start_client_output,
+    provider_stream_failure, sanitize_openai_capacity_shed_json_bytes,
+    sanitize_openai_capacity_shed_json_text, sanitize_openai_capacity_shed_sse_bytes,
+    synthesize_openai_capacity_shed_failed_json, synthesize_openai_capacity_shed_failed_sse,
 };
 use super::provider_ops::{ProviderExecution, ProviderOperation};
 #[cfg(test)]
@@ -109,7 +108,7 @@ use super::providers::claude::{
     RateLimitDecision as ClaudeRateLimitDecision, RateLimitEvidence as ClaudeRateLimitEvidence,
     RateLimitScope as ClaudeRateLimitScope,
 };
-use super::providers::{antigravity, claude};
+use super::providers::{antigravity, claude, codex};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
@@ -161,13 +160,7 @@ const CODEX_IMAGES_MAX_UPSTREAM_BYTES: usize = 72 * 1024 * 1024;
 const CODEX_IMAGES_MAX_PIXELS: u64 = 8_294_400;
 const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
 const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
-const MAX_CODEX_CAPACITY_RETRIES: u32 = 2;
-const CODEX_CAPACITY_RETRY_FIRST_MIN_DELAY_MS: u64 = 500;
-const CODEX_CAPACITY_RETRY_FIRST_MAX_DELAY_MS: u64 = 1_000;
-const CODEX_CAPACITY_RETRY_NEXT_MIN_DELAY_MS: u64 = 1_000;
-const CODEX_CAPACITY_RETRY_NEXT_MAX_DELAY_MS: u64 = 2_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
-const DEFAULT_SHARE_MODEL_COOLDOWN_MS: i64 = 5 * 60_000;
 const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS: usize = 64;
 const DEFAULT_CODEX_WEBSOCKET_MAX_CONNECTIONS: usize = 128;
@@ -3031,7 +3024,7 @@ async fn forward_with_attempt(
                     continue 'attempt;
                 }
                 record_provider_outcome(&state, &stored, capacity_shed_provider_outcome()).await;
-                return Err(codex_capacity_shed_proxy_error(failure));
+                return Err(codex::capacity_shed_proxy_error(failure));
             }
             buffered_upstream_body = Some(decoded);
         }
@@ -3329,7 +3322,7 @@ async fn forward_with_attempt(
                                     final_model.as_deref(),
                                 )
                                 .await;
-                                failure.error = codex_semantic_rate_limit_error(
+                                failure.error = codex::semantic_rate_limit_error(
                                     shed,
                                     &response_headers,
                                     &marker_body,
@@ -3372,7 +3365,7 @@ async fn forward_with_attempt(
                                     &failure,
                                 )
                                 .await;
-                                return Err(codex_capacity_shed_proxy_error(shed));
+                                return Err(codex::capacity_shed_proxy_error(shed));
                             }
                         }
                     }
@@ -4040,7 +4033,7 @@ async fn forward_with_attempt(
                                         drop(inner);
                                         drop(account_in_flight_guard);
                                         drop(share_invocation_guard);
-                                        return Err(codex_semantic_rate_limit_error(
+                                        return Err(codex::semantic_rate_limit_error(
                                             failure,
                                             &response_headers,
                                             &chunk,
@@ -4076,7 +4069,7 @@ async fn forward_with_attempt(
                                             drop(inner);
                                             drop(account_in_flight_guard);
                                             drop(share_invocation_guard);
-                                            return Err(codex_capacity_shed_proxy_error(failure));
+                                            return Err(codex::capacity_shed_proxy_error(failure));
                                         }
                                     }
                                     record_provider_outcome(
@@ -5337,7 +5330,7 @@ async fn forward_with_attempt(
                             },
                         )
                         .await;
-                        return Err(codex_semantic_rate_limit_error(
+                        return Err(codex::semantic_rate_limit_error(
                             failure,
                             &response_headers,
                             &marker_body,
@@ -5359,7 +5352,7 @@ async fn forward_with_attempt(
                         }
                         record_provider_outcome(&state, &stored, capacity_shed_provider_outcome())
                             .await;
-                        return Err(codex_capacity_shed_proxy_error(failure));
+                        return Err(codex::capacity_shed_proxy_error(failure));
                     }
                     record_provider_outcome(
                         &state,
@@ -13300,7 +13293,7 @@ fn run_codex_websocket_http_fallback<'a>(
                             output_patcher,
                             source,
                             Vec::new(),
-                            codex_capacity_shed_proxy_error(failure),
+                            codex::capacity_shed_proxy_error(failure),
                             "cc_switch_upstream_capacity_shed",
                             Some("provider_failure"),
                             active_usage_turn,
@@ -15870,28 +15863,8 @@ async fn maybe_mark_upstream_rate_limited(
     if claude::handle_rate_limit(state, execution, status, headers, body, share_id, model).await {
         return;
     }
-    if execution.stored.provider_type == ProviderType::CodexOAuth
-        && !codex_account_rate_limit_evidence(headers, body)
-    {
-        if let (Some(share_id), Some(model)) = (
-            share_id.map(str::trim).filter(|value| !value.is_empty()),
-            model.map(str::trim).filter(|value| !value.is_empty()),
-        ) {
-            let reason = if codex_model_capacity_error(body) {
-                "model_capacity"
-            } else {
-                "rate_limited_model"
-            };
-            state.mark_share_model_cooldown(
-                share_id,
-                &execution.plan.runtime_fingerprint,
-                model,
-                now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS),
-                reason,
-                now,
-            );
-            return;
-        }
+    if codex::handle_rate_limit(state, execution, status, headers, body, share_id, model).await {
+        return;
     }
     let Some((provider_type, account_id, auth_identity_generation)) =
         execution.managed_account_identity_target()
@@ -15919,17 +15892,13 @@ fn take_codex_http_fallback_capacity_retry(
     source: &'static str,
 ) -> Option<Duration> {
     let attempted = attempt_context.codex_capacity_retry_attempted();
-    if attempted >= MAX_CODEX_CAPACITY_RETRIES || !attempt_context.retry_allowed() {
-        return None;
-    }
     let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(
         current_time_ms().saturating_sub(attempt_context.attempt_budget.started_at_ms()),
     );
-    let (min_delay_ms, _) = codex_capacity_retry_delay_bounds(attempted);
-    if remaining_ms < min_delay_ms as u128 {
+    if !codex::capacity_retry_allowed(attempted, attempt_context.retry_allowed(), remaining_ms) {
         return None;
     }
-    let delay = codex_capacity_retry_delay(remaining_ms, attempted);
+    let delay = codex::capacity_retry_delay(remaining_ms, attempted);
     let next_attempt = attempt_context.next_for(
         execution,
         attempt_context.body_retry_stage,
@@ -15965,66 +15934,6 @@ fn semantic_failure_json(failure: &SemanticFailure) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-fn codex_semantic_rate_limit_error(
-    failure: &SemanticFailure,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> ProxyError {
-    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let until = upstream_rate_limit_until(
-        ProviderType::CodexOAuth,
-        StatusCode::TOO_MANY_REQUESTS,
-        headers,
-        body,
-        now,
-    )
-    .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
-    let retry_after_seconds = u64::try_from(until.saturating_sub(now))
-        .unwrap_or(u64::MAX)
-        .saturating_add(999)
-        / 1_000;
-    let message = if failure.message.trim().is_empty() {
-        "OpenAI Codex upstream is rate limited".to_string()
-    } else {
-        failure.message.trim().to_string()
-    };
-    ProxyError::rate_limited(message, retry_after_seconds.max(1))
-}
-
-fn codex_capacity_shed_proxy_error(failure: &SemanticFailure) -> ProxyError {
-    let _ = failure;
-    ProxyError::upstream_capacity_shed(1)
-}
-
-fn codex_capacity_retry_delay_bounds(attempted: u32) -> (u64, u64) {
-    if attempted == 0 {
-        (
-            CODEX_CAPACITY_RETRY_FIRST_MIN_DELAY_MS,
-            CODEX_CAPACITY_RETRY_FIRST_MAX_DELAY_MS,
-        )
-    } else {
-        (
-            CODEX_CAPACITY_RETRY_NEXT_MIN_DELAY_MS,
-            CODEX_CAPACITY_RETRY_NEXT_MAX_DELAY_MS,
-        )
-    }
-}
-
-fn codex_capacity_retry_delay(remaining_ms: u128, attempted: u32) -> Duration {
-    let (min_delay_ms, max_delay_ms) = codex_capacity_retry_delay_bounds(attempted);
-    if remaining_ms < min_delay_ms as u128 {
-        return Duration::from_millis(remaining_ms as u64);
-    }
-    let max_delay = max_delay_ms.min(remaining_ms as u64);
-    let delay_ms = if max_delay <= min_delay_ms {
-        max_delay
-    } else {
-        let span = max_delay - min_delay_ms;
-        min_delay_ms + (rand::rngs::OsRng.next_u64() % (span + 1))
-    };
-    Duration::from_millis(delay_ms)
-}
-
 fn next_codex_capacity_retry_attempt(
     route: ProxyRoute,
     attempt_context: &ForwardAttemptContext,
@@ -16034,17 +15943,14 @@ fn next_codex_capacity_retry_attempt(
     if !execution.driver_is("oauth.openai_codex") || !is_openai_capacity_shed_failure(failure) {
         return None;
     }
-    if attempt_context.codex_capacity_retry_attempted() >= MAX_CODEX_CAPACITY_RETRIES
-        || !attempt_context.retry_allowed()
-    {
-        return None;
-    }
     let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(
         current_time_ms().saturating_sub(attempt_context.attempt_budget.started_at_ms()),
     );
-    let (min_delay_ms, _) =
-        codex_capacity_retry_delay_bounds(attempt_context.codex_capacity_retry_attempted());
-    if remaining_ms < min_delay_ms as u128 {
+    if !codex::capacity_retry_allowed(
+        attempt_context.codex_capacity_retry_attempted(),
+        attempt_context.retry_allowed(),
+        remaining_ms,
+    ) {
         return None;
     }
     let source = capacity_shed_retry_source(failure);
@@ -16052,7 +15958,7 @@ fn next_codex_capacity_retry_attempt(
     attempt_context.after_codex_capacity_retry(
         execution,
         source,
-        codex_capacity_retry_delay(
+        codex::capacity_retry_delay(
             remaining_ms,
             attempt_context.codex_capacity_retry_attempted(),
         ),
@@ -16166,9 +16072,10 @@ fn upstream_rate_limit_until(
     if status != StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
+    if provider_type == ProviderType::CodexOAuth {
+        return codex::rate_limit_until(status, headers, body, now);
+    }
     let specialized_until = match provider_type {
-        ProviderType::CodexOAuth => codex_rate_limit_reset_at_ms(body, now)
-            .or_else(|| codex_exhausted_window_reset_at_ms(headers, now)),
         ProviderType::GrokOAuth => {
             super::grok::parse_cooldown_until_ms(status, headers, now).map(|(until, _)| until)
         }
@@ -16178,78 +16085,6 @@ fn upstream_rate_limit_until(
         .or_else(|| super::grok::retry_after_until_ms(headers, now))
         .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS));
     Some(super::bounded_upstream_rate_limit_until(now, until))
-}
-
-fn codex_account_rate_limit_evidence(headers: &HeaderMap, body: &[u8]) -> bool {
-    codex_usage_limit_reached(body) || codex_exhausted_window_reset_at_ms(headers, 0).is_some()
-}
-
-fn codex_usage_limit_reached(body: &[u8]) -> bool {
-    openai_payload_values(body).iter().any(|value| {
-        [
-            "/error/type",
-            "/error/code",
-            "/body/error/type",
-            "/body/error/code",
-            "/response/error/type",
-            "/response/error/code",
-            "/response/status_details/error/type",
-            "/response/status_details/error/code",
-        ]
-        .into_iter()
-        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-        .any(|kind| kind.trim().eq_ignore_ascii_case("usage_limit_reached"))
-    })
-}
-
-fn codex_model_capacity_error(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("selected model is at capacity")
-        || text.contains("model is at capacity. please try a different model")
-}
-
-fn codex_exhausted_window_reset_at_ms(headers: &HeaderMap, now_ms: i64) -> Option<i64> {
-    let mut exhausted = ["primary", "secondary"]
-        .into_iter()
-        .filter_map(|window| {
-            let used = header_decimal(headers, &format!("x-codex-{window}-used-percent"))?;
-            let window_minutes =
-                header_decimal(headers, &format!("x-codex-{window}-window-minutes"))?;
-            if used < 100.0 || window_minutes <= 0.0 {
-                return None;
-            }
-            let reset_seconds =
-                header_decimal(headers, &format!("x-codex-{window}-reset-after-seconds"))
-                    .filter(|value| *value > 0.0);
-            Some((window_minutes, reset_seconds))
-        })
-        .collect::<Vec<_>>();
-    exhausted.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let (window_minutes, reset_seconds) = exhausted.pop()?;
-    let fallback_ms = if window_minutes >= 1_440.0 {
-        7 * 24 * 60 * 60 * 1_000
-    } else if window_minutes >= 60.0 {
-        5 * 60 * 60 * 1_000
-    } else {
-        DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS
-    };
-    let reset_ms = reset_seconds
-        .map(|seconds| (seconds * 1_000.0).min(i64::MAX as f64) as i64)
-        .unwrap_or(fallback_ms);
-    Some(super::bounded_upstream_rate_limit_until(
-        now_ms,
-        now_ms.saturating_add(reset_ms),
-    ))
-}
-
-fn header_decimal(headers: &HeaderMap, name: &str) -> Option<f64> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
 }
 
 async fn maybe_mark_grok_cooldown(
@@ -16306,42 +16141,6 @@ async fn maybe_update_grok_entitlement(
             crate::infra::time::now_ms() as i64,
         )
         .await;
-}
-
-fn codex_rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
-    for value in openai_payload_values(body) {
-        let seconds = [
-            "/error/resets_in_seconds",
-            "/body/error/resets_in_seconds",
-            "/response/error/resets_in_seconds",
-            "/response/status_details/error/resets_in_seconds",
-        ]
-        .into_iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_i64));
-        if let Some(seconds) = seconds.filter(|seconds| *seconds > 0) {
-            return Some(now_ms.saturating_add(seconds.saturating_mul(1000)));
-        }
-        let reset_at = [
-            "/error/resets_at",
-            "/body/error/resets_at",
-            "/response/error/resets_at",
-            "/response/status_details/error/resets_at",
-        ]
-        .into_iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_i64))
-        .map(|value| {
-            if value < 10_000_000_000 {
-                value.saturating_mul(1000)
-            } else {
-                value
-            }
-        })
-        .filter(|until| *until > now_ms);
-        if reset_at.is_some() {
-            return reset_at;
-        }
-    }
-    None
 }
 
 struct WebSessionForwardOptions {
@@ -40303,27 +40102,27 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"id":"ex
     #[test]
     fn codex_rate_limit_reset_parses_seconds_and_absolute_epoch() {
         assert_eq!(
-            codex_rate_limit_reset_at_ms(
+            codex::rate_limit_reset_at_ms(
                 br#"{"error":{"resets_in_seconds":12,"message":"slow down"}}"#,
                 1_000
             ),
             Some(13_000)
         );
         assert_eq!(
-            codex_rate_limit_reset_at_ms(br#"{"error":{"resets_at":20}}"#, 1_000),
+            codex::rate_limit_reset_at_ms(br#"{"error":{"resets_at":20}}"#, 1_000),
             Some(20_000)
         );
         assert_eq!(
-            codex_rate_limit_reset_at_ms(br#"{"error":{"resets_at":1}}"#, 1_000),
+            codex::rate_limit_reset_at_ms(br#"{"error":{"resets_at":1}}"#, 1_000),
             None
         );
         let status_details_sse = br#"event: response.failed
 data: {"type":"response.failed","response":{"status":"failed","status_details":{"error":{"type":"usage_limit_reached","resets_in_seconds":9}}}}
 
 "#;
-        assert!(codex_usage_limit_reached(status_details_sse));
+        assert!(codex::usage_limit_reached(status_details_sse));
         assert_eq!(
-            codex_rate_limit_reset_at_ms(status_details_sse, 1_000),
+            codex::rate_limit_reset_at_ms(status_details_sse, 1_000),
             Some(10_000)
         );
     }
@@ -40501,9 +40300,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             "x-codex-primary-reset-after-seconds",
             HeaderValue::from_static("120"),
         );
-        assert!(codex_account_rate_limit_evidence(&headers, b"{}"));
+        assert!(codex::account_rate_limit_evidence(&headers, b"{}"));
         assert_eq!(
-            codex_exhausted_window_reset_at_ms(&headers, 1_000),
+            codex::exhausted_window_reset_at_ms(&headers, 1_000),
             Some(121_000)
         );
     }
@@ -41881,17 +41680,17 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
 
     #[test]
     fn capacity_retry_delay_grows_from_first_to_second_attempt() {
-        let (first_min, first_max) = codex_capacity_retry_delay_bounds(0);
-        let (next_min, next_max) = codex_capacity_retry_delay_bounds(1);
+        let (first_min, first_max) = codex::capacity_retry_delay_bounds(0);
+        let (next_min, next_max) = codex::capacity_retry_delay_bounds(1);
         assert_eq!(first_min, 500);
         assert_eq!(first_max, 1_000);
         assert_eq!(next_min, 1_000);
         assert_eq!(next_max, 2_000);
         for _ in 0..32 {
-            let first = codex_capacity_retry_delay(10_000, 0);
+            let first = codex::capacity_retry_delay(10_000, 0);
             assert!(first >= Duration::from_millis(first_min));
             assert!(first <= Duration::from_millis(first_max));
-            let next = codex_capacity_retry_delay(10_000, 1);
+            let next = codex::capacity_retry_delay(10_000, 1);
             assert!(next >= Duration::from_millis(next_min));
             assert!(next <= Duration::from_millis(next_max));
         }

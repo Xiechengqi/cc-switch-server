@@ -233,6 +233,98 @@ for (const model of expectedModels) {
     `${model} improperly claims live image evidence`,
   );
 }
+const realAcceptance = baseline.realAcceptance;
+assert(
+  realAcceptance?.receiptSchemaVersion === 1 &&
+    realAcceptance.harnessRevision === 1,
+  "Codex real-acceptance receipt schema changed",
+);
+const acceptanceOperations = new Map(
+  (realAcceptance.operations ?? []).map((operation) => [
+    operation.operation,
+    operation,
+  ]),
+);
+assert(
+  acceptanceOperations.size === 4,
+  "Codex live gate must contain three image variants and WS prewarm",
+);
+const expectedOperations = new Map([
+  ["gpt_image_2_5", "gpt-image-2.5"],
+  ["gpt_image_2_5_flare", "gpt-image-2.5-flare"],
+  ["gpt_image_2_5_sunburst", "gpt-image-2.5-sunburst"],
+  ["ws_prewarm", null],
+]);
+for (const [operationId, expectedModel] of expectedOperations) {
+  const operation = acceptanceOperations.get(operationId);
+  assert(operation, `Codex real acceptance is missing ${operationId}`);
+  assert(
+    operation.model === expectedModel &&
+      operation.status === "live_pending" &&
+      operation.receipt === null,
+    `${operationId} improperly claims live evidence`,
+  );
+  assert(
+    Array.isArray(operation.requiredChecks) &&
+      operation.requiredChecks.length >= 10 &&
+      new Set(operation.requiredChecks).size === operation.requiredChecks.length &&
+      operation.requiredChecks.includes("bound_account_provider_share") &&
+      operation.requiredChecks.includes("decoy_zero_requests") &&
+      operation.requiredChecks.includes("secret_scan"),
+    `${operationId} has an incomplete or duplicate check set`,
+  );
+  assert(
+    Array.isArray(operation.requiredBodyHashes) &&
+      operation.requiredBodyHashes.length >= 5 &&
+      new Set(operation.requiredBodyHashes).size === operation.requiredBodyHashes.length,
+    `${operationId} has an incomplete body-hash set`,
+  );
+  assert(
+    Array.isArray(operation.requiredMeasurements) &&
+      operation.requiredMeasurements.length === 5 &&
+      new Set(operation.requiredMeasurements).size === operation.requiredMeasurements.length,
+    `${operationId} has an incomplete measurement set`,
+  );
+}
+for (const operationId of [
+  "gpt_image_2_5",
+  "gpt_image_2_5_flare",
+  "gpt_image_2_5_sunburst",
+]) {
+  const checks = acceptanceOperations.get(operationId).requiredChecks;
+  for (const check of [
+    "generation_nonstream_b64",
+    "generation_stream_terminal",
+    "multipart_edit_large_input",
+    "responses_image_tool_sse",
+    "responses_image_tool_json",
+    "usage_present",
+    "error_mapping_bounded",
+    "quota_usage_limit_account_cooldown",
+    "capacity_or_unknown_share_model_cooldown",
+    "capability_restart_persistence",
+    "shared_store_cross_replica",
+    "cloudflare_stream_flush",
+    "no_model_fallback",
+    "no_post_commit_replay",
+  ]) {
+    assert(checks.includes(check), `${operationId} lost required check ${check}`);
+  }
+}
+for (const check of [
+  "upstream_prewarm_accepted",
+  "benchmark_sample_set",
+  "stable_ttfb_benefit",
+  "same_session_connection_reuse",
+  "pre_response_create_http_fallback",
+  "post_response_create_no_replay",
+  "shared_attempt_budget",
+]) {
+  assert(
+    acceptanceOperations.get("ws_prewarm").requiredChecks.includes(check),
+    `ws_prewarm lost required check ${check}`,
+  );
+}
 for (const publishPath of [
   "assets/contract/provider-registry.json",
   "src/proxy/codex_models.rs",
@@ -241,6 +333,41 @@ for (const publishPath of [
   for (const model of expectedModels) {
     assert(!source.includes(model), `${model} was published by ${publishPath} before evidence`);
   }
+}
+
+const imageProbe = fs.readFileSync(
+  path.join(repoRoot, "scripts/smoke/codex-images-real.mjs"),
+  "utf8",
+);
+assert(
+  imageProbe.includes('verificationState: "probe_only"') &&
+    imageProbe.includes('liveState: "live_pending"') &&
+    !imageProbe.includes("boundedText(Buffer.concat(chunks))") &&
+    !imageProbe.includes("value.error?.message"),
+  "Codex image probe may claim acceptance or expose raw upstream failures",
+);
+const receiptHarness = fs.readFileSync(
+  path.join(repoRoot, "scripts/smoke/codex-real-receipt.mjs"),
+  "utf8",
+);
+for (const operationId of expectedOperations.keys()) {
+  assert(
+    receiptHarness.includes(operationId),
+    `Codex receipt harness is missing ${operationId}`,
+  );
+}
+for (const boundary of [
+  'verificationState: "blocked_inputs"',
+  'liveState: "live_pending"',
+  "receipt file must stay outside the repository",
+  "receipt file must have mode 0600",
+  "crossAccountFallback: \"disabled\"",
+  "postCommitReplay: \"disabled\"",
+]) {
+  assert(
+    receiptHarness.includes(boundary),
+    `Codex receipt harness lost boundary ${boundary}`,
+  );
 }
 
 const golden = baseline.wireGoldens;

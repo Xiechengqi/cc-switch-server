@@ -60,6 +60,23 @@ function runEnvCheck(overrides) {
       CC_SWITCH_AGY_OAUTH_GEMINI_MODEL: "",
       AGY_OAUTH_REAL_RECEIPT_FILE: "",
       CC_SWITCH_CODEX_IMAGES_SMOKE: "0",
+      CODEX_OAUTH_TEST_ACCOUNT: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_PROVIDER_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_SHARE_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_MODEL: "",
+      CODEX_GPT_IMAGE_2_5_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_FLARE_PROVIDER_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_FLARE_SHARE_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_FLARE_MODEL: "",
+      CODEX_GPT_IMAGE_2_5_FLARE_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_SUNBURST_PROVIDER_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_SUNBURST_SHARE_ID: "",
+      CC_SWITCH_CODEX_GPT_IMAGE_2_5_SUNBURST_MODEL: "",
+      CODEX_GPT_IMAGE_2_5_SUNBURST_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CODEX_WS_PREWARM_PROVIDER_ID: "",
+      CC_SWITCH_CODEX_WS_PREWARM_SHARE_ID: "",
+      CC_SWITCH_CODEX_WS_PREWARM_MODEL: "",
+      CODEX_WS_PREWARM_REAL_RECEIPT_FILE: "",
       GITHUB_COPILOT_TEST_ACCOUNT: "",
       CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_COPILOT_CODEX_PROVIDER_ID: "",
@@ -183,6 +200,40 @@ test("Codex Images gate distinguishes disabled, blocked, and input-ready states"
     ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(ready.checks.codexImagesGateStatus, "inputs-ready");
+});
+
+test("Codex operation receipts remain independently gated", () => {
+  const common = {
+    STAGE: "AB5",
+    CODEX_OAUTH_TEST_ACCOUNT: "codex-test-account",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+  };
+  const image = runEnvCheck({
+    ...common,
+    CC_SWITCH_CODEX_GPT_IMAGE_2_5_PROVIDER_ID: "image-provider",
+    CC_SWITCH_CODEX_GPT_IMAGE_2_5_SHARE_ID: "image-share",
+    CC_SWITCH_CODEX_GPT_IMAGE_2_5_MODEL: "gpt-image-2.5",
+    CODEX_GPT_IMAGE_2_5_REAL_RECEIPT_FILE: "/tmp/codex-image-2-5.json",
+  });
+  assert.equal(image.checks.codexGptImage25GateStatus, "inputs-ready");
+  assert.equal(image.checks.codexGptImage25FlareGateStatus, "blocked-inputs");
+  assert.equal(image.checks.codexGptImage25SunburstGateStatus, "blocked-inputs");
+  assert.equal(image.checks.codexWsPrewarmGateStatus, "blocked-inputs");
+  assert.equal(image.longTailInputsPresent.codexGptImage25ReceiptFile, true);
+
+  const websocket = runEnvCheck({
+    ...common,
+    CC_SWITCH_CODEX_WS_PREWARM_PROVIDER_ID: "ws-provider",
+    CC_SWITCH_CODEX_WS_PREWARM_SHARE_ID: "ws-share",
+    CC_SWITCH_CODEX_WS_PREWARM_MODEL: "gpt-5.4-mini",
+    CODEX_WS_PREWARM_REAL_RECEIPT_FILE: "/tmp/codex-ws-prewarm.json",
+  });
+  assert.equal(websocket.checks.codexGptImage25GateStatus, "blocked-inputs");
+  assert.equal(websocket.checks.codexWsPrewarmGateStatus, "inputs-ready");
+  assert.equal(websocket.longTailInputsPresent.codexWsPrewarmReceiptFile, true);
 });
 
 test("Copilot external gate requires one account, control plane, Share, and three Provider IDs", () => {

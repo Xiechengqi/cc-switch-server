@@ -354,6 +354,193 @@
       "fallbackBoundary": "memory exhaustion cancels the active upstream and denies HTTP replay, account fallback, Provider fallback, rail fallback, and site fallback"
     }
   ],
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "harnessRevision": 1,
+    "scopeDigest": "sha256 lowercase hex over operation, target commit, one Codex OAuth Account generation, one Provider binding, one Share revision, exact selected model, and harness revision",
+    "operations": [
+      {
+        "operation": "gpt_image_2_5",
+        "model": "gpt-image-2.5",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "exact_model_upstream_acceptance",
+          "model_normalization_exact",
+          "size_quality_exact",
+          "generation_nonstream_b64",
+          "generation_stream_terminal",
+          "multipart_edit_large_input",
+          "responses_image_tool_sse",
+          "responses_image_tool_json",
+          "usage_present",
+          "error_mapping_bounded",
+          "invalid_limits_zero_upstream",
+          "quota_usage_limit_account_cooldown",
+          "capacity_or_unknown_share_model_cooldown",
+          "capability_get_head_auth",
+          "capability_restart_persistence",
+          "shared_store_cross_replica",
+          "cloudflare_stream_flush",
+          "no_model_fallback",
+          "no_post_commit_replay",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "generation_nonstream",
+          "generation_stream",
+          "multipart_edit",
+          "responses_sse",
+          "responses_json",
+          "quota_error",
+          "capacity_error",
+          "capability_metadata",
+          "cloudflare_stream"
+        ],
+        "requiredMeasurements": [
+          "generationRuns",
+          "editRuns",
+          "responsesRuns",
+          "replicaCount",
+          "cloudflareRuns"
+        ]
+      },
+      {
+        "operation": "gpt_image_2_5_flare",
+        "model": "gpt-image-2.5-flare",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "exact_model_upstream_acceptance",
+          "model_normalization_exact",
+          "size_quality_exact",
+          "generation_nonstream_b64",
+          "generation_stream_terminal",
+          "multipart_edit_large_input",
+          "responses_image_tool_sse",
+          "responses_image_tool_json",
+          "usage_present",
+          "error_mapping_bounded",
+          "invalid_limits_zero_upstream",
+          "quota_usage_limit_account_cooldown",
+          "capacity_or_unknown_share_model_cooldown",
+          "capability_get_head_auth",
+          "capability_restart_persistence",
+          "shared_store_cross_replica",
+          "cloudflare_stream_flush",
+          "no_model_fallback",
+          "no_post_commit_replay",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "generation_nonstream",
+          "generation_stream",
+          "multipart_edit",
+          "responses_sse",
+          "responses_json",
+          "quota_error",
+          "capacity_error",
+          "capability_metadata",
+          "cloudflare_stream"
+        ],
+        "requiredMeasurements": [
+          "generationRuns",
+          "editRuns",
+          "responsesRuns",
+          "replicaCount",
+          "cloudflareRuns"
+        ]
+      },
+      {
+        "operation": "gpt_image_2_5_sunburst",
+        "model": "gpt-image-2.5-sunburst",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "exact_model_upstream_acceptance",
+          "model_normalization_exact",
+          "size_quality_exact",
+          "generation_nonstream_b64",
+          "generation_stream_terminal",
+          "multipart_edit_large_input",
+          "responses_image_tool_sse",
+          "responses_image_tool_json",
+          "usage_present",
+          "error_mapping_bounded",
+          "invalid_limits_zero_upstream",
+          "quota_usage_limit_account_cooldown",
+          "capacity_or_unknown_share_model_cooldown",
+          "capability_get_head_auth",
+          "capability_restart_persistence",
+          "shared_store_cross_replica",
+          "cloudflare_stream_flush",
+          "no_model_fallback",
+          "no_post_commit_replay",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "generation_nonstream",
+          "generation_stream",
+          "multipart_edit",
+          "responses_sse",
+          "responses_json",
+          "quota_error",
+          "capacity_error",
+          "capability_metadata",
+          "cloudflare_stream"
+        ],
+        "requiredMeasurements": [
+          "generationRuns",
+          "editRuns",
+          "responsesRuns",
+          "replicaCount",
+          "cloudflareRuns"
+        ]
+      },
+      {
+        "operation": "ws_prewarm",
+        "model": null,
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "model_catalog_exact",
+          "upstream_prewarm_accepted",
+          "benchmark_sample_set",
+          "stable_ttfb_benefit",
+          "same_session_connection_reuse",
+          "pool_key_isolation",
+          "credential_generation_rotation",
+          "pre_response_create_http_fallback",
+          "post_response_create_no_replay",
+          "shared_attempt_budget",
+          "terminal_usage",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "prewarm_handshake",
+          "first_turn",
+          "second_turn",
+          "http_fallback",
+          "post_commit_failure"
+        ],
+        "requiredMeasurements": [
+          "benchmarkSamples",
+          "coldTtfbP50Ms",
+          "prewarmedTtfbP50Ms",
+          "upstreamConnections",
+          "turns"
+        ]
+      }
+    ]
+  },
   "wireGoldens": {
     "capacityFailure": {
       "input": {

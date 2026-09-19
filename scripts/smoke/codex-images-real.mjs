@@ -65,9 +65,7 @@ export function collectImageEvent(frame, result) {
   const value = frame.value;
   const type = String(value.type || frame.event || "");
   if (type === "error" || value.error || type === "response.failed") {
-    const message =
-      value.error?.message || value.response?.error?.message || value.message || JSON.stringify(value);
-    throw new Error(`image stream failed: ${boundedText(message)}`);
+    throw new Error("image stream reported an upstream failure");
   }
   if (type === "response.incomplete" || type === "response.cancelled" || type === "response.canceled") {
     throw new Error(`image stream terminated with ${type}`);
@@ -170,10 +168,6 @@ function addUniqueImage(target, value, index = null, url = false) {
   const normalized = value.trim();
   if (target.some((item) => item.value === normalized)) return;
   target.push({ value: normalized, index, url });
-}
-
-function boundedText(value, max = 500) {
-  return String(value).slice(0, max);
 }
 
 function parseArgs(argv, env) {
@@ -312,7 +306,7 @@ async function timedPost(options, endpoint, payload, label) {
     }
     timing.durationMs = Date.now() - started;
     if (!response.ok) {
-      throw new Error(`${label} returned HTTP ${response.status}: ${boundedText(Buffer.concat(chunks))}`);
+      throw new Error(`${label} returned HTTP ${response.status}`);
     }
     return { response, body: Buffer.concat(chunks), timing };
   } finally {
@@ -354,7 +348,7 @@ async function probeJson(options, responseFormat) {
     label,
   );
   const value = JSON.parse(body.toString("utf8"));
-  if (value.error) throw new Error(`${label} failed: ${boundedText(value.error.message || value.error)}`);
+  if (value.error) throw new Error(`${label} reported an upstream failure`);
   const data = Array.isArray(value.data) ? value.data : [];
   if (data.length === 0) throw new Error(`${label} response has no data items`);
   const result = { partial: [], final: [], completed: true };
@@ -559,7 +553,18 @@ async function main() {
     "[INFO] Running opt-in billable image acceptance; mode=all issues four 4K generation requests.\n",
   );
   const summaries = await run(options);
-  process.stdout.write(`${JSON.stringify({ ok: true, summaries }, null, 2)}\n`);
+  process.stdout.write(
+    `${JSON.stringify(
+      {
+        ok: true,
+        verificationState: "probe_only",
+        liveState: "live_pending",
+        summaries,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : "";

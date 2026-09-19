@@ -8,7 +8,7 @@
 - 仓库内只允许提交 `.env.example` 的占位符。
 - 记录验收结果时只写 URL、token prefix、状态码、requestId、脱敏 email 和时间；不要写 token 明文、refresh token、raw provider response。
 - 真实 provider 测试使用短 prompt、固定模型、固定 expected status，不跑大输入、不压测。
-- Codex Images 探针是显式例外：默认 `all` 会发起四次高质量 4K 生成并产生真实费用，只有确认账号、预算和 Cloudflare 被测路径后才设置 `CC_SWITCH_CODEX_IMAGES_SMOKE=1`。
+- Codex Images 探针是显式例外：默认 `all` 会发起四次高质量 4K 生成并产生真实费用，只有确认账号、预算和 Cloudflare 被测路径后才设置 `CC_SWITCH_CODEX_IMAGES_SMOKE=1`。该脚本只输出 `probe_only/live_pending`，不能生成或替代私有验收 receipt。
 - OAuth 能力必须等真实账号 non-stream/stream、refresh、错误路径都回归后才能把 capability 从 `manual_token_store` 切到 NativeOAuth。
 - 缺少经授权的真实 OAuth 账号、订阅 entitlement 或生产反代路径时，对应项目只能记录为 `live_pending`/blocked；本地 mock、fixture、smoke 或 readiness 通过不能升级为真实通过。
 
@@ -168,6 +168,10 @@ credential.
 | `CODEX_PROVIDER_TOKEN` | Codex app/provider 真实低成本回归 | 不记录明文 |
 | `GEMINI_PROVIDER_TOKEN` | Gemini app/provider 真实低成本回归 | 不记录明文 |
 | `CODEX_OAUTH_TEST_ACCOUNT` | Codex OAuth Plus/Pro 测试账号 | 记录脱敏 email |
+| `CC_SWITCH_CODEX_REAL_OPERATION` | 单次 Codex receipt gate：`gpt_image_2_5`、`gpt_image_2_5_flare`、`gpt_image_2_5_sunburst` 或 `ws_prewarm` | 可完整记录 |
+| `CC_SWITCH_CODEX_<OP>_{PROVIDER,SHARE}_ID` | 当前 Codex operation 的显式固定绑定；`<OP>` 为 `GPT_IMAGE_2_5`、`GPT_IMAGE_2_5_FLARE`、`GPT_IMAGE_2_5_SUNBURST` 或 `WS_PREWARM` | receipt 只记录 scope/binding digest |
+| `CC_SWITCH_CODEX_<OP>_MODEL` | 当前 operation 的精确模型；三个图片 operation 必须等于各自 canonical 2.5 variant | 可完整记录 |
+| `CODEX_<OP>_REAL_RECEIPT_FILE` | 当前 operation 的私有 receipt 仓库外绝对路径，真实模式权限必须为 `0600` | 只记录路径类别，不提交文件 |
 | `CLAUDE_OAUTH_TEST_ACCOUNT` | Claude OAuth 测试账号 | 记录脱敏 email |
 | `CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT` | Claude Max 5x OAuth 专项账号；缺失时 5x 等级验收必须记录为 blocked-inputs | 只记录脱敏 email 和计划显示名 |
 | `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` | Claude Max 20x OAuth 专项账号；缺失时 20x 等级验收必须记录为 blocked-inputs | 只记录脱敏 email 和计划显示名 |
@@ -240,6 +244,17 @@ OAuth refresh fixture 的最小验收顺序：
 
 Codex OAuth 专项补充：
 
+Codex 的真实 gate 必须分别运行，任一 operation 的 receipt 都不能提升另一个 operation：
+
+```bash
+CC_SWITCH_CODEX_REAL_OPERATION=gpt_image_2_5 node scripts/smoke/codex-real-receipt.mjs
+CC_SWITCH_CODEX_REAL_OPERATION=gpt_image_2_5_flare node scripts/smoke/codex-real-receipt.mjs
+CC_SWITCH_CODEX_REAL_OPERATION=gpt_image_2_5_sunburst node scripts/smoke/codex-real-receipt.mjs
+CC_SWITCH_CODEX_REAL_OPERATION=ws_prewarm node scripts/smoke/codex-real-receipt.mjs
+```
+
+三个 Image receipt 各自固定当前 target commit、Account generation、Provider binding、Share revision 和 exact model，并必须覆盖 generation/edit/Responses、usage、错误与两种 cooldown scope、capability 重启、多副本共享存储、Cloudflare flush、零 model fallback 和零 post-commit replay。WS receipt 另行要求至少五个 benchmark sample、cold/prewarmed P50 TTFB 的实际收益、上游 prewarm 接受性、同 session 连接复用，以及仅在 `response.create` 成功发送前允许 WS→HTTP。receipt 只保存脱敏 body hash、计数/时延和 binding digest，不得保存 prompt、图片、capability token、opaque reasoning 或原始错误体。缺任一输入时脚本只输出 `blocked_inputs/live_pending`；fixture 只能输出 `contract_verified/live_pending`。本地 validator 回归命令为 `node --test scripts/audit/codex-real-receipt.test.mjs`。
+
 1. Device Code 的 start/poll/cancel 必须绑定发起登录的管理员主体和 device-code 有效期，另一管理员不能 poll/cancel。同一 `device_code` 并发 poll 时只允许一个上游 exchange，其余返回 pending；完成后重复 poll 返回同一账号结果，cancel 后必须失效。
 2. 新登录和 refresh 的 ID/access token 必须通过 OpenAI JWKS 的 RS256、issuer、各自 audience、expiry/nbf 校验；合并身份必须同时含非空 `subject` 和 `chatgpt_account_id`，冲突或缺失任一字段均 fail closed。轮换 `kid` 时应刷新缓存，未知 `kid` 必须拒绝。
 3. 同一 refresh token 导入第二个账号必须拒绝；模拟 `refresh_token_reused` 时账号应立即进入 relogin，不等待普通 invalid-grant 阈值。
@@ -257,7 +272,7 @@ Codex OAuth 专项补充：
 8. provider 的 `codexWebsocketEnabled=false` 应使 GET WS 返回 503，并保持 POST Responses SSE 可用；恢复开关后再跑 text/binary WS 与 Windows reset 场景。
 9. 推理等级由客户端选择并透传：`low`、`medium`、`high`、`xhigh`、`max` 保持不变，仅把非 wire 别名 `ultra` 规范为 `max`；日志分别显示 requested/effective effort。Claude `output_config.effort`/`thinking.effort` 与 Gemini `generationConfig.thinkingConfig.thinkingLevel` 必须经过转换保留；`/v1/models` 应返回 Sol/Terra/Luna。
 10. usage fixture 同时覆盖 nested `cache_write_tokens`、cache read、cache creation 显式零值和 Anthropic exclusive input，核对 fresh/read/write/output 四桶与总 Token。
-11. Codex Images 必须同时验收 `/v1/images/generations` 与 `/v1/images/edits`：短 prompt 的 non-stream `b64_json` 能完整解码，`stream=true` 在上游生成完成前收到 `: connected`，超过 15 秒的生成持续收到 keepalive，partial/completed/error 的事件名前缀分别符合 generation/edit；显式 Responses image tool 的 SSE/JSON 也必须在上游首个业务事件前提交 comment/空白。edit 上传一张大于 1 MiB 的真实图片应到达上游；用两张 base64 图片验证超过 32 MiB HTTP body、但图片聚合不超过 32 MiB 时仍可进入 handler。单图大于 20 MiB、图片聚合大于 32 MiB、HTTP decoded envelope 大于 48 MiB、超过 16 张、伪造输入或输出 MIME/signature、非法参数和 `n>1` 必须在零上游或受控边界失败。模拟 `response.failed`、incomplete/cancel、无终止 EOF、首事件/idle timeout、错误 body 超限与客户端断连，核对已提交 wire `200` 时的流内 error 以及 usage 的 400/502/504/499、stream status、error message、inflight 归零，且其他账号/Provider 请求数为零；提交后不得透明 failover 或 overflow retry。`response_format=url` 应返回签名 ingress 中同一 Share host 下的随机 capability URL；携带 Router token 的 GET/HEAD bytes、Content-Type/Length、`no-store`/`nosniff` 正确，无效 token 为 404，缺少 Router 鉴权为 401。保留一个 URL，重启 Server 后旧 URL 仍应在 TTL 内可下载；再让两个副本挂载同一 `CC_SWITCH_IMAGE_STORE_DIR`，由不同副本分别生成和下载。共享目录必须验证跨进程锁、atomic rename、目录同步和权限；没有共享目录时才配置生成与下载的实例粘性。通过 Cloudflare Worker/Tunnel 再执行一次：Worker 必须直接透传 `Response.body`，不能调用 `.text()`、`.json()` 或 `.arrayBuffer()`；确认无 524、小心跳实际 flush、文件路由不被 Cache 拦截且 Router 鉴权不被移除。执行 `CC_SWITCH_CODEX_IMAGES_SMOKE=1 node scripts/smoke/codex-images-real.mjs`，只记录 requestId、状态、首块/最大静默时间、字节数、格式、SHA-256 和脱敏账号，不记录图片内容或 capability token。
+11. Codex Images 必须同时验收 `/v1/images/generations` 与 `/v1/images/edits`：短 prompt 的 non-stream `b64_json` 能完整解码，`stream=true` 在上游生成完成前收到 `: connected`，超过 15 秒的生成持续收到 keepalive，partial/completed/error 的事件名前缀分别符合 generation/edit；显式 Responses image tool 的 SSE/JSON 也必须在上游首个业务事件前提交 comment/空白。edit 上传一张大于 1 MiB 的真实图片应到达上游；用两张 base64 图片验证超过 32 MiB HTTP body、但图片聚合不超过 32 MiB 时仍可进入 handler。单图大于 20 MiB、图片聚合大于 32 MiB、HTTP decoded envelope 大于 48 MiB、超过 16 张、伪造输入或输出 MIME/signature、非法参数和 `n>1` 必须在零上游或受控边界失败。模拟 `response.failed`、incomplete/cancel、无终止 EOF、首事件/idle timeout、错误 body 超限与客户端断连，核对已提交 wire `200` 时的流内 error 以及 usage 的 400/502/504/499、stream status、error message、inflight 归零，且其他账号/Provider 请求数为零；提交后不得透明 failover 或 overflow retry。`response_format=url` 应返回签名 ingress 中同一 Share host 下的随机 capability URL；携带 Router token 的 GET/HEAD bytes、Content-Type/Length、`no-store`/`nosniff` 正确，无效 token 为 404，缺少 Router 鉴权为 401。保留一个 URL，重启 Server 后旧 URL 仍应在 TTL 内可下载；再让两个副本挂载同一 `CC_SWITCH_IMAGE_STORE_DIR`，由不同副本分别生成和下载。共享目录必须验证跨进程锁、atomic rename、目录同步和权限；没有共享目录时才配置生成与下载的实例粘性。通过 Cloudflare Worker/Tunnel 再执行一次：Worker 必须直接透传 `Response.body`，不能调用 `.text()`、`.json()` 或 `.arrayBuffer()`；确认无 524、小心跳实际 flush、文件路由不被 Cache 拦截且 Router 鉴权不被移除。可执行 `CC_SWITCH_CODEX_IMAGES_SMOKE=1 node scripts/smoke/codex-images-real.mjs` 做付费探针；它只记录 requestId、状态、首块/最大静默时间、字节数、格式、SHA-256 和脱敏账号，输出固定为 `probe_only/live_pending`，既不记录图片内容/capability token，也不能替代上述 operation receipt。
 12. server 不应自动读取或写入运行主机用户的 `~/.codex/auth.json`；只测试显式登录/导入。TLS/JA3 只有在 rustls 请求出现可重复的上游拒绝证据时才开启专项评估。
 13. 从配置中的非 loopback HTTPS Client URL 发起 CLI OAuth，确认授权请求仍使用 `http://localhost:1455/auth/callback`。浏览器本地回调失败后提交完整地址栏 URL 应完成同一管理员主体的会话；裸 code、`127.0.0.1`、错误端口/path、重复 state、过期/取消会话、另一管理员会话、非同源页面、未配置的 host 和远程 HTTP Client URL 都必须拒绝。另以 `0.0.0.0` 或 `::` 启动 Server，确认携带伪造 `Host: 127.0.0.1` 的远程请求仍被拒绝；只有 Server 实际绑定 loopback 时才允许本机例外。Device OAuth 同时保持可用。
 14. Provider 中伪造 OAuth authorize/token、quota 或 inference endpoint 后保存/转发必须被固定 endpoint policy 拒绝或覆盖，OAuth token 不得发往自定义 host；managed OAuth Provider 缺少显式账号绑定时必须拒绝保存，不能隐式选同类型第一个账号。

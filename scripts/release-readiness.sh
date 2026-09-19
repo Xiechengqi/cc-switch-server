@@ -61,7 +61,7 @@ need_var GEMINI_PROVIDER_TOKEN
 case "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" in
   0) ;;
   1)
-    CODEX_IMAGES_GATE_STATUS=configured-not-run
+    CODEX_IMAGES_GATE_STATUS=probe-configured-not-run
     for name in CC_SWITCH_SHARE_URL ROUTER_API_TOKEN; do
       if [[ -z "${!name:-}" || "${!name}" == \<* ]]; then
         CODEX_IMAGES_GATE_STATUS=blocked-inputs
@@ -81,9 +81,9 @@ if [[ "$RUN_REAL" == "1" && "${#BLOCKERS[@]}" -eq 0 ]]; then
   scripts/smoke/code-agent-regression.sh || FAILURES=$((FAILURES + 1))
   if [[ "${CC_SWITCH_CODEX_IMAGES_SMOKE:-0}" == "1" ]]; then
     if node scripts/smoke/codex-images-real.mjs; then
-      CODEX_IMAGES_GATE_STATUS=passed
+      CODEX_IMAGES_GATE_STATUS=probe-only-live-pending
     else
-      CODEX_IMAGES_GATE_STATUS=failed
+      CODEX_IMAGES_GATE_STATUS=probe-failed
       FAILURES=$((FAILURES + 1))
     fi
   fi

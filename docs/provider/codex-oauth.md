@@ -230,13 +230,15 @@ WebSocket 生命周期及其 HTTP fallback 不在自动压缩范围内：握手�
 
 ### GPT Image 2.5 quota/cache evidence gate
 
-`gpt-image-2.5`、`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst` 必须分别取得真实绑定账号的 generation、multipart edit、model normalization、size/quality、usage、error 和 quota/cooldown 脱敏 receipt。当前三者均为 `live_pending`，不会进入 registry、模型目录或 UI，Dedicated Images 在发网前明确拒绝；任一基础模型成功也不能外推另外两个 variant 的 entitlement。
+`gpt-image-2.5`、`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst` 必须分别取得真实绑定账号的 generation、multipart edit、Responses SSE/JSON、model normalization、size/quality、usage、error 和 quota/cooldown 脱敏 receipt。`scripts/smoke/codex-real-receipt.mjs` 将它们固定为三个独立 operation，并绑定 target commit、Account generation、Provider、Share revision 与 exact model；每份 receipt 还必须证明 capability 重启、多副本共享目录、Cloudflare flush、零 model fallback 和零 post-commit replay。当前三者均为 `live_pending` 且 receipt 为 `null`，不会进入 registry、模型目录或 UI，Dedicated Images 在发网前明确拒绝；任一基础模型成功也不能外推另外两个 variant 的 entitlement。
 
 在三个 variant 尚未逐项通过前，不实施 2.5 专属 quota refresh、缓存或性能路径。未来评估仍必须保持 prompt/图片不进入日志或 receipt，只保存计数、大小、格式和脱敏错误；现有单图 48 MiB、累计 72 MiB 输出上限与持久化 capability store 继续作为通用资源边界，不能被外部项目的商业计价逻辑改写。
 
 ### WS prewarm evidence gate
 
-当前不创建或合成 WS prewarm lifecycle。只有真实 upstream receipt 证明协议允许，并且固定 Provider/Account 的本地基准显示 TTFB 有稳定收益后才可启用。届时 pool key 至少包含 Provider、Account、auth/token generation、runtime、model/feature profile；取消、credential generation 或 runtime 漂移必须销毁连接。现有 WS→HTTP 恢复继续只发生在 `response.create` 成功发送前，共用总 attempt budget；发送后禁止重放。
+当前不创建或合成 WS prewarm lifecycle。`ws_prewarm` receipt 必须同时证明上游接受该生命周期、至少五个 benchmark sample 的 cold/prewarmed P50 TTFB 实际收益、同 session 两轮只建立一个上游连接，以及固定 Provider/Account 的严格恢复边界，才可进入后续启用评审。届时 pool key 至少包含 Provider、Account、auth/token generation、runtime、model/feature profile；取消、credential generation 或 runtime 漂移必须销毁连接。现有 WS→HTTP 恢复继续只发生在 `response.create` 成功发送前，共用总 attempt budget；发送后禁止重放。fixture 最多产生 `contract_verified/live_pending`，不能替代真实 upstream receipt 或基准。
+
+`scripts/smoke/codex-images-real.mjs` 仍可用于显式付费的人工诊断，但输出固定为 `probe_only/live_pending`，失败输出不包含 prompt、token 或原始 upstream body，且不能提升上述四个 operation。
 
 ## OAuth 刷新与持久化
 
