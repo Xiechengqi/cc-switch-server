@@ -19,6 +19,25 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, canonical(nested)]),
+    );
+  }
+  return value;
+}
+
+function objectDigest(value) {
+  return sha256(JSON.stringify(canonical(value)));
+}
+
+const commitPattern = /^[a-f0-9]{40}$/;
+const digestPattern = /^[a-f0-9]{64}$/;
+
 function safeRelative(value, label) {
   assert(
     typeof value === "string" &&
@@ -29,10 +48,31 @@ function safeRelative(value, label) {
   );
 }
 
+function gitTree(repository, commit) {
+  return execFileSync("git", ["-C", repository, "rev-parse", `${commit}^{tree}`], {
+    encoding: "utf8",
+  }).trim();
+}
+
+function gitFile(repository, commit, filePath, encoding = "utf8") {
+  return execFileSync("git", ["-C", repository, "show", `${commit}:${filePath}`], {
+    encoding,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
 const contract = JSON.parse(fs.readFileSync(contractPath, "utf8"));
 assert(
-  contract.format === "cc-switch-cursor-reference-delta" && contract.schemaVersion === 1,
+  contract.format === "cc-switch-cursor-reference-delta" &&
+    contract.schemaVersion === 2 &&
+    contract.legacySchemaVersion === 1,
   "Cursor reference delta format changed",
+);
+assert(
+  Number.isFinite(Date.parse(contract.capturedAt)) &&
+    Number.isFinite(Date.parse(contract.updatedAt)) &&
+    Date.parse(contract.updatedAt) >= Date.parse(contract.capturedAt),
+  "Cursor evidence timestamps are invalid",
 );
 assert(
   contract.policy?.externalSources === "read_only_optional_audit_input_never_runtime_dependency",
@@ -52,36 +92,141 @@ assert(
     contract.policy.liveEvidence.includes("never upgrades either rail"),
   "Cursor fixture/live evidence boundary changed",
 );
+assert(
+  contract.observationPolicy?.history ===
+    "append_only; every legacy schema v1 content field is immutable" &&
+    contract.observationPolicy?.sourceReadMode === "read_only_committed_git_objects" &&
+    contract.observationPolicy?.targetReadMode === "committed_git_objects" &&
+    contract.observationPolicy?.externalVerification?.includes(
+      "never a build, test, release, or runtime dependency",
+    ),
+  "Cursor observation policy changed",
+);
 
+const immutableLegacyDigests = new Map([
+  ["capturedAt", "18aca4884d737a6e7c2c3ee61b8abd0b8d19239c34d2385637cd99769060390e"],
+  ["policy", "c081934b7b7cf9445c6af548e0e4a752627041d2f1722e824d2f32915d3ade7f"],
+  ["sources", "e3fdbd8f0fd001f2423b733de2f114a47e1bdb61179bf8936e09f2e4bb265891"],
+  [
+    "incrementalReview",
+    "be61f22aef092e51373d2abace4b32608efecae219a5de0eb2078ea6cd552b08",
+  ],
+  [
+    "registryTruth",
+    "9e474b418412d1206b36a0cdb4923496e468f326b9e5fbd083f852ef06951406",
+  ],
+  [
+    "capabilities",
+    "d31d921ec16ed80f5f29e247acbc65a7d8c84f24416ff0e19924f1f79c687fd2",
+  ],
+  [
+    "enhancements",
+    "1a514afdf423c65b96501c356bd111e0164937d7299969d5d89cb31d74a211ee",
+  ],
+  [
+    "providerLifecycle",
+    "91ea0887a580b714305f20bf3bd6a78306d458d967fd0502322385ac45c11898",
+  ],
+  [
+    "realAcceptance",
+    "b4db1d12757a40a5b2934a6cc0eb10d1fb6ca235cb05caa60410a671b8c26cb7",
+  ],
+  [
+    "protobufFixtures",
+    "5091d5aebf02af15fb01ceabc7a6f90ac54069ec01e73a360e43c5780a580244",
+  ],
+]);
+for (const [field, digest] of immutableLegacyDigests) {
+  assert(objectDigest(contract[field]) === digest, `Cursor legacy ${field} history changed`);
+}
+
+const sourceById = new Map();
+const sourceRootById = new Map();
+const sourceFileById = new Map();
 for (const source of contract.sources ?? []) {
-  assert(source.id && source.rootEnv, "Cursor source metadata is incomplete");
-  assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
+  assert(
+    source.id && source.rootEnv && source.defaultRelativeRoot,
+    "Cursor source metadata is incomplete",
+  );
+  assert(!sourceById.has(source.id), `duplicate Cursor source ${source.id}`);
+  assert(commitPattern.test(source.commit), `${source.id} has an invalid commit`);
   assert(
     source.previousReviewedCommit === "a3ca33fa6442b59adc42976c795709eaf5351109",
     `${source.id} previous review point changed`,
   );
-  assert(Array.isArray(source.files) && source.files.length >= 2, `${source.id} lacks evidence files`);
+  assert(
+    Array.isArray(source.files) && source.files.length === 6,
+    `${source.id} must retain six reviewed evidence files`,
+  );
   const sourceRoot = path.resolve(
     repoRoot,
     process.env[source.rootEnv] || source.defaultRelativeRoot,
   );
+  const fileByPath = new Map();
   for (const file of source.files) {
     safeRelative(file.path, `${source.id} evidence path`);
-    assert(/^[a-f0-9]{64}$/.test(file.sha256), `${source.id}:${file.path} has invalid SHA-256`);
+    assert(!fileByPath.has(file.path), `${source.id} repeats ${file.path}`);
+    assert(
+      digestPattern.test(file.sha256),
+      `${source.id}:${file.path} has invalid SHA-256`,
+    );
+    fileByPath.set(file.path, file);
     if (checkSources) {
       assert(fs.existsSync(sourceRoot), `${source.id} source root is unavailable`);
-      const content = execFileSync(
-        "git",
-        ["-C", sourceRoot, "show", `${source.commit}:${file.path}`],
-        { encoding: null, maxBuffer: 64 * 1024 * 1024 },
-      );
+      const content = gitFile(sourceRoot, source.commit, file.path, null);
       assert(
         sha256(content) === file.sha256,
         `${source.id}:${file.path} drifted from the reviewed Git object`,
       );
     }
   }
+  sourceById.set(source.id, source);
+  sourceRootById.set(source.id, sourceRoot);
+  sourceFileById.set(source.id, fileByPath);
 }
+assert(sourceById.size === 1 && sourceById.has("omniroute"), "Cursor source set changed");
+
+const immutableSourceSnapshotDigests = new Map([
+  [
+    "omniroute-2026-09-19",
+    "821050b62be6a73e50f2d2c34272c3384cdd5fefdc1f64a418d32c891bc46638",
+  ],
+]);
+const sourceSnapshotById = new Map();
+for (const snapshot of contract.sourceSnapshots ?? []) {
+  assert(snapshot.id && !sourceSnapshotById.has(snapshot.id), "duplicate Cursor source snapshot");
+  const source = sourceById.get(snapshot.sourceId);
+  assert(source, `${snapshot.id} references an unknown source`);
+  assert(
+    snapshot.repository === "OmniRoute" &&
+      snapshot.headCommit === source.commit &&
+      commitPattern.test(snapshot.headTree),
+    `${snapshot.id} has invalid committed source identity`,
+  );
+  assert(
+    snapshot.worktreeClean === false &&
+      snapshot.worktreeChangesExcluded === true &&
+      snapshot.excludedWorktreeEntries === 22 &&
+      snapshot.readMode === "read_only_committed_git_objects",
+    `${snapshot.id} does not explicitly exclude the dirty worktree`,
+  );
+  assert(
+    immutableSourceSnapshotDigests.get(snapshot.id) === objectDigest(snapshot),
+    `${snapshot.id} changed after it was recorded`,
+  );
+  if (checkSources) {
+    assert(
+      gitTree(sourceRootById.get(snapshot.sourceId), snapshot.headCommit) ===
+        snapshot.headTree,
+      `${snapshot.id} HEAD tree drifted`,
+    );
+  }
+  sourceSnapshotById.set(snapshot.id, snapshot);
+}
+assert(
+  sourceSnapshotById.size === immutableSourceSnapshotDigests.size,
+  "Cursor source snapshot history is incomplete",
+);
 
 const incrementalReview = contract.incrementalReview;
 assert(incrementalReview?.id === "CUR-N2", "Cursor incremental review id changed");
@@ -119,6 +264,194 @@ if (checkSources) {
   ).trim();
   assert(changedReviewedPaths === "", "Cursor reviewed wire objects changed in the frozen range");
 }
+
+const immutableObservationDigests = new Map([
+  ["CUR-OBS-0001", "f3732163de10712d240bae6265bc301a62cdf12be94500e837ee9381b3e17524"],
+  ["CUR-OBS-0002", "84e95d79f94d721056617b00387e6c728bce903d30cb50f9444cf96ecc76cbe8"],
+  ["CUR-OBS-0003", "0b28cfaa9d0a116e6a3c1a54d4bd9b176ab78700e0f561a806ed915fb942d97b"],
+  ["CUR-OBS-0004", "b1597967c483d33cfd2f3bff23e5b4e0956420dc4e365ff8e7a8a077a0a85c5a"],
+  ["CUR-OBS-0005", "2d4a13ae09ae145cd5325778d65815ddc4568867cac778cc9554b356e7077701"],
+  ["CUR-OBS-0006", "0c781f29fc5adc7cb7a6d8939c75a3a670f41c7787278c01483955dbe34241f3"],
+  ["CUR-OBS-0007", "d16160313b7b1349ceb9e7394d2e59a02d556290cf5231546afa62a4b7ff7f3f"],
+]);
+const expectedEnhancementIds = new Set([
+  "CUR-01",
+  "CUR-02",
+  "CUR-03",
+  "CUR-N1",
+  "CUR-N2",
+  "CORE-N1",
+  "LIVE-N1",
+]);
+const observationIds = new Set();
+const observedEnhancementIds = new Set();
+const observedDeltaIds = new Set();
+for (const observation of contract.observations ?? []) {
+  assert(observation.id && !observationIds.has(observation.id), "duplicate Cursor observation");
+  observationIds.add(observation.id);
+  assert(observation.providerFamily === "cursor", `${observation.id} changed provider family`);
+  assert(
+    Number.isFinite(Date.parse(observation.observedAt)),
+    `${observation.id} has an invalid observedAt`,
+  );
+  assert(
+    ["adopt", "differential", "live_gate", "reject"].includes(
+      observation.disposition,
+    ),
+    `${observation.id} has an invalid disposition`,
+  );
+  assert(
+    typeof observation.reason === "string" && observation.reason.trim().length > 0,
+    `${observation.id} has no disposition reason`,
+  );
+  assert(
+    Array.isArray(observation.enhancementIds) &&
+      observation.enhancementIds.length > 0 &&
+      observation.enhancementIds.every((id) => expectedEnhancementIds.has(id)),
+    `${observation.id} has an invalid enhancement mapping`,
+  );
+  for (const id of observation.enhancementIds) observedEnhancementIds.add(id);
+
+  const reference = observation.reference ?? {};
+  const source = sourceById.get(reference.sourceId);
+  const snapshot = sourceSnapshotById.get(reference.snapshotId);
+  assert(
+    source && snapshot?.sourceId === reference.sourceId,
+    `${observation.id} has an invalid source snapshot`,
+  );
+  assert(
+    reference.repository === snapshot.repository &&
+      reference.commit === snapshot.headCommit &&
+      reference.tree === snapshot.headTree,
+    `${observation.id} changed committed source identity`,
+  );
+  assert(
+    typeof reference.deltaId === "string" &&
+      reference.deltaId.length > 0 &&
+      !observedDeltaIds.has(reference.deltaId),
+    `${observation.id} has an invalid or duplicate source delta`,
+  );
+  observedDeltaIds.add(reference.deltaId);
+  assert(
+    Array.isArray(reference.paths) &&
+      reference.paths.length > 0 &&
+      new Set(reference.paths).size === reference.paths.length,
+    `${observation.id} has invalid source paths`,
+  );
+  const fileByPath = sourceFileById.get(reference.sourceId);
+  const files = reference.paths.map((sourcePath) => {
+    safeRelative(sourcePath, `${observation.id}:${sourcePath ?? "<missing>"}`);
+    const file = fileByPath.get(sourcePath);
+    assert(file, `${observation.id} references an unfrozen source path`);
+    return file;
+  });
+  assert(
+    Array.isArray(reference.symbols) &&
+      reference.symbols.length > 0 &&
+      reference.symbols.every((symbol) => typeof symbol === "string" && symbol.trim()),
+    `${observation.id} has no source symbols`,
+  );
+  const expectedSourceDigest = objectDigest({
+    sourceId: reference.sourceId,
+    deltaId: reference.deltaId,
+    commit: reference.commit,
+    tree: reference.tree,
+    files,
+  });
+  assert(
+    digestPattern.test(reference.sourceDigest) &&
+      reference.sourceDigest === expectedSourceDigest,
+    `${observation.id} source digest drifted`,
+  );
+
+  const target = observation.target ?? {};
+  assert(
+    commitPattern.test(target.baselineCommit) &&
+      commitPattern.test(target.baselineTree) &&
+      gitTree(repoRoot, target.baselineCommit) === target.baselineTree,
+    `${observation.id} has an invalid target baseline object`,
+  );
+  const rejected = observation.disposition === "reject";
+  if (rejected) {
+    assert(
+      target.implementationCommit === null && target.implementationTree === null,
+      `${observation.id} rejected behavior must not claim an implementation`,
+    );
+    assert(
+      Array.isArray(target.fixtureIds) && target.fixtureIds.length === 0,
+      `${observation.id} rejected behavior must not claim fixtures`,
+    );
+  } else {
+    assert(
+      commitPattern.test(target.implementationCommit) &&
+        commitPattern.test(target.implementationTree) &&
+        target.baselineCommit !== target.implementationCommit &&
+        gitTree(repoRoot, target.implementationCommit) === target.implementationTree,
+      `${observation.id} has an invalid target implementation object`,
+    );
+    assert(
+      Array.isArray(target.fixtureIds) && target.fixtureIds.length > 0,
+      `${observation.id} has no implementation fixtures`,
+    );
+  }
+  const contractCommit = rejected
+    ? target.baselineCommit
+    : target.implementationCommit;
+  const targetSources = [];
+  for (const localContract of target.contracts ?? []) {
+    safeRelative(
+      localContract.path,
+      `${observation.id}:${localContract.path ?? "<missing>"}`,
+    );
+    const targetSource = gitFile(repoRoot, contractCommit, localContract.path);
+    targetSources.push(targetSource);
+    assert(
+      Array.isArray(localContract.anchors) &&
+        localContract.anchors.length > 0 &&
+        localContract.anchors.every((anchor) => targetSource.includes(anchor)),
+      `${observation.id} has an unavailable committed target anchor`,
+    );
+  }
+  assert(targetSources.length > 0, `${observation.id} has no target contracts`);
+  if (!rejected) {
+    assert(
+      target.fixtureIds.every((fixture) =>
+        targetSources.some((targetSource) => targetSource.includes(fixture)),
+      ),
+      `${observation.id} has an unmapped fixture`,
+    );
+  }
+  assert(
+    immutableObservationDigests.get(observation.id) === objectDigest(observation),
+    `${observation.id} changed after it was recorded`,
+  );
+
+  if (checkSources) {
+    assert(
+      gitTree(sourceRootById.get(reference.sourceId), reference.commit) ===
+        reference.tree,
+      `${observation.id} source tree drifted`,
+    );
+    const sourceText = reference.paths
+      .map((sourcePath) =>
+        gitFile(sourceRootById.get(reference.sourceId), reference.commit, sourcePath),
+      )
+      .join("\n");
+    assert(
+      reference.symbols.every((symbol) => sourceText.includes(symbol)),
+      `${observation.id} source symbol drifted`,
+    );
+  }
+}
+assert(
+  observationIds.size === immutableObservationDigests.size,
+  "Cursor observation history is incomplete",
+);
+assert(
+  JSON.stringify([...observedEnhancementIds].sort()) ===
+    JSON.stringify([...expectedEnhancementIds].sort()),
+  "Cursor enhancement observation coverage is incomplete",
+);
 
 const enhancements = new Map(
   (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),
@@ -342,7 +675,7 @@ assert(
 );
 
 console.log(
-  `cursor reference delta audit ok (${capabilities.size} capabilities, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
+  `cursor reference delta audit ok (${immutableLegacyDigests.size} legacy fields, ${observationIds.size} immutable observations, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

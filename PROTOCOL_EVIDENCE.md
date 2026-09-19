@@ -109,11 +109,13 @@ GPT Image 2.5 三个 variant 不从外部项目的静态声明推导真实 entit
 
 Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。2026-09-18 从旧点 `a3ca33fa6442b59adc42976c795709eaf5351109` 复核到 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`：六个 Cursor protobuf/session/executor 提交对象的 SHA-256 均未变化，提交区间没有 Cursor wire、protobuf、auth 或 session 增量，因此 CUR-N2 结论为 `reviewed_no_wire_delta`，不修改生产 executor。参考仓库当时 22 项未提交/未跟踪内容全部排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。
 
+EVID-N1 将合同提升为 append-only schema v2：原 v1 的 `capturedAt`、`policy`、`sources`、`incrementalReview`、`registryTruth`、`capabilities`、`enhancements`、`providerLifecycle`、`realAcceptance`、`protobufFixtures` 十个字段分别由 canonical SHA-256 固定；新增的 OmniRoute source snapshot 绑定 HEAD commit/tree，并明确记录 `worktreeClean=false`、22 项工作树内容全部排除。7 条不可变 observation 分别映射 CUR-01～03、CUR-N1/N2、CORE-N1、LIVE-N1，固定 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object 和 fixture，不允许用当前工作树冒充历史实现。
+
 Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段语义、重复 field 27/URL 失败关闭、Connect frame 任意分片与 partial EOF、成功/错误 terminal envelope、plain EOF 失败关闭，以及 fresh `composer-2.5-fast` 必须保留完整 wire ID。公开模型选择入口已经存在，因此 registry `special.cursor` revision 4 将 discovery 与 forward/test 一并标为 supported/`fixture_verified`；OAuth 返回静态 aliases，API-key 目录保持 exact Provider/runtime/credential scope，成功空目录权威，transient stale 只用于展示。
 
 CUR-02/CUR-N1 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
 
-后续 CORE-N1 切片以 `src/proxy/providers/cursor/` 作为共享 forwarder 与既有 `src/proxy/cursor/` 协议实现之间的生命周期 facade，收敛 Cursor adapter、模型选择、native driver dispatch 和 h2 timeout mapping，不改变 endpoint、protobuf、session、wire、attempt、terminal 或 usage。LIVE-N1 同时把 receipt 提升为 schema v2/harness revision 2：OAuth 与 API-key 仍独立，每份私有 receipt 必须绑定当前 target commit、App、Provider/runtime revision、Share revision、精确 credential generation、完整 `*-fast` model、22 项检查、10 份 body hash、5 项测量、固定恢复决策和 decoy/secret scan；真实文件必须在仓库外且权限为 `0600`。当前未提供真实凭据，两条 rail 的 receipt 仍为 `null`、状态保持 `live_pending`。
+CORE-N1 切片以 `src/proxy/providers/cursor/` 作为共享 forwarder 与既有 `src/proxy/cursor/` 协议实现之间的生命周期 facade，收敛 Cursor adapter、模型选择、native driver dispatch 和 h2 timeout mapping，不改变 endpoint、protobuf、session、wire、attempt、terminal 或 usage。LIVE-N1 同时把 receipt 提升为 schema v2/harness revision 2：OAuth 与 API-key 仍独立，每份私有 receipt 必须绑定当前 target commit、App、Provider/runtime revision、Share revision、精确 credential generation、完整 `*-fast` model、22 项检查、10 份 body hash、5 项测量、固定恢复决策和 decoy/secret scan；真实文件必须在仓库外且权限为 `0600`。当前未提供真实凭据，两条 rail 的 receipt 仍为 `null`、状态保持 `live_pending`。
 
 ## 2026-09-18 Grok reasoning replay/root-union/quality-observation differential freeze
 

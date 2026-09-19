@@ -1,13 +1,34 @@
 {
   "format": "cc-switch-cursor-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
     "scope": "one fixed Provider and one fixed credential identity per receipt; no pool; no rotation; no rail fallback; no cross-account fallback; no cross-Provider fallback",
     "liveEvidence": "OAuth and API-key rails require separate real receipts; fixture success never upgrades either rail"
   },
+  "observationPolicy": {
+    "history": "append_only; every legacy schema v1 content field is immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "externalVerification": "optional explicit audit only; never a build, test, release, or runtime dependency"
+  },
+  "sourceSnapshots": [
+    {
+      "id": "omniroute-2026-09-19",
+      "sourceId": "omniroute",
+      "repository": "OmniRoute",
+      "headCommit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+      "headTree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": 22,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
   "sources": [
     {
       "id": "omniroute",
@@ -274,5 +295,390 @@
       "expectedWireId": "composer-2.5-fast",
       "staleCatalogMayAuthorizeWireId": false
     }
-  }
+  },
+  "observations": [
+    {
+      "id": "CUR-OBS-0001",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "agentservice_driver_and_catalog",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "tests/unit/cursor-agent-protobuf.test.ts"
+        ],
+        "symbols": [
+          "CursorExecutor",
+          "getActiveSyncedCatalog",
+          "resolveRequestedModel"
+        ],
+        "sourceDigest": "043be4c5fa4d54d505c45a7bb482be3c492b6e93888ce529575d2fc53e992e38"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CUR-01"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "assets/contract/provider-registry.json",
+            "anchors": [
+              "\"driverId\":\"special.cursor\",\"driverContractRevision\":4"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/mod.rs",
+            "anchors": [
+              "all_supported_ingress_routes_select_the_expected_cursor_lifecycle"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "all_supported_ingress_routes_select_the_expected_cursor_lifecycle"
+        ]
+      },
+      "reason": "Retain the independently owned special.cursor registry and three ingress lifecycles while treating the reference executor and catalog as differential evidence rather than a runtime dependency."
+    },
+    {
+      "id": "CUR-OBS-0002",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "agentservice_live_acceptance_boundary",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "open-sse/services/cursorSessionManager.ts",
+          "tests/unit/cursor-agent-session.test.ts"
+        ],
+        "symbols": [
+          "CursorExecutor",
+          "CursorSessionManager",
+          "findByToolCallIds"
+        ],
+        "sourceDigest": "3a94552a5729e6446e03db252267714ddbd612a01d961721c3aa476e77b14d0e"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "CUR-02"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "scripts/smoke/cursor-real.mjs",
+            "anchors": [
+              "cursor dual-rail evidence remains live_pending",
+              "contract_verified",
+              "live_pending"
+            ]
+          },
+          {
+            "path": "scripts/audit/cursor-real.test.mjs",
+            "anchors": [
+              "Cursor real harness validates OAuth and API-key receipts independently"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Cursor real harness validates OAuth and API-key receipts independently"
+        ]
+      },
+      "reason": "Reference mechanics cannot prove this Server's subscription acceptance; OAuth and API-key remain independently live_pending until current-binding private receipts pass."
+    },
+    {
+      "id": "CUR-OBS-0003",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "protobuf_connect_and_terminal",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/utils/cursorAgentProtobuf.ts",
+          "tests/unit/cursor-agent-protobuf.test.ts",
+          "tests/unit/cursor-protobuf-wire-split.test.ts"
+        ],
+        "symbols": [
+          "decodeAgentServerMessage",
+          "iterateConnectFrames",
+          "checkedLen"
+        ],
+        "sourceDigest": "d8847c57d7b70df693812ba5163e52b095e601f7ebf1f31ff7297ba69afb0b29"
+      },
+      "disposition": "adopt",
+      "enhancementIds": [
+        "CUR-03"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/cursor/agent_proto.rs",
+            "anchors": [
+              "cursor_reference_fixture_preserves_known_semantics_around_unknown_fields"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/h2_client.rs",
+            "anchors": [
+              "cursor_reference_fixture_freezes_terminal_and_eof"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "cursor_reference_fixture_preserves_known_semantics_around_unknown_fields",
+          "cursor_reference_fixture_freezes_terminal_and_eof"
+        ]
+      },
+      "reason": "Adopt only the observed protobuf, Connect framing and terminal invariants through self-contained hex fixtures with duplicate, partial-EOF and unknown-field fail-closed coverage."
+    },
+    {
+      "id": "CUR-OBS-0004",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "credential_and_session_rails",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "open-sse/services/cursorSessionManager.ts"
+        ],
+        "symbols": [
+          "getAccessToken",
+          "invalidateCursorSessionToken",
+          "CursorSessionManager"
+        ],
+        "sourceDigest": "19e1e39ec66b11995d884b3d76c6e00b5db8a509d8dc2e5239869f2c47deca33"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "CUR-N1"
+      ],
+      "target": {
+        "baselineCommit": "08bac93251d64f0d80d40192631beab366afe501",
+        "baselineTree": "bd8575056803f0b63ac35312a2e016f094975ed7",
+        "implementationCommit": "8f72bb96e89e377de4c914cd3a4ae8fdce7e8677",
+        "implementationTree": "b42f84e939779709f561177db69b41496e38165e",
+        "contracts": [
+          {
+            "path": "scripts/smoke/cursor-real.mjs",
+            "anchors": [
+              "HARNESS_REVISION = 2",
+              "cursor_oauth",
+              "cursor_apikey",
+              "crossRailFallback: \"disabled\""
+            ]
+          },
+          {
+            "path": "scripts/audit/cursor-real.test.mjs",
+            "anchors": [
+              "Cursor OAuth and API-key receipts remain independently live_pending",
+              "Cursor Provider rail mismatch fails before Share and catalog calls"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Cursor OAuth and API-key receipts remain independently live_pending",
+          "Cursor Provider rail mismatch fails before Share and catalog calls"
+        ]
+      },
+      "reason": "Keep OAuth Account generations and API-key credential generations on disjoint fixed rails; neither receipt authorizes cross-rail, cross-Account, cross-Provider or cross-Share recovery."
+    },
+    {
+      "id": "CUR-OBS-0005",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "committed_cursor_object_refresh",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/utils/cursorAgentProtobuf.ts",
+          "open-sse/services/cursorSessionManager.ts",
+          "open-sse/executors/cursor.ts",
+          "tests/unit/cursor-agent-protobuf.test.ts",
+          "tests/unit/cursor-agent-session.test.ts",
+          "tests/unit/cursor-protobuf-wire-split.test.ts"
+        ],
+        "symbols": [
+          "decodeAgentServerMessage",
+          "CursorSessionManager",
+          "CursorExecutor",
+          "wire leaf exposes the primitives"
+        ],
+        "sourceDigest": "1830d44863b40a02b1d43efd9875456bb3f375a9af0ef09835c4be325fa51c4b"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CUR-N2"
+      ],
+      "target": {
+        "baselineCommit": "466291c40bd38118df4f7c70014567af7ce9cd42",
+        "baselineTree": "cce56e8dc2560175a46a10ef88be36591df7e71e",
+        "implementationCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "implementationTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "contracts": [
+          {
+            "path": "assets/contract/cursor-reference-delta.json",
+            "anchors": [
+              "\"id\": \"CUR-N2\"",
+              "\"wireDelta\": \"none\""
+            ]
+          },
+          {
+            "path": "scripts/audit/audit-cursor-reference-delta.mjs",
+            "anchors": [
+              "Cursor reviewed wire objects changed in the frozen range"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Cursor reviewed wire objects changed in the frozen range"
+        ]
+      },
+      "reason": "The six frozen Cursor objects did not change in the reviewed committed range; all 22 contemporaneous worktree entries were excluded and no production wire change was justified."
+    },
+    {
+      "id": "CUR-OBS-0006",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "provider_lifecycle_boundary",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "open-sse/utils/cursorAgentProtobuf.ts",
+          "open-sse/services/cursorSessionManager.ts"
+        ],
+        "symbols": [
+          "CursorExecutor",
+          "buildAgentRequestBody",
+          "CursorSessionManager"
+        ],
+        "sourceDigest": "e7543a852e1d731be02631a02583d9698525a8e4599bc44821454ada7feeb309"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N1"
+      ],
+      "target": {
+        "baselineCommit": "08bac93251d64f0d80d40192631beab366afe501",
+        "baselineTree": "bd8575056803f0b63ac35312a2e016f094975ed7",
+        "implementationCommit": "8f72bb96e89e377de4c914cd3a4ae8fdce7e8677",
+        "implementationTree": "b42f84e939779709f561177db69b41496e38165e",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/cursor/mod.rs",
+            "anchors": [
+              "prepare_agentservice_request",
+              "forward_agentservice",
+              "cursor_provider_facade_keeps_rails_independent_and_fail_closed"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "cursor::prepare_agentservice_request",
+              "cursor::forward_agentservice"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "cursor_provider_facade_keeps_rails_independent_and_fail_closed"
+        ]
+      },
+      "reason": "Move Cursor adapter, model selection, native dispatch and h2 timeout mapping behind a Provider lifecycle facade without changing protobuf, session, binding, attempt, terminal or usage ownership."
+    },
+    {
+      "id": "CUR-OBS-0007",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "dual_rail_receipt_gate",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "open-sse/services/cursorSessionManager.ts",
+          "tests/unit/cursor-agent-session.test.ts"
+        ],
+        "symbols": [
+          "getActiveSyncedCatalog",
+          "CursorSessionManager",
+          "release(awaiting_tool_result)"
+        ],
+        "sourceDigest": "882aaee98d088f2d96ead00837982ea6a6b43e89754959ca7ef9b6dfabf12b02"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
+      "target": {
+        "baselineCommit": "08bac93251d64f0d80d40192631beab366afe501",
+        "baselineTree": "bd8575056803f0b63ac35312a2e016f094975ed7",
+        "implementationCommit": "8f72bb96e89e377de4c914cd3a4ae8fdce7e8677",
+        "implementationTree": "b42f84e939779709f561177db69b41496e38165e",
+        "contracts": [
+          {
+            "path": "scripts/smoke/cursor-real.mjs",
+            "anchors": [
+              "Cursor receipt file must have mode 0600",
+              "targetCommit !== targetCommit",
+              "decoyRequests",
+              "sensitiveScan"
+            ]
+          },
+          {
+            "path": "scripts/audit/cursor-real.test.mjs",
+            "anchors": [
+              "Cursor receipt identity, generations, checks, and decisions fail closed",
+              "Cursor control-plane failures never print tokens or raw bodies"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Cursor receipt identity, generations, checks, and decisions fail closed",
+          "Cursor control-plane failures never print tokens or raw bodies"
+        ]
+      },
+      "reason": "Require current-commit private schema-v2 receipts bound to exact rail, Provider/runtime, Share, credential generation and model; fixture mode and missing credentials leave both rails live_pending."
+    }
+  ]
 }
