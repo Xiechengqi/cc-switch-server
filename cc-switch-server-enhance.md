@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）与 Claude（`6b0a0fe`）的首批 CORE-N1/LIVE-N1 切片及两类 EVID-N1 迁移，其余 Provider 与横切项仍按本文顺序推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）与 Codex（`069f3ef`）的首批 CORE-N1/LIVE-N1 切片及三类 EVID-N1 迁移，其余 Provider 与横切项仍按本文顺序推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -36,19 +36,20 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | `248e7c2` | 收口 Clippy、Phase-0 源码证据哈希与跨仓审计语法兼容；无 wire 行为变化 |
 | `e5bfc34` | Antigravity Provider lifecycle 拆分与两条 OAuth rail 的私有 receipt 验收链；无真实输入时保持 `live_pending` |
 | `6b0a0fe` | Claude Provider lifecycle 拆分与四个 operation 的私有 receipt 验收链；无真实输入时保持 `live_pending` |
+| `069f3ef` | Codex Provider lifecycle 拆分、三个 GPT Image 2.5 variant 与 WS prewarm 的四个私有 receipt gate；付费探针降级为 `probe_only` |
 
 | 类别 | 本轮已关闭 | 仍保持门禁/后续计划 |
 | --- | --- | --- |
 | Antigravity | AG-N1～N5 `fixture_verified`；CORE-N1 首个 Provider 切片与 reference-delta v2 已完成 | AG-N6 与两条 OAuth rail `live_pending`；CORE-N2 内存预算留在横切阶段 |
 | Claude | CL-N1～N4 `fixture_verified`；CORE-N1 Provider 切片与 reference-delta v2 已完成 | OAuth inference、Max 5x/20x plan、Fable 5.1 四个 operation 独立 `live_pending`；CORE-N2 留在横切阶段 |
-| Codex | CX-N1～N4 `fixture_verified` | 既有 GPT Image 2.5、WS prewarm 等真实门禁不变 |
+| Codex | CX-N1～N4 `fixture_verified`；CORE-N1 Provider 切片、CORE-N2 首个 request-memory 切片与 reference-delta v2 已完成 | GPT Image 2.5 三个 exact-model operation 与 WS prewarm 独立 `live_pending` |
 | Cursor | CUR-N2 `reviewed_no_wire_delta` | CUR-N1 OAuth/API-key 两 rail独立 `live_pending` |
 | Grok | GR-N1 `fixture_verified`（观察-only） | GR-N2 推理/媒体/compaction receipt `live_pending` |
 | Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture | KI-N3 启用与 auth kind × region receipt `live_pending` |
 | Qoder | QD-N2 `reviewed_no_wire_delta` | QD-N1 三 rail 独立 `live_pending` |
 | CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖 | CB-N4 与 Intl/CN receipt `live_pending`，v4.1 runtime disabled |
 
-CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 已完成 Antigravity、Claude 两个切片；其余六类 Provider 的结构拆分、reference delta v2 和所有 LIVE-N1 真站验收仍未完成。
+CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 已完成 Antigravity、Claude、Codex 三个切片；其余五类 Provider 的结构拆分、reference delta v2 和所有 LIVE-N1 真站验收仍未完成。
 
 ### 0.2 原始优先级摘要
 
@@ -327,6 +328,8 @@ CX-N4 统一核算压缩前/解压后 body、transport pending、semantic bootst
 
 不采纳账号级静态 Turn-State 注入、跨请求共享未知状态、background preemption lane、跨账号 capacity routing，以及为了缓存而延迟未知业务事件。
 
+CX-R1 明确拒绝从参考图片实现迁入商业计价、自动 driver-model fallback、账号池选号、轮换或跨账号恢复。`069f3ef` 把 Codex 429 scope、reset 解析和 capacity retry 决策收敛到 `src/proxy/providers/codex/`，保持原 wire、固定 Provider/Account 和共享总 attempt budget。私有 receipt harness 将 `gpt_image_2_5`、`gpt_image_2_5_flare`、`gpt_image_2_5_sunburst`、`ws_prewarm` 固定为四个独立 operation；前三项同时要求 generation/edit/Responses、usage/error/cooldown、capability、多副本、Cloudflare 与零 fallback/replay，WS 项要求 upstream acceptance、至少五个样本的 TTFB 收益、连接复用和严格 pre-commit WS→HTTP。当前无真实凭据，四份 receipt 均为 `null`，状态保持 `live_pending`。
+
 ## 7. Cursor
 
 ### 7.1 对比结论
@@ -486,7 +489,7 @@ CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项�
 
 ### 12.1 CORE-N1：渐进拆分巨型热路径
 
-状态：partially_completed；优先级：P2。Antigravity、Claude 两个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 仍待逐类实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
+状态：partially_completed；优先级：P2。Antigravity、Claude、Codex 三个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；Cursor、Grok、Kiro、Qoder、CodeBuddy 仍待逐类实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
 
 建议目标结构：
 
@@ -531,7 +534,7 @@ state.rs 保留 ServerStateInner 作为跨域门面，逐步把 Account lifecycl
 
 ### 12.3 EVID-N1：reference delta v2
 
-状态：partially_completed；优先级：P2。Antigravity 已用不可变 observation digest 固定 13 个 source delta、16 条处置记录及其本地测试映射；Claude 已固定 legacy v1 字段、12 个 source delta、两个 source snapshot、14 条处置记录和 committed target object 映射。两者均为 append-only schema v2；Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 仍使用各自 schema v1，待逐类迁移。
+状态：partially_completed；优先级：P2。Antigravity 已用不可变 observation digest 固定 13 个 source delta、16 条处置记录及其本地测试映射；Claude 已固定 legacy v1 字段、12 个 source delta、两个 source snapshot、14 条处置记录；Codex 已固定六个 legacy v1 字段摘要、9 个 source delta、两个干净 source snapshot、13 条处置记录与 committed target object 映射。三者均为 append-only schema v2；Cursor、Grok、Kiro、Qoder、CodeBuddy 仍使用各自 schema v1，待逐类迁移。
 
 现有八个 assets/contract/*-reference-delta.json 已冻结上一轮证据。新一轮不得覆盖旧 source commit 后假装历史从未存在；应扩展为 append-only observation 或新 revision，至少记录：
 
@@ -552,7 +555,7 @@ audit 必须验证 commit 格式、ID 唯一、目标文件存在、历史 obser
 
 - Antigravity：antigravity_oauth、agy_oauth、requestType 差分、可选 compaction；
 - Claude：`oauth_inference`、`max_5x_plan`、`max_20x_plan`、`fable_5_1` 四个独立 operation；
-- Codex：GPT Image 2.5、WS prewarm、image quota/cache；
+- Codex：`gpt_image_2_5`、`gpt_image_2_5_flare`、`gpt_image_2_5_sunburst`、`ws_prewarm` 四个独立 operation；
 - Cursor：OAuth、API-key；
 - Grok：推理/媒体矩阵、remote compaction；
 - Kiro：auth kind × region、可选 compact、多副本能力；
@@ -635,10 +638,10 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
-状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity 与 Claude 的 CORE-N1/EVID-N1 切片、CUR-N2 与 QD-N2 已完成；其余 CORE-N1、跨 Provider memory 推广和六类 reference-delta schema v2 留待后续独立变更。
+状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex 的 CORE-N1/EVID-N1 切片、CUR-N2 与 QD-N2 已完成；其余 CORE-N1、跨 Provider memory 推广和五类 reference-delta schema v2 留待后续独立变更。
 
 1. 先完成 CX-N4 的 request memory budget，再抽取 CORE-N2。
-2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude 已完成，后续优先 Codex、Kiro、CodeBuddy。
+2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex 已完成，后续优先 Kiro、CodeBuddy。
 3. 实施 EVID-N1 append-only reference delta v2。
 4. 执行 CUR-N2、QD-N2 的周期复核。
 5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority。
@@ -684,6 +687,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | `git diff --check`、docs index | 无 whitespace 错误；文档索引完整 | 通过 |
 | Antigravity 后续专项 | 58 个 Rust 关键词测试通过；13 个 Node 验收/环境门禁测试通过；13 个 source delta、16 条 v2 observation audit 通过 | 通过；两条 rail 仍为 `live_pending` |
 | Claude 后续专项 | 243 个 Rust Claude 测试通过；12 个 Node receipt gate 测试通过；12 个 source delta、14 条 v2 observation audit 通过 | 通过；四个 operation 仍为 `live_pending` |
+| Codex 后续专项 | 389 个 Rust Codex 关键词测试通过；12 个 Node receipt gate 与 7 个付费探针安全测试通过；9 个 source delta、13 条 v2 observation audit 通过 | 通过；四个 operation 仍为 `live_pending` |
 
 正式测试使用 64 MiB `RUST_MIN_STACK`；默认 2 MiB 线程栈的既有溢出不作为本轮回归。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
 
@@ -806,4 +810,4 @@ CodeBuddy：
 11. registry、合同源、生成 coverage、UI matrix、PROTOCOL_EVIDENCE 和 reference delta 一致；docs/provider/coverage.md 未被手改。
 12. 外部仓库没有进入构建、测试、CI、发布或运行时依赖。
 
-当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。Antigravity、Claude 已完成各自 CORE-N1/EVID-N1 首个切片，但 CORE-N1、CORE-N2 和 EVID-N1 的跨 Provider 推广仍是明确后续项。因此可以关闭首轮静态差分、P0/P1 离线实施及 Antigravity/Claude 后续切片，不能把完整真实验收队列或整体架构计划标记为完成。
+当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。Antigravity、Claude、Codex 已完成各自 CORE-N1/EVID-N1 首个切片，但 CORE-N1、CORE-N2 和 EVID-N1 的跨 Provider 推广仍是明确后续项。因此可以关闭首轮静态差分、P0/P1 离线实施及前三类 Provider 后续切片，不能把完整真实验收队列或整体架构计划标记为完成。

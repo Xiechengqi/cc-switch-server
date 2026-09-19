@@ -1,12 +1,20 @@
 {
   "format": "cc-switch-codex-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
     "recoveryBoundary": "same-account, pre-commit, shared total attempt budget",
     "liveEvidence": "local fixtures do not imply live ChatGPT entitlement or production WebSocket performance"
+  },
+  "observationPolicy": {
+    "history": "append_only; legacy schema v1 policy, sources, capabilities, incrementalEnhancements, realAcceptance, and wireGoldens are immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "externalVerification": "optional explicit audit only; never a build, test, release, or runtime dependency"
   },
   "sources": [
     {
@@ -541,6 +549,541 @@
       }
     ]
   },
+  "sourceExtensions": [],
+  "sourceSnapshots": [
+    {
+      "id": "cliproxyapi-2026-09-19",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "b773607e3e7756dc6020a291825e4eb08899595a",
+      "headTree": "a740e14d0b3efea8877f901301d0f9926c39258b",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "codex2api-2026-09-19",
+      "sourceId": "codex2api",
+      "repository": "codex2api",
+      "headCommit": "de41a5e3dfe9ff51524af864532c42e37955346f",
+      "headTree": "b767333ad809ee7bbe92c938be5bcce3ec0519c5",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "observations": [
+    {
+      "id": "CX-OBS-0001",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "unicode_schema_and_const_union",
+        "objects": [
+          {
+            "commit": "e56abd56f1424b9b25b4609839833724100f3ef5",
+            "tree": "130f2266fdf1195d9263c69fc8fc11319b46bd70",
+            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
+            "symbols": ["NormalizeCodexToolSchemas", "stripIncompatiblePatterns"]
+          },
+          {
+            "commit": "37ce368c5002bc4a83cd622ec01602b0b7984672",
+            "tree": "92c0a7010319e15bd66ceded336f71a98de7c2f5",
+            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
+            "symbols": ["patternProperties", "isPureConstBranch"]
+          }
+        ],
+        "sourceDigest": "3572955a138656b133d4ed45efd69a84c0195aaaecbd0f76590490bd0ee28e66"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-01", "CX-02"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/tool_schema.rs",
+            "anchors": ["has_incompatible_codex_unicode_escape", "codex_schema_sanitizer_fails_closed_at_each_budget", "simplify_codex_const_union", "codex_leaves_uncertain_const_unions_unchanged"]
+          }
+        ],
+        "fixtureIds": ["codex_schema_sanitizer_fails_closed_at_each_budget", "codex_leaves_uncertain_const_unions_unchanged"]
+      },
+      "reason": "Adopt bounded Unicode-pattern removal and only equivalence-preserving pure const-union simplification; uncertain unions remain unchanged."
+    },
+    {
+      "id": "CX-OBS-0002",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "gpt_image_25",
+        "objects": [
+          {
+            "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
+            "tree": "ac9c3fe8abcdf98513d7b08f0ca2535ff5c99323",
+            "paths": ["internal/runtime/executor/codex_openai_images.go", "internal/runtime/executor/codex_openai_images_test.go"],
+            "symbols": ["codexGPTImage25Model", "TestCodexExecutorDirectOpenAIImage25Models"]
+          }
+        ],
+        "sourceDigest": "c88f711be47e7eb9d31cf22d835cee3d1c66927d0b126bea00754ff02e250788"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["CX-03"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["CODEX_IMAGES_LIVE_PENDING_25_MODELS", "codex_image_25_variants_remain_independently_live_evidence_gated"]
+          }
+        ],
+        "fixtureIds": ["codex_image_25_variants_remain_independently_live_evidence_gated"]
+      },
+      "reason": "Keep each GPT Image 2.5 variant unpublished and fail closed until its own generation, edit, Responses, usage, error and quota receipt exists."
+    },
+    {
+      "id": "CX-OBS-0003",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "responses_error_sequence_and_bootstrap",
+        "objects": [
+          {
+            "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
+            "tree": "da486dd2b21a345cb2bb59cc0f4c48ac8e41ff24",
+            "paths": ["sdk/api/handlers/openai_responses_stream_error.go", "sdk/api/handlers/openai_responses_stream_error_test.go"],
+            "symbols": ["BuildOpenAIResponsesStreamErrorChunk", "BuildOpenAIResponsesStreamFailedChunk"]
+          },
+          {
+            "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
+            "tree": "98821a0f228dbb87c11e9e43fa917f13dacbcdc0",
+            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
+            "symbols": ["newCodexBootstrapOverloadErr", "isCodexOverloadBootstrapFailure"]
+          }
+        ],
+        "sourceDigest": "d75062f3f09960241cdb9ec5312f21ebd03f386d2567aae4d577dbd45f0380d9"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-04"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/openai_capacity_shed.rs",
+            "anchors": ["codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence", "codex_bootstrap_overload_golden_is_precommit_capacity_failure"]
+          }
+        ],
+        "fixtureIds": ["codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence", "codex_bootstrap_overload_golden_is_precommit_capacity_failure"]
+      },
+      "reason": "Preserve nested error details and sequence numbers across HTTP, SSE and WS while treating only proven bootstrap capacity failures as pre-commit recovery candidates."
+    },
+    {
+      "id": "CX-OBS-0004",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "websocket_prewarm_and_named_output",
+        "objects": [
+          {
+            "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
+            "tree": "2f9d378751cf56c35b0ae008556b77653d0e78e6",
+            "paths": ["sdk/api/handlers/openai/openai_responses_websocket_prewarm.go", "sdk/api/handlers/openai/openai_responses_websocket_test.go"],
+            "symbols": ["shouldHandleResponsesWebsocketPrewarmLocally", "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"]
+          }
+        ],
+        "sourceDigest": "33775a99ec28a53305805aabdd8f2e4a7ad12f4d416879fd3e19fcd8999b17b0"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["CX-05"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"]
+          },
+          {
+            "path": "docs/provider/codex-oauth.md",
+            "anchors": ["WS prewarm evidence gate"]
+          }
+        ],
+        "fixtureIds": ["codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"]
+      },
+      "reason": "Do not synthesize a prewarm lifecycle until the upstream accepts it and a fixed-binding benchmark proves stable TTFB benefit; existing fallback remains strictly pre-response.create."
+    },
+    {
+      "id": "CX-OBS-0005",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-19",
+        "repository": "codex2api",
+        "deltaId": "gpt_image_25_cross_check",
+        "objects": [
+          {
+            "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
+            "tree": "697a3f37bd7d452ef9f0c1eae6a4cb4b547688ae",
+            "paths": ["proxy/images.go", "proxy/images25_test.go"],
+            "symbols": ["isGPTImage2FamilyModel", "TestGPTImage25ImagesIngressToUpstream"]
+          }
+        ],
+        "sourceDigest": "7c3fa8c440ace2b0a9b75302417eff6cdb562aba90602509709852e8203d6816"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["CX-06"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["CODEX_IMAGES_LIVE_PENDING_25_MODELS", "codex_image_25_variants_remain_independently_live_evidence_gated"]
+          },
+          {
+            "path": "docs/provider/codex-oauth.md",
+            "anchors": ["GPT Image 2.5 quota/cache evidence gate"]
+          }
+        ],
+        "fixtureIds": ["codex_image_25_variants_remain_independently_live_evidence_gated"]
+      },
+      "reason": "Keep 2.5-specific quota and cache behavior disabled until each exact model receipt proves cooldown scope, capability persistence and multi-replica behavior."
+    },
+    {
+      "id": "CX-OBS-0006",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "empty_bootstrap_announcements",
+        "objects": [
+          {
+            "commit": "cb73cd9936116848274afad42a41a4079325d383",
+            "tree": "8aa29a2cadc889fe35264f55a8484997c85f4bf3",
+            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
+            "symbols": ["isCodexBootstrapBufferableEvent", "isCodexEmptyPart"]
+          }
+        ],
+        "sourceDigest": "d4d2cb715eec7c9ba9cdf4bd400ba99eb1bf43e58e1f968bdadc8f3aca6ecd33"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N1"],
+      "target": {
+        "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "implementationCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "implementationTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "contracts": [
+          {
+            "path": "src/proxy/response_semantics.rs",
+            "anchors": ["is_empty_startup_announcement", "codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier", "codex_visible_or_unknown_startup_announcements_commit_fail_closed"]
+          }
+        ],
+        "fixtureIds": ["codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier", "codex_visible_or_unknown_startup_announcements_commit_fail_closed"]
+      },
+      "reason": "Classify only a closed set of semantically empty startup announcements as lifecycle; visible or unknown payloads commit fail closed."
+    },
+    {
+      "id": "CX-OBS-0007",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-19",
+        "repository": "codex2api",
+        "deltaId": "input_item_internal_metadata_scope",
+        "objects": [
+          {
+            "commit": "dc47d1310006058d27c01320c76b3c2eb757a7f2",
+            "tree": "5c80406357552f40ae71edebfa73c02bf3686590",
+            "paths": ["proxy/translator.go", "proxy/translator_test.go"],
+            "symbols": ["responsesInputInternalMetadataField", "stripResponsesInputInternalMetadata"]
+          }
+        ],
+        "sourceDigest": "3c5fc599c6e24460f7279f8a0902cbdda8fa0ba2d3c217e81ba5a67d3888db10"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N2"],
+      "target": {
+        "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "implementationCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "implementationTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["sanitize_codex_oauth_request_body", "codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"]
+          }
+        ],
+        "fixtureIds": ["codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"]
+      },
+      "reason": "Strip only the input-item top-level internal metadata field; nested content, arguments, unrelated extensions and item ordering remain byte-semantic."
+    },
+    {
+      "id": "CX-OBS-0008",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "websocket_fragmented_write_fairness",
+        "objects": [
+          {
+            "commit": "b5ba02c2e3627e975538e217575abee9f73eccd8",
+            "tree": "e7718c0b0c4223442994871df0879a130a7325f6",
+            "paths": ["internal/runtime/executor/codex_websockets_session.go", "internal/runtime/executor/codex_websockets_executor_test.go"],
+            "symbols": ["writeMessage", "TestCodexWebsockets_ChunkedWriteAllowsPongInterleaving"]
+          }
+        ],
+        "sourceDigest": "b9ef52be9a25f9f7fbbf7e73b998a2762844cfee722450e437d7e7ffee05f537"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N3"],
+      "target": {
+        "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "implementationCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "implementationTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["write_responses_websocket_message", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+          }
+        ],
+        "fixtureIds": ["codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+      },
+      "reason": "Use one bounded writer owner and continuation frames while preserving the existing pool and fixed-identity replay boundary; control traffic and cancellation remain responsive."
+    },
+    {
+      "id": "CX-OBS-0009",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-19",
+        "repository": "codex2api",
+        "deltaId": "request_lifecycle_memory_budget",
+        "objects": [
+          {
+            "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
+            "tree": "0048e1ab6395c61eb9a915a9cdc9732e803775df",
+            "paths": ["security/request_memory.go", "security/request_memory_test.go", "proxy/responses_ws_memory_test.go"],
+            "symbols": ["TryAcquireRequestMemory", "RequestMemoryReservation", "ReadRequestMemory"]
+          }
+        ],
+        "sourceDigest": "a24363de04414b3bcb2f2c8596dd90caf4a0b9db924594c57e11d55c789ba9cd"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N4", "CORE-N2"],
+      "target": {
+        "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "implementationCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "implementationTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "contracts": [
+          {
+            "path": "src/proxy/request_memory.rs",
+            "anchors": ["RequestMemoryBudget", "exhaustion_is_sticky_but_release_always_returns_capacity", "retained_bytes_release_only_after_the_last_view_is_dropped"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["cc_switch_request_memory_exhausted"]
+          }
+        ],
+        "fixtureIds": ["exhaustion_is_sticky_but_release_always_returns_capacity", "retained_bytes_release_only_after_the_last_view_is_dropped"]
+      },
+      "reason": "Adopt a request-scoped sticky resident-memory budget across Codex HTTP and WS; exhaustion cancels the active upstream and denies every replay or fallback lane."
+    },
+    {
+      "id": "CX-OBS-0010",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "responses_error_sequence_and_bootstrap",
+        "objects": [
+          {
+            "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
+            "tree": "da486dd2b21a345cb2bb59cc0f4c48ac8e41ff24",
+            "paths": ["sdk/api/handlers/openai_responses_stream_error.go", "sdk/api/handlers/openai_responses_stream_error_test.go"],
+            "symbols": ["BuildOpenAIResponsesStreamErrorChunk", "BuildOpenAIResponsesStreamFailedChunk"]
+          },
+          {
+            "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
+            "tree": "98821a0f228dbb87c11e9e43fa917f13dacbcdc0",
+            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
+            "symbols": ["newCodexBootstrapOverloadErr", "isCodexOverloadBootstrapFailure"]
+          }
+        ],
+        "sourceDigest": "d75062f3f09960241cdb9ec5312f21ebd03f386d2567aae4d577dbd45f0380d9"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CORE-N1"],
+      "target": {
+        "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
+        "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
+        "implementationCommit": "069f3eff0bb91f9a0cbdfacae46710d1f87b9177",
+        "implementationTree": "2e7fcbc05420c7cfa5c406b71dc4f750ba11cb09",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/codex/mod.rs",
+            "anchors": ["handle_rate_limit", "semantic_rate_limit_error", "capacity_retry_allowed", "rate_limit_until"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["codex_unknown_429_cools_only_the_share_model", "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"]
+          }
+        ],
+        "fixtureIds": ["codex_unknown_429_cools_only_the_share_model", "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"]
+      },
+      "reason": "Move Codex rate-limit scope, reset parsing and capacity retry decisions behind one Provider boundary without changing wire, fixed binding or total attempt budget."
+    },
+    {
+      "id": "CX-OBS-0011",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "gpt_image_25",
+        "objects": [
+          {
+            "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
+            "tree": "ac9c3fe8abcdf98513d7b08f0ca2535ff5c99323",
+            "paths": ["internal/runtime/executor/codex_openai_images.go", "internal/runtime/executor/codex_openai_images_test.go"],
+            "symbols": ["codexGPTImage25Model", "TestCodexExecutorDirectOpenAIImage25Models"]
+          }
+        ],
+        "sourceDigest": "c88f711be47e7eb9d31cf22d835cee3d1c66927d0b126bea00754ff02e250788"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["LIVE-N1"],
+      "target": {
+        "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
+        "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
+        "implementationCommit": "069f3eff0bb91f9a0cbdfacae46710d1f87b9177",
+        "implementationTree": "2e7fcbc05420c7cfa5c406b71dc4f750ba11cb09",
+        "contracts": [
+          {
+            "path": "scripts/smoke/codex-real-receipt.mjs",
+            "anchors": ["operationSpecs", "gpt_image_2_5_sunburst", "contract_verified", "live_pending"]
+          },
+          {
+            "path": "scripts/audit/codex-real-receipt.test.mjs",
+            "anchors": ["accepts only a complete fixture receipt as live_pending", "control-plane failures never print tokens, prompts, or raw bodies"]
+          }
+        ],
+        "fixtureIds": ["accepts only a complete fixture receipt as live_pending", "control-plane failures never print tokens, prompts, or raw bodies"]
+      },
+      "reason": "Add three exact-model private Image receipt gates; fixture mode and the billable probe remain live_pending and cannot publish a variant."
+    },
+    {
+      "id": "CX-OBS-0012",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "websocket_prewarm_and_named_output",
+        "objects": [
+          {
+            "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
+            "tree": "2f9d378751cf56c35b0ae008556b77653d0e78e6",
+            "paths": ["sdk/api/handlers/openai/openai_responses_websocket_prewarm.go", "sdk/api/handlers/openai/openai_responses_websocket_test.go"],
+            "symbols": ["shouldHandleResponsesWebsocketPrewarmLocally", "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"]
+          }
+        ],
+        "sourceDigest": "33775a99ec28a53305805aabdd8f2e4a7ad12f4d416879fd3e19fcd8999b17b0"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["LIVE-N1"],
+      "target": {
+        "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
+        "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
+        "implementationCommit": "069f3eff0bb91f9a0cbdfacae46710d1f87b9177",
+        "implementationTree": "2e7fcbc05420c7cfa5c406b71dc4f750ba11cb09",
+        "contracts": [
+          {
+            "path": "scripts/smoke/codex-real-receipt.mjs",
+            "anchors": ["ws_prewarm", "benchmarkSamples", "pre_response_create_only", "live_pending"]
+          },
+          {
+            "path": "scripts/audit/codex-real-receipt.test.mjs",
+            "anchors": ["WS benchmark measurements require benefit, samples, and reuse"]
+          }
+        ],
+        "fixtureIds": ["WS benchmark measurements require benefit, samples, and reuse"]
+      },
+      "reason": "Add an independent WS prewarm receipt gate that requires upstream acceptance, measured TTFB benefit, connection reuse and strict pre-commit fallback."
+    },
+    {
+      "id": "CX-OBS-0013",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-19",
+        "repository": "codex2api",
+        "deltaId": "gpt_image_25_cross_check",
+        "objects": [
+          {
+            "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
+            "tree": "697a3f37bd7d452ef9f0c1eae6a4cb4b547688ae",
+            "paths": ["proxy/images.go", "proxy/images25_test.go"],
+            "symbols": ["nextImagesMainModelAfterUnsupported", "TestGPTImage25OfficialPricingIgnoresBatch"]
+          }
+        ],
+        "sourceDigest": "7c3fa8c440ace2b0a9b75302417eff6cdb562aba90602509709852e8203d6816"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["CX-R1"],
+      "target": {
+        "baselineCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "baselineTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["禁止账号池选号"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject commercial pricing, automatic driver-model fallback, account-pool selection and cross-account recovery; Server keeps explicit Provider/Account identity and exact-model gates."
+    }
+  ],
   "wireGoldens": {
     "capacityFailure": {
       "input": {

@@ -21,16 +21,60 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, canonical(nested)]),
+    );
+  }
+  return value;
+}
+
+function objectDigest(value) {
+  return sha256(JSON.stringify(canonical(value)));
+}
+
+const commitPattern = /^[a-f0-9]{40}$/;
+const digestPattern = /^[a-f0-9]{64}$/;
+
+function assertSafePath(value, label) {
+  assert(
+    typeof value === "string" &&
+      value.length > 0 &&
+      !path.isAbsolute(value) &&
+      !value.split("/").includes(".."),
+    `${label} has an unsafe path`,
+  );
+}
+
+function gitTree(repository, commit) {
+  return execFileSync("git", ["-C", repository, "rev-parse", `${commit}^{tree}`], {
+    encoding: "utf8",
+  }).trim();
+}
+
+function gitFile(repository, commit, filePath, encoding = "utf8") {
+  return execFileSync("git", ["-C", repository, "show", `${commit}:${filePath}`], {
+    encoding,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
 const baseline = JSON.parse(fs.readFileSync(baselinePath, "utf8"));
 assert(
   baseline.format === "cc-switch-codex-reference-delta" &&
-    baseline.schemaVersion === 1,
+    baseline.schemaVersion === 2 &&
+    baseline.legacySchemaVersion === 1,
   "Codex reference delta baseline format changed",
 );
 assert(
-  baseline.policy?.externalSources ===
-    "read_only_optional_audit_input_never_runtime_dependency",
-  "Codex external-source boundary changed",
+  Number.isFinite(Date.parse(baseline.capturedAt)) &&
+    Number.isFinite(Date.parse(baseline.updatedAt)) &&
+    Date.parse(baseline.updatedAt) >= Date.parse(baseline.capturedAt),
+  "Codex evidence timestamps are invalid",
 );
 for (const invariant of [
   "no pool",
@@ -45,60 +89,352 @@ for (const invariant of [
   );
 }
 assert(
-  baseline.policy?.recoveryBoundary ===
-    "same-account, pre-commit, shared total attempt budget",
-  "Codex recovery boundary changed",
+  baseline.policy?.externalSources ===
+    "read_only_optional_audit_input_never_runtime_dependency" &&
+    baseline.policy?.recoveryBoundary ===
+      "same-account, pre-commit, shared total attempt budget" &&
+    baseline.policy?.liveEvidence?.includes("do not imply live ChatGPT entitlement"),
+  "Codex recovery, live-evidence, or external-source boundary changed",
+);
+assert(
+  baseline.observationPolicy?.history?.includes("append_only") &&
+    baseline.observationPolicy?.sourceReadMode === "read_only_committed_git_objects" &&
+    baseline.observationPolicy?.targetReadMode === "committed_git_objects" &&
+    baseline.observationPolicy?.externalVerification?.includes(
+      "never a build, test, release, or runtime dependency",
+    ),
+  "Codex observation policy changed",
 );
 
+const immutableLegacyDigests = new Map([
+  ["policy", "f23c3eab5ceb9ca04506af5b627f0646416e97e16f7ed6834af0a2ea8abf44fd"],
+  ["sources", "41fb047a548c3f7ba4248c2bc2c6086e3d9d7dbc58f4df22f729e0cb8ef23967"],
+  ["capabilities", "713ca68594d9f0a23802efc23d4a1a8c28879ddabfb8021558cc54fbd2c36ab1"],
+  [
+    "incrementalEnhancements",
+    "cae24b61ceec0cd3b180ff224f17cb3c5e297e8560246797c2b841e217cf05d3",
+  ],
+  ["realAcceptance", "078a65ba2c43d8d3decc9f306d2154727c095a2471d99a37e0d5e5b9a9347026"],
+  ["wireGoldens", "6783f006cd5b98eca793f47639fbd9cce0cad9e8e68115758ba6c0fa88f25beb"],
+]);
+for (const [field, digest] of immutableLegacyDigests) {
+  assert(objectDigest(baseline[field]) === digest, `Codex legacy ${field} history changed`);
+}
+
+const sourceById = new Map();
+const sourceRootById = new Map();
+const sourceDeltaIds = new Set();
+const sourceDeltaByKey = new Map();
+
+function registerDelta(sourceId, delta) {
+  assert(delta.id && !sourceDeltaIds.has(delta.id), `duplicate Codex delta ${delta.id}`);
+  assert(
+    Array.isArray(delta.commits) &&
+      delta.commits.length > 0 &&
+      new Set(delta.commits).size === delta.commits.length &&
+      delta.commits.every((commit) => commitPattern.test(commit)),
+    `${delta.id} has invalid commits`,
+  );
+  assert(
+    Array.isArray(delta.files) && delta.files.length >= 2,
+    `${delta.id} must pin implementation and fixture evidence`,
+  );
+  sourceDeltaIds.add(delta.id);
+  sourceDeltaByKey.set(`${sourceId}/${delta.id}`, delta);
+  for (const file of delta.files) {
+    assert(
+      delta.commits.includes(file.commit),
+      `${delta.id}:${file.path} uses an undeclared commit`,
+    );
+    assertSafePath(file.path, `${delta.id}:${file.path ?? "<missing>"}`);
+    assert(
+      digestPattern.test(file.sha256),
+      `${delta.id}:${file.path} has an invalid SHA-256`,
+    );
+    if (checkSources) {
+      const content = gitFile(sourceRootById.get(sourceId), file.commit, file.path, null);
+      assert(
+        sha256(content) === file.sha256,
+        `${sourceId}:${delta.id}:${file.path} drifted from the reviewed object`,
+      );
+    }
+  }
+}
+
 for (const source of baseline.sources ?? []) {
-  assert(source.id && source.rootEnv, "Codex audit source metadata is incomplete");
+  assert(
+    source.id && source.rootEnv && source.defaultRelativeRoot,
+    "Codex audit source metadata is incomplete",
+  );
+  assert(!sourceById.has(source.id), `duplicate Codex source ${source.id}`);
   const sourceRoot = path.resolve(
     repoRoot,
     process.env[source.rootEnv] || source.defaultRelativeRoot,
   );
-  for (const delta of source.deltas ?? []) {
-    assert(delta.id, "Codex source delta is missing an id");
+  if (checkSources) {
+    assert(fs.existsSync(sourceRoot), `${source.id} source root is unavailable`);
+  }
+  sourceById.set(source.id, source);
+  sourceRootById.set(source.id, sourceRoot);
+  for (const delta of source.deltas ?? []) registerDelta(source.id, delta);
+}
+
+for (const extension of baseline.sourceExtensions ?? []) {
+  assert(sourceById.has(extension.sourceId), "Codex source extension has no legacy source");
+  assert(
+    Array.isArray(extension.deltas) && extension.deltas.length > 0,
+    `${extension.sourceId} source extension has no deltas`,
+  );
+  for (const delta of extension.deltas) registerDelta(extension.sourceId, delta);
+}
+
+const immutableSourceSnapshotDigests = new Map([
+  ["cliproxyapi-2026-09-19", "7482b03b5422de54996015f0ba9073435e9568bedb801faeabac0bd5fce42b2d"],
+  ["codex2api-2026-09-19", "392793aa5484f5995e76d864053967e7a48a0993bcc0687951278e2a20c7ec42"],
+]);
+const sourceSnapshotById = new Map();
+for (const snapshot of baseline.sourceSnapshots ?? []) {
+  assert(snapshot.id && !sourceSnapshotById.has(snapshot.id), "duplicate Codex source snapshot");
+  assert(sourceById.has(snapshot.sourceId), `${snapshot.id} references an unknown source`);
+  assert(snapshot.repository, `${snapshot.id} has no repository name`);
+  assert(
+    commitPattern.test(snapshot.headCommit) && commitPattern.test(snapshot.headTree),
+    `${snapshot.id} has an invalid HEAD commit or tree`,
+  );
+  assert(
+    snapshot.readMode === "read_only_committed_git_objects" &&
+      snapshot.worktreeClean === true &&
+      snapshot.worktreeChangesExcluded === false,
+    `${snapshot.id} does not declare a clean read-only source snapshot`,
+  );
+  assert(
+    immutableSourceSnapshotDigests.get(snapshot.id) === objectDigest(snapshot),
+    `${snapshot.id} changed after it was recorded`,
+  );
+  if (checkSources) {
     assert(
-      Array.isArray(delta.commits) &&
-        delta.commits.length > 0 &&
-        delta.commits.every((commit) => /^[a-f0-9]{40}$/.test(commit)),
-      `${delta.id} has invalid commits`,
+      gitTree(sourceRootById.get(snapshot.sourceId), snapshot.headCommit) ===
+        snapshot.headTree,
+      `${snapshot.id} HEAD tree drifted`,
+    );
+  }
+  sourceSnapshotById.set(snapshot.id, snapshot);
+}
+assert(
+  sourceSnapshotById.size === immutableSourceSnapshotDigests.size,
+  "Codex source snapshot history is incomplete",
+);
+
+const immutableObservationDigests = new Map([
+  ["CX-OBS-0001", "32e6512ff62c59c6ea12063aa60265f3c07ea1f0984a4f1a5245ac9f34106de3"],
+  ["CX-OBS-0002", "46c19e4bcbae733e2e4b5d3802b298106370048bf325e723abd654449541570f"],
+  ["CX-OBS-0003", "3584318a5e6a311ec80eaf41825642a41a786a452ffe458d8c64c498870b9e02"],
+  ["CX-OBS-0004", "fcc9fd8db6baad908a3950e29ab0d7134331ddb40453d7ff6b19b3d391ac17d8"],
+  ["CX-OBS-0005", "a128edc58e0c89e8edcbcbc274e3d9c5de0a4fdef1eba4042c8c76679d826a07"],
+  ["CX-OBS-0006", "ac4e101b28f3e269690caa7d8899f6ea09af7d0936e1caeafcfd729f2b27e1b7"],
+  ["CX-OBS-0007", "2dcf10b7feda01a0477cb88fe3d6b738d41c2fafaba197bc1af93e78188db713"],
+  ["CX-OBS-0008", "4f8d72813da963475133c5c391bb1735136945925b0801b44a059bfb044d7dee"],
+  ["CX-OBS-0009", "839276010a09a0d6cfda7a696e9269b0eafca49fdcd48373e8e3cc510c29dcf8"],
+  ["CX-OBS-0010", "e9aa9b35d0efb21dd9798e30260f7f7487c56b3f5b24e607ac5f427758b997d1"],
+  ["CX-OBS-0011", "df783db25d767ed6cfb55138cdf227ada51b2fe8abc19e58ac46e0c80f8a85a9"],
+  ["CX-OBS-0012", "10ae993de5900ca4c407c529a8d4fa52b87371f7b5dd81ad280d4c8ccf801a68"],
+  ["CX-OBS-0013", "d83df5c1012b6538f174303dede9dfee026b9d530e8d3eee7c4c5d35c0c9ffc4"],
+]);
+const expectedEnhancementIds = new Set([
+  "CX-01",
+  "CX-02",
+  "CX-03",
+  "CX-04",
+  "CX-05",
+  "CX-06",
+  "CX-N1",
+  "CX-N2",
+  "CX-N3",
+  "CX-N4",
+  "CX-R1",
+  "CORE-N1",
+  "CORE-N2",
+  "LIVE-N1",
+]);
+const observedEnhancementIds = new Set();
+const observedDeltaKeys = new Set();
+const observationIds = new Set();
+for (const observation of baseline.observations ?? []) {
+  assert(observation.id && !observationIds.has(observation.id), "duplicate Codex observation");
+  observationIds.add(observation.id);
+  assert(observation.providerFamily === "codex", `${observation.id} changed provider family`);
+  assert(Number.isFinite(Date.parse(observation.observedAt)), `${observation.id} has invalid observedAt`);
+  assert(
+    ["adopt", "differential", "live_gate", "reject"].includes(observation.disposition),
+    `${observation.id} has an invalid disposition`,
+  );
+  assert(
+    typeof observation.reason === "string" && observation.reason.trim().length > 0,
+    `${observation.id} has no disposition reason`,
+  );
+  assert(
+    Array.isArray(observation.enhancementIds) &&
+      observation.enhancementIds.length > 0 &&
+      observation.enhancementIds.every((id) => expectedEnhancementIds.has(id)),
+    `${observation.id} has an invalid enhancement mapping`,
+  );
+  for (const id of observation.enhancementIds) observedEnhancementIds.add(id);
+
+  const reference = observation.reference ?? {};
+  const snapshot = sourceSnapshotById.get(reference.snapshotId);
+  const deltaKey = `${reference.sourceId}/${reference.deltaId}`;
+  const delta = sourceDeltaByKey.get(deltaKey);
+  assert(
+    snapshot && snapshot.sourceId === reference.sourceId,
+    `${observation.id} has an invalid source snapshot`,
+  );
+  assert(snapshot.repository === reference.repository, `${observation.id} changed repository identity`);
+  assert(delta, `${observation.id} references an unknown frozen source delta`);
+  assert(
+    Array.isArray(reference.objects) && reference.objects.length > 0,
+    `${observation.id} has no committed source objects`,
+  );
+  const objectCommits = new Set();
+  for (const object of reference.objects) {
+    assert(
+      commitPattern.test(object.commit) && commitPattern.test(object.tree),
+      `${observation.id} has an invalid reference commit or tree`,
+    );
+    assert(!objectCommits.has(object.commit), `${observation.id} repeats a source commit`);
+    objectCommits.add(object.commit);
+    assert(
+      Array.isArray(object.paths) && object.paths.length > 0,
+      `${observation.id}:${object.commit} has no source paths`,
+    );
+    for (const sourcePath of object.paths) {
+      assertSafePath(sourcePath, `${observation.id}:${sourcePath ?? "<missing>"}`);
+    }
+    assert(
+      Array.isArray(object.symbols) &&
+        object.symbols.length > 0 &&
+        object.symbols.every((symbol) => typeof symbol === "string" && symbol.trim()),
+      `${observation.id}:${object.commit} has no source symbols`,
+    );
+  }
+  assert(
+    JSON.stringify([...objectCommits].sort()) === JSON.stringify([...delta.commits].sort()),
+    `${observation.id} source commits do not match the frozen delta`,
+  );
+  for (const file of delta.files) {
+    assert(
+      reference.objects.some(
+        (object) => object.commit === file.commit && object.paths.includes(file.path),
+      ),
+      `${observation.id} omitted frozen source path ${file.commit}:${file.path}`,
+    );
+  }
+  const expectedSourceDigest = sha256(
+    JSON.stringify({
+      sourceId: reference.sourceId,
+      deltaId: reference.deltaId,
+      commits: delta.commits,
+      files: delta.files,
+    }),
+  );
+  assert(
+    digestPattern.test(reference.sourceDigest) &&
+      reference.sourceDigest === expectedSourceDigest,
+    `${observation.id} source digest drifted`,
+  );
+  observedDeltaKeys.add(deltaKey);
+
+  const target = observation.target ?? {};
+  assert(
+    commitPattern.test(target.baselineCommit) && commitPattern.test(target.baselineTree),
+    `${observation.id} has an invalid target baseline commit or tree`,
+  );
+  assert(
+    gitTree(repoRoot, target.baselineCommit) === target.baselineTree,
+    `${observation.id} target baseline tree drifted`,
+  );
+  const rejected = observation.disposition === "reject";
+  if (rejected) {
+    assert(
+      target.implementationCommit === null && target.implementationTree === null,
+      `${observation.id} rejected behavior must not claim an implementation`,
     );
     assert(
-      Array.isArray(delta.files) && delta.files.length >= 2,
-      `${delta.id} must pin implementation and fixture evidence`,
+      Array.isArray(target.fixtureIds) && target.fixtureIds.length === 0,
+      `${observation.id} rejected behavior must not claim fixtures`,
     );
-    for (const file of delta.files) {
+  } else {
+    assert(
+      commitPattern.test(target.implementationCommit) &&
+        commitPattern.test(target.implementationTree),
+      `${observation.id} has an invalid target implementation commit or tree`,
+    );
+    assert(
+      target.baselineCommit !== target.implementationCommit &&
+        gitTree(repoRoot, target.implementationCommit) === target.implementationTree,
+      `${observation.id} target implementation tree drifted`,
+    );
+    assert(
+      Array.isArray(target.fixtureIds) && target.fixtureIds.length > 0,
+      `${observation.id} has no implementation fixtures`,
+    );
+  }
+  const contractCommit = rejected ? target.baselineCommit : target.implementationCommit;
+  const targetSources = [];
+  for (const contract of target.contracts ?? []) {
+    assertSafePath(contract.path, `${observation.id}:${contract.path ?? "<missing>"}`);
+    const source = gitFile(repoRoot, contractCommit, contract.path);
+    targetSources.push(source);
+    assert(
+      Array.isArray(contract.anchors) &&
+        contract.anchors.length > 0 &&
+        contract.anchors.every((anchor) => source.includes(anchor)),
+      `${observation.id} has an unavailable committed target anchor`,
+    );
+  }
+  assert(targetSources.length > 0, `${observation.id} has no target contracts`);
+  if (!rejected) {
+    assert(
+      target.fixtureIds.every((fixture) =>
+        targetSources.some((source) => source.includes(fixture)),
+      ),
+      `${observation.id} has an unmapped fixture`,
+    );
+  }
+  assert(
+    immutableObservationDigests.get(observation.id) === objectDigest(observation),
+    `${observation.id} changed after it was recorded`,
+  );
+
+  if (checkSources) {
+    const sourceRoot = sourceRootById.get(reference.sourceId);
+    for (const object of reference.objects) {
       assert(
-        delta.commits.includes(file.commit),
-        `${delta.id}:${file.path} uses an undeclared commit`,
+        gitTree(sourceRoot, object.commit) === object.tree,
+        `${observation.id}:${object.commit} source tree drifted`,
       );
+      const sourceText = object.paths
+        .map((sourcePath) => gitFile(sourceRoot, object.commit, sourcePath))
+        .join("\n");
       assert(
-        typeof file.path === "string" &&
-          file.path.length > 0 &&
-          !path.isAbsolute(file.path) &&
-          !file.path.split("/").includes(".."),
-        `${delta.id} has an unsafe evidence path`,
+        object.symbols.every((symbol) => sourceText.includes(symbol)),
+        `${observation.id}:${object.commit} source symbol drifted`,
       );
-      assert(
-        /^[a-f0-9]{64}$/.test(file.sha256),
-        `${delta.id}:${file.path} has an invalid SHA-256`,
-      );
-      if (checkSources) {
-        assert(fs.existsSync(sourceRoot), `${source.id} source root is unavailable`);
-        const content = execFileSync(
-          "git",
-          ["-C", sourceRoot, "show", `${file.commit}:${file.path}`],
-          { encoding: null, maxBuffer: 64 * 1024 * 1024 },
-        );
-        assert(
-          sha256(content) === file.sha256,
-          `${source.id}:${delta.id}:${file.path} drifted from the reviewed object`,
-        );
-      }
     }
   }
 }
+assert(
+  observationIds.size === immutableObservationDigests.size,
+  "Codex observation history is incomplete",
+);
+assert(
+  JSON.stringify([...observedEnhancementIds].sort()) ===
+    JSON.stringify([...expectedEnhancementIds].sort()),
+  "Codex enhancement observation coverage is incomplete",
+);
+assert(
+  [...sourceDeltaByKey.keys()].every((key) => observedDeltaKeys.has(key)),
+  "Codex frozen source deltas are not fully mapped to observations",
+);
 
 const capabilities = new Map(
   (baseline.capabilities ?? []).map((capability) => [capability.id, capability]),
@@ -130,11 +466,6 @@ for (const id of ["CX-03", "CX-05", "CX-06"]) {
   assert(capability.runtimeEnabled === false, `${id} cannot be enabled without evidence`);
 }
 
-const sourceDeltaIds = new Set(
-  (baseline.sources ?? []).flatMap((source) =>
-    (source.deltas ?? []).map((delta) => delta.id),
-  ),
-);
 const incrementalEnhancements = new Map(
   (baseline.incrementalEnhancements ?? []).map((enhancement) => [
     enhancement.id,
@@ -402,7 +733,7 @@ assert(
 );
 
 console.log(
-  `codex reference delta audit ok (${capabilities.size} baseline capabilities, ${incrementalEnhancements.size} incremental enhancements${
+  `codex reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${acceptanceOperations.size} live-pending operations${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

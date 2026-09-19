@@ -41,6 +41,10 @@ CX-N4 为每个 Codex HTTP 请求或 Responses WebSocket turn 建立独立 stick
 
 上述四项均为本仓库 `fixture_verified`。26 个 Codex WebSocket 回归覆盖 ping、公平写入、取消、handshake fallback、stale socket 与零 post-commit replay；压缩膨胀、raw+decoded+normalized 合计、稳定错误和 `Bytes` 生命周期另有专项测试。它们不构成真实 ChatGPT entitlement、生产网络性能或任何仍为 CX-03/CX-05/CX-06 `live_pending` 能力的 receipt。
 
+`069f3ef` 将 Codex 429 scope、reset 解析和 capacity retry/error 决策收敛到 `src/proxy/providers/codex/`，`forwarder.rs` 继续持有 dispatch、共享总 attempt budget、CommitGuard、terminal 和 usage 编排。该结构切片不改变 wire，也不改变固定 Provider/Account、同账号 pre-commit 恢复和零 post-commit replay 边界。私有 receipt harness 将真实验收拆成 `gpt_image_2_5`、`gpt_image_2_5_flare`、`gpt_image_2_5_sunburst`、`ws_prewarm` 四个互不外推的 operation；前三项分别要求 exact-model generation/edit/Responses、usage/error/cooldown、capability、多副本和 Cloudflare 证据，WS 项要求上游接受、至少五个 benchmark sample、P50 TTFB 收益、连接复用和严格 pre-`response.create` WS→HTTP fallback。付费 `codex-images-real.mjs` 仅为 `probe_only/live_pending`，不能生成验收 receipt。
+
+后续 EVID-N1 迁移把 Codex 差异资产提升为 append-only schema v2。原 schema v1 的 `policy`、`sources`、`capabilities`、`incrementalEnhancements`、`realAcceptance`、`wireGoldens` 六个字段分别由不可变 digest 固定；新增的两个干净只读 snapshot 为 `CLIProxyAPI@b773607e`（tree `a740e14d`）与 `codex2api@de41a5e3`（tree `b767333a`）。9 个 source delta 由 13 条不可变 observation 完整映射到 adopt、differential、live_gate 或 reject 处置以及 committed target baseline/implementation object；CX-R1 明确拒绝商业计价、自动 driver-model fallback、账号池、轮换和跨账号恢复。audit 默认只读取本仓库及其已提交 Git object，显式 `--check-sources` 才复核外部已提交对象。当前没有真实凭据，四个 operation 的 `receipt` 均为 `null`，状态保持 `live_pending`。
+
 ## 2026-09-18 Antigravity grounding, model capability, and conversation-edge freeze
 
 本轮增量证据追加在 `assets/contract/antigravity-reference-delta.json`，不改写 2026-09-11 的历史 observation。只读来源为 `CLIProxyAPI@ef63d2e7/@7fcbdf88/@a9e92b81/@b681a1e0/@8c984672/@fd3e6623` 与 `Antigravity-Manager@734e2bde/@9fd77989`；每个完整 commit、路径和提交态 SHA-256 均由 `scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核，默认构建、测试和运行时仍不读取外部仓库。
