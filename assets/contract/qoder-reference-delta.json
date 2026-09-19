@@ -39,6 +39,31 @@
       ]
     }
   ],
+  "sourceExtensions": [
+    {
+      "sourceId": "tokenrouter",
+      "deltas": [
+        {
+          "id": "bounded_response_state_memory_signal",
+          "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+          "files": [
+            {
+              "path": "backend/internal/pkg/qoder/client.go",
+              "sha256": "e50867996550fa78336804373385a9e1b29d8064553b4c55c157baf3cf64f31d"
+            },
+            {
+              "path": "backend/internal/service/qoder_gateway_service.go",
+              "sha256": "a26ae88b60cd1c68f023583fe9dfe480d22bd0b88c52b255b6aba8a4ab18bb93"
+            },
+            {
+              "path": "backend/internal/service/gateway_service.go",
+              "sha256": "b23867fafa9839850204707dbe597951ca6b6e9fc0206f6e437841014590a891"
+            }
+          ]
+        }
+      ]
+    }
+  ],
   "sourceSnapshots": [
     {
       "id": "tokenrouter-2026-09-19",
@@ -323,6 +348,63 @@
             "AB7 Qoder Global OAuth bound-account three-surface smoke",
             "AB7 Qoder Global PAT bound-account three-surface smoke",
             "AB7 Qoder CN OAuth bound-account three-surface smoke"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CORE-N2-QODER",
+      "status": "fixture_verified",
+      "rails": [
+        "global_oauth",
+        "global_pat",
+        "cn_oauth"
+      ],
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "transport": "cosy_http_sse",
+      "stickyExhaustion": true,
+      "canonicalAndWireBounded": true,
+      "encodingExpansionBounded": true,
+      "decoderAndAggregatorBounded": true,
+      "downstreamRetainedStateBounded": true,
+      "capacityShedNotNetworkFailure": true,
+      "liveReceiptState": "live_pending",
+      "localEvidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "qoder_request_memory_scope_is_provider_exact_on_every_surface",
+            "qoder_memory_exhaustion_is_capacity_shed_not_network_failure",
+            "plain_body_bytes.saturating_add(encoded_body_bytes.saturating_mul(4))"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder/qoder_http_tests.rs",
+          "anchors": [
+            "qoder_request_memory_rejects_all_surfaces_before_any_upstream_request",
+            "qoder_nonstream_aggregate_is_bounded_by_request_memory",
+            "qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal",
+            "qoder_memory_exhaustion_never_replays_unauthorized_on_any_rail"
+          ]
+        },
+        {
+          "path": "src/proxy/qoder.rs",
+          "anchors": [
+            "qoder_decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+            "qoder_aggregator_reservation_follows_finished_value_and_releases_on_drop",
+            "qoder_decoder_capacity_exhaustion_is_sticky_and_content_free"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/qoder/mod.rs",
+          "anchors": [
+            "pub(crate) prepared_memory: Option<RequestMemoryReservation>",
+            "canonical.retained_bytes().saturating_mul(3)",
+            "prepared.retained_bytes()"
           ]
         }
       ]
@@ -717,6 +799,80 @@
         "fixtureIds": []
       },
       "reason": "Reject external runtime dependencies, reference or fixture promotion of local live state, and any success path that lacks a unique authoritative terminal followed by EOF."
+    },
+    {
+      "id": "QD-OBS-0011",
+      "providerFamily": "qoder",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "tokenrouter",
+        "snapshotId": "tokenrouter-2026-09-19",
+        "repository": "TokenRouter",
+        "deltaId": "bounded_response_state_memory_signal",
+        "commit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+        "tree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+        "paths": [
+          "backend/internal/pkg/qoder/client.go",
+          "backend/internal/service/qoder_gateway_service.go",
+          "backend/internal/service/gateway_service.go"
+        ],
+        "symbols": [
+          "io.ReadAll(io.LimitReader(resp.Body, 4<<20))",
+          "ReadQoderSSEEventsContext",
+          "events = append(events, event)",
+          "scanner.Buffer(make([]byte, 0, 64*1024), defaultMaxLineSize)",
+          "500 * 1024 * 1024"
+        ],
+        "sourceDigest": "638715258d609b7202ebf46d273dcc0ca746b0385c6adf134be1c24beadd3d6e"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N2"
+      ],
+      "target": {
+        "baselineCommit": "511fe48c7c45d8ca6dd8d670b6d47b40ac334d89",
+        "baselineTree": "448c156dd818b329c0eb37e25169fca243e6b5ce",
+        "implementationCommit": "348557182e1a513dac3cc2de45202b7371411349",
+        "implementationTree": "11502fe6841cbd2a1bc46cd6762d318e088ae858",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "qoder_request_memory_scope_is_provider_exact_on_every_surface",
+              "qoder_memory_exhaustion_is_capacity_shed_not_network_failure"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/qoder_http_tests.rs",
+            "anchors": [
+              "qoder_request_memory_rejects_all_surfaces_before_any_upstream_request",
+              "qoder_nonstream_aggregate_is_bounded_by_request_memory",
+              "qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal",
+              "qoder_memory_exhaustion_never_replays_unauthorized_on_any_rail"
+            ]
+          },
+          {
+            "path": "src/proxy/qoder.rs",
+            "anchors": [
+              "qoder_decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+              "qoder_aggregator_reservation_follows_finished_value_and_releases_on_drop",
+              "qoder_decoder_capacity_exhaustion_is_sticky_and_content_free"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "qoder_request_memory_scope_is_provider_exact_on_every_surface",
+          "qoder_memory_exhaustion_is_capacity_shed_not_network_failure",
+          "qoder_request_memory_rejects_all_surfaces_before_any_upstream_request",
+          "qoder_nonstream_aggregate_is_bounded_by_request_memory",
+          "qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal",
+          "qoder_memory_exhaustion_never_replays_unauthorized_on_any_rail",
+          "qoder_decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+          "qoder_aggregator_reservation_follows_finished_value_and_releases_on_drop",
+          "qoder_decoder_capacity_exhaustion_is_sticky_and_content_free"
+        ]
+      },
+      "reason": "TokenRouter proves that control-plane JSON reads and SSE lines have explicit ceilings, while its default Qoder stream ceiling is 500 MiB and non-stream requests retain parsed events in an array. Treat that only as a differential signal that Qoder retained state must be bounded: the local implementation independently accounts canonical/runtime/catalog/payload copies, COSY encoding and signature expansion, response bodies, decoder and aggregator state, downstream transforms and all three credential rails under one sticky request-lifecycle budget."
     }
   ],
   "legacyV1": {

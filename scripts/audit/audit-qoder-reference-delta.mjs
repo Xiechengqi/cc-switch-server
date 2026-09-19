@@ -185,6 +185,7 @@ assert(
 const sourceById = new Map();
 const sourceRootById = new Map();
 const sourceFileById = new Map();
+const sourceExtensionDeltaById = new Map();
 for (const source of contract.sources ?? []) {
   assert(source.id && source.rootEnv, "Qoder source metadata is incomplete");
   assert(/^[a-f0-9]{40}$/.test(source.commit), `${source.id} has an invalid commit`);
@@ -226,6 +227,58 @@ for (const source of contract.sources ?? []) {
 assert(
   sourceById.size === 1 && sourceById.has("tokenrouter"),
   "Qoder source set changed",
+);
+assert(
+  objectDigest(contract.sourceExtensions) ===
+    "3b1d107be410ce6830264aa1777887b4108ee21f797c06d393c2024d29d7a38e",
+  "Qoder source extension history changed",
+);
+for (const extension of contract.sourceExtensions ?? []) {
+  const source = sourceById.get(extension.sourceId);
+  assert(source, `Qoder source extension ${extension.sourceId} has no legacy source`);
+  assert(
+    Array.isArray(extension.deltas) && extension.deltas.length > 0,
+    `${extension.sourceId} source extension has no deltas`,
+  );
+  const sourceRoot = sourceRootById.get(extension.sourceId);
+  const fileByPath = sourceFileById.get(extension.sourceId);
+  for (const delta of extension.deltas) {
+    assert(
+      delta.id && !sourceExtensionDeltaById.has(delta.id),
+      `duplicate Qoder source extension delta ${delta.id}`,
+    );
+    assert(
+      delta.commit === source.commit && commitPattern.test(delta.commit),
+      `${delta.id} changed committed source identity`,
+    );
+    assert(
+      Array.isArray(delta.files) && delta.files.length > 0,
+      `${delta.id} has no frozen source files`,
+    );
+    for (const file of delta.files) {
+      safeRelative(file.path, `${delta.id} evidence path`);
+      assert(!fileByPath.has(file.path), `${delta.id} repeats frozen path ${file.path}`);
+      assert(digestPattern.test(file.sha256), `${delta.id}:${file.path} has invalid SHA-256`);
+      fileByPath.set(file.path, file);
+      if (checkSources) {
+        assert(fs.existsSync(sourceRoot), `${extension.sourceId} source root is unavailable`);
+        const content = gitFile(sourceRoot, delta.commit, file.path, null);
+        assert(
+          sha256(content) === file.sha256,
+          `${extension.sourceId}:${delta.id}:${file.path} drifted from the reviewed Git object`,
+        );
+      }
+    }
+    sourceExtensionDeltaById.set(delta.id, {
+      sourceId: extension.sourceId,
+      ...delta,
+    });
+  }
+}
+assert(
+  sourceExtensionDeltaById.size === 1 &&
+    sourceExtensionDeltaById.get("bounded_response_state_memory_signal")?.files.length === 3,
+  "Qoder source extension set changed",
 );
 
 const immutableSourceSnapshotDigests = new Map([
@@ -302,6 +355,7 @@ const immutableObservationDigests = new Map([
   ["QD-OBS-0008", "284ff405962f0c2a8e6624deea71a6e0e12e0b4aad539a60bbd0ec971b02bd53"],
   ["QD-OBS-0009", "ecdd1ff9342e7c8633fc35214bacd4a77ce86253d0fbc0237b1bdc5dc224689c"],
   ["QD-OBS-0010", "218367eb612b3ca136829e900b95a127d96b9c163284aec79f2a1e0637e7bd31"],
+  ["QD-OBS-0011", "d6aec060547a24877f8452e52d71d743e6c07488b6578f2cb77f96529ad8e3c8"],
 ]);
 const expectedEnhancementIds = new Set([
   "QD-01",
@@ -310,6 +364,7 @@ const expectedEnhancementIds = new Set([
   "QD-N1",
   "QD-N2",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
   "QD-R1",
   "QD-R2",
@@ -326,6 +381,7 @@ const expectedDispositions = new Map([
   ["QD-OBS-0008", "reject"],
   ["QD-OBS-0009", "reject"],
   ["QD-OBS-0010", "reject"],
+  ["QD-OBS-0011", "differential"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -384,6 +440,16 @@ for (const observation of contract.observations ?? []) {
     assert(file, `${observation.id} references an unfrozen source path`);
     return file;
   });
+  const extensionDelta = sourceExtensionDeltaById.get(reference.deltaId);
+  if (extensionDelta) {
+    assert(
+      extensionDelta.sourceId === reference.sourceId &&
+        extensionDelta.commit === reference.commit &&
+        JSON.stringify(reference.paths) ===
+          JSON.stringify(extensionDelta.files.map((file) => file.path)),
+      `${observation.id} changed its frozen source extension delta`,
+    );
+  }
   assert(
     Array.isArray(reference.symbols) &&
       reference.symbols.length > 0 &&
@@ -495,22 +561,29 @@ assert(
 );
 
 assert(
-  objectDigest(contract.evidenceExtensions) ===
+  objectDigest(contract.evidenceExtensions?.slice(0, 2)) ===
     "75e3dc6d6553a51108ffb096d4f23926b7a57e6f49d2e704286acc7c61526133",
+  "Qoder legacy evidence extension history changed",
+);
+assert(
+  objectDigest(contract.evidenceExtensions) ===
+    "ad2233984ab567553cf31480b23a4f614eee5251d894d864a7632731e741b836",
   "Qoder evidence extension history changed",
 );
 const evidenceExtensions = new Map(
   (contract.evidenceExtensions ?? []).map((entry) => [entry.id, entry]),
 );
 assert(
-  evidenceExtensions.size === 2 &&
+  evidenceExtensions.size === 3 &&
     evidenceExtensions.has("CORE-N1") &&
-    evidenceExtensions.has("LIVE-N1"),
+    evidenceExtensions.has("LIVE-N1") &&
+    evidenceExtensions.has("CORE-N2-QODER"),
   "Qoder CORE/LIVE evidence extension set changed",
 );
 for (const [id, expectedCount] of [
   ["CORE-N1", 2],
   ["LIVE-N1", 3],
+  ["CORE-N2-QODER", 4],
 ]) {
   const extension = evidenceExtensions.get(id);
   assert(
@@ -541,6 +614,23 @@ assert(
     evidenceExtensions.get("LIVE-N1").receiptsIndependent === true &&
     evidenceExtensions.get("LIVE-N1").livePromotionBlockedByUnobservedChecks === true,
   "LIVE-N1 receipt isolation or live gate changed",
+);
+const requestMemoryExtension = evidenceExtensions.get("CORE-N2-QODER");
+assert(
+  requestMemoryExtension.status === "fixture_verified" &&
+    JSON.stringify(requestMemoryExtension.rails) ===
+      JSON.stringify(["global_oauth", "global_pat", "cn_oauth"]) &&
+    JSON.stringify(requestMemoryExtension.surfaces) ===
+      JSON.stringify(["claude", "codex", "gemini"]) &&
+    requestMemoryExtension.transport === "cosy_http_sse" &&
+    requestMemoryExtension.stickyExhaustion === true &&
+    requestMemoryExtension.canonicalAndWireBounded === true &&
+    requestMemoryExtension.encodingExpansionBounded === true &&
+    requestMemoryExtension.decoderAndAggregatorBounded === true &&
+    requestMemoryExtension.downstreamRetainedStateBounded === true &&
+    requestMemoryExtension.capacityShedNotNetworkFailure === true &&
+    requestMemoryExtension.liveReceiptState === "live_pending",
+  "CORE-N2-QODER evidence boundary changed",
 );
 
 const incrementalReview = contract.incrementalReview;

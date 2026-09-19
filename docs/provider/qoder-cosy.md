@@ -50,7 +50,7 @@ Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发�
 
 ## 验收边界
 
-oracle `verification` 是验证计数单源：65 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、响应 envelope、工具历史、Device Flow 容量、session/provider/account generation fencing、Provider facade scope、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；9 项 Node mutation 还冻结 bounded compatibility、安全边界、coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 65/9/7，不再维护手写副本。
+oracle `verification` 是既有验证计数单源：65 项离线 Rust Qoder 聚焦测试覆盖 Global/CN lifecycle exact HTTP、refresh rotation/receipt/error taxonomy、capability、公开 alias、权威空目录、坏目录、quota oracle、完整 payload/header、context/reasoning、clock skew、nonce/machine identity、三 credential rails × 三 Surfaces、EOF/唯一终态、响应 envelope、工具历史、Device Flow 容量、session/provider/account generation fencing、Provider facade scope、pre/post-commit 401，以及连续两次 401 只恢复原绑定账号一次；9 项 Node mutation 还冻结 bounded compatibility、安全边界、coherent projection、accepted reason、actual/signature path、header set、encoding/signature vector 与计数漂移；7 项 loopback real-harness fixture 验证 harness 合同。生成 coverage 直接读取 65/9/7，不再维护手写副本。CORE-N2 的独立容量 fixture 使当前 Qoder 关键词测试为 74/74、request-memory 关键词测试为 24/24，不改写 oracle 的历史 65/9/7 元数据。
 
 `scripts/smoke/qoder-real.mjs` 按 `global_oauth`、`global_pat`、`cn_oauth` 一次只运行一条 rail。schema-v2 receipt 绑定当前 target commit/harness、Account auth/token generation、三个 Surface Provider revision/runtime digest、Share revision、site/rail、exact model、三份 fresh catalog snapshot 和六个请求 body hash，再验收 quota、三 Surface non-stream/stream/tool/usage/唯一终态；文件写在仓库外并强制为 0600。`acceptanceChecks` 对每项分别写 `pass`、`binding_only` 或 `not_observed`；当前 harness 没有实际执行登录/轮换、权威空目录和受控两段 401，因此即使连接真实服务也只能写 `partial_live_verified/live_pending`，不能单独提升整条 rail。`scripts/audit/qoder-real.test.mjs` 的 loopback 结果固定为 `contract_verified/live_pending`，同样不能替代真实 receipt。
 
@@ -58,7 +58,9 @@ oracle `verification` 是验证计数单源：65 项离线 Rust Qoder 聚焦测�
 
 QD-N2 已把只读 TokenRouter 交叉核对刷新到 `7faf9469bc6957716923b5b4a98665c0fb9715e0`。已提交 Qoder 文档没有变化，handler 差异只适配共享错误 helper 的签名，没有新增 origin、header、签名、payload、terminal 或恢复 wire，因此本轮不修改生产实现；官方 CLI oracle 继续是第一来源。参考仓库的其他 Provider、调度、计费和 UI 增量不属于 Qoder wire 证据。
 
-Qoder reference delta 已迁为 append-only schema v2：原 schema-v1 文件及 11 个内容字段分别由不可变摘要固定；TokenRouter snapshot 绑定 `7faf9469bc6957716923b5b4a98665c0fb9715e0` 与 tree `b205061c4f0d9b53fbffb0242f34796e10b18251`，并声明只读取干净工作树的 committed Git objects。10 条 observation 把 QD-01～03、QD-N1/N2、CORE-N1、LIVE-N1 和 QD-R1～R3 映射到 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object。QD-R1～R3 明确拒绝账号池/轮换/affinity 或跨边界 fallback、商业控制面，以及外仓运行时依赖、伪 live 与宽松 terminal；默认 audit 自包含，`--check-sources` 才读取 TokenRouter 冻结对象。
+Qoder reference delta 已迁为 append-only schema v2：原 schema-v1 文件及 11 个内容字段分别由不可变摘要固定；TokenRouter snapshot 绑定 `7faf9469bc6957716923b5b4a98665c0fb9715e0` 与 tree `b205061c4f0d9b53fbffb0242f34796e10b18251`，并声明只读取干净工作树的 committed Git objects。11 条 observation 把 QD-01～03、QD-N1/N2、CORE-N1/N2、LIVE-N1 和 QD-R1～R3 映射到 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object。QD-OBS-0011 只把参考的 4 MiB 控制面读取、500 MiB 默认 SSE line ceiling 与非流事件数组作为 retained-state 差分信号；`CORE-N2-QODER=fixture_verified` 由本仓库独立 sticky budget 与 committed fixture 支持。QD-R1～R3 明确拒绝账号池/轮换/affinity 或跨边界 fallback、商业控制面，以及外仓运行时依赖、伪 live 与宽松 terminal；默认 audit 自包含，`--check-sources` 才读取 TokenRouter 冻结对象。
+
+CORE-N2 精确启用 `qoder_cosy`：Global OAuth、Global PAT、CN OAuth 和 Claude/Codex/Gemini 三 Surface 共享请求生命周期预算，覆盖 canonical/runtime/catalog/prepared payload、COSY 编码签名、错误响应、SSE decoder/canonical event、非流聚合与下游 retained state。耗尽为稳定 503/同码流终态和 `CapacityShed`，不 replay、refresh 或记为网络故障；真实 rail 状态不变，仍分别为 `live_pending`。
 
 ## CLI 升级门禁
 
