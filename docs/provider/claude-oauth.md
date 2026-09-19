@@ -182,7 +182,7 @@ Prometheus 标签禁止包含账号 ID、Provider ID 或 request ID；这些实�
 
 ## 真实账号验收
 
-脚本每次运行包含三个互相独立的 external gate：当前模型的 Share 推理、Max 5x 计划解析和 Max 20x 计划解析。完整运行示例：
+真实验收分为 `oauth_inference`、`max_5x_plan`、`max_20x_plan` 和 `fable_5_1` 四个互相独立的 operation。`claude-oauth-real.mjs` 仍可先做低成本 probe，但 probe 输出不能提升 live 状态：
 
 ```bash
 SERVER_URL='https://server.example.com' \
@@ -200,11 +200,28 @@ node scripts/smoke/claude-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `ROUTER_API_TOKEN_HEADER`：Router 使用非默认鉴权 header 时覆盖，默认 `Authorization`。
 
-Share gate 通过同一个 Share URL 检查 count_tokens、非流式 Messages 和完整 SSE lifecycle。两个 Max 变量分别按 Claude OAuth 账号 ID 或 email 精确匹配 `GET /api/accounts`，再调用 `GET /api/accounts/:id/quota?refresh=true&force=true`，检查账号/配额显示名、canonical `planType` / `planLabel` 以及 source/stale/conflict evidence 的一致性。脚本不输出账号选择器或完整 email。
+Share probe 通过同一个 Share URL 检查 count_tokens、非流式 Messages 和完整 SSE lifecycle。两个 Max 变量分别按 Claude OAuth 账号 ID 或 email 精确匹配 `GET /api/accounts`，再调用 `GET /api/accounts/:id/quota?refresh=true&force=true`，检查账号/配额显示名、canonical `planType` / `planLabel` 以及 source/stale/conflict evidence 的一致性。脚本不输出账号选择器、完整 email或失败响应正文。
 
-Fable 5.1 必须作为额外的独立 Share gate：先完成上面的普通模型运行，再把 `CC_SWITCH_SHARE_URL` 指向明确绑定 Max 20x 账号的 Share，设置 `CC_SWITCH_CLAUDE_MODEL=claude-fable-5-1` 后再次运行脚本。第二次运行的 count_tokens、非流式 Messages 和 SSE 结果单独记录，不得由普通模型或 Max 20x 计划解析结果替代。
+最终验收必须为每个 operation 单独准备仓库外、权限 `0600` 的私有 receipt，并设置对应的 `CC_SWITCH_CLAUDE_*_PROVIDER_ID`、`*_SHARE_ID`、`*_MODEL` 和 `*_REAL_RECEIPT_FILE`：
 
-每次运行的三个 gate 都单独判断输入：Share 缺 URL/token、某个 Max 等级缺账号选择器，或 Max gate 缺 Server URL/token 时，都为对应 gate 明确输出 `[SKIP]`，不阻止其他已配置 gate 运行。汇总时应分别记录普通 Share、Max 5x、Max 20x 和 Fable 5.1 四项，也绝不能把 SKIP 记为真实通过。
+```bash
+RUN_REAL=1 \
+CC_SWITCH_CLAUDE_REAL_OPERATION='oauth_inference' \
+SERVER_URL='https://server.example.com' \
+CC_SWITCH_SERVER_TOKEN='<server-session-token>' \
+CC_SWITCH_SHARE_URL='https://share.example.com' \
+ROUTER_API_TOKEN='<router-user-token>' \
+CLAUDE_OAUTH_TEST_ACCOUNT='<account-id-or-email>' \
+CC_SWITCH_CLAUDE_OAUTH_PROVIDER_ID='<provider-id>' \
+CC_SWITCH_CLAUDE_OAUTH_SHARE_ID='<share-id>' \
+CC_SWITCH_CLAUDE_OAUTH_MODEL='claude-sonnet-4-6' \
+CLAUDE_OAUTH_INFERENCE_REAL_RECEIPT_FILE='/private/claude-oauth-inference.json' \
+node scripts/smoke/claude-real-receipt.mjs --operation oauth_inference
+```
+
+其他 operation 使用 `.env.example` 中各自的 Max 5x、Max 20x 和 Fable 5.1 变量。validator 先核对当前 Git commit、唯一 Claude OAuth Account generation、`oauth.claude_messages` Provider、明确 Share binding 和精确模型；计划 operation 还会强制刷新并绑定 fresh canonical plan projection。Fable 5.1 必须使用精确 `claude-fable-5-1` 和 Max 20x 计划，不能由普通模型或 Max 20x 计划解析结果替代。
+
+四个 operation 分别判断输入并维持独立 receipt。输入不全时 validator 输出 `blocked_inputs/live_pending`；fixture 模式只能验证合同并输出 `contract_verified/live_pending`。任何一个 operation 的通过都不能提升另外三个，也绝不能把 SKIP、fixture 或 probe 结果记为真实通过。
 
 ## 非目标与剩余外部风险
 

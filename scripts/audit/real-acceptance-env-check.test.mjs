@@ -26,8 +26,25 @@ function runEnvCheck(overrides) {
       GROK_OAUTH_TEST_ACCOUNT: "",
       CC_SWITCH_SHARE_URL: "",
       ROUTER_API_TOKEN: "",
+      CLAUDE_OAUTH_TEST_ACCOUNT: "",
       CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT: "",
       CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "",
+      CC_SWITCH_CLAUDE_OAUTH_PROVIDER_ID: "",
+      CC_SWITCH_CLAUDE_OAUTH_SHARE_ID: "",
+      CC_SWITCH_CLAUDE_OAUTH_MODEL: "",
+      CLAUDE_OAUTH_INFERENCE_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CLAUDE_MAX_5X_PROVIDER_ID: "",
+      CC_SWITCH_CLAUDE_MAX_5X_SHARE_ID: "",
+      CC_SWITCH_CLAUDE_MAX_5X_MODEL: "",
+      CLAUDE_MAX_5X_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CLAUDE_MAX_20X_PROVIDER_ID: "",
+      CC_SWITCH_CLAUDE_MAX_20X_SHARE_ID: "",
+      CC_SWITCH_CLAUDE_MAX_20X_MODEL: "",
+      CLAUDE_MAX_20X_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CLAUDE_FABLE_5_1_PROVIDER_ID: "",
+      CC_SWITCH_CLAUDE_FABLE_5_1_SHARE_ID: "",
+      CC_SWITCH_CLAUDE_FABLE_5_1_MODEL: "",
+      CLAUDE_FABLE_5_1_REAL_RECEIPT_FILE: "",
       ANTIGRAVITY_OAUTH_TEST_ACCOUNT: "",
       CC_SWITCH_ANTIGRAVITY_OAUTH_SHARE_ID: "",
       CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_PROVIDER_ID: "",
@@ -77,23 +94,41 @@ function runEnvCheck(overrides) {
   }
 }
 
-test("Claude Max and Grok external input gates remain isolated", () => {
+test("Claude operation receipts and Grok external input gates remain isolated", () => {
   const grokReady = runEnvCheck({
     GROK_OAUTH_TEST_ACCOUNT: "grok-test-account",
     CC_SWITCH_SHARE_URL: "https://grok-share.example.test",
     ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(grokReady.checks.grokGateStatus, "inputs-ready");
+  assert.equal(grokReady.checks.claudeOauthInferenceGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeMax5xGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeMax20xGateStatus, "blocked-inputs");
+  assert.equal(grokReady.checks.claudeFable51GateStatus, "blocked-inputs");
 
   const maxReady = runEnvCheck({
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://share.example.test",
+    ROUTER_API_TOKEN: "router-token",
     CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT: "max-5x-test-account",
     CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "max-20x-test-account",
+    CC_SWITCH_CLAUDE_MAX_5X_PROVIDER_ID: "max-5x-provider",
+    CC_SWITCH_CLAUDE_MAX_5X_SHARE_ID: "max-5x-share",
+    CC_SWITCH_CLAUDE_MAX_5X_MODEL: "claude-sonnet-4-6",
+    CLAUDE_MAX_5X_REAL_RECEIPT_FILE: "/tmp/claude-max-5x.json",
+    CC_SWITCH_CLAUDE_MAX_20X_PROVIDER_ID: "max-20x-provider",
+    CC_SWITCH_CLAUDE_MAX_20X_SHARE_ID: "max-20x-share",
+    CC_SWITCH_CLAUDE_MAX_20X_MODEL: "claude-sonnet-4-6",
+    CLAUDE_MAX_20X_REAL_RECEIPT_FILE: "/tmp/claude-max-20x.json",
   });
   assert.equal(maxReady.checks.grokGateStatus, "blocked-inputs");
+  assert.equal(maxReady.checks.claudeOauthInferenceGateStatus, "blocked-inputs");
   assert.equal(maxReady.checks.claudeMax5xGateStatus, "inputs-ready");
   assert.equal(maxReady.checks.claudeMax20xGateStatus, "inputs-ready");
+  assert.equal(maxReady.checks.claudeFable51GateStatus, "blocked-inputs");
+  assert.equal(maxReady.longTailInputsPresent.claudeMax5xProviderId, true);
+  assert.equal(maxReady.longTailInputsPresent.claudeMax20xReceiptFile, true);
 });
 
 test("Antigravity and Agy external gates require independent bindings and receipts", () => {

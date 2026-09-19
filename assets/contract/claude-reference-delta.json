@@ -217,8 +217,8 @@
     {
       "id": "rate_limit_scope",
       "status": "fixture_verified",
-      "path": "src/proxy/forwarder.rs",
-      "anchors": ["classify_claude_rate_limit", "claude_rate_limit_scope_decision_table_is_fail_closed", "mark_account_rate_limited_until_if_current"]
+      "path": "src/proxy/providers/claude/mod.rs",
+      "anchors": ["classify_rate_limit", "handle_rate_limit", "mark_account_rate_limited_until_if_current"]
     },
     {
       "id": "caqs_signature_replay",
@@ -244,5 +244,40 @@
       "path": "src/proxy/forwarder.rs",
       "anchors": ["semantic_terminal_seen", "claude_message_stop_completes_before_upstream_eof_or_late_disconnect"]
     }
-  ]
+  ],
+  "realAcceptance": {
+    "receiptSchemaVersion": 1,
+    "harnessRevision": 1,
+    "scopeDigest": "sha256 lowercase hex over operation, target commit, one Claude OAuth Account generation, one Provider binding, one Share revision, selected model, and an optional fresh canonical plan projection",
+    "operations": [
+      {
+        "operation": "oauth_inference",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": ["bound_account_provider_share", "count_tokens", "messages_nonstream_usage", "messages_stream_terminal", "tool_roundtrip", "caqs_opaque_replay", "initial_turn_billing_fingerprint", "standalone_tool_output", "same_account_first_401_recovery", "second_401_terminal", "rate_limit_scope_matrix", "terminal_then_late_disconnect", "decoy_zero_requests", "secret_scan"],
+        "requiredBodyHashes": ["count_tokens", "messages_nonstream", "messages_stream", "tool_roundtrip"]
+      },
+      {
+        "operation": "max_5x_plan",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": ["bound_account_provider_share", "forced_quota_refresh", "canonical_max_5x", "fresh_plan_evidence", "plan_conflict_false", "decoy_zero_requests", "secret_scan"],
+        "requiredBodyHashes": ["quota_projection"]
+      },
+      {
+        "operation": "max_20x_plan",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": ["bound_account_provider_share", "forced_quota_refresh", "canonical_max_20x", "fresh_plan_evidence", "plan_conflict_false", "decoy_zero_requests", "secret_scan"],
+        "requiredBodyHashes": ["quota_projection"]
+      },
+      {
+        "operation": "fable_5_1",
+        "status": "live_pending",
+        "receipt": null,
+        "requiredChecks": ["bound_account_provider_share", "fresh_max_20x_plan", "exact_fable_5_1_model", "messages_nonstream_usage", "messages_stream_terminal", "fable_7d_oi_scope", "no_model_fallback", "decoy_zero_requests", "secret_scan"],
+        "requiredBodyHashes": ["messages_nonstream", "messages_stream"]
+      }
+    ]
+  }
 }

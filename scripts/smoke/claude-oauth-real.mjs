@@ -17,14 +17,6 @@ function fail(message) {
   throw new Error(message);
 }
 
-function redact(value) {
-  let redacted = String(value);
-  for (const secret of [routerToken, serverToken]) {
-    if (secret) redacted = redacted.split(secret).join("[REDACTED]");
-  }
-  return redacted;
-}
-
 function applyRouterAuth(headers) {
   if (/^authorization$/i.test(routerTokenHeader)) {
     headers.set("authorization", `Bearer ${routerToken}`);
@@ -70,12 +62,12 @@ async function requireJson(path, body, label) {
   try {
     const text = await response.text();
     if (!response.ok) {
-      fail(`${label} returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+      fail(`${label} returned HTTP ${response.status}`);
     }
     try {
       return JSON.parse(text);
-    } catch (error) {
-      fail(`${label} returned invalid JSON: ${error.message}`);
+    } catch {
+      fail(`${label} returned invalid JSON`);
     }
   } finally {
     stopTimeout();
@@ -102,8 +94,8 @@ function parseSseEvent(frame) {
   let payload;
   try {
     payload = JSON.parse(data.join("\n"));
-  } catch (error) {
-    fail(`stream emitted invalid SSE JSON: ${error.message}`);
+  } catch {
+    fail("stream emitted invalid SSE JSON");
   }
   if (!payload || typeof payload.type !== "string") {
     fail("stream SSE payload is missing type");
@@ -126,12 +118,12 @@ async function validateStream() {
   });
   try {
     if (!response.ok) {
-      const text = await response.text();
-      fail(`streaming messages returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+      await response.body?.cancel();
+      fail(`streaming messages returned HTTP ${response.status}`);
     }
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.toLowerCase().includes("text/event-stream")) {
-      fail(`streaming messages returned unexpected content-type: ${contentType}`);
+      fail("streaming messages returned an unexpected content type");
     }
     if (!response.body) fail("streaming messages returned no body");
 
@@ -153,8 +145,7 @@ async function validateStream() {
         const payload = parseSseEvent(frame);
         if (!payload) continue;
         if (payload.type === "error") {
-          const detail = payload.error?.message || payload.error?.type || "unknown error";
-          fail(`stream returned Anthropic error: ${detail}`);
+          fail("stream returned an Anthropic error event");
         }
         if (payload.type === "message_start") {
           if (sawStart) fail("stream emitted duplicate message_start");
@@ -250,12 +241,12 @@ async function requireServerJson(path, label) {
     });
     const text = await response.text();
     if (!response.ok) {
-      fail(`${label} returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+      fail(`${label} returned HTTP ${response.status}`);
     }
     try {
       return JSON.parse(text);
-    } catch (error) {
-      fail(`${label} returned invalid JSON: ${error.message}`);
+    } catch {
+      fail(`${label} returned invalid JSON`);
     }
   } finally {
     clearTimeout(timer);
@@ -425,11 +416,14 @@ async function main() {
   }
   const passed = results.filter(Boolean).length;
   if (passed > 0) {
-    console.log(`[PASS] Claude OAuth real-account gates complete (${passed}/3 passed)`);
+    console.log(`[PASS] Claude OAuth real-account probes complete (${passed}/3 passed)`);
+    console.log(
+      "[INFO] Probe output is not live acceptance; validate one private receipt per operation with claude-real-receipt.mjs.",
+    );
   }
 }
 
-main().catch((error) => {
-  console.error(`[FAIL] ${redact(error instanceof Error ? error.message : error)}`);
+main().catch(() => {
+  console.error("[FAIL] Claude OAuth probe failed (details redacted)");
   process.exit(1);
 });
