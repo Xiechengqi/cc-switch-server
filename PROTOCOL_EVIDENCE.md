@@ -59,11 +59,17 @@ Server 的独立 grounding 合同只读取选中候选，按 URL 去重 web chun
 
 Claude 增量证据追加在 `assets/contract/claude-reference-delta.json`。只读来源为 `CLIProxyAPI@44eaef00/@75ce6352/@377c315f/@2bcebaa8/@7c32971b`；实现与测试 Git object 的提交态 SHA-256 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 复核，默认构建、测试和运行时不读取外部 checkout。没有采纳账号池、跨账号/Provider fallback、credential cloaking、organization-hash 身份迁移或浏览器指纹模拟。
 
+后续 EVID-N1 迁移把该资产提升为 append-only schema v2：原 schema v1 `sources`、`localContracts`、`realAcceptance` 分别由不可变 digest 固定，新增 `sourceExtensions`、两个 source snapshot 和 14 条 observation。冻结 snapshot 为 `CLIProxyAPI@b773607e`（tree `a740e14d`，工作树干净）与 `OmniRoute@02c663cd`（tree `25b36e49`，未提交改动明确排除）；12 个 source delta 均绑定完整 commit、tree、路径、符号与 source digest。audit 默认只从本仓库已提交 Git object 核对 target baseline/implementation tree 和 anchors，显式 `--check-sources` 才读取外部已提交对象。
+
+14 条 observation 分别记录 adopt、differential、live_gate 或 reject 处置，并映射 CL-01～CL-06、CL-N1～CL-N4、CORE-N1、LIVE-N1 与 CL-R1。`CLIProxyAPI@fc96a87f` 的 organization-hashed credential filename 只作为拒绝证据：Account identity 继续由本仓库显式绑定，CL-R1 不声明 implementation commit 或 fixture，避免未来把 credential migration 当成待实现缺口。
+
 429 分类只在 5h/7d 子窗口明确 `rejected`、利用率证据不冲突且每个被拒窗口均有合法 reset 时写当前 Account generation 的共享窗口 cooldown。`unified` 单独拒绝、缺失/非法 reset、冲突 header 和未知 429 只允许精确 model cooldown；健康共享窗口下的 `7d_oi` 只影响 Fable pool 或精确 model；fast-credit、overage-disabled 与 organization spend-cap 明确信号只记 request entitlement。reset/Retry-After 继续受时间范围和全局上限保护，指标只包含固定 scope/reason/evidence，不记录 header 原值。
 
 CAQS EnvelopeVersion 4 仍视为厂商 opaque signature：Server 不解析、不生成、不截断，也不把内容写入日志或指标。native Claude 初次出站逐字保留非空字符串；Responses 流/非流通过本仓库带 MAC 的 reasoning carrier 往返恢复原块，空白、空值和非字符串不能被误认作可重放签名。初始 turn 的 billing/session fingerprint 在 system migration、cache metadata、后续轮次和 retry rewrite 前取值；后续历史变化不改变该初始锚点。
 
 standalone、错配和部分 tool output 继续用版本化 user 文本可逆保留，不伪造 tool pairing。通用流终态 guard 在收到唯一合法 `message_stop` 后立即完成、结算 usage 并释放上游 body；终态后的无 EOF、取消或断连不再反记为 upstream failure，终态前断连仍严格失败。以上只证明本地 `fixture_verified`；真实 Claude rail、Fable entitlement、CAQS 接受性和限流 header 仍为 `live_pending`。
+
+`6b0a0fe` 将 quota header 观测、429 scope 应用、Fable/Account/model cooldown 与 transport replay-safe 决策收敛到 `src/proxy/providers/claude/`，不改变 wire、usage、terminal 或固定绑定恢复语义。私有 receipt harness 将真实验收拆为 `oauth_inference`、`max_5x_plan`、`max_20x_plan`、`fable_5_1` 四个 operation；每项独立绑定 target commit、Account generation、Provider binding、Share revision、模型和可选 plan projection。fixture 只能生成 `contract_verified/live_pending`，真实 receipt 必须存放在仓库外并使用 `0600` 权限。当前未提供真实凭据，四项状态均保持 `live_pending`、`receipt=null`。
 
 ## 2026-09-11 Antigravity replay, session, schema, and transport freeze
 

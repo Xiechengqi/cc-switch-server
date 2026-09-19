@@ -1,7 +1,9 @@
 {
   "format": "cc-switch-claude-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
@@ -279,5 +281,512 @@
         "requiredBodyHashes": ["messages_nonstream", "messages_stream"]
       }
     ]
-  }
+  },
+  "sourceExtensions": [
+    {
+      "sourceId": "cliproxyapi",
+      "deltas": [
+        {
+          "id": "organization_hashed_identity",
+          "commit": "fc96a87fa66c0cfd8b4746449a178955229d9db8",
+          "files": [
+            {
+              "path": "internal/auth/claude/filename.go",
+              "sha256": "c2fc08f12a6ef2ad0ff86b50b2152d54f9e1a0a94ceaddc2f25ab0f6588f2136"
+            },
+            {
+              "path": "internal/auth/claude/filename_test.go",
+              "sha256": "8c15f242c5435cd800a775faec42adc0d7388890eacfaa68acac7b85354a8a75"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "observationPolicy": {
+    "history": "append_only; legacy schema v1 sources, localContracts, and realAcceptance are immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "externalVerification": "optional explicit audit only; never a build, test, release, or runtime dependency"
+  },
+  "sourceSnapshots": [
+    {
+      "id": "omniroute-2026-09-19",
+      "sourceId": "omniroute",
+      "repository": "OmniRoute",
+      "headCommit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+      "headTree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "cliproxyapi-2026-09-19",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "b773607e3e7756dc6020a291825e4eb08899595a",
+      "headTree": "a740e14d0b3efea8877f901301d0f9926c39258b",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "observations": [
+    {
+      "id": "CL-OBS-0001",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "leading_text_system",
+        "commit": "a3ca33fa6442b59adc42976c795709eaf5351109",
+        "tree": "4b8bfebb60d6e5b0afc0e6690c55a98392542f89",
+        "paths": ["open-sse/handlers/chatCore/claudeSystemRole.ts", "tests/unit/claude-leading-text-system-hoist.test.ts"],
+        "symbols": ["extractSystemRoleMessages", "relocateHoistedCacheBoundary"],
+        "sourceDigest": "c101564803f96bdbf71eb4ba6eeffca238c0f6f0aee722cf97a973362126920e"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-01"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": ["hoist_leading_text_system_messages", "native_leading_system_hoist_runs_before_final_cch_signature"]
+          }
+        ],
+        "fixtureIds": ["native_leading_system_hoist_runs_before_final_cch_signature"]
+      },
+      "reason": "Keep the narrower confirmed-native leading-text hoist and preserve directive-only or mid-conversation system turns in place."
+    },
+    {
+      "id": "CL-OBS-0002",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "request_category_cache_ttl",
+        "commit": "6a73f39627358ecf3724fee2952fd234ada919b1",
+        "tree": "3029d6a3e1c03ede9d62cbc50db9de4fe4a90712",
+        "paths": ["internal/runtime/executor/claude_executor_request.go", "internal/runtime/executor/claude_executor_test.go"],
+        "symbols": ["claudeExtendedCacheTTLBeta", "withClaudeOAuthCredentialBetas"],
+        "sourceDigest": "6a3371c84c37a6152cf988cf74f624efbe1994b85b91185444a9ed8a5c6f878f"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-02"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": ["claude_request_category_cache_matrix_preserves_only_supported_one_hour_requests"]
+          }
+        ],
+        "fixtureIds": ["claude_request_category_cache_matrix_preserves_only_supported_one_hour_requests"]
+      },
+      "reason": "Apply one-hour cache TTL only to audited request categories; helper, probe and default subagent requests remain on the conservative profile."
+    },
+    {
+      "id": "CL-OBS-0003",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "trailing_usage_timing",
+        "commit": "a59b1764e781e0c20bf102349cd9bc202ce8f668",
+        "tree": "3691c5abd0919ae3d4447d84aa277d657b19373c",
+        "paths": ["internal/translator/claude/openai/chat-completions/claude_openai_response.go", "internal/translator/claude/openai/chat-completions/claude_openai_response_test.go"],
+        "symbols": ["TrailingUsageSent", "claudeUsageTokens"],
+        "sourceDigest": "89722675e624c6e3e38d47ed404dcf5b09aa6f2d9e700e264009b9860d540a64"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-03"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": ["claude_chat_usage_golden_merges_lifecycle_and_emits_one_ordered_tail", "claude_chat_usage_golden_honors_opt_out_and_preserves_explicit_zero"]
+          }
+        ],
+        "fixtureIds": ["claude_chat_usage_golden_merges_lifecycle_and_emits_one_ordered_tail", "claude_chat_usage_golden_honors_opt_out_and_preserves_explicit_zero"]
+      },
+      "reason": "Emit one opt-in trailing Chat usage chunk after finish and before DONE while preserving explicit zero values."
+    },
+    {
+      "id": "CL-OBS-0004",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "structured_output",
+        "commit": "4f03809901ddde88d71e2eed8ee045420da098ad",
+        "tree": "98565a0565680ace41fa01980ced222c96e1dfa4",
+        "paths": ["internal/translator/common/claude_system.go", "internal/translator/common/claude_system_test.go"],
+        "symbols": ["BuildClaudeStructuredOutputInstruction", "ClaudeMessageSystemReminderText"],
+        "sourceDigest": "95ad61180d3fadc51392904c8dac37730f771f0ddc810e468fcbe34b0a8ea53e"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-04"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": ["claude_structured_output_instruction", "claude_structured_output_translation_is_scoped_and_preserves_system_text"]
+          }
+        ],
+        "fixtureIds": ["claude_structured_output_translation_is_scoped_and_preserves_system_text"]
+      },
+      "reason": "Add structured-output instructions only for the matching response-format shape and preserve unrelated system text."
+    },
+    {
+      "id": "CL-OBS-0005",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "sequential_interleaved_tools",
+        "commit": "ef99119e57f4607893c6592827d79c69acd2792a",
+        "tree": "8b47461b2c425bd6cbca799681d3d575d77c51cf",
+        "paths": ["internal/translator/openai/claude/openai_claude_response.go", "internal/translator/openai/claude/openai_claude_response_test.go"],
+        "symbols": ["InterleavedContentChunk", "emitBufferedInterleavedContent"],
+        "sourceDigest": "bf3dfe9e1ddbe60e69e9f94a076d6a5f9bd30f9867403fd177270faf37c431f8"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-05"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": ["InterleavedChatContent", "chat_interleaved_tools_and_content_emit_strictly_sequential_blocks"]
+          }
+        ],
+        "fixtureIds": ["chat_interleaved_tools_and_content_emit_strictly_sequential_blocks"]
+      },
+      "reason": "Buffer interleaved text or reasoning until the active tool block closes, then release content in wire order."
+    },
+    {
+      "id": "CL-OBS-0006",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "helper_request_id",
+        "commit": "35a4723872a4a04aef053ba290eb362ccdf14d07",
+        "tree": "6aa32e34da77eb47b9f124ee1657e56f0bff6b1c",
+        "paths": ["internal/runtime/executor/claude_executor_request.go", "internal/runtime/executor/claude_executor_native_helper_test.go"],
+        "symbols": ["x-client-request-id", "isAnthropicBase"],
+        "sourceDigest": "fb80dac8f0f8d0bda2be9f71694b028213ec24bcabcfeb9e33e33488145ce60e"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-06"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": ["is_first_party_anthropic_url", "helper_request_id_follows_the_actual_upstream_base"]
+          }
+        ],
+        "fixtureIds": ["helper_request_id_follows_the_actual_upstream_base"]
+      },
+      "reason": "Generate the helper request ID only for the actual first-party Anthropic origin; custom bases preserve only caller input."
+    },
+    {
+      "id": "CL-OBS-0007",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "rate_limit_scope",
+        "commit": "44eaef0009f8464fd04db7ce4747a61244b7922e",
+        "tree": "7da13a81abee3bd8c3e43c4b49c1d14a94aa4cf7",
+        "paths": ["internal/runtime/executor/helps/claude_ratelimit.go", "internal/runtime/executor/helps/claude_ratelimit_test.go"],
+        "symbols": ["ClaudeHeadersIndicateUnifiedRateLimitRejection", "ParseClaudeRateLimitReset"],
+        "sourceDigest": "b216d000197f4b120c24f7d133a8afd6a2d53d35f43e83725faf3513f70152ff"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-N1"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "implementationTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["classify_claude_rate_limit", "claude_rate_limit_scope_decision_table_is_fail_closed", "mark_account_rate_limited_until_if_current"]
+          }
+        ],
+        "fixtureIds": ["claude_rate_limit_scope_decision_table_is_fail_closed"]
+      },
+      "reason": "Only complete, non-conflicting 5h or 7d rejection evidence may cool the Account; all ambiguous evidence remains at the narrowest scope."
+    },
+    {
+      "id": "CL-OBS-0008",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "caqs_signature_replay",
+        "commit": "75ce6352939fe9b7b5b5c52efe34d330bd078868",
+        "tree": "2fa33985e4e58b65c290fc372c85e5d56ae1c742",
+        "paths": ["internal/signature/claude_validation.go", "internal/signature/claude_test.go"],
+        "symbols": ["EnvelopeVersion >= 4", "TestClaudeCAQSSignature_ObservedFable51Sample"],
+        "sourceDigest": "c582ff2c9edec8c5e242125937a9b7ee97c0797eb5aa8f0f3c087177f34608e9"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-N2"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "implementationTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "contracts": [
+          {
+            "path": "src/proxy/reasoning_bridge.rs",
+            "anchors": ["anthropic_block_is_signed", "caqs_v4_signature_is_opaque_and_round_trips_without_local_synthesis"]
+          }
+        ],
+        "fixtureIds": ["caqs_v4_signature_is_opaque_and_round_trips_without_local_synthesis"]
+      },
+      "reason": "Treat CAQS v4 as an opaque vendor signature and preserve it byte-for-byte without parsing, synthesis, logging or metrics."
+    },
+    {
+      "id": "CL-OBS-0009",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "initial_turn_billing_fingerprint",
+        "commit": "377c315fd71f94158d957c99d083b08da7fbca51",
+        "tree": "eed8468b0079fb0d075fb36234e23c204284d9c2",
+        "paths": ["internal/runtime/executor/claude_executor_cloaking.go", "internal/runtime/executor/claude_cloaked_cache_repro_test.go"],
+        "symbols": ["claudeBillingFingerprintMessageText", "TestClaudeBillingFingerprintMultiTurnUsesFirstUserText"],
+        "sourceDigest": "3df17a63ca72674b0bffc11245669865aa7adc6d77706c677f38cd2abb20cef7"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-N3"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "implementationTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "contracts": [
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": ["first_user_text_for_billing", "initial_turn_fingerprint_is_stable_across_later_history_and_retry_rewrites"]
+          }
+        ],
+        "fixtureIds": ["initial_turn_fingerprint_is_stable_across_later_history_and_retry_rewrites"]
+      },
+      "reason": "Freeze only the initial-turn billing/session anchor before rewrites; credential cloaking and browser fingerprint simulation remain rejected."
+    },
+    {
+      "id": "CL-OBS-0010",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "standalone_tool_output",
+        "commit": "2bcebaa89c98871bded27cc8a8c1c4c97be25623",
+        "tree": "fc49a56730246254f0968673b3e0aa59876a2859",
+        "paths": ["internal/translator/claude/openai/responses/claude_openai-responses_request.go", "internal/translator/claude/openai/responses/claude_openai-responses_request_test.go"],
+        "symbols": ["ConvertOpenAIResponsesRequestToClaude", "TestConvertOpenAIResponsesRequestToClaude_StandaloneToolOutputBecomesUserText"],
+        "sourceDigest": "84494757c75ee561928f4142414c00afd3efffcd4490b498b1df5dfda59faf2a"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CL-N4"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "implementationTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": ["demote_unpaired_tool_results", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]
+          }
+        ],
+        "fixtureIds": ["openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]
+      },
+      "reason": "Demote standalone, mismatched or partial tool output to reversible user text and never synthesize a false pairing."
+    },
+    {
+      "id": "CL-OBS-0011",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "terminal_disconnect",
+        "commit": "7c32971b91c8bce3a199833d1e738bd883e6b92f",
+        "tree": "d327d807d36018c7fb4a013a999b441f720ebc14",
+        "paths": ["internal/runtime/executor/claude_executor_stream.go", "internal/runtime/executor/claude_executor_stream_terminal_test.go"],
+        "symbols": ["ExecuteStream", "TestClaudeExecutor_ExecuteStream_Passthrough_ClientDisconnectAfterTerminalEventIsNotFailed"],
+        "sourceDigest": "c5024357e4ac12a01db4a2e0b9c5802fd271e44c0f16fa89a30925a776d0ea6f"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-N4"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
+        "implementationTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["semantic_terminal_seen", "claude_message_stop_completes_before_upstream_eof_or_late_disconnect"]
+          }
+        ],
+        "fixtureIds": ["claude_message_stop_completes_before_upstream_eof_or_late_disconnect"]
+      },
+      "reason": "Complete and release the upstream body at the unique legal message_stop; disconnect before terminal remains a strict failure."
+    },
+    {
+      "id": "CL-OBS-0012",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "organization_hashed_identity",
+        "commit": "fc96a87fa66c0cfd8b4746449a178955229d9db8",
+        "tree": "727bdfe7d07bcc98d2256a014cd3713404fe94d5",
+        "paths": ["internal/auth/claude/filename.go", "internal/auth/claude/filename_test.go"],
+        "symbols": ["CredentialFileName", "FindMatchingLegacyCredential"],
+        "sourceDigest": "6b028f6fd9cab73f312d33933df77f4700c630217484f3928e4265f1d67bef47"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["CL-R1"],
+      "target": {
+        "baselineCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
+        "baselineTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["不迁入 organization-hash 账号迁移"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject filename-derived organization identity and credential migration because Account identity remains an explicit repository-owned binding."
+    },
+    {
+      "id": "CL-OBS-0013",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "rate_limit_scope",
+        "commit": "44eaef0009f8464fd04db7ce4747a61244b7922e",
+        "tree": "7da13a81abee3bd8c3e43c4b49c1d14a94aa4cf7",
+        "paths": ["internal/runtime/executor/helps/claude_ratelimit.go", "internal/runtime/executor/helps/claude_ratelimit_test.go"],
+        "symbols": ["ClaudeHeadersIndicateUnifiedRateLimitRejection", "ParseClaudeRateLimitReset"],
+        "sourceDigest": "b216d000197f4b120c24f7d133a8afd6a2d53d35f43e83725faf3513f70152ff"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CORE-N1"],
+      "target": {
+        "baselineCommit": "88a5b663d0e73317d2524c7d05f0da2d7227334e",
+        "baselineTree": "130e5c9c0ef6d051abab4057b7e9cd70d0448213",
+        "implementationCommit": "6b0a0fe1bf433e55a6f7f87de0324286701d889f",
+        "implementationTree": "126b3fba91048359a11fe00f1b086f437327bada",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/claude/mod.rs",
+            "anchors": ["record_quota_response_headers", "handle_rate_limit", "classify_rate_limit", "transport_replay_safe"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["claude_rate_limit_scope_decision_table_is_fail_closed", "claude_oauth_response_headers_update_one_quota_store_for_json_sse_and_429"]
+          }
+        ],
+        "fixtureIds": ["claude_rate_limit_scope_decision_table_is_fail_closed", "claude_oauth_response_headers_update_one_quota_store_for_json_sse_and_429"]
+      },
+      "reason": "Move Claude quota observation, 429 scope application and replay-safe transport decisions behind one Provider boundary without changing wire behavior."
+    },
+    {
+      "id": "CL-OBS-0014",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "caqs_signature_replay",
+        "commit": "75ce6352939fe9b7b5b5c52efe34d330bd078868",
+        "tree": "2fa33985e4e58b65c290fc372c85e5d56ae1c742",
+        "paths": ["internal/signature/claude_validation.go", "internal/signature/claude_test.go"],
+        "symbols": ["EnvelopeVersion >= 4", "TestClaudeCAQSSignature_ObservedFable51Sample"],
+        "sourceDigest": "c582ff2c9edec8c5e242125937a9b7ee97c0797eb5aa8f0f3c087177f34608e9"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["LIVE-N1"],
+      "target": {
+        "baselineCommit": "88a5b663d0e73317d2524c7d05f0da2d7227334e",
+        "baselineTree": "130e5c9c0ef6d051abab4057b7e9cd70d0448213",
+        "implementationCommit": "6b0a0fe1bf433e55a6f7f87de0324286701d889f",
+        "implementationTree": "126b3fba91048359a11fe00f1b086f437327bada",
+        "contracts": [
+          {
+            "path": "scripts/smoke/claude-real-receipt.mjs",
+            "anchors": ["operationSpecs", "oauth.claude_messages", "contract_verified", "live_pending"]
+          },
+          {
+            "path": "scripts/audit/claude-real-receipt.test.mjs",
+            "anchors": ["Claude real harness validates all four operation receipts independently", "Claude real harness never prints secrets or a raw failure body"]
+          }
+        ],
+        "fixtureIds": ["Claude real harness validates all four operation receipts independently", "Claude real harness never prints secrets or a raw failure body"]
+      },
+      "reason": "Add four current-commit private receipt gates; without real credentials every operation remains independently live_pending."
+    }
+  ]
 }
