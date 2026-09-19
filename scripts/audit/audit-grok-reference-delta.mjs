@@ -115,7 +115,13 @@ assert(capabilities.get("GR-05")?.runtimeEnabled === false, "GR-05 runtime gate 
 const enhancements = new Map(
   (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),
 );
-assert(enhancements.size === 1 && enhancements.has("GR-N1"), "Grok enhancement set changed");
+assert(
+  enhancements.size === 3 &&
+    enhancements.has("GR-N1") &&
+    enhancements.has("CORE-N1") &&
+    enhancements.has("LIVE-N1"),
+  "Grok enhancement set changed",
+);
 const qualityObservation = enhancements.get("GR-N1");
 assert(qualityObservation.status === "fixture_verified", "GR-N1 fixture status changed");
 for (const field of ["automaticRetry", "accountRotation", "responseMutation"]) {
@@ -146,6 +152,39 @@ for (const evidence of qualityObservation.localEvidence) {
     assert(source.includes(anchor), `GR-N1 is missing local anchor ${anchor}`);
   }
 }
+for (const id of ["CORE-N1", "LIVE-N1"]) {
+  const enhancement = enhancements.get(id);
+  assert(
+    enhancement.status === (id === "CORE-N1" ? "fixture_verified" : "live_pending"),
+    `${id} status changed`,
+  );
+  assert(
+    Array.isArray(enhancement.localEvidence) &&
+      enhancement.localEvidence.length === (id === "CORE-N1" ? 2 : 3),
+    `${id} local evidence set changed`,
+  );
+  for (const evidence of enhancement.localEvidence) {
+    safeRelative(evidence.path, `${id} local path`);
+    const localPath = path.join(repoRoot, evidence.path);
+    assert(fs.existsSync(localPath), `${id} local path is unavailable: ${evidence.path}`);
+    const source = fs.readFileSync(localPath, "utf8");
+    for (const anchor of evidence.anchors ?? []) {
+      assert(source.includes(anchor), `${id} is missing local anchor ${anchor}`);
+    }
+  }
+}
+assert(
+  enhancements.get("CORE-N1").wireChanged === false &&
+    enhancements.get("CORE-N1").bindingChanged === false &&
+    enhancements.get("CORE-N1").recoveryBudgetChanged === false,
+  "CORE-N1 changed Grok wire, binding, or recovery budget",
+);
+assert(
+  enhancements.get("LIVE-N1").operationScoped === true &&
+    enhancements.get("LIVE-N1").receiptsIndependent === true &&
+    enhancements.get("LIVE-N1").runtimeAutoEnable === false,
+  "LIVE-N1 receipt isolation changed",
+);
 
 const fixtureChecks = contract.fixtureAcceptance?.checks ?? [];
 assert(fixtureChecks.length === 14 && new Set(fixtureChecks).size === 14, "Grok fixture matrix changed");
@@ -157,20 +196,38 @@ assert(
 const acceptance = contract.realAcceptance;
 assert(acceptance?.receiptSchemaVersion === 1, "Grok receipt schema version changed");
 assert(
-  acceptance.requiredChecks?.length === 15 && new Set(acceptance.requiredChecks).size === 15,
-  "Grok real acceptance matrix changed",
+  acceptance.harnessRevision === 1,
+  "Grok receipt harness revision changed",
 );
-const receipts = new Map((acceptance.receipts ?? []).map((receipt) => [receipt.capability, receipt]));
-assert(receipts.size === 3, "Grok inference/media/compaction receipts must remain separate");
-for (const capability of ["inference", "media", "remote_compaction"]) {
-  const receipt = receipts.get(capability);
+const operations = new Map(
+  (acceptance.operations ?? []).map((entry) => [entry.operation, entry]),
+);
+assert(operations.size === 3, "Grok inference/media/compaction receipts must remain separate");
+const operationShapes = {
+  inference: [21, 10, 5],
+  media: [17, 6, 5],
+  remote_compaction: [15, 5, 5],
+};
+for (const [operation, [checkCount, hashCount, measurementCount]] of Object.entries(
+  operationShapes,
+)) {
+  const receipt = operations.get(operation);
   assert(
     receipt?.rail === "oauth" && receipt.status === "live_pending" && receipt.receipt === null,
-    `${capability} improperly claims live evidence`,
+    `${operation} improperly claims live evidence`,
+  );
+  assert(
+    receipt.requiredChecks?.length === checkCount &&
+      new Set(receipt.requiredChecks).size === checkCount &&
+      receipt.requiredBodyHashes?.length === hashCount &&
+      new Set(receipt.requiredBodyHashes).size === hashCount &&
+      receipt.requiredMeasurements?.length === measurementCount &&
+      new Set(receipt.requiredMeasurements).size === measurementCount,
+    `${operation} acceptance matrix changed`,
   );
 }
 assert(
-  receipts.get("remote_compaction")?.runtimeEnabled === false &&
+  operations.get("remote_compaction")?.runtimeEnabled === false &&
     contract.remoteCompactionGate?.runtimeEnabled === false &&
     contract.remoteCompactionGate?.requiresLiveOAuthReceipt === true,
   "Grok remote compaction gate opened without evidence",
@@ -182,7 +239,7 @@ assert(
 );
 
 console.log(
-  `grok reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancement, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks${
+  `grok reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancements, ${fixtureChecks.length} fixture checks, ${[...operations.values()].reduce((total, entry) => total + entry.requiredChecks.length, 0)} operation checks${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

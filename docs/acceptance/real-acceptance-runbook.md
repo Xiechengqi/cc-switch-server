@@ -61,7 +61,10 @@ STRICT=1 scripts/smoke/real-acceptance-env-check.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/router-share-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 scripts/smoke/oauth-readiness-check.sh
-node scripts/smoke/grok-oauth-real.mjs
+node scripts/smoke/grok-oauth-real.mjs # probe_only/live_pending
+CC_SWITCH_GROK_REAL_OPERATION=inference GROK_INFERENCE_REAL_RECEIPT_FILE=/secure/grok-inference.json node scripts/smoke/grok-real-receipt.mjs
+CC_SWITCH_GROK_REAL_OPERATION=media GROK_MEDIA_REAL_RECEIPT_FILE=/secure/grok-media.json node scripts/smoke/grok-real-receipt.mjs
+CC_SWITCH_GROK_REAL_OPERATION=remote_compaction GROK_REMOTE_COMPACTION_REAL_RECEIPT_FILE=/secure/grok-compaction.json node scripts/smoke/grok-real-receipt.mjs
 CC_SWITCH_QODER_REAL_RAIL=global_oauth QODER_REAL_RECEIPT_FILE=/tmp/qoder-global-oauth-receipt.json node scripts/smoke/qoder-real.mjs
 CC_SWITCH_QODER_REAL_RAIL=global_pat QODER_REAL_RECEIPT_FILE=/tmp/qoder-global-pat-receipt.json node scripts/smoke/qoder-real.mjs
 CC_SWITCH_QODER_REAL_RAIL=cn_oauth QODER_REAL_RECEIPT_FILE=/tmp/qoder-cn-oauth-receipt.json node scripts/smoke/qoder-real.mjs
@@ -177,6 +180,11 @@ credential.
 | `CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT` | Claude Max 20x OAuth 专项账号；缺失时 20x 等级验收必须记录为 blocked-inputs | 只记录脱敏 email 和计划显示名 |
 | `GEMINI_OAUTH_TEST_ACCOUNT` | Gemini OAuth/CLI 测试账号 | 记录脱敏 email |
 | `GROK_OAUTH_TEST_ACCOUNT` | Grok/xAI OAuth 测试账号 | 记录脱敏 email |
+| `CC_SWITCH_GROK_REAL_OPERATION` | 单次 Grok receipt operation：`inference`、`media` 或 `remote_compaction` | 可完整记录 |
+| `CC_SWITCH_GROK_<OP>_{PROVIDER,SHARE}_ID` | operation 固定的 Grok Provider/Share；`<OP>` 为 `INFERENCE`、`MEDIA` 或 `COMPACTION` | receipt 只记录 binding digest |
+| `CC_SWITCH_GROK_<OP>_MODEL` | 当前 fresh catalog 中的精确模型 | 可完整记录 |
+| `CC_SWITCH_GROK_SIGNED_USER` / `CC_SWITCH_GROK_SESSION_ID` / `CC_SWITCH_GROK_TURN_INDEX` | 固定签名用户、session 与 canonical u64 turn scope | receipt 只记录用户/session digest 和 turn |
+| `GROK_INFERENCE_REAL_RECEIPT_FILE` / `GROK_MEDIA_REAL_RECEIPT_FILE` / `GROK_REMOTE_COMPACTION_REAL_RECEIPT_FILE` | 对应 operation 的私有 receipt 仓库外绝对路径，真实模式权限必须为 `0600` | 只记录路径类别，不提交文件 |
 | `CURSOR_OAUTH_TEST_ACCOUNT` | Cursor OAuth 测试账号 | 记录脱敏 email |
 | `CC_SWITCH_CURSOR_REAL_RAIL` | 单次 Cursor 验收 rail：`oauth` 或 `api_key` | 可完整记录 |
 | `CC_SWITCH_CURSOR_<RAIL>_{PROVIDER,SHARE}_ID` | 当前 Cursor rail 的显式固定 Provider/Share 绑定；`<RAIL>` 为 `OAUTH` 或 `API_KEY` | receipt 只记录 binding/scope digest |
@@ -202,8 +210,8 @@ credential.
 | `GROK_OAUTH_REFRESH_TOKEN_FIXTURE` | Grok OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `GROK_OAUTH_AUTH_JSON_FIXTURE` | 显式粘贴的 Grok auth.json fixture | 不记录内容或路径中的账号信息 |
 | `GROK_OAUTH_CALLBACK_URL` | Grok 固定 loopback callback，默认 `http://127.0.0.1:56121/callback` | 可完整记录 |
-| `CC_SWITCH_GROK_MODEL` | Grok 单模型验收值，默认 `grok-4.6` | 可完整记录 |
-| `CC_SWITCH_GROK_MEDIA_SMOKE` | `1` 时额外运行短图片生成 | 可完整记录 |
+| `CC_SWITCH_GROK_MODEL` | Grok normal-path probe 模型，默认 `grok-4.6` | 可完整记录；不能关闭 live gate |
+| `CC_SWITCH_GROK_MEDIA_SMOKE` | `1` 时在 probe 中额外运行短图片生成 | 可完整记录；不能替代 media receipt |
 | `CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE` | Cursor OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE` | Antigravity/Agy OAuth 手动导入 refresh token fixture | 不记录明文 |
 | `CURSOR_API_KEY_FIXTURE` | Cursor API Key 真实验收 fixture | 不记录明文 |
@@ -331,8 +339,9 @@ Grok OAuth 单账号专项补充：
 11. `/v1/models?app=codex&providerId=<id>` 必须返回当前账号的模型及 `source`、`stale`、`fetchedAtMs`，Provider 控制面 raw 还应包含保守的 model family 与 account capability manifest。依次验收 upstream、权威成功空目录、TTL fresh cache、ETag 304、network/408/429/5xx 后的同 scope last-known-good；无缓存时必须失败，禁止 static fallback。缓存 scope 必须同时匹配 app、Provider revision/runtime fingerprint、Account、`authIdentityGeneration` 与 `tokenRefreshGeneration`。首次 models 401 只强刷并重放原账号一次；第二个 401、403、坏 JSON、超大 body、未绑定、stale generation/plan 或 degraded persistence 均失败关闭，其他账号和静态 models 请求数为零。
 12. 将 Grok CLI version 降到已知不受支持值并触发上游 version gate，确认下游错误改写为面向管理员的 `CC_SWITCH_GROK_CLI_VERSION` / `CC_SWITCH_GROK_CLI_USER_AGENT` 指引，raw token/账号不泄漏，`cc_switch_grok_cli_version_gate_total` 增加；恢复默认 `0.2.111` 后重测。
 13. Quota 抓包同时覆盖 user、weekly、monthly、task usage 和 subscriptions。`currentPeriod.end`、`billingPeriodEnd`、token expiry 及 inactive subscription 不能成为订阅到期日；仅 active subscription 的明确 expiry 或账号手工 next-payment 值可进入 UI，且不影响凭据有效性和路由。
-14. 运行 `node scripts/smoke/grok-oauth-real.mjs`，通过同一个 `CC_SWITCH_SHARE_URL` 验收 models metadata、Responses JSON/完整 SSE terminal，以及 OpenAI Chat 非流式和流式合同。Chat 非流式必须包含正整数 Unix 秒 `created`；流式每个 `chat.completion.chunk` 必须包含同一个正整数 `created`，并观察到 `finish_reason`、usage 信息和唯一 `[DONE]`。只有显式设置 `CC_SWITCH_GROK_MEDIA_SMOKE=1` 才运行图片；缺少 Share URL/Router token 或仍为占位符时的 `SKIP` 只能记录为 blocked-inputs，不能记录为真实通过。
+14. 运行 `node scripts/smoke/grok-oauth-real.mjs`，通过同一个 `CC_SWITCH_SHARE_URL` 验收 models metadata、Responses JSON/完整 SSE terminal，以及 OpenAI Chat 非流式和流式合同。Chat 非流式必须包含正整数 Unix 秒 `created`；流式每个 `chat.completion.chunk` 必须包含同一个正整数 `created`，并观察到 `finish_reason`、usage 信息和唯一 `[DONE]`。只有显式设置 `CC_SWITCH_GROK_MEDIA_SMOKE=1` 才运行图片。该脚本固定是 `probe_only/live_pending`；`SKIP` 只能记录为 blocked-inputs，任何正常路径成功都不能关闭 live gate。
 15. 检查 `/metrics` 中 Provider outcome、forward retry、WS fallback、CLI version gate、model catalog、账号 in-flight/max、warm refresh 和 persistence degraded 指标；labels 和 evidence 只含有界分类、Provider id、模型和脱敏账号，不得包含 access/refresh/ID token 或 raw OAuth/upstream body。
+16. 以 `inference`、`media`、`remote_compaction` 三个 operation 分别运行 `grok-real-receipt.mjs`。每份仓库外 `0600` receipt 必须绑定当前 target commit、同一固定 OAuth Account auth/token generation、Provider revision/runtime、Share revision、签名用户、精确 model/session/turn 和 fresh catalog，并完整提供该 operation 的 checks、body hashes、measurements、恢复决策、零 decoy 请求与 secret scan。fixture 只能得到 `contract_verified/live_pending`；任一 operation 成功不能外推另外两个。remote compaction receipt 也不得自动修改 `runtimeEnabled=false`，启用前仍需独立安全设计评审。
 
 Qoder 三条单账号 rail 专项补充：
 
@@ -417,7 +426,7 @@ Claude OAuth 专项补充：
 26. `max_5x_plan` 与 `max_20x_plan` 都强制调用 `quota?refresh=true&force=true`，要求分别得到 `claude_max_5x` / `claude_max_20x`、`stale=false`、`conflict=false` 且 observedAt 在 freshness window 内。`fable_5_1` 额外要求精确模型 `claude-fable-5-1` 和 fresh Max 20x projection。20x 本地 fixture 与 5x 同形解析规则都不能代替厂商证据；实时证据冲突、缓存计划、通用 Max 或模型 fallback 一律失败关闭。
 27. receipt 只允许保存 operation、当前提交、harness revision、UTC 时间、精确 model、检查结果、脱敏 body hash、generation/revision、canonical plan projection、恢复决策、decoy 请求计数和 secret scan 结果。不得保存 Account/email、Authorization/Cookie/token、CAQS/opaque reasoning、prompt、原始 header、完整 profile/bootstrap/roles/usage/body 或错误正文。fixture harness 只能得到 `contract_verified/live_pending`；缺少任一输入时 readiness 必须为 `blocked_inputs`，不得写 `live_verified`。
 
-Grok 与 Amazon Q 的真实输入作为独立 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
+Grok 的 inference/media/remote-compaction 三个 receipt 和 normal-path probe、Amazon Q 的真实输入都作为彼此独立的 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
 
 ## 脱敏 Evidence
 
@@ -428,6 +437,7 @@ Grok 与 Amazon Q 的真实输入作为独立 external gate 接入环境检查�
 - `scripts/smoke/code-agent-regression.sh`
 - `scripts/smoke/oauth-readiness-check.sh`
 - `scripts/smoke/grok-oauth-real.mjs`
+- `scripts/smoke/grok-real-receipt.mjs`
 - `scripts/smoke/copilot-real.mjs`
 - `scripts/release-readiness.sh`
 

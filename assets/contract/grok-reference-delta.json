@@ -104,7 +104,7 @@
       "path": "docs/provider/grok-oauth.md",
       "anchors": [
         "Grok reasoning replay 与恢复",
-        "推理和媒体 capability receipt 必须分别留证"
+        "推理、媒体与 remote compaction receipt 必须分别留证"
       ]
     },
     {
@@ -156,6 +156,64 @@
           ]
         }
       ]
+    },
+    {
+      "id": "CORE-N1",
+      "status": "fixture_verified",
+      "wireChanged": false,
+      "bindingChanged": false,
+      "recoveryBudgetChanged": false,
+      "localEvidence": [
+        {
+          "path": "src/proxy/providers/grok/mod.rs",
+          "anchors": [
+            "prepare_http_replay",
+            "prepare_transport_replay",
+            "clear_rejected_and_reset",
+            "binding_is_current"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "grok_provider::prepare_http_replay",
+            "grok_provider::ReplayStreamWrite::new",
+            "grok_provider::commit"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "LIVE-N1",
+      "status": "live_pending",
+      "operationScoped": true,
+      "receiptsIndependent": true,
+      "runtimeAutoEnable": false,
+      "localEvidence": [
+        {
+          "path": "scripts/smoke/grok-real-receipt.mjs",
+          "anchors": [
+            "Grok normal-path probing and acceptance are intentionally separate",
+            "current target commit is unavailable",
+            "Grok receipt file must stay outside the repository"
+          ]
+        },
+        {
+          "path": "scripts/audit/grok-real-receipt.test.mjs",
+          "anchors": [
+            "validates all three operations independently",
+            "reports missing operation inputs without promotion",
+            "never prints secrets or raw failure bodies"
+          ]
+        },
+        {
+          "path": "scripts/smoke/grok-oauth-real.mjs",
+          "anchors": [
+            "probe_only",
+            "liveState=live_pending"
+          ]
+        }
+      ]
     }
   ],
   "fixtureAcceptance": {
@@ -179,43 +237,134 @@
   },
   "realAcceptance": {
     "receiptSchemaVersion": 1,
-    "scopeDigest": "sha256 lowercase hex over a private canonical Provider/Account/Share/user/session scope; raw identities and credentials are excluded",
-    "requiredChecks": [
-      "reasoning_capture_replay_reject",
-      "parallel_tools",
-      "http_json",
-      "sse",
-      "websocket",
-      "version_gate",
-      "rate_limit_cooldown",
-      "search_ownership",
-      "media_ownership",
-      "catalog_fresh",
-      "catalog_authoritative_empty",
-      "catalog_transient_stale",
-      "identity_generation_drift",
-      "share_binding_drift",
-      "session_turn_drift"
-    ],
-    "receipts": [
+    "harnessRevision": 1,
+    "scopeDigest": "sha256 lowercase hex over operation, current target commit, one Grok OAuth Account auth/token generation, one Provider revision/runtime, one Share revision, signed-user namespace, exact model/session/turn, and a fresh catalog snapshot; raw identities, credentials, prompts, and bodies are excluded",
+    "operations": [
       {
-        "capability": "inference",
+        "operation": "inference",
         "rail": "oauth",
         "status": "live_pending",
-        "receipt": null
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share_user",
+          "exact_model_session_turn",
+          "fresh_catalog",
+          "authoritative_empty_catalog",
+          "transient_stale_catalog",
+          "http_json_terminal_usage",
+          "sse_terminal_usage",
+          "websocket_terminal_usage",
+          "reasoning_capture_replay_reject",
+          "parallel_tools",
+          "search_ownership",
+          "version_gate",
+          "same_account_first_401_recovery",
+          "second_401_terminal",
+          "rate_limit_cooldown",
+          "identity_generation_drift",
+          "share_binding_drift",
+          "session_turn_drift",
+          "no_post_commit_replay",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "catalog",
+          "http_json",
+          "sse",
+          "websocket",
+          "reasoning_capture",
+          "reasoning_replay",
+          "reasoning_rejection",
+          "parallel_tools",
+          "version_gate",
+          "rate_limit"
+        ],
+        "requiredMeasurements": [
+          "httpRuns",
+          "sseRuns",
+          "websocketRuns",
+          "reasoningTurns",
+          "parallelToolCalls"
+        ]
       },
       {
-        "capability": "media",
+        "operation": "media",
         "rail": "oauth",
         "status": "live_pending",
-        "receipt": null
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share_user",
+          "exact_model_session_turn",
+          "fresh_catalog",
+          "image_generation",
+          "image_edit",
+          "video_generation_poll",
+          "capability_restart_persistence",
+          "media_task_sticky_binding",
+          "same_account_first_401_recovery",
+          "second_401_terminal",
+          "rate_limit_cooldown",
+          "invalid_input_zero_upstream",
+          "decompression_body_bounds",
+          "identity_generation_drift",
+          "share_binding_drift",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "catalog",
+          "image_generation",
+          "image_edit",
+          "video_generation",
+          "video_poll",
+          "rate_limit"
+        ],
+        "requiredMeasurements": [
+          "mediaRuns",
+          "imageBytes",
+          "editInputBytes",
+          "videoPolls",
+          "restartRuns"
+        ]
       },
       {
-        "capability": "remote_compaction",
+        "operation": "remote_compaction",
         "rail": "oauth",
         "status": "live_pending",
         "runtimeEnabled": false,
-        "receipt": null
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share_user",
+          "exact_model_session_turn",
+          "fresh_catalog",
+          "runtime_gate_disabled",
+          "upstream_protocol_acceptance",
+          "oauth_rail_exact",
+          "session_turn_scope",
+          "failure_semantics",
+          "no_web_cookie",
+          "no_cross_account_cache",
+          "no_pool_or_routing",
+          "identity_generation_drift",
+          "share_binding_drift",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "catalog",
+          "upstream_request",
+          "upstream_response",
+          "upstream_error",
+          "runtime_rejection"
+        ],
+        "requiredMeasurements": [
+          "upstreamRuns",
+          "failureRuns",
+          "runtimeRejectedRequests",
+          "sessionScopes",
+          "turnScopes"
+        ]
       }
     ]
   },

@@ -24,6 +24,21 @@ function runEnvCheck(overrides) {
       STRICT: "0",
       EVIDENCE_FILE: evidenceFile,
       GROK_OAUTH_TEST_ACCOUNT: "",
+      CC_SWITCH_GROK_SIGNED_USER: "",
+      CC_SWITCH_GROK_SESSION_ID: "",
+      CC_SWITCH_GROK_TURN_INDEX: "",
+      CC_SWITCH_GROK_INFERENCE_PROVIDER_ID: "",
+      CC_SWITCH_GROK_INFERENCE_SHARE_ID: "",
+      CC_SWITCH_GROK_INFERENCE_MODEL: "",
+      GROK_INFERENCE_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_GROK_MEDIA_PROVIDER_ID: "",
+      CC_SWITCH_GROK_MEDIA_SHARE_ID: "",
+      CC_SWITCH_GROK_MEDIA_MODEL: "",
+      GROK_MEDIA_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_GROK_COMPACTION_PROVIDER_ID: "",
+      CC_SWITCH_GROK_COMPACTION_SHARE_ID: "",
+      CC_SWITCH_GROK_COMPACTION_MODEL: "",
+      GROK_REMOTE_COMPACTION_REAL_RECEIPT_FILE: "",
       CC_SWITCH_SHARE_URL: "",
       ROUTER_API_TOKEN: "",
       CLAUDE_OAUTH_TEST_ACCOUNT: "",
@@ -127,6 +142,9 @@ test("Claude operation receipts and Grok external input gates remain isolated", 
     ROUTER_API_TOKEN: "router-token",
   });
   assert.equal(grokReady.checks.grokGateStatus, "inputs-ready");
+  assert.equal(grokReady.checks.grokInferenceGateStatus, "blocked-inputs");
+  assert.equal(grokReady.checks.grokMediaGateStatus, "blocked-inputs");
+  assert.equal(grokReady.checks.grokRemoteCompactionGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeOauthInferenceGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeMax5xGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeMax20xGateStatus, "blocked-inputs");
@@ -155,6 +173,48 @@ test("Claude operation receipts and Grok external input gates remain isolated", 
   assert.equal(maxReady.checks.claudeFable51GateStatus, "blocked-inputs");
   assert.equal(maxReady.longTailInputsPresent.claudeMax5xProviderId, true);
   assert.equal(maxReady.longTailInputsPresent.claudeMax20xReceiptFile, true);
+});
+
+test("Grok inference, media, and compaction receipts remain independently gated", () => {
+  const common = {
+    STAGE: "AB6",
+    GROK_OAUTH_TEST_ACCOUNT: "grok-test-account",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://grok-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    CC_SWITCH_GROK_SIGNED_USER: "signed-user@example.test",
+    CC_SWITCH_GROK_SESSION_ID: "grok-session",
+    CC_SWITCH_GROK_TURN_INDEX: "7",
+  };
+  const inference = runEnvCheck({
+    ...common,
+    CC_SWITCH_GROK_INFERENCE_PROVIDER_ID: "grok-inference-provider",
+    CC_SWITCH_GROK_INFERENCE_SHARE_ID: "grok-inference-share",
+    CC_SWITCH_GROK_INFERENCE_MODEL: "grok-4.6",
+    GROK_INFERENCE_REAL_RECEIPT_FILE: "/tmp/grok-inference.json",
+  });
+  assert.equal(inference.checks.grokInferenceGateStatus, "inputs-ready");
+  assert.equal(inference.checks.grokMediaGateStatus, "blocked-inputs");
+  assert.equal(inference.checks.grokRemoteCompactionGateStatus, "blocked-inputs");
+  assert.equal(inference.longTailInputsPresent.grokInferenceReceiptFile, true);
+
+  const mediaAndCompaction = runEnvCheck({
+    ...common,
+    CC_SWITCH_GROK_MEDIA_PROVIDER_ID: "grok-media-provider",
+    CC_SWITCH_GROK_MEDIA_SHARE_ID: "grok-media-share",
+    CC_SWITCH_GROK_MEDIA_MODEL: "grok-4.6",
+    GROK_MEDIA_REAL_RECEIPT_FILE: "/tmp/grok-media.json",
+    CC_SWITCH_GROK_COMPACTION_PROVIDER_ID: "grok-compaction-provider",
+    CC_SWITCH_GROK_COMPACTION_SHARE_ID: "grok-compaction-share",
+    CC_SWITCH_GROK_COMPACTION_MODEL: "grok-4.6",
+    GROK_REMOTE_COMPACTION_REAL_RECEIPT_FILE: "/tmp/grok-compaction.json",
+  });
+  assert.equal(mediaAndCompaction.checks.grokInferenceGateStatus, "blocked-inputs");
+  assert.equal(mediaAndCompaction.checks.grokMediaGateStatus, "inputs-ready");
+  assert.equal(mediaAndCompaction.checks.grokRemoteCompactionGateStatus, "inputs-ready");
+  assert.equal(mediaAndCompaction.longTailInputsPresent.grokMediaReceiptFile, true);
+  assert.equal(mediaAndCompaction.longTailInputsPresent.grokCompactionReceiptFile, true);
 });
 
 test("Antigravity and Agy external gates require independent bindings and receipts", () => {

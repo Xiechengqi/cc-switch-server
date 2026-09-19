@@ -77,16 +77,15 @@ use super::claude_oauth::ClaudeBodyRetryStage;
 use super::claude_quota_headers::parse_anthropic_reset_header;
 use super::deepseek;
 use super::execution::context::{
-    AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CacheSnapshotOwnership,
-    CommitGuard, DelaySource, RecoveryStage, RetryDecision,
+    AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CommitGuard, DelaySource,
+    RecoveryStage, RetryDecision,
 };
 use super::execution::transport::{
     wait_with_downstream_cancellation as wait_codex_http_fallback,
     DownstreamWait as CodexHttpFallbackWait,
 };
-use super::grok_replay::{
-    GrokReplayProof, GrokReplayScope, GrokReplaySnapshot, GrokReplayStreamAccumulator,
-};
+#[cfg(test)]
+use super::grok_replay::GrokReplayScope;
 use super::kimi_runtime::{
     kimi_thinking_replay_model_family, kimi_thinking_replay_user_namespace,
     restore_kimi_thinking_replay_content, KimiThinkingReplayScope, KimiThinkingReplaySnapshot,
@@ -107,7 +106,7 @@ use super::providers::claude::{
     RateLimitDecision as ClaudeRateLimitDecision, RateLimitEvidence as ClaudeRateLimitEvidence,
     RateLimitScope as ClaudeRateLimitScope,
 };
-use super::providers::{antigravity, claude, codex, cursor};
+use super::providers::{antigravity, claude, codex, cursor, grok as grok_provider};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
@@ -2602,7 +2601,7 @@ async fn forward_with_attempt(
         )
         .await;
 
-        let grok_reasoning_replay = prepare_grok_reasoning_replay(
+        let grok_reasoning_replay = grok_provider::prepare_http_replay(
             &state,
             &execution,
             &request_context,
@@ -2798,7 +2797,7 @@ async fn forward_with_attempt(
             && attempt_context.retry_allowed()
             && grok_reasoning_replay
                 .as_ref()
-                .is_some_and(|context| context.replay_applied)
+                .is_some_and(grok_provider::ReplayWriteContext::replay_applied)
         {
             let (response_bytes, response_transport_memory) =
                 read_response_body_limited_with_memory(
@@ -2816,7 +2815,7 @@ async fn forward_with_attempt(
                 attempt_context.request_memory(),
             )?;
             if super::grok_replay::is_explicit_rejection(status.as_u16(), &decoded.body) {
-                clear_rejected_grok_reasoning_replay(&state, grok_reasoning_replay.as_ref()).await;
+                grok_provider::clear_rejected(&state, grok_reasoning_replay.as_ref()).await;
                 if let Some(next_attempt) =
                     attempt_context.after_grok_reasoning_recovery(&execution)
                 {
@@ -4208,12 +4207,9 @@ async fn forward_with_attempt(
                 grok_responses_sse,
                 grok_search_identity,
                 grok_search_evidence_recorded: false,
-                grok_reasoning_replay: grok_reasoning_replay.clone().map(|context| {
-                    GrokReplayStreamWrite {
-                        context,
-                        accumulator: GrokReplayStreamAccumulator::default(),
-                    }
-                }),
+                grok_reasoning_replay: grok_reasoning_replay
+                    .clone()
+                    .map(grok_provider::ReplayStreamWrite::new),
                 antigravity_reasoning_replay: antigravity_reasoning_replay.clone().map(|context| {
                     antigravity::ReplayStreamWrite::new(context, adapter_request.body.clone())
                 }),
@@ -5447,8 +5443,7 @@ async fn forward_with_attempt(
                 kimi_thinking_replay_content,
             )
             .await;
-            commit_grok_reasoning_replay(&state, grok_reasoning_replay.as_ref(), grok_replay_proof)
-                .await;
+            grok_provider::commit(&state, grok_reasoning_replay.as_ref(), grok_replay_proof).await;
         }
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
@@ -10614,7 +10609,7 @@ async fn bridge_responses_websocket_inner(
     let mut semantic_provider_outcome_recorded = false;
     let mut active_response_body = None;
     let mut active_response_intent = None;
-    let mut active_grok_reasoning_replay: Option<GrokReplayStreamWrite> = None;
+    let mut active_grok_reasoning_replay: Option<grok_provider::ReplayStreamWrite> = None;
     let mut active_grok_quality_observer: Option<Box<super::grok::GrokQualityObserver>> = None;
     let mut active_grok_reasoning_retry_message: Option<TungsteniteMessage> = None;
     let mut active_grok_reasoning_recovery_attempted = false;
@@ -10898,10 +10893,7 @@ async fn bridge_responses_websocket_inner(
                         .as_ref()
                         .and(grok_reasoning_retry_message);
                     active_grok_reasoning_replay =
-                        grok_reasoning_replay.map(|context| GrokReplayStreamWrite {
-                            context,
-                            accumulator: GrokReplayStreamAccumulator::default(),
-                        });
+                        grok_reasoning_replay.map(grok_provider::ReplayStreamWrite::new);
                     active_grok_quality_observer = matches!(mode, ResponsesWebsocketMode::Grok)
                         .then(|| Box::new(super::grok::GrokQualityObserver::new(true)));
                     active_grok_reasoning_recovery_attempted = false;
@@ -11134,14 +11126,11 @@ async fn bridge_responses_websocket_inner(
                 if starts_response
                     && matches!(mode, ResponsesWebsocketMode::Grok)
                     && active_grok_reasoning_replay.as_ref().is_some()
-                    && !grok_reasoning_replay_binding_is_current(
-                        state,
-                        &active_grok_reasoning_replay
-                            .as_ref()
-                            .expect("checked Grok replay context")
-                            .context,
-                    )
-                    .await
+                    && !active_grok_reasoning_replay
+                        .as_ref()
+                        .expect("checked Grok replay context")
+                        .binding_is_current(state)
+                        .await
                 {
                     let original = active_grok_reasoning_retry_message
                         .as_ref()
@@ -11167,16 +11156,14 @@ async fn bridge_responses_websocket_inner(
                             "Grok replay scope changed before the request was sent",
                         )
                     })?;
-                    if !grok_reasoning_replay_binding_is_current(state, &refreshed).await {
+                    if !grok_provider::binding_is_current(state, &refreshed).await {
                         return Err(ProxyError::conflict(
                             "Grok Provider or Account changed before the request was sent",
                         ));
                     }
                     active_response_body = Some(responses_websocket_http_body(&message)?);
-                    active_grok_reasoning_replay = Some(GrokReplayStreamWrite {
-                        context: refreshed,
-                        accumulator: GrokReplayStreamAccumulator::default(),
-                    });
+                    active_grok_reasoning_replay =
+                        Some(grok_provider::ReplayStreamWrite::new(refreshed));
                     active_grok_reasoning_retry_message = Some(original);
                     crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
                 }
@@ -11804,7 +11791,7 @@ async fn bridge_responses_websocket_inner(
                 if response_in_flight {
                     if let Some(bytes) = websocket_message_payload(&message) {
                         if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                            replay.accumulator.push(bytes);
+                            replay.inspect(bytes);
                         }
                     }
                 }
@@ -11816,7 +11803,7 @@ async fn bridge_responses_websocket_inner(
                     })
                     && active_grok_reasoning_replay
                         .as_ref()
-                        .is_some_and(|replay| replay.context.replay_applied)
+                        .is_some_and(grok_provider::ReplayStreamWrite::replay_applied)
                     && grok_reasoning_rejection_from_websocket_message(&message)
                     && active_attempt.reserve_in_place(
                         &execution,
@@ -11833,10 +11820,7 @@ async fn bridge_responses_websocket_inner(
                     };
                     let retry_body = responses_websocket_http_body(&retry_message)?;
                     if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                        clear_rejected_grok_reasoning_replay(state, Some(&replay.context)).await;
-                        replay.context.replay_applied = false;
-                        replay.context.read = None;
-                        replay.accumulator = GrokReplayStreamAccumulator::default();
+                        replay.clear_rejected_and_reset(state).await;
                     }
                     pending_lifecycle_messages.clear();
                     if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
@@ -12188,8 +12172,7 @@ async fn bridge_responses_websocket_inner(
                             );
                         }
                         if let Some(replay) = active_grok_reasoning_replay.take() {
-                            let proof = replay.accumulator.finish();
-                            commit_grok_reasoning_replay(state, Some(&replay.context), proof).await;
+                            replay.commit(state).await;
                         }
                     } else {
                         active_grok_reasoning_replay = None;
@@ -14086,13 +14069,13 @@ async fn prepare_grok_reasoning_replay_websocket(
     session_id: Option<&str>,
     upstream_url: &str,
     message: &mut TungsteniteMessage,
-) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
+) -> Result<Option<grok_provider::ReplayWriteContext>, ProxyError> {
     let body = responses_websocket_http_body(message)?;
     let original = serde_json::to_vec(&body).map_err(|error| {
         ProxyError::bad_request(format!("encode Grok response.create body: {error}"))
     })?;
     let mut encoded = Bytes::from(original.clone());
-    let context = prepare_grok_reasoning_replay_for_transport(
+    let context = grok_provider::prepare_transport_replay(
         state,
         execution,
         request_context,
@@ -24160,314 +24143,6 @@ fn codex_image_tool_rejection_body(body: &[u8]) -> bool {
         .any(|marker| text.contains(marker))
 }
 
-async fn prepare_grok_reasoning_replay(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    request_context: &UsageLogContext,
-    headers: &HeaderMap,
-    upstream_url: &str,
-    suppress_replay: bool,
-    body: &mut Bytes,
-) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
-    prepare_grok_reasoning_replay_for_transport(
-        state,
-        execution,
-        request_context,
-        super::grok::turn_index_from_headers(headers),
-        request_context.session_id.as_deref(),
-        upstream_url,
-        "http",
-        suppress_replay,
-        body,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prepare_grok_reasoning_replay_for_transport(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    request_context: &UsageLogContext,
-    turn_index: Option<u64>,
-    session_id: Option<&str>,
-    upstream_url: &str,
-    rail: &'static str,
-    suppress_replay: bool,
-    body: &mut Bytes,
-) -> Result<Option<GrokReplayWriteContext>, ProxyError> {
-    if !execution.driver_is("oauth.grok_responses") {
-        return Ok(None);
-    }
-    let Some(turn_index) = turn_index else {
-        crate::metrics::record_grok_reasoning_replay("turn_absent", 1);
-        return Ok(None);
-    };
-    let Some(share_id) = request_context
-        .share_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        crate::metrics::record_grok_reasoning_replay("share_absent", 1);
-        return Ok(None);
-    };
-    let Some(user_namespace) = request_context
-        .user_email
-        .as_deref()
-        .and_then(super::grok_replay::user_namespace)
-    else {
-        crate::metrics::record_grok_reasoning_replay("user_absent", 1);
-        return Ok(None);
-    };
-    let session_id = session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a session"))?;
-    let document = serde_json::from_slice::<Value>(body)
-        .map_err(|_| ProxyError::bad_request("Grok reasoning replay request is invalid"))?;
-    let model_family = super::grok_replay::model_family(
-        document
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay requires a model"))?,
-    )
-    .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay model is invalid"))?;
-    let upstream_plane = reqwest::Url::parse(upstream_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay plane is invalid"))?;
-    let (provider_type, account_id, auth_identity_generation) = execution
-        .managed_account_identity_target()
-        .filter(|(provider_type, _, _)| *provider_type == ProviderType::GrokOAuth)
-        .ok_or_else(|| ProxyError::bad_request("Grok Provider must bind one Account"))?;
-    let account = state
-        .find_account_for_provider(provider_type, account_id)
-        .await
-        .filter(|account| account.auth_identity_generation == auth_identity_generation)
-        .ok_or_else(|| ProxyError::bad_request("Grok Account generation drifted"))?;
-    let token_refresh_generation = account.token_refresh_generation;
-    let derive = |turn| {
-        GrokReplayScope::derive(
-            execution.plan.provider_key.app.as_str(),
-            &execution.stored.provider.id,
-            execution.plan.provider_revision,
-            &execution.plan.runtime_fingerprint,
-            account_id,
-            auth_identity_generation,
-            token_refresh_generation,
-            share_id,
-            &user_namespace,
-            session_id,
-            turn,
-            &model_family,
-            rail,
-            &upstream_plane,
-        )
-    };
-    let write_scope = derive(turn_index)
-        .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
-    let now_ms = grok_replay_now_ms();
-    let (_, write_snapshot) = state.grok_reasoning_replays.get(&write_scope, now_ms).await;
-    let mut read = None;
-    let mut replay_applied = false;
-    if turn_index > 0 && !suppress_replay {
-        let read_scope = derive(turn_index - 1)
-            .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay scope is incomplete"))?;
-        let (proof, snapshot) = state.grok_reasoning_replays.get(&read_scope, now_ms).await;
-        let ownership = CacheSnapshotOwnership::from_hit(
-            "grok_reasoning_read",
-            read_scope.ownership_digest(),
-            snapshot.generation(),
-        );
-        read = Some((read_scope.clone(), snapshot, ownership.clone()));
-        if let Some(proof) = proof {
-            let result = super::grok_replay::apply(body, &proof);
-            if result.context_mismatch {
-                crate::metrics::record_grok_reasoning_replay("context_mismatch", 1);
-                if ownership.authorize_mutation(
-                    "grok_reasoning_read",
-                    &read_scope.ownership_digest(),
-                    snapshot.generation(),
-                ) {
-                    state
-                        .grok_reasoning_replays
-                        .delete_if_unchanged(&read_scope, snapshot, now_ms)
-                        .await;
-                }
-                return Err(ProxyError::bad_request(
-                    "Grok reasoning replay context does not match the cached turn",
-                ));
-            }
-            if result.applied {
-                *body = result.body;
-                replay_applied = true;
-                crate::metrics::record_grok_reasoning_replay("hit", 1);
-            } else {
-                crate::metrics::record_grok_reasoning_replay("present_noop", 1);
-            }
-        } else {
-            crate::metrics::record_grok_reasoning_replay("miss", 1);
-        }
-    }
-    Ok(Some(GrokReplayWriteContext {
-        read,
-        write_ownership: CacheSnapshotOwnership::from_hit(
-            "grok_reasoning_write",
-            write_scope.ownership_digest(),
-            write_snapshot.generation(),
-        ),
-        write_scope,
-        write_snapshot,
-        replay_applied,
-        app: execution.plan.provider_key.app,
-        provider_id: execution.stored.provider.id.clone(),
-        provider_revision: execution.plan.provider_revision,
-        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
-        account_id: account_id.to_string(),
-        auth_identity_generation,
-        token_refresh_generation,
-        share_id: share_id.to_string(),
-    }))
-}
-
-async fn clear_rejected_grok_reasoning_replay(
-    state: &ServerState,
-    context: Option<&GrokReplayWriteContext>,
-) {
-    let Some((scope, snapshot, ownership)) = context
-        .filter(|context| context.replay_applied)
-        .and_then(|context| context.read.as_ref())
-    else {
-        return;
-    };
-    if !ownership.authorize_mutation(
-        "grok_reasoning_read",
-        &scope.ownership_digest(),
-        snapshot.generation(),
-    ) {
-        crate::metrics::record_grok_reasoning_replay("rejection_ownership_denied", 1);
-        return;
-    }
-    let deleted = state
-        .grok_reasoning_replays
-        .delete_if_unchanged(scope, *snapshot, grok_replay_now_ms())
-        .await;
-    crate::metrics::record_grok_reasoning_replay(
-        if deleted {
-            "rejection_deleted"
-        } else {
-            "rejection_cas_conflict"
-        },
-        1,
-    );
-}
-
-async fn commit_grok_reasoning_replay(
-    state: &ServerState,
-    context: Option<&GrokReplayWriteContext>,
-    proof: Option<GrokReplayProof>,
-) {
-    let Some(context) = context else {
-        return;
-    };
-    if !grok_reasoning_replay_binding_is_current(state, context).await {
-        crate::metrics::record_grok_reasoning_replay("binding_drift", 1);
-        return;
-    }
-    if !context.write_ownership.authorize_mutation(
-        "grok_reasoning_write",
-        &context.write_scope.ownership_digest(),
-        context.write_snapshot.generation(),
-    ) {
-        crate::metrics::record_grok_reasoning_replay("commit_ownership_denied", 1);
-        return;
-    }
-    let now_ms = grok_replay_now_ms();
-    let (outcome, committed) = if let Some(proof) = proof {
-        let committed = state
-            .grok_reasoning_replays
-            .replace_if_unchanged(
-                context.write_scope.clone(),
-                context.write_snapshot,
-                proof,
-                now_ms,
-            )
-            .await;
-        ("commit", committed)
-    } else {
-        let committed = state
-            .grok_reasoning_replays
-            .delete_if_unchanged(&context.write_scope, context.write_snapshot, now_ms)
-            .await;
-        ("non_replayable", committed)
-    };
-    crate::metrics::record_grok_reasoning_replay(
-        if committed {
-            outcome
-        } else {
-            "commit_cas_conflict"
-        },
-        1,
-    );
-}
-
-async fn grok_reasoning_replay_binding_is_current(
-    state: &ServerState,
-    context: &GrokReplayWriteContext,
-) -> bool {
-    if state.credential_persistence_degraded() {
-        return false;
-    }
-    let Some(plan) = state
-        .provider_runtime_plan(context.app, &context.provider_id)
-        .await
-    else {
-        return false;
-    };
-    if plan.provider_revision != context.provider_revision
-        || plan.runtime_fingerprint != context.runtime_fingerprint
-        || !matches!(
-            &plan.auth_ref,
-            RuntimeAuthRef::ManagedAccount {
-                account_id,
-                expected_provider_type: ProviderType::GrokOAuth,
-                auth_identity_generation,
-            } if account_id == &context.account_id
-                && *auth_identity_generation == context.auth_identity_generation
-        )
-    {
-        return false;
-    }
-    let Some(account) = state
-        .find_account_for_provider(ProviderType::GrokOAuth, &context.account_id)
-        .await
-    else {
-        return false;
-    };
-    if account.auth_identity_generation != context.auth_identity_generation
-        || account.token_refresh_generation != context.token_refresh_generation
-    {
-        return false;
-    }
-    let shares = state.shares.read().await;
-    shares.get(&context.share_id).is_some_and(|share| {
-        share.enabled
-            && share.status == "active"
-            && ((share.app == context.app
-                && share.provider_id == context.provider_id
-                && share.provider_type == ProviderType::GrokOAuth)
-                || share.bindings.iter().any(|binding| {
-                    binding.app == context.app
-                        && binding.provider_id == context.provider_id
-                        && binding.provider_type == ProviderType::GrokOAuth
-                }))
-    })
-}
-
-fn grok_replay_now_ms() -> i64 {
-    current_time_ms().min(i64::MAX as u128) as i64
-}
-
 async fn prepare_kimi_thinking_replay(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -24687,7 +24362,7 @@ struct StreamForwardState {
     grok_responses_sse: Option<Box<super::grok::GrokResponsesSseInspector>>,
     grok_search_identity: Option<(String, u64)>,
     grok_search_evidence_recorded: bool,
-    grok_reasoning_replay: Option<GrokReplayStreamWrite>,
+    grok_reasoning_replay: Option<grok_provider::ReplayStreamWrite>,
     antigravity_reasoning_replay: Option<antigravity::ReplayStreamWrite>,
     kimi_thinking_replay: Option<KimiThinkingReplayStreamWrite>,
     stream_transform: super::stream_transforms::StreamEventTransformer,
@@ -24834,29 +24509,6 @@ struct KimiThinkingReplayWriteContext {
     share_id: String,
 }
 
-#[derive(Debug, Clone)]
-struct GrokReplayWriteContext {
-    read: Option<(GrokReplayScope, GrokReplaySnapshot, CacheSnapshotOwnership)>,
-    write_scope: GrokReplayScope,
-    write_snapshot: GrokReplaySnapshot,
-    write_ownership: CacheSnapshotOwnership,
-    replay_applied: bool,
-    app: AppKind,
-    provider_id: String,
-    provider_revision: u64,
-    runtime_fingerprint: String,
-    account_id: String,
-    auth_identity_generation: u64,
-    token_refresh_generation: u64,
-    share_id: String,
-}
-
-#[derive(Debug)]
-struct GrokReplayStreamWrite {
-    context: GrokReplayWriteContext,
-    accumulator: GrokReplayStreamAccumulator,
-}
-
 #[derive(Debug)]
 struct KimiThinkingReplayStreamWrite {
     context: KimiThinkingReplayWriteContext,
@@ -24908,7 +24560,7 @@ impl StreamForwardState {
 
     fn inspect_grok_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
         if let Some(replay) = self.grok_reasoning_replay.as_mut() {
-            replay.accumulator.push(chunk);
+            replay.inspect(chunk);
         }
     }
 
@@ -24916,8 +24568,7 @@ impl StreamForwardState {
         let Some(replay) = self.grok_reasoning_replay.take() else {
             return;
         };
-        let proof = replay.accumulator.finish();
-        commit_grok_reasoning_replay(&self.state, Some(&replay.context), proof).await;
+        replay.commit(&self.state).await;
     }
 
     async fn commit_antigravity_reasoning_replay_stream(&mut self) {
@@ -47289,7 +46940,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert!(
             state
                 .grok_reasoning_replays
-                .get(&seed_scope, grok_replay_now_ms())
+                .get(&seed_scope, current_time_ms().min(i64::MAX as u128) as i64,)
                 .await
                 .0
                 .is_some(),

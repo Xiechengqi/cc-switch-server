@@ -125,7 +125,11 @@ Server 的独立实现把 replay scope 固定到 Provider revision/runtime、Acc
 
 GR-N1 只吸收“需要观测响应质量形状”这一事实，不采用参考项目的 hold、最多六次尝试、跨账号轮换、推理 token 比例或密文长度启发式。Server 在成功 HTTP JSON、SSE 与原生 WebSocket Responses 上用有界状态机记录固定 outcome、terminal/tool/visible 布尔值和 `0|1_7|8_31|32_127|128_plus` 长度桶；不保留 plaintext/reasoning，不写 Provider、Account、Share、用户、prompt 或模型标签。单个至少 1024 字符的流式 bulk fragment 仅记为 `anomalous_dump` 诊断。观察器逐字节透传且没有 retry/rotation/response rewrite 决策入口；失败/不完整终态不冒充质量样本。
 
-这些 fixture 只支持 GR-01..03 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog receipt 仍分别 `live_pending`；GR-05 remote compaction 明确 `runtimeEnabled=false`，没有固定 OAuth rail 的真实上游 receipt 前不得启用，也不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
+CORE-N1 将 Grok reasoning replay 的 scope 派生、snapshot ownership、CAS 清理/提交以及 Provider/Account/Share generation fence 收敛到 `src/proxy/providers/grok/`。共享 forwarder 只保留 wire 编排并调用 HTTP/WS facade；固定 Provider/Account/Share、同账号一次 pre-commit 明确拒绝恢复、共享 attempt/10 秒预算和零 post-commit replay 均未改变。
+
+LIVE-N1 把真实门禁拆成 `inference`、`media`、`remote_compaction` 三个互不外推的 operation。每份仓库外 `0600` 私有 receipt 必须绑定当前 target commit、Provider revision/runtime、Account auth/token generation、Share revision、签名用户 namespace、精确 model/session/turn 和 fresh catalog，并精确匹配 checks、body hashes、measurements、固定恢复决策、零 decoy 请求与 secret scan。`grok-oauth-real.mjs` 仅为 `probe_only/live_pending`；fixture 只能产生 `contract_verified/live_pending`。当前没有真实 receipt，三项继续为 `receipt=null`、`live_pending`。
+
+这些 fixture 只支持 GR-01..03 与 CORE-N1 的 `fixture_verified`。GR-04 的真实 inference/media/WS/version/cooldown/catalog 仍待 operation receipt；GR-05 remote compaction 明确 `runtimeEnabled=false`，即使未来 receipt 证明上游协议也不能自动启用，必须另行完成 scope、versioned AEAD、TTL、失败语义和降级设计评审。不得借用 Grok Web Cookie、跨账号 cache 或外部商业路由。
 
 ## 2026-09-11 Kiro prompt-cache differential freeze
 

@@ -112,7 +112,9 @@ Grok Build 对多轮 function call 可能要求上一轮返回的 opaque `reason
 - 客户端自带 reasoning、普通 schema 400、401/403、429/capacity、5xx、传输故障以及已提交业务 delta 后的拒绝不进入 reasoning recovery。第二次明确拒绝直接终止，不再借 WS→HTTP fallback 形成第二次恢复。
 - 缺少合法 `x-grok-turn-idx`、Share 或签名用户时 replay 关闭；Server 不猜测 turn。该关闭不改变原有 direct Provider 测试和基础转发语义。
 
-本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理和媒体 capability receipt 必须分别留证，缺少任一真实 receipt 时对应能力保持 `live_pending`。
+CORE-N1 将上述 scope 派生、cache snapshot ownership、CAS 清理/提交以及 Provider/Account/Share generation fence 收敛到 `src/proxy/providers/grok/`。共享 `forwarder.rs` 只调用 facade 完成 HTTP/WS prepare、inspect、明确拒绝 reset 和 terminal commit；wire、固定绑定、共享 attempt/10 秒预算、一次 pre-commit 恢复与零 post-commit replay 均未改变。
+
+本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理、媒体与 remote compaction receipt 必须分别留证，缺少任一真实 receipt 时对应 operation 保持 `live_pending`。
 
 ## 脱敏质量观测
 
@@ -202,7 +204,7 @@ Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan
 
 ## 真实账号验收
 
-先确认待测 Share 的 Grok Provider Bundle 只绑定待测账号，再运行：
+`grok-oauth-real.mjs` 只检查正常成功路径，固定输出 `probe_only/live_pending`：
 
 ```bash
 CC_SWITCH_SHARE_URL='https://share.example.com' \
@@ -217,7 +219,19 @@ node scripts/smoke/grok-oauth-real.mjs
 - `CC_SWITCH_REAL_TIMEOUT_MS`：单请求超时，范围 1 秒到 5 分钟。
 - `EVIDENCE_FILE=/tmp/...json`：写入脱敏结果摘要。
 
-脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON/SSE，以及 OpenAI Chat 非流式/流式。Chat 检查严格要求非流式 `created` 为正整数，并要求所有流式 chunk 的 `created` 合法且流内一致，同时观察 `finish_reason`、usage 信息和唯一 `[DONE]`。四个推理请求都携带固定 session id 与合法 `x-grok-turn-idx`。推理和媒体 capability receipt 必须分别留证；一个成功不能推导另一个，也不能据本地 fixture 升级真实状态。缺少 Share URL 或 Router token，或者变量仍为占位符时，脚本输出 `SKIP` 并退出 0；这只表示真实验收未运行。
+脚本依次通过同一个 Share URL 检查 models 元数据、Responses JSON/SSE，以及 OpenAI Chat 非流式/流式。Chat 检查严格要求非流式 `created` 为正整数，并要求所有流式 chunk 的 `created` 合法且流内一致，同时观察到 `finish_reason`、usage 和唯一 `[DONE]`。该 probe 不证明受控 401/429/version/catalog/replay/decoy 路径，不能生成 live receipt。
+
+真实关闭门禁时，分别以 `inference`、`media`、`remote_compaction` 运行私有 receipt validator：
+
+```bash
+CC_SWITCH_GROK_REAL_OPERATION=inference \
+GROK_INFERENCE_REAL_RECEIPT_FILE=/secure/grok-inference.json \
+node scripts/smoke/grok-real-receipt.mjs
+```
+
+三次运行都要求 `RUN_REAL=1`、控制面和 Share URL、固定 `GROK_OAUTH_TEST_ACCOUNT`、operation 对应的 Provider/Share/model、`CC_SWITCH_GROK_SIGNED_USER`、`CC_SWITCH_GROK_SESSION_ID`、`CC_SWITCH_GROK_TURN_INDEX`，以及仓库外权限 `0600` 的私有 receipt。validator 绑定当前 target commit、Provider revision/runtime、Account auth/token generation、Share revision、签名用户 namespace、精确 model/session/turn 和 fresh catalog；同时逐项核对 checks、body hashes、measurements、恢复决策、decoy 计数与 secret scan。fixture 只能得到 `contract_verified/live_pending`，三个 operation 不互相继承。
+
+`remote_compaction` receipt 只证明上游协议证据，绝不自动开启运行时。即使 receipt 验证通过，`runtimeEnabled=false` 仍保持不变，后续还必须独立完成 scope、versioned AEAD、TTL、失败语义与降级设计评审。缺少任一输入或 receipt 时仅输出 `blocked_inputs/live_pending`。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/acceptance/real-acceptance-runbook.md` 单独留证。
 

@@ -68,6 +68,13 @@ function writeEvidence(status, notes = "") {
       ...process.env,
       EVIDENCE_STAGE: "grok-oauth-real",
       EVIDENCE_STATUS: status,
+      EVIDENCE_VERIFICATION_STATE:
+        status === "probe_only"
+          ? "contract_verified"
+          : status === "blocked-inputs"
+            ? "blocked_inputs"
+            : "failed",
+      EVIDENCE_VERIFICATION_SCOPE: "probe_only/live_pending",
       EVIDENCE_TARGET: isUsable(shareUrl) ? shareUrl : "",
       EVIDENCE_SOURCE: "scripts/smoke/grok-oauth-real.mjs",
       EVIDENCE_APP: "codex",
@@ -490,17 +497,19 @@ async function main() {
   }
 
   writeEvidence(
-    "pass",
-    "real xAI Responses and OpenAI Chat normal-path smoke completed",
+    "probe_only",
+    "real xAI Responses and OpenAI Chat normal-path probe completed; operation receipts remain live_pending",
   );
-  console.log(`[PASS] Grok OAuth real-account gate complete (model=${model})`);
+  console.log(
+    `[PASS] Grok OAuth normal-path probe complete (model=${model}, verificationState=probe_only, liveState=live_pending)`,
+  );
 }
 
 main().catch((error) => {
   const message = redact(error instanceof Error ? error.message : error);
   console.error(`[FAIL] ${message}`);
   try {
-    writeEvidence("fail", "real xAI smoke failed; inspect sanitized console output");
+    writeEvidence("probe_failed", "real xAI probe failed; inspect sanitized console output");
   } catch (evidenceError) {
     console.error(
       `[FAIL] writing redacted evidence failed: ${safePreview(
