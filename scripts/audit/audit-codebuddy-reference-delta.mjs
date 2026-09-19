@@ -378,6 +378,7 @@ const immutableObservationDigests = new Map([
   ["CB-OBS-0012", "e358f8903a5a7ee7f7f34b73381cea3d545d20e49cacc59e7a096ae30cd843ae"],
   ["CB-OBS-0013", "a7c5bdcf34082c3b2a1e24d7cfe21d5186931ac53a54f40c9cb071f81189e02a"],
   ["CB-OBS-0014", "d93a801d31e2be1cebab486a77dbd676b0ef83456f8a3b49bc32073dd0d4020f"],
+  ["CB-OBS-0015", "427a1fb0f6197d2d4a2cfa23fb939c6af031053321f3b613617e2f4c20c5f442"],
 ]);
 const expectedEnhancementIds = new Set([
   "CB-01",
@@ -390,6 +391,7 @@ const expectedEnhancementIds = new Set([
   "CB-N4",
   "CB-N5",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
   "CB-R1",
   "CB-R2",
@@ -410,6 +412,7 @@ const expectedDispositions = new Map([
   ["CB-OBS-0012", "reject"],
   ["CB-OBS-0013", "reject"],
   ["CB-OBS-0014", "reject"],
+  ["CB-OBS-0015", "differential"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -583,6 +586,55 @@ assert(
     JSON.stringify([...expectedEnhancementIds].sort()),
   "CodeBuddy enhancement observation coverage is incomplete",
 );
+
+assert(
+  objectDigest(contract.evidenceExtensions) ===
+    "54640bc7a8d7f6c6d89694a33bec7b86c94470712a3745e69cf70ef53c9ba939",
+  "CodeBuddy evidence extension history changed",
+);
+const evidenceExtensions = new Map(
+  (contract.evidenceExtensions ?? []).map((entry) => [entry.id, entry]),
+);
+assert(
+  evidenceExtensions.size === 1 &&
+    evidenceExtensions.size === contract.evidenceExtensions.length &&
+    evidenceExtensions.has("CORE-N2-CODEBUDDY"),
+  "CodeBuddy evidence extension set changed",
+);
+const requestMemoryExtension = evidenceExtensions.get("CORE-N2-CODEBUDDY");
+assert(
+  requestMemoryExtension.status === "fixture_verified" &&
+    requestMemoryExtension.providerType === "codebuddy_oauth" &&
+    JSON.stringify(requestMemoryExtension.sites) === JSON.stringify(["intl", "cn"]) &&
+    JSON.stringify(requestMemoryExtension.surfaces) ===
+      JSON.stringify(["claude", "codex", "gemini"]) &&
+    requestMemoryExtension.transport === "workbuddy_http_sse" &&
+    requestMemoryExtension.stickyExhaustion === true &&
+    requestMemoryExtension.sameBudgetAcross401Recovery === true &&
+    requestMemoryExtension.canonicalRuntimeCatalogAndPayloadBounded === true &&
+    requestMemoryExtension.wireHeadersAndErrorBodiesBounded === true &&
+    requestMemoryExtension.decoderAndAggregatorBounded === true &&
+    requestMemoryExtension.downstreamRetainedStateBounded === true &&
+    requestMemoryExtension.capacityShedNotNetworkFailure === true &&
+    requestMemoryExtension.liveReceiptState === "live_pending" &&
+    requestMemoryExtension.localEvidence?.length === 4,
+  "CORE-N2-CODEBUDDY evidence boundary changed",
+);
+for (const evidence of requestMemoryExtension.localEvidence) {
+  safeRelative(evidence.path, "CORE-N2-CODEBUDDY local path");
+  const localPath = path.join(repoRoot, evidence.path);
+  assert(
+    fs.existsSync(localPath),
+    `CORE-N2-CODEBUDDY local path is unavailable: ${evidence.path}`,
+  );
+  const local = fs.readFileSync(localPath, "utf8");
+  assert(
+    Array.isArray(evidence.anchors) &&
+      evidence.anchors.length > 0 &&
+      evidence.anchors.every((anchor) => local.includes(anchor)),
+    `CORE-N2-CODEBUDDY is missing a local anchor in ${evidence.path}`,
+  );
+}
 
 const capabilities = new Map(contract.capabilities.map((item) => [item.id, item]));
 assert(capabilities.size === 4, "CodeBuddy contract must contain CB-01 through CB-04");

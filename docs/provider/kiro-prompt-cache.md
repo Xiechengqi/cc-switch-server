@@ -1,6 +1,6 @@
 # Kiro Prompt Cache 本地计量合同
 
-状态：`KI-01`、`KI-02`、`KI-03` 为 `fixture_verified`；CORE-N1 facade、八路私有 receipt gate 与 EVID-N1 schema v2 已完成；`KI-04`、`KI-05` 仍为 `live_pending`，共享/远端缓存运行时关闭。
+状态：`KI-01`、`KI-02`、`KI-03` 与 CORE-N2 为 `fixture_verified`；CORE-N1 facade、八路私有 receipt gate 与 EVID-N1 schema v2 已完成；`KI-04`、`KI-05` 仍为 `live_pending`，共享/远端缓存运行时关闭。
 
 ## 边界
 
@@ -48,4 +48,4 @@
 
 ## 只读来源
 
-差异证据冻结在 `assets/contract/kiro-reference-delta.json`：append-only schema v2 保留 `kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 的 committed prompt-cache 对象、`f2cc574` / `19b7f4b` / `47633a4` 历史对象，以及 `f413e7de` / `3194bb29` / `0b8c7dec` / `d62054f5` / `13763b69` 的 tool/profile/compact 增量；同时固定干净的 `kiro.rs@be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863` committed-object snapshot、原 schema-v1 十字段摘要和 13 条不可变处置记录。外部工作树不是构建、测试、发布或运行时依赖；默认审计只验证本仓库合同，显式 `--check-sources` 才按 commit/tree 与 SHA-256 读取这些 Git objects。
+差异证据冻结在 `assets/contract/kiro-reference-delta.json`：append-only schema v2 保留 `kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 的 committed prompt-cache 对象、`f2cc574` / `19b7f4b` / `47633a4` 历史对象，以及 `f413e7de` / `3194bb29` / `0b8c7dec` / `d62054f5` / `13763b69` 的 tool/profile/compact 增量；同时固定干净的 `kiro.rs@be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863` committed-object snapshot、原 schema-v1 十字段摘要和 14 条不可变处置记录。第 14 条只把参考的 16 MiB EventStream frame/buffer ceiling 作为 retained-state 差分信号，`CORE-N2-KIRO=fixture_verified` 由本仓库独立实现支持。外部工作树不是构建、测试、发布或运行时依赖；默认审计只验证本仓库合同，显式 `--check-sources` 才按 commit/tree 与 SHA-256 读取这些 Git objects。

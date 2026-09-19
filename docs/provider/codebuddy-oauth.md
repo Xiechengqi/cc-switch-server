@@ -8,7 +8,7 @@
 
 本文定义 cc-switch-server 的 `codebuddy_oauth` Provider 边界。一个 CodeBuddy Provider 固定绑定一个 CodeBuddy Account；Server 不实现账号池、轮询、权重、按配额/并发选号、自动切站，或跨 Provider fallback。
 
-当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；2026-09-18 增量复核又关闭了中断工具轮次、reasoning-only 历史和取消生命周期的离线缺口。`assets/contract/codebuddy-reference-delta.json` 现为 append-only schema v2：原 11 个 v1 字段由独立 digest 固定，14 条不可变 observation 将 CB-01 至 CB-04、CB-N1 至 CB-N5、CORE-N1、LIVE-N1 和三条拒绝边界映射到外部只读提交及本仓库 committed target object。
+当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；2026-09-18 增量复核又关闭了中断工具轮次、reasoning-only 历史和取消生命周期的离线缺口，2026-09-19 再完成三 Surface、双站恢复共用的请求生命周期内存预算。`assets/contract/codebuddy-reference-delta.json` 现为 append-only schema v2：原 11 个 v1 字段由独立 digest 固定，15 条不可变 observation 将 CB-01 至 CB-04、CB-N1 至 CB-N5、CORE-N1/N2、LIVE-N1 和三条拒绝边界映射到外部只读提交及本仓库 committed target object。
 
 ---
 
@@ -351,7 +351,17 @@ prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_cache_write_tokens
 
 CORE-N1 将精确 `codebuddy_oauth` Account binding、canonical request/model、站点绑定的 live catalog capability、payload preparation 和 Provider/Account generation fence 收敛到 `src/proxy/providers/codebuddy/`。共享 `forwarder.rs` 仍拥有 Share/Account lease、usage、terminal、统一 attempt budget，以及是否允许原账号在下游提交前执行一次 401 refresh/replay。此次拆分不改变 endpoint、header、payload bytes、错误记录分支、恢复次数或 terminal + EOF 合同，也不引入 Account、Provider、site、domain 或 rail fallback。
 
-EVID-N1 冻结 `d81056c` 中原 schema-v1 文件及全部 11 个历史字段，追加 `cli2api@624874a` / tree `c2f02a3` 的 committed-object snapshot，并明确排除参考工作树中的 `proxy.html`、`proxy.md`。14 条 observation 分别记录 differential、live gate 或 reject，绑定 source path/symbol/digest、本仓库 baseline/implementation commit/tree、合同锚点和 fixture；默认 audit 完全自包含，只有显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才读取外部已提交对象。CB-R1～R3 拒绝账号调度与跨边界 fallback、运营/商业控制面，以及未验证能力、伪 live 和弱化 terminal + EOF。
+EVID-N1 冻结 `d81056c` 中原 schema-v1 文件及全部 11 个历史字段，追加 `cli2api@624874a` / tree `c2f02a3` 的 committed-object snapshot，并明确排除参考工作树中的 `proxy.html`、`proxy.md`。当前 15 条 observation 分别记录 differential、live gate 或 reject，绑定 source path/symbol/digest、本仓库 baseline/implementation commit/tree、合同锚点和 fixture；默认 audit 完全自包含，只有显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才读取外部已提交对象。CB-R1～R3 拒绝账号调度与跨边界 fallback、运营/商业控制面，以及未验证能力、伪 live 和弱化 terminal + EOF。
+
+### 5.9 请求生命周期内存预算
+
+CORE-N2 只对精确的 `codebuddy_oauth` Provider 启用；普通 `claude`、`claude_auth`、`gemini_cli` 或同一 App 下的其他 Provider 不会被误启用。Claude Messages、Codex Chat Completions/Responses 与 Gemini GenerateContent 的流式、非流式路径共用同一套容量语义。Intl/CN 同账号在下游提交前执行一次 401 refresh/replay 时继续使用原 request budget，不能通过恢复动作重置已经消费或已经耗尽的预算。
+
+核算范围包括 raw/decoded/canonical body、runtime/catalog、prepared payload、JSON wire、请求 ID、目标 headers、错误响应与解析工作集；流式路径还覆盖 transport chunk、rolling decoder buffer、event parse、canonical `Bytes` owner，以及 Claude/Codex/Gemini 下游 bridge retained state。非流路径的 content、reasoning、tool-call arguments 和最终 JSON `Value` 也在同一预算内；reservation 跟随最终 owner，到最后一个响应或 chunk owner drop 才释放。
+
+容量耗尽是 sticky 的：未提交响应返回稳定 `503`、`Retry-After: 1` 与 `cc_switch_request_memory_exhausted`；已提交 200 的 stream 只输出一个不含预算内部细节的 terminal。当前上游被取消，不 refresh/replay，不切 Account、Provider 或 site；usage 记录 `memory_capacity`，Provider outcome 归为 `CapacityShed` 而不是普通 `NetworkFailure`。分发边界对 `forward_codebuddy` future 做堆化，使默认 Tokio 测试线程栈无需额外 `RUST_MIN_STACK` 才能承载该状态机。
+
+`CB-OBS-0015` 只把 `cli2api` 的 1/16 MiB body 读取上限、16 MiB 单条 SSE line ceiling 和 retained non-stream aggregation 当作差分信号；参考项目没有证明统一生命周期预算、payload/header 副本、下游 transform、容量分类或上述恢复语义。`CORE-N2-CODEBUDDY=fixture_verified` 绑定本仓库 `573dc47` 的独立实现和 66 个 CodeBuddy、26 个 request-memory、15 个 memory-exhaustion 专项测试。它不构成 Intl/CN 真实长流或内存压力 receipt，两站仍分别为 `null/live_pending`。
 
 ---
 

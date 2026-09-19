@@ -1071,6 +1071,158 @@
         "fixtureIds": []
       },
       "reason": "Reject unverified enterprise or multimodal capability promotion, external runtime coupling, fixture-as-live claims and any success without a unique terminal followed by EOF."
+    },
+    {
+      "id": "CB-OBS-0015",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "bounded_response_state_memory_signal",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/sse.go"
+        ],
+        "symbols": [
+          "io.ReadAll(io.LimitReader(resp.Body, 1<<20))",
+          "io.ReadAll(io.LimitReader(resp.Body, 16<<20))",
+          "Aggregate",
+          "strings.Builder",
+          "toolCalls := map[int]map[string]any{}",
+          "scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)",
+          "copySanitizedSSE"
+        ],
+        "sourceDigest": "43a0d3dd1c6ba440b41950696a5696a7c1fa2dfaee47ca74ae648bcf3e7a1fbb"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N2"
+      ],
+      "target": {
+        "baselineCommit": "edf74e17fa8c52e0d009c7ce363d4b4e150f39a8",
+        "baselineTree": "534cf6f976e3d4d5f6fb3d46f10c438a1eef6d63",
+        "implementationCommit": "573dc478b21ebcd2d43a4efafc19796c0416990f",
+        "implementationTree": "b99432ce78c4c540b648aa84496a884f1449b410",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "codebuddy_request_memory_scope_is_provider_exact_on_every_surface",
+              "codebuddy_memory_exhaustion_is_capacity_shed_not_network_failure",
+              "adapter_request.body.len().saturating_mul(4)",
+              "runtime.retained_bytes()",
+              "serialized_body_bytes.saturating_add(estimated_header_bytes)"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+            "anchors": [
+              "codebuddy_request_memory_rejects_all_surfaces_before_any_upstream_request",
+              "codebuddy_nonstream_content_reasoning_and_tool_aggregate_is_memory_bounded",
+              "codebuddy_stream_bridge_memory_exhaustion_emits_one_redacted_terminal",
+              "codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site",
+              "codebuddy_both_sites_keep_one_request_budget_across_401_recovery"
+            ]
+          },
+          {
+            "path": "src/proxy/codebuddy.rs",
+            "anchors": [
+              "decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+              "aggregator_reservation_follows_finished_value_and_releases_on_drop",
+              "aggregate_content_reasoning_and_tool_arguments_share_one_sticky_budget",
+              "decoder_capacity_exhaustion_is_sticky_and_content_free"
+            ]
+          },
+          {
+            "path": "src/proxy/providers/codebuddy/mod.rs",
+            "anchors": [
+              "pub(crate) prepared_memory: Option<RequestMemoryReservation>",
+              "canonical.retained_bytes().saturating_mul(3)",
+              "memory.resize(prepared.retained_bytes())"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "codebuddy_request_memory_scope_is_provider_exact_on_every_surface",
+          "codebuddy_memory_exhaustion_is_capacity_shed_not_network_failure",
+          "codebuddy_request_memory_rejects_all_surfaces_before_any_upstream_request",
+          "codebuddy_nonstream_content_reasoning_and_tool_aggregate_is_memory_bounded",
+          "codebuddy_stream_bridge_memory_exhaustion_emits_one_redacted_terminal",
+          "codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site",
+          "codebuddy_both_sites_keep_one_request_budget_across_401_recovery",
+          "decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+          "aggregator_reservation_follows_finished_value_and_releases_on_drop",
+          "aggregate_content_reasoning_and_tool_arguments_share_one_sticky_budget",
+          "decoder_capacity_exhaustion_is_sticky_and_content_free"
+        ]
+      },
+      "reason": "cli2api proves only that several control-plane and error-body reads plus individual SSE lines have explicit ceilings, while non-stream aggregation retains content, reasoning, and tool-call maps. Treat that as a differential signal that reads, lines, and retained aggregation must be bounded; it does not establish one sticky request-lifecycle budget, payload or header copies, downstream transforms, capacity classification, or 401 recovery semantics. The local implementation independently accounts those states for both sites and all three surfaces."
+    }
+  ],
+  "evidenceExtensions": [
+    {
+      "id": "CORE-N2-CODEBUDDY",
+      "status": "fixture_verified",
+      "providerType": "codebuddy_oauth",
+      "sites": [
+        "intl",
+        "cn"
+      ],
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "transport": "workbuddy_http_sse",
+      "stickyExhaustion": true,
+      "sameBudgetAcross401Recovery": true,
+      "canonicalRuntimeCatalogAndPayloadBounded": true,
+      "wireHeadersAndErrorBodiesBounded": true,
+      "decoderAndAggregatorBounded": true,
+      "downstreamRetainedStateBounded": true,
+      "capacityShedNotNetworkFailure": true,
+      "liveReceiptState": "live_pending",
+      "localEvidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "codebuddy_request_memory_scope_is_provider_exact_on_every_surface",
+            "codebuddy_memory_exhaustion_is_capacity_shed_not_network_failure",
+            "return Box::pin(forward_codebuddy"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+          "anchors": [
+            "codebuddy_request_memory_rejects_all_surfaces_before_any_upstream_request",
+            "codebuddy_nonstream_content_reasoning_and_tool_aggregate_is_memory_bounded",
+            "codebuddy_stream_bridge_memory_exhaustion_emits_one_redacted_terminal",
+            "codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site",
+            "codebuddy_both_sites_keep_one_request_budget_across_401_recovery"
+          ]
+        },
+        {
+          "path": "src/proxy/codebuddy.rs",
+          "anchors": [
+            "decoder_reservations_follow_canonical_bytes_and_release_on_drop",
+            "aggregator_reservation_follows_finished_value_and_releases_on_drop",
+            "aggregate_content_reasoning_and_tool_arguments_share_one_sticky_budget",
+            "decoder_capacity_exhaustion_is_sticky_and_content_free"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/codebuddy/mod.rs",
+          "anchors": [
+            "pub(crate) prepared_memory: Option<RequestMemoryReservation>",
+            "canonical.retained_bytes().saturating_mul(3)",
+            "memory.resize(prepared.retained_bytes())"
+          ]
+        }
+      ]
     }
   ],
   "registryTruth": {
