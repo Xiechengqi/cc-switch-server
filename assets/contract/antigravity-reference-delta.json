@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-11T00:00:00Z",
-  "updatedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider, Share, Account, rail, and credential generation; no pool; no rotation; no credential fallback; no cross-account fallback; no cross-Provider fallback",
@@ -580,6 +580,38 @@
         "fixtureIds": ["Antigravity real harness keeps Antigravity and Agy receipts independent", "Antigravity real harness rejects a cross-rail receipt"]
       },
       "reason": "Add a current-commit private-receipt gate; both rails and compaction remain live_pending without real inputs."
+    },
+    {
+      "id": "AG-OBS-0017",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-18",
+        "repository": "CLIProxyAPI",
+        "deltaId": "reasoning_replay",
+        "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
+        "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
+        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
+        "symbols": ["AntigravityReasoningReplayCacheMaxBytesPerEntry", "antigravityReasoningReplayAccumulator"],
+        "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
+      },
+      "disposition": "differential",
+      "capabilityIds": ["CORE-N2-ANTIGRAVITY"],
+      "target": {
+        "baselineCommit": "a7c5c91a248657212996ca82e3ebb19738bb3f3a",
+        "baselineTree": "a07638e507dee9d8b7aa570d32acbf9c8aadaec0",
+        "implementationCommit": "4ad229329fff6d39cd6b859c4e34f05396c4d7b9",
+        "implementationTree": "5d22258fa25b8cb22b2ca1c1e7bbb3628ba093a7",
+        "contracts": [
+          {"path": "src/proxy/request_memory.rs", "anchors": ["ReasoningReplay", "GroundingCitation", "existing_reservation_can_follow_the_accounted_bytes"]},
+          {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["snapshot.retained_bytes()", "replay_stream_budget_is_sticky_and_releases_on_cancel", "replay_stream_accounting_follows_accumulator_lifetime"]},
+          {"path": "src/proxy/stream_transforms.rs", "anchors": ["retained_antigravity_bytes", "antigravity_transform_reports_buffered_web_search_state"]},
+          {"path": "src/proxy/forwarder.rs", "anchors": ["request_memory_provider_type_for_request", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]}
+        ],
+        "fixtureIds": ["existing_reservation_can_follow_the_accounted_bytes", "replay_stream_budget_is_sticky_and_releases_on_cancel", "replay_stream_accounting_follows_accumulator_lifetime", "antigravity_transform_reports_buffered_web_search_state", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]
+      },
+      "reason": "The reference proves bounded replay cache and accumulator state, but not a unified request lifecycle budget. Adopt the bounds as a signal while accounting raw/decoded/normalized bodies, replay clones and accumulators, and grounding/citation bridge state under one sticky Provider-scoped budget."
     }
   ],
   "capabilities": [
@@ -667,6 +699,16 @@
       "contracts": [
         {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]},
         {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\""]}
+      ]
+    },
+    {
+      "id": "CORE-N2-ANTIGRAVITY",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/request_memory.rs", "anchors": ["ReasoningReplay", "GroundingCitation", "retained_json_bytes"]},
+        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "ReplayStreamWrite", "replay_stream_budget_is_sticky_and_releases_on_cancel"]},
+        {"path": "src/proxy/stream_transforms.rs", "anchors": ["retained_antigravity_bytes", "antigravity_transform_reports_buffered_web_search_state"]},
+        {"path": "src/proxy/forwarder.rs", "anchors": ["request_memory_provider_type_for_request", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]}
       ]
     }
   ],

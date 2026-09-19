@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-19 Antigravity request-lifecycle memory freeze
+
+CORE-N2 的 Antigravity 切片冻结在 `assets/contract/antigravity-reference-delta.json` 的 `AG-OBS-0017`。一次性只读证据来自 `CLIProxyAPI@09a29bd345bc44c473abe7fd07859e32df2ea543`（tree `0b407c0c70c9c2f8a771d5126b028b9afe79bf2a`）：其 replay cache 将单 entry 限为 16 MiB，流 accumulator 也在溢出时放弃捕获。该证据只证明 replay 局部状态应有界，不能证明统一请求生命周期预算；默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才复核冻结 Git object。
+
+Server 的独立实现只为最终绑定到 `antigravity_oauth` 或 `agy_oauth` 的请求启用已有 sticky budget，不把同属 Claude/Gemini App 的其他 Provider 纳入。Share 请求在解压前按实际 Provider binding 初始化，pinned Provider test 按 `ProviderExecution` 初始化；最终 execution 选择后的代际漂移兜底会补齐 raw/decoded reservation。预算在所有 retry 间共享，耗尽后关闭后续 replay，并统一核算 raw/decoded/normalized body、reasoning replay cache clone/snapshot/stream accumulator，以及 grounding/citation、web-search gating、tool context 和 Chat canonicalizer pending state。
+
+Normalized body reservation 跟随最终 `Bytes` backing owner，直到最后一个 clone/view drop 才释放；replay previous chain 使用共享 owner，accumulator 超限后立即丢弃内容。流式 retained state 超限时取消当前上游并发送稳定的 `503 / cc_switch_request_memory_exhausted` 终止帧，不再发起 retry；取消、错误和正常终态均由生命周期测试验证 reservation 归零。错误与指标不包含 prompt、citation URL、凭据或 Provider/Account 身份。
+
+当前 67 个 Antigravity Rust 关键词测试和 17 条 append-only observation 只支持 `CORE-N2-ANTIGRAVITY=fixture_verified`。它们不是 Google OAuth、长流或真实内存压力 receipt；`antigravity_oauth`、`agy_oauth` 两条 rail、AG-N6 requestType 与 compaction 继续保持 `live_pending`，不得因本切片升级。
+
 ## 2026-09-18 Kiro tool names, profile fallback, and compaction gate freeze
 
 Kiro 增量证据追加在 `assets/contract/kiro-reference-delta.json`，保留 KI-01～KI-05 历史合同。只读来源为 `kiro.rs@f413e7de` 的裸 namespaced tool 恢复、`kiro.rs@3194bb29` 的 profileArn 兼容回退，以及 `kiro.rs@0b8c7dec/@d62054f5/@13763b69` 的 Responses Compact 结构；完整 commit、路径和提交态 SHA-256 可由 `node scripts/audit/audit-kiro-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时不读取外部 checkout。

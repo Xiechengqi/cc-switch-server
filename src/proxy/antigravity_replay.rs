@@ -989,11 +989,12 @@ impl fmt::Debug for AntigravityReplayStreamAccumulator {
 
 impl AntigravityReplayStreamAccumulator {
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.buffer.capacity().saturating_add(
-            (!self.content.is_null())
-                .then(|| retained_json_bytes(&self.content))
-                .unwrap_or_default(),
-        )
+        let content_bytes = if self.content.is_null() {
+            0
+        } else {
+            retained_json_bytes(&self.content)
+        };
+        self.buffer.capacity().saturating_add(content_bytes)
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
@@ -1206,10 +1207,8 @@ mod tests {
     fn stream_accumulator_reports_and_releases_retained_state_on_overflow() {
         let mut accumulator = AntigravityReplayStreamAccumulator::default();
         accumulator.push(
-            concat!(
-                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"retained\"}]}}]}}\n\n"
-            )
-            .as_bytes(),
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"retained\"}]}}]}}\n\n"
+                .as_bytes(),
         );
         assert!(accumulator.retained_bytes() > 0);
 

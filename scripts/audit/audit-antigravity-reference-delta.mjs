@@ -131,6 +131,7 @@ const immutableObservationDigests = new Map([
   ["AG-OBS-0014", "b669dea8772ecc66666b4bda7f2468111d1b852300357216943f689690c6cb82"],
   ["AG-OBS-0015", "664d7883c8005f7ea3285077125ca0fedf50c34ee51edc70f1e14e9b62788cec"],
   ["AG-OBS-0016", "fc8cb48e2fe0035a41a142937561b71a447bad933a5eeaf99aa3580314af8880"],
+  ["AG-OBS-0017", "01c34d7e48885c8dfd99aae78094698408c7398b293748d4696bbd61fd96c646"],
 ]);
 const capabilityIds = new Set((baseline.capabilities ?? []).map((capability) => capability.id));
 const observationIds = new Set();
@@ -262,6 +263,7 @@ const expectedCapabilities = new Map([
   ["AG-N4", "fixture_verified"],
   ["AG-N5", "fixture_verified"],
   ["AG-N6", "live_pending"],
+  ["CORE-N2-ANTIGRAVITY", "fixture_verified"],
 ]);
 for (const capability of baseline.capabilities ?? []) {
   assert(
