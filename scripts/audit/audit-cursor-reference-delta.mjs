@@ -273,6 +273,7 @@ const immutableObservationDigests = new Map([
   ["CUR-OBS-0005", "2d4a13ae09ae145cd5325778d65815ddc4568867cac778cc9554b356e7077701"],
   ["CUR-OBS-0006", "0c781f29fc5adc7cb7a6d8939c75a3a670f41c7787278c01483955dbe34241f3"],
   ["CUR-OBS-0007", "d16160313b7b1349ceb9e7394d2e59a02d556290cf5231546afa62a4b7ff7f3f"],
+  ["CUR-OBS-0008", "243fed6dacbf96b3f206db25d41c5cc003129d3439da75683eb389d5b35738ab"],
 ]);
 const expectedEnhancementIds = new Set([
   "CUR-01",
@@ -281,6 +282,7 @@ const expectedEnhancementIds = new Set([
   "CUR-N1",
   "CUR-N2",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
 ]);
 const observationIds = new Set();
@@ -452,6 +454,42 @@ assert(
     JSON.stringify([...expectedEnhancementIds].sort()),
   "Cursor enhancement observation coverage is incomplete",
 );
+
+assert(
+  objectDigest(contract.evidenceExtensions) ===
+    "2c1ed4ccb5f3fedfaf64fac412cbb1211ba5fef15cdc8f628650bdfd7adc9053",
+  "Cursor evidence extension history changed",
+);
+const evidenceExtensions = new Map(
+  (contract.evidenceExtensions ?? []).map((extension) => [extension.id, extension]),
+);
+const memoryExtension = evidenceExtensions.get("CORE-N2-CURSOR");
+assert(
+  evidenceExtensions.size === 1 &&
+    memoryExtension?.status === "fixture_verified" &&
+    JSON.stringify(memoryExtension.rails) === JSON.stringify(["oauth", "api_key"]) &&
+    JSON.stringify(memoryExtension.surfaces) === JSON.stringify(["claude", "codex", "gemini"]) &&
+    memoryExtension.stickyExhaustion === true &&
+    memoryExtension.parkedSessionTransfer === true &&
+    memoryExtension.gzipExpansionBounded === true,
+  "CORE-N2-CURSOR evidence state changed",
+);
+assert(
+  Array.isArray(memoryExtension.localEvidence) && memoryExtension.localEvidence.length === 5,
+  "CORE-N2-CURSOR local evidence set changed",
+);
+for (const evidence of memoryExtension.localEvidence) {
+  safeRelative(evidence.path, `CORE-N2-CURSOR:${evidence.path ?? "<missing>"}`);
+  const localPath = path.join(repoRoot, evidence.path);
+  assert(fs.existsSync(localPath), `CORE-N2-CURSOR local path is unavailable: ${evidence.path}`);
+  const source = fs.readFileSync(localPath, "utf8");
+  assert(
+    Array.isArray(evidence.anchors) &&
+      evidence.anchors.length > 0 &&
+      evidence.anchors.every((anchor) => source.includes(anchor)),
+    `CORE-N2-CURSOR is missing a local anchor in ${evidence.path}`,
+  );
+}
 
 const enhancements = new Map(
   (contract.enhancements ?? []).map((enhancement) => [enhancement.id, enhancement]),

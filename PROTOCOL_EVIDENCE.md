@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-19 Cursor request-lifecycle memory freeze
+
+CORE-N2 的 Cursor 切片冻结在 `assets/contract/cursor-reference-delta.json` 的 `CUR-OBS-0008`。一次性只读证据仍只取 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`（tree `25b36e4993a8cc52da22b3d0b0aa26bd4c60426b`）的 committed object：executor 对单个 Connect frame 设 16 MiB 上限并在消费后 splice rolling buffer；session manager 默认以 5 分钟 TTL、100 个 session 上限及 close cleanup 约束 parked h2 state。该参考只证明 transport/session retained state 必须有界，既没有统一 request-lifecycle budget，也没有约束 gzip expansion；22 项工作树内容继续全部排除。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才复核冻结 Git object。
+
+`3e0f5ff` 的独立实现对精确的 `ProviderType::CursorOAuth` 与 `ProviderType::CursorApiKey` 启用同一个 sticky request budget，并覆盖 Claude Messages、Codex Responses/Chat Completions 与 Gemini GenerateContent surface。Share 与 pinned Provider test 在 AgentService 发网前核算最终 normalized body；预算随后显式传入 Provider facade、driver 与 h2 transport，同一请求的 OAuth 401 replay 和 semantic retry 共用总量，耗尽即返回 `DeniedBudget`，不换 Account、Provider 或 rail。
+
+核算范围包括 Agent plan/JSON、模型与工具 schema、图片 decoded bytes、protobuf body、unbounded h2 write queue、parser growth、gzip expansion、decoded/pending frame、错误 body、SSE writer/marker/dedup、semantic buffered events 和 completed-response replay clone。parked session 保留原 reservation；continuation 必须先向新请求预算预留 session、parser 与 pending frame，再释放旧预算，close、expiry 和失败 guard 均清理 retained state。reservation 跟随最终 `Bytes` owner；已提交 200 的四种 surface 使用稳定 `cc_switch_request_memory_exhausted` 终止码，usage 标为 `memory_capacity`，Provider outcome 记为 capacity shed 而非网络故障。
+
+当前专项验证为 Cursor 304/304、request-memory 16/16、`cargo check --lib` 与 Clippy `-D warnings` 通过；reference-delta 默认和 `--check-sources` 审计均通过。8 条 append-only observation 与 `CORE-N2-CURSOR=fixture_verified` 只证明本地容量合同，不是 OAuth/API-key 真实长流或内存压力 receipt；两条 rail 仍分别保持 `live_pending`，不得因本切片升级。
+
 ## 2026-09-19 Claude OAuth request-lifecycle memory freeze
 
 CORE-N2 的 Claude 切片冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0015`。一次性只读证据来自 `CLIProxyAPI@2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e`（tree `48db041ce6e0ea0bb0c5c96a7fcfb0566c12eca8`）：其 Claude-compatible thinking replay 将每 session 限为 8 MiB/64 turns、每 turn 限为 512 blocks、进程总量限为 256 MiB，TTL 为一小时，并以 snapshot CAS replace/clear。该参考只证明 Claude retained replay state 必须有界，而且只适用于 API-key compatibility rail；它不能证明本仓库 Claude OAuth 的统一请求生命周期预算。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 才复核冻结 Git object。
@@ -135,13 +145,15 @@ GPT Image 2.5 三个 variant 不从外部项目的静态声明推导真实 entit
 
 Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。2026-09-18 从旧点 `a3ca33fa6442b59adc42976c795709eaf5351109` 复核到 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`：六个 Cursor protobuf/session/executor 提交对象的 SHA-256 均未变化，提交区间没有 Cursor wire、protobuf、auth 或 session 增量，因此 CUR-N2 结论为 `reviewed_no_wire_delta`，不修改生产 executor。参考仓库当时 22 项未提交/未跟踪内容全部排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。
 
-EVID-N1 将合同提升为 append-only schema v2：原 v1 的 `capturedAt`、`policy`、`sources`、`incrementalReview`、`registryTruth`、`capabilities`、`enhancements`、`providerLifecycle`、`realAcceptance`、`protobufFixtures` 十个字段分别由 canonical SHA-256 固定；新增的 OmniRoute source snapshot 绑定 HEAD commit/tree，并明确记录 `worktreeClean=false`、22 项工作树内容全部排除。7 条不可变 observation 分别映射 CUR-01～03、CUR-N1/N2、CORE-N1、LIVE-N1，固定 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object 和 fixture，不允许用当前工作树冒充历史实现。
+EVID-N1 将合同提升为 append-only schema v2：原 v1 的 `capturedAt`、`policy`、`sources`、`incrementalReview`、`registryTruth`、`capabilities`、`enhancements`、`providerLifecycle`、`realAcceptance`、`protobufFixtures` 十个字段分别由 canonical SHA-256 固定；新增的 OmniRoute source snapshot 绑定 HEAD commit/tree，并明确记录 `worktreeClean=false`、22 项工作树内容全部排除。当前 8 条不可变 observation 分别映射 CUR-01～03、CUR-N1/N2、CORE-N1、CORE-N2、LIVE-N1，固定 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object 和 fixture，不允许用当前工作树冒充历史实现。新增 `evidenceExtensions` 只记录 `CORE-N2-CURSOR=fixture_verified`，不改写十个 legacy 字段。
 
 Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段语义、重复 field 27/URL 失败关闭、Connect frame 任意分片与 partial EOF、成功/错误 terminal envelope、plain EOF 失败关闭，以及 fresh `composer-2.5-fast` 必须保留完整 wire ID。公开模型选择入口已经存在，因此 registry `special.cursor` revision 4 将 discovery 与 forward/test 一并标为 supported/`fixture_verified`；OAuth 返回静态 aliases，API-key 目录保持 exact Provider/runtime/credential scope，成功空目录权威，transient stale 只用于展示。
 
 CUR-02/CUR-N1 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
 
 CORE-N1 切片以 `src/proxy/providers/cursor/` 作为共享 forwarder 与既有 `src/proxy/cursor/` 协议实现之间的生命周期 facade，收敛 Cursor adapter、模型选择、native driver dispatch 和 h2 timeout mapping，不改变 endpoint、protobuf、session、wire、attempt、terminal 或 usage。LIVE-N1 同时把 receipt 提升为 schema v2/harness revision 2：OAuth 与 API-key 仍独立，每份私有 receipt 必须绑定当前 target commit、App、Provider/runtime revision、Share revision、精确 credential generation、完整 `*-fast` model、22 项检查、10 份 body hash、5 项测量、固定恢复决策和 decoy/secret scan；真实文件必须在仓库外且权限为 `0600`。当前未提供真实凭据，两条 rail 的 receipt 仍为 `null`、状态保持 `live_pending`。
+
+CUR-N2 的 `reviewed_no_wire_delta` 结论保持不变：冻结区间没有新的 Cursor wire 增量。后续 `3e0f5ff` 是独立的 CORE-N2 生命周期容量切片，以同一 committed reference 中已经存在的 frame/session 有界信号作为 differential 证据，不把它误写成上游新增协议，也不改变双 rail 的真实 receipt 状态。
 
 ## 2026-09-18 Grok reasoning replay/root-union/quality-observation differential freeze
 

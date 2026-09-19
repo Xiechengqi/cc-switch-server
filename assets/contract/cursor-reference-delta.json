@@ -679,6 +679,158 @@
         ]
       },
       "reason": "Require current-commit private schema-v2 receipts bound to exact rail, Provider/runtime, Share, credential generation and model; fixture mode and missing credentials leave both rails live_pending."
+    },
+    {
+      "id": "CUR-OBS-0008",
+      "providerFamily": "cursor",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "omniroute",
+        "snapshotId": "omniroute-2026-09-19",
+        "repository": "OmniRoute",
+        "deltaId": "frame_and_parked_session_memory_bounds",
+        "commit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+        "tree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+        "paths": [
+          "open-sse/executors/cursor.ts",
+          "open-sse/services/cursorSessionManager.ts"
+        ],
+        "symbols": [
+          "CURSOR_MAX_FRAME_BYTES",
+          "Splice off processed bytes so the buffer stays bounded.",
+          "DEFAULT_IDLE_TTL_MS",
+          "enforceMaxSessions"
+        ],
+        "sourceDigest": "bd5f2708eebb0a71cac9bae63d479a77f5b27e8e7e1a9e5f64819959f61fb132"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N2"
+      ],
+      "target": {
+        "baselineCommit": "6697ef4dc6f558c9f913abd9d250b1541d780f77",
+        "baselineTree": "18356b6a54eec75f419668e6eac171a844b71ee7",
+        "implementationCommit": "3e0f5ffa824b8e30c8df95235e8489a3c9635f47",
+        "implementationTree": "3af5984ff4cc74c455db049d40dd3019e53d64b9",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth",
+              "cursor_share_and_pinned_provider_test_fail_before_agentservice_network"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/memory.rs",
+            "anchors": [
+              "CursorResponseMemory",
+              "plan_estimate_grows_with_prompt_tools_and_response_items",
+              "buffered_event_estimate_uses_string_capacity"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/agent_proto.rs",
+            "anchors": [
+              "gzip_expansion_honors_request_memory_limit",
+              "partial_frame_preflight_accounts_for_parser_growth"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/h2_client.rs",
+            "anchors": [
+              "transfer_request_memory",
+              "anticipated_retained_bytes"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/session.rs",
+            "anchors": [
+              "parked_session_reservation_transfers_and_releases_on_close",
+              "expired_parked_session_releases_request_memory"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/agent_driver.rs",
+            "anchors": [
+              "cursor_auth_and_semantic_recovery_share_one_total_budget",
+              "cursor_memory_exhaustion_is_capacity_shed_not_network_failure"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/event_emitter.rs",
+            "anchors": [
+              "request_memory_terminal_keeps_the_stable_code_on_every_surface"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth",
+          "cursor_share_and_pinned_provider_test_fail_before_agentservice_network",
+          "plan_estimate_grows_with_prompt_tools_and_response_items",
+          "buffered_event_estimate_uses_string_capacity",
+          "gzip_expansion_honors_request_memory_limit",
+          "partial_frame_preflight_accounts_for_parser_growth",
+          "parked_session_reservation_transfers_and_releases_on_close",
+          "expired_parked_session_releases_request_memory",
+          "cursor_auth_and_semantic_recovery_share_one_total_budget",
+          "cursor_memory_exhaustion_is_capacity_shed_not_network_failure",
+          "request_memory_terminal_keeps_the_stable_code_on_every_surface"
+        ]
+      },
+      "reason": "OmniRoute proves a 16 MiB single-frame ceiling, rolling-buffer splicing, and bounded parked-session lifetime/count with close cleanup, but it does not provide a unified request-lifecycle budget or bound gzip expansion. Adopt the bounded transport/session signal while independently applying one sticky budget to exact Cursor OAuth and API-key rails across Claude, Codex, and Gemini surfaces, including request normalization, protobuf/gzip/parser state, images, response accumulators, retries, parked-session transfer, stable capacity terminals, and last-owner release."
+    }
+  ],
+  "evidenceExtensions": [
+    {
+      "id": "CORE-N2-CURSOR",
+      "status": "fixture_verified",
+      "rails": [
+        "oauth",
+        "api_key"
+      ],
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "stickyExhaustion": true,
+      "parkedSessionTransfer": true,
+      "gzipExpansionBounded": true,
+      "localEvidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "cursor_share_and_pinned_provider_test_fail_before_agentservice_network"
+          ]
+        },
+        {
+          "path": "src/proxy/cursor/agent_proto.rs",
+          "anchors": [
+            "gzip_expansion_honors_request_memory_limit",
+            "partial_frame_preflight_accounts_for_parser_growth"
+          ]
+        },
+        {
+          "path": "src/proxy/cursor/session.rs",
+          "anchors": [
+            "parked_session_reservation_transfers_and_releases_on_close",
+            "expired_parked_session_releases_request_memory"
+          ]
+        },
+        {
+          "path": "src/proxy/cursor/agent_driver.rs",
+          "anchors": [
+            "cursor_auth_and_semantic_recovery_share_one_total_budget",
+            "cursor_memory_exhaustion_is_capacity_shed_not_network_failure"
+          ]
+        },
+        {
+          "path": "src/proxy/cursor/event_emitter.rs",
+          "anchors": [
+            "request_memory_terminal_keeps_the_stable_code_on_every_surface"
+          ]
+        }
+      ]
     }
   ]
 }
