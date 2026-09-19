@@ -107,8 +107,8 @@ use super::providers::claude::{
     RateLimitScope as ClaudeRateLimitScope,
 };
 use super::providers::{
-    antigravity, claude, codex, cursor, grok as grok_provider, kiro as kiro_provider,
-    qoder as qoder_provider,
+    antigravity, claude, codebuddy as codebuddy_provider, codex, cursor, grok as grok_provider,
+    kiro as kiro_provider, qoder as qoder_provider,
 };
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
@@ -16382,27 +16382,8 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         share_invocation_guard,
         started,
     } = options;
-    let (ProviderType::CodeBuddyOAuth, account_id, expected_identity_generation) =
-        execution.managed_account_identity_target().ok_or_else(|| {
-            ProxyError::bad_request(
-                "CodeBuddy Provider must bind one explicit codebuddy_oauth managed account",
-            )
-        })?
-    else {
-        return Err(ProxyError::bad_request(
-            "CodeBuddy Provider account type does not match its runtime contract",
-        ));
-    };
-    let requested_model = adapter_request
-        .actual_model
-        .clone()
-        .or_else(|| adapter_request.model.clone())
-        .or_else(|| chat_model_from_canonical(&adapter_request.body))
-        .ok_or_else(|| ProxyError::bad_request("CodeBuddy request is missing a model"))?;
-    let canonical_chat_request =
-        serde_json::from_slice::<Value>(&adapter_request.body).map_err(|error| {
-            ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
-        })?;
+    let bound = codebuddy_provider::bound_account_identity(&execution)?;
+    let canonical = codebuddy_provider::prepare_canonical_request(&adapter_request)?;
 
     let mut recovery_attempt = ForwardAttemptContext::default();
     let binding_accounts = state.accounts_snapshot().await;
@@ -16410,18 +16391,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
     loop {
-        let runtime = match state
-            .prepare_codebuddy_runtime(
-                stored.app,
-                &stored.provider.id,
-                execution.plan.provider_revision,
-                &execution.plan.runtime_fingerprint,
-                account_id,
-                expected_identity_generation,
-                execution.request_timeout(),
-            )
-            .await
-        {
+        let runtime = match codebuddy_provider::prepare_runtime(&state, &execution, &bound).await {
             Ok(runtime) => runtime,
             Err(error)
                 if error.is_authentication_failure()
@@ -16461,77 +16431,37 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 return Err(error);
             }
         };
-        let model_id = super::codebuddy_runtime::resolve_codebuddy_model_id(
-            runtime.profile.site,
-            &requested_model,
-        )
-        .map_err(ProxyError::bad_request)?;
-        if !runtime
-            .catalog
-            .enabled_models
-            .iter()
-            .any(|enabled| enabled == &model_id)
-        {
-            let error = ProxyError {
-                status: StatusCode::FORBIDDEN,
-                message: format!(
-                    "CodeBuddy model {model_id} is not enabled in the bound account's live catalog"
-                ),
-            };
-            record_qoder_nonstream_failure(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                &error,
-            )
-            .await;
-            return Err(error);
-        }
-        let capability = runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
-            ProxyError::bad_gateway(format!(
-                "CodeBuddy live catalog has no capability record for enabled model {model_id}"
-            ))
-        })?;
-        let has_tools = canonical_chat_request
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty());
-        if has_tools && !capability.supports_tools {
-            return qoder_fail_before_commit(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                ProxyError::bad_request(format!(
-                    "CodeBuddy model {model_id} does not advertise tool support"
-                )),
-            )
-            .await;
-        }
-        let requests_reasoning = canonical_chat_request.get("reasoning").is_some()
-            || canonical_chat_request.get("reasoning_effort").is_some();
-        if requests_reasoning && !capability.supports_reasoning {
-            return qoder_fail_before_commit(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                ProxyError::bad_request(format!(
-                    "CodeBuddy model {model_id} does not advertise reasoning support"
-                )),
-            )
-            .await;
-        }
-        let payload = super::codebuddy_runtime::build_codebuddy_payload(
-            &canonical_chat_request,
-            &model_id,
-            capability,
-        )
-        .map_err(ProxyError::bad_request)?;
+        let prepared = match codebuddy_provider::prepare_generation(&runtime, &canonical) {
+            Ok(prepared) => prepared,
+            Err(codebuddy_provider::GenerationPreparationError::Direct(error)) => {
+                return Err(error);
+            }
+            Err(codebuddy_provider::GenerationPreparationError::RecordFailure(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(codebuddy_provider::GenerationPreparationError::FailBeforeCommit(error)) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error,
+                )
+                .await;
+            }
+        };
+        let model_id = prepared.model_id;
+        let payload = prepared.payload;
 
         adapter_request.actual_model = Some(model_id.clone());
         adapter_request.actual_model_source = Some("codebuddy_live_catalog".to_string());
@@ -16709,7 +16639,7 @@ async fn send_codebuddy_generation(
     runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
     payload: &Value,
 ) -> Result<PreparedCodeBuddyWireResponse, CodeBuddyForwardAttemptError> {
-    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+    if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
             "CodeBuddy Provider or bound account changed before inference",
         )));
@@ -16791,7 +16721,7 @@ async fn send_codebuddy_generation(
             .await
             .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
     };
-    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+    if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
             "CodeBuddy Provider or bound account changed while inference was starting",
         )));
@@ -16847,7 +16777,7 @@ async fn send_codebuddy_generation(
                 }
             })?;
         if !canonical.is_empty() || decoder.is_terminal() {
-            if !codebuddy_runtime_is_current(state, execution, runtime).await {
+            if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
                 return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
                     "CodeBuddy Provider or bound account changed before response commit",
                 )));
@@ -16880,24 +16810,6 @@ async fn codebuddy_next_wire_chunk(
         None => inner.try_next().await,
     };
     next.map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))
-}
-
-async fn codebuddy_runtime_is_current(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
-) -> bool {
-    state
-        .codebuddy_runtime_generation_matches(
-            execution.stored.app,
-            &execution.stored.provider.id,
-            execution.plan.provider_revision,
-            &execution.plan.runtime_fingerprint,
-            &runtime.account_id,
-            runtime.auth_identity_generation,
-            runtime.token_refresh_generation,
-        )
-        .await
 }
 
 async fn recover_codebuddy_auth(
@@ -17010,7 +16922,7 @@ async fn aggregate_codebuddy_nonstream(
                     CodeBuddyForwardAttemptError::Proxy(error)
                 }
             })?;
-        if !codebuddy_runtime_is_current(state, execution, runtime).await {
+        if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
             return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
                 "CodeBuddy Provider or bound account changed during inference",
             )));
@@ -17019,7 +16931,7 @@ async fn aggregate_codebuddy_nonstream(
             .push(canonical)
             .map_err(CodeBuddyForwardAttemptError::Proxy)?;
     }
-    if !codebuddy_runtime_is_current(state, execution, runtime).await {
+    if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
             "CodeBuddy Provider or bound account changed before response commit",
         )));
@@ -17175,7 +17087,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                             return;
                         }
                     };
-                    if !codebuddy_runtime_is_current(&state, &execution, &runtime).await {
+                    if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                         let error = ProxyError::conflict(
                             "CodeBuddy Provider or bound account changed before response commit",
                         );
@@ -17283,7 +17195,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     return;
                 }
             };
-            if !codebuddy_runtime_is_current(&state, &execution, &runtime).await {
+            if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                 let error = ProxyError::conflict(
                     "CodeBuddy Provider or bound account changed during inference",
                 );

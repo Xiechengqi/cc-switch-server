@@ -50,6 +50,37 @@ function kiroScopeEnv(authKind, region) {
   };
 }
 
+function clearedCodeBuddyEnv() {
+  const cleared = { CC_SWITCH_CODEBUDDY_REAL_SITE: "" };
+  for (const site of ["INTL", "CN"]) {
+    for (const name of [
+      `CODEBUDDY_${site}_TEST_ACCOUNT`,
+      `CC_SWITCH_CODEBUDDY_${site}_CLAUDE_PROVIDER_ID`,
+      `CC_SWITCH_CODEBUDDY_${site}_CODEX_PROVIDER_ID`,
+      `CC_SWITCH_CODEBUDDY_${site}_GEMINI_PROVIDER_ID`,
+      `CC_SWITCH_CODEBUDDY_${site}_SHARE_ID`,
+      `CC_SWITCH_CODEBUDDY_${site}_MODEL`,
+      `CODEBUDDY_${site}_REAL_RECEIPT_FILE`,
+    ]) {
+      cleared[name] = "";
+    }
+  }
+  return cleared;
+}
+
+function codeBuddySiteEnv(site) {
+  const prefix = site.toUpperCase();
+  return {
+    [`CODEBUDDY_${prefix}_TEST_ACCOUNT`]: `codebuddy-${site}-account`,
+    [`CC_SWITCH_CODEBUDDY_${prefix}_CLAUDE_PROVIDER_ID`]: `codebuddy-${site}-claude`,
+    [`CC_SWITCH_CODEBUDDY_${prefix}_CODEX_PROVIDER_ID`]: `codebuddy-${site}-codex`,
+    [`CC_SWITCH_CODEBUDDY_${prefix}_GEMINI_PROVIDER_ID`]: `codebuddy-${site}-gemini`,
+    [`CC_SWITCH_CODEBUDDY_${prefix}_SHARE_ID`]: `codebuddy-${site}-share`,
+    [`CC_SWITCH_CODEBUDDY_${prefix}_MODEL`]: site === "intl" ? "default-model" : "default",
+    [`CODEBUDDY_${prefix}_REAL_RECEIPT_FILE`]: `/tmp/codebuddy-${site}.json`,
+  };
+}
+
 function runEnvCheck(overrides) {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "cc-switch-real-env-check-"),
@@ -163,6 +194,7 @@ function runEnvCheck(overrides) {
       CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID: "",
       ...clearedKiroMatrixEnv(),
+      ...clearedCodeBuddyEnv(),
       CC_SWITCH_SERVER_TOKEN: "",
       SERVER_URL: "",
       ...overrides,
@@ -494,6 +526,33 @@ test("Qoder external gates keep the three credential rails independent", () => {
   assert.equal(globalPatAndCn.checks.qoderGlobalOauthGateStatus, "blocked-inputs");
   assert.equal(globalPatAndCn.checks.qoderGlobalPatGateStatus, "inputs-ready");
   assert.equal(globalPatAndCn.checks.qoderCnOauthGateStatus, "inputs-ready");
+});
+
+test("CodeBuddy Intl and CN private receipt gates remain independent", () => {
+  const common = {
+    STAGE: "AB7",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://codebuddy-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+  };
+  const intl = runEnvCheck({
+    ...common,
+    ...codeBuddySiteEnv("intl"),
+  });
+  assert.equal(intl.checks.codebuddyIntlGateStatus, "inputs-ready");
+  assert.equal(intl.checks.codebuddyCnGateStatus, "blocked-inputs");
+  assert.equal(intl.longTailInputsPresent.codebuddyIntlReceiptFile, true);
+  assert.equal(intl.longTailInputsPresent.codebuddyCnReceiptFile, false);
+
+  const cn = runEnvCheck({
+    ...common,
+    ...codeBuddySiteEnv("cn"),
+  });
+  assert.equal(cn.checks.codebuddyIntlGateStatus, "blocked-inputs");
+  assert.equal(cn.checks.codebuddyCnGateStatus, "inputs-ready");
+  assert.equal(cn.longTailInputsPresent.codebuddyIntlReceiptFile, false);
+  assert.equal(cn.longTailInputsPresent.codebuddyCnReceiptFile, true);
 });
 
 test("Amazon Q external gate is independent from Kiro and requires two explicit Provider IDs", () => {

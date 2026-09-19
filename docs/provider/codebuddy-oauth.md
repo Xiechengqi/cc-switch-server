@@ -347,6 +347,10 @@ prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_cache_write_tokens
 
 `credit` 是计费信号，`completion_thinking_tokens` 单独计推理 token。**U15 已关闭。**
 
+### 5.8 Provider lifecycle facade
+
+CORE-N1 将精确 `codebuddy_oauth` Account binding、canonical request/model、站点绑定的 live catalog capability、payload preparation 和 Provider/Account generation fence 收敛到 `src/proxy/providers/codebuddy/`。共享 `forwarder.rs` 仍拥有 Share/Account lease、usage、terminal、统一 attempt budget，以及是否允许原账号在下游提交前执行一次 401 refresh/replay。此次拆分不改变 endpoint、header、payload bytes、错误记录分支、恢复次数或 terminal + EOF 合同，也不引入 Account、Provider、site、domain 或 rail fallback。
+
 ---
 
 ## 6. 模型目录
@@ -610,6 +614,10 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 离线：站点 parse 与非法站点拒绝、identity 含 site 且跨站不碰撞、同站 domain 轮换不改 identity 与旧 ID 惰性复用、个人 rail 拒绝企业 identity、`X-No-*` 头齐备、cookie jar 复用、轮询 lease/容量/TTL/过期清理、refresh 身份冲突拒绝、header 最终覆盖、强制流式注入、named tool choice 与 reasoning effort 校验、完整/中断/孤立/重复/截断工具轮次、reasoning-only 与三 Surface namespace 闭环、SSE 多行/心跳/唯一终态、终态前后取消和租约释放、目录权威/空/stale/协议漂移、alias 按 site 投影、modern billing 合并与旧接口回退、官方用量分页/去重/prompt 不落盘、未知模型 400、单次 401 恢复与二次 401 终态、Provider/Account/token 三代际漂移。
 
 真实验收需要**国内与国际各一份**脱敏 receipt，覆盖：登录、refresh 轮换、`/v3/config` 目录、三 Surface 的非流与流式、tools、首个 401、第二个 401、429、中途断流、未知模型拒绝，以及日志/控制面/持久化文件不泄露 token。
+
+LIVE-N1 的 `scripts/smoke/codebuddy-real-receipt.mjs` 一次只接受 `--site intl` 或 `--site cn`。对应 Account、Claude/Codex/Gemini 三个 Provider、Share、exact model 和 receipt path 必须使用该 site 的独立环境变量；三个 Provider 都必须是 `special.codebuddy_oauth` / `ready`，固定同一 Account 与当前 `authIdentityGeneration`，Share 显式固定三项绑定。validator 重新读取三份 `source=codebuddy_live_model_catalog`、`stale=false` 的 fresh catalog，并把 target commit/harness、Account 两代际、三个 Provider revision/runtime digest、Share revision/binding digest、exact model、三份 catalog snapshot 与六个 non-stream/stream body hash共同绑定进 scope digest。
+
+私有 receipt schema v2 必须完整提供 16 项 `pass`、规定的 measurements、固定恢复决策、decoy 零计数与 secret scan；真实文件位于仓库外且权限为 `0600`。缺输入时只输出 `blocked_inputs/live_pending`；`CC_SWITCH_CODEBUDDY_HARNESS_MODE=fixture` 即使所有 mock 检查通过也只接受 `contract_verified/live_pending`，不能写成 `live_verified`。真实模式只有完整私有 harness 已覆盖登录、refresh rotation、`12153`、权威空目录、billing、三 Surface、两段 401、唯一 terminal + EOF、generation/decoy/secret 检查时才接受 `live_verified`。任一站成功不得继承给另一站，receipt 也不自动开放 `deepseek-v4.1-flash`、企业或多模态能力。
 
 国际 site 的采集已完成（2026-08-31，个人账号），可支撑 `fixture_verified`；**升 live verified 仍需在本仓库内按上述清单重跑一遍并留存脱敏 receipt** —— 本次采集是在 workbuddy-cliproxy 侧做的探针式验证，不是本仓库的验收流水线产物。
 

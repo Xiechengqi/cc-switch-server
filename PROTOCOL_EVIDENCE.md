@@ -207,6 +207,8 @@ CN `cosy-clientip` 现由 Server 自身出站路由决定并在 catalog、quota�
 
 参考实现的 `deepseek-v4.1-flash` 精确 native ID、顶层 reasoning 字段和 context-window 只是 CB-N4 二级信号。本仓库没有 CN 绑定账号 receipt 或冻结厂商目录，因此 reviewed allowlist 不开放该 ID，`runtimeEnabled=false`、状态保持 `live_pending`；不采用 `deep-model` 静默改写，也不把模型专属字段泛化。
 
+2026-09-19 的 CORE-N1 只调整 Server 内部所有权：`src/proxy/providers/codebuddy/` 统一持有 exact `codebuddy_oauth` Account binding、canonical request/model、Intl/CN live-catalog capability 与 payload preparation，以及 Provider/Account generation fence。共享 forwarder 继续拥有 Share/Account lease、usage、terminal、共享 attempt budget 和是否执行同账号 pre-commit 401 replay；endpoint、header、wire、错误记录路径与恢复次数没有变化。LIVE-N1 同时新增 Intl/CN 两份相互独立的 schema-v2 私有 receipt validator，绑定当前 target commit/harness、Account auth/token generation、三个 Surface Provider revision/runtime digest、Share revision/binding digest、exact model、三份 fresh `codebuddy_live_model_catalog` snapshot 与六个 body hash。16 项检查必须全部通过才可在真实模式接受 `live_verified`；fixture 永远只能得到 `contract_verified/live_pending`。当前未提供两站真实 receipt，合同中的 receipt 继续为 `null`，CB-N4、企业与多模态也不会被 receipt 自动启用。
+
 1. CodeBuddy CLI `2.142.0` bundle、站点 overlay，以及国际个人订阅账号的脱敏真实流量；
 2. 本仓库 [`docs/provider/codebuddy-oauth.md`](docs/provider/codebuddy-oauth.md) 已冻结的端点、OAuth、refresh、目录、计费与 terminal 约束；
 3. `cli2api` commit `9b18f2d` 的 WorkBuddy CN/Global adapter，仅作为国内实现、payload、错误投影与缺陷的交叉样本。

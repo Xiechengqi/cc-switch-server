@@ -200,6 +200,26 @@ assert(
   "CodeBuddy fixture acceptance matrix changed",
 );
 
+const lifecycle = contract.providerLifecycle;
+assert(
+  lifecycle?.id === "CORE-N1" &&
+    lifecycle.status === "fixture_verified" &&
+    lifecycle.wireChanged === false &&
+    lifecycle.bindingChanged === false &&
+    lifecycle.attemptBudgetChanged === false &&
+    lifecycle.localEvidence?.length === 2,
+  "CodeBuddy Provider lifecycle boundary changed",
+);
+for (const evidence of lifecycle.localEvidence) {
+  safeRelative(evidence.path, "CORE-N1 local path");
+  const localPath = path.join(repoRoot, evidence.path);
+  assert(fs.existsSync(localPath), `CORE-N1 local path is unavailable: ${evidence.path}`);
+  const local = fs.readFileSync(localPath, "utf8");
+  for (const anchor of evidence.anchors ?? []) {
+    assert(local.includes(anchor), `CORE-N1 is missing local anchor ${anchor}`);
+  }
+}
+
 const registry = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "assets/contract/provider-registry.json"), "utf8"),
 );
@@ -230,11 +250,23 @@ assert(
 
 const acceptance = contract.realAcceptance;
 assert(
-  acceptance?.receiptSchemaVersion === 1 &&
+  acceptance?.receiptSchemaVersion === 2 &&
+    acceptance.harnessRevision === 2 &&
     acceptance.requiredChecks.length === 16 &&
     new Set(acceptance.requiredChecks).size === 16,
   "CodeBuddy acceptance must retain 16 unique checks",
 );
+for (const [field, count] of [
+  ["scopeBindings", 8],
+  ["requiredBodyHashes", 6],
+  ["requiredMeasurements", 12],
+  ["requiredDecisions", 15],
+]) {
+  assert(
+    acceptance[field]?.length === count && new Set(acceptance[field]).size === count,
+    `CodeBuddy acceptance ${field} changed`,
+  );
+}
 const sites = new Map(acceptance.sites.map((site) => [site.site, site]));
 for (const site of ["intl", "cn"]) {
   assert(
@@ -243,6 +275,31 @@ for (const site of ["intl", "cn"]) {
   );
 }
 
+for (const [relativePath, anchors] of [
+  [
+    "scripts/smoke/codebuddy-real-receipt.mjs",
+    [
+      "const HARNESS_REVISION = 2",
+      "codebuddy_live_model_catalog",
+      "sameAccountFirst401",
+      "const expectedLive = fixtureMode ? \"live_pending\" : \"live_verified\"",
+    ],
+  ],
+  [
+    "scripts/audit/codebuddy-real-receipt.test.mjs",
+    [
+      "CodeBuddy Intl and CN fixture receipts stay contract-only",
+      "CodeBuddy receipt scope binds all six body hashes",
+      "CodeBuddy Provider binding mismatch fails before receipt acceptance",
+    ],
+  ],
+]) {
+  const local = fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const anchor of anchors) {
+    assert(local.includes(anchor), `${relativePath} is missing ${anchor}`);
+  }
+}
+
 console.log(
-  `codebuddy reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancements, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
+  `codebuddy reference delta audit ok (${capabilities.size} capabilities, ${enhancements.size} enhancements, CORE-N1 facade, ${fixtureChecks.length} fixture checks, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}, external check ${checkSources ? "verified" : "optional"})`,
 );

@@ -51,9 +51,9 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | Grok | GR-N1 `fixture_verified`（观察-only）；CORE-N1 Provider lifecycle 与 reference-delta v2 已完成 | GR-N2 inference/media/remote_compaction 三个 operation 独立 `live_pending` |
 | Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture；CORE-N1 Provider facade 与 reference-delta v2 已完成 | KI-N3 启用与 auth kind × region receipt `live_pending`；KI-05 shared cache 继续关闭 |
 | Qoder | QD-N2 `reviewed_no_wire_delta`；CORE-N1 Provider facade 与 reference-delta v2 已完成 | QD-N1 三 rail 独立 `live_pending` |
-| CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖 | CB-N4 与 Intl/CN receipt `live_pending`，v4.1 runtime disabled |
+| CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖；CORE-N1 Provider facade 与 Intl/CN schema-v2 私有 receipt gate 已完成 | CB-N4 与两站真实 receipt `live_pending`，v4.1 runtime disabled |
 
-CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 均已完成 Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 七个切片；CodeBuddy 的结构/证据拆分仍待推进，所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
+CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 已完成八个 Provider 切片；EVID-N1 已完成 Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 七个切片，CodeBuddy 的 append-only 证据迁移仍待独立提交。所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
 
 ### 0.2 原始优先级摘要
 
@@ -501,6 +501,8 @@ CB-N4 在没有 CN 绑定账号 receipt 或冻结 vendor catalog 前，不把 de
 
 CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项测试已覆盖终态前截断、`[DONE]` 后无 EOF 和 marker 前后取消，结论为“通用实现已覆盖”，未复制 cli2api 的语言/框架特定代码。
 
+CORE-N1 已新增 `src/proxy/providers/codebuddy/` facade，收拢精确 Account binding、canonical/model、站点目录 capability、payload preparation 与 generation fence；共享 forwarder 的 lease、usage、terminal、attempt budget 和一次 401 replay 决策保持不变。LIVE-N1 将 Intl/CN 拆为两份独立 schema-v2 私有 receipt：每份绑定 target commit/harness、Account 两代际、三 Surface Provider revision/runtime digest、Share revision/binding digest、exact model、三份 fresh `codebuddy_live_model_catalog` snapshot 与六个 body hash。fixture 只允许 `contract_verified/live_pending`；当前无真实 receipt，两站仍为 `null/live_pending`，也不自动开放 CB-N4、企业或多模态。
+
 ### 11.4 不采纳
 
 不迁入每日签到、企业运营、domain fallback、账号池、prompt rewrite、未验证的企业/图像/视频能力，亦不通过隐藏 11148 原因来制造成功。
@@ -509,7 +511,7 @@ CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项�
 
 ### 12.1 CORE-N1：渐进拆分巨型热路径
 
-状态：partially_completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 七个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；CodeBuddy 仍待实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
+状态：completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 八个 Provider 切片均已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点。CodeBuddy facade 持有精确 Account binding、canonical/model、站点目录 capability、payload preparation 与 generation fence；共享 forwarder 继续持有 lease、usage、terminal、attempt budget 和 401 replay 决策。这里关闭的是可维护性和审查边界，不改变 execution wire。
 
 建议目标结构：
 
@@ -658,10 +660,10 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
-状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex/Cursor/Grok/Kiro/Qoder 的 CORE-N1/EVID-N1 切片、Qoder LIVE-N1、CUR-N2 与 QD-N2 已完成；CodeBuddy CORE-N1/EVID-N1 与跨 Provider memory 推广留待后续独立变更。
+状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、八类 Provider 的 CORE-N1、Antigravity/Claude/Codex/Cursor/Grok/Kiro/Qoder 的 EVID-N1、Qoder 与 CodeBuddy LIVE-N1 gate、CUR-N2 与 QD-N2 已完成；CodeBuddy EVID-N1 与跨 Provider memory 推广留待后续独立变更。
 
 1. 先完成 CX-N4 的 request memory budget，再抽取 CORE-N2。
-2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 已完成，后续处理 CodeBuddy。
+2. 按 Provider 分批实施 CORE-N1；八类 Provider 已全部完成。
 3. 实施 EVID-N1 append-only reference delta v2。
 4. 执行 CUR-N2、QD-N2 的周期复核。
 5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority。
@@ -834,4 +836,4 @@ CodeBuddy：
 11. registry、合同源、生成 coverage、UI matrix、PROTOCOL_EVIDENCE 和 reference delta 一致；docs/provider/coverage.md 未被手改。
 12. 外部仓库没有进入构建、测试、CI、发布或运行时依赖。
 
-当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 已完成各自 CORE-N1/EVID-N1 首个切片，但 CodeBuddy 与 CORE-N2 的跨 Provider 推广仍是明确后续项。因此可以关闭首轮静态差分、P0/P1 离线实施及前七类 Provider 后续切片，不能把完整真实验收队列或整体架构计划标记为完成。
+当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。八类 Provider 已完成 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder 已完成 EVID-N1，CodeBuddy EVID-N1 与 CORE-N2 的跨 Provider 推广仍是明确后续项。因此可以关闭首轮静态差分、P0/P1 离线实施及八类 Provider lifecycle 拆分，不能把完整真实验收队列或整体架构计划标记为完成。

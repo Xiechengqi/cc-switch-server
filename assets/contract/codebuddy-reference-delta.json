@@ -319,8 +319,48 @@
       "cancel_after_done_before_eof_releases_upstream"
     ]
   },
+  "providerLifecycle": {
+    "id": "CORE-N1",
+    "status": "fixture_verified",
+    "wireChanged": false,
+    "bindingChanged": false,
+    "attemptBudgetChanged": false,
+    "localEvidence": [
+      {
+        "path": "src/proxy/providers/codebuddy/mod.rs",
+        "anchors": [
+          "pub(crate) fn bound_account_identity(",
+          "pub(crate) fn prepare_canonical_request(",
+          "pub(crate) fn prepare_generation(",
+          "pub(crate) async fn runtime_is_current(",
+          "generation_uses_exact_site_bound_live_catalog",
+          "generation_fails_closed_on_unadvertised_capabilities"
+        ]
+      },
+      {
+        "path": "src/proxy/forwarder.rs",
+        "anchors": [
+          "codebuddy_provider::bound_account_identity",
+          "codebuddy_provider::prepare_canonical_request",
+          "codebuddy_provider::prepare_generation",
+          "codebuddy_provider::runtime_is_current"
+        ]
+      }
+    ]
+  },
   "realAcceptance": {
-    "receiptSchemaVersion": 1,
+    "receiptSchemaVersion": 2,
+    "harnessRevision": 2,
+    "scopeBindings": [
+      "target_commit_and_harness_revision",
+      "immutable_site",
+      "account_auth_and_token_generations",
+      "three_surface_provider_revisions_and_runtime_digests",
+      "share_revision_and_binding_digest",
+      "exact_model",
+      "three_fresh_codebuddy_live_model_catalog_snapshots",
+      "six_request_body_hashes"
+    ],
     "sites": [
       {
         "site": "cn",
@@ -350,6 +390,45 @@
       "site_account_provider_generation_digest",
       "decoy_zero_request_counts",
       "secret_scan"
+    ],
+    "requiredBodyHashes": [
+      "claude_nonstream",
+      "claude_stream",
+      "codex_nonstream",
+      "codex_stream",
+      "gemini_nonstream",
+      "gemini_stream"
+    ],
+    "requiredMeasurements": [
+      "loginRuns",
+      "refreshRotationRuns",
+      "sessionDeadRuns",
+      "catalogRuns",
+      "authoritativeEmptyCatalogRuns",
+      "billingRuns",
+      "claudeRuns",
+      "codexRuns",
+      "geminiRuns",
+      "toolMatrixRuns",
+      "recoveryRuns",
+      "terminalEofRuns"
+    ],
+    "requiredDecisions": [
+      "sameAccountFirst401",
+      "second401",
+      "identityGenerationDrift",
+      "crossSiteFallback",
+      "crossDomainFallback",
+      "crossAccountFallback",
+      "crossProviderFallback",
+      "crossShareFallback",
+      "postCommitReplay",
+      "authoritativeEmptyCatalog",
+      "catalogStale",
+      "enterpriseRuntime",
+      "multimodalRuntime",
+      "deepseekV41Runtime",
+      "receiptAutoEnablesCapabilities"
     ]
   }
 }

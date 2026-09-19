@@ -371,6 +371,17 @@ Qoder 三条单账号 rail 专项补充：
 7. 缺 `RUN_REAL=1`、Server/Share 鉴权、Account selector、Share、任一 Provider ID 或 receipt path 时，脚本以成功退出码输出 `verificationState=blocked_inputs`、`liveState=live_pending`，不发网络请求且绝不输出 `live_verified`。三个 rail 的 receipt 缺一不可互相代替；当前 happy-path harness 未执行的 login/rotation、权威空目录与受控两段 401 仍写 `not_observed`，所以真实运行也只可写 `partial_live_verified/live_pending`。
 8. 本地运行 `node --test scripts/audit/qoder-real.test.mjs` 会以 loopback mock 分别覆盖三条 rail、binding fail-closed、blocked inputs 与泄漏扫描；其 receipt 固定为 `contract_verified/live_pending`，只证明 harness 合同。真实 Device Flow/PAT、refresh rotation、catalog、quota、三 Surface 与故障注入 receipt 未齐前，Registry/文档继续保持 `fixture_verified` / `live_pending`。
 
+CodeBuddy Intl/CN 双站私有 receipt 专项补充：
+
+1. Intl 与 CN 必须分两次独立运行，`--site intl|cn`（或 `CC_SWITCH_CODEBUDDY_REAL_SITE`）一次只选择一站。每站分别配置 `CODEBUDDY_<SITE>_TEST_ACCOUNT`、Share、exact model、Claude/Codex/Gemini 三个 Provider ID 与仓库外 receipt；另一站、另一 Account/Provider/Share、domain fallback、pool router、企业与多模态均为 decoy，请求数必须为零。
+2. Account 必须是 `codebuddy_oauth` OAuth credential owner，持有 access + refresh token、Profile/raw presence，且不处于 relogin。三个 Provider 必须为 `special.codebuddy_oauth` / `ready`，全部固定该 Account 当前 `authIdentityGeneration`；Share 必须显式固定三项 Surface binding。validator 不读取或输出 token、cookie、Profile/raw body、邮箱或原始上游错误。
+3. 三个 Surface 各自调用带显式 `app` + `providerId` 的 `/v1/models`，只接受 `source=codebuddy_live_model_catalog`、`stale=false`、fresh `fetchedAtMs`，且 exact model 恰出现一次。成功空目录是权威结果，必须由私有故障注入单独证明；不得从 reviewed allowlist、另一站、另一个 Account 或 stale identity 补齐。
+4. 私有 harness 必须在同一 site/binding 上覆盖登录 cookie flow、refresh token rotation/jitter、闲置会话 `12153` 终态、fresh/权威空目录、billing quota、Claude/Codex/Gemini non-stream+stream+tool+usage、工具历史/tool choice、唯一 terminal 后 EOF、首次 401 原账号 pre-commit 单次恢复与第二次 401 终态。任何提交后认证失败、generation drift 或跨边界恢复都失败。
+5. schema-v2 receipt 只保存当前 target commit/harness、site、exact model、Account auth/token generation、三个 Provider revision/runtime digest、Share revision/binding digest、三份 fresh catalog snapshot、六个请求 body hash、规定的 measurements/recovery decisions、decoy 零计数和 secret scan；禁止保存可逆 Account/Provider/Share ID、prompt、tool 参数、raw request/response/body、token、cookie 或错误正文。
+6. receipt 必须是仓库外绝对路径，真实模式权限为 `0600`，且采集时间在 24 小时内。scope digest 同时绑定上述 generation/catalog/body hash；改任一 body hash、Provider runtime、Share revision、Account generation、site/model/commit 都必须拒绝旧 receipt。
+7. 缺 `RUN_REAL=1`、Server/Share 鉴权、任一站点专属输入时，脚本成功退出并只输出 `blocked_inputs/live_pending`，不发网络请求。`CC_SWITCH_CODEBUDDY_HARNESS_MODE=fixture` 只接受 `contract_verified/live_pending`；真实模式仅在 16 项检查全部为 `pass` 时接受 `live_verified/live_verified`。一站 receipt 不得提升另一站，也不自动启用 CB-N4、企业或多模态。
+8. 执行示例：`RUN_REAL=1 node scripts/smoke/codebuddy-real-receipt.mjs --site intl`。本地运行 `node --test scripts/audit/codebuddy-real-receipt.test.mjs` 只验证双站隔离、binding/scope fail-closed 与脱敏，不构成厂商实测；当前两站 receipt 均为 `null/live_pending`。
+
 GitHub Copilot 单账号三 Surface 专项补充：
 
 1. 建立 Claude、Codex、Gemini 三个 `github_copilot` Provider，分别填入三个 `CC_SWITCH_COPILOT_*_PROVIDER_ID`；三者必须显式绑定 `GITHUB_COPILOT_TEST_ACCOUNT` 选中的同一个 Account 和相同 `authIdentityGeneration`，runtime 均为 `special.copilot` / `ready`。不得从 active account、模型名或 quota 选择另一个账号。
