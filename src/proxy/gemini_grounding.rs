@@ -78,6 +78,62 @@ impl GroundingCitation {
 }
 
 impl GroundingAccumulator {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let queries = self
+            .queries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(
+                self.queries
+                    .iter()
+                    .map(|query| query.capacity())
+                    .sum::<usize>(),
+            );
+        let chunks = self
+            .chunks
+            .capacity()
+            .saturating_mul(std::mem::size_of::<GroundingChunk>())
+            .saturating_add(
+                self.chunks
+                    .iter()
+                    .map(|chunk| chunk.url.capacity().saturating_add(chunk.title.capacity()))
+                    .sum::<usize>(),
+            );
+        let raw_chunk_map = self
+            .raw_chunk_map
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<usize>>());
+        let supports = self
+            .supports
+            .capacity()
+            .saturating_mul(std::mem::size_of::<GroundingSupport>())
+            .saturating_add(
+                self.supports
+                    .iter()
+                    .map(|support| {
+                        support
+                            .raw_chunk_indices
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<usize>())
+                    })
+                    .sum::<usize>(),
+            );
+        let support_keys = self
+            .support_keys
+            .iter()
+            .map(|key| {
+                key.capacity()
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+            })
+            .sum::<usize>();
+        queries
+            .saturating_add(chunks)
+            .saturating_add(raw_chunk_map)
+            .saturating_add(supports)
+            .saturating_add(support_keys)
+    }
+
     pub(crate) fn from_candidate(candidate: &Value) -> Self {
         let mut grounding = Self::default();
         grounding.observe_candidate(candidate);

@@ -15,6 +15,10 @@ pub(crate) struct OpenAiChatStreamCanonicalizer {
 }
 
 impl OpenAiChatStreamCanonicalizer {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.decoder.retained_bytes()
+    }
+
     pub(crate) fn new(path: &'static str) -> Self {
         Self::with_fallback_created(path, unix_timestamp_seconds())
     }
@@ -191,6 +195,10 @@ struct RawSseEventDecoder {
 }
 
 impl RawSseEventDecoder {
+    fn retained_bytes(&self) -> usize {
+        self.pending.capacity()
+    }
+
     fn new(max_event_bytes: usize) -> Self {
         Self {
             pending: Vec::new(),

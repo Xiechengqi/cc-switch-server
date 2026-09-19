@@ -1986,6 +1986,29 @@ async fn summarize_codex_overflow(
     output
 }
 
+fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<ProviderType>) -> bool {
+    app == AppKind::Codex || provider_type.is_some_and(antigravity::is_provider)
+}
+
+async fn request_memory_provider_type_for_request(
+    state: &ServerState,
+    app: AppKind,
+    headers: &HeaderMap,
+    attempt_context: &ForwardAttemptContext,
+) -> Option<ProviderType> {
+    if let Some(execution) = attempt_context.execution.as_ref() {
+        return Some(execution.stored.provider_type);
+    }
+    let share_id = request_context_from_headers(headers).share_id?;
+    // Keep the documented store lock order (providers before shares). Any
+    // selection error is intentionally left to the authoritative path below.
+    let providers = state.providers.read().await;
+    let shares = state.shares.read().await;
+    select_share_provider(&providers, &shares, app, &share_id)
+        .ok()
+        .map(|(stored, _)| stored.provider_type)
+}
+
 async fn forward_with_attempt(
     state: ServerState,
     route: ProxyRoute,
@@ -1996,7 +2019,13 @@ async fn forward_with_attempt(
 ) -> Result<Response, ProxyError> {
     let raw_body_for_retry = body;
     let retry_gemini_path = gemini_path;
-    if route.app() == AppKind::Codex {
+    let app = route.app();
+    let request_memory_provider_type = if app == AppKind::Codex {
+        None
+    } else {
+        request_memory_provider_type_for_request(&state, app, &headers, &attempt_context).await
+    };
+    if request_memory_enabled_for_provider(app, request_memory_provider_type) {
         attempt_context.initialize_request_memory(
             state.request_body_limits.memory_budget_bytes,
             raw_body_for_retry.len(),
@@ -2011,13 +2040,12 @@ async fn forward_with_attempt(
             }
         }
         let gemini_path = retry_gemini_path.clone();
-        let (body, _decoded_body_memory) = decode_request_body_with_memory(
+        let (body, mut _decoded_body_memory) = decode_request_body_with_memory(
             &headers,
             raw_body_for_retry.clone(),
             state.request_body_limits.default_bytes,
             attempt_context.request_memory(),
         )?;
-        let app = route.app();
         let claude_body_retry_stage = attempt_context.body_retry_stage;
         let mut request_context = request_context_from_headers(&headers);
         request_context.operation = inference_operation_for_route(route);
@@ -2071,6 +2099,24 @@ async fn forward_with_attempt(
                 ));
             }
         };
+        if antigravity::is_provider(execution.stored.provider_type)
+            && attempt_context.request_memory().is_none()
+        {
+            attempt_context.initialize_request_memory(
+                state.request_body_limits.memory_budget_bytes,
+                raw_body_for_retry.len(),
+            )?;
+            if request_body_has_content_coding(&headers) {
+                let budget = attempt_context.request_memory().ok_or_else(|| {
+                    ProxyError::bad_gateway("request memory budget initialization failed")
+                })?;
+                _decoded_body_memory = Some(
+                    budget
+                        .reserve(RequestMemoryComponent::DecodedBody, body.len())
+                        .map_err(|error| error.into_proxy_error())?,
+                );
+            }
+        }
         if execution.driver_is("oauth.claude_messages") {
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
         }
@@ -2219,7 +2265,7 @@ async fn forward_with_attempt(
                 adapter_request.body = body;
             }
         }
-        let _normalized_body_memory = attempt_context
+        let mut normalized_body_memory = attempt_context
             .request_memory()
             .map(|budget| {
                 budget
@@ -2566,8 +2612,9 @@ async fn forward_with_attempt(
             &request_context,
             &url,
             &mut adapter_request.body,
+            attempt_context.request_memory(),
         )
-        .await;
+        .await?;
 
         let grok_reasoning_replay = grok_provider::prepare_http_replay(
             &state,
@@ -2602,10 +2649,11 @@ async fn forward_with_attempt(
         )
         .await?;
 
-        if let Some(reservation) = _normalized_body_memory.as_ref() {
+        if let Some(reservation) = normalized_body_memory.take() {
             reservation
                 .resize(adapter_request.body.len())
                 .map_err(|error| error.into_proxy_error())?;
+            adapter_request.body = reservation.retain_bytes(adapter_request.body);
         }
 
         let http_client = forward_http_client(&state, &execution).await?;
@@ -4138,6 +4186,28 @@ async fn forward_with_attempt(
                         .map_err(|error| error.into_proxy_error())
                 })
                 .transpose()?;
+            let stream_transform =
+                super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
+                    &stored,
+                    route,
+                    adapter_request.responses_tool_context.clone(),
+                    adapter_request.downstream_include_usage,
+                );
+            let antigravity_transform_memory = if antigravity::is_provider(stored.provider_type) {
+                stream_request_memory
+                    .as_ref()
+                    .map(|budget| {
+                        budget
+                            .reserve(
+                                RequestMemoryComponent::GroundingCitation,
+                                stream_transform.retained_antigravity_bytes(),
+                            )
+                            .map_err(|error| error.into_proxy_error())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             if pending_chunk_committed_output {
                 attempt_context.mark_downstream_committed();
             }
@@ -4178,22 +4248,19 @@ async fn forward_with_attempt(
                 grok_reasoning_replay: grok_reasoning_replay
                     .clone()
                     .map(grok_provider::ReplayStreamWrite::new),
-                antigravity_reasoning_replay: antigravity_reasoning_replay.clone().map(|context| {
-                    antigravity::ReplayStreamWrite::new(context, adapter_request.body.clone())
-                }),
+                antigravity_reasoning_replay: antigravity_reasoning_replay
+                    .clone()
+                    .map(|context| {
+                        antigravity::ReplayStreamWrite::new(context, adapter_request.body.clone())
+                    })
+                    .transpose()?,
                 kimi_thinking_replay: kimi_thinking_replay.clone().map(|context| {
                     KimiThinkingReplayStreamWrite {
                         context,
                         accumulator: KimiThinkingReplayStreamAccumulator::default(),
                     }
                 }),
-                stream_transform:
-                    super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
-                        &stored,
-                        route,
-                        adapter_request.responses_tool_context.clone(),
-                        adapter_request.downstream_include_usage,
-                    ),
+                stream_transform,
                 terminal_detector,
                 claude_tool_name_stream_patcher:
                     super::claude_oauth::ClaudeToolNameStreamPatcher::new(
@@ -4244,6 +4311,7 @@ async fn forward_with_attempt(
                 semantic_transport_memory,
                 tool_argument_memory,
                 downstream_pending_memory,
+                antigravity_transform_memory,
             };
             let stream = stream::try_unfold(stream_state, |mut stream_state| async move {
                 stream_state.downstream_pending_memory.take();
@@ -4463,7 +4531,11 @@ async fn forward_with_attempt(
                                     .await;
                             }
                         }
-                        stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk);
+                        if let Err(error) =
+                            stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk)
+                        {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         stream_state.inspect_grok_reasoning_replay_chunk(&chunk);
                         stream_state.inspect_kimi_thinking_replay_chunk(&chunk);
                         let chunk = stream_state.codex_completed_output_patcher.push(chunk);
@@ -4607,7 +4679,7 @@ async fn forward_with_attempt(
                             .await;
                         }
                         let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
-                        let transformed = match stream_state.stream_transform.push(chunk) {
+                        let transformed = match stream_state.transform_stream_chunk(chunk) {
                             Ok(transformed) => transformed,
                             Err(error) => {
                                 return stream_state.terminate_transform_error(error).await
@@ -4635,9 +4707,12 @@ async fn forward_with_attempt(
                             stream_state.commit_text_downstream();
                         }
                         stream_state.record_image_transport_emit(&transformed, false);
-                        stream_state
+                        if let Err(error) = stream_state
                             .commit_antigravity_reasoning_replay_stream()
-                            .await;
+                            .await
+                        {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         stream_state.finalize_terminal_usage(false).await;
                         stream_state.downstream_pending_memory = normalized_event_memory;
@@ -4781,13 +4856,13 @@ async fn forward_with_attempt(
                             let chunk = stream_state.inspect_grok_responses_chunk(chunk).await;
                             let grok_tail = stream_state.finish_grok_responses_inspection().await;
                             let chunk = join_bytes(chunk, grok_tail);
-                            let transformed = match stream_state.stream_transform.push(chunk) {
+                            let transformed = match stream_state.transform_stream_chunk(chunk) {
                                 Ok(transformed) => transformed,
                                 Err(error) => {
                                     return stream_state.terminate_transform_error(error).await
                                 }
                             };
-                            let tail = match stream_state.stream_transform.finish() {
+                            let tail = match stream_state.finish_stream_transform() {
                                 Ok(tail) => tail,
                                 Err(error) => {
                                     return stream_state.terminate_transform_error(error).await
@@ -4812,9 +4887,12 @@ async fn forward_with_attempt(
                             }
                             let transformed = join_bytes(transformed, synthesized);
                             stream_state.record_image_transport_emit(&transformed, false);
-                            stream_state
+                            if let Err(error) = stream_state
                                 .commit_antigravity_reasoning_replay_stream()
-                                .await;
+                                .await
+                            {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             stream_state.finish_grok_reasoning_replay_stream().await;
                             stream_state.commit_kimi_thinking_replay_stream().await;
                             stream_state.finalize_terminal_usage(true).await;
@@ -4867,13 +4945,13 @@ async fn forward_with_attempt(
                         }
                         let grok_tail = stream_state.finish_grok_responses_inspection().await;
                         let transformed_grok_tail =
-                            match stream_state.stream_transform.push(grok_tail) {
+                            match stream_state.transform_stream_chunk(grok_tail) {
                                 Ok(tail) => tail,
                                 Err(error) => {
                                     return stream_state.terminate_transform_error(error).await
                                 }
                             };
-                        let transform_tail = match stream_state.stream_transform.finish() {
+                        let transform_tail = match stream_state.finish_stream_transform() {
                             Ok(tail) => tail,
                             Err(error) => {
                                 return stream_state.terminate_transform_error(error).await
@@ -4897,9 +4975,12 @@ async fn forward_with_attempt(
                         if let Err(error) = stream_state.resize_tool_argument_memory() {
                             return stream_state.terminate_transform_error(error).await;
                         }
-                        stream_state
+                        if let Err(error) = stream_state
                             .commit_antigravity_reasoning_replay_stream()
-                            .await;
+                            .await
+                        {
+                            return stream_state.terminate_transform_error(error).await;
+                        }
                         stream_state.finish_grok_reasoning_replay_stream().await;
                         stream_state.commit_kimi_thinking_replay_stream().await;
                         let synthesized =
@@ -5337,7 +5418,7 @@ async fn forward_with_attempt(
             &adapter_request.body,
             &bytes,
             status.is_success(),
-        );
+        )?;
         let grok_replay_proof = status
             .is_success()
             .then(|| super::grok_replay::capture_document(&bytes))
@@ -23783,6 +23864,7 @@ struct StreamForwardState {
     semantic_transport_memory: Option<RequestMemoryReservation>,
     tool_argument_memory: Option<RequestMemoryReservation>,
     downstream_pending_memory: Option<RequestMemoryReservation>,
+    antigravity_transform_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Clone)]
@@ -23793,6 +23875,36 @@ struct CodexRateLimitContext {
 }
 
 impl StreamForwardState {
+    fn transform_stream_chunk(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
+        if let Some(reservation) = self.antigravity_transform_memory.as_ref() {
+            reservation
+                .resize(
+                    self.stream_transform
+                        .retained_antigravity_bytes()
+                        .saturating_add(chunk.len()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        let transformed = self.stream_transform.push(chunk);
+        self.resize_antigravity_transform_memory()?;
+        transformed
+    }
+
+    fn finish_stream_transform(&mut self) -> Result<Bytes, ProxyError> {
+        let transformed = self.stream_transform.finish();
+        self.resize_antigravity_transform_memory()?;
+        transformed
+    }
+
+    fn resize_antigravity_transform_memory(&self) -> Result<(), ProxyError> {
+        if let Some(reservation) = self.antigravity_transform_memory.as_ref() {
+            reservation
+                .resize(self.stream_transform.retained_antigravity_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
+    }
+
     fn reserve_request_memory(
         &self,
         component: RequestMemoryComponent,
@@ -23941,10 +24053,14 @@ impl StreamForwardState {
         }
     }
 
-    fn inspect_antigravity_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
+    fn inspect_antigravity_reasoning_replay_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<(), ProxyError> {
         if let Some(replay) = self.antigravity_reasoning_replay.as_mut() {
-            replay.inspect(chunk);
+            replay.inspect(chunk)?;
         }
+        Ok(())
     }
 
     fn inspect_grok_reasoning_replay_chunk(&mut self, chunk: &[u8]) {
@@ -23960,9 +24076,9 @@ impl StreamForwardState {
         replay.commit(&self.state).await;
     }
 
-    async fn commit_antigravity_reasoning_replay_stream(&mut self) {
+    async fn commit_antigravity_reasoning_replay_stream(&mut self) -> Result<(), ProxyError> {
         antigravity::commit_complete_stream(&self.state, &mut self.antigravity_reasoning_replay)
-            .await;
+            .await
     }
 
     async fn commit_kimi_thinking_replay_stream(&mut self) {
@@ -28395,6 +28511,151 @@ mod tests {
     }
 
     #[test]
+    fn request_memory_scope_is_exact_to_codex_and_antigravity_provider_types() {
+        assert!(request_memory_enabled_for_provider(AppKind::Codex, None));
+        assert!(request_memory_enabled_for_provider(
+            AppKind::Claude,
+            Some(ProviderType::AntigravityOAuth)
+        ));
+        assert!(request_memory_enabled_for_provider(
+            AppKind::Gemini,
+            Some(ProviderType::AgyOAuth)
+        ));
+        assert!(!request_memory_enabled_for_provider(
+            AppKind::Claude,
+            Some(ProviderType::ClaudeOAuth)
+        ));
+        assert!(!request_memory_enabled_for_provider(
+            AppKind::Gemini,
+            Some(ProviderType::GeminiCli)
+        ));
+    }
+
+    #[tokio::test]
+    async fn antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion() {
+        let gemini_body =
+            Bytes::from_static(br#"{"contents":[{"parts":[{"text":"memory-bound share"}]}]}"#);
+        let mut share_state = forwarder_test_state("antigravity-share-request-memory");
+        Arc::get_mut(&mut share_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = gemini_body.len() + 1;
+        let (share_provider_id, _, _) = install_antigravity_test_provider(
+            &share_state,
+            "share-request-memory",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let share_id = "antigravity-request-memory-share";
+        install_antigravity_test_share(
+            &share_state,
+            share_id,
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            &share_provider_id,
+        )
+        .await;
+
+        let share_error = forward(
+            share_state,
+            ProxyRoute::Gemini,
+            Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+            antigravity_share_headers(share_id),
+            gemini_body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            share_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+
+        let claude_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"memory-bound provider test"}]}"#,
+        );
+        let mut pinned_state = forwarder_test_state("agy-pinned-request-memory");
+        Arc::get_mut(&mut pinned_state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = claude_body.len() + 1;
+        let (pinned_provider_id, _, _) = install_antigravity_test_provider(
+            &pinned_state,
+            "pinned-request-memory",
+            AppKind::Claude,
+            ProviderType::AgyOAuth,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+
+        let pinned_error = forward_for_test_surface(
+            pinned_state,
+            ProxyRoute::ClaudeMessages,
+            pinned_provider_id,
+            None,
+            gemini_v1internal_downstream_headers(),
+            claude_body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            pinned_error.error_code(),
+            "cc_switch_request_memory_exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_request_memory_combines_raw_decoded_and_normalized_bodies() {
+        let plain = Bytes::from(
+            json!({
+                "contents": [{"parts": [{"text": "z".repeat(2 * 1024)}]}]
+            })
+            .to_string(),
+        );
+        let compressed = Bytes::from(gzip_bytes(&plain));
+        let mut state = forwarder_test_state("antigravity-compressed-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = compressed.len() + plain.len() + 1;
+        let (provider_id, _, _) = install_antigravity_test_provider(
+            &state,
+            "compressed-request-memory",
+            AppKind::Gemini,
+            ProviderType::AntigravityOAuth,
+            "http://127.0.0.1:9".to_string(),
+        )
+        .await;
+        let mut headers = gemini_v1internal_downstream_headers();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let error = forward_for_test_surface(
+            state,
+            ProxyRoute::Gemini,
+            provider_id,
+            Some("models/gemini-3.5-flash-medium:generateContent".to_string()),
+            headers,
+            compressed,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+    }
+
+    #[test]
+    fn exhausted_request_memory_disables_recovery_for_the_remaining_lifecycle() {
+        let mut attempt = ForwardAttemptContext::default();
+        attempt.initialize_request_memory(32, 16).unwrap();
+        let budget = attempt.request_memory().unwrap();
+        let _ = budget.reject(RequestMemoryComponent::ReasoningReplay, 33);
+
+        assert!(!attempt.retry_allowed());
+        assert!(budget.is_exhausted());
+    }
+
+    #[test]
     fn codex_request_memory_combines_raw_decoded_and_normalized_bodies() {
         let plain = vec![b'y'; 2 * 1024];
         let compressed = Bytes::from(gzip_bytes(&plain));
@@ -30307,6 +30568,51 @@ mod tests {
         (address, observations, server)
     }
 
+    async fn spawn_antigravity_memory_stream_upstream() -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(axum::routing::post(move || {
+            let requests = Arc::clone(&requests_for_route);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let chunks = (0..128).map(|index| {
+                    let text = format!("{index:03}-{}", "x".repeat(256));
+                    Ok::<_, std::convert::Infallible>(Bytes::from(format!(
+                        "data: {}\n\n",
+                        json!({
+                            "response": {
+                                "candidates": [{
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": text}]
+                                    }
+                                }]
+                            }
+                        })
+                    )))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream::iter(chunks)))
+                    .unwrap()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, requests, server)
+    }
+
     fn antigravity_replay_headers(share_id: &str, session_id: &str) -> HeaderMap {
         let mut headers = antigravity_share_headers(share_id);
         headers.insert(
@@ -31117,6 +31423,52 @@ mod tests {
         assert_eq!(observations.len(), 2);
         assert!(request_has_antigravity_replay(&observations[1].body));
         drop(observations);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_grounding_state_exhaustion_terminates_stream_without_retry() {
+        let (address, requests, server) = spawn_antigravity_memory_stream_upstream().await;
+        let mut state = forwarder_test_state("antigravity-grounding-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 16 * 1024;
+        let provider_id = install_antigravity_claude_test_provider(
+            &state,
+            "grounding-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "antigravity-grounding-request-memory-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::AntigravityOAuth,
+            &provider_id,
+        )
+        .await;
+        let response = forward(
+            state,
+            ProxyRoute::ClaudeMessages,
+            None,
+            antigravity_share_headers(share_id),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"search with bounded memory"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let downstream = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let downstream = String::from_utf8_lossy(&downstream);
+        assert!(downstream.contains("cc_switch_request_memory_exhausted"));
+        assert!(downstream.contains("\"status\":503"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

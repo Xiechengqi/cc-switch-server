@@ -49,6 +49,38 @@ pub(crate) struct ResponsesToolContext {
 }
 
 impl ResponsesToolContext {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let chat_specs = self
+            .chat_name_to_spec
+            .iter()
+            .fold(0usize, |bytes, (key, spec)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(std::mem::size_of::<ResponsesToolSpec>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(key.capacity())
+                    .saturating_add(spec.name.capacity())
+                    .saturating_add(
+                        spec.namespace
+                            .as_ref()
+                            .map_or(0, |namespace| namespace.capacity()),
+                    )
+            });
+        let namespace_names = self.namespace_name_to_chat_name.iter().fold(
+            0usize,
+            |bytes, ((namespace, name), chat_name)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, String)>())
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(namespace.capacity())
+                    .saturating_add(name.capacity())
+                    .saturating_add(chat_name.capacity())
+            },
+        );
+        chat_specs.saturating_add(namespace_names)
+    }
+
     fn from_custom_tool_names(names: &BTreeSet<String>) -> Self {
         let mut context = Self::default();
         for name in names {

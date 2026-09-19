@@ -14,6 +14,7 @@ use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, responses_reasoning_item_from_anthropic_block,
     unsigned_responses_reasoning_item,
 };
+use super::request_memory::retained_json_bytes;
 use super::transforms;
 use super::transforms::StreamFrame;
 use super::{ProxyError, ProxyRoute};
@@ -33,6 +34,28 @@ pub(super) struct StreamEventTransformer {
 }
 
 impl StreamEventTransformer {
+    pub(super) fn retained_antigravity_bytes(&self) -> usize {
+        let bridge = self
+            .bridge
+            .as_ref()
+            .map_or(0, StreamBridgeState::retained_antigravity_bytes);
+        let chat_compat = self.chat_compat.as_ref().map_or(
+            0,
+            super::openai_chat_compat::OpenAiChatStreamCanonicalizer::retained_bytes,
+        );
+        let gemini_terminal = self.gemini_terminal.as_ref().map_or(0, |terminal| {
+            terminal.candidates.len().saturating_mul(
+                std::mem::size_of::<(i64, bool)>().saturating_add(std::mem::size_of::<usize>() * 3),
+            )
+        });
+        self.buffer
+            .capacity()
+            .saturating_add(self.responses_tool_context.retained_bytes())
+            .saturating_add(bridge)
+            .saturating_add(chat_compat)
+            .saturating_add(gemini_terminal)
+    }
+
     pub(super) fn new<T>(
         stored: &StoredProvider,
         route: ProxyRoute,
@@ -420,6 +443,14 @@ enum StreamBridgeState {
 }
 
 impl StreamBridgeState {
+    fn retained_antigravity_bytes(&self) -> usize {
+        match self {
+            Self::GeminiAnthropic(state) => state.retained_bytes(),
+            Self::GeminiOpenAi(state) => state.retained_bytes(),
+            _ => 0,
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
         Ok(match self {
             Self::GrokResponsesTools(state) => state.transform(input),
@@ -1644,6 +1675,89 @@ struct GeminiAnthropicToolState {
 }
 
 impl GeminiAnthropicState {
+    fn retained_bytes(&self) -> usize {
+        let buffered_inputs = self
+            .buffered_web_search_inputs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(
+                self.buffered_web_search_inputs
+                    .iter()
+                    .map(retained_json_bytes)
+                    .sum::<usize>(),
+            );
+        let mappings = self
+            .text_mappings
+            .capacity()
+            .saturating_mul(std::mem::size_of::<TextMapping>())
+            .saturating_add(
+                self.text_mappings
+                    .iter()
+                    .map(|mapping| mapping.text.capacity())
+                    .sum::<usize>(),
+            );
+        let text_by_block = self.text_by_block.iter().fold(0usize, |bytes, (_, text)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(u64, String)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(text.capacity())
+        });
+        let tools = self.tools.iter().fold(0usize, |bytes, (_, tool)| {
+            bytes
+                .saturating_add(std::mem::size_of::<GeminiAnthropicToolKey>())
+                .saturating_add(std::mem::size_of::<GeminiAnthropicToolState>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(tool.id.capacity())
+                .saturating_add(tool.name.capacity())
+                .saturating_add(retained_json_bytes(&tool.arguments))
+                .saturating_add(
+                    tool.signature
+                        .as_ref()
+                        .map_or(0, |signature| signature.capacity()),
+                )
+        });
+        let tool_order = self
+            .tool_order
+            .capacity()
+            .saturating_mul(std::mem::size_of::<GeminiAnthropicToolKey>());
+        let usage = self.usage.iter().fold(0usize, |bytes, (key, value)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(String, Value)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(key.capacity())
+                .saturating_add(retained_json_bytes(value))
+        });
+        let emitted_citations = self
+            .emitted_grounding_citations
+            .iter()
+            .map(|key| {
+                key.capacity()
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+            })
+            .sum::<usize>();
+        buffered_inputs
+            .saturating_add(self.text_seen.capacity())
+            .saturating_add(mappings)
+            .saturating_add(text_by_block)
+            .saturating_add(self.thinking_seen.capacity())
+            .saturating_add(
+                self.thinking_signature
+                    .as_ref()
+                    .map_or(0, |signature| signature.capacity()),
+            )
+            .saturating_add(tools)
+            .saturating_add(tool_order)
+            .saturating_add(usage)
+            .saturating_add(self.grounding.retained_bytes())
+            .saturating_add(emitted_citations)
+            .saturating_add(
+                self.pending_finish_reason
+                    .as_ref()
+                    .map_or(0, |reason| reason.capacity()),
+            )
+    }
+
     fn with_web_search_expected(web_search_expected: bool) -> Self {
         Self {
             web_search_expected,
@@ -2417,6 +2531,16 @@ enum GeminiOpenAiTarget {
 }
 
 impl GeminiOpenAiState {
+    fn retained_bytes(&self) -> usize {
+        let target = match &self.target {
+            GeminiOpenAiTarget::Responses(responses) => responses.retained_bytes(),
+            GeminiOpenAiTarget::Chat { responses, chat } => responses
+                .retained_bytes()
+                .saturating_add(chat.retained_bytes()),
+        };
+        self.source.retained_bytes().saturating_add(target)
+    }
+
     fn responses(responses_tool_context: transforms::ResponsesToolContext) -> Self {
         let web_search_expected = responses_tool_context.web_search_requested();
         Self {
@@ -3566,6 +3690,48 @@ struct ResponsesChatToolState {
 }
 
 impl ResponsesChatState {
+    fn retained_bytes(&self) -> usize {
+        let tools = self.tools.iter().fold(0usize, |bytes, (_, tool)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, ResponsesChatToolState)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(tool.call_id.capacity())
+                .saturating_add(tool.name.capacity())
+                .saturating_add(tool.arguments.capacity())
+                .saturating_add(tool.custom_input.capacity())
+                .saturating_add(
+                    tool.thought_signature
+                        .as_ref()
+                        .map_or(0, |signature| signature.capacity()),
+                )
+        });
+        let item_ids = self.item_ids.iter().fold(0usize, |bytes, (_, item_id)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, String)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(item_id.capacity())
+        });
+        let string_set_bytes = |values: &BTreeSet<String>| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .capacity()
+                        .saturating_add(std::mem::size_of::<String>())
+                        .saturating_add(std::mem::size_of::<usize>() * 3)
+                })
+                .sum::<usize>()
+        };
+        self.response_id
+            .capacity()
+            .saturating_add(self.model.capacity())
+            .saturating_add(tools)
+            .saturating_add(item_ids)
+            .saturating_add(string_set_bytes(&self.emitted_text_items))
+            .saturating_add(string_set_bytes(&self.emitted_reasoning_items))
+            .saturating_add(string_set_bytes(&self.emitted_annotations))
+    }
+
     fn new(include_usage: bool) -> Self {
         Self {
             include_usage,
@@ -4912,6 +5078,98 @@ enum AnthropicResponsesBlock {
 }
 
 impl AnthropicResponsesState {
+    fn retained_bytes(&self) -> usize {
+        let blocks = self.blocks.iter().fold(0usize, |bytes, (_, block)| {
+            let dynamic = match block {
+                AnthropicResponsesBlock::Text {
+                    item_id,
+                    text,
+                    annotations,
+                    ..
+                } => item_id
+                    .capacity()
+                    .saturating_add(text.capacity())
+                    .saturating_add(
+                        annotations
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Value>()),
+                    )
+                    .saturating_add(annotations.iter().map(retained_json_bytes).sum::<usize>()),
+                AnthropicResponsesBlock::Reasoning {
+                    item_id,
+                    text,
+                    signature,
+                    redacted_data,
+                    ..
+                } => item_id
+                    .capacity()
+                    .saturating_add(text.capacity())
+                    .saturating_add(signature.capacity())
+                    .saturating_add(redacted_data.as_ref().map_or(0, |data| data.capacity())),
+                AnthropicResponsesBlock::Tool {
+                    item_id,
+                    call_id,
+                    name,
+                    arguments,
+                    signature,
+                    ..
+                } => item_id
+                    .capacity()
+                    .saturating_add(call_id.capacity())
+                    .saturating_add(name.capacity())
+                    .saturating_add(arguments.capacity())
+                    .saturating_add(
+                        signature
+                            .as_ref()
+                            .map_or(0, |signature| signature.capacity()),
+                    ),
+                AnthropicResponsesBlock::Search {
+                    item_id,
+                    tool_use_id,
+                    arguments,
+                    sources,
+                    ..
+                } => item_id
+                    .capacity()
+                    .saturating_add(tool_use_id.capacity())
+                    .saturating_add(arguments.capacity())
+                    .saturating_add(
+                        sources
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Value>()),
+                    )
+                    .saturating_add(sources.iter().map(retained_json_bytes).sum::<usize>()),
+                AnthropicResponsesBlock::SearchResult { .. } => 0,
+            };
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, AnthropicResponsesBlock)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(dynamic)
+        });
+        let output_items = self
+            .output_items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(u64, Value)>())
+            .saturating_add(
+                self.output_items
+                    .iter()
+                    .map(|(_, value)| retained_json_bytes(value))
+                    .sum::<usize>(),
+            );
+        self.responses_tool_context
+            .retained_bytes()
+            .saturating_add(self.response_id.capacity())
+            .saturating_add(self.model.capacity())
+            .saturating_add(blocks)
+            .saturating_add(output_items)
+            .saturating_add(
+                self.stop_reason
+                    .as_ref()
+                    .map_or(0, |reason| reason.capacity()),
+            )
+            .saturating_add(self.usage.as_ref().map_or(0, retained_json_bytes))
+    }
+
     fn new<T>(responses_tool_context: T) -> Self
     where
         T: Into<transforms::ResponsesToolContext>,
@@ -5763,6 +6021,25 @@ mod tests {
             unwrap_v1internal: false,
             gemini_terminal: None,
         }
+    }
+
+    #[test]
+    fn antigravity_transform_reports_buffered_web_search_state() {
+        let stored = gemini_v1internal_stored_provider(
+            crate::domain::providers::model::AppKind::Claude,
+            crate::domain::providers::model::ProviderType::AntigravityOAuth,
+        );
+        let tool_context = transforms::responses_tool_context(&json!({
+            "tools": [{"googleSearch": {}}]
+        }));
+        let mut transformer =
+            StreamEventTransformer::new(&stored, ProxyRoute::ClaudeMessages, tool_context);
+        let chunk = Bytes::from(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"buffer until grounding arrives\"}]}}]}}\n\n",
+        );
+
+        assert!(transformer.push(chunk).unwrap().is_empty());
+        assert!(transformer.retained_antigravity_bytes() > 0);
     }
 
     #[test]

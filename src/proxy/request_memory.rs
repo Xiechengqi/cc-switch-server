@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use serde_json::Value;
 
 use super::ProxyError;
 
@@ -16,6 +17,8 @@ pub(super) enum RequestMemoryComponent {
     NormalizedEvent,
     WebSocketReadQueue,
     WebSocketWriteQueue,
+    ReasoningReplay,
+    GroundingCitation,
 }
 
 impl RequestMemoryComponent {
@@ -30,8 +33,40 @@ impl RequestMemoryComponent {
             Self::NormalizedEvent => "normalized_event",
             Self::WebSocketReadQueue => "websocket_read_queue",
             Self::WebSocketWriteQueue => "websocket_write_queue",
+            Self::ReasoningReplay => "reasoning_replay",
+            Self::GroundingCitation => "grounding_citation",
         }
     }
+}
+
+/// Returns a conservative allocation-sized estimate without serializing the
+/// value. This is used for request-scoped JSON state that survives between
+/// stream chunks; transient parse/output values are accounted separately.
+pub(super) fn retained_json_bytes(value: &Value) -> usize {
+    fn dynamic_bytes(value: &Value) -> usize {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(value) => value.capacity(),
+            Value::Array(values) => values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(values.iter().map(dynamic_bytes).sum::<usize>()),
+            Value::Object(values) => values.iter().fold(
+                values.len().saturating_mul(
+                    std::mem::size_of::<String>()
+                        .saturating_add(std::mem::size_of::<Value>())
+                        .saturating_add(std::mem::size_of::<usize>() * 3),
+                ),
+                |bytes, (key, value)| {
+                    bytes
+                        .saturating_add(key.capacity())
+                        .saturating_add(dynamic_bytes(value))
+                },
+            ),
+        }
+    }
+
+    std::mem::size_of::<Value>().saturating_add(dynamic_bytes(value))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,8 +519,11 @@ mod tests {
             .reserve(RequestMemoryComponent::TransportPending, 8)
             .unwrap();
         let retained = reservation.retain_bytes(Bytes::from_static(b"response"));
+        let retained_clone = retained.clone();
         assert_eq!(budget.snapshot().used_bytes, 8);
         drop(retained);
+        assert_eq!(budget.snapshot().used_bytes, 8);
+        drop(retained_clone);
         assert_eq!(budget.snapshot().used_bytes, 0);
     }
 

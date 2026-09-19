@@ -2,6 +2,7 @@ use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::Bytes;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::runtime::RuntimeAuthRef;
@@ -17,6 +18,9 @@ use super::super::antigravity_retry::{self, AntigravityRetryInfo};
 use super::super::antigravity_transport::{AntigravityTransportKey, AntigravityTransportPolicy};
 use super::super::execution::context::CacheSnapshotOwnership;
 use super::super::provider_ops::ProviderExecution;
+use super::super::request_memory::{
+    RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::router::ProxyRoute;
 use super::super::{bounded_upstream_rate_limit_until, ProxyError};
 
@@ -219,7 +223,9 @@ pub(crate) struct ReplayWriteContext {
     scope: AntigravityReplayScope,
     snapshot: AntigravityReplaySnapshot,
     ownership: CacheSnapshotOwnership,
-    previous_chain: Option<AntigravityReplayChain>,
+    previous_chain: Option<Arc<AntigravityReplayChain>>,
+    request_memory: Option<RequestMemoryBudget>,
+    _previous_chain_memory: Option<RequestMemoryReservation>,
     replay_applied: bool,
     app: AppKind,
     provider_id: String,
@@ -239,48 +245,72 @@ pub(crate) async fn prepare_reasoning_replay(
     request_context: &UsageLogContext,
     upstream_url: &str,
     body: &mut Bytes,
-) -> Option<ReplayWriteContext> {
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<Option<ReplayWriteContext>, ProxyError> {
     if route == ProxyRoute::ClaudeCountTokens || !is_provider(execution.stored.provider_type) {
-        return None;
+        return Ok(None);
     }
-    let share_id = request_context
+    let Some(share_id) = request_context
         .share_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let user_namespace = antigravity_replay::user_namespace(
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(user_namespace) = antigravity_replay::user_namespace(
         request_context
             .user_email
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())?,
-    )?;
-    let session_id = request_context
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(session_id) = request_context
         .session_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let document = serde_json::from_slice::<Value>(body).ok()?;
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Ok(document) = serde_json::from_slice::<Value>(body) else {
+        return Ok(None);
+    };
     if document.get("requestType").and_then(Value::as_str) == Some("web_search") {
-        return None;
+        return Ok(None);
     }
-    let model = document.get("model")?.as_str()?;
-    let model_family = antigravity_replay::model_family(model)?;
-    let upstream_plane = reqwest::Url::parse(upstream_url)
-        .ok()?
-        .host_str()?
-        .to_ascii_lowercase();
-    let (provider_type, account_id, auth_identity_generation) =
-        execution.managed_account_identity_target()?;
+    let Some(model) = document.get("model").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(model_family) = antigravity_replay::model_family(model) else {
+        return Ok(None);
+    };
+    let Ok(parsed_upstream_url) = reqwest::Url::parse(upstream_url) else {
+        return Ok(None);
+    };
+    let Some(upstream_plane) = parsed_upstream_url.host_str().map(str::to_ascii_lowercase) else {
+        return Ok(None);
+    };
+    let Some((provider_type, account_id, auth_identity_generation)) =
+        execution.managed_account_identity_target()
+    else {
+        return Ok(None);
+    };
     if !is_provider(provider_type) {
-        return None;
+        return Ok(None);
     }
-    let account = state
+    let Some(account) = state
         .find_account_for_provider(provider_type, account_id)
         .await
-        .filter(|account| account.auth_identity_generation == auth_identity_generation)?;
+        .filter(|account| account.auth_identity_generation == auth_identity_generation)
+    else {
+        return Ok(None);
+    };
     let token_refresh_generation = account.token_refresh_generation;
-    let scope = AntigravityReplayScope::derive(
+    let Some(scope) = AntigravityReplayScope::derive(
         execution.plan.provider_key.app.as_str(),
         &execution.stored.provider.id,
         execution.plan.provider_revision,
@@ -293,12 +323,25 @@ pub(crate) async fn prepare_reasoning_replay(
         session_id,
         &model_family,
         &upstream_plane,
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let now_ms = replay_now_ms();
-    let (mut previous_chain, mut snapshot) = state
+    let (previous_chain, mut snapshot) = state
         .antigravity_reasoning_replays
         .get(&scope, now_ms)
         .await;
+    let mut previous_chain = previous_chain.map(Arc::new);
+    let previous_chain_memory = request_memory
+        .map(|budget| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    snapshot.retained_bytes(),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
     let mut ownership = CacheSnapshotOwnership::from_hit(
         "antigravity_reasoning",
         scope.ownership_digest(),
@@ -326,8 +369,13 @@ pub(crate) async fn prepare_reasoning_replay(
                     .antigravity_reasoning_replays
                     .get(&scope, now_ms)
                     .await;
-                previous_chain = refreshed.0;
+                previous_chain = refreshed.0.map(Arc::new);
                 snapshot = refreshed.1;
+                if let Some(reservation) = previous_chain_memory.as_ref() {
+                    reservation
+                        .resize(snapshot.retained_bytes())
+                        .map_err(|error| error.into_proxy_error())?;
+                }
                 ownership = CacheSnapshotOwnership::from_hit(
                     "antigravity_reasoning",
                     scope.ownership_digest(),
@@ -340,11 +388,13 @@ pub(crate) async fn prepare_reasoning_replay(
     } else {
         crate::metrics::record_antigravity_reasoning_replay("miss", 1);
     }
-    Some(ReplayWriteContext {
+    Ok(Some(ReplayWriteContext {
         scope,
         snapshot,
         ownership,
         previous_chain,
+        request_memory: request_memory.cloned(),
+        _previous_chain_memory: previous_chain_memory,
         replay_applied,
         app: execution.plan.provider_key.app,
         provider_id: execution.stored.provider.id.clone(),
@@ -355,7 +405,7 @@ pub(crate) async fn prepare_reasoning_replay(
         auth_identity_generation,
         token_refresh_generation,
         share_id: share_id.to_string(),
-    })
+    }))
 }
 
 pub(crate) async fn clear_rejected_reasoning_replay(
@@ -395,6 +445,7 @@ pub(crate) fn is_signature_rejection(status: StatusCode, body: &[u8]) -> bool {
 pub(crate) struct ReplayCapture {
     terminal: bool,
     chain: Option<AntigravityReplayChain>,
+    chain_memory: Option<RequestMemoryReservation>,
 }
 
 pub(crate) fn capture_response(
@@ -402,7 +453,7 @@ pub(crate) fn capture_response(
     request_body: &[u8],
     response_body: &[u8],
     successful: bool,
-) -> ReplayCapture {
+) -> Result<ReplayCapture, ProxyError> {
     let terminal = successful && antigravity_replay::response_has_terminal(response_body);
     let chain = terminal
         .then(|| {
@@ -410,12 +461,28 @@ pub(crate) fn capture_response(
                 antigravity_replay::capture_response(
                     request_body,
                     response_body,
-                    context.previous_chain.as_ref(),
+                    context.previous_chain.as_deref(),
                 )
             })
         })
         .flatten();
-    ReplayCapture { terminal, chain }
+    let chain_memory = context
+        .and_then(|context| context.request_memory.as_ref())
+        .zip(chain.as_ref())
+        .map(|(budget, chain)| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    chain.retained_bytes(),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
+    Ok(ReplayCapture {
+        terminal,
+        chain,
+        chain_memory,
+    })
 }
 
 pub(crate) async fn commit_captured_response(
@@ -423,7 +490,12 @@ pub(crate) async fn commit_captured_response(
     context: Option<&ReplayWriteContext>,
     capture: ReplayCapture,
 ) {
-    commit_reasoning_replay(state, context, capture.terminal, capture.chain).await;
+    let ReplayCapture {
+        terminal,
+        chain,
+        chain_memory: _chain_memory,
+    } = capture;
+    commit_reasoning_replay(state, context, terminal, chain).await;
 }
 
 #[derive(Debug)]
@@ -431,19 +503,48 @@ pub(crate) struct ReplayStreamWrite {
     context: ReplayWriteContext,
     request_body: Bytes,
     accumulator: AntigravityReplayStreamAccumulator,
+    accumulator_memory: Option<RequestMemoryReservation>,
 }
 
 impl ReplayStreamWrite {
-    pub(crate) fn new(context: ReplayWriteContext, request_body: Bytes) -> Self {
-        Self {
+    pub(crate) fn new(
+        context: ReplayWriteContext,
+        request_body: Bytes,
+    ) -> Result<Self, ProxyError> {
+        let accumulator_memory = context
+            .request_memory
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve(RequestMemoryComponent::ReasoningReplay, 0)
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .transpose()?;
+        Ok(Self {
             context,
             request_body,
             accumulator: AntigravityReplayStreamAccumulator::default(),
-        }
+            accumulator_memory,
+        })
     }
 
-    pub(crate) fn inspect(&mut self, chunk: &[u8]) {
+    pub(crate) fn inspect(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
+        if let Some(reservation) = self.accumulator_memory.as_ref() {
+            reservation
+                .resize(
+                    self.accumulator
+                        .retained_bytes()
+                        .saturating_add(chunk.len()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
         self.accumulator.push(chunk);
+        if let Some(reservation) = self.accumulator_memory.as_ref() {
+            reservation
+                .resize(self.accumulator.retained_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        Ok(())
     }
 
     fn is_complete(&self) -> bool {
@@ -454,18 +555,36 @@ impl ReplayStreamWrite {
 pub(crate) async fn commit_complete_stream(
     state: &ServerState,
     replay: &mut Option<ReplayStreamWrite>,
-) {
+) -> Result<(), ProxyError> {
     if !replay.as_ref().is_some_and(ReplayStreamWrite::is_complete) {
-        return;
+        return Ok(());
     }
     let Some(replay) = replay.take() else {
-        return;
+        return Ok(());
     };
-    let previous_chain = replay.context.previous_chain.clone();
-    let chain = replay
-        .accumulator
-        .finish(&replay.request_body, previous_chain.as_ref());
-    commit_reasoning_replay(state, Some(&replay.context), true, chain).await;
+    let ReplayStreamWrite {
+        context,
+        request_body,
+        accumulator,
+        accumulator_memory,
+    } = replay;
+    let chain = accumulator.finish(&request_body, context.previous_chain.as_deref());
+    let _chain_memory = context
+        .request_memory
+        .as_ref()
+        .zip(chain.as_ref())
+        .map(|(budget, chain)| {
+            budget
+                .reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    chain.retained_bytes(),
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+        .transpose()?;
+    drop(accumulator_memory);
+    commit_reasoning_replay(state, Some(&context), true, chain).await;
+    Ok(())
 }
 
 async fn commit_reasoning_replay(
@@ -568,4 +687,81 @@ async fn reasoning_replay_binding_is_current(
 
 fn replay_now_ms() -> i64 {
     current_time_ms().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn replay_context(request_memory: RequestMemoryBudget) -> ReplayWriteContext {
+        let scope = AntigravityReplayScope::derive(
+            "gemini",
+            "provider",
+            1,
+            "runtime",
+            "account",
+            1,
+            1,
+            "share",
+            "principal",
+            "session",
+            "gemini-3-flash",
+            "cloudcode-pa.googleapis.com",
+        )
+        .unwrap();
+        let cache = antigravity_replay::AntigravityReplayCache::default();
+        let (_, snapshot) = cache.get(&scope, 1).await;
+        ReplayWriteContext {
+            ownership: CacheSnapshotOwnership::from_hit(
+                "antigravity_reasoning",
+                scope.ownership_digest(),
+                snapshot.generation(),
+            ),
+            scope,
+            snapshot,
+            previous_chain: None,
+            request_memory: Some(request_memory),
+            _previous_chain_memory: None,
+            replay_applied: false,
+            app: AppKind::Gemini,
+            provider_id: "provider".to_string(),
+            provider_revision: 1,
+            runtime_fingerprint: "runtime".to_string(),
+            provider_type: ProviderType::AntigravityOAuth,
+            account_id: "account".to_string(),
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
+            share_id: "share".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_stream_budget_is_sticky_and_releases_on_cancel() {
+        let budget = RequestMemoryBudget::new(256);
+        let context = replay_context(budget.clone()).await;
+        let mut replay = ReplayStreamWrite::new(context, Bytes::new()).unwrap();
+
+        let error = replay.inspect(&vec![b'x'; 257]).unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+        assert!(budget.is_exhausted());
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        drop(replay);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_stream_accounting_follows_accumulator_lifetime() {
+        let budget = RequestMemoryBudget::new(8 * 1024);
+        let context = replay_context(budget.clone()).await;
+        let mut replay = ReplayStreamWrite::new(context, Bytes::new()).unwrap();
+        replay
+            .inspect(b"data: {\"response\":{\"candidates\":[]}}")
+            .unwrap();
+        assert!(budget.snapshot().used_bytes > 0);
+
+        drop(replay);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().active_reservations, 0);
+    }
 }

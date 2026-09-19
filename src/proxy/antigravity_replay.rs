@@ -7,6 +7,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use super::request_memory::retained_json_bytes;
+
 const MAX_ENTRIES: usize = 2_048;
 const MAX_TURNS_PER_ENTRY: usize = 256;
 const MAX_ITEMS_PER_ENTRY: usize = 4_096;
@@ -196,11 +198,16 @@ impl fmt::Debug for ReplayEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AntigravityReplaySnapshot {
     generation: u64,
+    bytes: usize,
 }
 
 impl AntigravityReplaySnapshot {
     pub(crate) fn generation(self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn retained_bytes(self) -> usize {
+        self.bytes
     }
 }
 
@@ -250,6 +257,7 @@ impl AntigravityReplayCache {
             entry.chain.clone(),
             AntigravityReplaySnapshot {
                 generation: entry.generation,
+                bytes: entry.bytes,
             },
         )
     }
@@ -368,6 +376,12 @@ fn valid_chain_bytes(chain: &AntigravityReplayChain) -> Option<usize> {
     }
     let bytes = serde_json::to_vec(chain).ok()?.len();
     (bytes <= MAX_BYTES_PER_ENTRY).then_some(bytes)
+}
+
+impl AntigravityReplayChain {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        valid_chain_bytes(self).unwrap_or(0)
+    }
 }
 
 pub(crate) struct ReplayApplyResult {
@@ -974,13 +988,23 @@ impl fmt::Debug for AntigravityReplayStreamAccumulator {
 }
 
 impl AntigravityReplayStreamAccumulator {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buffer.capacity().saturating_add(
+            (!self.content.is_null())
+                .then(|| retained_json_bytes(&self.content))
+                .unwrap_or_default(),
+        )
+    }
+
     pub(crate) fn push(&mut self, chunk: &[u8]) {
         if self.overflow || chunk.is_empty() {
             return;
         }
         if self.buffer.len().saturating_add(chunk.len()) > MAX_STREAM_BUFFER_BYTES {
             self.overflow = true;
-            self.buffer.clear();
+            self.buffer = Vec::new();
+            self.content = Value::Null;
+            self.terminal = false;
             return;
         }
         self.buffer.extend_from_slice(chunk);
@@ -1150,6 +1174,48 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn cache_snapshot_exposes_the_bytes_cloned_into_a_request() {
+        let cache = AntigravityReplayCache::default();
+        let scope = scope("snapshot-bytes");
+        let request = request(json!([{"role": "user", "parts": [{"text": "lookup"}]}]));
+        let response = response(json!({
+            "role": "model",
+            "parts": [{
+                "functionCall": {"id": "call-a", "name": "lookup", "args": {"q": 1}},
+                "thoughtSignature": SIG_A
+            }]
+        }));
+        let chain = capture_response(&request, &response, None).unwrap();
+        let (_, empty_snapshot) = cache.get(&scope, 1).await;
+        assert_eq!(empty_snapshot.retained_bytes(), 0);
+        assert!(
+            cache
+                .replace_if_unchanged(scope.clone(), empty_snapshot, chain, 2)
+                .await
+        );
+
+        let (cloned, snapshot) = cache.get(&scope, 3).await;
+        assert!(cloned.is_some());
+        assert!(snapshot.retained_bytes() > 0);
+    }
+
+    #[test]
+    fn stream_accumulator_reports_and_releases_retained_state_on_overflow() {
+        let mut accumulator = AntigravityReplayStreamAccumulator::default();
+        accumulator.push(
+            concat!(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"retained\"}]}}]}}\n\n"
+            )
+            .as_bytes(),
+        );
+        assert!(accumulator.retained_bytes() > 0);
+
+        accumulator.push(&vec![b'x'; MAX_STREAM_BUFFER_BYTES + 1]);
+        assert_eq!(accumulator.retained_bytes(), 0);
+        assert!(!accumulator.is_complete());
     }
 
     #[test]
