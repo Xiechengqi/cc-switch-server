@@ -1,12 +1,54 @@
 {
   "format": "cc-switch-codebuddy-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
   "policy": {
     "scope": "single bound Provider/Share/Account and immutable site; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no domain fallback, no cross-account fallback, no cross-Provider fallback",
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; untracked and modified files are excluded",
     "liveEvidence": "Intl and CN require separate complete real receipts; fixture success never upgrades either site"
+  },
+  "observationPolicy": {
+    "history": "append_only; every schema v1 content field is immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "sourceDigest": "canonical sha256 over sourceId, deltaId, commit, tree and the ordered frozen file records",
+    "externalVerification": "optional explicit --check-sources only; never a build, test, release or runtime dependency"
+  },
+  "legacyV1": {
+    "path": "assets/contract/codebuddy-reference-delta.json",
+    "targetCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+    "targetTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+    "fileSha256": "9300a4810b773ab7e0352f3a5729e6afe3a315a16d73faed43338247ac106d44",
+    "canonicalDigest": "7a4c85306f4c272070dd5fcb0a812a223eb904fbf07806503ce276a644004c3c",
+    "fields": [
+      "format",
+      "schemaVersion",
+      "capturedAt",
+      "policy",
+      "sources",
+      "registryTruth",
+      "capabilities",
+      "incrementalEnhancements",
+      "fixtureAcceptance",
+      "providerLifecycle",
+      "realAcceptance"
+    ],
+    "fieldDigests": {
+      "format": "3ff2d2f6eab8502e43d9b50f1b095ed1e1cd1982cb75ad4aa98cdae5d5635ef9",
+      "schemaVersion": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "capturedAt": "18aca4884d737a6e7c2c3ee61b8abd0b8d19239c34d2385637cd99769060390e",
+      "policy": "a4707121c5daf07ba2a8eb9f8317e9b6341fd1bc8020ae1b7555bb34d057f49a",
+      "sources": "ec58d5f3b3a7fc162dd8e63e1415c8678488fc36583ce9830372890313dda347",
+      "registryTruth": "05a5d56a451e3b50953ad15b32cc543617317b5ff0fae8825e86754c2ac5109b",
+      "capabilities": "e27624e162eb47f5eb79c13c83a802adceafa5c7dbc85a77f74ac660fbb83f2c",
+      "incrementalEnhancements": "d12b9ff077441ca8834cd1366b5aa3167c74400d91b58f87d7b464409c6b333f",
+      "fixtureAcceptance": "a2503cd71eb6dde9b981084de4764d52659287f4f710fa5a9c33fe2b38388fe1",
+      "providerLifecycle": "12c80919a78277d7a5311adfbe64254262604d287e0ba7e3c03ac2251468758b",
+      "realAcceptance": "feea4c2d3f87f112b1fe06884b7d3c933f81d2c307bf4bbb42e45bc7ebc4a6dd"
+    }
   },
   "sources": [
     {
@@ -155,6 +197,880 @@
           ]
         }
       ]
+    }
+  ],
+  "sourceExtensions": [
+    {
+      "id": "cli2api-head",
+      "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
+      "commit": "624874a0331f5e8f012ef104b633e69826487458",
+      "extendsSourceId": "cli2api-current-review",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/payload.go",
+          "sha256": "54a9c647edb5878d0e986f95f732e9e6a935d70fdd6d4938aff2ec7921cf4577"
+        },
+        {
+          "path": "internal/providers/workbuddy/sse.go",
+          "sha256": "e61d969264e83f23e6ccaed3b07c4e50d2b10cc50733d86f79e15a88723d6725"
+        },
+        {
+          "path": "internal/providers/workbuddy/mapping.go",
+          "sha256": "c1cc606000356326a519d0287324697016becfa61cbce0fbabd4d997460d74f1"
+        },
+        {
+          "path": "internal/providers/workbuddy/catalog.go",
+          "sha256": "8ddfa7fd704ed0a53eac4e647804cd845b7b9852366cf78606a5fe4caea10e91"
+        },
+        {
+          "path": "internal/providers/workbuddy/client.go",
+          "sha256": "57b6808f00d8c987474fe71c804a2e93613a7d418eb054255c5fa20b383bb063"
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "0784dd39cd79bc1e106eda11d58148d1229f102536eb948b1c1152d39c68179f"
+        },
+        {
+          "path": "internal/translate/tools.go",
+          "sha256": "ff9d92778bfe1728050785660459150c5f7e9b4f3b7e6f8cbeaaee656509bf46"
+        },
+        {
+          "path": "internal/translate/tools_test.go",
+          "sha256": "a5fd21e2b8b5692634af7f3e4f3c695054cb470c7173f99a484e3fd511a93616"
+        },
+        {
+          "path": "internal/accounts/pool.go",
+          "sha256": "d8d7f9e2c97e72f8dc5a83d046cf5b906a1b45a575f47f444eea306e03d6900a"
+        },
+        {
+          "path": "internal/executor/chat.go",
+          "sha256": "58482d7b7d776b9e88c64873af67ec7ede7661127215f330a38802587759a733"
+        },
+        {
+          "path": "internal/executor/session_affinity.go",
+          "sha256": "9b5f7e35a1ac9e36c4b3cde256cb0495b20916f470d08863eea81272cadb7c92"
+        },
+        {
+          "path": "internal/accounts/manager.go",
+          "sha256": "ff350b6eeac670a7b228ebe33e62ef19d8108ca19a83dbc70f0125d9f16522c5"
+        },
+        {
+          "path": "internal/accounts/store.go",
+          "sha256": "341af8d32cc2d42d72301945fa1a9bb84cef3b1d9cb7069a345f139aa2860fd0"
+        },
+        {
+          "path": "internal/accounts/api_keys.go",
+          "sha256": "cacd757a1b7590f9cf7f608ff32d043f4fc92858ab5adea8e1cbebd65bf4e9b7"
+        },
+        {
+          "path": "README_EN.md",
+          "sha256": "a00be5f5bb63c7644077bad4c9a7ee7fe19203ce38026e92b7bd458e1ccf11f8"
+        }
+      ]
+    }
+  ],
+  "sourceSnapshots": [
+    {
+      "id": "cli2api-2026-09-19",
+      "sourceId": "cli2api-head",
+      "repository": "cli2api",
+      "headCommit": "624874a0331f5e8f012ef104b633e69826487458",
+      "headTree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": 2,
+      "excludedWorktreePaths": [
+        "proxy.html",
+        "proxy.md"
+      ],
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "reviewedRejections": [
+    {
+      "id": "CB-R1",
+      "status": "rejected",
+      "behaviors": [
+        "account_pool_selection_or_rotation",
+        "session_affinity_or_model_driven_account_selection",
+        "cross_domain_site_account_or_provider_fallback"
+      ],
+      "boundary": "A CodeBuddy request remains fixed to one Provider, Share, Account and immutable site; only one same-account same-rail pre-commit recovery is permitted, never pool, rotation, affinity, domain, site, Account or Provider fallback."
+    },
+    {
+      "id": "CB-R2",
+      "status": "rejected",
+      "behaviors": [
+        "daily_checkin_or_enterprise_operations",
+        "prompt_rewrite",
+        "commercial_api_key_management",
+        "multi_tenant_admin_backend"
+      ],
+      "boundary": "Reference maintenance, enterprise operations, prompt rewriting and commercial key or tenant administration are outside the single-account subscription proxy boundary and are not implementation gaps."
+    },
+    {
+      "id": "CB-R3",
+      "status": "rejected",
+      "behaviors": [
+        "unverified_enterprise_image_or_video_capabilities",
+        "external_repository_runtime_dependency",
+        "fixture_or_reference_success_promotes_local_live_site",
+        "missing_unique_terminal_or_eof_counts_as_success"
+      ],
+      "boundary": "Enterprise and multimodal capabilities require separate real evidence; external objects remain optional audit input, fixture success never promotes a site, and success requires one authoritative terminal followed by EOF."
+    }
+  ],
+  "observations": [
+    {
+      "id": "CB-OBS-0001",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "semantic_empty_message_filter",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "normalizeEmptyMessageContent",
+          "messageContentEmpty",
+          "TestPrepareBodyNormalizesEmptyMessageContent"
+        ],
+        "sourceDigest": "a8b5dc12fddbcd72552add29e2c30a4326091292a9ca0b45d2c47073c1443a63"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-01"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "messages.retain(codebuddy_message_is_semantic)",
+              "fn codebuddy_message_is_semantic(",
+              "payload_drops_empty_messages_but_preserves_tool_protocol_history"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "payload_drops_empty_messages_but_preserves_tool_protocol_history"
+        ]
+      },
+      "reason": "Adopt semantic empty-message cleanup while preserving local tool calls and tool results under the fixed canonical request boundary."
+    },
+    {
+      "id": "CB-OBS-0002",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "semantic_stream_delta_filter",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/sse.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "sanitizeSSEPayload",
+          "sanitizeDelta",
+          "TestCopySanitizedSSEDropsEmptyThinkingDeltas",
+          "TestChatStreamStripsEmptyWorkBuddyDeltas"
+        ],
+        "sourceDigest": "6f5726b629609d420f5f69bcaaad6794e8a6d0f9280c8b6c50c0df7dfa6de991"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-02"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy.rs",
+            "anchors": [
+              "fn sanitize_codebuddy_stream_chunk(",
+              "fn dummy_function_call(",
+              "decoder_drops_empty_deltas_and_preserves_semantic_stream_fields"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "decoder_drops_empty_deltas_and_preserves_semantic_stream_fields"
+        ]
+      },
+      "reason": "Adopt the empty-delta finding through the stricter local decoder, which retains semantic role, finish, usage, tool and reasoning fields."
+    },
+    {
+      "id": "CB-OBS-0003",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "tool_choice_and_namespace_normalization",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/client_test.go",
+          "internal/translate/tools.go"
+        ],
+        "symbols": [
+          "normalizeToolChoice",
+          "normalizeTools",
+          "NormalizeOpenAITools",
+          "TestPrepareBodyForcesStreamAndStringToolChoice"
+        ],
+        "sourceDigest": "9c83e599fd36609c166ec219e89d5e61bf3c309e729efe749a2a9709ba6876d4"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-03"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "fn normalize_codebuddy_tools_and_choice(",
+              "CodeBuddy tool_choice string must be none, auto, or required",
+              "payload_normalizes_empty_none_and_attached_tool_choices"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "payload_normalizes_empty_none_and_attached_tool_choices"
+        ]
+      },
+      "reason": "Keep the local closed tool-choice contract and shared namespace bridge rather than copying permissive reference rewrites."
+    },
+    {
+      "id": "CB-OBS-0004",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "intl_cn_login_catalog_and_quota_live_gate",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/catalog.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "StartLogin",
+          "PollLogin",
+          "Refresh",
+          "Models",
+          "Quota",
+          "TestModelsUsesAccountRegionAndDesktopCatalogUA"
+        ],
+        "sourceDigest": "1d282236b08b728c1b866cb70e2fa29fe8423011e2daaa69ab8d9ef418eb8269"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "CB-04"
+      ],
+      "target": {
+        "baselineCommit": "d5177f6691fbfe15f1878d4c26892f84ded4df41",
+        "baselineTree": "ce2a734b3fb02a139770ce199fbd2df12630f8a6",
+        "implementationCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "implementationTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "contracts": [
+          {
+            "path": "scripts/smoke/codebuddy-real-receipt.mjs",
+            "anchors": [
+              "const HARNESS_REVISION = 2",
+              "codebuddy_live_model_catalog",
+              "const expectedLive = fixtureMode ? \"live_pending\" : \"live_verified\""
+            ]
+          },
+          {
+            "path": "scripts/audit/codebuddy-real-receipt.test.mjs",
+            "anchors": [
+              "CodeBuddy Intl and CN fixture receipts stay contract-only"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "CodeBuddy Intl and CN fixture receipts stay contract-only"
+        ]
+      },
+      "reason": "Reference fixtures cannot establish local subscription acceptance; Intl and CN remain independent private receipt gates."
+    },
+    {
+      "id": "CB-OBS-0005",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "interrupted_tool_round_repair",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "repairToolSequence",
+          "hasCompleteToolRound",
+          "TestPrepareBodyRepairsInterruptedToolSequence"
+        ],
+        "sourceDigest": "110e90bab87fd6112d20219e76fc3326b668ed67bd94b810660f10c153bcc092"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-N1"
+      ],
+      "target": {
+        "baselineCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "baselineTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "implementationCommit": "db65188ac1e030df36a3dd6ba7122bd363b2a07b",
+        "implementationTree": "bb1931c2d657a4a5c41ab010b0f5e29f392695a6",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "fn repair_codebuddy_tool_history(",
+              "fn codebuddy_tool_round_is_complete(",
+              "payload_repairs_only_incomplete_historical_tool_rounds"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "payload_repairs_only_incomplete_historical_tool_rounds"
+        ]
+      },
+      "reason": "Use the reference 11148 failure as a differential, but additionally require valid names and complete JSON arguments and never fabricate tool results."
+    },
+    {
+      "id": "CB-OBS-0006",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "reasoning_only_history_projection",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/client_test.go",
+          "internal/translate/tools_test.go"
+        ],
+        "symbols": [
+          "hasReasoningContent",
+          "TestPrepareBodyKeepsReasoningOnlyAssistant",
+          "TestTranslateResponsesMergesReasoningMessageAndFunctionCall"
+        ],
+        "sourceDigest": "82aa5688f120ee4fb3ddaff405b4b6fa9559d8d14af36f56e26be262bd1351fd"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-N2"
+      ],
+      "target": {
+        "baselineCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "baselineTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "implementationCommit": "db65188ac1e030df36a3dd6ba7122bd363b2a07b",
+        "implementationTree": "bb1931c2d657a4a5c41ab010b0f5e29f392695a6",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "fn canonicalize_codebuddy_assistant_reasoning(",
+              "payload_keeps_complete_tool_round_byte_shape_and_reasoning_only_history"
+            ]
+          },
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "responses_reasoning_attaches_forward_and_backfills_trailing_summary"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "payload_keeps_complete_tool_round_byte_shape_and_reasoning_only_history",
+          "responses_reasoning_attaches_forward_and_backfills_trailing_summary"
+        ]
+      },
+      "reason": "Canonicalize upstream assistant reasoning before semantic filtering and preserve one logical assistant turn across all downstream surfaces."
+    },
+    {
+      "id": "CB-OBS-0007",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "namespace_tool_bridge",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/client_test.go",
+          "internal/translate/tools.go",
+          "internal/translate/tools_test.go"
+        ],
+        "symbols": [
+          "NormalizeOpenAITools",
+          "qualifyNamespaceToolName",
+          "TestPrepareBodyExpandsNamespaceTools",
+          "TestNormalizeOpenAIToolsExpandsNamespaceAndDropsHostedShells"
+        ],
+        "sourceDigest": "f9dd74f8da719a2afd690f2f0e8076faa858d9d88a2ea674d0495b25eeb3c747"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-N3"
+      ],
+      "target": {
+        "baselineCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "baselineTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "implementationCommit": "db65188ac1e030df36a3dd6ba7122bd363b2a07b",
+        "implementationTree": "bb1931c2d657a4a5c41ab010b0f5e29f392695a6",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "payload_closes_namespace_tool_rounds_across_claude_chat_and_responses"
+            ]
+          },
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "responses_namespace_tools_round_trip_through_chat_and_anthropic",
+              "long_namespace_tool_names_are_stable_and_byte_bounded"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "payload_closes_namespace_tool_rounds_across_claude_chat_and_responses",
+          "responses_namespace_tools_round_trip_through_chat_and_anthropic",
+          "long_namespace_tool_names_are_stable_and_byte_bounded"
+        ]
+      },
+      "reason": "Retain the existing request-local shared bridge and reject reference-specific hosted-tool behavior or bare-child guessing."
+    },
+    {
+      "id": "CB-OBS-0008",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "deepseek_v4_1_flash_live_gate",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/mapping.go",
+          "internal/providers/workbuddy/catalog.go",
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "officialTopLevelReasoningModels",
+          "usesTopLevelReasoningFields",
+          "catalogModel",
+          "TestModelsExposesProductConfigDeepseekWithoutPersonalCatalog",
+          "TestChatRequestKeepsNativeDeepseekWhenCatalogHasIt"
+        ],
+        "sourceDigest": "5bd27aee38d9b24c1f3b82a671c562e93e80caa981963a1b95bb4808183ecdec"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "CB-N4"
+      ],
+      "target": {
+        "baselineCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "baselineTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "implementationCommit": "db65188ac1e030df36a3dd6ba7122bd363b2a07b",
+        "implementationTree": "bb1931c2d657a4a5c41ab010b0f5e29f392695a6",
+        "contracts": [
+          {
+            "path": "assets/contract/codebuddy-reference-delta.json",
+            "anchors": [
+              "\"id\": \"CB-N4\"",
+              "\"runtimeEnabled\": false"
+            ]
+          },
+          {
+            "path": "scripts/audit/audit-codebuddy-reference-delta.mjs",
+            "anchors": [
+              "CB-N4 Deepseek gate opened without live evidence"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "CB-N4 Deepseek gate opened without live evidence"
+        ]
+      },
+      "reason": "Reference catalog support is insufficient to enable a CN native model locally; the exact model remains disabled until a bound-site receipt exists."
+    },
+    {
+      "id": "CB-OBS-0009",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "stream_cancellation_and_terminal_differential",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/sse.go",
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "copySanitizedSSE",
+          "ChatStream",
+          "TestChatNonStreamReadLifecycle",
+          "context.Canceled"
+        ],
+        "sourceDigest": "983a52b4b27f414f425dfb81a752cdad59d31cc83370fb70dff5537fefcb543c"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-N5"
+      ],
+      "target": {
+        "baselineCommit": "56447b1c10548ec465c4fbdb134b3ce0e978a89c",
+        "baselineTree": "51eab272bf50d62cea40c96f41b4f7eb92a008c5",
+        "implementationCommit": "db65188ac1e030df36a3dd6ba7122bd363b2a07b",
+        "implementationTree": "bb1931c2d657a4a5c41ab010b0f5e29f392695a6",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+            "anchors": [
+              "codebuddy_truncation_before_done_is_never_reported_as_success",
+              "codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker"
+            ]
+          },
+          {
+            "path": "src/proxy/codebuddy.rs",
+            "anchors": [
+              "decoder_requires_one_done_and_rejects_post_terminal_data"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "codebuddy_truncation_before_done_is_never_reported_as_success",
+          "codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker",
+          "decoder_requires_one_done_and_rejects_post_terminal_data"
+        ]
+      },
+      "reason": "Use the shared local cancellation and strict terminal-plus-EOF guard; do not copy a weaker language-specific stream wrapper."
+    },
+    {
+      "id": "CB-OBS-0010",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "provider_lifecycle_facade",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/payload.go",
+          "internal/providers/workbuddy/sse.go"
+        ],
+        "symbols": [
+          "type Client struct",
+          "chatRequest",
+          "PrepareBody",
+          "rewriteChatStream"
+        ],
+        "sourceDigest": "a354997029b577a50452b2fcdd7b832edb2610155694274ff13c9eb903dc233f"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N1"
+      ],
+      "target": {
+        "baselineCommit": "d5177f6691fbfe15f1878d4c26892f84ded4df41",
+        "baselineTree": "ce2a734b3fb02a139770ce199fbd2df12630f8a6",
+        "implementationCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "implementationTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/codebuddy/mod.rs",
+            "anchors": [
+              "pub(crate) fn bound_account_identity(",
+              "pub(crate) fn prepare_canonical_request(",
+              "pub(crate) fn prepare_generation(",
+              "pub(crate) async fn runtime_is_current(",
+              "generation_uses_exact_site_bound_live_catalog",
+              "generation_fails_closed_on_unadvertised_capabilities"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "codebuddy_provider::prepare_canonical_request",
+              "codebuddy_provider::prepare_generation",
+              "codebuddy_provider::runtime_is_current"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "generation_uses_exact_site_bound_live_catalog",
+          "generation_fails_closed_on_unadvertised_capabilities"
+        ]
+      },
+      "reason": "Separate CodeBuddy lifecycle preparation and generation fencing behind a facade while shared orchestration retains lease, usage, terminal, attempts and replay decisions."
+    },
+    {
+      "id": "CB-OBS-0011",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "site_scoped_private_receipts",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/catalog.go",
+          "internal/providers/workbuddy/client_test.go"
+        ],
+        "symbols": [
+          "StartLogin",
+          "resolvedCredential",
+          "Models",
+          "UserResource",
+          "TestModelsUsesAccountRegionAndDesktopCatalogUA",
+          "TestUserResourceAggregation"
+        ],
+        "sourceDigest": "f56cc48aa6b52fa3d437f07f1f7c5a58b9b563739a47c21f1b3bd66d30ad2874"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
+      "target": {
+        "baselineCommit": "d5177f6691fbfe15f1878d4c26892f84ded4df41",
+        "baselineTree": "ce2a734b3fb02a139770ce199fbd2df12630f8a6",
+        "implementationCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "implementationTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "contracts": [
+          {
+            "path": "scripts/smoke/codebuddy-real-receipt.mjs",
+            "anchors": [
+              "const HARNESS_REVISION = 2",
+              "codebuddy_live_model_catalog",
+              "sameAccountFirst401",
+              "const expectedLive = fixtureMode ? \"live_pending\" : \"live_verified\""
+            ]
+          },
+          {
+            "path": "scripts/audit/codebuddy-real-receipt.test.mjs",
+            "anchors": [
+              "CodeBuddy receipt scope binds all six body hashes",
+              "CodeBuddy Provider binding mismatch fails before receipt acceptance"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "CodeBuddy receipt scope binds all six body hashes",
+          "CodeBuddy Provider binding mismatch fails before receipt acceptance"
+        ]
+      },
+      "reason": "Bind Intl and CN receipts independently to the exact Account generations, three Provider runtimes, Share, model, catalogs and six request bodies; fixture success remains live-pending."
+    },
+    {
+      "id": "CB-OBS-0012",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "pool_rotation_affinity_and_fallback_rejected",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/accounts/pool.go",
+          "internal/executor/chat.go",
+          "internal/executor/session_affinity.go"
+        ],
+        "symbols": [
+          "PickRoute",
+          "routeLoop",
+          "canFailover",
+          "SessionAffinity",
+          "Bind"
+        ],
+        "sourceDigest": "122b4a8a2471b590d12e748b787b5497203331b58e27ec0544f6fd189a927823"
+      },
+      "disposition": "reject",
+      "enhancementIds": [
+        "CB-R1"
+      ],
+      "target": {
+        "baselineCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "baselineTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/codebuddy-reference-delta.json",
+            "anchors": [
+              "single bound Provider/Share/Account",
+              "no pool",
+              "no domain fallback",
+              "no cross-account fallback",
+              "no cross-Provider fallback"
+            ]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": [
+              "禁止账号池选择、跨账号轮换、跨 Provider fallback、跨站点 fallback"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject scheduling, affinity, rotation and broad fallback because every request is already bound to one Provider, Share, Account and immutable site."
+    },
+    {
+      "id": "CB-OBS-0013",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "operations_and_commercial_control_plane_rejected",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/accounts/manager.go",
+          "internal/accounts/store.go",
+          "internal/accounts/api_keys.go",
+          "README_EN.md"
+        ],
+        "symbols": [
+          "DailyCheckin",
+          "RunWorkBuddyMaintenanceLoop",
+          "CreateAPIKey",
+          "prompt/completion capture"
+        ],
+        "sourceDigest": "dbb4793b324f6ed2b3f35c1bdaf6c98fddf6b6a1cb8b3f0b1bcf40634aac1d64"
+      },
+      "disposition": "reject",
+      "enhancementIds": [
+        "CB-R2"
+      ],
+      "target": {
+        "baselineCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "baselineTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": [
+              "不迁入每日签到、企业运营、domain fallback、账号池、prompt rewrite、未验证的企业/图像/视频能力",
+              "不迁入桌面/Tauri、商业计费、Key 分销、签到、运营自动化、账号调度和外部项目 UI"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject maintenance automation, prompt capture or rewriting, commercial API keys and tenant administration as control-plane scope unrelated to this proxy."
+    },
+    {
+      "id": "CB-OBS-0014",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head",
+        "snapshotId": "cli2api-2026-09-19",
+        "repository": "cli2api",
+        "deltaId": "unverified_capability_and_weak_terminal_rejected",
+        "commit": "624874a0331f5e8f012ef104b633e69826487458",
+        "tree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+        "paths": [
+          "internal/providers/workbuddy/sse.go",
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/catalog.go",
+          "README_EN.md"
+        ],
+        "symbols": [
+          "Aggregate",
+          "sawDone",
+          "EnterpriseID",
+          "not WorkBuddy"
+        ],
+        "sourceDigest": "30ef6c4322a63f8e7b842f3d100ee141ed58faeffd59583761cfb2682de2523a"
+      },
+      "disposition": "reject",
+      "enhancementIds": [
+        "CB-R3"
+      ],
+      "target": {
+        "baselineCommit": "d81056c786196357c1074336a06a6cb847c9f9d6",
+        "baselineTree": "3ad3b2aa8ee0b18d2c36bec839e610bb0e2176c7",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/codebuddy-reference-delta.json",
+            "anchors": [
+              "strict_terminal_then_eof",
+              "receiptAutoEnablesCapabilities",
+              "externalSources"
+            ]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": [
+              "fixture_verified 只说明本仓库自包含合同已通过，不等价于真实订阅已验收"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject unverified enterprise or multimodal capability promotion, external runtime coupling, fixture-as-live claims and any success without a unique terminal followed by EOF."
     }
   ],
   "registryTruth": {
