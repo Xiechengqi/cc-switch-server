@@ -1,27 +1,56 @@
 #!/usr/bin/env node
 
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-// cursor dual-rail evidence remains live_pending until each private rail receipt passes.
+// cursor dual-rail evidence remains live_pending: OAuth and API-key evidence
+// stays independent. Fixture mode proves only that this validator fails closed;
+// it never promotes either rail.
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const contract = JSON.parse(
-  fs.readFileSync(path.join(repoRoot, "assets/contract/cursor-reference-delta.json"), "utf8"),
+  fs.readFileSync(
+    path.join(repoRoot, "assets/contract/cursor-reference-delta.json"),
+    "utf8",
+  ),
 );
+const HARNESS_REVISION = 2;
+const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+let failureReported = false;
+
+function reportFailure() {
+  if (!failureReported) {
+    failureReported = true;
+    console.error("[FAIL] Cursor acceptance failed (details redacted)");
+  }
+  process.exitCode = 1;
+}
+
+process.on("uncaughtException", reportFailure);
+process.on("unhandledRejection", reportFailure);
+
 const railSpecs = Object.freeze({
   oauth: Object.freeze({
     providerType: "cursor_oauth",
-    providerEnv: "CURSOR_OAUTH_PROVIDER_ID",
-    shareEnv: "CURSOR_OAUTH_SHARE_ID",
+    providerEnv: "CC_SWITCH_CURSOR_OAUTH_PROVIDER_ID",
+    legacyProviderEnv: "CURSOR_OAUTH_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CURSOR_OAUTH_SHARE_ID",
+    legacyShareEnv: "CURSOR_OAUTH_SHARE_ID",
+    modelEnv: "CC_SWITCH_CURSOR_OAUTH_MODEL",
+    receiptEnv: "CURSOR_OAUTH_REAL_RECEIPT_FILE",
     accountEnv: "CURSOR_OAUTH_TEST_ACCOUNT",
     authKind: "managed_account",
   }),
   api_key: Object.freeze({
-    providerType: "cursor_api_key",
-    providerEnv: "CURSOR_API_KEY_PROVIDER_ID",
-    shareEnv: "CURSOR_API_KEY_SHARE_ID",
+    providerType: "cursor_apikey",
+    providerEnv: "CC_SWITCH_CURSOR_API_KEY_PROVIDER_ID",
+    legacyProviderEnv: "CURSOR_API_KEY_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CURSOR_API_KEY_SHARE_ID",
+    legacyShareEnv: "CURSOR_API_KEY_SHARE_ID",
+    modelEnv: "CC_SWITCH_CURSOR_API_KEY_MODEL",
+    receiptEnv: "CURSOR_API_KEY_REAL_RECEIPT_FILE",
     accountEnv: null,
     authKind: "static_credential",
   }),
@@ -33,7 +62,9 @@ function env(name, fallback = "") {
 
 function argValue(name, fallback = "") {
   const index = process.argv.indexOf(name);
-  return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : fallback;
+  return index >= 0 && index + 1 < process.argv.length
+    ? process.argv[index + 1]
+    : fallback;
 }
 
 function usable(value) {
@@ -57,12 +88,30 @@ function canonical(value) {
   return value;
 }
 
+function sameCanonical(left, right) {
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
 function digest(domain, value) {
   return crypto
     .createHash("sha256")
     .update(`${domain}\0`)
     .update(JSON.stringify(canonical(value)))
     .digest("hex");
+}
+
+function gitCommit() {
+  try {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!/^[a-f0-9]{40}$/.test(commit)) fail("current target commit is invalid");
+    return commit;
+  } catch {
+    fail("current target commit is unavailable");
+  }
 }
 
 const rail = argValue("--rail", env("CC_SWITCH_CURSOR_REAL_RAIL"));
@@ -84,12 +133,12 @@ const shareUrl = env("CC_SWITCH_SHARE_URL").replace(/\/+$/, "");
 const serverToken = env("CC_SWITCH_SERVER_TOKEN");
 const routerToken = env("ROUTER_API_TOKEN");
 const routerTokenHeader = env("ROUTER_API_TOKEN_HEADER", "Authorization");
-const providerId = env(spec.providerEnv);
-const shareId = env(spec.shareEnv);
+const providerId = env(spec.providerEnv, env(spec.legacyProviderEnv));
+const shareId = env(spec.shareEnv, env(spec.legacyShareEnv));
 const accountSelector = spec.accountEnv ? env(spec.accountEnv) : "";
 const app = env("CURSOR_REAL_PROVIDER_APP", "codex");
-const fastModel = env("CURSOR_REAL_FAST_MODEL");
-const receiptFile = env("CURSOR_REAL_RECEIPT_FILE");
+const model = env(spec.modelEnv, env("CURSOR_REAL_FAST_MODEL"));
+const receiptFile = env(spec.receiptEnv, env("CURSOR_REAL_RECEIPT_FILE"));
 const configuredTimeoutMs = Number(env("CC_SWITCH_REAL_TIMEOUT_MS", "30000"));
 const timeoutMs = Number.isFinite(configuredTimeoutMs)
   ? Math.max(1_000, Math.min(120_000, Math.trunc(configuredTimeoutMs)))
@@ -103,20 +152,29 @@ const requiredInputs = [
   ["ROUTER_API_TOKEN", routerToken],
   [spec.providerEnv, providerId],
   [spec.shareEnv, shareId],
-  ["CURSOR_REAL_FAST_MODEL", fastModel],
-  ["CURSOR_REAL_RECEIPT_FILE", receiptFile],
+  [spec.modelEnv, model],
+  [spec.receiptEnv, receiptFile],
 ];
 if (spec.accountEnv) requiredInputs.push([spec.accountEnv, accountSelector]);
-const missingInputs = requiredInputs.filter(([, value]) => !usable(value)).map(([name]) => name);
+const missingInputs = requiredInputs
+  .filter(([, value]) => !usable(value))
+  .map(([name]) => name);
 if (missingInputs.length > 0) {
   console.log(
-    JSON.stringify({ rail, verificationState: "blocked_inputs", liveState: "live_pending", missingInputs }),
+    JSON.stringify({
+      rail,
+      verificationState: "blocked_inputs",
+      liveState: "live_pending",
+      missingInputs,
+    }),
   );
   process.exit(0);
 }
-if (!["claude", "codex", "gemini"].includes(app)) fail("CURSOR_REAL_PROVIDER_APP is unsupported");
-if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}-fast$/.test(fastModel)) {
-  fail("CURSOR_REAL_FAST_MODEL must be one exact bounded *-fast model id");
+if (!["claude", "codex", "gemini"].includes(app)) {
+  fail("CURSOR_REAL_PROVIDER_APP is unsupported");
+}
+if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}-fast$/.test(model)) {
+  fail(`${spec.modelEnv} must be one exact bounded *-fast model id`);
 }
 
 function safeOrigin(value, label, { share = false } = {}) {
@@ -126,7 +184,13 @@ function safeOrigin(value, label, { share = false } = {}) {
   } catch {
     fail(`${label} is not a valid URL`);
   }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== "/"
+  ) {
     fail(`${label} must be a credential-free origin`);
   }
   const loopback = ["127.0.0.1", "::1", "localhost"].includes(parsed.hostname);
@@ -141,17 +205,31 @@ safeOrigin(shareUrl, "CC_SWITCH_SHARE_URL", { share: true });
 if (!/^(authorization|x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
   fail("ROUTER_API_TOKEN_HEADER is unsupported");
 }
-if (!path.isAbsolute(receiptFile)) fail("CURSOR_REAL_RECEIPT_FILE must be an absolute path");
-const receiptPath = path.resolve(receiptFile);
+if (!path.isAbsolute(receiptFile)) {
+  fail("Cursor receipt file must be an absolute path");
+}
+const requestedReceiptPath = path.resolve(receiptFile);
+const requestedRelative = path.relative(repoRoot, requestedReceiptPath);
+if (!requestedRelative.startsWith("..") && !path.isAbsolute(requestedRelative)) {
+  fail("Cursor receipt file must stay outside the repository");
+}
+if (
+  !fs.existsSync(requestedReceiptPath) ||
+  !fs.statSync(requestedReceiptPath).isFile()
+) {
+  fail("Cursor receipt file is unavailable");
+}
+const receiptPath = fs.realpathSync(requestedReceiptPath);
 const receiptRelative = path.relative(repoRoot, receiptPath);
 if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
-  fail("CURSOR_REAL_RECEIPT_FILE must stay outside the repository");
+  fail("Cursor receipt file must stay outside the repository");
 }
-if (!fs.existsSync(receiptPath) || !fs.statSync(receiptPath).isFile()) {
-  fail("CURSOR_REAL_RECEIPT_FILE is unavailable");
+const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
+  fail("Cursor receipt file size is invalid");
 }
-if (!fixtureMode && (fs.statSync(receiptPath).mode & 0o077) !== 0) {
-  fail("CURSOR_REAL_RECEIPT_FILE must not be group/world accessible");
+if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
+  fail("Cursor receipt file must have mode 0600");
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -161,7 +239,8 @@ function hasSecretLike(value) {
     secrets.some((secret) => text.includes(secret)) ||
     /Bearer\s+[A-Za-z0-9._~+/-]{10,}/i.test(text) ||
     /\b(?:sk|key|jwt)-[A-Za-z0-9_-]{8,}\b/i.test(text) ||
-    /\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b/.test(text)
+    /\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b/.test(text) ||
+    /"(?:access|refresh|id)_token"\s*:\s*"[^"<][^"]+"/i.test(text)
   );
 }
 
@@ -181,9 +260,15 @@ async function requestJson(base, requestPath, headers, label) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${base}${requestPath}`, { method: "GET", headers, signal: controller.signal });
+    const response = await fetch(`${base}${requestPath}`, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
     const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) fail(`${label} exceeded the response-size bound`);
+    if (bytes.byteLength > 4 * 1024 * 1024) {
+      fail(`${label} exceeded the response-size bound`);
+    }
     const text = new TextDecoder().decode(bytes);
     if (hasSecretLike(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -205,8 +290,49 @@ function exactOne(values, label) {
   return values[0];
 }
 
-async function validateControlPlane() {
-  const providerList = await requestJson(serverUrl, "/api/providers", adminHeaders(), "Cursor Provider list");
+async function validateAccount() {
+  if (rail !== "oauth") return null;
+  const response = await requestJson(
+    serverUrl,
+    "/api/accounts",
+    adminHeaders(),
+    "Cursor Account list",
+  );
+  if (response?.ok !== true || !Array.isArray(response.accounts)) {
+    fail("Cursor Account list violated the control-plane contract");
+  }
+  const selector = accountSelector.toLowerCase();
+  const account = exactOne(
+    response.accounts.filter(
+      (candidate) =>
+        candidate?.providerType === "cursor_oauth" &&
+        (candidate.id === accountSelector ||
+          candidate.email?.trim().toLowerCase() === selector),
+    ),
+    "Cursor Account selector",
+  );
+  if (
+    !Number.isSafeInteger(account.authIdentityGeneration) ||
+    account.authIdentityGeneration < 1 ||
+    !Number.isSafeInteger(account.tokenRefreshGeneration) ||
+    account.tokenRefreshGeneration < 0 ||
+    account.hasAccessToken !== true ||
+    account.hasRefreshToken !== true ||
+    account.hasApiKey === true ||
+    account.needsRelogin === true
+  ) {
+    fail("Cursor Account is not a live refreshable OAuth identity generation");
+  }
+  return account;
+}
+
+async function validateBinding(account) {
+  const providerList = await requestJson(
+    serverUrl,
+    "/api/providers",
+    adminHeaders(),
+    "Cursor Provider list",
+  );
   if (providerList?.ok !== true || !Array.isArray(providerList.providers)) {
     fail("Cursor Provider list violated the control-plane contract");
   }
@@ -216,39 +342,56 @@ async function validateControlPlane() {
     ),
     "Cursor Provider binding",
   );
+  const authRef = view.runtime?.authRef;
   if (
     view.providerType !== spec.providerType ||
     view.providerTypeId !== spec.providerType ||
     view.runtime?.driverId !== "special.cursor" ||
     view.runtime?.configurationState !== "ready" ||
-    view.runtime?.authRef?.kind !== spec.authKind
+    authRef?.kind !== spec.authKind
   ) {
     fail("Cursor Provider rail or runtime binding does not match the selected rail");
   }
-  const authRef = view.runtime.authRef;
-  let identityGeneration;
+  let generations;
   if (rail === "oauth") {
     if (
-      authRef.accountId !== accountSelector ||
+      !account ||
+      authRef.accountId !== account.id ||
       authRef.expectedProviderType !== "cursor_oauth" ||
-      !Number.isSafeInteger(authRef.authIdentityGeneration) ||
-      authRef.authIdentityGeneration < 1
+      authRef.authIdentityGeneration !== account.authIdentityGeneration
     ) {
       fail("Cursor OAuth Provider is not fixed to the selected Account generation");
     }
-    identityGeneration = authRef.authIdentityGeneration;
+    generations = {
+      authIdentityGeneration: account.authIdentityGeneration,
+      tokenRefreshGeneration: account.tokenRefreshGeneration,
+    };
   } else {
-    if (!Number.isSafeInteger(authRef.credentialGeneration) || authRef.credentialGeneration < 1) {
-      fail("Cursor API-key Provider is missing its credential generation");
+    if (
+      authRef.authScheme !== "bearer" ||
+      !Array.isArray(authRef.slots) ||
+      !authRef.slots.includes("apiKey") ||
+      !Number.isSafeInteger(authRef.credentialGeneration) ||
+      authRef.credentialGeneration < 1
+    ) {
+      fail("Cursor API-key Provider is missing its exact credential generation");
     }
-    identityGeneration = authRef.credentialGeneration;
+    generations = { credentialGeneration: authRef.credentialGeneration };
   }
 
-  const shareList = await requestJson(serverUrl, "/api/shares", adminHeaders(), "Cursor Share list");
+  const shareList = await requestJson(
+    serverUrl,
+    "/api/shares",
+    adminHeaders(),
+    "Cursor Share list",
+  );
   if (shareList?.ok !== true || !Array.isArray(shareList.shares)) {
     fail("Cursor Share list violated the control-plane contract");
   }
-  const share = exactOne(shareList.shares.filter((candidate) => candidate?.id === shareId), "Cursor Share");
+  const share = exactOne(
+    shareList.shares.filter((candidate) => candidate?.id === shareId),
+    "Cursor Share",
+  );
   const bindings = [
     { app: share.app, providerId: share.providerId, providerType: share.providerType },
     ...(Array.isArray(share.bindings) ? share.bindings : []),
@@ -263,11 +406,24 @@ async function validateControlPlane() {
   ) {
     fail("Cursor Share is not fixed to the selected Provider rail");
   }
+  const providerRevision =
+    view.runtime?.providerRevision ?? view.revision ?? view.providerRevision ?? 0;
+  const runtimeFingerprint = String(view.runtime?.runtimeFingerprint || "");
+  const shareRevision = share.configRevision ?? 0;
+  if (
+    !Number.isSafeInteger(providerRevision) ||
+    providerRevision < 0 ||
+    !runtimeFingerprint ||
+    !Number.isSafeInteger(shareRevision) ||
+    shareRevision < 0
+  ) {
+    fail("Cursor Provider or Share revision scope is incomplete");
+  }
   return {
-    identityGeneration,
-    runtimeFingerprint: String(view.runtime.runtimeFingerprint || ""),
-    providerRevision: view.providerRevision ?? view.provider?.revision ?? 0,
-    shareRevision: share.configRevision ?? 0,
+    providerRevision,
+    runtimeFingerprint,
+    shareRevision,
+    ...generations,
   };
 }
 
@@ -279,68 +435,205 @@ async function validateCatalog() {
     shareHeaders(),
     "Cursor model catalog",
   );
-  if (!Array.isArray(catalog?.data)) fail("Cursor model catalog violated the public contract");
-  const matches = catalog.data.filter((entry) => entry?.id === fastModel);
-  if (matches.length !== 1) fail("Cursor model catalog did not preserve the exact fresh *-fast id");
+  if (!Array.isArray(catalog?.data)) {
+    fail("Cursor model catalog violated the public contract");
+  }
+  if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
+    fail("Cursor model catalog did not preserve the exact fresh *-fast id");
+  }
 }
 
-function validateReceipt(receipt, expectedScopeDigest) {
-  const allowed = new Set([
+function expectedDecisions() {
+  return {
+    sameIdentity401: "replayed_once",
+    second401: "terminal",
+    identityGenerationDrift: "terminal",
+    crossRailFallback: "disabled",
+    crossAccountFallback: "disabled",
+    crossProviderFallback: "disabled",
+    crossShareFallback: "disabled",
+    postCommitReplay: "disabled",
+    staleCatalogWireAuthorization: "disabled",
+  };
+}
+
+function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
+  const fields = [
     "schemaVersion",
+    "providerFamily",
     "rail",
     "verificationState",
     "liveState",
-    "scopeDigest",
-    "checks",
+    "targetCommit",
+    "harnessRevision",
     "recordedAt",
-  ]);
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) fail("Cursor receipt must be an object");
-  for (const key of Object.keys(receipt)) {
-    if (!allowed.has(key)) fail(`Cursor receipt contains forbidden field ${key}`);
+    "scopeDigest",
+    "app",
+    "model",
+    "checks",
+    "bodyHashes",
+    "generations",
+    "measurements",
+    "decisions",
+    "decoyRequests",
+    "sensitiveScan",
+  ];
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    fail("Cursor receipt must be an object");
   }
-  if (hasSecretLike(JSON.stringify(receipt))) fail("Cursor receipt contained secret-like material");
-  if (receipt.schemaVersion !== contract.realAcceptance.receiptSchemaVersion) {
-    fail("Cursor receipt schema version changed");
+  if (!sameCanonical(Object.keys(receipt).sort(), [...fields].sort())) {
+    fail("Cursor receipt fields do not match schema version 2");
   }
-  if (receipt.rail !== rail) fail("Cursor receipt rail does not match the selected rail");
-  if (!/^[a-f0-9]{64}$/.test(receipt.scopeDigest) || receipt.scopeDigest !== expectedScopeDigest) {
-    fail("Cursor receipt scope digest does not match the selected binding");
+  if (hasSecretLike(JSON.stringify(receipt))) {
+    fail("Cursor receipt contained secret-like material");
+  }
+  const railContract = contract.realAcceptance.rails.find(
+    (candidate) => candidate.rail === rail,
+  );
+  if (
+    !railContract ||
+    receipt.schemaVersion !== contract.realAcceptance.receiptSchemaVersion ||
+    receipt.providerFamily !== "cursor" ||
+    receipt.rail !== rail ||
+    receipt.targetCommit !== targetCommit ||
+    receipt.harnessRevision !== HARNESS_REVISION ||
+    receipt.harnessRevision !== contract.realAcceptance.harnessRevision ||
+    receipt.app !== app ||
+    receipt.model !== model ||
+    receipt.scopeDigest !== scopeDigest ||
+    !/^[a-f0-9]{64}$/.test(receipt.scopeDigest)
+  ) {
+    fail("Cursor receipt identity or scope does not match the selected rail");
   }
   const expectedVerification = fixtureMode ? "contract_verified" : "live_verified";
   const expectedLive = fixtureMode ? "live_pending" : "live_verified";
-  if (receipt.verificationState !== expectedVerification || receipt.liveState !== expectedLive) {
+  if (
+    receipt.verificationState !== expectedVerification ||
+    receipt.liveState !== expectedLive
+  ) {
     fail("Cursor receipt evidence state is not valid for this harness mode");
   }
-  if (!receipt.checks || typeof receipt.checks !== "object" || Array.isArray(receipt.checks)) {
-    fail("Cursor receipt checks are missing");
+  const recordedAt = Date.parse(receipt.recordedAt);
+  const now = Date.now();
+  if (
+    !Number.isFinite(recordedAt) ||
+    recordedAt < now - RECEIPT_MAX_AGE_MS ||
+    recordedAt > now + 5 * 60_000
+  ) {
+    fail("Cursor receipt timestamp is outside the acceptance window");
   }
-  const keys = Object.keys(receipt.checks).sort();
-  const required = [...contract.realAcceptance.requiredChecks].sort();
-  if (JSON.stringify(keys) !== JSON.stringify(required)) fail("Cursor receipt check set is incomplete");
-  for (const check of required) {
-    if (receipt.checks[check] !== "pass") fail(`Cursor receipt check ${check} did not pass`);
+  const checkKeys = Object.keys(receipt.checks || {}).sort();
+  const requiredChecks = [...railContract.requiredChecks].sort();
+  if (!sameCanonical(checkKeys, requiredChecks)) {
+    fail("Cursor receipt check set is incomplete");
+  }
+  for (const check of requiredChecks) {
+    if (receipt.checks[check] !== "pass") {
+      fail(`Cursor receipt check ${check} did not pass`);
+    }
+  }
+  const hashKeys = Object.keys(receipt.bodyHashes || {}).sort();
+  const requiredHashes = [...railContract.requiredBodyHashes].sort();
+  if (!sameCanonical(hashKeys, requiredHashes)) {
+    fail("Cursor receipt body hash set is incomplete");
+  }
+  for (const name of requiredHashes) {
+    if (!/^[a-f0-9]{64}$/.test(receipt.bodyHashes[name])) {
+      fail(`Cursor receipt body hash ${name} is invalid`);
+    }
+  }
+  const providerBindingDigest = digest("cc-switch-server:cursor-provider-binding:v2", {
+    rail,
+    app,
+    providerId,
+    runtimeFingerprint: binding.runtimeFingerprint,
+    accountId: account?.id ?? null,
+    authIdentityGeneration: binding.authIdentityGeneration ?? null,
+    credentialGeneration: binding.credentialGeneration ?? null,
+  });
+  const expectedGenerations = {
+    ...(rail === "oauth"
+      ? {
+          authIdentityGeneration: binding.authIdentityGeneration,
+          tokenRefreshGeneration: binding.tokenRefreshGeneration,
+        }
+      : { credentialGeneration: binding.credentialGeneration }),
+    providerRevision: binding.providerRevision,
+    shareRevision: binding.shareRevision,
+    providerBindingDigest,
+  };
+  if (!sameCanonical(receipt.generations, expectedGenerations)) {
+    fail("Cursor receipt generations do not match the selected binding");
+  }
+  const measurementKeys = Object.keys(receipt.measurements || {}).sort();
+  const requiredMeasurements = [...railContract.requiredMeasurements].sort();
+  if (!sameCanonical(measurementKeys, requiredMeasurements)) {
+    fail("Cursor receipt measurement set is incomplete");
+  }
+  const minimums = {
+    surfaceRuns: 6,
+    catalogRuns: 3,
+    toolRuns: 1,
+    imageRuns: 1,
+    parkResumeRuns: 1,
+  };
+  for (const [name, minimum] of Object.entries(minimums)) {
+    if (
+      !Number.isSafeInteger(receipt.measurements[name]) ||
+      receipt.measurements[name] < minimum
+    ) {
+      fail(`Cursor receipt measurement ${name} is below the frozen minimum`);
+    }
+  }
+  if (!sameCanonical(receipt.decisions, expectedDecisions())) {
+    fail("Cursor receipt recovery decisions are incomplete");
+  }
+  if (
+    !sameCanonical(
+      Object.keys(receipt.decisions).sort(),
+      [...railContract.requiredDecisions].sort(),
+    ) ||
+    receipt.decoyRequests?.otherRail !== 0 ||
+    receipt.decoyRequests?.otherAccount !== 0 ||
+    receipt.decoyRequests?.otherProvider !== 0 ||
+    receipt.decoyRequests?.otherShare !== 0 ||
+    Object.keys(receipt.decoyRequests || {}).length !== 4 ||
+    receipt.sensitiveScan?.status !== "pass" ||
+    receipt.sensitiveScan?.matches !== 0 ||
+    Object.keys(receipt.sensitiveScan || {}).length !== 2
+  ) {
+    fail("Cursor receipt did not prove fixed binding and secret safety");
   }
 }
 
 async function main() {
-  const scope = await validateControlPlane();
+  const targetCommit = gitCommit();
+  const account = await validateAccount();
+  const binding = await validateBinding(account);
   await validateCatalog();
-  const scopeDigest = digest("cc-switch-server:cursor-real-scope:v1", {
+  const scopeDigest = digest("cc-switch-server:cursor-real-scope:v2", {
     rail,
+    targetCommit,
+    harnessRevision: HARNESS_REVISION,
     app,
     providerId,
+    providerRevision: binding.providerRevision,
+    runtimeFingerprint: binding.runtimeFingerprint,
     shareId,
-    accountSelector: rail === "oauth" ? accountSelector : null,
-    fastModel,
-    ...scope,
+    shareRevision: binding.shareRevision,
+    accountId: account?.id ?? null,
+    authIdentityGeneration: binding.authIdentityGeneration ?? null,
+    tokenRefreshGeneration: binding.tokenRefreshGeneration ?? null,
+    credentialGeneration: binding.credentialGeneration ?? null,
+    model,
   });
   let receipt;
   try {
     receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
   } catch {
-    fail("CURSOR_REAL_RECEIPT_FILE is not valid JSON");
+    fail("Cursor receipt file is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest);
+  validateReceipt(receipt, scopeDigest, targetCommit, account, binding);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(
@@ -348,7 +641,4 @@ async function main() {
   );
 }
 
-main().catch(() => {
-  console.error("[FAIL] Cursor acceptance failed (details redacted)");
-  process.exitCode = 1;
-});
+main().catch(reportFailure);

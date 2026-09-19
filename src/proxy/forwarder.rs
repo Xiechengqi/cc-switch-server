@@ -75,7 +75,6 @@ use super::anthropic_semantics::{
 use super::claude_oauth::ClaudeBodyRetryStage;
 #[cfg(test)]
 use super::claude_quota_headers::parse_anthropic_reset_header;
-use super::cursor;
 use super::deepseek;
 use super::execution::context::{
     AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CacheSnapshotOwnership,
@@ -108,7 +107,7 @@ use super::providers::claude::{
     RateLimitDecision as ClaudeRateLimitDecision, RateLimitEvidence as ClaudeRateLimitEvidence,
     RateLimitScope as ClaudeRateLimitScope,
 };
-use super::providers::{antigravity, claude, codex};
+use super::providers::{antigravity, claude, codex, cursor};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
@@ -2144,20 +2143,18 @@ async fn forward_with_attempt(
         )?;
         let started = Instant::now();
         if execution.driver_is("special.cursor") && cursor::agentservice_driver_requested(&stored) {
-            let adapter_request = adapters::cursor_agentservice_request(
-                body,
+            let prepared = cursor::prepare_agentservice_request(
+                &execution,
                 &stored,
                 route,
                 gemini_path.as_deref(),
+                body,
             )?;
-            let mut adapter_request = adapter_request;
-            execution.enforce_model_policy(&mut adapter_request)?;
-            let cursor_model = cursor::apply_agentservice_model_selection(&mut adapter_request)?;
             ensure_share_model_available(
                 &state,
                 &execution,
                 request_context.share_id.as_deref(),
-                Some(&cursor_model.model_id),
+                Some(&prepared.model_id),
             )
             .await?;
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
@@ -2167,16 +2164,14 @@ async fn forward_with_attempt(
                 state,
                 route,
                 stored,
-                adapter_request,
+                adapter_request: prepared.adapter_request,
                 request_context,
                 account_in_flight_guard,
                 share_invocation_guard,
                 runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
-                timeouts: cursor::h2_client::CursorH2Timeouts {
-                    request: execution.request_timeout(),
-                    first_frame: execution.stream_first_byte_timeout(),
-                    inter_frame: execution.stream_idle_timeout(),
-                },
+                request_timeout: execution.request_timeout(),
+                first_frame_timeout: execution.stream_first_byte_timeout(),
+                inter_frame_timeout: execution.stream_idle_timeout(),
             })
             .await;
         }

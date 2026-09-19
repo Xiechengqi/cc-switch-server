@@ -178,6 +178,10 @@ credential.
 | `GEMINI_OAUTH_TEST_ACCOUNT` | Gemini OAuth/CLI 测试账号 | 记录脱敏 email |
 | `GROK_OAUTH_TEST_ACCOUNT` | Grok/xAI OAuth 测试账号 | 记录脱敏 email |
 | `CURSOR_OAUTH_TEST_ACCOUNT` | Cursor OAuth 测试账号 | 记录脱敏 email |
+| `CC_SWITCH_CURSOR_REAL_RAIL` | 单次 Cursor 验收 rail：`oauth` 或 `api_key` | 可完整记录 |
+| `CC_SWITCH_CURSOR_<RAIL>_{PROVIDER,SHARE}_ID` | 当前 Cursor rail 的显式固定 Provider/Share 绑定；`<RAIL>` 为 `OAUTH` 或 `API_KEY` | receipt 只记录 binding/scope digest |
+| `CC_SWITCH_CURSOR_<RAIL>_MODEL` | 当前 rail fresh catalog 中的精确完整 `*-fast` 模型 ID | 可完整记录 |
+| `CURSOR_OAUTH_REAL_RECEIPT_FILE` / `CURSOR_API_KEY_REAL_RECEIPT_FILE` | 对应 rail 的私有 schema-v2 receipt 仓库外绝对路径，真实模式权限必须为 `0600` | 只记录路径类别，不提交文件 |
 | `CC_SWITCH_ANTIGRAVITY_REAL_RAIL` | 单次 Antigravity 验收 rail：`antigravity_oauth` 或 `agy_oauth` | 可完整记录 |
 | `ANTIGRAVITY_OAUTH_TEST_ACCOUNT` | `antigravity_oauth` 测试账号 selector | receipt 只记录绑定摘要 |
 | `AGY_OAUTH_TEST_ACCOUNT` | `agy_oauth` 测试账号 selector；不得复用 Antigravity Account | receipt 只记录绑定摘要 |

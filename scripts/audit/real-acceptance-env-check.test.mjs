@@ -77,6 +77,15 @@ function runEnvCheck(overrides) {
       CC_SWITCH_CODEX_WS_PREWARM_SHARE_ID: "",
       CC_SWITCH_CODEX_WS_PREWARM_MODEL: "",
       CODEX_WS_PREWARM_REAL_RECEIPT_FILE: "",
+      CURSOR_OAUTH_TEST_ACCOUNT: "",
+      CC_SWITCH_CURSOR_OAUTH_PROVIDER_ID: "",
+      CC_SWITCH_CURSOR_OAUTH_SHARE_ID: "",
+      CC_SWITCH_CURSOR_OAUTH_MODEL: "",
+      CURSOR_OAUTH_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CURSOR_API_KEY_PROVIDER_ID: "",
+      CC_SWITCH_CURSOR_API_KEY_SHARE_ID: "",
+      CC_SWITCH_CURSOR_API_KEY_MODEL: "",
+      CURSOR_API_KEY_REAL_RECEIPT_FILE: "",
       GITHUB_COPILOT_TEST_ACCOUNT: "",
       CC_SWITCH_COPILOT_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_COPILOT_CODEX_PROVIDER_ID: "",
@@ -234,6 +243,38 @@ test("Codex operation receipts remain independently gated", () => {
   assert.equal(websocket.checks.codexGptImage25GateStatus, "blocked-inputs");
   assert.equal(websocket.checks.codexWsPrewarmGateStatus, "inputs-ready");
   assert.equal(websocket.longTailInputsPresent.codexWsPrewarmReceiptFile, true);
+});
+
+test("Cursor OAuth and API-key receipt inputs remain independently gated", () => {
+  const common = {
+    STAGE: "AB7",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://cursor-share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+  };
+  const oauth = runEnvCheck({
+    ...common,
+    CURSOR_OAUTH_TEST_ACCOUNT: "cursor-oauth-account",
+    CC_SWITCH_CURSOR_OAUTH_PROVIDER_ID: "cursor-oauth-provider",
+    CC_SWITCH_CURSOR_OAUTH_SHARE_ID: "cursor-oauth-share",
+    CC_SWITCH_CURSOR_OAUTH_MODEL: "composer-2.5-fast",
+    CURSOR_OAUTH_REAL_RECEIPT_FILE: "/tmp/cursor-oauth.json",
+  });
+  assert.equal(oauth.checks.cursorOauthGateStatus, "inputs-ready");
+  assert.equal(oauth.checks.cursorApiKeyGateStatus, "blocked-inputs");
+  assert.equal(oauth.longTailInputsPresent.cursorOauthReceiptFile, true);
+
+  const apiKey = runEnvCheck({
+    ...common,
+    CC_SWITCH_CURSOR_API_KEY_PROVIDER_ID: "cursor-api-key-provider",
+    CC_SWITCH_CURSOR_API_KEY_SHARE_ID: "cursor-api-key-share",
+    CC_SWITCH_CURSOR_API_KEY_MODEL: "composer-2.5-fast",
+    CURSOR_API_KEY_REAL_RECEIPT_FILE: "/tmp/cursor-api-key.json",
+  });
+  assert.equal(apiKey.checks.cursorOauthGateStatus, "blocked-inputs");
+  assert.equal(apiKey.checks.cursorApiKeyGateStatus, "inputs-ready");
+  assert.equal(apiKey.longTailInputsPresent.cursorApiKeyReceiptFile, true);
 });
 
 test("Copilot external gate requires one account, control plane, Share, and three Provider IDs", () => {

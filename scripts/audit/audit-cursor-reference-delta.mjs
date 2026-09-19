@@ -157,6 +157,33 @@ for (const id of ["CUR-01", "CUR-03"]) {
 }
 assert(capabilities.get("CUR-02")?.status === "live_pending", "CUR-02 must remain live_pending");
 
+const lifecycle = contract.providerLifecycle;
+assert(
+  lifecycle?.id === "CORE-N1" &&
+    lifecycle.status === "fixture_verified" &&
+    lifecycle.wireChanged === false &&
+    lifecycle.boundary?.includes("binding, lease, Share, attempt, terminal, and usage ownership remain unchanged"),
+  "Cursor Provider lifecycle boundary changed",
+);
+safeRelative(lifecycle.path, "Cursor Provider lifecycle path");
+const lifecycleSource = fs.readFileSync(path.join(repoRoot, lifecycle.path), "utf8");
+for (const anchor of lifecycle.anchors ?? []) {
+  assert(lifecycleSource.includes(anchor), `Cursor lifecycle is missing ${anchor}`);
+}
+const forwarderSource = fs.readFileSync(path.join(repoRoot, "src/proxy/forwarder.rs"), "utf8");
+assert(
+  forwarderSource.includes("cursor::prepare_agentservice_request") &&
+    forwarderSource.includes("cursor::forward_agentservice") &&
+    !forwarderSource.includes("cursor::h2_client::CursorH2Timeouts"),
+  "Cursor shared-forwarder lifecycle facade drifted",
+);
+assert(
+  fs
+    .readFileSync(path.join(repoRoot, "src/proxy/providers/mod.rs"), "utf8")
+    .includes("mod cursor;"),
+  "Cursor Provider lifecycle module is not registered",
+);
+
 const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
 const drivers = Array.isArray(registry) ? registry : registry.drivers;
 const driver = drivers?.find((candidate) => candidate.driverId === contract.registryTruth.driverId);
@@ -177,14 +204,12 @@ for (const [operation, expected] of Object.entries(contract.registryTruth.confor
 }
 
 const acceptance = contract.realAcceptance;
-assert(acceptance?.receiptSchemaVersion === 1, "Cursor receipt schema version changed");
 assert(
-  Array.isArray(acceptance.requiredChecks) &&
-    acceptance.requiredChecks.length === 16 &&
-    new Set(acceptance.requiredChecks).size === 16,
-  "Cursor acceptance must retain exactly 16 unique checks",
+  acceptance?.receiptSchemaVersion === 2 && acceptance.harnessRevision === 2,
+  "Cursor receipt schema or harness revision changed",
 );
 const expectedChecks = [
+  "bound_account_provider_share",
   "fresh_catalog",
   "authoritative_empty_catalog",
   "transient_stale_catalog",
@@ -199,13 +224,44 @@ const expectedChecks = [
   "image_input",
   "park_resume",
   "same_identity_401",
+  "second_401_terminal",
   "absolute_deadline",
   "identity_generation_drift",
+  "malformed_connect_fail_closed",
+  "terminal_usage",
+  "decoy_zero_requests",
+  "secret_scan",
 ];
-assert(
-  JSON.stringify(acceptance.requiredChecks) === JSON.stringify(expectedChecks),
-  "Cursor acceptance check set or order changed",
-);
+const expectedBodyHashes = [
+  "catalog",
+  "claude_stream",
+  "claude_non_stream",
+  "codex_stream",
+  "codex_non_stream",
+  "gemini_stream",
+  "gemini_non_stream",
+  "declared_tool",
+  "image_input",
+  "park_resume",
+];
+const expectedMeasurements = [
+  "surfaceRuns",
+  "catalogRuns",
+  "toolRuns",
+  "imageRuns",
+  "parkResumeRuns",
+];
+const expectedDecisions = [
+  "sameIdentity401",
+  "second401",
+  "identityGenerationDrift",
+  "crossRailFallback",
+  "crossAccountFallback",
+  "crossProviderFallback",
+  "crossShareFallback",
+  "postCommitReplay",
+  "staleCatalogWireAuthorization",
+];
 assert(Array.isArray(acceptance.rails) && acceptance.rails.length === 2, "Cursor needs two rails");
 const rails = new Map(acceptance.rails.map((rail) => [rail.rail, rail]));
 assert(
@@ -214,7 +270,46 @@ assert(
   "Cursor OAuth/API-key credential ownership changed",
 );
 for (const rail of rails.values()) {
-  assert(rail.status === "live_pending" && rail.receipt === null, `${rail.rail} improperly claims live evidence`);
+  assert(
+    rail.status === "live_pending" && rail.receipt === null,
+    `${rail.rail} improperly claims live evidence`,
+  );
+  assert(
+    JSON.stringify(rail.requiredChecks) === JSON.stringify(expectedChecks) &&
+      new Set(rail.requiredChecks).size === expectedChecks.length,
+    `${rail.rail} acceptance check set or order changed`,
+  );
+  assert(
+    JSON.stringify(rail.requiredBodyHashes) === JSON.stringify(expectedBodyHashes) &&
+      new Set(rail.requiredBodyHashes).size === expectedBodyHashes.length,
+    `${rail.rail} body-hash set changed`,
+  );
+  assert(
+    JSON.stringify(rail.requiredMeasurements) === JSON.stringify(expectedMeasurements) &&
+      new Set(rail.requiredMeasurements).size === expectedMeasurements.length,
+    `${rail.rail} measurement set changed`,
+  );
+  assert(
+    JSON.stringify(rail.requiredDecisions) === JSON.stringify(expectedDecisions) &&
+      new Set(rail.requiredDecisions).size === expectedDecisions.length,
+    `${rail.rail} recovery-decision set changed`,
+  );
+}
+
+const receiptHarness = fs.readFileSync(
+  path.join(repoRoot, "scripts/smoke/cursor-real.mjs"),
+  "utf8",
+);
+for (const boundary of [
+  "HARNESS_REVISION = 2",
+  'targetCommit !== targetCommit',
+  "Cursor receipt file must have mode 0600",
+  'crossRailFallback: "disabled"',
+  'providerType: "cursor_apikey"',
+  'verificationState: "blocked_inputs"',
+  'liveState: "live_pending"',
+]) {
+  assert(receiptHarness.includes(boundary), `Cursor receipt harness lost ${boundary}`);
 }
 
 const fixtures = contract.protobufFixtures;
@@ -247,7 +342,7 @@ assert(
 );
 
 console.log(
-  `cursor reference delta audit ok (${capabilities.size} capabilities, ${acceptance.requiredChecks.length} acceptance checks${
+  `cursor reference delta audit ok (${capabilities.size} capabilities, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

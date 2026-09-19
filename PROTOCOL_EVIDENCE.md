@@ -111,7 +111,9 @@ Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。202
 
 Server 自包含 hex fixture 固定 ServerConfig 和 interaction 的未知字段语义、重复 field 27/URL 失败关闭、Connect frame 任意分片与 partial EOF、成功/错误 terminal envelope、plain EOF 失败关闭，以及 fresh `composer-2.5-fast` 必须保留完整 wire ID。公开模型选择入口已经存在，因此 registry `special.cursor` revision 4 将 discovery 与 forward/test 一并标为 supported/`fixture_verified`；OAuth 返回静态 aliases，API-key 目录保持 exact Provider/runtime/credential scope，成功空目录权威，transient stale 只用于展示。
 
-CUR-02/CUR-N1 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识，receipt 只允许 rail、SHA-256 scope digest、状态、时间和 16 项完整 pass map。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
+CUR-02/CUR-N1 仍是双 rail 真实证据缺口。`scripts/smoke/cursor-real.mjs` 每次固定一个 rail、Provider、Share 和 credential identity，只接受仓库外权限受限的私密 receipt；公开输出不包含这些标识。loopback 测试只产生 `contract_verified`/`live_pending`，OAuth 与 API-key receipt 不得互相推导，恢复也不得切换 rail、Provider 或 Account。
+
+后续 CORE-N1 切片以 `src/proxy/providers/cursor/` 作为共享 forwarder 与既有 `src/proxy/cursor/` 协议实现之间的生命周期 facade，收敛 Cursor adapter、模型选择、native driver dispatch 和 h2 timeout mapping，不改变 endpoint、protobuf、session、wire、attempt、terminal 或 usage。LIVE-N1 同时把 receipt 提升为 schema v2/harness revision 2：OAuth 与 API-key 仍独立，每份私有 receipt 必须绑定当前 target commit、App、Provider/runtime revision、Share revision、精确 credential generation、完整 `*-fast` model、22 项检查、10 份 body hash、5 项测量、固定恢复决策和 decoy/secret scan；真实文件必须在仓库外且权限为 `0600`。当前未提供真实凭据，两条 rail 的 receipt 仍为 `null`、状态保持 `live_pending`。
 
 ## 2026-09-18 Grok reasoning replay/root-union/quality-observation differential freeze
 

@@ -101,39 +101,142 @@
       "productionCodeChanged": false
     }
   ],
-  "realAcceptance": {
-    "receiptSchemaVersion": 1,
-    "scopeDigest": "sha256 lowercase hex over a private canonical scope; raw provider/account/credential values are excluded",
-    "requiredChecks": [
-      "fresh_catalog",
-      "authoritative_empty_catalog",
-      "transient_stale_catalog",
-      "full_fast_model_id",
-      "claude_stream",
-      "claude_non_stream",
-      "codex_stream",
-      "codex_non_stream",
-      "gemini_stream",
-      "gemini_non_stream",
-      "declared_tool",
-      "image_input",
-      "park_resume",
-      "same_identity_401",
-      "absolute_deadline",
-      "identity_generation_drift"
+  "providerLifecycle": {
+    "id": "CORE-N1",
+    "status": "fixture_verified",
+    "path": "src/proxy/providers/cursor/mod.rs",
+    "anchors": [
+      "prepare_agentservice_request",
+      "forward_agentservice",
+      "cursor_provider_facade_keeps_rails_independent_and_fail_closed"
     ],
+    "wireChanged": false,
+    "boundary": "Provider-specific adapter, model selection, native-driver dispatch, and h2 timeout mapping are isolated from the shared forwarder; binding, lease, Share, attempt, terminal, and usage ownership remain unchanged"
+  },
+  "realAcceptance": {
+    "receiptSchemaVersion": 2,
+    "harnessRevision": 2,
+    "scopeDigest": "sha256 lowercase hex over rail, target commit, harness revision, App, one Provider revision/runtime, one Share revision, exact credential generation, and exact selected model; raw identities and credentials are excluded",
     "rails": [
       {
         "rail": "oauth",
         "credentialOwner": "managed_account",
         "status": "live_pending",
-        "receipt": null
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "fresh_catalog",
+          "authoritative_empty_catalog",
+          "transient_stale_catalog",
+          "full_fast_model_id",
+          "claude_stream",
+          "claude_non_stream",
+          "codex_stream",
+          "codex_non_stream",
+          "gemini_stream",
+          "gemini_non_stream",
+          "declared_tool",
+          "image_input",
+          "park_resume",
+          "same_identity_401",
+          "second_401_terminal",
+          "absolute_deadline",
+          "identity_generation_drift",
+          "malformed_connect_fail_closed",
+          "terminal_usage",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "catalog",
+          "claude_stream",
+          "claude_non_stream",
+          "codex_stream",
+          "codex_non_stream",
+          "gemini_stream",
+          "gemini_non_stream",
+          "declared_tool",
+          "image_input",
+          "park_resume"
+        ],
+        "requiredMeasurements": [
+          "surfaceRuns",
+          "catalogRuns",
+          "toolRuns",
+          "imageRuns",
+          "parkResumeRuns"
+        ],
+        "requiredDecisions": [
+          "sameIdentity401",
+          "second401",
+          "identityGenerationDrift",
+          "crossRailFallback",
+          "crossAccountFallback",
+          "crossProviderFallback",
+          "crossShareFallback",
+          "postCommitReplay",
+          "staleCatalogWireAuthorization"
+        ]
       },
       {
         "rail": "api_key",
         "credentialOwner": "provider_static_secret",
         "status": "live_pending",
-        "receipt": null
+        "receipt": null,
+        "requiredChecks": [
+          "bound_account_provider_share",
+          "fresh_catalog",
+          "authoritative_empty_catalog",
+          "transient_stale_catalog",
+          "full_fast_model_id",
+          "claude_stream",
+          "claude_non_stream",
+          "codex_stream",
+          "codex_non_stream",
+          "gemini_stream",
+          "gemini_non_stream",
+          "declared_tool",
+          "image_input",
+          "park_resume",
+          "same_identity_401",
+          "second_401_terminal",
+          "absolute_deadline",
+          "identity_generation_drift",
+          "malformed_connect_fail_closed",
+          "terminal_usage",
+          "decoy_zero_requests",
+          "secret_scan"
+        ],
+        "requiredBodyHashes": [
+          "catalog",
+          "claude_stream",
+          "claude_non_stream",
+          "codex_stream",
+          "codex_non_stream",
+          "gemini_stream",
+          "gemini_non_stream",
+          "declared_tool",
+          "image_input",
+          "park_resume"
+        ],
+        "requiredMeasurements": [
+          "surfaceRuns",
+          "catalogRuns",
+          "toolRuns",
+          "imageRuns",
+          "parkResumeRuns"
+        ],
+        "requiredDecisions": [
+          "sameIdentity401",
+          "second401",
+          "identityGenerationDrift",
+          "crossRailFallback",
+          "crossAccountFallback",
+          "crossProviderFallback",
+          "crossShareFallback",
+          "postCommitReplay",
+          "staleCatalogWireAuthorization"
+        ]
       }
     ]
   },
