@@ -1,6 +1,6 @@
 # Kiro Prompt Cache 本地计量合同
 
-状态：`KI-01`、`KI-02`、`KI-03` 为 `fixture_verified`；`KI-04`、`KI-05` 为 `live_pending`，共享/远端缓存运行时关闭。
+状态：`KI-01`、`KI-02`、`KI-03` 为 `fixture_verified`；CORE-N1 facade 与八路私有 receipt gate 已完成；`KI-04`、`KI-05` 仍为 `live_pending`，共享/远端缓存运行时关闭。
 
 ## 边界
 
@@ -34,11 +34,17 @@
 
 ## KI-04：真实验收
 
-真实 receipt 必须按 auth kind 与 runtime region 分开，至少覆盖 `builder_id`、`idc`、`social`、`api_key` × `us-east-1`、`eu-central-1`。每个 receipt 固定一个 Provider/Share/Account scope digest，执行 Claude/Codex non-stream/stream、auto/explicit/no-cache、5m/1h、四断点、20-block 边界、最新 user、上游 usage 优先与同账号 401；不得保存 token、原始 prompt 或响应正文。当前没有这些输入，全部保持 `live_pending`。
+真实 receipt 必须按 auth kind 与 runtime region 分开，覆盖 `builder_id`、`idc`、`social`、`api_key` × `us-east-1`、`eu-central-1`。每份 receipt 固定当前 target commit、一个 Account auth/token generation、Claude/Codex 两个 Provider revision/runtime、一个 Share revision、签名用户/session、exact model 和两份 fresh catalog；执行 CountTokens 零推理发网、Claude/Codex non-stream/stream、tool namespace、auto/explicit/no-cache、5m/1h、四断点、20-block 边界、最新 user、上游 usage 优先、401/timeout/throttle/代际漂移、Compact 零发网、decoy 和 secret scan。OAuth kind 只允许同账号首次 401 pre-commit 重放，API Key 401 直接终止。
+
+`scripts/smoke/kiro-real-receipt.mjs` 以 `--auth-kind` 与 `--region` 逐份验证仓库外 `0600` 私有 receipt；`scripts/audit/kiro-real-receipt.test.mjs` 已在 fixture 模式覆盖全部八组及漂移/伪造负例。fixture 只可得到 `contract_verified/live_pending`，不能生成真实通过。当前八份合同 receipt 仍全部为 `null`，全部保持 `live_pending`。
 
 ## KI-05：共享缓存门禁
 
 共享/远端缓存当前 `runtimeEnabled=false`。只有明确的多副本需求、本地 SQLite 不足的运行证据、固定 namespace/version、TLS/secret 管理、短 timeout、熔断和本地降级设计全部完成后，才能另行评审。参考项目的 Redis、singleflight、session affinity、账号调度和命中驱动路由均未迁入；任何未来 remote hit 也不得改变固定 Account binding。
+
+## CORE-N1：Provider lifecycle facade
+
+`src/proxy/providers/kiro/` 现在承载 Kiro/Amazon Q 产品类型、canonical request/model/session、Account-bound catalog/region/request preparation、本地 CountTokens、keepalive、错误分类和 subscription throttle 决策。AWS EventStream/协议转换继续位于 `src/proxy/kiro.rs`；Share/Account lease、usage、terminal、统一 attempt budget 和同账号 401 replay 所有权继续位于共享 forwarder。该拆分不引入账号选择、跨产品共享 credential、额外 attempt 或 wire 变化。
 
 ## 只读来源
 

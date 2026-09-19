@@ -29,6 +29,10 @@ KI-N2 只在带 profileArn 的请求收到 403，或收到正文明确包含 `Im
 
 KI-N3 当前只完成保守门禁：Kiro 与独立 Amazon Q 的 `/responses/compact` 或普通 Responses compaction trigger 在模型目录、凭据刷新和推理发网前稳定拒绝，decoy fixture 请求数为零。参考项目的 remote compaction 仅证明值得后续差分研究，不能替代本产品的绑定账号真实 receipt；`runtimeEnabled=false`、`live_pending` 和空 receipt 保持不变。
 
+CORE-N1 已将 Kiro/Amazon Q 产品类型、canonical request/model/session、Account-bound catalog/region/request preparation、本地 CountTokens、keepalive、stream error 和 subscription throttle 决策收敛到 `src/proxy/providers/kiro/`。共享 forwarder 继续拥有 Share/Account lease、usage、terminal、统一 attempt budget 和同账号 401 replay；AWS EventStream codec 与协议转换仍在 `src/proxy/kiro.rs`。专项 Rust fixture 覆盖三 Surface、CountTokens 零推理发网、产品隔离、Compact gate、401 once-only、CRC/截断/timeout 与 lease 释放，拆分没有增加新 attempt 或 fallback。
+
+LIVE-N1 私有 validator 将 Kiro 拆成 `builder_id`、`idc`、`social`、`api_key` × `us-east-1`、`eu-central-1` 八个独立 receipt。每份绑定当前 target commit、Account auth/token generation、Claude/Codex Provider revision/runtime、Share revision、签名用户/session、exact model 和两份 fresh catalog，并要求 CountTokens、两 Surface stream/non-stream、tool namespace、Prompt Cache、401/throttle/timeout/drift、Compact 与 shared-cache 关闭、decoy 和 secret scan 证据。receipt 必须在仓库外且真实模式为 `0600`；fixture 模式八组已验证 validator，但只能输出 `contract_verified/live_pending`。当前八份 receipt 仍为 `null`，KI-N3 Compact 与 KI-05 shared cache 均不会因 harness 自动启用。
+
 ## 2026-09-18 Codex bootstrap, metadata, WebSocket fairness, and memory freeze
 
 Codex 增量证据追加在 `assets/contract/codex-reference-delta.json`，保留原有 CX-01～CX-06 历史合同。只读来源为 `CLIProxyAPI@cb73cd99` 的空 bootstrap announcement、`CLIProxyAPI@b5ba02c2` 的大帧写入公平性、`codex2api@dc47d131` 的 input-item metadata 层级和 `codex2api@19ee8db4` 的请求生命周期内存预算；完整 commit、文件路径与提交态 SHA-256 可由 `node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时均不读取外部 checkout。

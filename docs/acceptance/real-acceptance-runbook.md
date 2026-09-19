@@ -233,6 +233,11 @@ credential.
 | `KIRO_REGION` | Kiro device flow region，默认 `us-east-1` | 可完整记录 |
 | `KIRO_START_URL` | Kiro/AWS SSO start URL | 可完整记录 |
 | `KIRO_REFRESH_TOKEN_FIXTURE` | Kiro 已导入 refresh token fixture | 不记录明文 |
+| `CC_SWITCH_KIRO_SIGNED_USER` / `CC_SWITCH_KIRO_SESSION_ID` | 八个 Kiro receipt 共用的签名用户与 bounded session scope | receipt 仅记录各自 SHA-256 scope digest |
+| `KIRO_<AUTH>_<REGION>_TEST_ACCOUNT` | `<AUTH>` 为 `BUILDER_ID` / `IDC` / `SOCIAL` / `API_KEY`，`<REGION>` 为 `US_EAST_1` / `EU_CENTRAL_1`；八个 scope 独立选择 Account | 只记录 generation 与不可逆 scope digest |
+| `CC_SWITCH_KIRO_<AUTH>_<REGION>_{CLAUDE,CODEX}_PROVIDER_ID` | 对应 scope 中固定绑定同一 Account generation 的两个 Provider | 只记录 binding digest |
+| `CC_SWITCH_KIRO_<AUTH>_<REGION>_{SHARE_ID,MODEL}` | 对应 scope 的固定 Share 与两个 fresh catalog 中的 exact model | Share 只记录 binding digest；model 可完整记录 |
+| `KIRO_<AUTH>_<REGION>_REAL_RECEIPT_FILE` | 对应 scope 的仓库外私有 receipt 绝对路径 | 文件权限必须为 `0600`，不提交 |
 | `AMAZON_Q_TEST_ACCOUNT` | Amazon Q Developer Builder ID/IdC 测试账号；不能填写 Kiro Account | 记录脱敏 email/账号名 |
 | `AMAZON_Q_REFRESH_TOKEN_FIXTURE` | Amazon Q SSO OIDC refresh token fixture；不能复用 Kiro token | 不记录明文、prefix、长度或 digest |
 | `CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID` | 显式绑定待测 Amazon Q Account 的 Claude Provider ID | 只记录是否存在 |
@@ -343,6 +348,17 @@ Grok OAuth 单账号专项补充：
 15. 检查 `/metrics` 中 Provider outcome、forward retry、WS fallback、CLI version gate、model catalog、账号 in-flight/max、warm refresh 和 persistence degraded 指标；labels 和 evidence 只含有界分类、Provider id、模型和脱敏账号，不得包含 access/refresh/ID token 或 raw OAuth/upstream body。
 16. 以 `inference`、`media`、`remote_compaction` 三个 operation 分别运行 `grok-real-receipt.mjs`。每份仓库外 `0600` receipt 必须绑定当前 target commit、同一固定 OAuth Account auth/token generation、Provider revision/runtime、Share revision、签名用户、精确 model/session/turn 和 fresh catalog，并完整提供该 operation 的 checks、body hashes、measurements、恢复决策、零 decoy 请求与 secret scan。fixture 只能得到 `contract_verified/live_pending`；任一 operation 成功不能外推另外两个。remote compaction receipt 也不得自动修改 `runtimeEnabled=false`，启用前仍需独立安全设计评审。
 
+Kiro auth kind × region 专项补充：
+
+1. Builder ID、IdC、Social、API Key 必须分别在 `us-east-1` 与 `eu-central-1` 运行，共八个互不替代的 scope。每次只设置该 scope 的 Account、Claude/Codex Provider、Share、exact model 和 receipt path；另七组即使已通过，也不能提升当前组。
+2. 两个 Provider 必须都是 `kiro_oauth` / `special.kiro` / `ready`，显式绑定同一 Account 的当前 `authIdentityGeneration`。OAuth 类 Account 必须只有可刷新的 access/refresh credential presence；API Key Account 必须是非刷新 `API_KEY`。Amazon Q Account、另一 auth kind、另一 region、另一 Account/Provider/Share 和 pool router 均作为 decoy，真实请求计数必须为零。
+3. Claude 与 Codex 分别读取带显式 `app` + `providerId` 的 fresh catalog；exact model 必须各出现一次，`stale=false` 且 `fetchedAtMs` 有效。成功空目录、身份漂移和认证/坏合同不得用静态目录、另一 auth kind/region 或另一 Account 补齐；仅同身份 transient failure 可按既有 bounded stale 合同处理。
+4. 每个 scope 独立覆盖本地 CountTokens 零推理发网、Claude/Codex stream/non-stream terminal+usage、唯一裸 namespaced tool 恢复与歧义 fail-closed、Prompt Cache 三种模式/TTL/边界/最新用户 guardrail，以及上游 usage 对本地估算的优先级。
+5. OAuth 类首次 401 只可在下游提交前刷新并重放原 Account 一次；第二次 401、代际/region/profile 漂移、首帧/idle timeout 和 post-commit failure 均终止。API Key 401 不刷新。subscription throttle 只作用于固定 Account，不能授权跨账号、Provider、auth kind 或 region fallback。
+6. Compact 必须继续在推理发网前失败且 decoy 为零；receipt 成功不修改 `KI-N3.runtimeEnabled=false`。多副本 shared cache 同样保持 `KI-05.runtimeEnabled=false`，不得因单副本 cache 命中或 receipt 自动引入 Redis、affinity 或账号路由。
+7. 私有 receipt 必须绑定当前完整 target commit、harness revision、auth kind/region、Account auth/token generation、两个 Provider revision/runtime、Share revision、签名用户/session digest、exact model 和两份 fresh catalog，并提供合同规定的 checks、body hashes、measurements、恢复决策、decoy 零计数和 secret scan。receipt 只能位于仓库外且真实模式权限为 `0600`；禁止保存 token/API Key、profile ARN、邮箱、prompt、tool 参数、EventStream、完整错误体或 raw body。
+8. 执行示例：`RUN_REAL=1 node scripts/smoke/kiro-real-receipt.mjs --auth-kind builder_id --region us-east-1`。缺任一输入时输出 `blocked_inputs/live_pending`；本地 `node --test scripts/audit/kiro-real-receipt.test.mjs` 的八组 PASS 只证明 validator fail-closed，不能替代真实厂商验收。
+
 Qoder 三条单账号 rail 专项补充：
 
 1. Global Device OAuth、Global PAT、CN Device OAuth 必须分三次独立运行，`CC_SWITCH_QODER_REAL_RAIL` 分别设为 `global_oauth`、`global_pat`、`cn_oauth`。每次只配置该 rail 的 Account selector 和 Claude/Codex/Gemini 三个 Provider ID；三个 Provider 必须为 `special.qoder_cosy` / `ready`，固定同一 `qoder_cosy` Account 和同一 `authIdentityGeneration`。另一账号、另一 rail、另一 site 与 decoy Provider 不得参与。
@@ -426,7 +442,7 @@ Claude OAuth 专项补充：
 26. `max_5x_plan` 与 `max_20x_plan` 都强制调用 `quota?refresh=true&force=true`，要求分别得到 `claude_max_5x` / `claude_max_20x`、`stale=false`、`conflict=false` 且 observedAt 在 freshness window 内。`fable_5_1` 额外要求精确模型 `claude-fable-5-1` 和 fresh Max 20x projection。20x 本地 fixture 与 5x 同形解析规则都不能代替厂商证据；实时证据冲突、缓存计划、通用 Max 或模型 fallback 一律失败关闭。
 27. receipt 只允许保存 operation、当前提交、harness revision、UTC 时间、精确 model、检查结果、脱敏 body hash、generation/revision、canonical plan projection、恢复决策、decoy 请求计数和 secret scan 结果。不得保存 Account/email、Authorization/Cookie/token、CAQS/opaque reasoning、prompt、原始 header、完整 profile/bootstrap/roles/usage/body 或错误正文。fixture harness 只能得到 `contract_verified/live_pending`；缺少任一输入时 readiness 必须为 `blocked_inputs`，不得写 `live_verified`。
 
-Grok 的 inference/media/remote-compaction 三个 receipt 和 normal-path probe、Amazon Q 的真实输入都作为彼此独立的 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
+Grok 的 inference/media/remote-compaction 三个 receipt 和 normal-path probe、Kiro 的八个 auth-kind/region receipt、Amazon Q 的真实输入都作为彼此独立的 external gate 接入环境检查：缺失时不阻断本地 release readiness，也绝不能宣称真实通过。Cursor/Copilot/Kiro/Bedrock 的真实验收变量继续由 AB7 gate 管理；Amazon Q 虽也在 AB7 展示，但其 gate、Account、token、Provider 与 Kiro 完全独立。所有变量齐备都只代表可以开始真实验收；non-stream、stream、usage、错误路径全绿前，不得提升 native capability。Router 内建 Share Market entitlement 的真实验收属于 Router/Share 集成边界，server 只验证 pending share edit 的签名、幂等应用、只读 managed grant 和 ack；详见 [`router-market-acceptance.md`](router-share-acceptance.md)。
 
 ## 脱敏 Evidence
 

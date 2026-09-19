@@ -106,7 +106,9 @@ use super::providers::claude::{
     RateLimitDecision as ClaudeRateLimitDecision, RateLimitEvidence as ClaudeRateLimitEvidence,
     RateLimitScope as ClaudeRateLimitScope,
 };
-use super::providers::{antigravity, claude, codex, cursor, grok as grok_provider};
+use super::providers::{
+    antigravity, claude, codex, cursor, grok as grok_provider, kiro as kiro_provider,
+};
 use super::request_governance::{
     content_encoding_value, decode_request_body_for_proxy_with_limit,
     decode_response_body_for_proxy, decode_response_body_for_proxy_with_limit,
@@ -284,41 +286,6 @@ fn responses_keepalive_surface(route: ProxyRoute) -> &'static str {
         ProxyRoute::CodexChatCompletions => "chat_completions",
         ProxyRoute::ClaudeMessages => "anthropic_messages",
         ProxyRoute::ClaudeCountTokens | ProxyRoute::Gemini => "other",
-    }
-}
-
-fn kiro_text_keepalive_interval(execution: &ProviderExecution) -> Option<Duration> {
-    let configured = execution
-        .plan
-        .driver_options
-        .get("kiroKeepaliveIntervalMs")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            std::env::var("CC_SWITCH_KIRO_KEEPALIVE_MS")
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(25_000);
-    if configured == 0 {
-        None
-    } else {
-        #[cfg(test)]
-        let interval = configured;
-        #[cfg(not(test))]
-        let interval = configured.clamp(5_000, 60_000);
-        Some(Duration::from_millis(interval))
-    }
-}
-
-fn kiro_downstream_keepalive_frame(route: ProxyRoute) -> Bytes {
-    match route {
-        ProxyRoute::ClaudeMessages => {
-            Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
-        }
-        ProxyRoute::CodexChatCompletions
-        | ProxyRoute::CodexResponses
-        | ProxyRoute::CodexResponsesCompact => Bytes::from_static(b": keepalive\n\n"),
-        ProxyRoute::ClaudeCountTokens | ProxyRoute::Gemini => Bytes::new(),
     }
 }
 
@@ -2126,7 +2093,7 @@ async fn forward_with_attempt(
             route,
             &body,
         )?;
-        kiro::enforce_disabled_compaction_contract(stored.provider_type, route, &body)?;
+        kiro_provider::enforce_disabled_compaction_contract(stored.provider_type, route, &body)?;
         let codex_request_intent = if execution.driver_is("oauth.openai_codex") {
             super::codex_request_policy::extract_intent_from_bytes(&body)
         } else {
@@ -15801,38 +15768,8 @@ async fn maybe_mark_upstream_rate_limited(
     share_id: Option<&str>,
     model: Option<&str>,
 ) {
-    if matches!(
-        execution.stored.provider_type,
-        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
-    ) {
-        if let Some(class) = kiro::classify_throttle(status, body) {
-            if class != kiro::KiroThrottleClass::OrdinaryOverload {
-                let Some((provider_type, account_id, auth_identity_generation)) =
-                    execution.managed_account_identity_target()
-                else {
-                    return;
-                };
-                let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-                let fallback = now.saturating_add(
-                    i64::try_from(kiro::throttle_default_cooldown(class).as_millis())
-                        .unwrap_or(i64::MAX),
-                );
-                let until = super::grok::retry_after_until_ms(headers, now).unwrap_or(fallback);
-                let until = super::bounded_upstream_rate_limit_until(now, until);
-                state
-                    .mark_account_rate_limited_until_if_current(
-                        account_id,
-                        provider_type,
-                        auth_identity_generation,
-                        until,
-                        Some(format!(
-                            "CodeWhisperer subscription throttle classified as {class:?}"
-                        )),
-                    )
-                    .await;
-                return;
-            }
-        }
+    if kiro_provider::handle_subscription_throttle(state, execution, status, headers, body).await {
+        return;
     }
     if status != StatusCode::TOO_MANY_REQUESTS {
         return;
@@ -19998,65 +19935,31 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         share_invocation_guard,
         started,
     } = options;
-    let expected_provider_type = stored.provider_type;
-    if !matches!(
-        expected_provider_type,
-        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
-    ) {
-        return Err(ProxyError::bad_request(
-            "CodeWhisperer driver requires kiro_oauth or amazon_q_oauth Provider",
-        ));
-    }
-    let product_label = if expected_provider_type == ProviderType::AmazonQOAuth {
-        "Amazon Q"
-    } else {
-        "Kiro"
-    };
+    let product = kiro_provider::product_boundary(&stored)?;
+    let expected_provider_type = product.provider_type;
     let mut audit_attempt = ForwardAttemptContext::default();
-    let adapter = adapters::adapter_for(route.app(), stored.provider_type);
-    let copilot_metadata = adapters::CopilotRequestMetadata {
-        has_anthropic_beta: headers.contains_key("anthropic-beta"),
-        session_id: request_context.session_id.clone(),
-    };
-    let mut runtime_request = adapter.transform_request_for_route_with_metadata(
-        body,
+    let mut request_context = request_context;
+    let canonical = kiro_provider::prepare_canonical_request(
+        &execution,
         &stored,
         route,
         gemini_path.as_deref(),
-        &copilot_metadata,
+        &headers,
+        body,
+        &mut request_context,
     )?;
-    execution.enforce_model_policy(&mut runtime_request)?;
-    let request_body: Value = serde_json::from_slice(&runtime_request.body).map_err(|error| {
-        ProxyError::bad_request(format!(
-            "invalid {product_label} canonical request body: {error}"
-        ))
-    })?;
-    let mut request_context = request_context;
-    if request_context.session_id.is_none() {
-        request_context.session_id = Some(kiro::request_scoped_session_id());
-    }
-    let routed_model = request_body
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ProxyError::bad_request("missing model"))?
-        .to_string();
-    let response_model = runtime_request
-        .requested_model
-        .clone()
-        .unwrap_or_else(|| routed_model.clone());
-    let actual_model = kiro::resolve_model(&routed_model).ok_or_else(|| {
-        ProxyError::bad_request(format!(
-            "{product_label} model identifier is invalid: {routed_model}"
-        ))
-    })?;
-    let stream_requested = runtime_request.stream_requested;
+    let kiro_provider::CanonicalRequest {
+        adapter,
+        runtime_request,
+        request_body,
+        routed_model: _,
+        response_model,
+        actual_model,
+        stream_requested,
+        claude_code_tools,
+    } = canonical;
 
-    if route == ProxyRoute::ClaudeCountTokens {
-        let input_tokens = kiro::count_input_tokens(&request_body)?;
-        let response = json!({"input_tokens": input_tokens});
-        let response_bytes = serde_json::to_vec(&response).map_err(ProxyError::bad_gateway)?;
+    if let Some(response_bytes) = kiro_provider::local_count_tokens_body(route, &request_body)? {
         drop(account_in_flight_guard);
         drop(share_invocation_guard);
         let mut response = Response::new(Body::from(response_bytes));
@@ -20072,176 +19975,25 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
     let http_client = forward_http_client(&state, &execution).await?;
-    let ide_version = if expected_provider_type == ProviderType::KiroOAuth {
-        state.kiro_ide_version().await
-    } else {
-        "amazon-q-cli".to_string()
-    };
-    let claude_code_tools = route == ProxyRoute::ClaudeMessages
-        && (headers
-            .get("x-app")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("cli"))
-            || headers.contains_key("x-claude-code-session-id")
-            || headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("claude-code")));
+    let ide_version = kiro_provider::runtime_client_version(&state, expected_provider_type).await;
     let (upstream, prepared, first_frame_deadline) = loop {
         let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
-        execution.materialize_auth(&accounts)?;
-        let account_id = execution
-            .managed_account_target()
-            .filter(|(provider_type, _)| *provider_type == expected_provider_type)
-            .map(|(_, account_id)| account_id)
-            .ok_or_else(|| {
-                ProxyError::bad_request(format!(
-                    "{} managed account binding is required",
-                    expected_provider_type.as_str()
-                ))
-            })?;
-        let expected_auth_identity_generation = match &execution.plan.auth_ref {
-            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
-                account_id: bound_account_id,
-                expected_provider_type: bound_provider_type,
-                auth_identity_generation,
-            } if bound_account_id == account_id
-                && *bound_provider_type == expected_provider_type =>
-            {
-                *auth_identity_generation
-            }
-            _ => {
-                return Err(ProxyError::conflict(format!(
-                    "{product_label} runtime account binding changed before model discovery"
-                )))
-            }
-        };
-        let account = accounts
-            .find_for_provider(expected_provider_type, Some(account_id))
-            .cloned()
-            .ok_or_else(|| {
-                ProxyError::not_found(format!(
-                    "{} managed account not found",
-                    expected_provider_type.as_str()
-                ))
-            })?;
-        let replay_allowed = account
-            .refresh_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty());
-        #[cfg(test)]
-        let models_endpoint_override = execution
-            .plan
-            .driver_options
-            .get(if expected_provider_type == ProviderType::AmazonQOAuth {
-                "testAmazonQModelsUrl"
-            } else {
-                "testKiroModelsUrl"
-            })
-            .and_then(Value::as_str);
-        #[cfg(not(test))]
-        let models_endpoint_override: Option<&str> = None;
-        #[cfg(test)]
-        let catalog_model = if models_endpoint_override.is_none() {
-            Some((actual_model.clone(), None))
-        } else if expected_provider_type == ProviderType::AmazonQOAuth {
-            state
-                .amazon_q_catalog_model(
-                    stored.app,
-                    &stored.provider.id,
-                    execution.plan.provider_revision,
-                    &execution.plan.runtime_fingerprint,
-                    account_id,
-                    expected_auth_identity_generation,
-                    &actual_model,
-                    models_endpoint_override,
-                    execution.request_timeout(),
-                )
-                .await
-        } else {
-            state
-                .kiro_catalog_model(
-                    stored.app,
-                    &stored.provider.id,
-                    execution.plan.provider_revision,
-                    &execution.plan.runtime_fingerprint,
-                    account_id,
-                    expected_auth_identity_generation,
-                    &actual_model,
-                    models_endpoint_override,
-                    execution.request_timeout(),
-                )
-                .await
-        };
-        #[cfg(not(test))]
-        let catalog_model = if expected_provider_type == ProviderType::AmazonQOAuth {
-            state
-                .amazon_q_catalog_model(
-                    stored.app,
-                    &stored.provider.id,
-                    execution.plan.provider_revision,
-                    &execution.plan.runtime_fingerprint,
-                    account_id,
-                    expected_auth_identity_generation,
-                    &actual_model,
-                    models_endpoint_override,
-                    execution.request_timeout(),
-                )
-                .await
-        } else {
-            state
-                .kiro_catalog_model(
-                    stored.app,
-                    &stored.provider.id,
-                    execution.plan.provider_revision,
-                    &execution.plan.runtime_fingerprint,
-                    account_id,
-                    expected_auth_identity_generation,
-                    &actual_model,
-                    models_endpoint_override,
-                    execution.request_timeout(),
-                )
-                .await
-        };
-        let (catalog_model_id, catalog_max_input_tokens) = catalog_model.ok_or_else(|| {
-            ProxyError::bad_request(format!(
-                "{product_label} model is not available to the bound account: {actual_model}"
-            ))
-        })?;
-        let cache_session = request_context
-            .session_id
-            .as_deref()
-            .expect("Kiro request session identity is always resolved");
-        let cache_runtime_region = kiro::KiroAccountData::from_account(&account)?.api_region;
-        let cache_route = format!("{route:?}");
-        let cache_namespace = super::kiro_prompt_cache::PromptCacheScope {
-            app: stored.app.as_str(),
-            provider_id: &stored.provider.id,
-            provider_revision: execution.plan.provider_revision,
-            runtime_fingerprint: &execution.plan.runtime_fingerprint,
-            account_id: &account.id,
-            auth_identity_generation: account.auth_identity_generation,
-            token_refresh_generation: account.token_refresh_generation,
-            share_id: request_context.share_id.as_deref().unwrap_or("direct"),
-            signed_user: request_context.user_email.as_deref().unwrap_or("anonymous"),
-            route: &cache_route,
-            runtime_region: &cache_runtime_region,
-            session: cache_session,
-        }
-        .namespace();
-        let call_context = kiro::KiroCallContext {
-            ide_version: ide_version.clone(),
+        let bound = kiro_provider::prepare_bound_request(
+            &state,
+            &execution,
+            &stored,
+            &accounts,
+            route,
+            &request_context,
+            &request_body,
+            &actual_model,
+            &ide_version,
             claude_code_tools,
-            cache_namespace,
-            catalog_model_id: Some(catalog_model_id),
-            catalog_max_input_tokens,
-            session_id: Some(cache_session.to_string()),
-        };
-        let mut prepared =
-            kiro::prepare_kiro_request_with_context(&account, &request_body, &call_context)?;
-        if let Some(base_url) = kiro_api_base_override(&stored) {
-            prepared.url = kiro_url_with_base_override(&base_url, &prepared.url)?;
-        }
+        )
+        .await?;
+        let replay_allowed = bound.replay_allowed;
+        let _bound_account_id = bound.account_id;
+        let prepared = bound.prepared;
         let serialized_body = serde_json::to_vec(&prepared.body)
             .map(Bytes::from)
             .map_err(|error| ProxyError::bad_request(format!("encode Kiro request: {error}")))?;
@@ -20396,7 +20148,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             first_frame_deadline,
             idle_timeout: execution.stream_idle_timeout(),
             context_window: prepared.context_window,
-            keepalive_interval: kiro_text_keepalive_interval(&execution),
+            keepalive_interval: kiro_provider::text_keepalive_interval(&execution),
         })
         .await;
     }
@@ -20434,7 +20186,7 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
             },
         )
         .await;
-        if kiro::is_client_validation_error(&bytes) {
+        if kiro_provider::is_client_validation_error(&bytes) {
             tracing::warn!(
                 provider_id = %stored.provider.id,
                 status_code,
@@ -20664,7 +20416,7 @@ async fn forward_claude_kiro_stream(
                         if let Some(keepalive) = downstream_keepalive.as_mut() {
                             keepalive.emitted(now);
                         }
-                        let frame = kiro_downstream_keepalive_frame(route);
+                        let frame = kiro_provider::downstream_keepalive_frame(route);
                         if !frame.is_empty() {
                             yield Ok::<Bytes, std::io::Error>(frame);
                         }
@@ -20680,7 +20432,7 @@ async fn forward_claude_kiro_stream(
             let canonical_chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let failure_status = kiro_stream_failure_status(&error);
+                    let failure_status = kiro_provider::stream_failure_status(&error);
                     let usage_result = std::mem::take(&mut interrupt_guard.usage)
                         .finish_with_status();
                     let usage = usage_result.usage;
@@ -20866,17 +20618,6 @@ async fn forward_claude_kiro_stream(
     Ok(response)
 }
 
-fn kiro_stream_failure_status(error: &std::io::Error) -> StatusCode {
-    if error
-        .to_string()
-        .starts_with("[KIRO_EVENT_STREAM_TIMEOUT] ")
-    {
-        StatusCode::GATEWAY_TIMEOUT
-    } else {
-        StatusCode::BAD_GATEWAY
-    }
-}
-
 struct ShareStreamInterruptGuard {
     armed: bool,
     state: ServerState,
@@ -20947,52 +20688,6 @@ fn routed_model_metadata(
         actual_model: Some(actual_model.to_string()),
         actual_model_source: Some(policy_source.unwrap_or(fallback_source).to_string()),
     }
-}
-
-fn kiro_api_base_override(stored: &StoredProvider) -> Option<String> {
-    #[cfg(test)]
-    {
-        if stored.provider_type == ProviderType::AmazonQOAuth {
-            setting(
-                &stored.provider,
-                &["AMAZON_Q_API_BASE_URL", "AMAZON_Q_BASE_URL"],
-            )
-        } else {
-            setting(
-                &stored.provider,
-                &[
-                    "KIRO_API_BASE_URL",
-                    "KIRO_BASE_URL",
-                    "CODEWHISPERER_BASE_URL",
-                ],
-            )
-        }
-    }
-    #[cfg(not(test))]
-    {
-        let _ = stored;
-        None
-    }
-}
-
-fn kiro_url_with_base_override(base_url: &str, prepared_url: &str) -> Result<String, ProxyError> {
-    let prepared = url::Url::parse(prepared_url)
-        .map_err(|error| ProxyError::bad_gateway(format!("invalid prepared Kiro URL: {error}")))?;
-    let mut base = url::Url::parse(base_url)
-        .map_err(|error| ProxyError::bad_request(format!("invalid Kiro API base URL: {error}")))?;
-    let base_path = base.path().trim_end_matches('/');
-    let prepared_path = prepared.path().trim_start_matches('/');
-    let path = if base_path.is_empty() {
-        format!("/{prepared_path}")
-    } else if prepared_path.is_empty() {
-        format!("{base_path}/")
-    } else {
-        format!("{base_path}/{prepared_path}")
-    };
-    base.set_path(&path);
-    base.set_query(prepared.query());
-    base.set_fragment(None);
-    Ok(base.to_string())
 }
 
 enum AccountInFlightAcquire {
@@ -26747,7 +26442,8 @@ mod tests {
         )
         .unwrap();
         let url =
-            kiro_url_with_base_override("http://127.0.0.1:43123/proxy", &prepared.url).unwrap();
+            kiro_provider::url_with_base_override("http://127.0.0.1:43123/proxy", &prepared.url)
+                .unwrap();
         let target_headers = prepared
             .headers
             .iter()
@@ -40154,14 +39850,16 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     #[test]
     fn kiro_keepalive_frames_match_each_downstream_surface() {
         assert_eq!(
-            kiro_downstream_keepalive_frame(ProxyRoute::ClaudeMessages),
+            kiro_provider::downstream_keepalive_frame(ProxyRoute::ClaudeMessages),
             Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
         );
         assert_eq!(
-            kiro_downstream_keepalive_frame(ProxyRoute::CodexResponses),
+            kiro_provider::downstream_keepalive_frame(ProxyRoute::CodexResponses),
             Bytes::from_static(b": keepalive\n\n")
         );
-        assert!(kiro_downstream_keepalive_frame(ProxyRoute::ClaudeCountTokens).is_empty());
+        assert!(
+            kiro_provider::downstream_keepalive_frame(ProxyRoute::ClaudeCountTokens).is_empty()
+        );
     }
 
     #[test]

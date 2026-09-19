@@ -11,6 +11,45 @@ const envCheckScript = path.join(
   "scripts/smoke/real-acceptance-env-check.sh",
 );
 
+function kiroPrefix(authKind, region) {
+  return `${authKind}_${region}`.replaceAll("-", "_").toUpperCase();
+}
+
+function clearedKiroMatrixEnv() {
+  const cleared = {
+    CC_SWITCH_KIRO_SIGNED_USER: "",
+    CC_SWITCH_KIRO_SESSION_ID: "",
+  };
+  for (const authKind of ["builder_id", "idc", "social", "api_key"]) {
+    for (const region of ["us-east-1", "eu-central-1"]) {
+      const prefix = kiroPrefix(authKind, region);
+      for (const name of [
+        `KIRO_${prefix}_TEST_ACCOUNT`,
+        `CC_SWITCH_KIRO_${prefix}_CLAUDE_PROVIDER_ID`,
+        `CC_SWITCH_KIRO_${prefix}_CODEX_PROVIDER_ID`,
+        `CC_SWITCH_KIRO_${prefix}_SHARE_ID`,
+        `CC_SWITCH_KIRO_${prefix}_MODEL`,
+        `KIRO_${prefix}_REAL_RECEIPT_FILE`,
+      ]) {
+        cleared[name] = "";
+      }
+    }
+  }
+  return cleared;
+}
+
+function kiroScopeEnv(authKind, region) {
+  const prefix = kiroPrefix(authKind, region);
+  return {
+    [`KIRO_${prefix}_TEST_ACCOUNT`]: `kiro-${authKind}-${region}-account`,
+    [`CC_SWITCH_KIRO_${prefix}_CLAUDE_PROVIDER_ID`]: `kiro-${authKind}-${region}-claude`,
+    [`CC_SWITCH_KIRO_${prefix}_CODEX_PROVIDER_ID`]: `kiro-${authKind}-${region}-codex`,
+    [`CC_SWITCH_KIRO_${prefix}_SHARE_ID`]: `kiro-${authKind}-${region}-share`,
+    [`CC_SWITCH_KIRO_${prefix}_MODEL`]: "claude-sonnet-4-5",
+    [`KIRO_${prefix}_REAL_RECEIPT_FILE`]: `/tmp/kiro-${authKind}-${region}.json`,
+  };
+}
+
 function runEnvCheck(overrides) {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "cc-switch-real-env-check-"),
@@ -120,6 +159,7 @@ function runEnvCheck(overrides) {
       AMAZON_Q_TEST_ACCOUNT: "",
       CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID: "",
       CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID: "",
+      ...clearedKiroMatrixEnv(),
       CC_SWITCH_SERVER_TOKEN: "",
       SERVER_URL: "",
       ...overrides,
@@ -215,6 +255,58 @@ test("Grok inference, media, and compaction receipts remain independently gated"
   assert.equal(mediaAndCompaction.checks.grokRemoteCompactionGateStatus, "inputs-ready");
   assert.equal(mediaAndCompaction.longTailInputsPresent.grokMediaReceiptFile, true);
   assert.equal(mediaAndCompaction.longTailInputsPresent.grokCompactionReceiptFile, true);
+});
+
+test("Kiro auth-kind and region receipt gates remain independently scoped", () => {
+  const common = {
+    STAGE: "AB7",
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    CC_SWITCH_KIRO_SIGNED_USER: "signed-user@example.test",
+    CC_SWITCH_KIRO_SESSION_ID: "kiro-session",
+  };
+  const builderUsEast = runEnvCheck({
+    ...common,
+    ...kiroScopeEnv("builder_id", "us-east-1"),
+  });
+  assert.equal(
+    builderUsEast.checks.kiroBuilderIdUsEast1GateStatus,
+    "inputs-ready",
+  );
+  assert.equal(
+    builderUsEast.checks.kiroBuilderIdEuCentral1GateStatus,
+    "blocked-inputs",
+  );
+  assert.equal(builderUsEast.checks.kiroIdcUsEast1GateStatus, "blocked-inputs");
+  assert.equal(builderUsEast.checks.kiroSocialUsEast1GateStatus, "blocked-inputs");
+  assert.equal(builderUsEast.checks.kiroApiKeyUsEast1GateStatus, "blocked-inputs");
+  assert.equal(
+    builderUsEast.longTailInputsPresent.kiroBuilderIdUsEast1ReceiptFile,
+    true,
+  );
+
+  const apiKeyEuCentral = runEnvCheck({
+    ...common,
+    ...kiroScopeEnv("api_key", "eu-central-1"),
+  });
+  assert.equal(
+    apiKeyEuCentral.checks.kiroApiKeyEuCentral1GateStatus,
+    "inputs-ready",
+  );
+  assert.equal(
+    apiKeyEuCentral.checks.kiroApiKeyUsEast1GateStatus,
+    "blocked-inputs",
+  );
+  assert.equal(
+    apiKeyEuCentral.checks.kiroBuilderIdUsEast1GateStatus,
+    "blocked-inputs",
+  );
+  assert.equal(
+    apiKeyEuCentral.longTailInputsPresent.kiroApiKeyEuCentral1ReceiptFile,
+    true,
+  );
 });
 
 test("Antigravity and Agy external gates require independent bindings and receipts", () => {

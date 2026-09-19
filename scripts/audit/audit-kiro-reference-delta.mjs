@@ -42,6 +42,7 @@ for (const invariant of [
   "no pool",
   "no rotation",
   "no credential-rail fallback",
+  "no cross-region fallback",
   "no cross-account fallback",
   "no cross-Provider fallback",
 ]) {
@@ -238,8 +239,42 @@ assert(
 const acceptance = contract.realAcceptance;
 assert(acceptance?.receiptSchemaVersion === 1, "Kiro receipt schema version changed");
 assert(
-  acceptance.requiredChecks?.length === 10 && new Set(acceptance.requiredChecks).size === 10,
+  acceptance.harnessRevision === 1,
+  "Kiro receipt harness revision changed",
+);
+assert(
+  acceptance.requiredChecks?.length === 29 &&
+    new Set(acceptance.requiredChecks).size === 29,
   "Kiro real acceptance checks changed",
+);
+assert(
+  acceptance.requiredBodyHashes?.length === 13 &&
+    new Set(acceptance.requiredBodyHashes).size === 13,
+  "Kiro real acceptance body hashes changed",
+);
+assert(
+  acceptance.requiredMeasurements?.length === 7 &&
+    new Set(acceptance.requiredMeasurements).size === 7,
+  "Kiro real acceptance measurements changed",
+);
+assert(
+  JSON.stringify(acceptance.requiredDecisions) ===
+    JSON.stringify([
+      "sameAccount401",
+      "second401",
+      "identityGenerationDrift",
+      "crossAuthKindFallback",
+      "crossRegionFallback",
+      "crossAccountFallback",
+      "crossProviderFallback",
+      "crossShareFallback",
+      "postCommitReplay",
+      "catalogStale",
+      "compactRuntime",
+      "receiptAutoEnablesCompact",
+      "sharedCacheRuntime",
+    ]),
+  "Kiro real acceptance recovery decisions changed",
 );
 const receipts = acceptance.receipts ?? [];
 assert(receipts.length === 8, "Kiro acceptance must remain split by four auth kinds and two regions");
@@ -260,6 +295,12 @@ for (const receipt of receipts) {
     receipt.status === "live_pending" && receipt.receipt === null,
     `${receipt.authKind}/${receipt.region} improperly claims live evidence`,
   );
+}
+for (const localPath of [
+  "scripts/smoke/kiro-real-receipt.mjs",
+  "scripts/audit/kiro-real-receipt.test.mjs",
+]) {
+  assert(fs.existsSync(path.join(repoRoot, localPath)), `Kiro acceptance harness is missing ${localPath}`);
 }
 
 const shared = contract.sharedCacheGate;

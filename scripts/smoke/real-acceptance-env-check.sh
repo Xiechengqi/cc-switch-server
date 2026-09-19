@@ -55,6 +55,43 @@ gate_status() {
   printf '%s' "inputs-ready"
 }
 
+kiro_scope_prefix() {
+  local auth_kind="$1"
+  local region="$2"
+  printf '%s_%s' "${auth_kind^^}" "${region^^}" | tr '-' '_'
+}
+
+kiro_gate_status() {
+  local prefix
+  prefix="$(kiro_scope_prefix "$1" "$2")"
+  gate_status \
+    SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN \
+    CC_SWITCH_KIRO_SIGNED_USER CC_SWITCH_KIRO_SESSION_ID \
+    "KIRO_${prefix}_TEST_ACCOUNT" \
+    "CC_SWITCH_KIRO_${prefix}_CLAUDE_PROVIDER_ID" \
+    "CC_SWITCH_KIRO_${prefix}_CODEX_PROVIDER_ID" \
+    "CC_SWITCH_KIRO_${prefix}_SHARE_ID" \
+    "CC_SWITCH_KIRO_${prefix}_MODEL" \
+    "KIRO_${prefix}_REAL_RECEIPT_FILE"
+}
+
+check_kiro_receipt_scope() {
+  local auth_kind="$1"
+  local region="$2"
+  local prefix
+  prefix="$(kiro_scope_prefix "$auth_kind" "$region")"
+  check_external_group \
+    "AB7 Kiro ${auth_kind}/${region} receipt" \
+    SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN \
+    CC_SWITCH_KIRO_SIGNED_USER CC_SWITCH_KIRO_SESSION_ID \
+    "KIRO_${prefix}_TEST_ACCOUNT" \
+    "CC_SWITCH_KIRO_${prefix}_CLAUDE_PROVIDER_ID" \
+    "CC_SWITCH_KIRO_${prefix}_CODEX_PROVIDER_ID" \
+    "CC_SWITCH_KIRO_${prefix}_SHARE_ID" \
+    "CC_SWITCH_KIRO_${prefix}_MODEL" \
+    "KIRO_${prefix}_REAL_RECEIPT_FILE"
+}
+
 join_missing() {
   local missing=("$@")
   local output=""
@@ -299,6 +336,16 @@ if should_run "AB7"; then
   echo "[INFO] Run node scripts/smoke/copilot-real.mjs; input readiness is not live acceptance."
   check_group "AB7 Kiro device flow account" KIRO_TEST_ACCOUNT KIRO_REGION KIRO_START_URL
   check_optional KIRO_REFRESH_TOKEN_FIXTURE
+  echo "== AB7 Kiro auth-kind/region private receipt gates =="
+  check_kiro_receipt_scope builder_id us-east-1
+  check_kiro_receipt_scope builder_id eu-central-1
+  check_kiro_receipt_scope idc us-east-1
+  check_kiro_receipt_scope idc eu-central-1
+  check_kiro_receipt_scope social us-east-1
+  check_kiro_receipt_scope social eu-central-1
+  check_kiro_receipt_scope api_key us-east-1
+  check_kiro_receipt_scope api_key eu-central-1
+  echo "[INFO] Run node scripts/smoke/kiro-real-receipt.mjs once per auth kind and region; input readiness is not live acceptance."
   check_external_group "AB7 Amazon Q bound-account two-surface smoke" AMAZON_Q_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_AMAZON_Q_CLAUDE_PROVIDER_ID CC_SWITCH_AMAZON_Q_CODEX_PROVIDER_ID
   check_optional AMAZON_Q_REFRESH_TOKEN_FIXTURE
   check_optional CC_SWITCH_AMAZON_Q_MODEL
@@ -340,6 +387,14 @@ if [[ -n "$EVIDENCE_FILE" ]]; then
   AGY_OAUTH_GATE_STATUS="$(gate_status AGY_OAUTH_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_AGY_OAUTH_SHARE_ID CC_SWITCH_AGY_OAUTH_CLAUDE_PROVIDER_ID CC_SWITCH_AGY_OAUTH_GEMINI_PROVIDER_ID CC_SWITCH_AGY_OAUTH_CLAUDE_MODEL CC_SWITCH_AGY_OAUTH_GEMINI_MODEL AGY_OAUTH_REAL_RECEIPT_FILE)" \
   CURSOR_OAUTH_GATE_STATUS="$(gate_status CURSOR_OAUTH_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_CURSOR_OAUTH_PROVIDER_ID CC_SWITCH_CURSOR_OAUTH_SHARE_ID CC_SWITCH_CURSOR_OAUTH_MODEL CURSOR_OAUTH_REAL_RECEIPT_FILE)" \
   CURSOR_API_KEY_GATE_STATUS="$(gate_status SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_CURSOR_API_KEY_PROVIDER_ID CC_SWITCH_CURSOR_API_KEY_SHARE_ID CC_SWITCH_CURSOR_API_KEY_MODEL CURSOR_API_KEY_REAL_RECEIPT_FILE)" \
+  KIRO_BUILDER_ID_US_EAST_1_GATE_STATUS="$(kiro_gate_status builder_id us-east-1)" \
+  KIRO_BUILDER_ID_EU_CENTRAL_1_GATE_STATUS="$(kiro_gate_status builder_id eu-central-1)" \
+  KIRO_IDC_US_EAST_1_GATE_STATUS="$(kiro_gate_status idc us-east-1)" \
+  KIRO_IDC_EU_CENTRAL_1_GATE_STATUS="$(kiro_gate_status idc eu-central-1)" \
+  KIRO_SOCIAL_US_EAST_1_GATE_STATUS="$(kiro_gate_status social us-east-1)" \
+  KIRO_SOCIAL_EU_CENTRAL_1_GATE_STATUS="$(kiro_gate_status social eu-central-1)" \
+  KIRO_API_KEY_US_EAST_1_GATE_STATUS="$(kiro_gate_status api_key us-east-1)" \
+  KIRO_API_KEY_EU_CENTRAL_1_GATE_STATUS="$(kiro_gate_status api_key eu-central-1)" \
   QODER_GLOBAL_OAUTH_GATE_STATUS="$(gate_status QODER_GLOBAL_OAUTH_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_QODER_GLOBAL_OAUTH_CLAUDE_PROVIDER_ID CC_SWITCH_QODER_GLOBAL_OAUTH_CODEX_PROVIDER_ID CC_SWITCH_QODER_GLOBAL_OAUTH_GEMINI_PROVIDER_ID)" \
   QODER_GLOBAL_PAT_GATE_STATUS="$(gate_status QODER_GLOBAL_PAT_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_QODER_GLOBAL_PAT_CLAUDE_PROVIDER_ID CC_SWITCH_QODER_GLOBAL_PAT_CODEX_PROVIDER_ID CC_SWITCH_QODER_GLOBAL_PAT_GEMINI_PROVIDER_ID)" \
   QODER_CN_OAUTH_GATE_STATUS="$(gate_status QODER_CN_OAUTH_TEST_ACCOUNT SERVER_URL CC_SWITCH_SERVER_TOKEN CC_SWITCH_SHARE_URL ROUTER_API_TOKEN CC_SWITCH_QODER_CN_OAUTH_CLAUDE_PROVIDER_ID CC_SWITCH_QODER_CN_OAUTH_CODEX_PROVIDER_ID CC_SWITCH_QODER_CN_OAUTH_GEMINI_PROVIDER_ID)" \
