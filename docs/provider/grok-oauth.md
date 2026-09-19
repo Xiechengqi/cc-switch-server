@@ -116,6 +116,8 @@ CORE-N1 将上述 scope 派生、cache snapshot ownership、CAS 清理/提交以
 
 本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理、媒体与 remote compaction receipt 必须分别留证，缺少任一真实 receipt 时对应 operation 保持 `live_pending`。
 
+EVID-N1 已把 Grok reference delta 迁为 append-only schema v2。原 schema-v1 文件及十个历史字段由 `269850a` committed object、文件 SHA-256 和 canonical digest 固定；两个 source snapshot 分别绑定干净的 grok2api 提交态与排除 6 项本地修改的 sub2api 提交态。10 条不可变 observation 将 GR-01～05、GR-N1、CORE-N1、LIVE-N1、GR-R1 绑定到 source/target committed object；默认审计不读取外部仓库，只有显式 `--check-sources` 才复核外部 Git object。sub2api 的账号池/轮换、商业路由/计价和 soft quota gate 仅作为 reject evidence，不构成运行时能力。
+
 ## 脱敏质量观测
 
 GR-N1 在 Grok Responses 的 HTTP JSON、SSE 和原生 WebSocket rail 上记录只读响应形状。指标 `cc_switch_grok_quality_observations_total` 只包含固定的 transport/outcome、terminal/tool/visible 布尔值和 `0`、`1_7`、`8_31`、`32_127`、`128_plus` 长度桶；outcome 限于 `empty`、`tool_only`、`short_text`、`text`、`text_and_tool`、`reasoning_only`、`anomalous_dump`。观察器不保存或输出正文、reasoning、token 比例、模型、Provider/Account/Share/用户身份或 prompt。

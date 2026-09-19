@@ -1,6 +1,6 @@
 {
   "format": "cc-switch-grok-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "capturedAt": "2026-09-18T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
@@ -376,5 +376,659 @@
       "cross_account_cache",
       "sub2api_pool_or_routing"
     ]
-  }
+  },
+  "legacySchemaVersion": 1,
+  "updatedAt": "2026-09-19T00:00:00Z",
+  "observationPolicy": {
+    "history": "append_only; every schema v1 content field is immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "sourceDigest": "canonical sha256 over sourceId, deltaId, commit, tree and the ordered frozen file records",
+    "externalVerification": "optional explicit --check-sources only; never a build, test, release or runtime dependency"
+  },
+  "legacyV1": {
+    "path": "assets/contract/grok-reference-delta.json",
+    "targetCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+    "targetTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+    "fileSha256": "54bba90fa332c416e53fc0c3d9408250eea6141c8403102429d4d20bc83f0214",
+    "canonicalDigest": "1124873f44cd8e95cc87a313def458e9b36626e08056e73ad1bc9f4602e63bcf",
+    "fields": [
+      "format",
+      "schemaVersion",
+      "capturedAt",
+      "policy",
+      "sources",
+      "capabilities",
+      "enhancements",
+      "fixtureAcceptance",
+      "realAcceptance",
+      "remoteCompactionGate"
+    ],
+    "fieldDigests": {
+      "format": "9ce335d18ba34555693112f0a3300813dcda138f99d42e3cd9910d059bac3fb0",
+      "schemaVersion": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "capturedAt": "18aca4884d737a6e7c2c3ee61b8abd0b8d19239c34d2385637cd99769060390e",
+      "policy": "c843dc172f0acce4e48bff6a9537cd98b20a34306f03262fceaf28acd619e34c",
+      "sources": "d590a8003f351752c3ebefd8e5f328a3ab3e99580ad47e216c646cb7ce714069",
+      "capabilities": "94a0b094f2486f13a5ed66b75f29c0d049f277fe46efbeb0bf577172dea8ebae",
+      "enhancements": "963dda3db088061184e45d154fb8d0fc3fbc0be83cf19edd2857d430643e2a38",
+      "fixtureAcceptance": "8d924bfc37329368e827c7cf2207d92843b347348f78461cf8ef621a9d7d1b9d",
+      "realAcceptance": "2713eeb4ca4ad85c1c18926bdc1b4766ee589117bc0720f62d04dcccb9b070f0",
+      "remoteCompactionGate": "9e7087b4e5d97678c10dc6439430197782b895f18099fd139bc33b816e8d5106"
+    }
+  },
+  "sourceExtensions": [
+    {
+      "id": "sub2api",
+      "rootEnv": "CC_SWITCH_GROK_SUB2API_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/sub2api",
+      "commit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+      "files": [
+        {
+          "path": "backend/internal/service/grok_free_quota_gate.go",
+          "sha256": "1c2122f0d2a79d7fd53e4e3ba2cf6c7e585abfc04682ca4c6ebcf5f052f70769"
+        },
+        {
+          "path": "backend/internal/service/gateway_account_selection_test.go",
+          "sha256": "13680f0bfbb2e6fda63b2e09257e12a863e07c75e28b418da6bb87292dd10457"
+        },
+        {
+          "path": "backend/internal/service/composite_route_resolver.go",
+          "sha256": "3b4df94ac4d8b02a8299a53640ba299d22086ed39779fdfce079075761783118"
+        },
+        {
+          "path": "backend/internal/pkg/xai/billing.go",
+          "sha256": "78307ff2ff958ace7e5d36d17190102dafabbf8369385ce7358bceee6a4c2241"
+        }
+      ]
+    }
+  ],
+  "sourceSnapshots": [
+    {
+      "id": "grok2api-2026-09-19",
+      "sourceId": "grok2api",
+      "repository": "grok2api",
+      "headCommit": "906b9493b099d192381c698d4e320fafeccb851c",
+      "headTree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "excludedWorktreeEntries": 0,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "sub2api-2026-09-19",
+      "sourceId": "sub2api",
+      "repository": "sub2api",
+      "headCommit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+      "headTree": "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": 6,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "reviewedRejections": [
+    {
+      "id": "GR-R1",
+      "status": "rejected",
+      "productionCodeChanged": false,
+      "behaviors": [
+        "visible_or_plaintext_ratio_automatic_retry",
+        "account_pool_selection_or_rotation",
+        "commercial_composite_routing_or_billing",
+        "local_soft_quota_gate"
+      ],
+      "boundary": "fixed Provider, Account, Share, user, rail, session and turn; diagnostics cannot authorize retries or routing"
+    }
+  ],
+  "observations": [
+    {
+      "id": "GR-OBS-0001",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "reasoning_capture_replay",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/conversation/reasoning_cache.go",
+          "backend/internal/infra/provider/conversation/reasoning_cache_test.go",
+          "backend/internal/infra/provider/conversation/reasoning_integration_test.go"
+        ],
+        "symbols": [
+          "ReasoningCache",
+          "RememberReasoningForEnvelope",
+          "TestAnthropicParallelToolUsesInjectOneReasoningProof",
+          "TestStreamReasoningReplayCommitsOnlyAfterSuccessfulTerminal"
+        ],
+        "sourceDigest": "c9d2b69849f3b43a116ace8c36a49bc3dd59b7498c41fc97f026176ea270881a"
+      },
+      "disposition": "adopt",
+      "enhancementIds": [
+        "GR-01"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/grok_replay.rs",
+            "anchors": [
+              "parallel_calls_restore_one_exact_reasoning_item",
+              "stream_capture_handles_fragmented_crlf_and_raw_websocket_json"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "parallel_calls_restore_one_exact_reasoning_item",
+          "stream_capture_handles_fragmented_crlf_and_raw_websocket_json"
+        ]
+      },
+      "reason": "Adopt only bounded, generation-fenced reasoning capture and exact replay under the already selected Provider, Account, Share, user, session and turn scope."
+    },
+    {
+      "id": "GR-OBS-0002",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "explicit_rejection_and_parallel_tools",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/cli/responses_reasoning_recovery.go",
+          "backend/internal/infra/provider/cli/responses_reasoning_recovery_test.go",
+          "backend/internal/infra/provider/cli/responses_tool_declarations.go",
+          "backend/internal/infra/provider/cli/responses_tools_test.go"
+        ],
+        "symbols": [
+          "recoverReasoningDecodeFailure",
+          "TestRecoverReasoningDecodeFailureRetriesSameUpstreamOnce",
+          "normalizeResponsesTools",
+          "TestNormalizeResponsesRequestSerializesParallelClientToolSearch"
+        ],
+        "sourceDigest": "bc1f602f36d364064784233a7ab2e5fc00d37cf57fef6e61331959e3440755be"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "GR-02"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once",
+              "grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once",
+          "grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit"
+        ]
+      },
+      "reason": "Keep the narrower one-shot explicit-rejection recovery on the same identity and rail, inside one shared budget, for HTTP, SSE and WebSocket; do not inherit multi-stage or plane fallback."
+    },
+    {
+      "id": "GR-OBS-0003",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "build_root_union",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/cli/responses_tool_declarations.go",
+          "backend/internal/infra/provider/cli/responses_tools_test.go"
+        ],
+        "symbols": [
+          "NormalizeBuildFunctionParametersRoot",
+          "rootUnion",
+          "TestNormalizeBuildFunctionParametersRootVariants"
+        ],
+        "sourceDigest": "2aa9e6a7b637c0e938d8d4f7e3d9ff116583d4713861e53e1802738d12163277"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "GR-03"
+      ],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "normalize_grok_build_parameters",
+              "grok_build_root_union_rejects_ambiguous_cycles_and_non_object_roots"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "grok_build_root_union_rejects_ambiguous_cycles_and_non_object_roots"
+        ]
+      },
+      "reason": "Project only provable object-root union leaves after the local sanitizer; ambiguous, cyclic, mixed or non-object roots fail before network access."
+    },
+    {
+      "id": "GR-OBS-0004",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "live_inference_media_gate",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/conversation/reasoning_integration_test.go",
+          "backend/internal/infra/provider/cli/responses_tools_test.go"
+        ],
+        "symbols": [
+          "TestAnthropicParallelToolUsesInjectOneReasoningProof",
+          "TestStreamReasoningReplayCommitsOnlyAfterSuccessfulTerminal",
+          "TestNormalizeResponsesRequestSerializesParallelClientToolSearch"
+        ],
+        "sourceDigest": "3be1d0b877d5e460e15b0a8a36dec1acbdb3a2edbef9e675850bc9c7369e0c78"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "GR-04"
+      ],
+      "target": {
+        "baselineCommit": "429566f5ab944e02a04aa031429ec559a45042f0",
+        "baselineTree": "6a870fd4b9bb144c4ede15e9450a9aa202e5e60b",
+        "implementationCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "implementationTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "contracts": [
+          {
+            "path": "assets/contract/grok-reference-delta.json",
+            "anchors": [
+              "\"operation\": \"inference\"",
+              "\"operation\": \"media\"",
+              "websocket_terminal_usage",
+              "rate_limit_cooldown",
+              "fresh_catalog"
+            ]
+          },
+          {
+            "path": "scripts/audit/grok-real-receipt.test.mjs",
+            "anchors": [
+              "Grok receipt harness validates all three operations independently"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Grok receipt harness validates all three operations independently"
+        ]
+      },
+      "reason": "Reference fixtures cannot prove this Server's OAuth inference, media entitlement, WebSocket, version, cooldown or fresh-catalog behavior; inference and media remain independent live receipts."
+    },
+    {
+      "id": "GR-OBS-0005",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "remote_compaction_gate",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/cli/responses_reasoning_recovery.go",
+          "backend/internal/infra/provider/cli/responses_reasoning_recovery_test.go"
+        ],
+        "symbols": [
+          "hasCompactionInputItem",
+          "TestCompactionBlobDecodeFailureIsReturnedToClient",
+          "TestRecoverReasoningDecodeFailureKeepsLegacyCompactionMarkerWithoutCompactionInput"
+        ],
+        "sourceDigest": "9a8e3f324cf674d12c880af2738ae8d8112bb389de1a89f4f2bf10c51e3a12d2"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "GR-05"
+      ],
+      "target": {
+        "baselineCommit": "429566f5ab944e02a04aa031429ec559a45042f0",
+        "baselineTree": "6a870fd4b9bb144c4ede15e9450a9aa202e5e60b",
+        "implementationCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "implementationTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "contracts": [
+          {
+            "path": "assets/contract/grok-reference-delta.json",
+            "anchors": [
+              "\"operation\": \"remote_compaction\"",
+              "\"runtimeEnabled\": false",
+              "no_web_cookie",
+              "no_cross_account_cache"
+            ]
+          },
+          {
+            "path": "scripts/audit/grok-real-receipt.test.mjs",
+            "anchors": [
+              "Grok receipt harness validates all three operations independently"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Grok receipt harness validates all three operations independently"
+        ]
+      },
+      "reason": "Remote compaction remains runtime-disabled; even a future protocol receipt cannot auto-enable it or authorize Web Cookie, cross-account cache, pool or routing behavior."
+    },
+    {
+      "id": "GR-OBS-0006",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "bounded_quality_observation",
+        "commit": "7f3f3d3ce030d5cf946b0bbe994f3026775fa308",
+        "tree": "6699241ceb2af6a5f154e4558be92d2e06285c48",
+        "paths": [
+          "backend/internal/application/gateway/quality_retry.go",
+          "backend/internal/application/gateway/quality_retry_scan.go",
+          "backend/internal/application/gateway/quality_retry_test.go"
+        ],
+        "symbols": [
+          "ClassifyQualityHold",
+          "ObserveQualityChunk",
+          "TestCanReplayQualityHoldAcrossAccounts"
+        ],
+        "sourceDigest": "f2e5bdf8139617a4eaec1002ae64db739daf5ea4f64da104ef9b5b94ec3f452f"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "GR-N1"
+      ],
+      "target": {
+        "baselineCommit": "d80662b82045974057f48e5a1d3c18fe33e592c0",
+        "baselineTree": "6ef2bf19a459c0f528e7ff23f50ae78d030361f3",
+        "implementationCommit": "466291c40bd38118df4f7c70014567af7ce9cd42",
+        "implementationTree": "cce56e8dc2560175a46a10ef88be36591df7e71e",
+        "contracts": [
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "GrokQualityObserver",
+              "quality_observer_classifies_completed_shapes_without_retaining_content",
+              "quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump"
+            ]
+          },
+          {
+            "path": "src/metrics.rs",
+            "anchors": [
+              "cc_switch_grok_quality_observations_total"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "record_grok_quality_observation",
+              "active_grok_quality_observer"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "quality_observer_classifies_completed_shapes_without_retaining_content",
+          "quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump"
+        ]
+      },
+      "reason": "Adopt only bounded content-free shape observation across HTTP, SSE and WebSocket; no plaintext, reasoning, identity, prompt or model value is retained."
+    },
+    {
+      "id": "GR-OBS-0007",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "heuristic_quality_retry_rejected",
+        "commit": "7f3f3d3ce030d5cf946b0bbe994f3026775fa308",
+        "tree": "6699241ceb2af6a5f154e4558be92d2e06285c48",
+        "paths": [
+          "backend/internal/application/gateway/quality_retry.go",
+          "backend/internal/application/gateway/quality_retry_scan.go",
+          "backend/internal/application/gateway/quality_retry_test.go"
+        ],
+        "symbols": [
+          "DecideQualityRetry",
+          "canReplayQualityHoldAcrossAccounts",
+          "TestAttemptLoopQualityHold"
+        ],
+        "sourceDigest": "b2f9ab751526c8e8aa638f20b50429a33c847e25764332c3ed282980855b9018"
+      },
+      "disposition": "reject",
+      "enhancementIds": [
+        "GR-N1"
+      ],
+      "target": {
+        "baselineCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "baselineTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/grok-reference-delta.json",
+            "anchors": [
+              "\"automaticRetry\": false",
+              "\"accountRotation\": false",
+              "\"responseMutation\": false"
+            ]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": [
+              "明确不采纳 visible token 阈值",
+              "不采纳账号池和跨账号 balance failover"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject visible-length, plaintext-ratio, keyword and output-shape driven retry or cross-account replay because legitimate short, tool-only and structured outputs would be misclassified."
+    },
+    {
+      "id": "GR-OBS-0008",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "provider_lifecycle_facade",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/conversation/reasoning_cache.go",
+          "backend/internal/infra/provider/cli/responses_reasoning_recovery.go"
+        ],
+        "symbols": [
+          "ReasoningCache",
+          "recoverReasoningDecodeFailure"
+        ],
+        "sourceDigest": "9e5f188cd2264fd9c78a4935e2d303fca6c21d9bb776875242ed96f01bf81a65"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CORE-N1"
+      ],
+      "target": {
+        "baselineCommit": "429566f5ab944e02a04aa031429ec559a45042f0",
+        "baselineTree": "6a870fd4b9bb144c4ede15e9450a9aa202e5e60b",
+        "implementationCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "implementationTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/grok/mod.rs",
+            "anchors": [
+              "prepare_http_replay",
+              "prepare_transport_replay",
+              "clear_rejected_and_reset",
+              "binding_is_current"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "grok_provider::prepare_http_replay",
+              "grok_provider::ReplayStreamWrite::new",
+              "grok_provider::commit",
+              "grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once",
+              "grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "grok_http_reasoning_replay_captures_parallel_calls_and_recovers_once",
+          "grok_websocket_reasoning_replay_is_parallel_and_recovers_once_precommit"
+        ]
+      },
+      "reason": "Move replay scope, snapshot ownership, CAS reset/commit and binding-generation fences behind the Grok Provider facade without changing wire, binding, attempt budget or commit semantics."
+    },
+    {
+      "id": "GR-OBS-0009",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-19",
+        "repository": "grok2api",
+        "deltaId": "operation_scoped_live_receipts",
+        "commit": "906b9493b099d192381c698d4e320fafeccb851c",
+        "tree": "eca3a45c482375fad636578b28d73c1186d2bef4",
+        "paths": [
+          "backend/internal/infra/provider/conversation/reasoning_integration_test.go",
+          "backend/internal/infra/provider/cli/responses_tools_test.go"
+        ],
+        "symbols": [
+          "TestChatMultiTurnReasoningRestoration",
+          "TestAnthropicParallelToolUsesInjectOneReasoningProof",
+          "TestNormalizeResponsesRequestSerializesParallelClientToolSearch"
+        ],
+        "sourceDigest": "ed50f5715306dbe551004ba2ae25d410b8404f01f91ee6e1473acfc4a92e4b3b"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
+      "target": {
+        "baselineCommit": "429566f5ab944e02a04aa031429ec559a45042f0",
+        "baselineTree": "6a870fd4b9bb144c4ede15e9450a9aa202e5e60b",
+        "implementationCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "implementationTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "contracts": [
+          {
+            "path": "scripts/smoke/grok-real-receipt.mjs",
+            "anchors": [
+              "Grok normal-path probing and acceptance are intentionally separate",
+              "Grok receipt file must stay outside the repository",
+              "Grok receipt file must have mode 0600",
+              "receipt.targetCommit !== targetCommit",
+              "decoyRequests"
+            ]
+          },
+          {
+            "path": "scripts/audit/grok-real-receipt.test.mjs",
+            "anchors": [
+              "Grok receipt harness validates all three operations independently",
+              "Grok receipt harness reports missing operation inputs without promotion",
+              "Grok receipt harness never prints secrets or raw failure bodies"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Grok receipt harness validates all three operations independently",
+          "Grok receipt harness reports missing operation inputs without promotion",
+          "Grok receipt harness never prints secrets or raw failure bodies"
+        ]
+      },
+      "reason": "Require three independent current-commit private receipts bound to exact Provider, Account, Share, user, model, session and turn; missing real inputs keep every operation live_pending."
+    },
+    {
+      "id": "GR-OBS-0010",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "sub2api",
+        "snapshotId": "sub2api-2026-09-19",
+        "repository": "sub2api",
+        "deltaId": "pool_routing_commercial_soft_gate_rejected",
+        "commit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+        "tree": "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a",
+        "paths": [
+          "backend/internal/service/grok_free_quota_gate.go",
+          "backend/internal/service/gateway_account_selection_test.go",
+          "backend/internal/service/composite_route_resolver.go",
+          "backend/internal/pkg/xai/billing.go"
+        ],
+        "symbols": [
+          "resolveGrokFreeQuotaGateSettings",
+          "filterGrokFreeQuotaAccountsCore",
+          "sortAccountsByPriorityAndLastUsed",
+          "filterByMinPriority",
+          "filterByMinLoadRate",
+          "selectByLRU",
+          "CompositeRouteResolver",
+          "Resolve",
+          "matchCompositeRoute",
+          "BuildBillingSummary",
+          "BuildBillingURLWithValidator",
+          "ApplyCLIBillingHeaders"
+        ],
+        "sourceDigest": "38b74a6c77e2c21f73733759d2b12bcb6553f01eec3bf0a75635d6a63dc638a8"
+      },
+      "disposition": "reject",
+      "enhancementIds": [
+        "GR-R1"
+      ],
+      "target": {
+        "baselineCommit": "269850ac6922e763c6429ab1d06b5d69843646c8",
+        "baselineTree": "3a8668ad7af8b6545aad45bf2962b6e57cdffc16",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": [
+              "禁止账号池选择、跨账号轮换、跨 Provider fallback、跨站点 fallback",
+              "不迁入桌面/Tauri、商业计费、Key 分销、签到、运营自动化、账号调度和外部项目 UI"
+            ]
+          },
+          {
+            "path": "docs/provider/grok-oauth.md",
+            "anchors": [
+              "不提供账号池、轮询、权重调度、配额溢出或跨 Provider 故障转移",
+              "不采用 sub2api 的账号池、商业路由或 fallback 逻辑"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject sub2api account selection, priority/load/LRU rotation, composite commercial routing, billing projection and local soft quota gates; they conflict with the fixed binding and authoritative upstream evidence model."
+    }
+  ]
 }
