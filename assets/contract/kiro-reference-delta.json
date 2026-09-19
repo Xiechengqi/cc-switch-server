@@ -1,7 +1,16 @@
 {
   "format": "cc-switch-kiro-reference-delta",
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
+  "updatedAt": "2026-09-19T00:00:00Z",
+  "observationPolicy": {
+    "history": "append_only; every schema v1 content field is immutable",
+    "sourceReadMode": "read_only_committed_git_objects",
+    "targetReadMode": "committed_git_objects",
+    "sourceDigest": "canonical sha256 over sourceId, deltaId, commit, tree and the ordered frozen file records",
+    "externalVerification": "optional explicit --check-sources only; never a build, test, release or runtime dependency"
+  },
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
@@ -75,6 +84,86 @@
           ]
         }
       ]
+    }
+  ],
+  "sourceExtensions": [
+    {
+      "id": "kiro-rs-head",
+      "rootEnv": "CC_SWITCH_KIRO_RS_AUDIT_ROOT",
+      "defaultRelativeRoot": "../proxy/Kiro/kiro.rs",
+      "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+      "previousReviewedCommit": "22d2c2d0695ba350890072c19990f54782827ae5",
+      "files": [
+        {
+          "path": "src/anthropic/cache_metering.rs",
+          "sha256": "f18d4cc2ee73a817359366a45b560c6fa684915422d9131c01ca46e19ab48fd5"
+        },
+        {
+          "path": "src/anthropic/stream.rs",
+          "sha256": "ea907b7180553ff37fd2c39b68f10b873bb29fefdd3c24ebdd4f55df23b47847"
+        },
+        {
+          "path": "src/anthropic/responses.rs",
+          "sha256": "2b0060ddebc6374b65ece1cf4bb7bec0bc96a65a3bd7b5181a15fa2c10016231"
+        },
+        {
+          "path": "src/anthropic/responses_compaction.rs",
+          "sha256": "87b43f627426c72c086d91f91ad3ace3e88465240630cf1b8f7af2a57f608ae1"
+        },
+        {
+          "path": "src/anthropic/handlers.rs",
+          "sha256": "d4b055f09842b315ee3994ccba0aea060974c79c67239cb655dca618e75b062f"
+        },
+        {
+          "path": "src/kiro/token_manager.rs",
+          "sha256": "42fce0977ee8242e74c14e349ce8927e7f4805ae4c52b291b8ba34cea747374e"
+        },
+        {
+          "path": "src/kiro/provider.rs",
+          "sha256": "b2d148d3f39fc1669c0d7a4f899ea77d77fe9edfc15010dc5b1c2edf604dcc82"
+        },
+        {
+          "path": "src/kiro/model/credentials.rs",
+          "sha256": "e02b108cec4309372f78f27be641e34f93d8d5c245224c15a3a2497e043d0197"
+        },
+        {
+          "path": "src/kiro/auth/idc.rs",
+          "sha256": "806083f8b8604a4c9e81b44df5f43aa194439fcdfe04e2496b39ebc609850886"
+        },
+        {
+          "path": "src/kiro/auth/social.rs",
+          "sha256": "6792970de0a16403ca394c7985c838e66c8c41ce104c96bcc70f037ac28f0b62"
+        },
+        {
+          "path": "src/kiro/endpoint/cli.rs",
+          "sha256": "63293a714395b447032a537c05a12a52bca8903c6a3d5b167f026365154a7e9f"
+        },
+        {
+          "path": "src/kiro/endpoint/ide.rs",
+          "sha256": "986ce78b1710d1e678d0c0e12b23e0a9c5c469209e887321bb87db867dc647e4"
+        },
+        {
+          "path": "src/kiro/session_affinity.rs",
+          "sha256": "26dd31b341b3d0480b42e76a0b7b6b3b0303138d2ddefedcf84250e787878bea"
+        },
+        {
+          "path": "src/kiro/parser/decoder.rs",
+          "sha256": "1c66a96f56c189fe967365635d74f17fe09a22a9b7857d625671bdb374a3f676"
+        }
+      ]
+    }
+  ],
+  "sourceSnapshots": [
+    {
+      "id": "kiro-rs-2026-09-19",
+      "sourceId": "kiro-rs-head",
+      "repository": "kiro.rs",
+      "headCommit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+      "headTree": "5e656c1bf70aac0224a68251b2065966db01e933",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "excludedWorktreeEntries": 0,
+      "readMode": "read_only_committed_git_objects"
     }
   ],
   "capabilities": [
@@ -327,5 +416,673 @@
       "cross_account_cache",
       "reference_redis_runtime_dependency"
     ]
+  },
+  "evidenceExtensions": [
+    {
+      "id": "CORE-N1",
+      "status": "fixture_verified",
+      "wireChanged": false,
+      "bindingChanged": false,
+      "attemptBudgetChanged": false,
+      "localEvidence": [
+        {
+          "path": "src/proxy/providers/kiro/mod.rs",
+          "anchors": [
+            "prepare_canonical_request",
+            "prepare_bound_request",
+            "handle_subscription_throttle",
+            "provider_facade_keeps_kiro_and_amazon_q_product_labels_distinct"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "kiro_provider::prepare_canonical_request",
+            "kiro_provider::prepare_bound_request",
+            "kiro_provider::handle_subscription_throttle"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "LIVE-N1",
+      "status": "live_pending",
+      "authKindRegionScoped": true,
+      "receiptCount": 8,
+      "receiptsIndependent": true,
+      "runtimeAutoEnable": false,
+      "localEvidence": [
+        {
+          "path": "scripts/smoke/kiro-real-receipt.mjs",
+          "anchors": [
+            "requiredChecks",
+            "crossAuthKindFallback",
+            "crossRegionFallback",
+            "fixtureMode ? \"contract_verified\" : \"live_verified\""
+          ]
+        },
+        {
+          "path": "scripts/audit/kiro-real-receipt.test.mjs",
+          "anchors": [
+            "all eight Kiro auth-kind and region receipts remain independent",
+            "Kiro fixture receipt can never impersonate live_verified"
+          ]
+        },
+        {
+          "path": "scripts/smoke/real-acceptance-env-check.sh",
+          "anchors": [
+            "check_kiro_receipt_scope builder_id us-east-1",
+            "check_kiro_receipt_scope api_key eu-central-1"
+          ]
+        }
+      ]
+    }
+  ],
+  "reviewedRejections": [
+    {
+      "id": "KI-R1",
+      "status": "rejected",
+      "behaviors": [
+        "account_pool_selection_or_rotation",
+        "cross_auth_kind_or_region_fallback",
+        "cross_account_or_provider_fallback",
+        "broad_profile_arn_or_host_fallback"
+      ],
+      "boundary": "Only the already selected Account may perform one pre-commit credential recovery; profileArn compatibility is limited to the frozen rejection shapes and never authorizes pool, rail, region, Account, Provider or host fallback."
+    },
+    {
+      "id": "KI-R2",
+      "status": "rejected",
+      "behaviors": [
+        "reference_redis_runtime_dependency",
+        "session_affinity_account_selection",
+        "cache_hit_account_routing",
+        "cross_account_shared_cache"
+      ],
+      "boundary": "Reference Redis and session-affinity code is evidence only; local metering cannot change upstream inference, cost, Account binding or routing, and shared cache remains runtime-disabled."
+    },
+    {
+      "id": "KI-R3",
+      "status": "rejected",
+      "behaviors": [
+        "receipt_auto_enables_compaction",
+        "ordinary_inference_as_compaction",
+        "reference_compaction_payload_reuse_without_receipt"
+      ],
+      "boundary": "Remote compaction remains fail-closed before network access; neither reference support nor a fixture or receipt may auto-enable a separate runtime executor."
+    }
+  ],
+  "observations": [
+    {
+      "id": "KI-OBS-0001",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "prompt_cache_breakpoints",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/cache_metering.rs"],
+        "symbols": [
+          "compute_cache_usage",
+          "top_level_auto_caching_advances_and_hits_longest_prefix",
+          "lookback_20_blocks_boundary",
+          "mixed_ttl_independent_expiry_and_renewal"
+        ],
+        "sourceDigest": "7434515e0a47fbb80d1dbbc5c56cfb986dc78b6f918b9777f7913c3eb0200bcf"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["KI-01"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro_prompt_cache.rs",
+            "anchors": [
+              "auto_cache_keeps_latest_user_tail_uncached",
+              "twenty_position_lookback_groups_consecutive_tool_blocks",
+              "mixed_ttl_order_is_enforced",
+              "hit_renews_with_entry_own_ttl"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "auto_cache_keeps_latest_user_tail_uncached",
+          "twenty_position_lookback_groups_consecutive_tool_blocks",
+          "mixed_ttl_order_is_enforced",
+          "hit_renews_with_entry_own_ttl"
+        ]
+      },
+      "reason": "Adopt the bounded breakpoint, lookback, TTL and latest-user semantics as local downstream metering only, under the already fixed request namespace."
+    },
+    {
+      "id": "KI-OBS-0002",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "authoritative_usage_precedence",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": [
+          "src/anthropic/cache_metering.rs",
+          "src/anthropic/handlers.rs",
+          "src/anthropic/stream.rs"
+        ],
+        "symbols": [
+          "CacheUsage",
+          "non_stream_usage_prefers_sanitized_provider_snapshot",
+          "StreamContext"
+        ],
+        "sourceDigest": "d2a63af00ff49b46e1ed5bbbb76b94aa2d951a6a7df50a6d7455d388249516f5"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["KI-02"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro.rs",
+            "anchors": [
+              "kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate",
+              "local_prompt_cache_estimate",
+              "upstream_token_usage"
+            ]
+          }
+        ],
+        "fixtureIds": ["kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate"]
+      },
+      "reason": "Keep authoritative upstream usage, including explicit zero, ahead of local estimates while conserving the final input-token total."
+    },
+    {
+      "id": "KI-OBS-0003",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "cache_persistence_differential",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/cache_metering.rs"],
+        "symbols": ["CacheMeter", "flush_and_reload_round_trip"],
+        "sourceDigest": "267007b1f9b186050a4640cdbde164fbc29f75d132dbe4403b10a5f7aaf3f34b"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["KI-03"],
+      "target": {
+        "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
+        "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
+        "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
+        "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro_prompt_cache.rs",
+            "anchors": [
+              "sqlite_restart_preserves_unexpired_entries_and_legacy_source",
+              "unavailable_disk_never_blocks_or_changes_memory_semantics",
+              "sqlite_generation_cas_rolls_back_conflicting_batch"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "sqlite_restart_preserves_unexpired_entries_and_legacy_source",
+          "unavailable_disk_never_blocks_or_changes_memory_semantics",
+          "sqlite_generation_cas_rolls_back_conflicting_batch"
+        ]
+      },
+      "reason": "Use Server-owned bounded async SQLite persistence and generation CAS rather than copying synchronous JSON or external cache state into the request path."
+    },
+    {
+      "id": "KI-OBS-0004",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "live_cache_cost_gate",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/cache_metering.rs", "src/anthropic/handlers.rs"],
+        "symbols": ["compute_cache_usage", "execute_non_stream_request"],
+        "sourceDigest": "6821123cdbc80d10a7889f840831f80700dd8e0965ff17b511243de68c5296d5"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["KI-04"],
+      "target": {
+        "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
+        "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
+        "implementationCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "implementationTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["prompt_cache_auto_explicit_no_cache", "upstream_usage_precedence"]
+          },
+          {
+            "path": "scripts/audit/kiro-real-receipt.test.mjs",
+            "anchors": ["all eight Kiro auth-kind and region receipts remain independent"]
+          }
+        ],
+        "fixtureIds": ["all eight Kiro auth-kind and region receipts remain independent"]
+      },
+      "reason": "Fixture cache hits cannot prove vendor-side cost or entitlement; every auth-kind and region scope remains independently live-pending."
+    },
+    {
+      "id": "KI-OBS-0005",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "shared_cache_gate",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/cache_metering.rs", "src/kiro/session_affinity.rs"],
+        "symbols": ["RedisCacheStore", "SessionAffinity"],
+        "sourceDigest": "39dc68eb8b6219d99315b1460d219f6b5d8464a552e19768a7681629ab8d9447"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["KI-05"],
+      "target": {
+        "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
+        "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
+        "implementationCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "implementationTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["shared_cache_disabled", "\"runtimeEnabled\": false", "reference_redis_runtime_dependency"]
+          },
+          {
+            "path": "scripts/audit/kiro-real-receipt.test.mjs",
+            "anchors": ["Kiro fixture receipt can never impersonate live_verified"]
+          }
+        ],
+        "fixtureIds": ["Kiro fixture receipt can never impersonate live_verified"]
+      },
+      "reason": "Keep shared cache disabled until a real multi-replica need and independent safety evidence exist; reference Redis and affinity do not establish either."
+    },
+    {
+      "id": "KI-OBS-0006",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "unique_bare_namespaced_tool",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/responses.rs", "src/anthropic/stream.rs"],
+        "symbols": [
+          "resolve_declared_tool",
+          "declared_tool_resolution_prefers_exact_and_rejects_ambiguous_bare_names",
+          "ToolJsonAccumulator"
+        ],
+        "sourceDigest": "70c5ea2251e7583dc54009063901d7f837512adcf14250447200fa1ed780b2b9"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["KI-N1"],
+      "target": {
+        "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "implementationCommit": "d80662b82045974057f48e5a1d3c18fe33e592c0",
+        "implementationTree": "6ef2bf19a459c0f528e7ff23f50ae78d030361f3",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro.rs",
+            "anchors": [
+              "KiroToolNameRegistry",
+              "request_tool_registry_excludes_names_seen_only_in_history",
+              "fragmented_tool_json_uses_request_registry_and_ambiguity_fails_closed"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"]
+          }
+        ],
+        "fixtureIds": [
+          "request_tool_registry_excludes_names_seen_only_in_history",
+          "fragmented_tool_json_uses_request_registry_and_ambiguity_fails_closed",
+          "kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"
+        ]
+      },
+      "reason": "Adopt request-scoped exact-to-unique tool-name recovery and fail closed on ambiguous bare children across every downstream surface."
+    },
+    {
+      "id": "KI-OBS-0007",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "narrow_profile_arn_fallback",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/kiro/token_manager.rs"],
+        "symbols": [
+          "should_retry_usage_api_without_profile_arn",
+          "test_usage_api_profile_arn_error_fallback_only_for_arn_attempt"
+        ],
+        "sourceDigest": "0c03bb48353a422a0847c41d9173d946f78b371c8af8a8f60e88793b55867603"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["KI-N2"],
+      "target": {
+        "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "implementationCommit": "d80662b82045974057f48e5a1d3c18fe33e592c0",
+        "implementationTree": "6ef2bf19a459c0f528e7ff23f50ae78d030361f3",
+        "contracts": [
+          {
+            "path": "src/clients/oauth/kiro_device.rs",
+            "anchors": [
+              "should_retry_usage_without_profile_arn",
+              "usage_profile_fallback_only_accepts_evidenced_profile_rejections"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/kiro_runtime.rs",
+            "anchors": [
+              "profile_arn_compatibility_error",
+              "discovery_retries_profileless_after_evidenced_bad_request_only"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "usage_profile_fallback_only_accepts_evidenced_profile_rejections",
+          "discovery_retries_profileless_after_evidenced_bad_request_only"
+        ]
+      },
+      "reason": "Adopt only the evidenced profileArn rejection shapes on the same Account and host; preserve every other error class as terminal."
+    },
+    {
+      "id": "KI-OBS-0008",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "remote_compaction_gate",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/responses.rs", "src/anthropic/responses_compaction.rs"],
+        "symbols": ["Operation::RemoteCompact", "compaction_trigger must be the final input item", "execute_non_stream_request"],
+        "sourceDigest": "237bfe08b6c03bb6f2d97c6594c082d3997b97ce3744555165695ba41e9e52eb"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["KI-N3"],
+      "target": {
+        "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
+        "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
+        "implementationCommit": "d80662b82045974057f48e5a1d3c18fe33e592c0",
+        "implementationTree": "6ef2bf19a459c0f528e7ff23f50ae78d030361f3",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro.rs",
+            "anchors": ["enforce_disabled_compaction_contract", "compact_contract_is_disabled_for_kiro_and_amazon_q_only"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["kiro_and_amazon_q_compact_fail_before_any_upstream_request"]
+          }
+        ],
+        "fixtureIds": [
+          "compact_contract_is_disabled_for_kiro_and_amazon_q_only",
+          "kiro_and_amazon_q_compact_fail_before_any_upstream_request"
+        ]
+      },
+      "reason": "Reference compaction establishes a differential target, not permission to enable it; Kiro and Amazon Q remain fail-closed before all upstream work."
+    },
+    {
+      "id": "KI-OBS-0009",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "provider_lifecycle_facade",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": [
+          "src/anthropic/handlers.rs",
+          "src/kiro/provider.rs",
+          "src/kiro/parser/decoder.rs"
+        ],
+        "symbols": ["execute_non_stream_request", "KiroProvider", "EventStreamDecoder"],
+        "sourceDigest": "34471000c854d0037fbba4d71dbb2c655874a303ab88c2047e5595a37b383bdd"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CORE-N1"],
+      "target": {
+        "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
+        "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
+        "implementationCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "implementationTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/kiro/mod.rs",
+            "anchors": [
+              "prepare_canonical_request",
+              "prepare_bound_request",
+              "handle_subscription_throttle",
+              "provider_facade_keeps_kiro_and_amazon_q_product_labels_distinct"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["kiro_provider::prepare_canonical_request", "kiro_provider::prepare_bound_request"]
+          }
+        ],
+        "fixtureIds": ["provider_facade_keeps_kiro_and_amazon_q_product_labels_distinct"]
+      },
+      "reason": "Move canonical request, exact Account/catalog preparation and Provider-specific classification behind a facade while keeping Share, lease, usage, terminal and attempt ownership shared."
+    },
+    {
+      "id": "KI-OBS-0010",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "auth_kind_region_receipts",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": [
+          "src/kiro/model/credentials.rs",
+          "src/kiro/auth/idc.rs",
+          "src/kiro/auth/social.rs",
+          "src/kiro/endpoint/cli.rs",
+          "src/kiro/endpoint/ide.rs"
+        ],
+        "symbols": ["CredentialType", "effective_auth_region", "effective_api_region", "register_client", "exchange_code_for_token"],
+        "sourceDigest": "9f54a73f7edbc1bf24a9ab2f9ffcb5a4777b43527ca2f323751522c32c8a7c91"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": ["LIVE-N1"],
+      "target": {
+        "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
+        "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
+        "implementationCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "implementationTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["\"authKind\": \"builder_id\"", "\"authKind\": \"api_key\"", "\"region\": \"eu-central-1\""]
+          },
+          {
+            "path": "scripts/audit/kiro-real-receipt.test.mjs",
+            "anchors": [
+              "all eight Kiro auth-kind and region receipts remain independent",
+              "Kiro receipt rejects cross-region identity and incomplete recovery decisions"
+            ]
+          }
+        ],
+        "fixtureIds": ["all eight Kiro auth-kind and region receipts remain independent"]
+      },
+      "reason": "Require eight independent private receipts for Builder ID, IdC, Social and API Key across two regions; fixture success never upgrades live state."
+    },
+    {
+      "id": "KI-OBS-0011",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "broad_fallback_and_rotation_rejected",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/kiro/token_manager.rs", "src/kiro/provider.rs"],
+        "symbols": ["select_next_credential", "sticky_candidate", "account_rate_limit_with_fallback"],
+        "sourceDigest": "d7b542ec193b4de60046cb76ce758faa0a4b4b451d7166e3eac55831c9dd7e47"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["KI-R1"],
+      "target": {
+        "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["no credential-rail fallback", "no cross-region fallback", "no cross-account fallback", "no cross-Provider fallback"]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["不能换账号", "不扩大 profileArn fallback"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject pool selection, rotation and broad fallback because a Kiro request is fixed to one Provider, Account generation, auth kind and region."
+    },
+    {
+      "id": "KI-OBS-0012",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "cache_affinity_routing_rejected",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": [
+          "src/anthropic/cache_metering.rs",
+          "src/kiro/session_affinity.rs",
+          "src/kiro/token_manager.rs"
+        ],
+        "symbols": ["RedisCacheStore", "SessionAffinity", "select_next_credential"],
+        "sourceDigest": "c66740d9dc36c24d2e4b3675c76263a136186c2059391f6ae6507f91f301d004"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["KI-R2"],
+      "target": {
+        "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["account_affinity", "cache_hit_account_selection", "reference_redis_runtime_dependency"]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["不迁入 Redis/多副本 cache、账号 affinity 或调度"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject Redis, session affinity and cache-driven account routing; local cache observations must never participate in Provider or Account selection."
+    },
+    {
+      "id": "KI-OBS-0013",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "remote_compaction_auto_enable_rejected",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/anthropic/responses.rs", "src/anthropic/responses_compaction.rs"],
+        "symbols": ["Operation::RemoteCompact", "compaction_trigger must be the final input item"],
+        "sourceDigest": "54d4625f1202d198255511bd2d38791a8d3bc97f43fd8a2846ea0a6a0426c800"
+      },
+      "disposition": "reject",
+      "enhancementIds": ["KI-R3"],
+      "target": {
+        "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+        "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "contracts": [
+          {
+            "path": "assets/contract/kiro-reference-delta.json",
+            "anchors": ["receiptAutoEnablesCompact", "\"runtimeEnabled\": false", "zeroUpstreamBeforeReject"]
+          },
+          {
+            "path": "cc-switch-server-enhance.md",
+            "anchors": ["不因参考项目支持就直接启用 remote compaction"]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Reject automatic remote-compaction enablement and ordinary-inference substitution until a separately reviewed executor and real receipt exist."
+    }
+  ],
+  "legacyV1": {
+    "path": "assets/contract/kiro-reference-delta.json",
+    "targetCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
+    "targetTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
+    "fileSha256": "728d5b1b71b00caba869d1f0a518f1fd6e54ab5115afce842e82905e00cb9809",
+    "canonicalDigest": "a05869c3eecc15abb6029e306259ae8c0702b413fac927b7c65bf2e7067a33fc",
+    "fields": [
+      "format",
+      "schemaVersion",
+      "capturedAt",
+      "policy",
+      "sources",
+      "capabilities",
+      "incrementalEnhancements",
+      "fixtureAcceptance",
+      "realAcceptance",
+      "sharedCacheGate"
+    ],
+    "fieldDigests": {
+      "format": "38933a9331dbbee811e770d5729b9b7b1fadbced037ec3922a2821bc85bc932f",
+      "schemaVersion": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "capturedAt": "18aca4884d737a6e7c2c3ee61b8abd0b8d19239c34d2385637cd99769060390e",
+      "policy": "3d0a30b81509f22303649d5fafd02b45703fe4443e01c2dadd45f8b70c151524",
+      "sources": "41a77548c379b6cf6c29afb91e2f16eb200ca6c9a2a50ce6e98e82b4a3a8d1db",
+      "capabilities": "4ebd5407db4517eb8791dc650bcb235d32474b46a07b1ee5ac16ac2d1e81f5b6",
+      "incrementalEnhancements": "5c3e3d1edeceb24c90b59bee586444732a02326bc39d51bfa308d0681609916b",
+      "fixtureAcceptance": "23515fe36c6856ec6e4e1966cab08792d01f2c444837589b2337a0a8a6b4eda0",
+      "realAcceptance": "f07d07a31161ce9517b45a63b813f33cc1d83e3173413e808daeff7987d45884",
+      "sharedCacheGate": "3ab26a5c161d3b1a16daf7fb04c4e1f59b211f053561ad02b434e19b7e72bb45"
+    }
   }
 }

@@ -33,6 +33,8 @@ CORE-N1 已将 Kiro/Amazon Q 产品类型、canonical request/model/session、Ac
 
 LIVE-N1 私有 validator 将 Kiro 拆成 `builder_id`、`idc`、`social`、`api_key` × `us-east-1`、`eu-central-1` 八个独立 receipt。每份绑定当前 target commit、Account auth/token generation、Claude/Codex Provider revision/runtime、Share revision、签名用户/session、exact model 和两份 fresh catalog，并要求 CountTokens、两 Surface stream/non-stream、tool namespace、Prompt Cache、401/throttle/timeout/drift、Compact 与 shared-cache 关闭、decoy 和 secret scan 证据。receipt 必须在仓库外且真实模式为 `0600`；fixture 模式八组已验证 validator，但只能输出 `contract_verified/live_pending`。当前八份 receipt 仍为 `null`，KI-N3 Compact 与 KI-05 shared cache 均不会因 harness 自动启用。
 
+EVID-N1 已将 Kiro reference delta 迁为 append-only schema v2。`1124082` 中原 schema-v1 文件 SHA-256、target commit/tree、全部十个历史字段的 canonical/逐字段 digest 均已冻结；新增干净的 `kiro.rs@be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863` / tree `5e656c1bf70aac0224a68251b2065966db01e933` committed-object snapshot，以及 13 条不可变 observation，覆盖 KI-01～05、KI-N1～N3、CORE-N1、LIVE-N1 和 KI-R1～R3。三条 reject 分别固定跨 Account/auth-kind/region/Provider 或宽 profile/host fallback、Redis/session-affinity/cache 路由，以及无独立执行器和真实证据的 remote-compaction 自动启用。每条 observation 绑定 source commit/tree/path/symbol/digest 与本仓库 committed target object；默认审计不读取外部 checkout，只有显式 `--check-sources` 才复核冻结对象。
+
 ## 2026-09-18 Codex bootstrap, metadata, WebSocket fairness, and memory freeze
 
 Codex 增量证据追加在 `assets/contract/codex-reference-delta.json`，保留原有 CX-01～CX-06 历史合同。只读来源为 `CLIProxyAPI@cb73cd99` 的空 bootstrap announcement、`CLIProxyAPI@b5ba02c2` 的大帧写入公平性、`codex2api@dc47d131` 的 input-item metadata 层级和 `codex2api@19ee8db4` 的请求生命周期内存预算；完整 commit、文件路径与提交态 SHA-256 可由 `node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可选复核。默认审计、构建、测试、发布和运行时均不读取外部 checkout。

@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）与 Grok（`269850a`）的首批 CORE-N1/LIVE-N1 切片及五类 EVID-N1 迁移，其余 Provider 与横切项仍按本文顺序推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）与 Kiro（`1124082`）的首批 CORE-N1/LIVE-N1 切片及六类 EVID-N1 迁移，其余 Provider 与横切项仍按本文顺序推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -39,6 +39,7 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | `069f3ef` | Codex Provider lifecycle 拆分、三个 GPT Image 2.5 variant 与 WS prewarm 的四个私有 receipt gate；付费探针降级为 `probe_only` |
 | `8f72bb9` | Cursor Provider lifecycle facade 与 OAuth/API-key 双 rail schema-v2 私有 receipt gate；无真实输入时保持 `live_pending` |
 | `269850a` | Grok Provider lifecycle 拆分与 inference/media/remote_compaction 三个 operation 的私有 receipt gate；无真实输入时保持 `live_pending` |
+| `1124082` | Kiro Provider lifecycle facade 与四种 auth kind × 两个 region 的八路私有 receipt gate；无真实输入时保持 `live_pending` |
 
 | 类别 | 本轮已关闭 | 仍保持门禁/后续计划 |
 | --- | --- | --- |
@@ -47,11 +48,11 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | Codex | CX-N1～N4 `fixture_verified`；CORE-N1 Provider 切片、CORE-N2 首个 request-memory 切片与 reference-delta v2 已完成 | GPT Image 2.5 三个 exact-model operation 与 WS prewarm 独立 `live_pending` |
 | Cursor | CUR-N2 `reviewed_no_wire_delta`；CORE-N1 Provider facade 与 reference-delta v2 已完成 | CUR-N1 OAuth/API-key 两 rail 独立 `live_pending` |
 | Grok | GR-N1 `fixture_verified`（观察-only）；CORE-N1 Provider lifecycle 与 reference-delta v2 已完成 | GR-N2 inference/media/remote_compaction 三个 operation 独立 `live_pending` |
-| Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture | KI-N3 启用与 auth kind × region receipt `live_pending` |
+| Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture；CORE-N1 Provider facade 与 reference-delta v2 已完成 | KI-N3 启用与 auth kind × region receipt `live_pending`；KI-05 shared cache 继续关闭 |
 | Qoder | QD-N2 `reviewed_no_wire_delta` | QD-N1 三 rail 独立 `live_pending` |
 | CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖 | CB-N4 与 Intl/CN receipt `live_pending`，v4.1 runtime disabled |
 
-CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 已完成 Antigravity、Claude、Codex、Cursor、Grok 五个切片；Kiro、Qoder、CodeBuddy 的结构拆分与 reference delta v2 仍待推进，所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
+CORE-N2 已在 Codex 请求生命周期先行落地；推广到其他大 payload Provider 仍是后续工作。CORE-N1 与 EVID-N1 已完成 Antigravity、Claude、Codex、Cursor、Grok、Kiro 六个切片；Qoder、CodeBuddy 的结构拆分与 reference delta v2 仍待推进，所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁。
 
 ### 0.2 原始优先级摘要
 
@@ -428,6 +429,10 @@ Grok reference delta 已迁为 append-only schema v2：`269850a` 中原 schema-v
 
 不因参考项目支持就直接启用 remote compaction，不迁入 Redis/多副本 cache、账号 affinity 或调度；不扩大 profileArn fallback 来提高表面成功率。
 
+`1124082` 已把 Kiro/Amazon Q 产品边界、canonical request/model/session、Account-bound catalog/region/request preparation、本地 CountTokens、keepalive、stream error 与 subscription throttle 收敛到 `src/proxy/providers/kiro/`；AWS EventStream/wire 转换仍由 `src/proxy/kiro.rs` 持有，Share/Account lease、usage、terminal、共享 attempt budget 与同账号 401 replay 仍由 forwarder 持有。LIVE-N1 同时新增 Builder ID、IdC、Social、API Key × `us-east-1`、`eu-central-1` 八个独立私有 receipt gate，分别绑定当前 target commit、Account auth/token generation、Claude/Codex Provider revision/runtime、Share revision、签名用户/session、exact model、两份 fresh catalog、checks/body hashes/measurements、恢复决策、decoy counters 与 secret scan；真实文件必须位于仓库外且为 `0600`。当前八份 receipt 均为 `null/live_pending`，receipt 不会自动开启 KI-N3 Compact 或 KI-05 shared cache。
+
+Kiro reference delta 已迁为 append-only schema v2：`1124082` 中原 schema-v1 文件 SHA-256、target commit/tree、全部十个历史字段的 canonical/逐字段 digest 均被冻结；新增干净的 `kiro.rs@be0c042` / tree `5e656c1` committed-object snapshot，以及 13 条不可变 observation，完整映射 KI-01～05、KI-N1～N3、CORE-N1、LIVE-N1、KI-R1～R3。每条记录绑定 source commit/tree/path/symbol/digest 与本仓库 committed target object；三条 reject 明确排除跨 Account/auth-kind/region/Provider 或宽 profile/host fallback、Redis/session-affinity/cache 路由，以及无独立执行器与真实证据的 remote-compaction 自动启用。默认审计不读取外部仓库，只有显式 `--check-sources` 才复核冻结对象。
+
 ## 10. Qoder
 
 ### 10.1 对比结论
@@ -499,7 +504,7 @@ CB-N5 继续使用统一取消 token、CommitGuard 和 terminal 逻辑。专项�
 
 ### 12.1 CORE-N1：渐进拆分巨型热路径
 
-状态：partially_completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok 五个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；Kiro、Qoder、CodeBuddy 仍待逐类实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
+状态：partially_completed；优先级：P2。Antigravity、Claude、Codex、Cursor、Grok、Kiro 六个 Provider 切片已完成，并分别在独立提交中先锁 golden、再迁移 orchestration、最后切调用点；Qoder、CodeBuddy 仍待逐类实施。这里的差距是可维护性和审查边界，不是 execution 原语缺失。
 
 建议目标结构：
 
@@ -544,7 +549,7 @@ state.rs 保留 ServerStateInner 作为跨域门面，逐步把 Account lifecycl
 
 ### 12.3 EVID-N1：reference delta v2
 
-状态：partially_completed；优先级：P2。Antigravity 已用不可变 observation digest 固定 13 个 source delta、16 条处置记录及其本地测试映射；Claude 已固定 legacy v1 字段、12 个 source delta、两个 source snapshot、14 条处置记录；Codex 已固定六个 legacy v1 字段摘要、9 个 source delta、两个干净 source snapshot、13 条处置记录与 committed target object 映射；Cursor 已固定全部十个 legacy v1 字段摘要、一个明确排除 22 项工作树改动的 source snapshot、7 条处置记录及 committed target object 映射；Grok 已固定原 schema-v1 文件及十字段摘要、两个 source snapshot、10 条处置记录与 GR-R1 reject 边界。五者均为 append-only schema v2；Kiro、Qoder、CodeBuddy 仍使用各自 schema v1，待逐类迁移。
+状态：partially_completed；优先级：P2。Antigravity 已用不可变 observation digest 固定 13 个 source delta、16 条处置记录及其本地测试映射；Claude 已固定 legacy v1 字段、12 个 source delta、两个 source snapshot、14 条处置记录；Codex 已固定六个 legacy v1 字段摘要、9 个 source delta、两个干净 source snapshot、13 条处置记录与 committed target object 映射；Cursor 已固定全部十个 legacy v1 字段摘要、一个明确排除 22 项工作树改动的 source snapshot、7 条处置记录及 committed target object 映射；Grok 已固定原 schema-v1 文件及十字段摘要、两个 source snapshot、10 条处置记录与 GR-R1 reject 边界；Kiro 已固定原 schema-v1 文件及十字段摘要、一个干净 source snapshot、13 条处置记录与 KI-R1～R3 reject 边界。六者均为 append-only schema v2；Qoder、CodeBuddy 仍使用各自 schema v1，待逐类迁移。
 
 现有八个 assets/contract/*-reference-delta.json 已冻结上一轮证据。新一轮不得覆盖旧 source commit 后假装历史从未存在；应扩展为 append-only observation 或新 revision，至少记录：
 
@@ -648,10 +653,10 @@ Phase 2 只对差分红灯或真实 receipt 已证明的能力修改生产代码
 
 ### Phase 3：P2 架构、内存和证据
 
-状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex/Cursor/Grok 的 CORE-N1/EVID-N1 切片、CUR-N2 与 QD-N2 已完成；其余 CORE-N1、跨 Provider memory 推广和 Kiro/Qoder/CodeBuddy 三类 reference-delta schema v2 留待后续独立变更。
+状态：部分完成。CX-N4/CORE-N2 的 Codex 首个切片、Antigravity/Claude/Codex/Cursor/Grok/Kiro 的 CORE-N1/EVID-N1 切片、CUR-N2 与 QD-N2 已完成；其余 CORE-N1、跨 Provider memory 推广和 Qoder/CodeBuddy 两类 reference-delta schema v2 留待后续独立变更。
 
 1. 先完成 CX-N4 的 request memory budget，再抽取 CORE-N2。
-2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok 已完成，后续依次处理 Kiro、Qoder、CodeBuddy。
+2. 按 Provider 分批实施 CORE-N1；Antigravity、Claude、Codex、Cursor、Grok、Kiro 已完成，后续依次处理 Qoder、CodeBuddy。
 3. 实施 EVID-N1 append-only reference delta v2。
 4. 执行 CUR-N2、QD-N2 的周期复核。
 5. 对 state.rs 和 server_sqlite.rs 做纯结构拆分，不重新设计 authority。
@@ -687,10 +692,10 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 
 ### 14.2 本轮最终验证快照
 
-| 门禁 | 2026-09-18 结果 | 判定 |
+| 门禁 | 2026-09-19 结果 | 判定 |
 | --- | --- | --- |
-| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3109 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
-| `scripts/static-checks.sh` | rustfmt、Clippy、JSON/Node/Shell、Provider/产品边界/依赖方向/文档审计全部通过；Provider audit 129 tests、smoke 13 tests、Web 41 files/213 tests 通过 | 通过 |
+| `RUST_MIN_STACK=67108864 cargo test --no-fail-fast` | lib 3113 passed/1 ignored；API contract 124 passed；两个独立 integration 各 1 passed；0 failed | 通过 |
+| `scripts/static-checks.sh` | rustfmt、Clippy、JSON/Node/Shell、Provider/产品边界/依赖方向/文档审计全部通过；Provider audit 135 tests、smoke 13 tests、Web 41 files/213 tests 通过 | 通过 |
 | 八类 reference delta `--check-sources` | Antigravity、Claude、Codex、Cursor、Grok、Kiro、Qoder、CodeBuddy 均按冻结 Git object 通过 | 通过；不构成 live receipt |
 | `scripts/smoke/smoke-local.sh` | health、Web fallback、setup、密码/API Token 登录、Provider/Share 创建通过 | 通过 |
 | `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh` | `failures=0`，但因主动跳过内置测试产生 1 个 internal blocker；缺 8 个真实环境输入且 deployment 未测，共 9 个 blocker | `decision=blocked` / `blocked_inputs`，符合预期 |
@@ -700,6 +705,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | Codex 后续专项 | 389 个 Rust Codex 关键词测试通过；12 个 Node receipt gate 与 7 个付费探针安全测试通过；9 个 source delta、13 条 v2 observation audit 通过 | 通过；四个 operation 仍为 `live_pending` |
 | Cursor 后续专项 | 295 个 Rust Cursor 关键词测试通过；7 个顶层 Node receipt gate/21 个断言通过；10 个 legacy 字段摘要、1 个 dirty-worktree-excluded snapshot、7 条 v2 observation audit 通过 | 通过；OAuth/API-key 两条 rail 仍为 `live_pending` |
 | Grok 后续专项 | 8 个 Rust replay/HTTP/WS 专项通过；6 个顶层 Node receipt gate/11 个断言通过；10 个 legacy 字段摘要、2 个 committed-object snapshot、10 条 v2 observation 的默认与 `--check-sources` audit 均通过 | 通过；inference/media/remote_compaction 三个 operation 仍为 `live_pending` |
+| Kiro 后续专项 | 97 个 Rust Kiro 关键词测试通过；5 个顶层 Node receipt gate 覆盖八个 scope；10 个 legacy 字段摘要、1 个干净 committed-object snapshot、13 条 v2 observation 与 3 条 reject 边界的默认及 `--check-sources` audit 均通过 | 通过；八个 auth-kind × region receipt、remote compaction 与 shared cache 仍为 `live_pending`/disabled |
 
 正式测试使用 64 MiB `RUST_MIN_STACK`；默认 2 MiB 线程栈的既有溢出不作为本轮回归。离线 readiness 中的 `local-contracts-unverified` 仅表示该命令显式设置了 `RUN_TESTS=0`，不能覆盖上表已独立完成的全量测试；同样也不能消除真实凭据与部署 blocker。没有任何 rail 因 fixture、参考项目结果或本地 smoke 被提升为 `live_verified`。
 
