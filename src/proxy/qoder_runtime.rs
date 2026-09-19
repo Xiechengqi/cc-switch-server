@@ -189,6 +189,15 @@ impl PreparedQoderRuntime {
     pub fn exact_model_config(&self, model_key: &str) -> Option<&Value> {
         self.catalog.exact_config(model_key)
     }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.scope
+            .0
+            .capacity()
+            .saturating_add(self.session.gateway_base_url.capacity())
+            .saturating_add(self.catalog.retained_bytes())
+            .saturating_add(self.account_id.capacity())
+    }
 }
 
 impl QoderModelCatalog {
@@ -226,6 +235,60 @@ impl QoderModelCatalog {
 
     fn is_fresh(&self, now_ms: i64) -> bool {
         self.expires_at_ms > now_ms
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let enabled_models = self.enabled_models.iter().fold(
+            self.enabled_models
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+            |bytes, model| bytes.saturating_add(model.capacity()),
+        );
+        let raw_configs = self
+            .raw_configs
+            .iter()
+            .fold(0_usize, |bytes, (key, value)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, Value)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(key.capacity())
+                    .saturating_add(super::request_memory::retained_json_bytes(value))
+            });
+        let capabilities = self
+            .capabilities
+            .iter()
+            .fold(0_usize, |bytes, (key, capability)| {
+                let reasoning = capability.reasoning_efforts.iter().fold(
+                    capability
+                        .reasoning_efforts
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, effort| bytes.saturating_add(effort.capacity()),
+                );
+                let modalities = capability.input_modalities.iter().fold(
+                    capability
+                        .input_modalities
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, modality| bytes.saturating_add(modality.capacity()),
+                );
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, QoderModelCapability)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(key.capacity())
+                    .saturating_add(capability.model_key.capacity())
+                    .saturating_add(
+                        capability
+                            .display_name
+                            .as_ref()
+                            .map_or(0, |name| name.capacity()),
+                    )
+                    .saturating_add(reasoning)
+                    .saturating_add(modalities)
+            });
+        enabled_models
+            .saturating_add(raw_configs)
+            .saturating_add(capabilities)
     }
 }
 
@@ -504,6 +567,15 @@ pub struct PreparedQoderPayload {
     pub request_id: String,
     pub session_id: String,
     pub model_key: String,
+}
+
+impl PreparedQoderPayload {
+    pub fn retained_bytes(&self) -> usize {
+        super::request_memory::retained_json_bytes(&self.body)
+            .saturating_add(self.request_id.capacity())
+            .saturating_add(self.session_id.capacity())
+            .saturating_add(self.model_key.capacity())
+    }
 }
 
 pub fn build_qoder_payload(

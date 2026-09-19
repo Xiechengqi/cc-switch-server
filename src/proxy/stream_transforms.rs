@@ -38,7 +38,7 @@ impl StreamEventTransformer {
         let bridge = self
             .bridge
             .as_ref()
-            .map_or(0, StreamBridgeState::retained_antigravity_bytes);
+            .map_or(0, StreamBridgeState::retained_bytes);
         let chat_compat = self.chat_compat.as_ref().map_or(
             0,
             super::openai_chat_compat::OpenAiChatStreamCanonicalizer::retained_bytes,
@@ -447,12 +447,21 @@ enum StreamBridgeState {
 }
 
 impl StreamBridgeState {
-    fn retained_antigravity_bytes(&self) -> usize {
+    fn retained_bytes(&self) -> usize {
         match self {
+            Self::ChatAnthropic(state) => state.retained_bytes(),
             Self::GeminiAnthropic(state) => state.retained_bytes(),
             Self::GeminiOpenAi(state) => state.retained_bytes(),
-            _ => 0,
+            Self::ResponsesChat(state) => state.retained_bytes(),
+            Self::ChatResponses(state) => state.retained_bytes(),
+            Self::AnthropicResponses(state) => state.retained_bytes(),
+            Self::ToGemini(state) => state.retained_bytes(),
+            Self::GrokResponsesTools(_) | Self::ResponsesAnthropic(_) | Self::AnthropicChat(_) => 0,
         }
+    }
+
+    fn retained_antigravity_bytes(&self) -> usize {
+        self.retained_bytes()
     }
 
     fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
@@ -2651,6 +2660,14 @@ enum ToAnthropicSource {
 }
 
 impl ToGeminiState {
+    fn retained_bytes(&self) -> usize {
+        let source = match &self.source {
+            ToAnthropicSource::Chat(state) => state.retained_bytes(),
+            ToAnthropicSource::Anthropic | ToAnthropicSource::Responses(_) => 0,
+        };
+        source.saturating_add(self.target.retained_bytes())
+    }
+
     fn anthropic() -> Self {
         Self {
             source: ToAnthropicSource::Anthropic,
@@ -2766,6 +2783,43 @@ enum AnthropicGeminiBlock {
 }
 
 impl AnthropicGeminiState {
+    fn retained_bytes(&self) -> usize {
+        let blocks = self.blocks.iter().fold(0_usize, |bytes, (_, block)| {
+            let dynamic = match block {
+                AnthropicGeminiBlock::Text => 0,
+                AnthropicGeminiBlock::Thinking { signature } => signature.capacity(),
+                AnthropicGeminiBlock::Tool {
+                    id,
+                    name,
+                    arguments,
+                    signature,
+                    ..
+                } => id
+                    .capacity()
+                    .saturating_add(name.capacity())
+                    .saturating_add(arguments.capacity())
+                    .saturating_add(signature.as_ref().map_or(0, String::capacity)),
+            };
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, AnthropicGeminiBlock)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(dynamic)
+        });
+        let usage = self.usage.iter().fold(0_usize, |bytes, (key, value)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(String, Value)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(key.capacity())
+                .saturating_add(retained_json_bytes(value))
+        });
+        self.response_id
+            .capacity()
+            .saturating_add(self.model.capacity())
+            .saturating_add(blocks)
+            .saturating_add(usage)
+            .saturating_add(self.stop_reason.as_ref().map_or(0, String::capacity))
+    }
+
     fn transform(&mut self, input: &Value) -> Result<Vec<StreamFrame>, ProxyError> {
         if self.completed {
             return Ok(Vec::new());
@@ -3185,6 +3239,56 @@ enum InterleavedChatContent {
 }
 
 impl ChatAnthropicState {
+    fn retained_bytes(&self) -> usize {
+        let tools = self.tools.iter().fold(0_usize, |bytes, (_, tool)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, ToolBlockState)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(tool.custom_input.delta.capacity())
+                .saturating_add(
+                    tool.custom_input
+                        .done
+                        .as_ref()
+                        .map_or(0, retained_json_bytes),
+                )
+        });
+        let deferred_tools = self
+            .deferred_tools
+            .iter()
+            .fold(0_usize, |bytes, (_, tool)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(i64, DeferredChatToolState)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3)
+                    .saturating_add(tool.id.capacity())
+                    .saturating_add(tool.name.capacity())
+                    .saturating_add(tool.arguments.capacity())
+                    .saturating_add(tool.signature.as_ref().map_or(0, String::capacity))
+            });
+        let interleaved = self.interleaved_content.iter().fold(
+            self.interleaved_content
+                .capacity()
+                .saturating_mul(std::mem::size_of::<InterleavedChatContent>()),
+            |bytes, content| {
+                bytes.saturating_add(match content {
+                    InterleavedChatContent::Text(value)
+                    | InterleavedChatContent::Reasoning(value)
+                    | InterleavedChatContent::Signature(value) => value.capacity(),
+                })
+            },
+        );
+        self.reasoning_signature
+            .capacity()
+            .saturating_add(tools)
+            .saturating_add(deferred_tools)
+            .saturating_add(interleaved)
+            .saturating_add(self.usage.as_ref().map_or(0, retained_json_bytes))
+            .saturating_add(
+                self.pending_finish_reason
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+    }
+
     fn deferred_for_gemini() -> Self {
         Self {
             defer_terminal: true,
@@ -4284,6 +4388,37 @@ struct ChatResponsesToolState {
 }
 
 impl ChatResponsesState {
+    fn retained_bytes(&self) -> usize {
+        let tools = self.tools.iter().fold(0_usize, |bytes, (_, tool)| {
+            bytes
+                .saturating_add(std::mem::size_of::<(i64, ChatResponsesToolState)>())
+                .saturating_add(std::mem::size_of::<usize>() * 3)
+                .saturating_add(tool.item_id.capacity())
+                .saturating_add(tool.call_id.capacity())
+                .saturating_add(tool.name.capacity())
+                .saturating_add(tool.arguments.capacity())
+        });
+        let output_items = self.output_items.iter().fold(
+            self.output_items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, Value)>()),
+            |bytes, (_, item)| bytes.saturating_add(retained_json_bytes(item)),
+        );
+        self.responses_tool_context
+            .retained_bytes()
+            .saturating_add(self.response_id.capacity())
+            .saturating_add(self.model.capacity())
+            .saturating_add(retained_json_bytes(&self.created_at))
+            .saturating_add(self.text.item_id.capacity())
+            .saturating_add(self.text.text.capacity())
+            .saturating_add(self.reasoning.item_id.capacity())
+            .saturating_add(self.reasoning.text.capacity())
+            .saturating_add(tools)
+            .saturating_add(output_items)
+            .saturating_add(self.finish_reason.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.usage.as_ref().map_or(0, retained_json_bytes))
+    }
+
     fn new<T>(responses_tool_context: T) -> Self
     where
         T: Into<transforms::ResponsesToolContext>,
@@ -7514,6 +7649,40 @@ mod tests {
             assert_eq!(terminals[0]["usage"]["input_tokens"], 3);
             assert_eq!(terminals[0]["usage"]["output_tokens"], 5);
         }
+    }
+
+    #[test]
+    fn qoder_chat_bridges_report_retained_tool_state_for_every_downstream_surface() {
+        let arguments = "x".repeat(64 * 1024);
+        let event = json!({
+            "id": "chat-memory",
+            "model": "auto",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_memory",
+                    "type": "function",
+                    "function": {"name": "bounded_tool", "arguments": arguments.clone()}
+                }]},
+                "finish_reason": null
+            }]
+        });
+
+        let mut claude = ChatAnthropicState::default();
+        let claude_before = claude.retained_bytes();
+        let _ = claude.transform(&event);
+        assert!(claude.retained_bytes() > claude_before);
+
+        let mut responses = ChatResponsesState::new(BTreeSet::new());
+        let responses_before = responses.retained_bytes();
+        let _ = responses.transform(&event);
+        assert!(responses.retained_bytes() > responses_before + arguments.len());
+
+        let mut gemini = ToGeminiState::chat();
+        let gemini_before = gemini.retained_bytes();
+        let _ = gemini.transform(&event).unwrap();
+        assert!(gemini.retained_bytes() > gemini_before + arguments.len());
     }
 
     #[test]

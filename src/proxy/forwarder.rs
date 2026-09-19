@@ -1998,6 +1998,7 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
                         | ProviderType::GrokOAuth
                         | ProviderType::KiroOAuth
                         | ProviderType::AmazonQOAuth
+                        | ProviderType::QoderCosy
                 )
         })
 }
@@ -2360,6 +2361,7 @@ async fn forward_with_attempt(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                request_memory: attempt_context.request_memory().cloned(),
             })
             .await;
         }
@@ -17660,9 +17662,11 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     route,
                     request_context,
                     canonical,
+                    canonical_memory: None,
                     account_in_flight_guard,
                     share_invocation_guard,
                     started,
+                    request_memory: None,
                 })
                 .await;
             }
@@ -18587,9 +18591,11 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
                     route,
                     request_context,
                     canonical,
+                    canonical_memory: None,
                     account_in_flight_guard,
                     share_invocation_guard,
                     started,
+                    request_memory: None,
                 })
                 .await;
             }
@@ -19189,6 +19195,7 @@ struct QoderForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 struct PreparedQoderWireResponse {
@@ -19214,8 +19221,32 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        request_memory,
     } = options;
     let bound = qoder_provider::bound_account_identity(&execution)?;
+    let canonical_memory = match request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                adapter_request.body.len().saturating_mul(4),
+            )
+        })
+        .transpose()
+    {
+        Ok(memory) => memory,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error.into_proxy_error(),
+            )
+            .await;
+        }
+    };
     let canonical =
         match qoder_provider::prepare_canonical_request(&adapter_request, &mut request_context) {
             Ok(canonical) => canonical,
@@ -19232,13 +19263,29 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 .await;
             }
         };
+    if let Some(memory) = canonical_memory.as_ref() {
+        if let Err(error) = memory.resize(canonical.retained_bytes()) {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error.into_proxy_error(),
+            )
+            .await;
+        }
+    }
 
-    let mut recovery_attempt = ForwardAttemptContext::default();
+    let mut recovery_attempt = ForwardAttemptContext {
+        request_memory: request_memory.clone(),
+        ..ForwardAttemptContext::default()
+    };
     let binding_accounts = state.accounts_snapshot().await;
     recovery_attempt
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
-    let (runtime, model_key, wire) = loop {
+    let (runtime, runtime_memory, model_key, wire) = loop {
         let runtime = match qoder_provider::prepare_runtime(&state, &execution, &bound).await {
             Ok(runtime) => runtime,
             Err(error)
@@ -19288,8 +19335,36 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 return Err(error);
             }
         };
+        let runtime_memory = match request_memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::NormalizedBody,
+                    runtime.retained_bytes(),
+                )
+            })
+            .transpose()
+        {
+            Ok(memory) => memory,
+            Err(error) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    error.into_proxy_error(),
+                )
+                .await;
+            }
+        };
         let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-        let prepared = match qoder_provider::prepare_generation(&runtime, &canonical, now_ms) {
+        let prepared = match qoder_provider::prepare_generation(
+            &runtime,
+            &canonical,
+            now_ms,
+            request_memory.as_ref(),
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return qoder_fail_before_commit(
@@ -19309,10 +19384,11 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             &runtime,
             &prepared.payload,
             &prepared.model_source,
+            request_memory.as_ref(),
         )
         .await;
         match wire {
-            Ok(wire) => break (runtime, prepared.model_key, wire),
+            Ok(wire) => break (runtime, runtime_memory, prepared.model_key, wire),
             Err(QoderForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure()
                     && !recovery_attempt.auth_refresh_attempted() =>
@@ -19407,39 +19483,53 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             account_in_flight_guard,
             share_invocation_guard,
             started,
+            request_memory,
+            runtime_memory,
         })
         .await
     } else {
-        let canonical =
-            match aggregate_qoder_nonstream(&state, &execution, &runtime, wire, &model_key).await {
-                Ok(canonical) => canonical,
-                Err(QoderForwardAttemptError::Upstream(error)) => {
-                    qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
-                    let error = error.into_proxy_error();
-                    record_qoder_nonstream_failure(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        &error,
-                    )
-                    .await;
-                    return Err(error);
-                }
-                Err(QoderForwardAttemptError::Proxy(error)) => {
-                    record_qoder_nonstream_failure(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        &error,
-                    )
-                    .await;
-                    return Err(error);
-                }
-            };
+        let canonical = match aggregate_qoder_nonstream(
+            &state,
+            &execution,
+            &runtime,
+            wire,
+            &model_key,
+            request_memory.clone(),
+        )
+        .await
+        {
+            Ok(canonical) => canonical,
+            Err(QoderForwardAttemptError::Upstream(error)) => {
+                qoder_provider::record_limit_if_needed(&state, &execution, &error).await;
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(QoderForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let super::qoder::QoderAggregatedResponse {
+            value: canonical,
+            memory: canonical_memory,
+        } = canonical;
         finish_qoder_nonstream(QoderNonstreamFinishOptions {
             state,
             stored,
@@ -19448,9 +19538,11 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             route,
             request_context,
             canonical,
+            canonical_memory,
             account_in_flight_guard,
             share_invocation_guard,
             started,
+            request_memory,
         })
         .await
     }
@@ -19462,18 +19554,39 @@ async fn send_qoder_generation(
     runtime: &super::qoder_runtime::PreparedQoderRuntime,
     payload: &super::qoder_runtime::PreparedQoderPayload,
     model_source: &str,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<PreparedQoderWireResponse, QoderForwardAttemptError> {
     if !qoder_provider::runtime_is_current(state, execution, runtime).await {
         return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
             "Qoder Provider or bound account changed before inference",
         )));
     }
+    let plain_body_bytes = serialized_json_bytes(&payload.body);
+    let encoded_body_bytes = plain_body_bytes
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4);
+    // qoder_encode holds the standard Base64, rearranged copy, and mapped
+    // output concurrently. signed_headers subsequently builds another
+    // full-body signature preimage, so reserve all copies before allocating.
+    let wire_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                plain_body_bytes.saturating_add(encoded_body_bytes.saturating_mul(4)),
+            )
+        })
+        .transpose()
+        .map_err(|error| QoderForwardAttemptError::Proxy(error.into_proxy_error()))?;
     let plain_body = serde_json::to_vec(&payload.body).map_err(|error| {
         QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
             "encode Qoder generation payload: {error}"
         )))
     })?;
+    debug_assert_eq!(plain_body.len(), plain_body_bytes);
     let encoded_body = Bytes::from(crate::domain::qoder::qoder_encode(&plain_body));
+    debug_assert_eq!(encoded_body.len(), encoded_body_bytes);
+    drop(plain_body);
     let url = super::join_url(
         &runtime.session.gateway_base_url,
         crate::domain::qoder::QODER_GENERATION_PATH,
@@ -19519,6 +19632,27 @@ async fn send_qoder_generation(
             crate::domain::qoder::QODER_COSY_USER_AGENT.to_string(),
         ),
     ]);
+    let target_header_bytes = target_headers.iter().fold(
+        target_headers
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, String)>()),
+        |bytes, (name, value)| {
+            bytes
+                .saturating_add(name.capacity())
+                .saturating_add(value.capacity())
+        },
+    );
+    if let Some(memory) = wire_memory.as_ref() {
+        memory
+            .resize(
+                encoded_body
+                    .len()
+                    .saturating_add(target_header_bytes.saturating_mul(2))
+                    .saturating_add(url.len())
+                    .saturating_add(client_ip.capacity()),
+            )
+            .map_err(|error| QoderForwardAttemptError::Proxy(error.into_proxy_error()))?;
+    }
     let mut headers = HeaderMap::new();
     super::outbound_request::insert_target_headers(&mut headers, &target_headers)
         .map_err(QoderForwardAttemptError::Proxy)?;
@@ -19555,12 +19689,22 @@ async fn send_qoder_generation(
     let status = response.status();
     if !status.is_success() {
         let response_headers = response.headers().clone();
-        let body = crate::infra::http::read_response_body_limited(
+        let (body, _body_memory) = read_response_body_limited_with_memory(
             &mut response,
             PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+            request_memory,
         )
         .await
-        .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+        .map_err(|error| QoderForwardAttemptError::Proxy(error.into_proxy_error()))?;
+        let _error_parse_memory = request_memory
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::SemanticPrelude,
+                    body.len().saturating_mul(4),
+                )
+            })
+            .transpose()
+            .map_err(|error| QoderForwardAttemptError::Proxy(error.into_proxy_error()))?;
         return Err(QoderForwardAttemptError::Upstream(
             super::qoder::QoderUpstreamError::from_response(
                 status.as_u16(),
@@ -19571,7 +19715,8 @@ async fn send_qoder_generation(
     }
 
     let mut inner = response.bytes_stream().boxed();
-    let mut decoder = super::qoder::QoderSseDecoder::default();
+    let mut decoder = super::qoder::QoderSseDecoder::with_request_memory(request_memory.cloned())
+        .map_err(QoderForwardAttemptError::Proxy)?;
     let mut received_chunk = false;
     loop {
         let timeout = if received_chunk {
@@ -19751,6 +19896,22 @@ async fn record_qoder_nonstream_failure(
     started: Instant,
     error: &ProxyError,
 ) {
+    let memory_exhausted = error.is_request_memory_exhausted();
+    let mut context = request_context.clone();
+    context.is_streaming = request.stream_requested;
+    context.stream_status = request.stream_requested.then(|| {
+        if memory_exhausted {
+            "memory_capacity"
+        } else {
+            "upstream_error"
+        }
+        .to_string()
+    });
+    if memory_exhausted {
+        context.outcome = Some(UsageOutcome::InternalError);
+        context.failure_kind = Some("memory_capacity".to_string());
+        context.error_message = Some(error.client_message().to_string());
+    }
     log_usage(
         state,
         stored,
@@ -19758,13 +19919,7 @@ async fn record_qoder_nonstream_failure(
         started.elapsed().as_millis(),
         model_metadata(request),
         TokenUsage::default(),
-        UsageLogContext {
-            is_streaming: request.stream_requested,
-            stream_status: request
-                .stream_requested
-                .then(|| "upstream_error".to_string()),
-            ..request_context.clone()
-        },
+        context,
     )
     .await;
     record_share_invocation_result(
@@ -19774,12 +19929,15 @@ async fn record_qoder_nonstream_failure(
         TokenUsage::default(),
     )
     .await;
-    record_provider_outcome(
-        state,
-        stored,
-        provider_outcome_from_status(error.status.as_u16()),
-    )
-    .await;
+    record_provider_outcome(state, stored, qoder_failure_provider_outcome(error)).await;
+}
+
+fn qoder_failure_provider_outcome(error: &ProxyError) -> ProviderOutcome {
+    if error.is_request_memory_exhausted() {
+        capacity_shed_provider_outcome()
+    } else {
+        provider_outcome_from_status(error.status.as_u16())
+    }
 }
 
 struct QoderNonstreamFinishOptions {
@@ -19790,9 +19948,11 @@ struct QoderNonstreamFinishOptions {
     route: ProxyRoute,
     request_context: UsageLogContext,
     canonical: Value,
+    canonical_memory: Option<RequestMemoryReservation>,
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 async fn aggregate_qoder_nonstream(
@@ -19801,8 +19961,10 @@ async fn aggregate_qoder_nonstream(
     runtime: &super::qoder_runtime::PreparedQoderRuntime,
     mut wire: PreparedQoderWireResponse,
     model_key: &str,
-) -> Result<Value, QoderForwardAttemptError> {
-    let mut aggregator = super::qoder::QoderChatSseAggregator::default();
+    request_memory: Option<RequestMemoryBudget>,
+) -> Result<super::qoder::QoderAggregatedResponse, QoderForwardAttemptError> {
+    let mut aggregator = super::qoder::QoderChatSseAggregator::with_request_memory(request_memory)
+        .map_err(QoderForwardAttemptError::Proxy)?;
     aggregator
         .push(wire.first_canonical)
         .map_err(QoderForwardAttemptError::Proxy)?;
@@ -19853,7 +20015,7 @@ async fn aggregate_qoder_nonstream(
         )));
     }
     aggregator
-        .finish(
+        .finish_with_memory(
             model_key,
             super::openai_chat_compat::unix_timestamp_seconds(),
         )
@@ -19871,11 +20033,32 @@ async fn finish_qoder_nonstream(
         route,
         request_context,
         canonical,
+        canonical_memory: _canonical_memory,
         account_in_flight_guard: _account_in_flight_guard,
         share_invocation_guard: _share_invocation_guard,
         started,
+        request_memory,
     } = options;
     let usage = usage_from_json_with_semantics(&canonical, InputTokenSemantics::Inclusive);
+    let canonical_size = serialized_json_bytes(&canonical);
+    let response_memory = match request_memory
+        .as_ref()
+        .map(|budget| budget.reserve(RequestMemoryComponent::NormalizedEvent, canonical_size))
+        .transpose()
+    {
+        Ok(memory) => memory,
+        Err(error) => {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error.into_proxy_error(),
+            )
+            .await;
+        }
+    };
     let canonical_bytes = match serde_json::to_vec(&canonical).map(Bytes::from) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -19890,6 +20073,20 @@ async fn finish_qoder_nonstream(
             .await;
         }
     };
+    debug_assert_eq!(canonical_bytes.len(), canonical_size);
+    if let Some(memory) = response_memory.as_ref() {
+        if let Err(error) = memory.resize(canonical_bytes.len().saturating_mul(2)) {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error.into_proxy_error(),
+            )
+            .await;
+        }
+    }
     let response_bytes = match adapter.transform_response_for_request(
         canonical_bytes,
         &stored,
@@ -19908,6 +20105,22 @@ async fn finish_qoder_nonstream(
             )
             .await;
         }
+    };
+    let response_bytes = if let Some(memory) = response_memory {
+        if let Err(error) = memory.resize(response_bytes.len()) {
+            return qoder_fail_before_commit(
+                &state,
+                &stored,
+                &adapter_request,
+                &request_context,
+                started,
+                error.into_proxy_error(),
+            )
+            .await;
+        }
+        memory.retain_bytes(response_bytes)
+    } else {
+        response_bytes
     };
     log_usage(
         &state,
@@ -19955,6 +20168,59 @@ struct QoderStreamOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    request_memory: Option<RequestMemoryBudget>,
+    runtime_memory: Option<RequestMemoryReservation>,
+}
+
+fn transform_qoder_stream_chunk(
+    stream_transform: &mut super::stream_transforms::StreamEventTransformer,
+    usage: &mut StreamUsageAccumulator,
+    canonical: Bytes,
+    finish: bool,
+    retained_memory: Option<&RequestMemoryReservation>,
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<Bytes, ProxyError> {
+    if let Some(memory) = retained_memory {
+        memory
+            .resize(
+                stream_transform
+                    .retained_bytes()
+                    .saturating_add(usage.retained_bytes())
+                    .saturating_add(canonical.len().saturating_mul(4)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    if !canonical.is_empty() {
+        usage.push(&canonical);
+    }
+    let mut transformed = stream_transform.push(canonical)?;
+    if finish {
+        if let Some(memory) = retained_memory {
+            memory
+                .resize(
+                    stream_transform
+                        .retained_bytes()
+                        .saturating_add(usage.retained_bytes())
+                        .saturating_mul(2),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        transformed = join_bytes(transformed, stream_transform.finish()?);
+    }
+    if let Some(memory) = retained_memory {
+        memory
+            .resize(
+                stream_transform
+                    .retained_bytes()
+                    .saturating_add(usage.retained_bytes()),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    retain_request_bytes(
+        transformed,
+        request_memory,
+        RequestMemoryComponent::NormalizedEvent,
+    )
 }
 
 async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, ProxyError> {
@@ -19970,8 +20236,9 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        request_memory,
+        runtime_memory,
     } = options;
-    let first_canonical = wire.first_canonical;
     let mut stream_transform =
         super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
             &stored,
@@ -19979,7 +20246,25 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             adapter_request.responses_tool_context.clone(),
             adapter_request.downstream_include_usage,
         );
-    let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
+    let stream_retained_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::StreamRetainedState,
+                stream_transform.retained_bytes(),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    let mut initial_usage = StreamUsageAccumulator::default();
+    let first_transformed = match transform_qoder_stream_chunk(
+        &mut stream_transform,
+        &mut initial_usage,
+        wire.first_canonical,
+        wire.decoder.is_terminal(),
+        stream_retained_memory.as_ref(),
+        request_memory.as_ref(),
+    ) {
         Ok(transformed) => transformed,
         Err(error) => {
             return qoder_fail_before_commit(
@@ -19993,23 +20278,6 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             .await;
         }
     };
-    if wire.decoder.is_terminal() {
-        let tail = match stream_transform.finish() {
-            Ok(tail) => tail,
-            Err(error) => {
-                return qoder_fail_before_commit(
-                    &state,
-                    &stored,
-                    &adapter_request,
-                    &request_context,
-                    started,
-                    error,
-                )
-                .await;
-            }
-        };
-        first_transformed = join_bytes(first_transformed, tail);
-    }
     let request_id = log_usage(
         &state,
         &stored,
@@ -20030,6 +20298,8 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
     let stream = async_stream::stream! {
         let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
+        let _runtime_memory = runtime_memory;
+        let _request_memory_owner = request_memory.clone();
         let mut interrupt_guard = ShareStreamInterruptGuard {
             armed: true,
             state: state.clone(),
@@ -20040,12 +20310,9 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             user_email: user_email.clone(),
             started,
             first_token_ms: None,
-            usage: StreamUsageAccumulator::default(),
+            usage: initial_usage,
         };
         let mut first_token_ms = None;
-        if !first_canonical.is_empty() {
-            interrupt_guard.usage.push(&first_canonical);
-        }
         if !first_transformed.is_empty() {
             first_token_ms = Some(started.elapsed().as_millis());
             interrupt_guard.first_token_ms = first_token_ms;
@@ -20108,10 +20375,14 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                         }
                         return;
                     }
-                    if !canonical.is_empty() {
-                        interrupt_guard.usage.push(&canonical);
-                    }
-                    let mut transformed = match stream_transform.push(canonical) {
+                    let transformed = match transform_qoder_stream_chunk(
+                        &mut stream_transform,
+                        &mut interrupt_guard.usage,
+                        canonical,
+                        true,
+                        stream_retained_memory.as_ref(),
+                        request_memory.as_ref(),
+                    ) {
                         Ok(transformed) => transformed,
                         Err(error) => {
                             if let Some(frame) = finish_qoder_stream_failure(
@@ -20124,19 +20395,6 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                             return;
                         }
                     };
-                    match stream_transform.finish() {
-                        Ok(tail) => transformed = join_bytes(transformed, tail),
-                        Err(error) => {
-                            if let Some(frame) = finish_qoder_stream_failure(
-                                &mut interrupt_guard,
-                                route,
-                                &error,
-                            ).await {
-                                yield Ok(frame);
-                            }
-                            return;
-                        }
-                    }
                     if !transformed.is_empty() {
                         if first_token_ms.is_none() {
                             first_token_ms = Some(started.elapsed().as_millis());
@@ -20218,10 +20476,14 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                 }
                 return;
             }
-            if !canonical.is_empty() {
-                interrupt_guard.usage.push(&canonical);
-            }
-            let mut transformed = match stream_transform.push(canonical) {
+            let transformed = match transform_qoder_stream_chunk(
+                &mut stream_transform,
+                &mut interrupt_guard.usage,
+                canonical,
+                wire.decoder.is_terminal(),
+                stream_retained_memory.as_ref(),
+                request_memory.as_ref(),
+            ) {
                 Ok(transformed) => transformed,
                 Err(error) => {
                     if let Some(frame) = finish_qoder_stream_failure(
@@ -20234,21 +20496,6 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                     return;
                 }
             };
-            if wire.decoder.is_terminal() {
-                match stream_transform.finish() {
-                    Ok(tail) => transformed = join_bytes(transformed, tail),
-                    Err(error) => {
-                        if let Some(frame) = finish_qoder_stream_failure(
-                            &mut interrupt_guard,
-                            route,
-                            &error,
-                        ).await {
-                            yield Ok(frame);
-                        }
-                        return;
-                    }
-                }
-            }
             if !transformed.is_empty() {
                 if first_token_ms.is_none() {
                     first_token_ms = Some(started.elapsed().as_millis());
@@ -20319,6 +20566,7 @@ async fn finish_qoder_stream_failure(
     route: ProxyRoute,
     error: &ProxyError,
 ) -> Option<Bytes> {
+    let memory_exhausted = error.is_request_memory_exhausted();
     let usage_result = std::mem::take(&mut guard.usage).finish_with_status();
     let usage = usage_result.usage;
     update_stream_usage_result(
@@ -20329,10 +20577,33 @@ async fn finish_qoder_stream_failure(
         guard.started.elapsed().as_millis(),
         guard.first_token_ms,
         usage_result,
-        Some("upstream_error"),
+        Some(if memory_exhausted {
+            "memory_capacity"
+        } else {
+            "upstream_error"
+        }),
     )
     .await;
-    update_terminal_usage_error(&guard.state, &guard.request_id, error.message.clone()).await;
+    update_terminal_usage_error(
+        &guard.state,
+        &guard.request_id,
+        if memory_exhausted {
+            error.client_message().to_string()
+        } else {
+            error.message.clone()
+        },
+    )
+    .await;
+    if memory_exhausted {
+        let _ = guard
+            .state
+            .update_usage_log(&guard.request_id, |log| {
+                log.outcome = UsageOutcome::InternalError;
+                log.failure_kind = Some("memory_capacity".to_string());
+                log.reset_router_sync_state();
+            })
+            .await;
+    }
     record_share_invocation_result(
         &guard.state,
         guard.share_id.as_deref(),
@@ -20343,11 +20614,19 @@ async fn finish_qoder_stream_failure(
     record_provider_outcome(
         &guard.state,
         &guard.stored,
-        provider_outcome_from_status(error.status.as_u16()),
+        qoder_failure_provider_outcome(error),
     )
     .await;
     guard.disarm();
-    stream_terminal_error_frame(route, &error.message, error.status.as_u16())
+    stream_terminal_error_frame(
+        route,
+        if memory_exhausted {
+            error.client_message()
+        } else {
+            &error.message
+        },
+        error.status.as_u16(),
+    )
 }
 
 async fn finish_kiro_stream_failure(
@@ -30283,6 +30562,36 @@ mod tests {
                 Some(provider_type)
             ));
         }
+    }
+
+    #[test]
+    fn qoder_request_memory_scope_is_provider_exact_on_every_surface() {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            assert!(request_memory_enabled_for_provider(
+                app,
+                Some(ProviderType::QoderCosy)
+            ));
+        }
+        for provider_type in [
+            ProviderType::Claude,
+            ProviderType::ClaudeAuth,
+            ProviderType::DeepSeekApi,
+            ProviderType::GeminiCli,
+        ] {
+            assert!(!request_memory_enabled_for_provider(
+                AppKind::Claude,
+                Some(provider_type)
+            ));
+        }
+    }
+
+    #[test]
+    fn qoder_memory_exhaustion_is_capacity_shed_not_network_failure() {
+        let error = ProxyError::request_memory_exhausted();
+        assert_eq!(
+            qoder_failure_provider_outcome(&error),
+            ProviderOutcome::CapacityShed { status_code: 503 }
+        );
     }
 
     #[test]

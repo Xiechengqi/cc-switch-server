@@ -21,6 +21,9 @@ use super::super::adapters::AdapterRequest;
 use super::super::provider_ops::ProviderExecution;
 use super::super::qoder as wire;
 use super::super::qoder_runtime::{self as runtime, PreparedQoderRuntime};
+use super::super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
+};
 use super::super::{bounded_upstream_rate_limit_until, ProxyError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +78,17 @@ pub(crate) struct CanonicalRequest {
     pub(crate) downstream_session_id: String,
     pub(crate) requested_model: String,
     pub(crate) body: Value,
+}
+
+impl CanonicalRequest {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.share_id
+            .capacity()
+            .saturating_add(self.user_namespace.capacity())
+            .saturating_add(self.downstream_session_id.capacity())
+            .saturating_add(self.requested_model.capacity())
+            .saturating_add(retained_json_bytes(&self.body))
+    }
 }
 
 #[derive(Debug)]
@@ -157,13 +171,36 @@ pub(crate) struct PreparedGeneration {
     pub(crate) model_key: String,
     pub(crate) model_source: String,
     pub(crate) payload: runtime::PreparedQoderPayload,
+    pub(crate) prepared_memory: Option<RequestMemoryReservation>,
+}
+
+impl PreparedGeneration {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.model_key
+            .capacity()
+            .saturating_add(self.model_source.capacity())
+            .saturating_add(self.payload.retained_bytes())
+    }
 }
 
 pub(crate) fn prepare_generation(
     prepared_runtime: &PreparedQoderRuntime,
     canonical: &CanonicalRequest,
     now_ms: i64,
+    request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<PreparedGeneration, ProxyError> {
+    // Model/session derivation and payload construction normalize history and
+    // tools before assembling the final COSY document. Reserve their working
+    // set before any request-owned strings or JSON clones are allocated.
+    let prepared_memory = request_memory
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                canonical.retained_bytes().saturating_mul(3),
+            )
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
     let model_key = runtime::resolve_qoder_model_key(
         prepared_runtime.session.session.site,
         &canonical.requested_model,
@@ -198,6 +235,16 @@ pub(crate) fn prepare_generation(
         &model_key,
     )
     .map_err(ProxyError::bad_request)?;
+    if let Some(memory) = prepared_memory.as_ref() {
+        memory
+            .resize(
+                canonical
+                    .retained_bytes()
+                    .saturating_mul(3)
+                    .saturating_add(retained_json_bytes(exact_model_config).saturating_mul(2)),
+            )
+            .map_err(|error| error.into_proxy_error())?;
+    }
     let payload = runtime::build_qoder_payload(
         &canonical.body,
         exact_model_config,
@@ -215,11 +262,18 @@ pub(crate) fn prepare_generation(
         .filter(|value| !value.is_empty())
         .unwrap_or("system")
         .to_string();
-    Ok(PreparedGeneration {
+    let prepared = PreparedGeneration {
         model_key,
         model_source,
         payload,
-    })
+        prepared_memory,
+    };
+    if let Some(memory) = prepared.prepared_memory.as_ref() {
+        memory
+            .resize(prepared.retained_bytes())
+            .map_err(|error| error.into_proxy_error())?;
+    }
+    Ok(prepared)
 }
 
 pub(crate) async fn runtime_is_current(
@@ -363,15 +417,15 @@ mod tests {
     #[tokio::test]
     async fn live_catalog_selection_is_exact_and_site_scoped() {
         let global = runtime(QoderSite::Global).await;
-        let prepared = prepare_generation(&global, &canonical("glm-5.3"), 1_700_000_000_000)
+        let prepared = prepare_generation(&global, &canonical("glm-5.3"), 1_700_000_000_000, None)
             .expect("Global alias is entitled");
         assert_eq!(prepared.model_key, "gmodel");
         assert_eq!(prepared.model_source, "system");
         assert_eq!(prepared.payload.model_key, "gmodel");
 
         let cn = runtime(QoderSite::Cn).await;
-        let missing =
-            prepare_generation(&cn, &canonical("qwen3.7-max"), 1_700_000_000_000).unwrap_err();
+        let missing = prepare_generation(&cn, &canonical("qwen3.7-max"), 1_700_000_000_000, None)
+            .unwrap_err();
         assert_eq!(missing.status, StatusCode::FORBIDDEN);
         assert!(missing.message.contains("qmodel_latest"));
     }
@@ -379,12 +433,18 @@ mod tests {
     #[tokio::test]
     async fn conversation_identity_changes_with_share_and_never_falls_back() {
         let prepared_runtime = runtime(QoderSite::Global).await;
-        let first = prepare_generation(&prepared_runtime, &canonical("glm-5.3"), 1_700_000_000_000)
-            .unwrap();
+        let first = prepare_generation(
+            &prepared_runtime,
+            &canonical("glm-5.3"),
+            1_700_000_000_000,
+            None,
+        )
+        .unwrap();
         let mut second_request = canonical("glm-5.3");
         second_request.share_id = "share-qoder-decoy".to_string();
         let second =
-            prepare_generation(&prepared_runtime, &second_request, 1_700_000_000_000).unwrap();
+            prepare_generation(&prepared_runtime, &second_request, 1_700_000_000_000, None)
+                .unwrap();
         assert_ne!(first.payload.session_id, second.payload.session_id);
     }
 }

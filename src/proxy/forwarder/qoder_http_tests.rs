@@ -59,7 +59,10 @@ impl QoderFixtureRail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QoderGenerationReply {
     Success,
+    LargeAggregate,
+    LargeToolStream,
     HttpUnauthorized,
+    OversizedHttpUnauthorized,
     EmbeddedUnauthorized,
     FirstBusinessThenUnauthorized,
     Entitlement112,
@@ -286,6 +289,72 @@ fn success_stream() -> Response {
         .unwrap()
 }
 
+fn large_aggregate_stream() -> Response {
+    let content = "a".repeat(4 * 1024);
+    let mut chunks = (0..96)
+        .map(|_| {
+            Ok::<_, std::convert::Infallible>(qoder_wrapper(
+                json!("OK"),
+                inner_success_chunk(Some(&content), false),
+            ))
+        })
+        .collect::<Vec<_>>();
+    chunks.push(Ok(qoder_wrapper(
+        json!("OK"),
+        inner_success_chunk(None, true),
+    )));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap()
+}
+
+fn tool_argument_chunk(fragment: &str, first: bool, terminal: bool) -> Value {
+    let tool_call = if first {
+        json!({
+            "index": 0,
+            "id": "call_memory",
+            "type": "function",
+            "function": {"name": "bounded_tool", "arguments": fragment}
+        })
+    } else {
+        json!({"index": 0, "function": {"arguments": fragment}})
+    };
+    json!({
+        "id": "chat-qoder-memory",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": MODEL_KEY,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [tool_call]},
+            "finish_reason": terminal.then_some("tool_calls")
+        }]
+    })
+}
+
+fn large_tool_stream() -> Response {
+    let fragment = "x".repeat(2 * 1024);
+    let mut chunks = (0..128)
+        .map(|index| {
+            Ok::<_, std::convert::Infallible>(qoder_wrapper(
+                json!("OK"),
+                tool_argument_chunk(&fragment, index == 0, false),
+            ))
+        })
+        .collect::<Vec<_>>();
+    chunks.push(Ok(qoder_wrapper(
+        json!("OK"),
+        tool_argument_chunk("", false, true),
+    )));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap()
+}
+
 fn embedded_error(status: &'static str, body: Value) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -330,10 +399,19 @@ async fn qoder_generation(
         .unwrap_or(QoderGenerationReply::Success);
     match reply {
         QoderGenerationReply::Success => success_stream(),
+        QoderGenerationReply::LargeAggregate => large_aggregate_stream(),
+        QoderGenerationReply::LargeToolStream => large_tool_stream(),
         QoderGenerationReply::HttpUnauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(json!({"message": "expired"}).to_string()))
+            .unwrap(),
+        QoderGenerationReply::OversizedHttpUnauthorized => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"message": "x".repeat(512 * 1024)}).to_string(),
+            ))
             .unwrap(),
         QoderGenerationReply::EmbeddedUnauthorized => {
             embedded_error("UNAUTHORIZED", json!({"message": "embedded expired"}))
@@ -861,6 +939,225 @@ fn qoder_http_fixture_covers_all_credential_rails_and_client_surfaces() {
                     server.abort();
                 }
             }
+        }
+    });
+}
+
+#[test]
+fn qoder_request_memory_rejects_all_surfaces_before_any_upstream_request() {
+    run_qoder_async_test(async {
+        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+            let name = format!("qoder-memory-pre-network-{}", app.as_str());
+            let (address, fixture, server) = spawn_qoder_upstream(
+                QoderFixtureRail::GlobalOauth,
+                vec![QoderGenerationReply::Success],
+            )
+            .await;
+            let (_, _, body) = surface_request(app, false);
+            let mut state = qoder_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("Qoder test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = body.len().saturating_add(1);
+            let origin = format!("http://{address}");
+            let (provider_id, _) =
+                install_qoder_provider(&state, &name, app, QoderFixtureRail::GlobalOauth, &origin)
+                    .await;
+            let share_id = format!("{name}-share");
+            install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com").await;
+
+            let error = forward_qoder_surface(
+                state,
+                app,
+                provider_id,
+                &share_id,
+                "owner@example.com",
+                "memory-pre-network",
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.is_request_memory_exhausted(), "{app:?}: {error:?}");
+            assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
+            assert_eq!(fixture.count(&fixture.model_requests), 0, "{app:?}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 0, "{app:?}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn qoder_nonstream_aggregate_is_bounded_by_request_memory() {
+    run_qoder_async_test(async {
+        let name = "qoder-memory-nonstream-aggregate";
+        let (address, fixture, server) = spawn_qoder_upstream(
+            QoderFixtureRail::GlobalOauth,
+            vec![QoderGenerationReply::LargeAggregate],
+        )
+        .await;
+        let mut state = qoder_test_state(name);
+        Arc::get_mut(&mut state)
+            .expect("Qoder test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 192 * 1024;
+        let origin = format!("http://{address}");
+        let (provider_id, _) = install_qoder_provider(
+            &state,
+            name,
+            AppKind::Claude,
+            QoderFixtureRail::GlobalOauth,
+            &origin,
+        )
+        .await;
+        let share_id = format!("{name}-share");
+        install_qoder_share(
+            &state,
+            &share_id,
+            AppKind::Claude,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+
+        let error = forward_qoder_surface(
+            state.clone(),
+            AppKind::Claude,
+            provider_id,
+            &share_id,
+            "owner@example.com",
+            "memory-aggregate",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_request_memory_exhausted(), "{error:?}");
+        assert_eq!(fixture.count(&fixture.model_requests), 1);
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        let usage = state.usage.read().await.logs.last().cloned().unwrap();
+        assert_eq!(usage.stream_status, None);
+        assert_eq!(usage.failure_kind.as_deref(), Some("memory_capacity"));
+        assert_eq!(usage.outcome, UsageOutcome::InternalError);
+        server.abort();
+    });
+}
+
+#[test]
+fn qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal() {
+    run_qoder_async_test(async {
+        let name = "qoder-memory-stream-tools";
+        let (address, fixture, server) = spawn_qoder_upstream(
+            QoderFixtureRail::GlobalOauth,
+            vec![QoderGenerationReply::LargeToolStream],
+        )
+        .await;
+        let mut state = qoder_test_state(name);
+        Arc::get_mut(&mut state)
+            .expect("Qoder test state must be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 192 * 1024;
+        let origin = format!("http://{address}");
+        let (provider_id, _) = install_qoder_provider(
+            &state,
+            name,
+            AppKind::Codex,
+            QoderFixtureRail::GlobalOauth,
+            &origin,
+        )
+        .await;
+        let share_id = format!("{name}-share");
+        install_qoder_share(
+            &state,
+            &share_id,
+            AppKind::Codex,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+
+        let response = forward_qoder_surface(
+            state.clone(),
+            AppKind::Codex,
+            provider_id,
+            &share_id,
+            "owner@example.com",
+            "memory-stream-tools",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(collect(response).await).unwrap();
+        assert_eq!(
+            body.matches("cc_switch_request_memory_exhausted").count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(body.matches("event: response.failed").count(), 1, "{body}");
+        assert!(
+            !body.contains("resident-memory budget exhausted for"),
+            "{body}"
+        );
+        assert_eq!(fixture.count(&fixture.model_requests), 1);
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        let usage = state.usage.read().await.logs.last().cloned().unwrap();
+        assert_eq!(usage.stream_status.as_deref(), Some("memory_capacity"));
+        assert_eq!(usage.failure_kind.as_deref(), Some("memory_capacity"));
+        assert_eq!(usage.outcome, UsageOutcome::InternalError);
+        server.abort();
+    });
+}
+
+#[test]
+fn qoder_memory_exhaustion_never_replays_unauthorized_on_any_rail() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            let name = format!("qoder-memory-auth-no-replay-{}", rail.label());
+            let (address, fixture, server) =
+                spawn_qoder_upstream(rail, vec![QoderGenerationReply::OversizedHttpUnauthorized])
+                    .await;
+            let mut state = qoder_test_state(&name);
+            Arc::get_mut(&mut state)
+                .expect("Qoder test state must be uniquely owned")
+                .request_body_limits
+                .memory_budget_bytes = 128 * 1024;
+            let origin = format!("http://{address}");
+            let (provider_id, _) =
+                install_qoder_provider(&state, &name, AppKind::Codex, rail, &origin).await;
+            let share_id = format!("{name}-share");
+            install_qoder_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+
+            let error = forward_qoder_surface(
+                state,
+                AppKind::Codex,
+                provider_id,
+                &share_id,
+                "owner@example.com",
+                "memory-auth-no-replay",
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.is_request_memory_exhausted(), "{rail:?}: {error:?}");
+            assert_eq!(fixture.count(&fixture.model_requests), 1, "{rail:?}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1, "{rail:?}");
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{rail:?}");
+            assert_eq!(
+                fixture.count(&fixture.pat_exchanges),
+                usize::from(rail == QoderFixtureRail::Pat),
+                "{rail:?}"
+            );
+            server.abort();
         }
     });
 }
