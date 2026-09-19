@@ -149,6 +149,10 @@
         {
           "path": "src/kiro/parser/decoder.rs",
           "sha256": "1c66a96f56c189fe967365635d74f17fe09a22a9b7857d625671bdb374a3f676"
+        },
+        {
+          "path": "src/kiro/parser/frame.rs",
+          "sha256": "0c3a13d6da5d527dae0a9721a593a4d599572dd98794f9c5107b8f586ee1d035"
         }
       ]
     }
@@ -473,6 +477,62 @@
           "anchors": [
             "check_kiro_receipt_scope builder_id us-east-1",
             "check_kiro_receipt_scope api_key eu-central-1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CORE-N2-KIRO",
+      "status": "fixture_verified",
+      "rails": ["kiro_oauth", "amazon_q_oauth"],
+      "surfaces": ["claude_messages", "codex_chat_completions", "codex_responses"],
+      "transports": ["http_eventstream", "sse_eventstream"],
+      "stickyExhaustion": true,
+      "canonicalAndWireBounded": true,
+      "imageExpansionBounded": true,
+      "eventStreamRetainedStateBounded": true,
+      "capacityShedNotNetworkFailure": true,
+      "liveReceiptState": "live_pending",
+      "compactRuntimeEnabled": false,
+      "sharedCacheRuntimeEnabled": false,
+      "localEvidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "kiro_and_amazon_q_request_memory_scope_is_provider_exact",
+            "kiro_and_amazon_q_request_memory_exhaust_before_any_upstream_request",
+            "kiro_non_stream_response_memory_exhaustion_is_stable_and_not_retried",
+            "kiro_stream_tool_state_memory_exhaustion_emits_one_stable_terminal",
+            "kiro_memory_exhaustion_is_capacity_shed_not_network_failure"
+          ]
+        },
+        {
+          "path": "src/proxy/kiro.rs",
+          "anchors": [
+            "KiroStreamMemory",
+            "kiro_event_stream_to_claude_sse_with_request_memory",
+            "REQUEST_MEMORY_STREAM_ERROR_PREFIX"
+          ]
+        },
+        {
+          "path": "src/proxy/kiro/image.rs",
+          "anchors": [
+            "prepare_anthropic_images_with_memory",
+            "image_decode_working_set_obeys_request_memory_budget"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/kiro/mod.rs",
+          "anchors": [
+            "prepared_memory",
+            "prepare_kiro_request_with_context_and_memory"
+          ]
+        },
+        {
+          "path": "src/proxy/request_memory.rs",
+          "anchors": [
+            "serialized_json_bytes",
+            "serialized_json_size_matches_compact_serde_output"
           ]
         }
       ]
@@ -1052,6 +1112,60 @@
         "fixtureIds": []
       },
       "reason": "Reject automatic remote-compaction enablement and ordinary-inference substitution until a separately reviewed executor and real receipt exist."
+    },
+    {
+      "id": "KI-OBS-0014",
+      "providerFamily": "kiro",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "kiro-rs-head",
+        "snapshotId": "kiro-rs-2026-09-19",
+        "repository": "kiro.rs",
+        "deltaId": "eventstream_frame_buffer_memory_signal",
+        "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+        "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
+        "paths": ["src/kiro/parser/decoder.rs", "src/kiro/parser/frame.rs"],
+        "symbols": ["DEFAULT_MAX_BUFFER_SIZE", "MAX_MESSAGE_SIZE", "BufferOverflow", "MessageTooLarge"],
+        "sourceDigest": "04020906c408b2fdb206eb6eb4a52ef04c42863551f38fb44f1b4d57eef2484d"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CORE-N2"],
+      "target": {
+        "baselineCommit": "f21b63e82d27c5e07d9fa196b7c122e1a33e27d9",
+        "baselineTree": "154e049700e91739ada3714fd4b78f4a9f6d0b2f",
+        "implementationCommit": "7526159242d3279ec9fd2eca56a6efacf0c3c9da",
+        "implementationTree": "76f89befd1e2f28a227e37d2998c874011dcecde",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "kiro_and_amazon_q_request_memory_scope_is_provider_exact",
+              "kiro_and_amazon_q_request_memory_exhaust_before_any_upstream_request",
+              "kiro_non_stream_response_memory_exhaustion_is_stable_and_not_retried",
+              "kiro_stream_tool_state_memory_exhaustion_emits_one_stable_terminal",
+              "kiro_memory_exhaustion_is_capacity_shed_not_network_failure"
+            ]
+          },
+          {
+            "path": "src/proxy/kiro/image.rs",
+            "anchors": ["image_decode_working_set_obeys_request_memory_budget"]
+          },
+          {
+            "path": "src/proxy/request_memory.rs",
+            "anchors": ["serialized_json_size_matches_compact_serde_output"]
+          }
+        ],
+        "fixtureIds": [
+          "kiro_and_amazon_q_request_memory_scope_is_provider_exact",
+          "kiro_and_amazon_q_request_memory_exhaust_before_any_upstream_request",
+          "kiro_non_stream_response_memory_exhaustion_is_stable_and_not_retried",
+          "kiro_stream_tool_state_memory_exhaustion_emits_one_stable_terminal",
+          "kiro_memory_exhaustion_is_capacity_shed_not_network_failure",
+          "image_decode_working_set_obeys_request_memory_budget",
+          "serialized_json_size_matches_compact_serde_output"
+        ]
+      },
+      "reason": "kiro.rs proves that an AWS EventStream frame and the rolling decoder buffer must each remain bounded at 16 MiB. It does not prove one request-lifecycle budget, image decode/resize expansion, canonical and wire copies, downstream transform state, sticky exhaustion, or capacity classification; those are independently enforced for exact Kiro and Amazon Q bindings by the local implementation."
     }
   ],
   "legacyV1": {

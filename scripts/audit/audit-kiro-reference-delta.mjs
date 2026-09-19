@@ -229,7 +229,7 @@ for (const source of contract.sources ?? []) {
 
 assert(
   objectDigest(contract.sourceExtensions) ===
-    "20371c3723bec8b69ae0799be87eb8f5b01451330e85b49b6eab21303a25b1d0",
+    "bb127e5540cbb9845572c93f5b3abdc67c3f0d886c2f34dbeb70c0cc588c6ce4",
   "Kiro source extension history changed",
 );
 const sourceById = new Map();
@@ -276,7 +276,7 @@ const currentSource = sourceById.get("kiro-rs-head");
 assert(
   currentSource.commit === "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863" &&
     currentSource.previousReviewedCommit === "22d2c2d0695ba350890072c19990f54782827ae5" &&
-    currentSource.files.length === 14,
+    currentSource.files.length === 15,
   "Kiro current committed source history changed",
 );
 
@@ -351,6 +351,7 @@ const immutableObservationDigests = new Map([
   ["KI-OBS-0011", "78fdbf5d963fb7793cc30c865fc9674d50b62ae48cb227919bc82a77c22f2266"],
   ["KI-OBS-0012", "9b4393cb33aa4977c72d38320413fad6567f504e027d6c4e1dc307d5f97bf176"],
   ["KI-OBS-0013", "a5378092cba17dc28ebb7d4bc81eaa837e009952a2691b43e7839bc840d752d1"],
+  ["KI-OBS-0014", "98324a4673b86d56c253b4146b4257d3773ce267df0511184c07f8940312f2e4"],
 ]);
 const expectedEnhancementIds = new Set([
   "KI-01",
@@ -362,6 +363,7 @@ const expectedEnhancementIds = new Set([
   "KI-N2",
   "KI-N3",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
   "KI-R1",
   "KI-R2",
@@ -381,6 +383,7 @@ const expectedDispositions = new Map([
   ["KI-OBS-0011", "reject"],
   ["KI-OBS-0012", "reject"],
   ["KI-OBS-0013", "reject"],
+  ["KI-OBS-0014", "differential"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -551,21 +554,23 @@ assert(
 
 assert(
   objectDigest(contract.evidenceExtensions) ===
-    "3bbe6eb43e0c7ba1d4e37b686b2b367d3aa0e158fd80057b8bd76eb701f6f770",
+    "7391e437530b4d086080bc9ea05618d70ba332a9fd442f0fb404dcc10a009ceb",
   "Kiro evidence extension history changed",
 );
 const evidenceExtensions = new Map(
   (contract.evidenceExtensions ?? []).map((entry) => [entry.id, entry]),
 );
 assert(
-  evidenceExtensions.size === 2 &&
+  evidenceExtensions.size === 3 &&
     evidenceExtensions.has("CORE-N1") &&
-    evidenceExtensions.has("LIVE-N1"),
+    evidenceExtensions.has("LIVE-N1") &&
+    evidenceExtensions.has("CORE-N2-KIRO"),
   "Kiro CORE/LIVE evidence extension set changed",
 );
 for (const [id, expectedCount] of [
   ["CORE-N1", 2],
   ["LIVE-N1", 3],
+  ["CORE-N2-KIRO", 5],
 ]) {
   const extension = evidenceExtensions.get(id);
   assert(
@@ -596,6 +601,25 @@ assert(
     evidenceExtensions.get("LIVE-N1").receiptsIndependent === true &&
     evidenceExtensions.get("LIVE-N1").runtimeAutoEnable === false,
   "LIVE-N1 receipt isolation or runtime gate changed",
+);
+const requestMemoryExtension = evidenceExtensions.get("CORE-N2-KIRO");
+assert(
+  requestMemoryExtension.status === "fixture_verified" &&
+    JSON.stringify(requestMemoryExtension.rails) ===
+      JSON.stringify(["kiro_oauth", "amazon_q_oauth"]) &&
+    JSON.stringify(requestMemoryExtension.surfaces) ===
+      JSON.stringify(["claude_messages", "codex_chat_completions", "codex_responses"]) &&
+    JSON.stringify(requestMemoryExtension.transports) ===
+      JSON.stringify(["http_eventstream", "sse_eventstream"]) &&
+    requestMemoryExtension.stickyExhaustion === true &&
+    requestMemoryExtension.canonicalAndWireBounded === true &&
+    requestMemoryExtension.imageExpansionBounded === true &&
+    requestMemoryExtension.eventStreamRetainedStateBounded === true &&
+    requestMemoryExtension.capacityShedNotNetworkFailure === true &&
+    requestMemoryExtension.liveReceiptState === "live_pending" &&
+    requestMemoryExtension.compactRuntimeEnabled === false &&
+    requestMemoryExtension.sharedCacheRuntimeEnabled === false,
+  "CORE-N2-KIRO evidence boundary changed",
 );
 
 const capabilities = new Map(

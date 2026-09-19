@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-19 Kiro request-lifecycle memory freeze
+
+CORE-N2 的 Kiro 切片冻结在 `assets/contract/kiro-reference-delta.json` 的 `KI-OBS-0014` 与 `CORE-N2-KIRO` evidence extension。一次性只读证据继续只取 `kiro.rs@be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863`（tree `5e656c1bf70aac0224a68251b2065966db01e933`）的 committed object：`MAX_MESSAGE_SIZE` 与 `DEFAULT_MAX_BUFFER_SIZE` 都是 16 MiB，分别拒绝超长 AWS EventStream frame 与 rolling decoder buffer。该参考只证明 frame/buffer retained state 必须有界，不证明统一 request-lifecycle budget、图片解码/resize 膨胀、canonical/wire 副本、下游 transform 或容量分类。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-kiro-reference-delta.mjs --check-sources` 才复核冻结 Git object。
+
+生产实现冻结在 `7526159242d3279ec9fd2eca56a6efacf0c3c9da`（tree `76f89befd1e2f28a227e37d2998c874011dcecde`）。它只为精确的 `ProviderType::KiroOAuth` 与 `ProviderType::AmazonQOAuth` 启用 sticky budget，覆盖 Claude Messages、Codex Chat Completions/Responses 的非流与流式 EventStream；raw/decoded body、canonical JSON、prepared request、序列化 wire body、目标 headers、prompt-cache 临时状态、非流响应 wire/解压/聚合/转换，以及 EventStream decoder/frame、tool JSON、tool leak filter、SSE builder、usage parser 与 downstream transform 共享同一请求预算。图片路径在 base64 decode 前预留 decoded upper bound，并核算像素 decode、resize、RGB、JPEG 与重新 base64 的工作集。
+
+同账号 401 replay 前后不会重置预算；容量耗尽是 sticky 的，未提交响应返回稳定 `503 / cc_switch_request_memory_exhausted`，已提交 200 的 stream 发送同码 503 terminal。usage 归类 `memory_capacity`，Provider outcome 归类 capacity shed，不会进入普通 `NetworkFailure`，也不会重放、换 Account、Provider、auth kind 或 region。prepared/canonical reservation 跟随流式 Response body 生命周期；内外两层 stream 堆化，避免大型状态按值穿过 `Poll` 导致默认测试线程栈溢出。
+
+专项验证为 Kiro 102/102、request-memory 21/21、Amazon Q 14/14，`cargo check --lib`、Clippy `--all-targets -D warnings`、格式与差异检查均通过。14 条 append-only observation 与 `CORE-N2-KIRO=fixture_verified` 只证明本地容量合同，不是八个 auth-kind × region scope 的真实 OAuth/长流/内存压力 receipt；八份 receipt 继续分别为 `null/live_pending`，remote compaction 与 shared cache 仍保持 runtime disabled。
+
 ## 2026-09-19 Grok request-lifecycle memory freeze
 
 CORE-N2 的 Grok 切片冻结在 `assets/contract/grok-reference-delta.json` 的 `GR-OBS-0011` 与 `CORE-N2-GROK` evidence extension。一次性只读证据继续只取 `grok2api@906b9493b099d192381c698d4e320fafeccb851c`（tree `eca3a45c482375fad636578b28d73c1186d2bef4`）的 committed object：reasoning cache 默认以 4096 entry、30 分钟 TTL、scope key 与 LRU 淘汰约束状态。该参考只证明 replay retained state 必须有界，没有单 proof 字节上限，也没有统一 request-lifecycle budget；`sub2api@ab99d56e9626e6cd731592dae8553c9758a0efa2` 的 6 项工作树修改继续全部排除。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核冻结 Git object。
