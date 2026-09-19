@@ -299,6 +299,28 @@
               "sha256": "8c15f242c5435cd800a775faec42adc0d7388890eacfaa68acac7b85354a8a75"
             }
           ]
+        },
+        {
+          "id": "thinking_replay_memory_bounds",
+          "commit": "2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e",
+          "files": [
+            {
+              "path": "internal/cache/claude_thinking_replay_cache.go",
+              "sha256": "182b829012cedbb6ee7e45d1ec8e326ac3297d60881b050b7d31692071531001"
+            },
+            {
+              "path": "internal/cache/claude_thinking_replay_cache_test.go",
+              "sha256": "0f2423b2280ac16db249ffcaf21b8d0ab4020704cc6e9b8fc378f6d2482ba990"
+            },
+            {
+              "path": "internal/runtime/executor/claude_thinking_replay.go",
+              "sha256": "d421ce59c2a21a0cdf813b1d5c13f7695db3207739797fcfc882120e1c9f2934"
+            },
+            {
+              "path": "internal/runtime/executor/claude_thinking_replay_test.go",
+              "sha256": "a4615ad501ec42c45931fc22002d33ce91be881b978f75a39e1a84e74fdf8d0a"
+            }
+          ]
         }
       ]
     }
@@ -787,6 +809,74 @@
         "fixtureIds": ["Claude real harness validates all four operation receipts independently", "Claude real harness never prints secrets or a raw failure body"]
       },
       "reason": "Add four current-commit private receipt gates; without real credentials every operation remains independently live_pending."
+    },
+    {
+      "id": "CL-OBS-0015",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-19T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-19",
+        "repository": "CLIProxyAPI",
+        "deltaId": "thinking_replay_memory_bounds",
+        "commit": "2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e",
+        "tree": "48db041ce6e0ea0bb0c5c96a7fcfb0566c12eca8",
+        "paths": ["internal/cache/claude_thinking_replay_cache.go", "internal/cache/claude_thinking_replay_cache_test.go", "internal/runtime/executor/claude_thinking_replay.go", "internal/runtime/executor/claude_thinking_replay_test.go"],
+        "symbols": ["ClaudeThinkingReplayCacheMaxBytesPerSession", "ClaudeThinkingReplayCacheMaxTurnsPerSession", "ClaudeThinkingReplayCacheMaxBlocksPerTurn", "ClaudeThinkingReplayCacheMaxTotalBytes", "ReplaceClaudeThinkingReplayIfUnchanged", "prepareClaudeThinkingReplayRequest"],
+        "sourceDigest": "c32eb842c8b7cd1272ee051464e8a19db20eafe5026f14548af2ce4757d5ce8e"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CORE-N2"],
+      "target": {
+        "baselineCommit": "05f6a81cba5c84b484fa1ed5cbf33b7c0d9cf01b",
+        "baselineTree": "9f3a2ec6632fbd7eb0f419a2ece0cd99c8901f0b",
+        "implementationCommit": "87fc0b0aeeff861a8096b26093c040ac19c99d0d",
+        "implementationTree": "37b60b5f3d3ea1cbcc8cc63b188262b7572b624a",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth", "claude_oauth_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "claude_oauth_compressed_sse_expansion_exhaustion_is_sticky_and_not_retried", "claude_oauth_retained_tool_json_exhaustion_terminates_committed_stream_without_retry", "claude_streaming_decoder_budgets_wire_and_decoded_bytes_until_last_view_drop"]
+          },
+          {
+            "path": "src/proxy/anthropic_semantics.rs",
+            "anchors": ["AnthropicSseInspector", "retained_bytes"]
+          },
+          {
+            "path": "src/proxy/request_memory.rs",
+            "anchors": ["StreamRetainedState", "retain_bytes"]
+          }
+        ],
+        "fixtureIds": ["request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth", "claude_oauth_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "claude_oauth_compressed_sse_expansion_exhaustion_is_sticky_and_not_retried", "claude_oauth_retained_tool_json_exhaustion_terminates_committed_stream_without_retry", "claude_streaming_decoder_budgets_wire_and_decoded_bytes_until_last_view_drop"]
+      },
+      "reason": "The reference proves bounded retained Claude replay state (8 MiB per session, 64 turns, 512 blocks per turn, 256 MiB process total, one-hour TTL and CAS replacement), but not a unified Claude OAuth request-lifecycle budget; adopt the bounded-state signal while independently covering raw, decoded and normalized bodies, compressed SSE expansion, per-chunk parser and tool-patcher state, sticky exhaustion, and last-view release on the exact ClaudeOAuth Provider type."
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "CORE-N2-CLAUDE",
+      "status": "fixture_verified",
+      "contracts": [
+        {
+          "path": "src/proxy/request_memory.rs",
+          "anchors": ["StreamRetainedState", "retain_bytes"]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth", "claude_oauth_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "claude_oauth_compressed_sse_expansion_exhaustion_is_sticky_and_not_retried", "claude_oauth_retained_tool_json_exhaustion_terminates_committed_stream_without_retry", "claude_streaming_decoder_budgets_wire_and_decoded_bytes_until_last_view_drop"]
+        },
+        {
+          "path": "src/proxy/anthropic_semantics.rs",
+          "anchors": ["AnthropicSseInspector", "retained_bytes"]
+        },
+        {
+          "path": "src/proxy/streaming.rs",
+          "anchors": ["StreamUsageAccumulator", "ClaudeSseErrorDetector", "retained_bytes"]
+        },
+        {
+          "path": "src/proxy/claude_oauth.rs",
+          "anchors": ["ClaudeToolNameStreamPatcher", "retained_bytes"]
+        }
+      ]
     }
   ]
 }

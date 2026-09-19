@@ -207,6 +207,7 @@ const immutableObservationDigests = new Map([
   ["CL-OBS-0012", "0ea15c51dea16ee523df0ed7b1f320b7405b41e16f9b56b30328f42ddf28965c"],
   ["CL-OBS-0013", "668063ac2a715cafb46980165278cb5b31277e1a48645186c9351da356e4af7f"],
   ["CL-OBS-0014", "f1e71a3c98544d255b560b9cf087f9b4bab0e486af777308d33d140bdd63443a"],
+  ["CL-OBS-0015", "9af39e8156399d207a2fe39d2e7b7adbb556c3967149cff7e04f1c5870d5abf6"],
 ]);
 const expectedEnhancementIds = new Set([
   "CL-01",
@@ -221,6 +222,7 @@ const expectedEnhancementIds = new Set([
   "CL-N4",
   "CL-R1",
   "CORE-N1",
+  "CORE-N2",
   "LIVE-N1",
 ]);
 const observedEnhancementIds = new Set();
@@ -374,6 +376,35 @@ assert(
   [...sourceDeltaByKey.keys()].every((key) => observedDeltaKeys.has(key)),
   "Claude frozen source deltas are not fully mapped to observations",
 );
+
+const expectedCapabilities = new Map([["CORE-N2-CLAUDE", "fixture_verified"]]);
+for (const capability of baseline.capabilities ?? []) {
+  assert(
+    expectedCapabilities.get(capability.id) === capability.status,
+    `${capability.id} has an unsupported evidence state`,
+  );
+  expectedCapabilities.delete(capability.id);
+  assert(
+    Array.isArray(capability.contracts) && capability.contracts.length > 0,
+    `${capability.id} has no local contracts`,
+  );
+  for (const contract of capability.contracts) {
+    assertSafePath(contract.path, `${capability.id}:${contract.path ?? "<missing>"}`);
+    const localPath = path.resolve(root, contract.path);
+    assert(
+      localPath.startsWith(`${root}${path.sep}`) && fs.existsSync(localPath),
+      `${capability.id} local contract path is unavailable`,
+    );
+    const source = fs.readFileSync(localPath, "utf8");
+    assert(
+      Array.isArray(contract.anchors) &&
+        contract.anchors.length > 0 &&
+        contract.anchors.every((anchor) => source.includes(anchor)),
+      `${capability.id} has an unavailable local contract anchor`,
+    );
+  }
+}
+assert(expectedCapabilities.size === 0, "Claude capability coverage is incomplete");
 
 const localIds = new Set();
 for (const contract of baseline.localContracts ?? []) {

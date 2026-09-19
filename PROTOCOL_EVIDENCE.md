@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-19 Claude OAuth request-lifecycle memory freeze
+
+CORE-N2 的 Claude 切片冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0015`。一次性只读证据来自 `CLIProxyAPI@2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e`（tree `48db041ce6e0ea0bb0c5c96a7fcfb0566c12eca8`）：其 Claude-compatible thinking replay 将每 session 限为 8 MiB/64 turns、每 turn 限为 512 blocks、进程总量限为 256 MiB，TTL 为一小时，并以 snapshot CAS replace/clear。该参考只证明 Claude retained replay state 必须有界，而且只适用于 API-key compatibility rail；它不能证明本仓库 Claude OAuth 的统一请求生命周期预算。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 才复核冻结 Git object。
+
+`87fc0b0` 的独立实现只为精确的 `ProviderType::ClaudeOAuth` 启用已有 sticky budget；同一 Claude App 下的 `claude`、`claude_auth` 和其他 Provider 不被误启用。Share binding 与 pinned Provider test 均在发网前初始化预算，最终 execution 选择后的 binding 漂移兜底会补齐 raw/decoded reservation。预算在同一请求的 transport/body recovery 间共享，一旦耗尽便禁止 replay，不切换 Account、Provider 或 rail。
+
+核算范围包括 raw/decoded/normalized request body、buffered response，以及 Claude 压缩 SSE 的完整 wire body 和解压 body；解压上限按预算剩余量收窄，decoded `Bytes` 的 reservation 跟随 backing owner 到最后一个 clone/view drop。流式路径在每次可能增长前预留并在处理后缩回实际 retained bytes，覆盖 Anthropic inspector 的 pending/open blocks/tool partial JSON、terminal detector、usage decoder、Claude error detector、工具名 alias/buffer 与通用 stream transformer。请求转换同时移除整棵 JSON 和 alias map 的不必要 clone，不改变 header/wire golden。
+
+低预算 fixture 证明 Share 与 pinned Provider test 在发网前零请求拒绝，raw+decoded+normalized 合计超限，压缩 SSE 膨胀只请求一次且不触发 transport retry，以及已返回 200 后 tool partial JSON 累积只能发送稳定的 `503 / cc_switch_request_memory_exhausted` 终止帧。完整 Rust 回归为 lib 3132 passed/1 ignored、API contract 124 passed、两个独立 integration 各 1 passed。13 个 source delta 与 15 条 append-only observation 只支持 `CORE-N2-CLAUDE=fixture_verified`；`oauth_inference`、`max_5x_plan`、`max_20x_plan`、`fable_5_1` 四个 operation 仍为 `live_pending`，不得因本切片升级。
+
 ## 2026-09-19 Antigravity request-lifecycle memory freeze
 
 CORE-N2 的 Antigravity 切片冻结在 `assets/contract/antigravity-reference-delta.json` 的 `AG-OBS-0017`。一次性只读证据来自 `CLIProxyAPI@09a29bd345bc44c473abe7fd07859e32df2ea543`（tree `0b407c0c70c9c2f8a771d5126b028b9afe79bf2a`）：其 replay cache 将单 entry 限为 16 MiB，流 accumulator 也在溢出时放弃捕获。该证据只证明 replay 局部状态应有界，不能证明统一请求生命周期预算；默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才复核冻结 Git object。
@@ -79,9 +89,9 @@ Server 的独立 grounding 合同只读取选中候选，按 URL 去重 web chun
 
 Claude 增量证据追加在 `assets/contract/claude-reference-delta.json`。只读来源为 `CLIProxyAPI@44eaef00/@75ce6352/@377c315f/@2bcebaa8/@7c32971b`；实现与测试 Git object 的提交态 SHA-256 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 复核，默认构建、测试和运行时不读取外部 checkout。没有采纳账号池、跨账号/Provider fallback、credential cloaking、organization-hash 身份迁移或浏览器指纹模拟。
 
-后续 EVID-N1 迁移把该资产提升为 append-only schema v2：原 schema v1 `sources`、`localContracts`、`realAcceptance` 分别由不可变 digest 固定，新增 `sourceExtensions`、两个 source snapshot 和 14 条 observation。冻结 snapshot 为 `CLIProxyAPI@b773607e`（tree `a740e14d`，工作树干净）与 `OmniRoute@02c663cd`（tree `25b36e49`，未提交改动明确排除）；12 个 source delta 均绑定完整 commit、tree、路径、符号与 source digest。audit 默认只从本仓库已提交 Git object 核对 target baseline/implementation tree 和 anchors，显式 `--check-sources` 才读取外部已提交对象。
+后续 EVID-N1 迁移把该资产提升为 append-only schema v2：原 schema v1 `sources`、`localContracts`、`realAcceptance` 分别由不可变 digest 固定，新增 `sourceExtensions`、两个 source snapshot；当前追加到 15 条 observation。冻结 snapshot 为 `CLIProxyAPI@b773607e`（tree `a740e14d`，工作树干净）与 `OmniRoute@02c663cd`（tree `25b36e49`，未提交改动明确排除）；13 个 source delta 均绑定完整 commit、tree、路径、符号与 source digest。audit 默认只从本仓库已提交 Git object 核对 target baseline/implementation tree 和 anchors，显式 `--check-sources` 才读取外部已提交对象。
 
-14 条 observation 分别记录 adopt、differential、live_gate 或 reject 处置，并映射 CL-01～CL-06、CL-N1～CL-N4、CORE-N1、LIVE-N1 与 CL-R1。`CLIProxyAPI@fc96a87f` 的 organization-hashed credential filename 只作为拒绝证据：Account identity 继续由本仓库显式绑定，CL-R1 不声明 implementation commit 或 fixture，避免未来把 credential migration 当成待实现缺口。
+15 条 observation 分别记录 adopt、differential、live_gate 或 reject 处置，并映射 CL-01～CL-06、CL-N1～CL-N4、CORE-N1、CORE-N2、LIVE-N1 与 CL-R1。`CLIProxyAPI@fc96a87f` 的 organization-hashed credential filename 只作为拒绝证据：Account identity 继续由本仓库显式绑定，CL-R1 不声明 implementation commit 或 fixture，避免未来把 credential migration 当成待实现缺口。
 
 429 分类只在 5h/7d 子窗口明确 `rejected`、利用率证据不冲突且每个被拒窗口均有合法 reset 时写当前 Account generation 的共享窗口 cooldown。`unified` 单独拒绝、缺失/非法 reset、冲突 header 和未知 429 只允许精确 model cooldown；健康共享窗口下的 `7d_oi` 只影响 Fable pool 或精确 model；fast-credit、overage-disabled 与 organization spend-cap 明确信号只记 request entitlement。reset/Retry-After 继续受时间范围和全局上限保护，指标只包含固定 scope/reason/evidence，不记录 header 原值。
 
