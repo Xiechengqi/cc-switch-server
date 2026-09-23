@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::domain::accounts::claude_quota::{project_account_quota, projected_quota_queried_at};
+use crate::domain::accounts::claude_quota::{
+    project_account_quota_presentation, projected_quota_queried_at, AccountQuotaTierHint,
+};
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
     active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
@@ -28,7 +30,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::Share;
 
-pub const SHARE_CONTRACT_VERSION: u16 = 6;
+pub const SHARE_CONTRACT_VERSION: u16 = 7;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -495,6 +497,21 @@ pub struct ShareUpstreamQuotaTier {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShareUpstreamQuotaTierHint {
+    pub name: String,
+    pub label: String,
+    pub scope: String,
+    pub capacity_pool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_weekly_capacity: Option<f64>,
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareUpstreamQuota {
     pub status: String,
     #[serde(
@@ -519,6 +536,8 @@ pub struct ShareUpstreamQuota {
     pub blocked_scope: Option<String>,
     #[serde(default)]
     pub tiers: Vec<ShareUpstreamQuotaTier>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1513,7 +1532,13 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         .and_then(|block| unix_ms_to_rfc3339(block.until_ms));
     let blocked_reason = block.as_ref().map(|block| block.reason.to_string());
     let blocked_scope = block.as_ref().map(|block| block.scope.to_string());
-    let Some(quota) = project_account_quota(account, account.quota.as_ref(), now_ms) else {
+    let projection = project_account_quota_presentation(account, account.quota.as_ref(), now_ms);
+    let unobserved_tiers = projection
+        .unobserved_tiers
+        .iter()
+        .map(share_upstream_quota_tier_hint_from_account)
+        .collect::<Vec<_>>();
+    let Some(quota) = projection.quota else {
         if subscription_period_end.is_none() && block.is_none() {
             return None;
         }
@@ -1531,9 +1556,11 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             blocked_reason,
             blocked_scope,
             tiers: Vec::new(),
+            unobserved_tiers,
         });
     };
     if quota.tiers.is_empty()
+        && unobserved_tiers.is_empty()
         && !quota.success
         && subscription_period_end.is_none()
         && block.is_none()
@@ -1569,7 +1596,23 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             .iter()
             .map(share_upstream_quota_tier_from_account)
             .collect(),
+        unobserved_tiers,
     })
+}
+
+fn share_upstream_quota_tier_hint_from_account(
+    tier: &AccountQuotaTierHint,
+) -> ShareUpstreamQuotaTierHint {
+    ShareUpstreamQuotaTierHint {
+        name: tier.name.clone(),
+        label: tier.label.clone(),
+        scope: tier.scope.clone(),
+        capacity_pool: tier.capacity_pool.clone(),
+        model_family: tier.model_family.clone(),
+        relative_weekly_capacity: tier.relative_weekly_capacity,
+        source: tier.source.clone(),
+        reason: tier.reason.clone(),
+    }
 }
 
 fn share_upstream_quota_tier_from_account(tier: &AccountQuotaTier) -> ShareUpstreamQuotaTier {
@@ -1957,7 +2000,7 @@ mod tests {
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         let provider = descriptor.app_providers.codex.first().unwrap();
 
-        assert_eq!(descriptor.contract_version, 6);
+        assert_eq!(descriptor.contract_version, 7);
         assert_eq!(provider.bundle_id.as_deref(), Some("p1"));
         assert_eq!(provider.supported_apps, ["claude", "codex", "gemini"]);
         assert_eq!(provider.model_policy_scope, Some(ModelPolicyScope::Global));
@@ -2539,6 +2582,86 @@ mod tests {
         assert_eq!(fable.model_family.as_deref(), Some("claude-fable-5"));
         assert_eq!(fable.relative_weekly_capacity, Some(0.5));
         assert_eq!(fable.source.as_deref(), Some("anthropic_ratelimit_7d_oi"));
+        assert!(quota.unobserved_tiers.is_empty());
+    }
+
+    #[test]
+    fn descriptor_projects_unobserved_fable_hint_consistently_without_numeric_usage() {
+        let mut share = test_share(ProviderType::ClaudeOAuth, Some(24.0));
+        share.app = AppKind::Claude;
+        share.bindings[0].app = AppKind::Claude;
+        let mut provider = test_provider(ProviderType::ClaudeOAuth);
+        provider.app = AppKind::Claude;
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let mut account = test_account(ProviderType::ClaudeOAuth);
+        account.subscription_level = Some("claude_max_20x".to_string());
+        account.quota = Some(AccountQuota {
+            success: true,
+            credential_message: Some("Claude Max 20x".to_string()),
+            tiers: vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(0.24),
+                ..Default::default()
+            }],
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_20x",
+                    "planLabel": "Claude Max 20x",
+                    "planStale": false
+                },
+                "subscriptionEvidence": {"conflict": false}
+            })),
+        });
+        account.quota_window_observations.clear();
+        let accounts = AccountStore {
+            accounts: vec![account],
+            ..Default::default()
+        };
+
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let upstream_quota = descriptor
+            .upstream_provider
+            .as_ref()
+            .and_then(|provider| provider.quota.as_ref())
+            .expect("upstream quota");
+        let runtime_quota = descriptor
+            .app_runtimes
+            .claude
+            .as_ref()
+            .and_then(|provider| provider.quota.as_ref())
+            .expect("Claude runtime quota");
+        let app_provider_quota = descriptor
+            .app_providers
+            .claude
+            .first()
+            .and_then(|provider| provider.quota.as_ref())
+            .expect("Claude app provider quota");
+
+        for quota in [upstream_quota, runtime_quota, app_provider_quota] {
+            assert!(quota.tiers.iter().all(|tier| tier.label != "Fable 7d"));
+            assert_eq!(quota.unobserved_tiers.len(), 1);
+            let hint = &quota.unobserved_tiers[0];
+            assert_eq!(hint.name, "seven_day_fable");
+            assert_eq!(hint.label, "Fable 7d");
+            assert_eq!(hint.scope, "model_family");
+            assert_eq!(hint.capacity_pool, "claude_fable_7d_oi");
+            assert_eq!(hint.model_family.as_deref(), Some("claude-fable-5"));
+            assert_eq!(hint.relative_weekly_capacity, Some(0.5));
+            assert_eq!(hint.source, "claude_subscription_plan");
+            assert_eq!(hint.reason, "awaiting_upstream_observation");
+        }
+        assert_eq!(
+            serde_json::to_value(upstream_quota).unwrap(),
+            serde_json::to_value(runtime_quota).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(upstream_quota).unwrap(),
+            serde_json::to_value(app_provider_quota).unwrap()
+        );
     }
 
     #[test]

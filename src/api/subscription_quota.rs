@@ -5,6 +5,9 @@ use super::types::{
     account_quota_public_view, account_subscription_level_public_view,
     redact_account_public_diagnostic, AccountQuotaResponse,
 };
+use crate::domain::accounts::claude_quota::{
+    project_account_quota_presentation, AccountQuotaTierHint,
+};
 use crate::domain::accounts::store::{Account, AccountQuota, AccountQuotaTier};
 use crate::domain::accounts::subscription_expiry::{
     resolved_subscription_expiry, SubscriptionExpirySource,
@@ -131,6 +134,7 @@ pub(in crate::api) fn cached_cursor_account_quota(
             .iter()
             .map(subscription_tier_from_account_tier)
             .collect::<Vec<_>>(),
+        "unobservedTiers": [],
         "extraUsage": Value::Null,
         "bankedReset": Value::Null,
         "error": if quota.is_some() { Value::Null } else { warning.map(Value::String).unwrap_or(Value::Null) },
@@ -188,6 +192,7 @@ pub(in crate::api) fn subscription_quota_not_found(tool: &str) -> Value {
         "warnings": [],
         "staleTierNames": [],
         "tiers": [],
+        "unobservedTiers": [],
         "extraUsage": Value::Null,
         "bankedReset": Value::Null,
         "error": Value::Null,
@@ -206,7 +211,12 @@ fn subscription_quota_from_parts(
     }
 
     let public_quota = account_quota_public_view(account, quota);
-    let quota = public_quota.as_ref();
+    let presentation = project_account_quota_presentation(
+        account,
+        public_quota.as_ref(),
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    );
+    let quota = presentation.quota.as_ref();
 
     let queried_at = quota
         .and_then(|quota| quota.extra_usage.as_ref())
@@ -260,6 +270,11 @@ fn subscription_quota_from_parts(
             .unwrap_or_default()
             .iter()
             .map(subscription_tier_from_account_tier)
+            .collect::<Vec<_>>(),
+        "unobservedTiers": presentation
+            .unobserved_tiers
+            .iter()
+            .map(subscription_tier_hint_from_account_tier_hint)
             .collect::<Vec<_>>(),
         "extraUsage": extra_usage_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
         "providerUsage": quota
@@ -349,6 +364,19 @@ fn subscription_tier_from_account_tier(tier: &AccountQuotaTier) -> Value {
         "modelFamily": tier.model_family,
         "relativeWeeklyCapacity": tier.relative_weekly_capacity,
         "source": tier.source,
+    })
+}
+
+fn subscription_tier_hint_from_account_tier_hint(tier: &AccountQuotaTierHint) -> Value {
+    json!({
+        "name": tier.name,
+        "label": tier.label,
+        "scope": tier.scope,
+        "capacityPool": tier.capacity_pool,
+        "modelFamily": tier.model_family,
+        "relativeWeeklyCapacity": tier.relative_weekly_capacity,
+        "source": tier.source,
+        "reason": tier.reason,
     })
 }
 
@@ -506,6 +534,25 @@ mod tests {
         }
     }
 
+    fn claude_max_account(stale: bool, tiers: Vec<AccountQuotaTier>) -> Account {
+        let mut account = sample_account(AccountQuota {
+            success: true,
+            credential_message: Some("Claude Max 20x".to_string()),
+            tiers,
+            extra_usage: Some(json!({
+                "subscription": {
+                    "planType": "claude_max_20x",
+                    "planLabel": "Claude Max 20x",
+                    "planStale": stale
+                },
+                "subscriptionEvidence": {"conflict": false}
+            })),
+        });
+        account.provider_type = ProviderType::ClaudeOAuth;
+        account.subscription_level = Some("claude_max_20x".to_string());
+        account
+    }
+
     #[test]
     fn utilization_for_ui_scales_fractions_to_percent() {
         assert_eq!(utilization_for_ui(Some(0.42)), 42.0);
@@ -567,6 +614,86 @@ mod tests {
         assert_eq!(quota["bankedReset"]["availableCount"], 2);
         assert_eq!(quota["bankedReset"]["detailsAvailable"], true);
         assert_eq!(quota["bankedReset"]["credits"][0]["id"], "credit-a");
+    }
+
+    #[test]
+    fn subscription_quota_exposes_unobserved_fable_pool_without_zero_usage() {
+        let account = claude_max_account(
+            false,
+            vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(0.24),
+                ..Default::default()
+            }],
+        );
+
+        let quota = subscription_quota_from_account(&account, "claude_oauth");
+
+        assert_eq!(quota["tiers"].as_array().unwrap().len(), 1);
+        assert!(quota["tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tier| tier["name"] != "seven_day_fable"));
+        let hints = quota["unobservedTiers"].as_array().unwrap();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["name"], "seven_day_fable");
+        assert_eq!(hints[0]["label"], "Fable 7d");
+        assert_eq!(hints[0]["scope"], "model_family");
+        assert_eq!(hints[0]["capacityPool"], "claude_fable_7d_oi");
+        assert_eq!(hints[0]["modelFamily"], "claude-fable-5");
+        assert_eq!(hints[0]["relativeWeeklyCapacity"], 0.5);
+        assert_eq!(hints[0]["source"], "claude_subscription_plan");
+        assert_eq!(hints[0]["reason"], "awaiting_upstream_observation");
+        assert!(!hints[0].as_object().unwrap().contains_key("utilization"));
+    }
+
+    #[test]
+    fn subscription_quota_real_fable_tier_overrides_unobserved_hint() {
+        let account = claude_max_account(
+            false,
+            vec![
+                AccountQuotaTier {
+                    name: "seven_day".to_string(),
+                    utilization: Some(0.24),
+                    ..Default::default()
+                },
+                AccountQuotaTier {
+                    name: "seven_day_fable".to_string(),
+                    utilization: Some(0.41),
+                    scope: Some("model_family".to_string()),
+                    capacity_pool: Some("claude_fable_7d_oi".to_string()),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let quota = subscription_quota_from_account(&account, "claude_oauth");
+
+        assert_eq!(quota["unobservedTiers"], json!([]));
+        let fable = quota["tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tier| tier["name"] == "seven_day_fable")
+            .unwrap();
+        assert_eq!(fable["utilization"], 41.0);
+    }
+
+    #[test]
+    fn subscription_quota_hides_unobserved_fable_pool_for_stale_plan() {
+        let account = claude_max_account(
+            true,
+            vec![AccountQuotaTier {
+                name: "seven_day".to_string(),
+                utilization: Some(0.24),
+                ..Default::default()
+            }],
+        );
+
+        let quota = subscription_quota_from_account(&account, "claude_oauth");
+
+        assert_eq!(quota["unobservedTiers"], json!([]));
     }
 
     #[test]

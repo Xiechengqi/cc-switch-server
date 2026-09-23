@@ -19,6 +19,17 @@ export interface QuotaTier {
   source?: string | null;
 }
 
+export interface QuotaTierHint {
+  name: string;
+  label?: string | null;
+  scope: "account" | "model_family" | string;
+  capacityPool: string;
+  modelFamily?: string | null;
+  relativeWeeklyCapacity?: number | null;
+  source: string;
+  reason: string;
+}
+
 export interface ExtraUsage {
   isEnabled: boolean;
   monthlyLimit: number | null;
@@ -88,6 +99,7 @@ export interface SubscriptionQuota {
   warnings?: string[];
   staleTierNames?: string[];
   tiers: QuotaTier[];
+  unobservedTiers?: QuotaTierHint[];
   extraUsage: ExtraUsage | null;
   providerUsage?: {
     status?: "complete" | "unavailable";

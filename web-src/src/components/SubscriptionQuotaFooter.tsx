@@ -12,6 +12,7 @@ import {
 import type {
   CodexBankedResetQuotaSummary,
   QuotaTier,
+  QuotaTierHint,
   SubscriptionInfo,
   SubscriptionQuota,
 } from "@/types/subscription";
@@ -318,6 +319,69 @@ function formatCompactTierAmount(tier: QuotaTier): string | null {
   return null;
 }
 
+function normalizedTierIdentity(value: string | null | undefined): string {
+  const normalized = value?.trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!normalized) return "";
+  if (
+    normalized === "sevendayfable" ||
+    normalized === "fable7d" ||
+    normalized === "fable7day"
+  ) {
+    return "seven_day_fable";
+  }
+  return normalized;
+}
+
+function tierIdentityKeys(
+  tier: Pick<QuotaTier, "name" | "label" | "capacityPool"> | QuotaTierHint,
+): string[] {
+  const keys = new Set<string>();
+  const capacityPool = tier.capacityPool?.trim().toLowerCase();
+  if (capacityPool) keys.add(`pool:${capacityPool}`);
+  const name = normalizedTierIdentity(tier.name);
+  if (name) keys.add(`tier:${name}`);
+  const label = normalizedTierIdentity(tier.label);
+  if (label) keys.add(`tier:${label}`);
+  return [...keys];
+}
+
+function visibleUnobservedQuotaTiers(
+  quota: SubscriptionQuota,
+): QuotaTierHint[] {
+  const observedKeys = new Set(
+    (quota.tiers ?? []).flatMap((tier) => tierIdentityKeys(tier)),
+  );
+  const emittedKeys = new Set<string>();
+  return (quota.unobservedTiers ?? []).filter((hint) => {
+    const keys = tierIdentityKeys(hint);
+    if (keys.some((key) => observedKeys.has(key))) return false;
+    if (keys.some((key) => emittedKeys.has(key))) return false;
+    keys.forEach((key) => emittedKeys.add(key));
+    return true;
+  });
+}
+
+function unobservedTierLabel(
+  tier: QuotaTierHint,
+  t?: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  return (
+    tier.label?.trim() ||
+    COMPACT_TIER_LABELS[tier.name] ||
+    (t && TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name)
+  );
+}
+
+export function formatUnobservedQuotaTier(
+  tier: QuotaTierHint,
+  t?: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const state = t
+    ? t("subscription.awaitingObservation")
+    : "awaiting observation";
+  return `${unobservedTierLabel(tier, t)} ${state}`;
+}
+
 export function formatCompactTier(
   tier: QuotaTier,
   t?: (key: string, options?: Record<string, unknown>) => string,
@@ -338,6 +402,7 @@ export function formatQuotaSummary(
   tiers: QuotaTier[],
   t?: (key: string, options?: Record<string, unknown>) => string,
   nowMs = Date.now(),
+  unobservedTiers = visibleUnobservedQuotaTiers(quota),
 ): string {
   const resolvedPlanLabel =
     quota.subscription?.planLabel?.trim() || quota.credentialMessage?.trim();
@@ -351,6 +416,7 @@ export function formatQuotaSummary(
       ? formatSubscriptionExpirySummary(quota.subscription, t, nowMs)
       : null,
     ...tiers.map((tier) => formatCompactTier(tier, t, nowMs)),
+    ...unobservedTiers.map((tier) => formatUnobservedQuotaTier(tier, t)),
     formatBankedResetSummary(quota.bankedReset, t, nowMs),
     quota.quotaStatus === "valid_non_numeric"
       ? t
@@ -617,13 +683,28 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   const summaryTiers = inline
     ? inlineTiers
     : tiers.filter((tier) => !SUPPRESSED_TIERS.has(tier.name));
-  const summaryText = formatQuotaSummary(quota, summaryTiers, t, now);
-  const fablePoolHelp = summaryTiers.some(
-    (tier) => tier.name === "seven_day_fable",
-  )
+  const unobservedTiers = visibleUnobservedQuotaTiers(quota).filter((tier) => {
+    if (!allowUnknownTierNames && !(tier.name in TIER_I18N_KEYS)) return false;
+    if (visibleTierNames && !visibleTierNames.includes(tier.name)) return false;
+    return !SUPPRESSED_TIERS.has(tier.name);
+  });
+  const summaryUnobservedTiers = inline
+    ? unobservedTiers.filter((tier) => !HIDDEN_INLINE_TIERS.has(tier.name))
+    : unobservedTiers;
+  const summaryText = formatQuotaSummary(
+    quota,
+    summaryTiers,
+    t,
+    now,
+    summaryUnobservedTiers,
+  );
+  const fablePoolHelp =
+    summaryTiers.some((tier) => tier.name === "seven_day_fable") ||
+    summaryUnobservedTiers.some((tier) => tier.name === "seven_day_fable")
     ? t("subscription.fablePoolHelp")
     : undefined;
-  if (tiers.length === 0 && !summaryText) return null;
+  if (tiers.length === 0 && unobservedTiers.length === 0 && !summaryText)
+    return null;
 
   // ── inline 模式：紧凑两行显示 ──
   if (inline) {
@@ -702,6 +783,14 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
         </div>
       )}
 
+      {unobservedTiers.length > 0 && (
+        <div className="mt-2 flex flex-col gap-2">
+          {unobservedTiers.map((tier) => (
+            <UnobservedTierRow key={tier.capacityPool || tier.name} tier={tier} t={t} />
+          ))}
+        </div>
+      )}
+
       {/* 超额使用 */}
       {quota.extraUsage?.isEnabled && (
         <div className="mt-2 pt-2 border-t border-border-default text-xs text-gray-500 dark:text-gray-400">
@@ -719,6 +808,30 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           </span>
         </div>
       )}
+    </div>
+  );
+};
+
+const UnobservedTierRow: React.FC<{
+  tier: QuotaTierHint;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}> = ({ tier, t }) => {
+  const help =
+    tier.name === "seven_day_fable"
+      ? t("subscription.fablePoolHelp")
+      : undefined;
+  return (
+    <div
+      className="flex items-center gap-3 text-xs text-muted-foreground"
+      title={help}
+    >
+      <span className="min-w-0 font-medium" style={{ width: "25%" }}>
+        {unobservedTierLabel(tier, t)}
+      </span>
+      <div className="flex flex-1 items-center gap-1.5">
+        <Clock size={11} aria-hidden="true" />
+        <span>{t("subscription.awaitingObservation")}</span>
+      </div>
     </div>
   );
 };

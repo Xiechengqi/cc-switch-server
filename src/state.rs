@@ -1996,6 +1996,7 @@ fn ollama_cloud_share_projection(
             blocked_reason: None,
             blocked_scope: None,
             tiers,
+            unobserved_tiers: Vec::new(),
         },
     })
 }
@@ -12882,7 +12883,10 @@ impl ServerStateInner {
         let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         let usage_block_changed =
             active_account_usage_block(before, now_ms) != active_account_usage_block(after, now_ms);
-        if !expiry_changed && !usage_block_changed {
+        let quota_visual_changed = after.provider_type == ProviderType::ClaudeOAuth
+            && claude_quota_visual_fingerprint(before, before.quota.as_ref(), now_ms)
+                != claude_quota_visual_fingerprint(after, after.quota.as_ref(), now_ms);
+        if !expiry_changed && !usage_block_changed && !quota_visual_changed {
             return Ok(false);
         }
 
@@ -32340,6 +32344,161 @@ mod tests {
                 .await,
             ClaudeQuotaObservationCommit::StaleIdentity
         );
+    }
+
+    #[tokio::test]
+    async fn claude_quota_hint_transitions_refresh_the_bound_share_snapshot() {
+        fn claude_account(plan_stale: bool) -> Account {
+            serde_json::from_value(json!({
+                "id": "claude-hint-refresh-account",
+                "providerType": "claude_oauth",
+                "authIdentityGeneration": 1,
+                "tokenRefreshGeneration": 1,
+                "email": "owner@example.com",
+                "accessToken": "access",
+                "subscriptionLevel": "claude_max_20x",
+                "quota": {
+                    "success": true,
+                    "credentialMessage": "Claude Max 20x",
+                    "tiers": [
+                        {"name": "seven_day", "utilization": 0.24}
+                    ],
+                    "extraUsage": {
+                        "subscription": {
+                            "planType": "claude_max_20x",
+                            "planLabel": "Claude Max 20x",
+                            "planStale": plan_stale
+                        },
+                        "subscriptionEvidence": {"conflict": false}
+                    }
+                }
+            }))
+            .unwrap()
+        }
+
+        let state = test_state();
+        let stale = claude_account(true);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![stale.clone()],
+                ..Default::default()
+            })
+            .await;
+        state
+            .replace_provider_store_for_test(ProviderStore {
+                providers: vec![StoredProvider {
+                    app: AppKind::Claude,
+                    provider: Provider {
+                        id: "claude-hint-refresh-provider".to_string(),
+                        name: "Claude OAuth".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            auth_binding: Some(AuthBinding {
+                                source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
+                                auth_provider: Some("claude_oauth".to_string()),
+                                account_id: Some(stale.id.clone()),
+                                auth_identity_generation: Some(stale.auth_identity_generation),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: BTreeMap::new(),
+                    },
+                    provider_type: ProviderType::ClaudeOAuth,
+                    provider_type_id: "claude_oauth".to_string(),
+                    resource: ProviderResourceMetadata::default(),
+                }],
+                ..Default::default()
+            })
+            .await;
+        let mut share_input =
+            router_sync_share_input("claude-hint-refresh-share", "claude-hint-refresh-provider");
+        share_input.app = AppKind::Claude;
+        share_input.provider_type = ProviderType::ClaudeOAuth;
+        share_input.bindings = vec![ShareBinding {
+            app: AppKind::Claude,
+            provider_id: "claude-hint-refresh-provider".to_string(),
+            provider_type: ProviderType::ClaudeOAuth,
+        }];
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .refresh_account_subscription_metadata(ProviderType::ClaudeOAuth, Some(&stale.id),)
+                .await
+                .unwrap(),
+            ["claude-hint-refresh-share"]
+        );
+        let initial_share = state
+            .shares
+            .read()
+            .await
+            .get("claude-hint-refresh-share")
+            .cloned()
+            .unwrap();
+        assert!(initial_share
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| { snapshot.pointer("/upstreamProvider/quota/unobservedTiers") })
+            .is_none());
+
+        let fresh = claude_account(false);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![fresh.clone()],
+                ..Default::default()
+            })
+            .await;
+        assert!(state
+            .refresh_account_runtime_metadata_if_changed(&stale, &fresh)
+            .await
+            .unwrap());
+        let with_hint = state
+            .shares
+            .read()
+            .await
+            .get("claude-hint-refresh-share")
+            .cloned()
+            .unwrap();
+        assert!(with_hint.config_revision > initial_share.config_revision);
+        assert_eq!(
+            with_hint
+                .runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot.pointer("/upstreamProvider/quota/unobservedTiers/0/name")
+                })
+                .and_then(Value::as_str),
+            Some("seven_day_fable")
+        );
+
+        let stale_again = claude_account(true);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![stale_again.clone()],
+                ..Default::default()
+            })
+            .await;
+        assert!(state
+            .refresh_account_runtime_metadata_if_changed(&fresh, &stale_again)
+            .await
+            .unwrap());
+        let without_hint = state
+            .shares
+            .read()
+            .await
+            .get("claude-hint-refresh-share")
+            .cloned()
+            .unwrap();
+        assert!(without_hint.config_revision > with_hint.config_revision);
+        assert!(without_hint
+            .runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| { snapshot.pointer("/upstreamProvider/quota/unobservedTiers") })
+            .is_none());
     }
 
     #[test]

@@ -1210,6 +1210,7 @@
     "unreachableHint": "接続を確立できませんでした（DNS / 接続 / TLS / タイムアウト）。base_url とネットワークを確認してください。"
   },
   "subscription": {
+    "awaitingObservation": "観測待ち",
     "copilotPremium": "プレミアム",
     "credentialParseFailed": "認証情報を解析できませんでした",
     "cursorCredits": "使用量",
@@ -1224,7 +1225,7 @@
     "expiryUnknown": "有効期限は不明です",
     "expiryWorkspaceUnverified": "ChatGPT ワークスペースを再確認または選択してください",
     "extraUsage": "超過使用量",
-    "fablePoolHelp": "Fable は Claude Max 5x/20x 専用の週次容量プールで、通常の週次上限の 50% が上限です。この割合は Anthropic の 7d_oi/seven_day_overage_included から直接取得し、通常の週次使用量から推定しません。",
+    "fablePoolHelp": "Fable は Claude Max 5x/20x 専用の週次容量プールで、通常の週次上限の 50% が上限です。実トラフィックで Anthropic の 7d_oi/seven_day_overage_included が返るまでは「観測待ち」と表示します。能動的なプローブは送信せず、通常の週次使用量から割合を推定しません。",
     "fiveHour": "5時間",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",

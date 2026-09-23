@@ -1210,6 +1210,7 @@
     "unreachableHint": "无法建立连接（DNS / 连接 / TLS / 超时）。请检查 base_url 与网络。"
   },
   "subscription": {
+    "awaitingObservation": "待观测",
     "copilotPremium": "高级请求",
     "credentialParseFailed": "凭据数据解析失败",
     "cursorCredits": "用量",
@@ -1224,7 +1225,7 @@
     "expiryUnknown": "到期时间未知",
     "expiryWorkspaceUnverified": "需要重新验证或选择 ChatGPT 工作区",
     "extraUsage": "超额用量",
-    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的独立周容量池，上限为普通周额度的 50%。百分比直接来自 Anthropic 7d_oi/seven_day_overage_included，不由普通周用量推算。",
+    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的独立周容量池，上限为普通周额度的 50%。真实流量尚未返回 Anthropic 7d_oi/seven_day_overage_included 时显示“待观测”；系统不会主动探测，也不会根据普通周用量推算百分比。",
     "fiveHour": "5小时",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",

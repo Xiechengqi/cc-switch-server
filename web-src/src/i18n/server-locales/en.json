@@ -1210,6 +1210,7 @@
     "unreachableHint": "Could not establish a connection (DNS / connect / TLS / timeout). Check the base_url and your network."
   },
   "subscription": {
+    "awaitingObservation": "awaiting observation",
     "copilotPremium": "Premium",
     "credentialParseFailed": "Credential data could not be parsed",
     "cursorCredits": "Usage",
@@ -1224,7 +1225,7 @@
     "expiryUnknown": "Expiration unknown",
     "expiryWorkspaceUnverified": "Verify or select the ChatGPT workspace",
     "extraUsage": "Extra Usage",
-    "fablePoolHelp": "Fable has a separate weekly capacity pool for Claude Max 5x/20x, capped at 50% of the regular weekly allowance. This percentage comes directly from Anthropic 7d_oi/seven_day_overage_included and is not inferred from regular weekly usage.",
+    "fablePoolHelp": "Fable has a separate weekly capacity pool for Claude Max 5x/20x, capped at 50% of the regular weekly allowance. Until Anthropic reports 7d_oi/seven_day_overage_included on real traffic, it is shown as awaiting observation; no probe is sent and no percentage is inferred from regular weekly usage.",
     "fiveHour": "5-Hour",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",

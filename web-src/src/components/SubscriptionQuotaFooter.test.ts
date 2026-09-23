@@ -98,6 +98,18 @@ describe("SubscriptionQuotaFooter summaries", () => {
           source: "anthropic_ratelimit_7d_oi",
         },
       ],
+      unobservedTiers: [
+        {
+          name: "seven_day_fable",
+          label: "Fable 7d",
+          scope: "model_family",
+          capacityPool: "claude_fable_7d_oi",
+          modelFamily: "claude-fable-5",
+          relativeWeeklyCapacity: 0.5,
+          source: "claude_subscription_plan",
+          reason: "awaiting_upstream_observation",
+        },
+      ],
       extraUsage: null,
       error: null,
       queriedAt: now,
@@ -108,5 +120,69 @@ describe("SubscriptionQuotaFooter summaries", () => {
     expect(summary).toContain("5h 3% 4h22m");
     expect(summary).toContain("7d 24% 5d9h");
     expect(summary).toContain("Fable 7d 41% 5d9h");
+    expect(summary).not.toContain("awaiting observation");
+  });
+
+  it("shows an unobserved Fable pool without inventing zero percent usage", () => {
+    const quota: SubscriptionQuota = {
+      tool: "claude_oauth",
+      credentialStatus: "valid",
+      credentialMessage: "Claude Max 20x",
+      success: true,
+      tiers: [
+        {
+          name: "seven_day",
+          utilization: 24,
+          resetsAt: null,
+        },
+      ],
+      unobservedTiers: [
+        {
+          name: "seven_day_fable",
+          label: "Fable 7d",
+          scope: "model_family",
+          capacityPool: "claude_fable_7d_oi",
+          modelFamily: "claude-fable-5",
+          relativeWeeklyCapacity: 0.5,
+          source: "claude_subscription_plan",
+          reason: "awaiting_upstream_observation",
+        },
+      ],
+      extraUsage: null,
+      error: null,
+      queriedAt: null,
+    };
+
+    const summary = formatQuotaSummary(quota, quota.tiers);
+
+    expect(summary).toContain("Fable 7d awaiting observation");
+    expect(summary).not.toContain("Fable 7d 0%");
+  });
+
+  it("localizes the unobserved Fable state", () => {
+    const quota: SubscriptionQuota = {
+      tool: "claude_oauth",
+      credentialStatus: "valid",
+      credentialMessage: "Claude Max 5x",
+      success: true,
+      tiers: [],
+      unobservedTiers: [
+        {
+          name: "seven_day_fable",
+          label: "Fable 7d",
+          scope: "model_family",
+          capacityPool: "claude_fable_7d_oi",
+          source: "claude_subscription_plan",
+          reason: "awaiting_upstream_observation",
+        },
+      ],
+      extraUsage: null,
+      error: null,
+      queriedAt: null,
+    };
+    const t = (key: string) =>
+      key === "subscription.awaitingObservation" ? "待观测" : key;
+
+    expect(formatQuotaSummary(quota, [], t)).toContain("Fable 7d 待观测");
   });
 });

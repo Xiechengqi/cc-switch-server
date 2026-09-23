@@ -21,7 +21,29 @@ pub struct ClaudeQuotaVisualTierFingerprint {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeQuotaVisualFingerprint {
     pub tiers: Vec<ClaudeQuotaVisualTierFingerprint>,
+    pub unobserved_tiers: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountQuotaTierHint {
+    pub name: String,
+    pub label: String,
+    pub scope: String,
+    pub capacity_pool: String,
+    pub model_family: Option<String>,
+    pub relative_weekly_capacity: Option<f64>,
+    pub source: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountQuotaProjection {
+    pub quota: Option<AccountQuota>,
+    pub unobserved_tiers: Vec<AccountQuotaTierHint>,
+}
+
+pub const CLAUDE_SUBSCRIPTION_PLAN_QUOTA_SOURCE: &str = "claude_subscription_plan";
+pub const AWAITING_UPSTREAM_QUOTA_OBSERVATION_REASON: &str = "awaiting_upstream_observation";
 
 pub fn project_account_quota(
     account: &Account,
@@ -72,6 +94,45 @@ pub fn project_account_quota(
     Some(quota)
 }
 
+pub fn project_account_quota_presentation(
+    account: &Account,
+    quota: Option<&AccountQuota>,
+    now_ms: i64,
+) -> AccountQuotaProjection {
+    let quota = project_account_quota(account, quota, now_ms);
+    let unobserved_tiers = quota
+        .as_ref()
+        .filter(|quota| {
+            account.provider_type == ProviderType::ClaudeOAuth
+                && claude_fable_plan_eligibility(account, quota) == ClaudeFableEligibility::Eligible
+                && !quota.tiers.iter().any(is_fable_quota_tier)
+        })
+        .map(|_| vec![unobserved_fable_quota_tier()])
+        .unwrap_or_default();
+    AccountQuotaProjection {
+        quota,
+        unobserved_tiers,
+    }
+}
+
+fn is_fable_quota_tier(tier: &AccountQuotaTier) -> bool {
+    tier.name == CLAUDE_FABLE_QUOTA_TIER
+        || tier.capacity_pool.as_deref() == Some(CLAUDE_FABLE_CAPACITY_POOL)
+}
+
+fn unobserved_fable_quota_tier() -> AccountQuotaTierHint {
+    AccountQuotaTierHint {
+        name: CLAUDE_FABLE_QUOTA_TIER.to_string(),
+        label: "Fable 7d".to_string(),
+        scope: "model_family".to_string(),
+        capacity_pool: CLAUDE_FABLE_CAPACITY_POOL.to_string(),
+        model_family: Some(CLAUDE_FABLE_MODEL_FAMILY.to_string()),
+        relative_weekly_capacity: Some(CLAUDE_FABLE_RELATIVE_WEEKLY_CAPACITY),
+        source: CLAUDE_SUBSCRIPTION_PLAN_QUOTA_SOURCE.to_string(),
+        reason: AWAITING_UPSTREAM_QUOTA_OBSERVATION_REASON.to_string(),
+    }
+}
+
 pub fn projected_quota_queried_at(quota: &AccountQuota, fallback: Option<i64>) -> Option<i64> {
     quota
         .extra_usage
@@ -87,7 +148,8 @@ pub fn claude_quota_visual_fingerprint(
     quota: Option<&AccountQuota>,
     now_ms: i64,
 ) -> ClaudeQuotaVisualFingerprint {
-    let Some(quota) = project_account_quota(account, quota, now_ms) else {
+    let projection = project_account_quota_presentation(account, quota, now_ms);
+    let Some(quota) = projection.quota else {
         return ClaudeQuotaVisualFingerprint::default();
     };
     let mut tiers = quota
@@ -111,13 +173,25 @@ pub fn claude_quota_visual_fingerprint(
         })
         .collect::<Vec<_>>();
     tiers.sort_by_key(|tier| tier_order(&tier.name));
-    ClaudeQuotaVisualFingerprint { tiers }
+    let mut unobserved_tiers = projection
+        .unobserved_tiers
+        .into_iter()
+        .map(|tier| tier.name)
+        .collect::<Vec<_>>();
+    unobserved_tiers.sort();
+    ClaudeQuotaVisualFingerprint {
+        tiers,
+        unobserved_tiers,
+    }
 }
 
 pub fn claude_quota_visual_change_is_urgent(
     before: &ClaudeQuotaVisualFingerprint,
     after: &ClaudeQuotaVisualFingerprint,
 ) -> bool {
+    if before.unobserved_tiers != after.unobserved_tiers {
+        return true;
+    }
     if before.tiers.is_empty() != after.tiers.is_empty() {
         return true;
     }
@@ -209,6 +283,24 @@ fn claude_fable_observation_eligibility(
     quota: &AccountQuota,
     observation: &AccountQuotaWindowObservation,
 ) -> ClaudeFableEligibility {
+    match claude_fable_plan_eligibility(account, quota) {
+        ClaudeFableEligibility::Eligible => return ClaudeFableEligibility::Eligible,
+        ClaudeFableEligibility::Ineligible => return ClaudeFableEligibility::Ineligible,
+        ClaudeFableEligibility::Unknown => {}
+    }
+    if observation.fable_entitlement_evidence.is_some() {
+        return ClaudeFableEligibility::Eligible;
+    }
+    ClaudeFableEligibility::Unknown
+}
+
+fn claude_fable_plan_eligibility(
+    account: &Account,
+    quota: &AccountQuota,
+) -> ClaudeFableEligibility {
+    if !quota.success {
+        return ClaudeFableEligibility::Unknown;
+    }
     let subscription = quota
         .extra_usage
         .as_ref()
@@ -257,15 +349,12 @@ fn claude_fable_observation_eligibility(
     let conflict = subscription_evidence
         .and_then(|evidence| evidence.get("conflict"))
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !stale
         && !conflict
         && resolved_plan
             .is_some_and(|plan| plan.fable_eligibility() == ClaudeFableEligibility::Eligible)
     {
-        return ClaudeFableEligibility::Eligible;
-    }
-    if observation.fable_entitlement_evidence.is_some() {
         return ClaudeFableEligibility::Eligible;
     }
     ClaudeFableEligibility::Unknown
@@ -359,6 +448,72 @@ mod tests {
     }
 
     #[test]
+    fn fresh_specific_max_plan_projects_unobserved_fable_hint_without_zero_usage() {
+        for plan in ["claude_max_5x", "claude_max_20x"] {
+            let mut account = account(plan, false, fable_observation(None));
+            account.quota_window_observations.clear();
+
+            let projection =
+                project_account_quota_presentation(&account, account.quota.as_ref(), 3_000);
+            let quota = projection.quota.expect("projected quota");
+            assert!(
+                quota
+                    .tiers
+                    .iter()
+                    .all(|tier| tier.name != CLAUDE_FABLE_QUOTA_TIER),
+                "an unobserved pool must not become a numeric tier"
+            );
+            assert_eq!(projection.unobserved_tiers.len(), 1);
+            let hint = &projection.unobserved_tiers[0];
+            assert_eq!(hint.name, CLAUDE_FABLE_QUOTA_TIER);
+            assert_eq!(hint.capacity_pool, CLAUDE_FABLE_CAPACITY_POOL);
+            assert_eq!(
+                hint.model_family.as_deref(),
+                Some(CLAUDE_FABLE_MODEL_FAMILY)
+            );
+            assert_eq!(hint.relative_weekly_capacity, Some(0.5));
+            assert_eq!(hint.source, CLAUDE_SUBSCRIPTION_PLAN_QUOTA_SOURCE);
+            assert_eq!(hint.reason, AWAITING_UPSTREAM_QUOTA_OBSERVATION_REASON);
+        }
+    }
+
+    #[test]
+    fn unobserved_fable_hint_fails_closed_for_uncertain_or_ineligible_plans() {
+        for (plan, stale) in [
+            ("claude_max", false),
+            ("claude_max_20x", true),
+            ("claude_free", false),
+            ("claude_pro", false),
+            ("claude_team", false),
+            ("claude_enterprise", false),
+        ] {
+            let mut account = account(plan, stale, fable_observation(None));
+            account.quota_window_observations.clear();
+            assert!(
+                project_account_quota_presentation(&account, account.quota.as_ref(), 3_000)
+                    .unobserved_tiers
+                    .is_empty(),
+                "unexpected Fable hint for plan={plan} stale={stale}"
+            );
+        }
+
+        let mut conflict = account("claude_max_20x", false, fable_observation(None));
+        conflict.quota_window_observations.clear();
+        conflict
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["subscriptionEvidence"]["conflict"] = json!(true);
+        assert!(
+            project_account_quota_presentation(&conflict, conflict.quota.as_ref(), 3_000)
+                .unobserved_tiers
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn direct_fable_success_can_lift_stale_max_but_not_explicit_pro() {
         let evidence = Some(ClaudeFableEntitlementEvidence::SuccessfulFableRequest);
         let max = account("claude_max_20x", true, fable_observation(evidence));
@@ -400,12 +555,35 @@ mod tests {
         );
 
         account.quota.as_mut().unwrap().tiers.pop();
-        assert!(
-            project_account_quota(&account, account.quota.as_ref(), 20_001)
-                .unwrap()
-                .tiers
-                .iter()
-                .all(|tier| tier.name != CLAUDE_FABLE_QUOTA_TIER)
-        );
+        let expired = project_account_quota_presentation(&account, account.quota.as_ref(), 20_001);
+        assert!(expired
+            .quota
+            .unwrap()
+            .tiers
+            .iter()
+            .all(|tier| tier.name != CLAUDE_FABLE_QUOTA_TIER));
+        assert_eq!(expired.unobserved_tiers.len(), 1);
+    }
+
+    #[test]
+    fn visual_fingerprint_treats_hint_transitions_as_urgent() {
+        let mut account = account("claude_max_20x", false, fable_observation(None));
+        account.quota_window_observations.clear();
+        let with_hint = claude_quota_visual_fingerprint(&account, account.quota.as_ref(), 3_000);
+        assert_eq!(with_hint.unobserved_tiers, [CLAUDE_FABLE_QUOTA_TIER]);
+
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["subscription"]["planStale"] = json!(true);
+        let without_hint = claude_quota_visual_fingerprint(&account, account.quota.as_ref(), 3_000);
+        assert!(without_hint.unobserved_tiers.is_empty());
+        assert!(claude_quota_visual_change_is_urgent(
+            &with_hint,
+            &without_hint
+        ));
     }
 }

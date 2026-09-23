@@ -117,9 +117,9 @@ Anthropic 的主动 `/api/oauth/usage` 响应不保证包含 Fable 独立周窗�
 - reset 支持相对秒、epoch 秒/毫秒、RFC3339 和 HTTP-date；5h 与周窗口分别限制在 6 小时和 8 天的合理未来范围。缺 reset 的样本最多保留 1 小时。
 - 样本绑定请求实际使用的 Account ID 和 `authIdentityGeneration`，按窗口单调、部分合并；旧响应、旧身份和过期样本不能覆盖当前状态。token-only refresh 保留样本，重新登录/主体变化清空样本。
 - 主动 usage 中的同名 tier 始终优先；被动样本只补缺，不覆盖主动值。投影使用最新贡献样本更新 `queriedAt`。
-- `7d_oi` 映射为 `seven_day_fable`，并公开 `scope=model_family`、`capacityPool=claude_fable_7d_oi`、`modelFamily=claude-fable-5`、`relativeWeeklyCapacity=0.5` 与 `source=anthropic_ratelimit_7d_oi`。新鲜且无冲突的 Max 5x/20x 计划可以展示；计划为 stale/generic Max 时还必须有成功 Fable 请求或明确 Fable-only 429 的直接证据；明确 Free/Pro/Team/Enterprise 永不展示。
+- `7d_oi` 映射为真实数值 tier `seven_day_fable`，并公开 `scope=model_family`、`capacityPool=claude_fable_7d_oi`、`modelFamily=claude-fable-5`、`relativeWeeklyCapacity=0.5` 与 `source=anthropic_ratelimit_7d_oi`。新鲜、无冲突且明确为 Max 5x/20x 的计划在尚无真实 `7d_oi` 样本时，只通过独立 `unobservedTiers` 投影 `Fable 7d · 待观测`；它没有 utilization/reset，不得伪装为 `0%`，也不参与调度、限流、可用性或容量评分。真实样本到达后数值 tier 覆盖提示；样本到期而计划仍新鲜时回退到待观测。stale/generic Max 不生成提示，只有成功 Fable 请求或明确 Fable-only 429 的直接证据才可展示真实 tier；明确 Free/Pro/Team/Enterprise 永不展示。
 
-普通样本保存在独立 quota observation 中，不写入代表“已耗尽并阻断”的 `capacity_pool_limits`。UI 继续复用 generation-aware `oauth-quota-updated`；首次出现、tier/reset 变化和跨入 100% 立即通知，普通百分比变化最多 30 秒通知一次。reset/TTL 到期会移除样本并通知 UI/Share 投影。所有行为只针对一个明确绑定账号，不引入账号池、选号或 fallback。
+普通样本保存在独立 quota observation 中，不写入代表“已耗尽并阻断”的 `capacity_pool_limits`。UI 继续复用 generation-aware `oauth-quota-updated`；首次出现、tier/reset 变化和跨入 100% 立即通知，普通百分比变化最多 30 秒通知一次。reset/TTL 到期会移除样本并通知 UI/Share 投影。Server 不会为了填充 Fable 数值主动发送推理或探测请求；数值只能来自真实 usage/响应头观测。所有行为只针对一个明确绑定账号，不引入账号池、选号或 fallback。
 
 ## 429 与响应编码
 

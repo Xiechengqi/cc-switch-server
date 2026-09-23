@@ -1210,6 +1210,7 @@
     "unreachableHint": "無法建立連線（DNS / 連線 / TLS / 逾時）。請檢查 base_url 與網路。"
   },
   "subscription": {
+    "awaitingObservation": "待觀測",
     "copilotPremium": "進階請求",
     "credentialParseFailed": "憑據資料解析失敗",
     "cursorCredits": "用量",
@@ -1224,7 +1225,7 @@
     "expiryUnknown": "到期時間未知",
     "expiryWorkspaceUnverified": "需要重新驗證或選擇 ChatGPT 工作區",
     "extraUsage": "超額用量",
-    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的獨立週容量池，上限為一般週額度的 50%。百分比直接來自 Anthropic 7d_oi/seven_day_overage_included，不由一般週用量推算。",
+    "fablePoolHelp": "Fable 是 Claude Max 5x/20x 的獨立週容量池，上限為一般週額度的 50%。真實流量尚未回傳 Anthropic 7d_oi/seven_day_overage_included 時顯示「待觀測」；系統不會主動探測，也不會根據一般週用量推算百分比。",
     "fiveHour": "5 小時",
     "geminiFlash": "Flash",
     "geminiFlashLite": "Flash Lite",
