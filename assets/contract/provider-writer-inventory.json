@@ -13,7 +13,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "c22c2669ce364d0ab675872df91d8262d62d0403b733182d6032b1324422ba73"
+      "sha256": "5162d1b769101beed5c7b45271d6c7316de0a6d7380e87b2865a8ad6b8ef5164"
     },
     {
       "path": "src/api/types/providers.rs",
