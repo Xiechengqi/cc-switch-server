@@ -60,6 +60,15 @@ const specs = Object.freeze({
     model: "claude-fable-5-1",
     plan: Object.freeze({ planType: "claude_max_20x", planLabel: "Claude Max 20x" }),
   }),
+  opus_5_5: Object.freeze({
+    accountEnv: "CLAUDE_OAUTH_TEST_ACCOUNT",
+    providerEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_SHARE_ID",
+    modelEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_MODEL",
+    receiptEnv: "CLAUDE_OPUS_5_5_REAL_RECEIPT_FILE",
+    model: "claude-opus-5-5",
+    plan: null,
+  }),
 });
 
 function canonical(value) {
@@ -129,6 +138,11 @@ function expectedDecisions(operation) {
       rateLimitScope: "fable_pool",
       modelFallback: "disabled",
     });
+  } else if (operation === "opus_5_5") {
+    Object.assign(decisions, {
+      modelFallback: "disabled",
+      context1mProbe: "bounded_small_request",
+    });
   } else {
     decisions.quotaRefresh = "forced";
   }
@@ -154,7 +168,10 @@ function scopeDigest(value) {
 }
 
 function receipt(value, overrides = {}) {
-  const operationContract = contract.realAcceptance.operations.find(
+  const operationContract = [
+    ...contract.realAcceptance.operations,
+    ...(contract.realAcceptanceExtensions || []),
+  ].find(
     (candidate) => candidate.operation === value.operation,
   );
   return {
@@ -411,7 +428,7 @@ function fullEnv(value, url, receiptFile) {
   };
 }
 
-test("Claude real harness validates all four operation receipts independently", async (t) => {
+test("Claude real harness validates all five operation receipts independently", async (t) => {
   for (const operation of Object.keys(specs)) {
     await t.test(operation, async () => {
       const value = fixture(operation);

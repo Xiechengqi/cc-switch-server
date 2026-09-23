@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod claude_cli;
+pub mod claude_models;
 pub mod codebuddy;
 pub mod grok_cli;
 pub mod health;

@@ -263,13 +263,22 @@ pub(crate) fn classify_rate_limit(
         parse_claude_utilization_header(headers, "anthropic-ratelimit-unified-7d-utilization");
     let rejected_5h = status_5h.as_deref() == Some("rejected");
     let rejected_7d = status_7d.as_deref() == Some("rejected");
+    let overage_rejected = status_7d_oi.as_deref() == Some("rejected")
+        || overage_status.as_deref() == Some("rejected")
+        || representative_claim
+            .as_deref()
+            .is_some_and(|claim| claim.contains("overage"));
     let conflict_5h = window_evidence_conflicts(status_5h.as_deref(), utilization_5h);
     let conflict_7d = window_evidence_conflicts(status_7d.as_deref(), utilization_7d);
     let retry_after = super::super::grok::retry_after_until_ms(headers, now);
+    let overage_or_fable_only_rejection =
+        overage_rejected && !rejected_5h && !rejected_7d && !conflict_5h && !conflict_7d;
     let exact_until = || {
         bounded_upstream_rate_limit_until(
             now,
-            retry_after
+            (!overage_or_fable_only_rejection)
+                .then_some(retry_after)
+                .flatten()
                 .unwrap_or_else(|| now.saturating_add(DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)),
         )
     };
@@ -337,11 +346,6 @@ pub(crate) fn classify_rate_limit(
         claude_shared_window_explicitly_healthy(status_5h.as_deref(), utilization_5h);
     let shared_7d_healthy =
         claude_shared_window_explicitly_healthy(status_7d.as_deref(), utilization_7d);
-    let overage_rejected = status_7d_oi.as_deref() == Some("rejected")
-        || overage_status.as_deref() == Some("rejected")
-        || representative_claim
-            .as_deref()
-            .is_some_and(|claim| claim.contains("overage"));
     if shared_5h_healthy && shared_7d_healthy {
         if fable_request && status_7d_oi.as_deref() == Some("rejected") {
             let until = parse_anthropic_reset_header(
@@ -350,7 +354,6 @@ pub(crate) fn classify_rate_limit(
                 now,
                 CLAUDE_WEEKLY_OBSERVATION_MAX_FUTURE_MS,
             )
-            .or(retry_after)
             .unwrap_or_else(|| now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS));
             return RateLimitDecision {
                 scope: RateLimitScope::FablePool,
@@ -451,4 +454,66 @@ pub(crate) fn transport_replay_safe(
     retry_allowed
         && (route == ProxyRoute::ClaudeCountTokens
             || (route == ProxyRoute::ClaudeMessages && reason == "connect_error" && attempt == 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers(values: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in values {
+            headers.insert(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn fable_only_rejection_ignores_generic_retry_after() {
+        let now = 1_790_121_600_000;
+        let decision = classify_rate_limit(
+            &headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+                ("retry-after", "3600"),
+            ]),
+            b"{}",
+            true,
+            now,
+        );
+        assert_eq!(decision.scope, RateLimitScope::FablePool);
+        assert_eq!(decision.until, Some(now + DEFAULT_SHARE_MODEL_COOLDOWN_MS));
+    }
+
+    #[test]
+    fn overage_only_rejection_ignores_generic_retry_after() {
+        let now = 1_790_121_600_000;
+        let decision = classify_rate_limit(
+            &headers(&[
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ("anthropic-ratelimit-unified-overage-status", "rejected"),
+                ("retry-after", "3600"),
+            ]),
+            b"{}",
+            false,
+            now,
+        );
+        assert_eq!(decision.scope, RateLimitScope::ExactModel);
+        assert_eq!(decision.reason, "anthropic_overage_model_scope");
+        assert_eq!(
+            decision.until,
+            Some(now + DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS)
+        );
+    }
+
+    #[test]
+    fn ordinary_model_rejection_still_honors_retry_after() {
+        let now = 1_790_121_600_000;
+        let decision = classify_rate_limit(&headers(&[("retry-after", "120")]), b"{}", false, now);
+        assert_eq!(decision.scope, RateLimitScope::ExactModel);
+        assert_eq!(decision.until, Some(now + 120_000));
+    }
 }

@@ -134,6 +134,10 @@ pub(in crate::api) fn openai_model_list(
                     crate::proxy::codex_models::resolved_capability_for_model(provider, &model_id)
                 })
                 .flatten();
+            let claude_capability = (provider.app == AppKind::Claude
+                && provider.provider_type == ProviderType::ClaudeOAuth)
+                .then(|| crate::domain::claude_models::claude_model_capability(&model_id))
+                .flatten();
             let coding_plan_modalities = coding_plan
                 .and_then(|contract| contract.models.iter().find(|model| model.id == model_id))
                 .map(|model| {
@@ -157,14 +161,33 @@ pub(in crate::api) fn openai_model_list(
                 owned_by: owned_by.clone(),
                 reasoning_efforts: capability
                     .as_ref()
-                    .and_then(|capability| capability.reasoning_efforts.clone()),
+                    .and_then(|capability| capability.reasoning_efforts.clone())
+                    .or_else(|| {
+                        claude_capability.map(|capability| {
+                            capability
+                                .effort_levels
+                                .iter()
+                                .map(|effort| (*effort).to_string())
+                                .collect()
+                        })
+                    })
+                    .filter(|efforts: &Vec<String>| !efforts.is_empty()),
                 input_modalities: coding_plan_modalities.or_else(|| {
                     capability
                         .as_ref()
                         .and_then(|capability| capability.input_modalities.clone())
+                        .or_else(|| {
+                            claude_capability.map(|capability| {
+                                capability
+                                    .input_modalities
+                                    .iter()
+                                    .map(|modality| (*modality).to_string())
+                                    .collect()
+                            })
+                        })
                 }),
-                context_window: None,
-                supports_tools: None,
+                context_window: claude_capability.map(|capability| capability.context_window),
+                supports_tools: claude_capability.map(|_| true),
             });
         }
     }

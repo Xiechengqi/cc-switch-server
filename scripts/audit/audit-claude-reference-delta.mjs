@@ -377,7 +377,10 @@ assert(
   "Claude frozen source deltas are not fully mapped to observations",
 );
 
-const expectedCapabilities = new Map([["CORE-N2-CLAUDE", "fixture_verified"]]);
+const expectedCapabilities = new Map([
+  ["CORE-N2-CLAUDE", "fixture_verified"],
+  ["CLAUDE-OPUS-5-5", "fixture_verified"],
+]);
 for (const capability of baseline.capabilities ?? []) {
   assert(
     expectedCapabilities.get(capability.id) === capability.status,
@@ -497,6 +500,37 @@ const expectedOperations = [
     ],
     requiredBodyHashes: ["messages_nonstream", "messages_stream"],
   },
+  {
+    operation: "opus_5_5",
+    requiredChecks: [
+      "bound_account_provider_share",
+      "exact_opus_5_5_model",
+      "count_tokens",
+      "messages_nonstream_usage",
+      "messages_stream_terminal",
+      "dynamic_thinking",
+      "tool_roundtrip",
+      "per_turn_control",
+      "per_turn_timing",
+      "inline_tool_addition",
+      "mid_conversation_system_clear_at",
+      "dangerous_tool_safeguards",
+      "thinking_block_binding",
+      "prompt_cache_evict",
+      "context_1m_acceptance",
+      "no_model_fallback",
+      "decoy_zero_requests",
+      "secret_scan",
+    ],
+    requiredBodyHashes: [
+      "count_tokens",
+      "messages_nonstream",
+      "messages_stream",
+      "thinking",
+      "tool_roundtrip",
+      "per_turn_controls",
+    ],
+  },
 ];
 const acceptance = baseline.realAcceptance;
 assert(
@@ -511,13 +545,17 @@ assert(
     acceptance.scopeDigest.includes("Share revision"),
   "Claude real-acceptance scope is incomplete",
 );
+const acceptanceOperations = [
+  ...(acceptance.operations ?? []),
+  ...(baseline.realAcceptanceExtensions ?? []),
+];
 assert(
   Array.isArray(acceptance.operations) &&
-    acceptance.operations.length === expectedOperations.length,
+    acceptanceOperations.length === expectedOperations.length,
   "Claude real-acceptance operations changed",
 );
 for (const expected of expectedOperations) {
-  const operation = acceptance.operations.find(
+  const operation = acceptanceOperations.find(
     (candidate) => candidate.operation === expected.operation,
   );
   assert(operation, `Claude operation ${expected.operation} is missing`);

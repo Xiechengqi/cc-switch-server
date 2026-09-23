@@ -65,6 +65,15 @@ const operationSpecs = Object.freeze({
     }),
     exactModel: "claude-fable-5-1",
   }),
+  opus_5_5: Object.freeze({
+    accountEnv: "CLAUDE_OAUTH_TEST_ACCOUNT",
+    providerEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_SHARE_ID",
+    modelEnv: "CC_SWITCH_CLAUDE_OPUS_5_5_MODEL",
+    receiptEnv: "CLAUDE_OPUS_5_5_REAL_RECEIPT_FILE",
+    expectedPlan: null,
+    exactModel: "claude-opus-5-5",
+  }),
 });
 
 function env(name, fallback = "") {
@@ -131,7 +140,7 @@ if (!spec) {
       verificationState: "blocked_inputs",
       liveState: "live_pending",
       missingInputs: [
-        "--operation oauth_inference|max_5x_plan|max_20x_plan|fable_5_1",
+        "--operation oauth_inference|max_5x_plan|max_20x_plan|fable_5_1|opus_5_5",
       ],
     }),
   );
@@ -479,6 +488,11 @@ function expectedDecisions() {
       rateLimitScope: "fable_pool",
       modelFallback: "disabled",
     });
+  } else if (operation === "opus_5_5") {
+    Object.assign(decisions, {
+      modelFallback: "disabled",
+      context1mProbe: "bounded_small_request",
+    });
   } else {
     decisions.quotaRefresh = "forced";
   }
@@ -514,7 +528,10 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding, p
   if (containsSecret(JSON.stringify(receipt))) {
     fail("Claude receipt contained secret-like material");
   }
-  const operationContract = contract.realAcceptance.operations.find(
+  const operationContract = [
+    ...contract.realAcceptance.operations,
+    ...(contract.realAcceptanceExtensions || []),
+  ].find(
     (candidate) => candidate.operation === operation,
   );
   if (

@@ -282,6 +282,15 @@
       }
     ]
   },
+  "realAcceptanceExtensions": [
+    {
+      "operation": "opus_5_5",
+      "status": "live_pending",
+      "receipt": null,
+      "requiredChecks": ["bound_account_provider_share", "exact_opus_5_5_model", "count_tokens", "messages_nonstream_usage", "messages_stream_terminal", "dynamic_thinking", "tool_roundtrip", "per_turn_control", "per_turn_timing", "inline_tool_addition", "mid_conversation_system_clear_at", "dangerous_tool_safeguards", "thinking_block_binding", "prompt_cache_evict", "context_1m_acceptance", "no_model_fallback", "decoy_zero_requests", "secret_scan"],
+      "requiredBodyHashes": ["count_tokens", "messages_nonstream", "messages_stream", "thinking", "tool_roundtrip", "per_turn_controls"]
+    }
+  ],
   "sourceExtensions": [
     {
       "sourceId": "cliproxyapi",
@@ -875,6 +884,32 @@
         {
           "path": "src/proxy/claude_oauth.rs",
           "anchors": ["ClaudeToolNameStreamPatcher", "retained_bytes"]
+        }
+      ]
+    },
+    {
+      "id": "CLAUDE-OPUS-5-5",
+      "status": "fixture_verified",
+      "contracts": [
+        {
+          "path": "src/domain/claude_models.rs",
+          "anchors": ["claude-opus-5-5", "per_turn_effort", "per_turn_timing", "opus_5_5_capability_is_complete_and_suffix_aware"]
+        },
+        {
+          "path": "src/proxy/claude_oauth.rs",
+          "anchors": ["PER_TURN_CONTROL_BETA", "PER_TURN_TIMING_BETA", "opus_5_5_betas_follow_the_2_1_280_wire_order_and_shape_gates", "native_passthrough_accepts_the_audited_2_1_280_beta_set"]
+        },
+        {
+          "path": "src/proxy/thinking.rs",
+          "anchors": ["claude_model_capability", "adaptive_model_capabilities_match_current_anthropic_contract"]
+        },
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": ["openai_reasoning_disable_and_small_budget_preserve_sampling", "claude-opus-5-5"]
+        },
+        {
+          "path": "scripts/smoke/claude-real-receipt.mjs",
+          "anchors": ["opus_5_5", "CLAUDE_OPUS_5_5_REAL_RECEIPT_FILE", "context1mProbe"]
         }
       ]
     }

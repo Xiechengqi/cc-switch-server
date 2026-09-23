@@ -4307,11 +4307,11 @@ fn openai_chat_message_to_anthropic(
         let output = message.get("content").cloned().unwrap_or(Value::Null);
         return Ok(vec![json!({
             "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": message.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
-                "content": anthropic_tool_result_content(&output)
-            }]
+            "content": [anthropic_tool_result_block(
+                message.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
+                &output,
+                message.get("is_error")
+            )]
         })]);
     }
 
@@ -4371,14 +4371,13 @@ fn openai_response_item_to_anthropic(
         }
         Some("function_call_output" | "custom_tool_call_output" | "tool_search_output") => {
             let output = item.get("output").cloned().unwrap_or(Value::Null);
-            let mut block = json!({
-                "type": "tool_result",
-                "tool_use_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
-                "content": anthropic_tool_result_content(&output)
-            });
-            if let Some(is_error) = item.get("is_error") {
-                block["is_error"] = is_error.clone();
-            }
+            let block = anthropic_tool_result_block(
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                &output,
+                item.get("is_error"),
+            );
             return Ok(vec![json!({"role": "user", "content": [block]})]);
         }
         Some("input_text" | "output_text" | "text") => {
@@ -4794,6 +4793,41 @@ fn anthropic_tool_result_content(output: &Value) -> Value {
             .filter_map(ToolMediaPart::to_anthropic_block),
     );
     Value::Array(content)
+}
+
+fn anthropic_tool_result_block(
+    tool_use_id: &str,
+    output: &Value,
+    is_error: Option<&Value>,
+) -> Value {
+    let cache_control = match output {
+        Value::Array(parts) => parts
+            .iter()
+            .find_map(|part| part.get("cache_control"))
+            .cloned(),
+        Value::Object(object) => object.get("cache_control").cloned(),
+        _ => None,
+    };
+    let mut content = anthropic_tool_result_content(output);
+    if let Value::Array(parts) = &mut content {
+        for part in parts {
+            if let Some(object) = part.as_object_mut() {
+                object.remove("cache_control");
+            }
+        }
+    }
+    let mut block = json!({
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content
+    });
+    if let Some(cache_control) = cache_control.filter(Value::is_object) {
+        block["cache_control"] = cache_control;
+    }
+    if let Some(is_error) = is_error {
+        block["is_error"] = is_error.clone();
+    }
+    block
 }
 
 fn gemini_contents_to_anthropic(contents: &[Value]) -> Result<Vec<Value>, TransformError> {
@@ -7194,6 +7228,46 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_part_cache_control_is_hoisted_to_the_block() {
+        let messages = openai_chat_message_to_anthropic(
+            &json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{
+                    "type": "text",
+                    "text": "4",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }),
+            "tool",
+        )
+        .unwrap();
+        let block = &messages[0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+        assert_eq!(block["content"][0]["text"], "4");
+        assert!(block["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn openai_responses_string_input_is_a_single_claude_user_turn() {
+        let output = openai_responses_to_anthropic(&json!({
+            "model": "claude-opus-5-5",
+            "instructions": "Be concise.",
+            "input": "line 1\n\"line 2\"\n你好，世界 🌍",
+            "max_output_tokens": 32
+        }))
+        .unwrap();
+        assert_eq!(output["system"], "Be concise.");
+        assert_eq!(output["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(output["messages"][0]["role"], "user");
+        assert_eq!(
+            output["messages"][0]["content"][0]["text"],
+            "line 1\n\"line 2\"\n你好，世界 🌍"
+        );
+    }
+
+    #[test]
     fn openai_chat_to_anthropic_validates_arguments_and_demotes_orphan_outputs() {
         for arguments in [json!("{broken"), json!("[]"), json!(1)] {
             let error = openai_chat_to_anthropic(&json!({
@@ -7354,6 +7428,18 @@ mod tests {
         .unwrap();
         assert_eq!(required["thinking"], json!({"type": "adaptive"}));
         assert_eq!(required["output_config"], json!({"effort": "low"}));
+
+        let opus_5_5 = openai_responses_to_anthropic(&json!({
+            "model": "claude-opus-5-5",
+            "max_output_tokens": 4096,
+            "temperature": 0.2,
+            "reasoning": {"effort": "none"},
+            "input": "ping"
+        }))
+        .unwrap();
+        assert_eq!(opus_5_5["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(opus_5_5["output_config"], json!({"effort": "low"}));
+        assert!(opus_5_5.get("temperature").is_none());
     }
 
     #[test]

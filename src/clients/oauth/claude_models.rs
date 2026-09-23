@@ -2,18 +2,11 @@ pub use crate::domain::accounts::claude_subscription::{
     is_claude_fable_5_model, CLAUDE_FABLE_MODEL_FAMILY,
 };
 use crate::domain::claude_cli::CLAUDE_WIRE_PROFILE;
+pub use crate::domain::claude_models::{
+    claude_model_capability, ClaudeModelCapability, CLAUDE_MODEL_CAPABILITIES, CLAUDE_MODEL_IDS,
+};
 
-pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_788_307_200_000;
-pub const CLAUDE_MODEL_IDS: &[&str] = &[
-    "claude-fable-5-1",
-    "claude-fable-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-sonnet-5",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-];
+pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_790_121_600_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeModelCatalog {
@@ -57,6 +50,7 @@ mod tests {
         assert_eq!(
             catalog.models,
             vec![
+                "claude-opus-5-5",
                 "claude-fable-5-1",
                 "claude-fable-5",
                 "claude-opus-5",
@@ -114,7 +108,7 @@ mod tests {
             CLAUDE_WIRE_PROFILE.billing_prompt_fingerprint_salt
         );
         assert_eq!(profile["billing"]["billingBlockCacheControl"], false);
-        assert_eq!(models.as_slice(), CLAUDE_MODEL_IDS);
+        assert_eq!(models.as_slice(), CLAUDE_MODEL_IDS.as_slice());
         assert_eq!(
             profile["modelCatalog"]["source"],
             static_claude_model_catalog().source

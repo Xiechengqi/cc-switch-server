@@ -17,6 +17,7 @@ use crate::domain::claude_cli::{
     claude_stainless_arch, claude_stainless_os, claude_stainless_package_version,
     claude_stainless_runtime, claude_stainless_runtime_version, CLAUDE_CODE_IDENTITY_TEXT,
 };
+use crate::domain::claude_models::{claude_model_capability, ClaudeModelCapability};
 
 use super::anthropic_cache_control::{
     has_extended_cache_ttl, normalize_anthropic_cache_control, reconcile_forced_tool_choice,
@@ -39,6 +40,12 @@ const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18
 const THINKING_TOKEN_COUNT_BETA: &str = "thinking-token-count-2026-05-13";
 const PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
 const MID_CONVERSATION_SYSTEM_BETA: &str = "mid-conversation-system-2026-04-07";
+const PER_TURN_CONTROL_BETA: &str = "per-turn-control-2026-07-01";
+const PER_TURN_TIMING_BETA: &str = "timing-2026-09-09";
+const MID_CONVERSATION_TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+const MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+const DANGEROUS_TOOL_USE_BETA: &str = "dangerous-tool-use-2026-09-03";
 const ADVISOR_TOOL_BETA: &str = "advisor-tool-2026-03-01";
 const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
 const SERVER_SIDE_FALLBACK_ARRAY_BETA: &str = "server-side-fallback-2026-06-01";
@@ -47,6 +54,9 @@ const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-06-01";
 const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-12-15";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const CACHE_DIAGNOSIS_BETA: &str = "cache-diagnosis-2026-04-07";
+const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+const THINKING_RESUMPTION_BETA: &str = "thinking-resumption-2026-07-17";
+const PROMPT_CACHING_EVICT_BETA: &str = "prompt-caching-evict-2026-05-12";
 const MESSAGES_CLIENT_BETAS: &[&str] = &[
     "prompt-caching-2024-07-31",
     "token-efficient-tools-2025-02-19",
@@ -607,14 +617,66 @@ fn restore_claude_tool_name_field(
     else {
         return false;
     };
-    let Some(original) = aliases.get(&current.to_ascii_lowercase()) else {
+    let Some(original) = resolve_claude_tool_name(current, aliases) else {
         return false;
     };
     if current == original {
         return false;
     }
-    object.insert(field.to_string(), Value::String(original.clone()));
+    object.insert(field.to_string(), Value::String(original));
     true
+}
+
+fn resolve_claude_tool_name(current: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
+    let lookup = current.to_ascii_lowercase();
+    if let Some(original) = aliases.get(&lookup) {
+        return Some(original.clone());
+    }
+    let parts = lookup.split("__").collect::<Vec<_>>();
+    if parts.first().copied() != Some("mcp") || parts.len() < 3 {
+        return None;
+    }
+
+    let suffix = parts[2..].join("__");
+
+    // A declared client tool wins over an MCP passthrough with the same
+    // semantic suffix. This mirrors exact-alias precedence even when Claude
+    // wraps or replaces the name with a virtual MCP server prefix.
+    let mut client_matches = aliases.values().filter(|original| {
+        let original_lookup = original.to_ascii_lowercase();
+        !original_lookup.starts_with("mcp__") && original_lookup == suffix
+    });
+    if let Some(original) = client_matches.next() {
+        if client_matches.next().is_none() {
+            return Some(original.clone());
+        }
+        return None;
+    }
+
+    // Hybrid recovery 1: Claude prepended a virtual server to the caller's
+    // complete MCP name: mcp__virtual__real_server__tool.
+    if parts.len() >= 4 {
+        let reprefixed = format!("mcp__{}", parts[2..].join("__"));
+        if let Some(original) = aliases.get(&reprefixed) {
+            if original.to_ascii_lowercase() == reprefixed {
+                return Some(original.clone());
+            }
+        }
+    }
+
+    // Hybrid recovery 2: Claude replaced the real server with a virtual one.
+    // Only a unique declared passthrough MCP tool may be recovered. Exact
+    // client aliases above always win, and ambiguity remains fail closed.
+    let mut matches = aliases.iter().filter_map(|(wire, original)| {
+        let original_lookup = original.to_ascii_lowercase();
+        if wire != &original_lookup || !original_lookup.starts_with("mcp__") {
+            return None;
+        }
+        let (_, tool) = original_lookup.strip_prefix("mcp__")?.split_once("__")?;
+        (tool == suffix).then(|| original.clone())
+    });
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
 }
 
 #[derive(Debug, Default)]
@@ -1563,9 +1625,7 @@ fn build_anthropic_beta_value_for_class(
     match operation {
         ClaudeBetaOperation::Messages => {
             push_beta(&mut betas, INTERLEAVED_THINKING_BETA);
-            if body.is_some_and(body_has_thinking_display_updates) {
-                push_beta(&mut betas, THINKING_DISPLAY_UPDATES_BETA);
-            } else if !body.is_some_and(body_has_thinking_display) {
+            if !body.is_some_and(body_has_thinking_display) {
                 push_beta(&mut betas, REDACT_THINKING_BETA);
             }
             push_beta(&mut betas, THINKING_TOKEN_COUNT_BETA);
@@ -1574,11 +1634,41 @@ fn build_anthropic_beta_value_for_class(
             if body.is_some_and(body_model_supports_mid_conversation_system) {
                 push_beta(&mut betas, MID_CONVERSATION_SYSTEM_BETA);
             }
+            if requested.iter().any(|beta| beta == PER_TURN_CONTROL_BETA)
+                || body.is_some_and(body_model_supports_per_turn_effort)
+            {
+                push_beta(&mut betas, PER_TURN_CONTROL_BETA);
+            }
+            if requested.iter().any(|beta| beta == PER_TURN_TIMING_BETA)
+                || body.is_some_and(body_has_supported_per_turn_timing)
+            {
+                push_beta(&mut betas, PER_TURN_TIMING_BETA);
+            }
+            if body.is_some_and(body_model_supports_mid_conversation_tool_changes) {
+                push_beta(&mut betas, MID_CONVERSATION_TOOL_CHANGES_BETA);
+            }
+            if requested.iter().any(|beta| beta == INLINE_TOOLS_BETA)
+                || body.is_some_and(body_has_inline_tool_addition)
+            {
+                push_beta(&mut betas, INLINE_TOOLS_BETA);
+            }
             if body.is_some_and(body_has_advisor_tool) {
                 push_beta(&mut betas, ADVISOR_TOOL_BETA);
             }
             if body.is_some_and(body_has_advanced_tool_use) {
                 push_beta(&mut betas, ADVANCED_TOOL_USE_BETA);
+            }
+            if requested
+                .iter()
+                .any(|beta| beta == MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA)
+                || body.is_some_and(body_has_supported_mid_conversation_clear_at)
+            {
+                push_beta(&mut betas, MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA);
+            }
+            if requested.iter().any(|beta| beta == DANGEROUS_TOOL_USE_BETA)
+                || body.is_some_and(body_has_safeguards)
+            {
+                push_beta(&mut betas, DANGEROUS_TOOL_USE_BETA);
             }
             push_beta(&mut betas, EFFORT_BETA);
             if let Some(fallback_beta) = body.and_then(body_server_side_fallback_beta) {
@@ -1586,17 +1676,43 @@ fn build_anthropic_beta_value_for_class(
                     push_beta(&mut betas, fallback_beta);
                 }
             }
-            if is_claude_oauth || body.is_some_and(body_has_fallback_credit) {
+            if requested.iter().any(|beta| beta == FALLBACK_CREDIT_BETA)
+                || body.is_some_and(body_has_fallback_credit)
+                || (is_claude_oauth && body.is_some_and(body_has_fallbacks))
+            {
                 push_beta(&mut betas, FALLBACK_CREDIT_BETA);
             }
             if body.is_some_and(body_has_structured_output) {
                 push_beta(&mut betas, STRUCTURED_OUTPUTS_BETA);
+            }
+            if requested
+                .iter()
+                .any(|beta| beta == THINKING_BINDING_CONTROLS_BETA)
+                || body.is_some_and(body_has_thinking_block_binding)
+            {
+                push_beta(&mut betas, THINKING_BINDING_CONTROLS_BETA);
+            }
+            if body.is_some_and(body_has_thinking_display_updates) {
+                push_beta(&mut betas, THINKING_DISPLAY_UPDATES_BETA);
+            }
+            if requested
+                .iter()
+                .any(|beta| beta == THINKING_RESUMPTION_BETA)
+            {
+                push_beta(&mut betas, THINKING_RESUMPTION_BETA);
             }
             if body.is_some_and(body_has_fast_mode) {
                 push_beta(&mut betas, FAST_MODE_BETA);
             }
             if is_claude_oauth && current_beta_profile_enabled() {
                 push_beta(&mut betas, EXTENDED_CACHE_TTL_BETA);
+            }
+            if requested
+                .iter()
+                .any(|beta| beta == PROMPT_CACHING_EVICT_BETA)
+                || body.is_some_and(body_has_prompt_cache_evict)
+            {
+                push_beta(&mut betas, PROMPT_CACHING_EVICT_BETA);
             }
             if body.is_some_and(body_has_diagnostics) {
                 push_beta(&mut betas, CACHE_DIAGNOSIS_BETA);
@@ -1679,6 +1795,9 @@ fn native_passthrough_betas(
                 .and_then(body_server_side_fallback_beta)
                 .is_some_and(|required| required == beta),
             ADVANCED_TOOL_USE_BETA => body.is_some_and(body_has_advanced_tool_use),
+            MID_CONVERSATION_TOOL_CHANGES_BETA => {
+                body.is_some_and(body_model_supports_mid_conversation_tool_changes)
+            }
             THINKING_DISPLAY_UPDATES_BETA => body.is_some_and(body_has_thinking_display_updates),
             REDACT_THINKING_BETA => !body.is_some_and(body_has_thinking_display),
             _ => true,
@@ -1870,6 +1989,12 @@ fn native_beta_allowed(beta: &str, operation: ClaudeBetaOperation) -> bool {
                 | THINKING_TOKEN_COUNT_BETA
                 | PROMPT_CACHING_SCOPE_BETA
                 | MID_CONVERSATION_SYSTEM_BETA
+                | PER_TURN_CONTROL_BETA
+                | PER_TURN_TIMING_BETA
+                | MID_CONVERSATION_TOOL_CHANGES_BETA
+                | INLINE_TOOLS_BETA
+                | MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA
+                | DANGEROUS_TOOL_USE_BETA
                 | ADVISOR_TOOL_BETA
                 | ADVANCED_TOOL_USE_BETA
                 | SERVER_SIDE_FALLBACK_ARRAY_BETA
@@ -1877,6 +2002,9 @@ fn native_beta_allowed(beta: &str, operation: ClaudeBetaOperation) -> bool {
                 | FALLBACK_CREDIT_BETA
                 | STRUCTURED_OUTPUTS_BETA
                 | FAST_MODE_BETA
+                | THINKING_BINDING_CONTROLS_BETA
+                | THINKING_RESUMPTION_BETA
+                | PROMPT_CACHING_EVICT_BETA
                 | CACHE_DIAGNOSIS_BETA
         ),
         ClaudeBetaOperation::CountTokens => {
@@ -1999,17 +2127,88 @@ fn body_has_advisor_tool(body: &Value) -> bool {
 }
 
 fn body_model_supports_mid_conversation_system(body: &Value) -> bool {
-    let Some(model) = body.get("model").and_then(Value::as_str) else {
-        return false;
-    };
-    matches!(
-        model.trim_end_matches("[1m]"),
-        "claude-opus-4-8"
-            | "claude-opus-5"
-            | "claude-sonnet-5"
-            | "claude-fable-5"
-            | "claude-fable-5-1"
-    )
+    body_model_capability(body).is_some_and(|capability| capability.mid_conversation_system)
+}
+
+fn body_model_capability(body: &Value) -> Option<&'static ClaudeModelCapability> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .and_then(claude_model_capability)
+}
+
+fn body_model_supports_mid_conversation_tool_changes(body: &Value) -> bool {
+    body_model_capability(body).is_some_and(|capability| capability.mid_conversation_tool_changes)
+}
+
+fn body_model_supports_per_turn_effort(body: &Value) -> bool {
+    body_model_capability(body).is_some_and(|capability| capability.per_turn_effort)
+}
+
+fn body_has_supported_per_turn_timing(body: &Value) -> bool {
+    body_model_capability(body).is_some_and(|capability| capability.per_turn_timing)
+        && (body.pointer("/output_config/timing").is_some()
+            || body
+                .get("messages")
+                .and_then(Value::as_array)
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message.pointer("/output_config/timing").is_some())
+                }))
+}
+
+fn body_has_inline_tool_addition(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("tool_addition"))
+                                && block.pointer("/tool/definition").is_some()
+                        })
+                    })
+            })
+        })
+}
+
+fn body_has_supported_mid_conversation_clear_at(body: &Value) -> bool {
+    body_model_supports_mid_conversation_system(body)
+        && body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.get("clear_at").is_some())
+            })
+}
+
+fn body_has_safeguards(body: &Value) -> bool {
+    body.get("safeguards").is_some()
+}
+
+fn body_has_thinking_block_binding(body: &Value) -> bool {
+    body.pointer("/thinking/block_binding").is_some()
+}
+
+fn body_has_prompt_cache_evict(body: &Value) -> bool {
+    fn contains(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key("evict_on_complete") || object.values().any(contains)
+            }
+            Value::Array(items) => items.iter().any(contains),
+            _ => false,
+        }
+    }
+    contains(body)
 }
 
 fn body_server_side_fallback_beta(body: &Value) -> Option<&'static str> {
@@ -2072,6 +2271,10 @@ fn body_has_fallback_credit(body: &Value) -> bool {
     body.get("fallback_credit_token")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn body_has_fallbacks(body: &Value) -> bool {
+    body.get("fallbacks").is_some()
 }
 
 fn body_has_structured_output(body: &Value) -> bool {
@@ -2757,7 +2960,7 @@ mod tests {
         let result = ensure_claude_oauth_billing_header_system(body);
         let billing = result["system"][0]["text"].as_str().unwrap();
 
-        assert!(billing.contains("cc_version=2.1.258.d3d;"));
+        assert!(billing.contains("cc_version=2.1.280.c6d;"));
         assert_eq!(
             result["messages"][0]["content"],
             json!("This migrated system prompt must not become billing input.")
@@ -2930,7 +3133,7 @@ mod tests {
         assert_eq!(system.len(), 1);
         let text = system[0]["text"].as_str().unwrap_or("");
         assert!(text.starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli; cch="
         ));
         assert!(!text.contains("cch=abcde;"));
         assert!(system[0].get("cache_control").is_none());
@@ -2949,8 +3152,119 @@ mod tests {
         );
         assert_eq!(
             beta,
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11"
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11"
         );
+    }
+
+    #[test]
+    fn opus_5_5_betas_follow_the_2_1_280_wire_order_and_shape_gates() {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "thinking": {"type": "adaptive", "display": "updates", "block_binding": "required"},
+            "output_config": {"effort": "medium", "timing": {"enabled": true}},
+            "messages": [{
+                "role": "system",
+                "clear_at": "next_turn",
+                "content": [{"type": "tool_addition", "tool": {"definition": {"name": "late"}}}]
+            }],
+            "safeguards": {},
+            "cache_control": {"evict_on_complete": true}
+        });
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&body),
+            &[THINKING_RESUMPTION_BETA.to_string()],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        let betas = beta.split(',').collect::<Vec<_>>();
+        let expected = [
+            MID_CONVERSATION_SYSTEM_BETA,
+            PER_TURN_CONTROL_BETA,
+            PER_TURN_TIMING_BETA,
+            MID_CONVERSATION_TOOL_CHANGES_BETA,
+            INLINE_TOOLS_BETA,
+            MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA,
+            DANGEROUS_TOOL_USE_BETA,
+            EFFORT_BETA,
+            THINKING_BINDING_CONTROLS_BETA,
+            THINKING_DISPLAY_UPDATES_BETA,
+            THINKING_RESUMPTION_BETA,
+            EXTENDED_CACHE_TTL_BETA,
+            PROMPT_CACHING_EVICT_BETA,
+        ];
+        let positions = expected
+            .iter()
+            .map(|expected| {
+                betas
+                    .iter()
+                    .position(|beta| beta == expected)
+                    .unwrap_or_else(|| panic!("missing {expected} in {beta}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!beta.contains(REDACT_THINKING_BETA));
+        assert!(!beta.contains(FALLBACK_CREDIT_BETA));
+    }
+
+    #[test]
+    fn timing_and_model_gated_betas_fail_closed_for_unknown_models() {
+        let unknown = json!({
+            "model": "claude-opus-next",
+            "output_config": {"timing": {"enabled": true}}
+        });
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&unknown),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        for gated in [
+            MID_CONVERSATION_SYSTEM_BETA,
+            MID_CONVERSATION_TOOL_CHANGES_BETA,
+            PER_TURN_CONTROL_BETA,
+            PER_TURN_TIMING_BETA,
+        ] {
+            assert!(!beta.contains(gated), "unexpected {gated}: {beta}");
+        }
+
+        let known_without_shape = json!({"model": "claude-opus-5-5"});
+        let beta = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&known_without_shape),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(beta.contains(PER_TURN_CONTROL_BETA));
+        assert!(!beta.contains(PER_TURN_TIMING_BETA));
+    }
+
+    #[test]
+    fn fallback_credit_is_not_synthesized_for_ordinary_oauth_messages() {
+        let ordinary = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&json!({"model": "claude-opus-5-5", "messages": []})),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(!ordinary.contains(FALLBACK_CREDIT_BETA));
+
+        let with_token = build_anthropic_beta_value(
+            &HeaderMap::new(),
+            Some(&json!({"fallback_credit_token": "opaque"})),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+        );
+        assert!(with_token.contains(FALLBACK_CREDIT_BETA));
     }
 
     #[test]
@@ -2978,16 +3292,27 @@ mod tests {
         let messages = &profile["betaMatrices"]["messages"];
         let count_tokens = &profile["betaMatrices"]["countTokens"];
         let maximal_messages_body = json!({
-            "model": "claude-sonnet-5",
+            "model": "claude-opus-5-5",
             "stream": true,
-            "thinking": {"type": "adaptive", "display": "updates"},
+            "thinking": {"type": "adaptive", "display": "updates", "block_binding": "required"},
             "tools": [
                 {"name": "deferred", "defer_loading": true},
                 {"type": "advisor_20260301"}
             ],
+            "messages": [{
+                "role": "system",
+                "clear_at": "next_turn",
+                "output_config": {"timing": {"enabled": true}},
+                "content": [{
+                    "type": "tool_addition",
+                    "tool": {"definition": {"name": "later"}}
+                }]
+            }],
             "fallbacks": "default",
             "context_management": {"edits": []},
             "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+            "safeguards": {},
+            "cache_control": {"evict_on_complete": true},
             "speed": "fast",
             "diagnostics": {},
             "system": [{"cache_control": {"type": "ephemeral", "ttl": "1h"}}]
@@ -2996,7 +3321,10 @@ mod tests {
         let message_betas = build_anthropic_beta_value(
             &HeaderMap::new(),
             Some(&maximal_messages_body),
-            &[SERVER_SIDE_FALLBACK_DEFAULT_BETA.to_string()],
+            &[
+                SERVER_SIDE_FALLBACK_DEFAULT_BETA.to_string(),
+                THINKING_RESUMPTION_BETA.to_string(),
+            ],
             true,
             true,
             ClaudeBetaOperation::Messages,
@@ -3098,10 +3426,63 @@ mod tests {
         assert_eq!(catalog_models, capability_models);
         for (model, capabilities) in catalog["capabilitiesByModel"].as_object().unwrap() {
             let body = json!({"model": model});
+            let runtime = claude_model_capability(model).unwrap();
             assert_eq!(
                 body_model_supports_mid_conversation_system(&body),
                 capabilities["midConversationSystem"].as_bool().unwrap(),
                 "model capability fixture drift for {model}"
+            );
+            assert_eq!(
+                runtime.context_window,
+                capabilities["contextWindow"].as_u64().unwrap()
+            );
+            assert_eq!(
+                runtime.max_output_tokens,
+                capabilities["maxOutputTokens"].as_u64().unwrap()
+            );
+            assert_eq!(
+                runtime.input_modalities,
+                capabilities["inputModalities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                runtime.effort_levels,
+                capabilities["effortLevels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                runtime.dynamic_thinking,
+                capabilities["dynamicThinking"].as_bool().unwrap()
+            );
+            assert_eq!(
+                runtime.rejects_disabled_thinking,
+                capabilities["rejectsDisabledThinking"].as_bool().unwrap()
+            );
+            assert_eq!(
+                runtime.per_turn_effort,
+                capabilities["perTurnEffort"].as_bool().unwrap()
+            );
+            assert_eq!(
+                runtime.per_turn_timing,
+                capabilities["perTurnTiming"].as_bool().unwrap()
+            );
+            assert_eq!(
+                runtime.mid_conversation_tool_changes,
+                capabilities["midConversationToolChanges"]
+                    .as_bool()
+                    .unwrap()
+            );
+            assert_eq!(
+                runtime.web_search,
+                capabilities["webSearch"].as_bool().unwrap()
             );
         }
     }
@@ -3126,7 +3507,7 @@ mod tests {
         );
         assert_eq!(
             beta,
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,prompt-caching-2024-07-31,token-efficient-tools-2025-02-19"
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11,prompt-caching-2024-07-31,token-efficient-tools-2025-02-19"
         );
         assert!(!beta.contains("custom-beta"));
         assert_eq!(beta.matches(PROMPT_CACHING_SCOPE_BETA).count(), 1);
@@ -3465,6 +3846,40 @@ mod tests {
     }
 
     #[test]
+    fn native_passthrough_accepts_the_audited_2_1_280_beta_set() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(
+                "per-turn-control-2026-07-01,timing-2026-09-09,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,mid-conversation-system-clear-at-2026-08-21,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-resumption-2026-07-17,prompt-caching-evict-2026-05-12",
+            ),
+        );
+        let body = json!({"model": "claude-opus-5-5"});
+        let beta = build_anthropic_beta_value_for_class(
+            &headers,
+            Some(&body),
+            &[],
+            false,
+            true,
+            ClaudeBetaOperation::Messages,
+            ClaudeClientClass::NativeCli,
+        );
+        for expected in [
+            PER_TURN_CONTROL_BETA,
+            PER_TURN_TIMING_BETA,
+            MID_CONVERSATION_TOOL_CHANGES_BETA,
+            INLINE_TOOLS_BETA,
+            MID_CONVERSATION_SYSTEM_CLEAR_AT_BETA,
+            DANGEROUS_TOOL_USE_BETA,
+            THINKING_BINDING_CONTROLS_BETA,
+            THINKING_RESUMPTION_BETA,
+            PROMPT_CACHING_EVICT_BETA,
+        ] {
+            assert!(beta.contains(expected), "missing {expected}: {beta}");
+        }
+    }
+
+    #[test]
     fn native_passthrough_also_enforces_fallback_body_beta_consistency() {
         let mut headers = HeaderMap::new();
         headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
@@ -3717,7 +4132,7 @@ mod tests {
         assert!(value["system"][0]["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("cc_version=2.1.258.1e2;"));
+            .contains("cc_version=2.1.280.d7b;"));
         assert!(value["system"][0].get("cache_control").is_none());
         assert_eq!(value["tools"], json!([]));
     }
@@ -3999,6 +4414,52 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_mcp_passthrough_names_recover_only_unique_declared_tools() {
+        let aliases = BTreeMap::from([
+            (
+                "mcp__weather__forecast".to_string(),
+                "mcp__weather__forecast".to_string(),
+            ),
+            (
+                "mcp__calendar__lookup".to_string(),
+                "mcp__calendar__lookup".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_claude_tool_name("mcp__virtual__weather__forecast", &aliases).as_deref(),
+            Some("mcp__weather__forecast")
+        );
+        assert_eq!(
+            resolve_claude_tool_name("mcp__virtual__forecast", &aliases).as_deref(),
+            Some("mcp__weather__forecast")
+        );
+
+        let ambiguous = BTreeMap::from([
+            (
+                "mcp__weather__lookup".to_string(),
+                "mcp__weather__lookup".to_string(),
+            ),
+            (
+                "mcp__calendar__lookup".to_string(),
+                "mcp__calendar__lookup".to_string(),
+            ),
+        ]);
+        assert!(resolve_claude_tool_name("mcp__virtual__lookup", &ambiguous).is_none());
+
+        let client_precedence = BTreeMap::from([
+            ("cc_tool_1234".to_string(), "Bash".to_string()),
+            (
+                "mcp__shell__bash".to_string(),
+                "mcp__shell__Bash".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_claude_tool_name("mcp__virtual__Bash", &client_precedence).as_deref(),
+            Some("Bash")
+        );
+    }
+
+    #[test]
     fn claude_tool_name_stream_patcher_restores_fragmented_sse_events() {
         let aliases = BTreeMap::from([("read".to_string(), "read".to_string())]);
         let mut patcher = ClaudeToolNameStreamPatcher::new(aliases);
@@ -4200,8 +4661,12 @@ mod tests {
     #[test]
     fn cch_matches_current_claude_code_golden_vector() {
         let profile: Value = serde_json::from_str(WIRE_PROFILE_JSON).unwrap();
-        let vector = &profile["cch"]["goldenVectors"][0];
-        assert_eq!(vector["signature"], "8d393");
+        let vector = profile["cch"]["goldenVectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vector| vector["profile"] == "2.1.280-prompt-ping")
+            .unwrap();
         assert_eq!(
             vector["syntheticBody"]["messages"][0]["content"][0]["text"],
             "ping"

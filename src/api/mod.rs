@@ -2996,6 +2996,19 @@ mod grok_catalog_provider_tests {
         let mut expected = crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS.to_vec();
         expected.sort_unstable();
         assert_eq!(models, expected);
+        let opus = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "claude-opus-5-5")
+            .unwrap();
+        assert_eq!(opus["contextWindow"], 1_000_000);
+        assert_eq!(opus["inputModalities"], json!(["text", "image"]));
+        assert_eq!(
+            opus["reasoningEfforts"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(opus["supportsTools"], true);
     }
 
     #[tokio::test]

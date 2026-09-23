@@ -92,6 +92,9 @@ fn optimize_thinking(body: &mut Value) {
 }
 
 pub(super) fn uses_adaptive_thinking(model: &str) -> bool {
+    if let Some(capability) = crate::domain::claude_models::claude_model_capability(model) {
+        return capability.dynamic_thinking;
+    }
     let normalized = normalize_model_name(model);
     [
         "fable-5",
@@ -108,6 +111,11 @@ pub(super) fn uses_adaptive_thinking(model: &str) -> bool {
 }
 
 pub(super) fn adaptive_thinking_is_default(model: &str) -> bool {
+    if crate::domain::claude_models::claude_model_capability(model)
+        .is_some_and(|capability| capability.rejects_disabled_thinking)
+    {
+        return true;
+    }
     let normalized = normalize_model_name(model);
     ["fable-5", "mythos-5", "mythos-preview", "sonnet-5"]
         .iter()
@@ -115,6 +123,9 @@ pub(super) fn adaptive_thinking_is_default(model: &str) -> bool {
 }
 
 pub(super) fn thinking_cannot_be_disabled(model: &str) -> bool {
+    if let Some(capability) = crate::domain::claude_models::claude_model_capability(model) {
+        return capability.rejects_disabled_thinking;
+    }
     let normalized = normalize_model_name(model);
     ["fable-5", "mythos-5"]
         .iter()
@@ -291,6 +302,9 @@ mod tests {
 
     #[test]
     fn adaptive_model_capabilities_match_current_anthropic_contract() {
+        assert!(uses_adaptive_thinking("claude-opus-5-5"));
+        assert!(adaptive_thinking_is_default("claude-opus-5-5[1m]"));
+        assert!(thinking_cannot_be_disabled("claude-opus-5-5"));
         assert!(adaptive_thinking_is_default("anthropic.claude-sonnet-5"));
         assert!(thinking_cannot_be_disabled("claude-fable-5"));
         assert!(thinking_cannot_be_disabled("claude-fable-5-1"));

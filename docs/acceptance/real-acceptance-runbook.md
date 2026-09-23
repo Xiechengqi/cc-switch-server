@@ -426,17 +426,18 @@ Claude OAuth 专项补充：
 
 1. 同一 `claude_oauth` 账号并发触发多次 refresh 时，上游 token endpoint 不应收到重复风暴；失败后短窗口内应进入 per-token backoff。
 2. 新建 Claude 授权 URL 必须包含 `prompt=login`，避免多账号浏览器会话抢占。
-3. Claude proxy 请求应携带 2.1.258 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。billing 应在 system 迁移前从同一原始 user text 计算 UTF-16 prompt fingerprint；`ping` 必须产生 `cc_version=2.1.258.1e2`，billing block 不得带 `cache_control`。
+3. Claude proxy 请求应携带 2.1.280 CLI header set、基于首条 user 文本稳定合成的 `x-claude-code-session-id`，并在无客户端 `metadata.user_id` 时注入 server 合成值。billing 应在 system 迁移前从同一原始 user text 计算 UTF-16 prompt fingerprint；`ping` 必须产生 `cc_version=2.1.280.d7b`，billing block 不得带 `cache_control`。
 4. `anthropic-beta` 应按请求形状出现：普通工具数组不能触发 advanced-tool-use，只有审计过的 tool-search/deferred tool 才能触发；`thinking.display="updates"` 应加入 thinking-display-updates 且不加入 redact-thinking；Fable 5.1 应加入 mid-conversation-system。messages 与 profile/usage 请求的 Claude CLI UA 应保持同一版本，CCH `cc_entrypoint` 默认应为 `cli`。
 5. 上游 429 时应记录 Share 所绑定 Provider 的 rate-limited outcome，并原样保留审计过的 rate-limit 响应头。Claude Messages/count_tokens 请求不得切换 Provider 或账号；绑定账号的 429 直接返回。
 5a. 在明确绑定 Max 20x 账号的 Fable 5.1 non-stream 与 SSE 请求上，记录脱敏后的 `5h`/`7d`/`7d_oi` header 存在性、取整 utilization 和 reset 倒计时范围，不保存整组原始 header。随后刷新账号/Provider quota，必须出现 `Fable 7d`，且后端 tier metadata 为 `scope=model_family`、`capacityPool=claude_fable_7d_oi`、`modelFamily=claude-fable-5`、`relativeWeeklyCapacity=0.5`、`source=anthropic_ratelimit_7d_oi`，`queriedAt` 不早于样本时间。主动 usage 若已提供同名 tier，必须优先于被动样本。若真实响应没有 `7d_oi` 证据，本项保持 `live_pending`，不得从 7d 或计划倍率推测。
 5b. 注入或等待明确的 Fable-only 429：`7d_oi=rejected` 且 5h/7d 为 `allowed`/`allowed_warning`。Fable tier 应显示 100%，后续 Fable 请求在 reset 前被本地拒绝，但同账号普通 Sonnet/Opus 请求仍能到达原绑定上游；不得换 Provider/账号。共享窗口缺失或也 rejected 时必须走账号级 cooldown。到达 reset 后 Fable 被动 tier/阻断应失效，打开中的 UI 通过 generation-aware quota event 自动刷新。
 6. Claude SSE 中出现 `event:error` 且类型为 `rate_limit_error`、`overloaded_error` 或 `api_error` 时，应记录 Share 绑定 Provider failure；无论 error 位于下游 commit 前后都不得透明重放或切换账号，已开始输出的流以 Anthropic 终止错误帧结束。
-7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并在移除 billing cache marker 后重算 CCH；2.1.258 golden fixture 应得到 `cch=8d393`。
+7. 非 Claude Code 客户端请求应被改写为 billing/identity system blocks，原 system 迁移到首条 user message，并在移除 billing cache marker 后重算 CCH；2.1.280 golden fixture 应得到 `cch=daec4`。
 8. 上游 400 signature/thinking 错误应触发反应式降级重试：thinking block 降为 text；工具签名错误时 tool_use/tool_result 降为 text；web_search 历史块错误时剥离历史 server_tool_use/web_search_tool_result。
 9. `CC_SWITCH_CCH_SALT_HEX`、`CC_SWITCH_CLI_STAINLESS_OS`、`CC_SWITCH_CLI_STAINLESS_ARCH`、`CC_SWITCH_CLI_STAINLESS_RUNTIME_VERSION` 覆盖应只用于灰度/抓包追热；默认路径应按账号 seed 稳定选择 stainless OS/arch，stream 请求 `x-stainless-timeout=600`，非 stream 请求为 `60`。
 10. 长闲置 Claude OAuth 账号应由后台 60s 维护循环提前 warm-refresh；真实回归可把 access token 置空或调短 `expiresAt`，确认首个 proxy 请求前账号已恢复可用或只触发一次 singleflight refresh。
-11. 若上游返回 Claude Code CLI 版本过期提示，响应体应替换为面向 cc-switch-server admin 的 `CC_SWITCH_CLI_UA_VERSION` / `CC_SWITCH_CLI_UA` 调整提示，并记录 error 日志。启动前应确认两个 override 默认为空；任何低于 2.1.258 的遗留值必须被拒绝，并在日志/`cc_switch_claude_wire_profile_info` 中显示 `stale_override_rejected=true`。
+11. 若上游返回 Claude Code CLI 版本过期提示，响应体应替换为面向 cc-switch-server admin 的 `CC_SWITCH_CLI_UA_VERSION` / `CC_SWITCH_CLI_UA` 调整提示，并记录 error 日志。启动前应确认两个 override 默认为空；任何低于 2.1.280 的遗留值必须被拒绝，并在日志/`cc_switch_claude_wire_profile_info` 中显示 `stale_override_rejected=true`。
+11a. Opus 5.5 必须使用独立 `opus_5_5` receipt：精确模型 `claude-opus-5-5`，分别覆盖 count_tokens、Messages JSON/SSE、dynamic thinking、tools、per-turn control/timing、inline tool addition、system clear-at、safeguards、thinking binding、cache eviction 与小请求 1M capability acceptance；不得发送巨大上下文、自动 fallback、切换 Provider 或切换账号。离线 fixture 只能保持 `live_pending`。
 12. Claude OAuth 出站 JSON 不应被 key 字母序化；抓包时至少确认原始 `model` / `max_tokens` / `messages` 相对顺序被保留，缺省工具请求应补 `tools: []`。
 13. 上游响应含 `x-request-id` 时，下游客户端应能拿到同名 header，便于 Anthropic support 联合排查。
 14. Claude OAuth 客户端 header 中加入未知 beta（例如 `prompt-caching-scope-2026-01-05`）时，上游不得收到该 token；已审计的 `prompt-caching-2024-07-31` 与 `token-efficient-tools-2025-02-19` 应保留，server debug 日志应能定位被过滤事件但不得记录 token/account 身份。

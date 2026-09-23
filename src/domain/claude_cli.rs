@@ -14,8 +14,8 @@ pub struct ClaudeWireProfile {
 }
 
 pub const CLAUDE_WIRE_PROFILE: ClaudeWireProfile = ClaudeWireProfile {
-    id: "claude-code-2.1.258-audited-2026-09-02",
-    claude_code_version: "2.1.258",
+    id: "claude-code-2.1.280-audited-2026-09-23",
+    claude_code_version: "2.1.280",
     stainless_package_version: "0.112.1",
     node_version: "v26.3.0",
     axios_version: "1.15.2",
@@ -374,16 +374,16 @@ mod tests {
     fn resolved_identity_keeps_all_version_surfaces_coherent() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _ua = EnvGuard::unset("CC_SWITCH_CLI_UA");
-        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.260");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.281");
 
         let identity = claude_cli_identity();
-        assert_eq!(identity.version, "2.1.260");
-        assert_eq!(identity.user_agent, "claude-cli/2.1.260 (external, cli)");
+        assert_eq!(identity.version, "2.1.281");
+        assert_eq!(identity.user_agent, "claude-cli/2.1.281 (external, cli)");
         assert_eq!(identity.source, "version_override");
         assert!(!identity.override_conflict);
         assert!(!identity.stale_override_rejected);
-        assert_eq!(claude_code_user_agent(), "claude-code/2.1.260");
-        assert!(claude_billing_header_text().contains("cc_version=2.1.260."));
+        assert_eq!(claude_code_user_agent(), "claude-code/2.1.281");
+        assert!(claude_billing_header_text().contains("cc_version=2.1.281."));
     }
 
     #[test]
@@ -391,12 +391,12 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _ua = EnvGuard::set(
             "CC_SWITCH_CLI_UA",
-            "claude-cli/2.1.261 (external, claude-vscode, agent-sdk/0.3.261)",
+            "claude-cli/2.1.282 (external, claude-vscode, agent-sdk/0.3.282)",
         );
-        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.260");
+        let _version = EnvGuard::set("CC_SWITCH_CLI_UA_VERSION", "2.1.281");
 
         let identity = claude_cli_identity();
-        assert_eq!(identity.version, "2.1.261");
+        assert_eq!(identity.version, "2.1.282");
         assert_eq!(identity.source, "user_agent_override");
         assert!(identity.override_conflict);
         assert!(!identity.stale_override_rejected);
@@ -447,6 +447,7 @@ mod tests {
         let _ua = EnvGuard::unset("CC_SWITCH_CLI_UA");
         let _version = EnvGuard::unset("CC_SWITCH_CLI_UA_VERSION");
         assert_eq!(claude_billing_prompt_fingerprint("ping", "2.1.258"), "1e2");
+        assert_eq!(claude_billing_prompt_fingerprint("ping", "2.1.280"), "d7b");
         assert_eq!(
             claude_billing_prompt_fingerprint("abcdefghijklmnopqrstuvwxyz", "2.1.258"),
             "d3d"
@@ -455,15 +456,15 @@ mod tests {
             claude_billing_prompt_fingerprint("abcd😀ghijklmnopqrstuvwxyz", "2.1.258"),
             "a15"
         );
-        assert!(claude_billing_header_text_for_prompt("ping").contains("cc_version=2.1.258.1e2;"));
+        assert!(claude_billing_header_text_for_prompt("ping").contains("cc_version=2.1.280.d7b;"));
     }
 
     #[test]
     fn public_version_comparison_is_numeric() {
-        assert!(public_cli_version_at_least_profile("2.1.258"));
+        assert!(public_cli_version_at_least_profile("2.1.280"));
         assert!(public_cli_version_at_least_profile("2.2.0"));
         assert!(public_cli_version_at_least_profile("3.0.0"));
-        assert!(!public_cli_version_at_least_profile("2.1.99"));
+        assert!(!public_cli_version_at_least_profile("2.1.279"));
         assert!(!public_cli_version_at_least_profile("1.999999.999999"));
     }
 

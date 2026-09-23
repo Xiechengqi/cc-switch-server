@@ -9012,7 +9012,7 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS
+            crate::clients::oauth::claude_models::CLAUDE_MODEL_IDS.as_slice()
         );
         assert!(fetched.models.iter().all(|model| {
             model.raw["wireProfileId"] == crate::domain::claude_cli::CLAUDE_WIRE_PROFILE.id

@@ -1,22 +1,22 @@
 {
   "format": "cc-switch-claude-oauth-wire-profile",
-  "schemaVersion": 3,
-  "profileId": "claude-code-2.1.258-audited-2026-09-02",
-  "capturedAt": "2026-09-02T00:00:00Z",
+  "schemaVersion": 4,
+  "profileId": "claude-code-2.1.280-audited-2026-09-23",
+  "capturedAt": "2026-09-23T00:00:00Z",
   "versions": {
-    "claudeCode": "2.1.258",
+    "claudeCode": "2.1.280",
     "stainlessSdk": "0.112.1",
     "node": "v26.3.0",
     "axios": "1.15.2"
   },
   "endpointIdentities": {
-    "usage": "claude-code/2.1.258",
-    "bootstrap": "claude-cli/2.1.258 (external, cli)",
+    "usage": "claude-code/2.1.280",
+    "bootstrap": "claude-cli/2.1.280 (external, cli)",
     "profile": "axios/1.15.2",
     "roles": "axios/1.15.2",
     "token": "axios/1.15.2",
     "inference": {
-      "userAgent": "claude-cli/2.1.258 (external, cli)",
+      "userAgent": "claude-cli/2.1.280 (external, cli)",
       "xStainlessPackageVersion": "0.112.1",
       "xStainlessRuntime": "node",
       "xStainlessRuntimeVersion": "v26.3.0"
@@ -39,7 +39,8 @@
       "digestHexCharacters": 3,
       "promptSource": "first_user_text_before_system_migration",
       "goldenVectors": [
-        {"prompt": "ping", "version": "2.1.258", "fingerprint": "1e2"}
+        {"prompt": "ping", "version": "2.1.258", "fingerprint": "1e2"},
+        {"prompt": "ping", "version": "2.1.280", "fingerprint": "d7b"}
       ]
     }
   },
@@ -58,6 +59,25 @@
           "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
           "system": [
             {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;"},
+            {"type": "text", "text": "system-x"}
+          ],
+          "tools": [],
+          "metadata": {"user_id": "meta-x"},
+          "max_tokens": 1,
+          "thinking": {"type": "adaptive", "display": "omitted"},
+          "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+          "output_config": {"effort": "high"},
+          "stream": true
+        }
+      },
+      {
+        "profile": "2.1.280-prompt-ping",
+        "signature": "daec4",
+        "syntheticBody": {
+          "model": "model-a",
+          "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+          "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=sdk-cli; cch=00000;"},
             {"type": "text", "text": "system-x"}
           ],
           "tools": [],
@@ -124,17 +144,26 @@
         "context-management-2025-06-27",
         "prompt-caching-scope-2026-01-05",
         "effort-2025-11-24",
-        "fallback-credit-2026-06-01",
         "extended-cache-ttl-2025-04-11"
       ],
       "shapeGated": [
         "context-1m-2025-08-07",
         "thinking-display-updates-2026-08-18",
         "mid-conversation-system-2026-04-07",
+        "per-turn-control-2026-07-01",
+        "timing-2026-09-09",
+        "mid-conversation-tool-changes-2026-07-01",
+        "inline-tools-2026-09-15",
         "advisor-tool-2026-03-01",
         "advanced-tool-use-2025-11-20",
+        "mid-conversation-system-clear-at-2026-08-21",
+        "dangerous-tool-use-2026-09-03",
+        "fallback-credit-2026-06-01",
         "structured-outputs-2025-12-15",
+        "thinking-binding-controls-2026-08-01",
+        "thinking-resumption-2026-07-17",
         "fast-mode-2026-02-01",
+        "prompt-caching-evict-2026-05-12",
         "cache-diagnosis-2026-04-07"
       ],
       "shapeRules": {
@@ -192,19 +221,26 @@
         "server_side_fallback",
         "cache_diagnosis"
       ],
-      "modelGatedCapabilities": ["mid_conversation_system"]
+      "modelGatedCapabilities": [
+        "mid_conversation_system",
+        "mid_conversation_tool_changes",
+        "per_turn_effort",
+        "per_turn_timing"
+      ]
     },
     "capabilitiesByModel": {
-      "claude-fable-5-1": {"midConversationSystem": true},
-      "claude-fable-5": {"midConversationSystem": true},
-      "claude-opus-5": {"midConversationSystem": true},
-      "claude-opus-4-8": {"midConversationSystem": true},
-      "claude-sonnet-5": {"midConversationSystem": true},
-      "claude-opus-4-6": {"midConversationSystem": false},
-      "claude-sonnet-4-6": {"midConversationSystem": false},
-      "claude-haiku-4-5-20251001": {"midConversationSystem": false}
+      "claude-opus-5-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": true, "perTurnTiming": true, "webSearch": true},
+      "claude-fable-5-1": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": true, "perTurnTiming": true, "webSearch": true},
+      "claude-fable-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-opus-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-opus-4-8": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-sonnet-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-opus-4-6": {"contextWindow": 200000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-sonnet-4-6": {"contextWindow": 200000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
+      "claude-haiku-4-5-20251001": {"contextWindow": 200000, "maxOutputTokens": 64000, "inputModalities": ["text", "image"], "effortLevels": [], "dynamicThinking": false, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true}
     },
     "models": [
+      "claude-opus-5-5",
       "claude-fable-5-1",
       "claude-fable-5",
       "claude-opus-5",
@@ -218,7 +254,8 @@
   "provenance": {
     "kind": "sanitized_npm_latest_native_binary_static_and_loopback_audit",
     "containsSecrets": false,
+    "officialLinuxX64BinarySha256": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b",
     "realAccountVerification": "pending",
-    "notes": "Audited from the official npm latest/next Claude Code 2.1.258 native binary on 2026-09-02 while npm stable remained 2.1.236. Static inspection plus a loopback capture using fake local credentials confirmed the public identity versions, prompt-derived billing fingerprint, retained CCH, beta gates, and the claude-fable-5-1 catalog entry without contacting Anthropic. Values retain only public endpoint, version, header-family, beta-policy, model capability, fingerprint, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, raw request bodies, raw response bodies, and private build metadata are excluded. Real subscription-account verification remains pending."
+    "notes": "Audited from the official npm latest Claude Code 2.1.280 Linux x64 native binary on 2026-09-23. Static inspection confirmed the public identity versions, prompt-derived billing salt, retained CCH normalization identifiers, Opus 5.5 model catalog capability data, and the ordered feature-gated beta names without using a real credential or contacting Anthropic. CLIProxyAPI 24303543, 779bf317 and bd584a75 were read-only cross-evidence. Values retain only public endpoint, version, header-family, beta-policy, model capability, fingerprint, checksum, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, raw request bodies, raw response bodies, pricing, provider fallbacks, and private build metadata are excluded. Real subscription-account verification remains pending."
   }
 }

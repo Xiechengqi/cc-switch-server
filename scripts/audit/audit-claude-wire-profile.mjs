@@ -10,9 +10,15 @@ const profilePath = path.join(
   "assets/contract/claude-oauth-wire-profile.json",
 );
 const domainPath = path.join(repoRoot, "src/domain/claude_cli.rs");
+const modelDomainPath = path.join(repoRoot, "src/domain/claude_models.rs");
+const oauthPath = path.join(repoRoot, "src/proxy/claude_oauth.rs");
+const thinkingPath = path.join(repoRoot, "src/proxy/thinking.rs");
 const envExamplePath = path.join(repoRoot, ".env.example");
 const profile = JSON.parse(fs.readFileSync(profilePath, "utf8"));
 const domainSource = fs.readFileSync(domainPath, "utf8");
+const modelDomainSource = fs.readFileSync(modelDomainPath, "utf8");
+const oauthSource = fs.readFileSync(oauthPath, "utf8");
+const thinkingSource = fs.readFileSync(thinkingPath, "utf8");
 const envExample = fs.readFileSync(envExamplePath, "utf8");
 const version = profile?.versions?.claudeCode;
 let npmStable;
@@ -25,8 +31,8 @@ function fail(message) {
 if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) {
   fail("versions.claudeCode must be a three-part numeric version");
 }
-if (profile.schemaVersion !== 3) {
-  fail("schemaVersion must be 3 for the prompt-fingerprinted billing profile");
+if (profile.schemaVersion !== 4) {
+  fail("schemaVersion must be 4 for the capability-driven 2.1.280 profile");
 }
 
 const captureDate = profile?.capturedAt?.slice(0, 10);
@@ -97,26 +103,92 @@ for (const vector of fingerprint?.goldenVectors ?? []) {
     fail(`billing prompt fingerprint golden mismatch for ${vector.version}`);
   }
 }
-if (
-  !fingerprint?.goldenVectors?.some(
-    (vector) =>
-      vector.prompt === "ping" &&
-      vector.version === version &&
-      vector.fingerprint === "1e2",
-  )
-) {
-  fail("billing prompt fingerprint must retain the 2.1.258 ping golden");
+for (const [goldenVersion, expectedFingerprint] of [
+  ["2.1.258", "1e2"],
+  [version, "d7b"],
+]) {
+  if (
+    !fingerprint?.goldenVectors?.some(
+      (vector) =>
+        vector.prompt === "ping" &&
+        vector.version === goldenVersion &&
+        vector.fingerprint === expectedFingerprint,
+    )
+  ) {
+    fail(`billing prompt fingerprint is missing ${goldenVersion} ping golden`);
+  }
 }
-const cchGolden = profile?.cch?.goldenVectors?.find(
-  (vector) => vector.profile === "2.1.258-prompt-ping",
-);
+for (const [goldenProfile, signature, billing] of [
+  [
+    "2.1.258-prompt-ping",
+    "8d393",
+    "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;",
+  ],
+  [
+    `${version}-prompt-ping`,
+    "daec4",
+    `x-anthropic-billing-header: cc_version=${version}.d7b; cc_entrypoint=sdk-cli; cch=00000;`,
+  ],
+]) {
+  const cchGolden = profile?.cch?.goldenVectors?.find(
+    (vector) => vector.profile === goldenProfile,
+  );
+  if (
+    cchGolden?.signature !== signature ||
+    cchGolden?.syntheticBody?.messages?.[0]?.content?.[0]?.text !== "ping" ||
+    cchGolden?.syntheticBody?.system?.[0]?.text !== billing
+  ) {
+    fail(`CCH profile must retain the ${goldenProfile} golden`);
+  }
+}
+const required280Betas = [
+  "per-turn-control-2026-07-01",
+  "timing-2026-09-09",
+  "mid-conversation-tool-changes-2026-07-01",
+  "inline-tools-2026-09-15",
+  "mid-conversation-system-clear-at-2026-08-21",
+  "dangerous-tool-use-2026-09-03",
+  "thinking-binding-controls-2026-08-01",
+  "thinking-resumption-2026-07-17",
+  "prompt-caching-evict-2026-05-12",
+];
+const messageBetas = [
+  ...(profile?.betaMatrices?.messages?.always ?? []),
+  ...(profile?.betaMatrices?.messages?.shapeGated ?? []),
+];
+for (const beta of required280Betas) {
+  if (!messageBetas.includes(beta) || !oauthSource.includes(beta)) {
+    fail(`2.1.280 beta ${beta} is not paired across contract and runtime`);
+  }
+}
+const opus55 = profile?.modelCatalog?.capabilitiesByModel?.["claude-opus-5-5"];
 if (
-  cchGolden?.signature !== "8d393" ||
-  cchGolden?.syntheticBody?.messages?.[0]?.content?.[0]?.text !== "ping" ||
-  cchGolden?.syntheticBody?.system?.[0]?.text !==
-    "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;"
+  !profile?.modelCatalog?.models?.includes("claude-opus-5-5") ||
+  opus55?.contextWindow !== 1_000_000 ||
+  opus55?.maxOutputTokens !== 128_000 ||
+  JSON.stringify(opus55?.inputModalities) !== '["text","image"]' ||
+  JSON.stringify(opus55?.effortLevels) !== '["low","medium","high","xhigh","max"]' ||
+  opus55?.dynamicThinking !== true ||
+  opus55?.rejectsDisabledThinking !== true ||
+  opus55?.midConversationSystem !== true ||
+  opus55?.midConversationToolChanges !== true ||
+  opus55?.perTurnEffort !== true ||
+  opus55?.perTurnTiming !== true ||
+  !modelDomainSource.includes('id: "claude-opus-5-5"')
 ) {
-  fail("CCH profile must retain the 2.1.258 prompt-ping golden");
+  fail("Opus 5.5 capability contract is incomplete or drifted from runtime");
+}
+if (
+  !thinkingSource.includes("claude_model_capability(model)") ||
+  !thinkingSource.includes('thinking_cannot_be_disabled("claude-opus-5-5")')
+) {
+  fail("Opus 5.5 thinking conversion is not driven by the capability registry");
+}
+if (
+  profile?.provenance?.officialLinuxX64BinarySha256 !==
+  "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+) {
+  fail("official Claude Code 2.1.280 Linux x64 binary digest drifted");
 }
 if (profile.provenance?.realAccountVerification !== "pending") {
   fail("real-account evidence must stay explicitly pending until a live receipt exists");
