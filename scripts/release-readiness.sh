@@ -10,6 +10,8 @@ RUN_TESTS="${RUN_TESTS:-1}"
 RUN_REAL="${RUN_REAL:-0}"
 RUN_DEPLOYMENT_TESTS="${RUN_DEPLOYMENT_TESTS:-0}"
 EVIDENCE_FILE="${EVIDENCE_FILE:-}"
+SERVER_REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROUTER_AUDIT_ROOT="${CC_SWITCH_ROUTER_AUDIT_ROOT:-$SERVER_REPOSITORY_ROOT/../cc-switch-router}"
 FAILURES=0
 WARNINGS=0
 BLOCKERS=()
@@ -32,7 +34,14 @@ need_var() {
 
 echo "== local release checks =="
 node scripts/audit/audit-proxy-bridge-contract.mjs --check || FAILURES=$((FAILURES + 1))
-node scripts/audit/audit-token-market-decoupling.mjs --check || FAILURES=$((FAILURES + 1))
+if [[ -d "$ROUTER_AUDIT_ROOT" ]]; then
+  CC_SWITCH_ROUTER_AUDIT_ROOT="$ROUTER_AUDIT_ROOT" \
+    node scripts/audit/audit-token-market-decoupling.mjs --check || FAILURES=$((FAILURES + 1))
+elif [[ "$RUN_TESTS" == "1" ]]; then
+  fail "Router audit root is unavailable"
+else
+  echo "[SKIP] Router cross-repository audit unavailable while local tests are disabled"
+fi
 if [[ "$RUN_TESTS" == "1" ]]; then
   LOCAL_FAILURES_BEFORE="$FAILURES"
   cargo fmt --check || FAILURES=$((FAILURES + 1))

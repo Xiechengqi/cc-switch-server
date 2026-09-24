@@ -23,6 +23,7 @@ test("skipped local contracts block release readiness and evidence", () => {
     RUN_REAL: "0",
     RUN_DEPLOYMENT_TESTS: "0",
     EVIDENCE_FILE: evidenceFile,
+    CC_SWITCH_ROUTER_AUDIT_ROOT: path.join(directory, "missing-router"),
     CC_SWITCH_SERVER_TOKEN: "",
     ROUTER_BASE_URL: "",
     SHARE_ID: "",
@@ -41,9 +42,14 @@ test("skipped local contracts block release readiness and evidence", () => {
   });
 
   assert.equal(result.status, 1, result.stderr);
+  assert.match(
+    result.stdout,
+    /\[SKIP\] Router cross-repository audit unavailable while local tests are disabled/,
+  );
   assert.match(result.stdout, /\[BLOCKED-INTERNAL\] local-contracts-unverified/);
   assert.match(result.stdout, /decision=blocked/);
   assert.match(result.stdout, /verificationState=blocked_inputs/);
+  assert.match(result.stdout, /failures=0/);
   assert.doesNotMatch(
     result.stdout,
     /decision=ready-with-known-external-blockers/,
