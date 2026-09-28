@@ -2457,13 +2457,17 @@ async fn forward_with_attempt(
                 super::remote_image::inline_codex_remote_images(&adapter_request.body).await?;
         }
         let grok_contract = if execution.driver_is("oauth.grok_responses") {
+            refresh_execution_managed_account_if_needed(&state, &execution).await?;
             let cli_profile = grok_cli_profile(&execution);
             let preserved_session_id = attempt_context.grok_session_id.as_deref();
             let tenant_scope = preserved_session_id
                 .is_none()
                 .then(|| grok_tenant_scope(&request_context, &stored))
                 .flatten();
-            let contract = match super::grok::apply_forward_contract(
+            let normalized_model = super::grok::normalized_request_model(&adapter_request.body);
+            let reasoning_capability =
+                fresh_grok_reasoning_capability(&state, &execution, &normalized_model).await;
+            let contract = match super::grok::apply_forward_contract_with_reasoning_capability(
                 &mut adapter_request.body,
                 &headers,
                 route,
@@ -2471,6 +2475,7 @@ async fn forward_with_attempt(
                 preserved_session_id,
                 tenant_scope.as_deref(),
                 cli_profile,
+                reasoning_capability.as_ref(),
             ) {
                 Ok(contract) => contract,
                 Err(error) if error.is_protocol_incompatible() => {
@@ -11590,11 +11595,26 @@ async fn bridge_responses_websocket_inner(
                     }
                     ensure_responses_websocket_turn_allowed(state, &execution, mode).await?;
                 }
+                let grok_reasoning_capability = if raw_starts_response
+                    && matches!(mode, ResponsesWebsocketMode::Grok)
+                {
+                    let requested_model = single_upstream_model.as_deref().or_else(|| {
+                        original_response_body
+                            .as_ref()
+                            .and_then(|body| body.get("model"))
+                            .and_then(Value::as_str)
+                    });
+                    let normalized_model = super::grok::normalized_model(requested_model);
+                    fresh_grok_reasoning_capability(state, &execution, &normalized_model).await
+                } else {
+                    None
+                };
                 let mut message = match axum_ws_message_to_tungstenite(
                     message,
                     mode,
                     grok_session_id.as_deref(),
                     single_upstream_model.as_deref(),
+                    grok_reasoning_capability.as_ref(),
                 ) {
                     Ok(Some(message)) => message,
                     Ok(None) => break,
@@ -14960,7 +14980,11 @@ async fn prepare_codex_http_fallback_target(
     adapter_request.upstream_stream_requested = true;
     execution.enforce_model_policy(&mut adapter_request)?;
     let grok_contract = if grok {
-        let mut contract = super::grok::apply_forward_contract(
+        refresh_execution_managed_account_if_needed(state, execution).await?;
+        let normalized_model = super::grok::normalized_request_model(&adapter_request.body);
+        let reasoning_capability =
+            fresh_grok_reasoning_capability(state, execution, &normalized_model).await;
+        let mut contract = super::grok::apply_forward_contract_with_reasoning_capability(
             &mut adapter_request.body,
             &HeaderMap::new(),
             ProxyRoute::CodexResponses,
@@ -14968,6 +14992,7 @@ async fn prepare_codex_http_fallback_target(
             session_id,
             None,
             grok_cli_profile(execution),
+            reasoning_capability.as_ref(),
         )?;
         super::grok::set_forward_contract_turn_index(&mut contract, grok_turn_index);
         adapter_request.model = Some(contract.actual_model.clone());
@@ -16803,6 +16828,7 @@ fn axum_ws_message_to_tungstenite(
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<&str>,
     single_upstream_model: Option<&str>,
+    grok_reasoning_capability: Option<&super::grok::GrokReasoningCapability>,
 ) -> Result<Option<TungsteniteMessage>, ProxyError> {
     match message {
         AxumWsMessage::Text(text) => {
@@ -16811,6 +16837,7 @@ fn axum_ws_message_to_tungstenite(
                 mode,
                 grok_session_id,
                 single_upstream_model,
+                grok_reasoning_capability,
             )?
             .unwrap_or(text);
             Ok(Some(TungsteniteMessage::Text(text)))
@@ -16822,6 +16849,7 @@ fn axum_ws_message_to_tungstenite(
                     mode,
                     grok_session_id,
                     single_upstream_model,
+                    grok_reasoning_capability,
                 )?
             } else {
                 None
@@ -16848,6 +16876,7 @@ fn transform_responses_websocket_request(
     mode: ResponsesWebsocketMode,
     grok_session_id: Option<&str>,
     single_upstream_model: Option<&str>,
+    grok_reasoning_capability: Option<&super::grok::GrokReasoningCapability>,
 ) -> Result<Option<String>, ProxyError> {
     if !matches!(mode, ResponsesWebsocketMode::Grok) && single_upstream_model.is_none() {
         return Ok(None);
@@ -16859,7 +16888,11 @@ fn transform_responses_websocket_request(
         enforce_responses_websocket_model(&mut value, model);
     }
     if matches!(mode, ResponsesWebsocketMode::Grok) {
-        value = super::grok::ws_message_body(value, grok_session_id)?;
+        value = super::grok::ws_message_body_with_reasoning_capability(
+            value,
+            grok_session_id,
+            grok_reasoning_capability,
+        )?;
     }
     serde_json::to_string(&value)
         .map(Some)
@@ -23585,6 +23618,42 @@ fn grok_cli_profile(execution: &ProviderExecution) -> bool {
             execution.managed_account_target(),
             Some((ProviderType::GrokOAuth, _))
         )
+}
+
+async fn fresh_grok_reasoning_capability(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    model: &str,
+) -> Option<super::grok::GrokReasoningCapability> {
+    let (ProviderType::GrokOAuth, account_id, expected_generation) =
+        execution.managed_account_identity_target()?
+    else {
+        return None;
+    };
+    let account = state
+        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
+        .await?;
+    if account.auth_identity_generation != expected_generation {
+        return None;
+    }
+    let (supports_reasoning_effort, reasoning_efforts) = state
+        .fresh_grok_reasoning_capability(
+            crate::state::GrokReasoningCapabilityScope {
+                app: execution.stored.app,
+                provider_id: &execution.stored.provider.id,
+                provider_revision: execution.plan.provider_revision,
+                runtime_fingerprint: &execution.plan.runtime_fingerprint,
+                account_id,
+                auth_identity_generation: expected_generation,
+                token_refresh_generation: account.token_refresh_generation,
+            },
+            model,
+        )
+        .await?;
+    Some(super::grok::GrokReasoningCapability {
+        supports_reasoning_effort,
+        reasoning_efforts,
+    })
 }
 
 fn grok_tenant_scope(context: &UsageLogContext, stored: &StoredProvider) -> Option<String> {
@@ -44944,6 +45013,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             ResponsesWebsocketMode::Codex,
             Some("session-1"),
             Some("gpt-5.5"),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -51306,6 +51376,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 ResponsesWebsocketMode::Grok,
                 Some("session-1"),
                 Some("grok-4.5"),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -51338,6 +51409,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             ResponsesWebsocketMode::Grok,
             Some("session-compatible"),
             Some("grok-4.6"),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -51361,6 +51433,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             ResponsesWebsocketMode::Grok,
             Some("session-incompatible"),
             Some("grok-4.6"),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -51405,6 +51478,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 ResponsesWebsocketMode::Grok,
                 Some("handshake-session"),
                 Some("grok-composer"),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -51429,6 +51503,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             ResponsesWebsocketMode::Grok,
             None,
             Some("grok-custom"),
+            None,
         )
         .unwrap()
         .unwrap();

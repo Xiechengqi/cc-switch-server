@@ -621,6 +621,12 @@ pub(super) struct GrokForwardContract {
     pub protocol_transform: super::protocol_compat::TransformPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GrokReasoningCapability {
+    pub supports_reasoning_effort: Option<bool>,
+    pub reasoning_efforts: Vec<String>,
+}
+
 pub(super) fn set_forward_contract_turn_index(
     contract: &mut GrokForwardContract,
     turn_index: Option<u64>,
@@ -678,7 +684,31 @@ pub(super) fn apply_forward_contract(
     tenant_scope: Option<&str>,
     cli_profile: bool,
 ) -> Result<GrokForwardContract, ProxyError> {
-    let protocol_transform = patch_grok_request_body(body, route)?;
+    apply_forward_contract_with_reasoning_capability(
+        body,
+        downstream_headers,
+        route,
+        downstream_session_id,
+        preserved_session_id,
+        tenant_scope,
+        cli_profile,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_forward_contract_with_reasoning_capability(
+    body: &mut Bytes,
+    downstream_headers: &HeaderMap,
+    route: ProxyRoute,
+    downstream_session_id: Option<&str>,
+    preserved_session_id: Option<&str>,
+    tenant_scope: Option<&str>,
+    cli_profile: bool,
+    reasoning_capability: Option<&GrokReasoningCapability>,
+) -> Result<GrokForwardContract, ProxyError> {
+    let protocol_transform =
+        patch_grok_request_body_with_reasoning_capability(body, route, reasoning_capability)?;
     record_protocol_transform(&protocol_transform, "http");
     let model = request_model(body).unwrap_or_else(|| DEFAULT_GROK_MODEL.to_string());
     let session_id = grok_session_id(
@@ -972,10 +1002,18 @@ pub(super) fn patch_grok_request_body(
     body: &mut Bytes,
     route: ProxyRoute,
 ) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
+    patch_grok_request_body_with_reasoning_capability(body, route, None)
+}
+
+pub(super) fn patch_grok_request_body_with_reasoning_capability(
+    body: &mut Bytes,
+    route: ProxyRoute,
+    reasoning_capability: Option<&GrokReasoningCapability>,
+) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
     let mut value = serde_json::from_slice::<Value>(body).map_err(|error| {
         ProxyError::bad_request(format!("Grok request body must be valid JSON: {error}"))
     })?;
-    let protocol_transform = patch_grok_request_value(&mut value, route)?;
+    let protocol_transform = patch_grok_request_value(&mut value, route, reasoning_capability)?;
     *body = serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError::bad_request(format!("Grok request encode failed: {error}")))?;
@@ -1017,6 +1055,7 @@ fn remove_prompt_cache_key(body: &mut Bytes) -> Result<(), ProxyError> {
 fn patch_grok_request_value(
     value: &mut Value,
     _route: ProxyRoute,
+    reasoning_capability: Option<&GrokReasoningCapability>,
 ) -> Result<super::protocol_compat::TransformPlan, ProxyError> {
     let tool_compatibility = super::transforms::normalize_grok_responses_tool_compatibility(value)
         .map_err(|error| ProxyError::protocol_incompatible(error.to_string()))?;
@@ -1054,7 +1093,7 @@ fn patch_grok_request_value(
                 "service_tier",
             ],
         );
-        sanitize_reasoning(object, &model);
+        sanitize_reasoning(object, &model, reasoning_capability);
         sanitize_tools(object)?;
     }
     if store_false {
@@ -1474,8 +1513,10 @@ fn redact_video_diagnostic(value: &str) -> String {
 fn normalize_ws_response_body(
     value: &mut Value,
     session_id: Option<&str>,
+    reasoning_capability: Option<&GrokReasoningCapability>,
 ) -> Result<(), ProxyError> {
-    let protocol_transform = patch_grok_request_value(value, ProxyRoute::CodexResponses)?;
+    let protocol_transform =
+        patch_grok_request_value(value, ProxyRoute::CodexResponses, reasoning_capability)?;
     record_protocol_transform(&protocol_transform, "websocket");
     if let Some(session_id) = session_id {
         if let Some(object) = value.as_object_mut() {
@@ -1497,23 +1538,33 @@ fn normalize_ws_response_body(
     Ok(())
 }
 
-pub(super) fn ws_request_body(
+pub(super) fn ws_request_body(value: Value, session_id: Option<&str>) -> Result<Value, ProxyError> {
+    ws_request_body_with_reasoning_capability(value, session_id, None)
+}
+
+pub(super) fn ws_request_body_with_reasoning_capability(
     mut value: Value,
     session_id: Option<&str>,
+    reasoning_capability: Option<&GrokReasoningCapability>,
 ) -> Result<Value, ProxyError> {
-    normalize_ws_response_body(&mut value, session_id)?;
+    normalize_ws_response_body(&mut value, session_id, reasoning_capability)?;
     Ok(json!({
         "type": "response.create",
         "response": value,
     }))
 }
 
-pub(super) fn ws_message_body(
+pub(super) fn ws_message_body(value: Value, session_id: Option<&str>) -> Result<Value, ProxyError> {
+    ws_message_body_with_reasoning_capability(value, session_id, None)
+}
+
+pub(super) fn ws_message_body_with_reasoning_capability(
     mut value: Value,
     session_id: Option<&str>,
+    reasoning_capability: Option<&GrokReasoningCapability>,
 ) -> Result<Value, ProxyError> {
     if value.get("type").is_none() {
-        return ws_request_body(value, session_id);
+        return ws_request_body_with_reasoning_capability(value, session_id, reasoning_capability);
     }
     if value
         .get("type")
@@ -1521,12 +1572,12 @@ pub(super) fn ws_message_body(
         .is_some_and(|event_type| event_type == "response.create")
     {
         if let Some(response) = value.get_mut("response") {
-            normalize_ws_response_body(response, session_id)?;
+            normalize_ws_response_body(response, session_id, reasoning_capability)?;
         } else if let Some(event_type) = value
             .as_object_mut()
             .and_then(|object| object.remove("type"))
         {
-            normalize_ws_response_body(&mut value, session_id)?;
+            normalize_ws_response_body(&mut value, session_id, reasoning_capability)?;
             if let Some(object) = value.as_object_mut() {
                 object.insert("type".to_string(), event_type);
             }
@@ -1548,6 +1599,16 @@ fn request_model(body: &[u8]) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
+}
+
+pub(super) fn normalized_request_model(body: &[u8]) -> String {
+    normalized_model(request_model(body).as_deref())
+}
+
+pub(super) fn normalized_model(model: Option<&str>) -> String {
+    model
+        .map(normalize_grok_model)
+        .unwrap_or_else(|| DEFAULT_GROK_MODEL.to_string())
 }
 
 fn normalize_grok_model(model: &str) -> String {
@@ -1605,12 +1666,64 @@ pub(super) fn namespace_session_id(tenant_scope: Option<&str>, raw: &str) -> Str
     format!("ccs_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
 }
 
-fn sanitize_reasoning(object: &mut Map<String, Value>, model: &str) {
+fn sanitize_reasoning(
+    object: &mut Map<String, Value>,
+    model: &str,
+    capability: Option<&GrokReasoningCapability>,
+) {
+    if let Some(capability) = capability {
+        sanitize_catalog_reasoning_effort(object, capability);
+        return;
+    }
     if grok_model_supports_reasoning_effort(model) {
         return;
     }
     object.remove("reasoning");
     object.remove("reasoning_effort");
+}
+
+fn sanitize_catalog_reasoning_effort(
+    object: &mut Map<String, Value>,
+    capability: &GrokReasoningCapability,
+) {
+    let accepted = |value: &Value| {
+        if capability.supports_reasoning_effort == Some(false) {
+            return None;
+        }
+        let normalized = value.as_str()?.trim().to_ascii_lowercase();
+        capability
+            .reasoning_efforts
+            .iter()
+            .any(|effort| effort == &normalized)
+            .then_some(Value::String(normalized))
+    };
+
+    match object.get("reasoning_effort").and_then(&accepted) {
+        Some(value) => {
+            object.insert("reasoning_effort".to_string(), value);
+        }
+        None => {
+            object.remove("reasoning_effort");
+        }
+    }
+
+    let mut remove_reasoning = false;
+    if let Some(reasoning) = object.get_mut("reasoning") {
+        if let Some(reasoning) = reasoning.as_object_mut() {
+            match reasoning.get("effort").and_then(&accepted) {
+                Some(value) => {
+                    reasoning.insert("effort".to_string(), value);
+                }
+                None => {
+                    reasoning.remove("effort");
+                }
+            }
+            remove_reasoning = reasoning.is_empty();
+        }
+    }
+    if remove_reasoning {
+        object.remove("reasoning");
+    }
 }
 
 fn grok_model_supports_reasoning_effort(model: &str) -> bool {
@@ -2099,6 +2212,139 @@ mod tests {
             "grok-4.20-0309-non-reasoning"
         );
         assert_eq!(normalize_grok_model("grok-custom"), "grok-custom");
+    }
+
+    #[test]
+    fn catalog_reasoning_menu_is_ordered_exact_and_supports_minimal_and_max() {
+        let capability = GrokReasoningCapability {
+            supports_reasoning_effort: None,
+            reasoning_efforts: vec!["minimal".to_string(), "high".to_string(), "max".to_string()],
+        };
+        for (requested, expected) in [
+            (" MINIMAL ", Some("minimal")),
+            ("MAX", Some("max")),
+            ("xhigh", None),
+            ("", None),
+            ("future", None),
+        ] {
+            let mut body = json_body(json!({
+                "model": "grok-4.7",
+                "input": "ping",
+                "reasoning": {"effort": requested, "summary": "auto"},
+                "reasoning_effort": requested
+            }));
+            patch_grok_request_body_with_reasoning_capability(
+                &mut body,
+                ProxyRoute::CodexResponses,
+                Some(&capability),
+            )
+            .unwrap();
+            let value = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!(
+                value.pointer("/reasoning/effort").and_then(Value::as_str),
+                expected,
+                "nested effort for {requested:?}"
+            );
+            assert_eq!(
+                value.get("reasoning_effort").and_then(Value::as_str),
+                expected,
+                "top-level effort for {requested:?}"
+            );
+            assert_eq!(value.pointer("/reasoning/summary"), Some(&json!("auto")));
+        }
+    }
+
+    #[test]
+    fn explicit_catalog_false_blocks_effort_without_discarding_summary_controls() {
+        let capability = GrokReasoningCapability {
+            supports_reasoning_effort: Some(false),
+            reasoning_efforts: vec!["max".to_string()],
+        };
+        let mut body = json_body(json!({
+            "model": "grok-4.7",
+            "input": "ping",
+            "reasoning": {"effort": "max", "summary": "auto"},
+            "reasoning_effort": "max"
+        }));
+        patch_grok_request_body_with_reasoning_capability(
+            &mut body,
+            ProxyRoute::CodexResponses,
+            Some(&capability),
+        )
+        .unwrap();
+        let value = serde_json::from_slice::<Value>(&body).unwrap();
+        assert!(value.pointer("/reasoning/effort").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+        assert_eq!(value.pointer("/reasoning/summary"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn websocket_uses_the_same_fresh_catalog_reasoning_menu() {
+        let capability = GrokReasoningCapability {
+            supports_reasoning_effort: Some(true),
+            reasoning_efforts: vec!["minimal".to_string(), "max".to_string()],
+        };
+        let value = ws_request_body_with_reasoning_capability(
+            json!({
+                "model": "grok-4.7",
+                "input": "ping",
+                "reasoning": {"effort": "MAX"}
+            }),
+            Some("session-1"),
+            Some(&capability),
+        )
+        .unwrap();
+        assert_eq!(
+            value.pointer("/response/reasoning/effort"),
+            Some(&json!("max"))
+        );
+
+        let blocked = ws_request_body_with_reasoning_capability(
+            json!({
+                "model": "grok-4.7",
+                "input": "ping",
+                "reasoning": {"effort": "high"}
+            }),
+            Some("session-1"),
+            Some(&capability),
+        )
+        .unwrap();
+        assert!(blocked.pointer("/response/reasoning/effort").is_none());
+    }
+
+    #[test]
+    fn missing_fresh_catalog_keeps_the_existing_conservative_model_gate() {
+        let mut unknown = json_body(json!({
+            "model": "grok-4.7",
+            "input": "ping",
+            "reasoning": {"effort": "max"},
+            "reasoning_effort": "max"
+        }));
+        patch_grok_request_body_with_reasoning_capability(
+            &mut unknown,
+            ProxyRoute::CodexResponses,
+            None,
+        )
+        .unwrap();
+        let unknown = serde_json::from_slice::<Value>(&unknown).unwrap();
+        assert!(unknown.get("reasoning").is_none());
+        assert!(unknown.get("reasoning_effort").is_none());
+
+        let mut proven_prefix = json_body(json!({
+            "model": "grok-4.6",
+            "input": "ping",
+            "reasoning": {"effort": "high"}
+        }));
+        patch_grok_request_body_with_reasoning_capability(
+            &mut proven_prefix,
+            ProxyRoute::CodexResponses,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&proven_prefix).unwrap()["reasoning"]["effort"],
+            "high"
+        );
     }
 
     #[test]

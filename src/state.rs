@@ -1179,6 +1179,16 @@ impl RouterRegistrationFlight {
 
 pub type ServerState = Arc<ServerStateInner>;
 
+pub(crate) struct GrokReasoningCapabilityScope<'a> {
+    pub app: AppKind,
+    pub provider_id: &'a str,
+    pub provider_revision: u64,
+    pub runtime_fingerprint: &'a str,
+    pub account_id: &'a str,
+    pub auth_identity_generation: u64,
+    pub token_refresh_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WebSessionStateError {
     #[error("Web Session Provider identity changed")]
@@ -12020,6 +12030,30 @@ impl ServerStateInner {
             .await
             .find_for_provider(provider_type, Some(account_id))
             .cloned()
+    }
+
+    pub(crate) async fn fresh_grok_reasoning_capability(
+        &self,
+        scope: GrokReasoningCapabilityScope<'_>,
+        model: &str,
+    ) -> Option<(Option<bool>, Vec<String>)> {
+        let scope = crate::clients::oauth::grok_models::GrokModelCatalogScope {
+            app: scope.app.as_str().to_string(),
+            provider_id: scope.provider_id.to_string(),
+            provider_revision: scope.provider_revision,
+            runtime_fingerprint: scope.runtime_fingerprint.to_string(),
+            account_id: scope.account_id.to_string(),
+            auth_identity_generation: scope.auth_identity_generation,
+            token_refresh_generation: scope.token_refresh_generation,
+        };
+        crate::clients::oauth::grok_models::fresh_grok_model_capability(&scope, model)
+            .await
+            .map(|capability| {
+                (
+                    capability.supports_reasoning_effort,
+                    capability.reasoning_efforts,
+                )
+            })
     }
 
     pub async fn mutate_accounts<R>(&self, mutate: impl FnOnce(&mut AccountStore) -> R) -> R {

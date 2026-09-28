@@ -4382,17 +4382,28 @@ fn grok_provider_models_fetch_result(
     let models = catalog
         .models
         .iter()
-        .map(|id| FetchedProviderModel {
-            id: id.clone(),
-            upstream_model: id.clone(),
-            display_name: None,
-            raw: serde_json::json!({
-                "id": id,
-                "object": "model",
-                "capabilityManifestVersion": 1,
-                "modelFamily": grok_model_family(id),
-                "accountCapability": grok_account_capability_manifest(id),
-            }),
+        .map(|id| {
+            let capability = catalog.capabilities.get(id);
+            FetchedProviderModel {
+                id: id.clone(),
+                upstream_model: id.clone(),
+                display_name: None,
+                raw: serde_json::json!({
+                    "id": id,
+                    "object": "model",
+                    "capabilityManifestVersion": 2,
+                    "modelFamily": grok_model_family(id),
+                    "capabilities": {
+                        "supportsReasoningEffort": capability.and_then(|value| value.supports_reasoning_effort),
+                        "reasoningEfforts": capability.map(|value| &value.reasoning_efforts),
+                        "reasoningDefault": capability.and_then(|value| value.default_reasoning_effort.as_deref()),
+                        "contextWindow": capability.and_then(|value| value.context_window),
+                        "maxOutputTokens": capability.and_then(|value| value.max_completion_tokens),
+                        "supportsBackendSearch": capability.and_then(|value| value.supports_backend_search),
+                    },
+                    "accountCapability": grok_account_capability_manifest(id),
+                }),
+            }
         })
         .collect();
     ProviderModelsFetchResult {
@@ -7536,7 +7547,19 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string();
-                    axum::Json(json!({"data": [{"id": "grok-mock-live"}]}))
+                    axum::Json(json!({"data": [{
+                        "id": "grok-mock-live",
+                        "reasoning_efforts": [
+                            {"value": "xhigh", "default": false},
+                            {"value": "high", "default": true},
+                            {"value": "minimal", "default": false},
+                            {"value": "max", "default": false}
+                        ],
+                        "supports_reasoning_effort": true,
+                        "context_window": 500000,
+                        "max_completion_tokens": 1000000,
+                        "supports_backend_search": true
+                    }]}))
                 }
             }),
         );
@@ -7606,7 +7629,32 @@ mod tests {
         assert_eq!(fetched.url, expected_models_url);
         assert_eq!(fetched.models.len(), 1);
         assert_eq!(fetched.models[0].id, "grok-mock-live");
+        assert_eq!(fetched.models[0].raw["capabilityManifestVersion"], 2);
         assert_eq!(fetched.models[0].raw["modelFamily"], "text");
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["reasoningEfforts"],
+            json!(["xhigh", "high", "minimal", "max"])
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["reasoningDefault"],
+            "high"
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["supportsReasoningEffort"],
+            true
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["contextWindow"],
+            500000
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["maxOutputTokens"],
+            1000000
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["supportsBackendSearch"],
+            true
+        );
         assert_eq!(
             fetched.models[0].raw["accountCapability"]["responsesHttpSse"],
             "supported"
@@ -7615,6 +7663,27 @@ mod tests {
             fetched.models[0].raw["accountCapability"]["hostedSearch"],
             "unknown"
         );
+        let account = state
+            .find_account_for_provider(ProviderType::GrokOAuth, "grok-model-account")
+            .await
+            .unwrap();
+        let runtime_capability = state
+            .fresh_grok_reasoning_capability(
+                crate::state::GrokReasoningCapabilityScope {
+                    app: AppKind::Codex,
+                    provider_id: "grok-model-provider",
+                    provider_revision: execution.plan.provider_revision,
+                    runtime_fingerprint: &execution.plan.runtime_fingerprint,
+                    account_id: "grok-model-account",
+                    auth_identity_generation: account.auth_identity_generation,
+                    token_refresh_generation: account.token_refresh_generation,
+                },
+                "grok-mock-live",
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_capability.0, Some(true));
+        assert_eq!(runtime_capability.1, ["xhigh", "high", "minimal", "max"]);
         assert_eq!(
             observed_authorization.lock().unwrap().as_str(),
             "Bearer grok-model-access"

@@ -26,10 +26,21 @@ pub struct GrokModelCatalogScope {
 #[derive(Debug, Clone)]
 pub struct GrokModelCatalog {
     pub models: Vec<String>,
+    pub capabilities: BTreeMap<String, GrokModelCapability>,
     pub source: &'static str,
     pub source_url: String,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrokModelCapability {
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub supports_reasoning_effort: Option<bool>,
+    pub context_window: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+    pub supports_backend_search: Option<bool>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -57,15 +68,29 @@ impl GrokModelCatalogFailure {
 #[derive(Debug, Clone)]
 struct CachedCatalog {
     models: Vec<String>,
+    capabilities: BTreeMap<String, GrokModelCapability>,
     source_url: String,
     etag: Option<String>,
     fetched_at: Instant,
+    fresh_for: Duration,
     fetched_at_ms: i64,
 }
 
 fn cache() -> &'static Mutex<BTreeMap<GrokModelCatalogScope, CachedCatalog>> {
     static CACHE: OnceLock<Mutex<BTreeMap<GrokModelCatalogScope, CachedCatalog>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub async fn fresh_grok_model_capability(
+    scope: &GrokModelCatalogScope,
+    model: &str,
+) -> Option<GrokModelCapability> {
+    let entries = cache().lock().await;
+    let cached = entries.get(scope)?;
+    if cached.fetched_at.elapsed() >= cached.fresh_for {
+        return None;
+    }
+    cached.capabilities.get(model).cloned()
 }
 
 pub async fn grok_model_catalog(
@@ -169,6 +194,7 @@ async fn fetch_catalog(
         };
         cached.fetched_at = Instant::now();
         cached.fetched_at_ms = chrono::Utc::now().timestamp_millis();
+        cached.fresh_for = ttl;
         let result = catalog_from_cache(&cached, "upstream_not_modified", false);
         cache().lock().await.insert(scope.clone(), cached);
         crate::metrics::record_grok_model_catalog("upstream_not_modified");
@@ -232,8 +258,10 @@ async fn fetch_catalog(
             format!("Grok model catalog JSON was invalid: {error}"),
         )
     })?;
-    let models =
-        parse_models(&raw).map_err(|message| GrokModelCatalogFailure::new(502, false, message))?;
+    let parsed =
+        parse_catalog(&raw).map_err(|message| GrokModelCatalogFailure::new(502, false, message))?;
+    let models = parsed.models;
+    let capabilities = parsed.capabilities;
     let fetched_at_ms = chrono::Utc::now().timestamp_millis();
     let source_url = url.to_string();
     {
@@ -248,9 +276,11 @@ async fn fetch_catalog(
             scope.clone(),
             CachedCatalog {
                 models: models.clone(),
+                capabilities: capabilities.clone(),
                 source_url: source_url.clone(),
                 etag,
                 fetched_at: Instant::now(),
+                fresh_for: ttl,
                 fetched_at_ms,
             },
         );
@@ -258,6 +288,7 @@ async fn fetch_catalog(
     crate::metrics::record_grok_model_catalog("upstream");
     Ok(GrokModelCatalog {
         models,
+        capabilities,
         source: "upstream",
         source_url,
         stale: false,
@@ -291,6 +322,7 @@ fn catalog_from_cache(
 ) -> GrokModelCatalog {
     GrokModelCatalog {
         models: cached.models.clone(),
+        capabilities: cached.capabilities.clone(),
         source,
         source_url: cached.source_url.clone(),
         stale,
@@ -298,13 +330,19 @@ fn catalog_from_cache(
     }
 }
 
-fn parse_models(raw: &Value) -> Result<Vec<String>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCatalog {
+    models: Vec<String>,
+    capabilities: BTreeMap<String, GrokModelCapability>,
+}
+
+fn parse_catalog(raw: &Value) -> Result<ParsedCatalog, String> {
     let values = raw
         .get("data")
         .and_then(Value::as_array)
         .or_else(|| raw.get("models").and_then(Value::as_array))
         .ok_or_else(|| "Grok model catalog omitted the data/models array".to_string())?;
-    let mut models = BTreeMap::new();
+    let mut capabilities = BTreeMap::new();
     for value in values {
         if value.get("hidden").and_then(Value::as_bool) == Some(true)
             || value.pointer("/_meta/hidden").and_then(Value::as_bool) == Some(true)
@@ -321,10 +359,110 @@ fn parse_models(raw: &Value) -> Result<Vec<String>, String> {
             .or_else(|| value.pointer("/_meta/modelId").and_then(Value::as_str))
             .and_then(normalize_model_id);
         if let Some(id) = id {
-            models.insert(id, ());
+            capabilities
+                .entry(id)
+                .or_insert_with(|| parse_model_capability(value));
         }
     }
-    Ok(models.into_keys().collect())
+    Ok(ParsedCatalog {
+        models: capabilities.keys().cloned().collect(),
+        capabilities,
+    })
+}
+
+#[cfg(test)]
+fn parse_models(raw: &Value) -> Result<Vec<String>, String> {
+    parse_catalog(raw).map(|catalog| catalog.models)
+}
+
+fn parse_model_capability(value: &Value) -> GrokModelCapability {
+    let Some(object) = value.as_object() else {
+        return GrokModelCapability::default();
+    };
+    let reasoning_entries = object
+        .get("reasoning_efforts")
+        .or_else(|| object.get("reasoningEfforts"))
+        .and_then(Value::as_array);
+    let mut reasoning_efforts = Vec::new();
+    let mut menu_default = None;
+    if let Some(entries) = reasoning_entries {
+        for entry in entries {
+            let (candidate, is_default) = match entry {
+                Value::String(value) => (Some(value.as_str()), false),
+                Value::Object(object) => (
+                    object.get("value").and_then(Value::as_str),
+                    object.get("default").and_then(Value::as_bool) == Some(true),
+                ),
+                _ => (None, false),
+            };
+            let Some(effort) = candidate.and_then(normalize_reasoning_effort) else {
+                continue;
+            };
+            if !reasoning_efforts.contains(&effort) {
+                reasoning_efforts.push(effort.clone());
+            }
+            if is_default && menu_default.is_none() {
+                menu_default = Some(effort);
+            }
+        }
+    }
+    let default_reasoning_effort = menu_default
+        .or_else(|| {
+            object
+                .get("reasoning_effort")
+                .or_else(|| object.get("reasoningEffort"))
+                .and_then(Value::as_str)
+                .and_then(normalize_reasoning_effort)
+        })
+        .filter(|effort| reasoning_efforts.contains(effort));
+
+    GrokModelCapability {
+        reasoning_efforts,
+        default_reasoning_effort,
+        supports_reasoning_effort: optional_bool(
+            object,
+            "supports_reasoning_effort",
+            "supportsReasoningEffort",
+        ),
+        context_window: optional_u64(object, "context_window", "contextWindow"),
+        max_completion_tokens: optional_u64(object, "max_completion_tokens", "maxCompletionTokens"),
+        supports_backend_search: optional_bool(
+            object,
+            "supports_backend_search",
+            "supportsBackendSearch",
+        ),
+    }
+}
+
+fn optional_bool(
+    object: &serde_json::Map<String, Value>,
+    snake_case: &str,
+    camel_case: &str,
+) -> Option<bool> {
+    object
+        .get(snake_case)
+        .or_else(|| object.get(camel_case))
+        .and_then(Value::as_bool)
+}
+
+fn optional_u64(
+    object: &serde_json::Map<String, Value>,
+    snake_case: &str,
+    camel_case: &str,
+) -> Option<u64> {
+    object
+        .get(snake_case)
+        .or_else(|| object.get(camel_case))
+        .and_then(Value::as_u64)
+}
+
+fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    matches!(
+        value.as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+    .then_some(value)
 }
 
 fn normalize_model_id(value: &str) -> Option<String> {
@@ -390,6 +528,73 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(parse_models(&serde_json::json!({"object": "list"})).is_err());
+    }
+
+    #[test]
+    fn parses_scoped_capability_menu_without_losing_order_or_explicit_zeroes() {
+        let parsed = parse_catalog(&serde_json::json!({
+            "data": [
+                {
+                    "id": "grok-4.7",
+                    "reasoning_efforts": [
+                        {"value": "XHIGH", "default": false},
+                        "minimal",
+                        {"value": "high", "default": true},
+                        {"value": "xhigh", "default": true},
+                        {"value": "future"},
+                        {"label": "missing value"}
+                    ],
+                    "reasoning_effort": "low",
+                    "supports_reasoning_effort": false,
+                    "context_window": 0,
+                    "max_completion_tokens": 0,
+                    "supports_backend_search": false
+                },
+                {
+                    "id": "grok-missing",
+                    "reasoningEfforts": ["low", {"value": "max"}],
+                    "reasoningEffort": "unknown",
+                    "contextWindow": 500000,
+                    "maxCompletionTokens": 1000000,
+                    "supportsBackendSearch": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        let explicit = &parsed.capabilities["grok-4.7"];
+        assert_eq!(explicit.reasoning_efforts, ["xhigh", "minimal", "high"]);
+        assert_eq!(explicit.default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(explicit.supports_reasoning_effort, Some(false));
+        assert_eq!(explicit.context_window, Some(0));
+        assert_eq!(explicit.max_completion_tokens, Some(0));
+        assert_eq!(explicit.supports_backend_search, Some(false));
+
+        let missing = &parsed.capabilities["grok-missing"];
+        assert_eq!(missing.reasoning_efforts, ["low", "max"]);
+        assert_eq!(missing.default_reasoning_effort, None);
+        assert_eq!(missing.supports_reasoning_effort, None);
+        assert_eq!(missing.context_window, Some(500000));
+        assert_eq!(missing.max_completion_tokens, Some(1000000));
+        assert_eq!(missing.supports_backend_search, Some(true));
+    }
+
+    #[test]
+    fn catalog_default_must_be_a_member_of_the_filtered_menu() {
+        let parsed = parse_catalog(&serde_json::json!({
+            "models": [
+                {
+                    "id": "grok-menu",
+                    "reasoning_efforts": ["low", "high"],
+                    "reasoning_effort": "max"
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.capabilities["grok-menu"].default_reasoning_effort,
+            None
+        );
     }
 
     #[tokio::test]
@@ -484,6 +689,9 @@ mod tests {
         .unwrap();
         assert_eq!(third.source, "last_known_good");
         assert!(third.stale);
+        assert!(fresh_grok_model_capability(&scope, "grok-live")
+            .await
+            .is_none());
 
         let mut next_generation = scope.clone();
         next_generation.auth_identity_generation += 1;
@@ -535,7 +743,7 @@ mod tests {
                     0 => (
                         "200 OK",
                         "application/json",
-                        r#"{"data":[{"id":"grok-live"}]}"#,
+                        r#"{"data":[{"id":"grok-live","reasoning_efforts":["max"]}]}"#,
                     ),
                     1 => (
                         "401 Unauthorized",
@@ -572,6 +780,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.models, ["grok-live"]);
+        assert_eq!(first.capabilities["grok-live"].reasoning_efforts, ["max"]);
 
         let unauthorized = fetch_catalog(
             &client,
@@ -597,6 +806,7 @@ mod tests {
         .await
         .unwrap();
         assert!(empty.models.is_empty());
+        assert!(empty.capabilities.is_empty());
         assert_eq!(empty.source, "upstream");
         assert!(!empty.stale);
 
@@ -612,6 +822,67 @@ mod tests {
         .unwrap_err();
         assert_eq!(malformed.status_code, 502);
         assert!(!malformed.retryable);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_capability_lookup_is_exact_across_every_scope_dimension() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = r#"{"data":[{"id":"grok-4.7","reasoning_efforts":["minimal","max"]}]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let exact = scope(format!("scope-{}", address.port()), 7);
+        fetch_catalog(
+            &reqwest::Client::new(),
+            &exact,
+            "access-token",
+            &format!("http://{address}/v1/models"),
+            Duration::from_secs(60),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fresh_grok_model_capability(&exact, "grok-4.7")
+                .await
+                .unwrap()
+                .reasoning_efforts,
+            ["minimal", "max"]
+        );
+
+        for drift in 0..7 {
+            let mut changed = exact.clone();
+            match drift {
+                0 => changed.app.push_str("-changed"),
+                1 => changed.provider_id.push_str("-changed"),
+                2 => changed.provider_revision += 1,
+                3 => changed.runtime_fingerprint.push_str("-changed"),
+                4 => changed.account_id.push_str("-changed"),
+                5 => changed.auth_identity_generation += 1,
+                6 => changed.token_refresh_generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(fresh_grok_model_capability(&changed, "grok-4.7")
+                .await
+                .is_none());
+        }
+        assert!(fresh_grok_model_capability(&exact, "grok-unlisted")
+            .await
+            .is_none());
         server.await.unwrap();
     }
 
