@@ -1980,7 +1980,9 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
                     }
                 }));
             }
-            Some("web_search_tool_result") => {}
+            Some("web_search_tool_result") => {
+                flush_response_output_message(&mut output, &mut message_content);
+            }
             Some("tool_use") => {
                 flush_response_output_message(&mut output, &mut message_content);
                 output.push(anthropic_tool_use_to_openai_response_with_tool_context(
@@ -2005,7 +2007,7 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
                     output.push(item);
                 }
             }
-            _ => {
+            Some("text") => {
                 let text = block
                     .get("text")
                     .and_then(Value::as_str)
@@ -2013,11 +2015,22 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
                 if !text.is_empty() {
                     output_text.push(text.to_string());
                 }
+                append_anthropic_text_to_response_content(&mut message_content, block);
+            }
+            Some("refusal") => {
+                flush_response_output_message(&mut output, &mut message_content);
                 message_content.push(json!({
-                    "type": "output_text",
-                    "text": text,
-                    "annotations": anthropic_citations_to_responses_annotations(block, 0)
+                    "type": "refusal",
+                    "refusal": block
+                        .get("refusal")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(DEFAULT_UPSTREAM_REFUSAL_MESSAGE)
                 }));
+                flush_response_output_message(&mut output, &mut message_content);
+            }
+            _ => {
+                flush_response_output_message(&mut output, &mut message_content);
             }
         }
     }
@@ -2049,6 +2062,46 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
         response["incomplete_details"] = json!({"reason": reason});
     }
     Ok(response)
+}
+
+fn append_anthropic_text_to_response_content(content: &mut Vec<Value>, block: &Value) {
+    let text = block
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(last) = content
+        .last_mut()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+    else {
+        content.push(json!({
+            "type": "output_text",
+            "text": text,
+            "annotations": anthropic_citations_to_responses_annotations(block, 0)
+        }));
+        return;
+    };
+
+    let base = last
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|existing| existing.chars().count())
+        .unwrap_or_default();
+    let next_annotations = anthropic_citations_to_responses_annotations(block, base);
+    if let Some(existing) = last.get("text").and_then(Value::as_str) {
+        let mut merged = String::with_capacity(existing.len().saturating_add(text.len()));
+        merged.push_str(existing);
+        merged.push_str(text);
+        last["text"] = Value::String(merged);
+    } else {
+        last["text"] = Value::String(text.to_string());
+    }
+    if !next_annotations.is_empty() {
+        if let Some(annotations) = last.get_mut("annotations").and_then(Value::as_array_mut) {
+            annotations.extend(next_annotations);
+        } else {
+            last["annotations"] = Value::Array(next_annotations);
+        }
+    }
 }
 
 fn flush_response_output_message(output: &mut Vec<Value>, content: &mut Vec<Value>) {
@@ -10585,6 +10638,96 @@ mod tests {
                 .pointer("/output/0/content/0/text")
                 .and_then(Value::as_str),
             Some("hello")
+        );
+    }
+
+    #[test]
+    fn anthropic_response_to_responses_merges_adjacent_text_with_scalar_citations() {
+        let input = json!({
+            "id": "msg_adjacent_citations",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "🙂e\u{301} same ",
+                    "citations": [{
+                        "type": "web_search_result_location",
+                        "url": "https://example.test/unicode",
+                        "title": "Unicode",
+                        "cited_text": "🙂e\u{301}"
+                    }]
+                },
+                {
+                    "type": "text",
+                    "text": "same same",
+                    "citations": [
+                        {
+                            "type": "web_search_result_location",
+                            "url": "https://example.test/first",
+                            "title": "First",
+                            "cited_text": "same"
+                        },
+                        {
+                            "type": "web_search_result_location",
+                            "url": "https://example.test/second",
+                            "title": "Second",
+                            "cited_text": "same"
+                        }
+                    ]
+                },
+                {"type": "text", "text": "!"},
+                {"type": "thinking", "thinking": "boundary", "signature": "sig"},
+                {"type": "text", "text": "tail"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                {"type": "text", "text": "after tool"}
+            ],
+            "model": "claude-sonnet-4",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+
+        let output = anthropic_response_to_openai_responses(&input).unwrap();
+        assert_eq!(
+            output["output_text"],
+            "🙂e\u{301} same same same!tailafter tool"
+        );
+        assert_eq!(output["output"].as_array().unwrap().len(), 5);
+        assert_eq!(output.pointer("/output/0/type"), Some(&json!("message")));
+        assert_eq!(
+            output.pointer("/output/0/content/0/text"),
+            Some(&json!("🙂e\u{301} same same same!"))
+        );
+        assert_eq!(
+            output
+                .pointer("/output/0/content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let annotations = output
+            .pointer("/output/0/content/0/annotations")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(annotations.len(), 3);
+        assert_eq!(annotations[0]["start_index"], 0);
+        assert_eq!(annotations[0]["end_index"], 3);
+        assert_eq!(annotations[1]["start_index"], 9);
+        assert_eq!(annotations[1]["end_index"], 13);
+        assert_eq!(annotations[2]["start_index"], 14);
+        assert_eq!(annotations[2]["end_index"], 18);
+        assert_eq!(output.pointer("/output/1/type"), Some(&json!("reasoning")));
+        assert_eq!(
+            output.pointer("/output/2/content/0/text"),
+            Some(&json!("tail"))
+        );
+        assert_eq!(
+            output.pointer("/output/3/type"),
+            Some(&json!("function_call"))
+        );
+        assert_eq!(
+            output.pointer("/output/4/content/0/text"),
+            Some(&json!("after tool"))
         );
     }
 

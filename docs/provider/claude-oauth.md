@@ -102,10 +102,10 @@ helper request ID 遵循真实上游 base：`api.anthropic.com` 缺值时生成 
 
 Claude 凭据显式区分 `refreshable_oauth` 与 `access_only_setup_token`。OAuth exchange 只有在 scope 明确包含 `user:inference` 且不含 profile/office scope 时，才允许缺失 refresh token；该 scope 会在任何 bootstrap/profile 请求之前识别并直接跳过无权访问的 enrichment。手工 credentials import 则由 access-only 凭据拓扑标记 setup-token。setup-token 不进入 refresh，profile/quota 403 只降低 enrichment，不阻断 inference；缺失账号 UUID 时使用带域分离的 credential digest 生成不可逆内部 ID。过期后直接要求重新导入，不形成 refresh loop。可用 `CC_SWITCH_CLAUDE_SETUP_TOKEN=disabled` 关闭 access-only exchange/import 入口，标准 refreshable OAuth 不受影响。
 
-两个证据门控的隐私增强默认关闭：
+日期指纹规范化仍是默认关闭的证据门控隐私增强；工具名 alias 则承担默认开启的协议兼容职责：
 
 - `CC_SWITCH_CLAUDE_DATELINE_NORMALIZATION=enabled` 只规范 system text 和 `<system-reminder>` 内已验证的日期指纹，不修改普通用户正文、assistant 正文或 tool input/result。
-- `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=enabled` 只对确认的非原生客户端启用 session-scoped custom/MCP alias；没有显式 session 标识时 fail closed 并跳过 alias。declaration、forced choice、历史引用以及 JSON/SSE 响应全链路回映，保留 Claude server tools，映射最多 128 项且碰撞 fail closed。
+- `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS` 默认开启，但只 alias 不符合 `^[A-Za-z0-9_-]{1,64}$` 的普通 custom/MCP 名称；合法自定义名称逐字节保留，Claude Code 内建名称继续使用既有 canonical case，server tool 原样保留。映射仅存在于当前请求，declaration、forced choice、历史 `tool_use` / `tool_reference` 与 JSON/SSE 响应共用同一可逆 map；最多 128 项，大小写或 wire alias 碰撞直接拒绝。事故回滚可设为 `disabled`，此时非法名称会保持原样且由上游决定是否接受。
 
 没有上游拒绝证据，因此 TLS ClientHello/header-order 模拟仍不实现；当前继续使用 rustls transport。
 

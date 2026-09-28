@@ -178,6 +178,17 @@ if (
 ) {
   fail("Opus 5.5 capability contract is incomplete or drifted from runtime");
 }
+const customToolAlias = profile?.runtimeControls?.customToolAlias;
+if (
+  customToolAlias?.environment !== "CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS" ||
+  customToolAlias?.default !== true ||
+  customToolAlias?.rollback !== false ||
+  customToolAlias?.scope !== "invalid_custom_names_only" ||
+  !oauthSource.includes("claude_tool_name_is_legal") ||
+  !oauthSource.includes("feature_enabled(CLAUDE_CUSTOM_TOOL_ALIAS_ENV, true)")
+) {
+  fail("invalid Claude custom tool alias default or rollback contract drifted");
+}
 if (
   !thinkingSource.includes("claude_model_capability(model)") ||
   !thinkingSource.includes('thinking_cannot_be_disabled("claude-opus-5-5")')

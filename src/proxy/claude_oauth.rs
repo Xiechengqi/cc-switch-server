@@ -225,7 +225,6 @@ fn apply_forward_contract_inner(
             client_class = ClaudeClientClass::ThirdPartyAnthropic;
         }
         session_id = session_id.or_else(|| claude_session_id_from_body_value(&value));
-        let client_session_id = session_id.clone();
         if !client_class.is_confirmed_native() {
             session_id = session_id.or_else(|| Some(synth_session_id(identity_seed, &value)));
             if let Some(session_id) = session_id.as_deref() {
@@ -233,10 +232,12 @@ fn apply_forward_contract_inner(
             }
             value = normalize_claude_code_identity(value, &billing_header);
         }
-        let tool_alias_seed = (!client_class.is_confirmed_native() && custom_tool_alias_enabled())
-            .then_some(client_session_id.as_deref())
-            .flatten()
-            .map(|session_id| format!("{identity_seed}\0{session_id}"));
+        let tool_alias_seed = custom_tool_alias_enabled().then(|| {
+            format!(
+                "{identity_seed}\0{}",
+                session_id.as_deref().unwrap_or("request-without-session")
+            )
+        });
         tool_name_map = normalize_claude_oauth_tool_names(&mut value, tool_alias_seed.as_deref())?;
         if tool_name_map
             .iter()
@@ -416,18 +417,15 @@ fn normalize_claude_oauth_tool_names(
                 "Claude custom tool alias map exceeds 128 declarations",
             ));
         }
-        for tool in tools {
-            let Some(original) = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
+        let mut declarations = Vec::with_capacity(tools.len());
+        let mut declared_names = BTreeMap::new();
+        for (index, tool) in tools.iter().enumerate() {
+            let Some(original) = tool.get("name").and_then(Value::as_str).map(str::to_string)
             else {
                 continue;
             };
             let lookup = original.to_ascii_lowercase();
-            if aliases
+            if declared_names
                 .get(&lookup)
                 .is_some_and(|existing| existing != &original)
             {
@@ -435,26 +433,52 @@ fn normalize_claude_oauth_tool_names(
                     "Claude tool names collide case-insensitively",
                 ));
             }
-            let wire_name = CLAUDE_CODE_TOOL_NAMES
+            declared_names.insert(lookup.clone(), original.clone());
+            let fixed_wire_name = if reserved_server_tool(tool) {
+                Some(original.clone())
+            } else if let Some(canonical) = CLAUDE_CODE_TOOL_NAMES
                 .iter()
                 .copied()
                 .find(|canonical| canonical.eq_ignore_ascii_case(&original))
-                .map(str::to_string)
-                .or_else(|| {
-                    custom_alias_seed
-                        .filter(|_| !reserved_server_tool(tool))
-                        .map(|seed| custom_tool_alias(seed, &lookup, &used_wire_names))
-                })
-                .unwrap_or_else(|| original.clone());
+            {
+                Some(canonical.to_string())
+            } else if claude_tool_name_is_legal(&original) || custom_alias_seed.is_none() {
+                Some(original.clone())
+            } else {
+                None
+            };
+            if let Some(wire_name) = fixed_wire_name.as_deref() {
+                if !used_wire_names.insert(wire_name.to_ascii_lowercase()) {
+                    return Err(ProxyError::bad_request(
+                        "Claude tool names map to the same wire alias",
+                    ));
+                }
+            }
+            declarations.push((index, original, lookup, fixed_wire_name));
+        }
+
+        for (index, original, lookup, fixed_wire_name) in declarations {
+            let alias_candidate = fixed_wire_name.is_none();
+            let wire_name = fixed_wire_name.unwrap_or_else(|| {
+                custom_tool_alias(
+                    custom_alias_seed.expect("alias candidates require an enabled seed"),
+                    &lookup,
+                )
+            });
             let wire_lookup = wire_name.to_ascii_lowercase();
-            if !used_wire_names.insert(wire_lookup.clone()) {
+            if alias_candidate && !used_wire_names.insert(wire_lookup.clone()) {
+                return Err(ProxyError::bad_request(
+                    "Claude tool names map to the same wire alias",
+                ));
+            }
+            if aliases.contains_key(&wire_lookup) {
                 return Err(ProxyError::bad_request(
                     "Claude tool names map to the same wire alias",
                 ));
             }
             aliases.insert(wire_lookup, original.clone());
             request_names.insert(lookup, wire_name.clone());
-            tool["name"] = Value::String(wire_name);
+            tools[index]["name"] = Value::String(wire_name);
         }
     }
     if let Some(tool_choice) = body.get_mut("tool_choice") {
@@ -482,7 +506,15 @@ fn normalize_claude_oauth_tool_names(
 }
 
 fn custom_tool_alias_enabled() -> bool {
-    feature_enabled(CLAUDE_CUSTOM_TOOL_ALIAS_ENV, false)
+    feature_enabled(CLAUDE_CUSTOM_TOOL_ALIAS_ENV, true)
+}
+
+fn claude_tool_name_is_legal(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn feature_enabled(name: &str, default: bool) -> bool {
@@ -506,24 +538,14 @@ fn reserved_server_tool(tool: &Value) -> bool {
             .is_some_and(|name| name.starts_with("mcp__"))
 }
 
-fn custom_tool_alias(
-    seed: &str,
-    original_lookup: &str,
-    used: &std::collections::BTreeSet<String>,
-) -> String {
-    for counter in 0_u16..=u16::MAX {
-        let mut digest = Sha256::new();
-        digest.update(b"cc-switch-server:claude-tool-alias:v1\0");
-        digest.update(seed.as_bytes());
-        digest.update(b"\0");
-        digest.update(original_lookup.as_bytes());
-        digest.update(counter.to_le_bytes());
-        let alias = format!("cc_tool_{}", hex::encode(&digest.finalize()[..8]));
-        if !used.contains(&alias) {
-            return alias;
-        }
-    }
-    unreachable!("u16 alias collision space exhausted")
+fn custom_tool_alias(seed: &str, original_lookup: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:claude-tool-alias:v1\0");
+    digest.update(seed.as_bytes());
+    digest.update(b"\0");
+    digest.update(original_lookup.as_bytes());
+    digest.update(0_u16.to_le_bytes());
+    format!("cc_tool_{}", hex::encode(&digest.finalize()[..8]))
 }
 
 fn rewrite_claude_tool_name_field(
@@ -531,12 +553,7 @@ fn rewrite_claude_tool_name_field(
     field: &str,
     request_names: &BTreeMap<String, String>,
 ) {
-    let Some(name) = value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    else {
+    let Some(name) = value.get(field).and_then(Value::as_str) else {
         return;
     };
     let Some(wire_name) = request_names.get(&name.to_ascii_lowercase()) else {
@@ -4377,27 +4394,31 @@ mod tests {
     }
 
     #[test]
-    fn custom_tool_alias_is_stable_scoped_and_round_trips() {
+    fn invalid_custom_tool_alias_is_stable_scoped_and_round_trips() {
         let mut request = json!({
             "tools": [
                 {"name": "CustomLookup", "input_schema": {"type": "object"}},
-                {"name": "mcp__weather__forecast", "type": "mcp_tool", "input_schema": {"type": "object"}},
-                {"name": "web_search", "type": "web_search_20250305"}
+                {"name": "custom.lookup", "input_schema": {"type": "object"}},
+                {"name": "mcp__weather:forecast", "type": "mcp_tool", "input_schema": {"type": "object"}},
+                {"name": "web_search", "type": "web_search_20250305"},
+                {"name": "server.tool", "type": "computer_20250124"}
             ],
-            "tool_choice": {"type": "tool", "name": "customlookup"},
+            "tool_choice": {"type": "tool", "name": "custom.lookup"},
             "messages": [{"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_1", "name": "CustomLookup", "input": {}},
-                {"type": "tool_reference", "tool_name": "mcp__weather__forecast"}
+                {"type": "tool_use", "id": "toolu_1", "name": "custom.lookup", "input": {}},
+                {"type": "tool_reference", "tool_name": "mcp__weather:forecast"}
             ]}]
         });
         let aliases =
             normalize_claude_oauth_tool_names(&mut request, Some("account-a\0session-a")).unwrap();
-        let custom_alias = request["tools"][0]["name"].as_str().unwrap().to_string();
-        let mcp_alias = request["tools"][1]["name"].as_str().unwrap().to_string();
+        assert_eq!(request["tools"][0]["name"], "CustomLookup");
+        let custom_alias = request["tools"][1]["name"].as_str().unwrap().to_string();
+        let mcp_alias = request["tools"][2]["name"].as_str().unwrap().to_string();
         assert!(custom_alias.starts_with("cc_tool_"));
         assert!(mcp_alias.starts_with("cc_tool_"));
         assert_ne!(custom_alias, mcp_alias);
-        assert_eq!(request["tools"][2]["name"], "web_search");
+        assert_eq!(request["tools"][3]["name"], "web_search");
+        assert_eq!(request["tools"][4]["name"], "server.tool");
         assert_eq!(request["tool_choice"]["name"], custom_alias);
         assert_eq!(request["messages"][0]["content"][0]["name"], custom_alias);
         assert_eq!(request["messages"][0]["content"][1]["tool_name"], mcp_alias);
@@ -4410,7 +4431,114 @@ mod tests {
         );
         let restored = restore_claude_tool_names_in_response_bytes(response, &aliases);
         let restored: Value = serde_json::from_slice(&restored).unwrap();
-        assert_eq!(restored["content"][0]["name"], "CustomLookup");
+        assert_eq!(restored["content"][0]["name"], "custom.lookup");
+    }
+
+    #[test]
+    fn forward_contract_aliases_only_invalid_custom_names_by_default() {
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "valid_Custom-1", "input_schema": {"type": "object"}},
+                    {"name": "mcp.server:lookup", "input_schema": {"type": "object"}},
+                    {"name": "web_search", "type": "web_search_20250305"}
+                ],
+                "tool_choice": {"type": "tool", "name": "mcp.server:lookup"}
+            }))
+            .unwrap(),
+        );
+
+        let contract = apply_forward_contract(
+            &mut url,
+            &mut body,
+            &HeaderMap::new(),
+            "account-default-alias",
+            false,
+            None,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let alias = body["tools"][1]["name"].as_str().unwrap();
+        assert_eq!(body["tools"][0]["name"], "valid_Custom-1");
+        assert!(alias.starts_with("cc_tool_"));
+        assert_eq!(body["tool_choice"]["name"], alias);
+        assert_eq!(body["tools"][2]["name"], "web_search");
+        assert_eq!(
+            contract.tool_name_map.get(alias).map(String::as_str),
+            Some("mcp.server:lookup")
+        );
+    }
+
+    #[test]
+    fn invalid_custom_tool_alias_can_be_disabled_for_incident_rollback() {
+        let mut request = json!({
+            "tools": [{"name": "mcp.server:lookup", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "mcp.server:lookup"}
+        });
+
+        let aliases = normalize_claude_oauth_tool_names(&mut request, None).unwrap();
+        assert_eq!(request["tools"][0]["name"], "mcp.server:lookup");
+        assert_eq!(request["tool_choice"]["name"], "mcp.server:lookup");
+        assert_eq!(
+            aliases.get("mcp.server:lookup").map(String::as_str),
+            Some("mcp.server:lookup")
+        );
+    }
+
+    #[test]
+    fn invalid_custom_tool_alias_rejects_reserved_wire_collision() {
+        let seed = "account-a\0session-a";
+        let invalid = "mcp.server:lookup";
+        let colliding = custom_tool_alias(seed, &invalid.to_ascii_lowercase());
+        let mut request = json!({
+            "tools": [
+                {"name": colliding, "input_schema": {"type": "object"}},
+                {"name": invalid, "input_schema": {"type": "object"}}
+            ]
+        });
+
+        let error = normalize_claude_oauth_tool_names(&mut request, Some(seed)).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("same wire alias"));
+    }
+
+    #[test]
+    fn invalid_overlong_tool_names_get_distinct_bounded_aliases() {
+        let shared_prefix = "a".repeat(64);
+        let first = format!("{shared_prefix}.first");
+        let second = format!("{shared_prefix}.second");
+        let mut request = json!({
+            "tools": [
+                {"name": first, "input_schema": {"type": "object"}},
+                {"name": second, "input_schema": {"type": "object"}}
+            ]
+        });
+
+        normalize_claude_oauth_tool_names(&mut request, Some("account-a\0session-a")).unwrap();
+        let first_alias = request["tools"][0]["name"].as_str().unwrap();
+        let second_alias = request["tools"][1]["name"].as_str().unwrap();
+        assert_ne!(first_alias, second_alias);
+        assert!(first_alias.len() <= 64);
+        assert!(second_alias.len() <= 64);
+        assert!(claude_tool_name_is_legal(first_alias));
+        assert!(claude_tool_name_is_legal(second_alias));
+    }
+
+    #[test]
+    fn wire_profile_enables_invalid_tool_alias_with_explicit_rollback() {
+        let profile: Value = serde_json::from_str(WIRE_PROFILE_JSON).unwrap();
+        assert_eq!(
+            profile.pointer("/runtimeControls/customToolAlias/default"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            profile.pointer("/runtimeControls/customToolAlias/rollback"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -4461,19 +4589,22 @@ mod tests {
 
     #[test]
     fn claude_tool_name_stream_patcher_restores_fragmented_sse_events() {
-        let aliases = BTreeMap::from([("read".to_string(), "read".to_string())]);
+        let aliases = BTreeMap::from([(
+            "cc_tool_deadbeef".to_string(),
+            "mcp.server:read".to_string(),
+        )]);
         let mut patcher = ClaudeToolNameStreamPatcher::new(aliases);
 
         assert!(patcher
             .push(Bytes::from_static(
-                b"event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"Re"
+                b"event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"cc_tool_dead"
             ))
             .is_empty());
         let output = patcher.push(Bytes::from_static(
-            b"ad\",\"input\":{}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+            b"beef\",\"input\":{}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
         ));
         let output = std::str::from_utf8(&output).unwrap();
-        assert!(output.contains("\"name\":\"read\""));
+        assert!(output.contains("\"name\":\"mcp.server:read\""));
         assert!(output.contains("event: content_block_start\r\n"));
         assert!(output.contains("data: {\"type\":\"message_stop\"}"));
         assert!(patcher.finish().is_empty());

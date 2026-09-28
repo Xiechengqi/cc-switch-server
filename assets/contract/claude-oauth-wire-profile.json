@@ -116,7 +116,9 @@
     },
     "customToolAlias": {
       "environment": "CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS",
-      "default": false
+      "default": true,
+      "rollback": false,
+      "scope": "invalid_custom_names_only"
     },
     "extendedResponseDecoding": {
       "environment": "CC_SWITCH_RESPONSE_EXTENDED_DECODING",

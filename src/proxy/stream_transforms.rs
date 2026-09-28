@@ -5168,6 +5168,7 @@ struct AnthropicResponsesState {
     model: String,
     started: bool,
     next_output_index: u64,
+    active_text_index: Option<i64>,
     blocks: BTreeMap<i64, AnthropicResponsesBlock>,
     output_items: Vec<(u64, Value)>,
     stop_reason: Option<String>,
@@ -5182,6 +5183,7 @@ enum AnthropicResponsesBlock {
         item_id: String,
         text: String,
         annotations: Vec<Value>,
+        citation_block_start_byte: usize,
         citation_search_from_byte: usize,
         done: bool,
     },
@@ -5377,48 +5379,95 @@ impl AnthropicResponsesState {
             return Vec::new();
         };
         let mut frames = self.ensure_started();
-        let output_index = self.allocate_output_index();
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                let item_id = format!("msg_{}_{}", response_id_suffix(&self.response_id), index);
-                let initial = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                self.blocks.insert(
-                    index,
-                    AnthropicResponsesBlock::Text {
+        if block.get("type").and_then(Value::as_str) == Some("text") {
+            let initial = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(active_index) = self.active_text_index {
+                if active_index == index {
+                    protocol_error("duplicate_content_block_index");
+                    return frames;
+                }
+                if let Some(mut active) = self.blocks.remove(&active_index) {
+                    if let AnthropicResponsesBlock::Text {
                         output_index,
-                        item_id: item_id.clone(),
-                        text: initial.clone(),
-                        annotations: Vec::new(),
-                        citation_search_from_byte: 0,
-                        done: false,
-                    },
-                );
+                        item_id,
+                        text,
+                        citation_block_start_byte,
+                        citation_search_from_byte,
+                        done,
+                        ..
+                    } = &mut active
+                    {
+                        if !*done {
+                            *citation_block_start_byte = text.len();
+                            *citation_search_from_byte = text.len();
+                            text.push_str(&initial);
+                            let output_index = *output_index;
+                            let item_id = item_id.clone();
+                            self.blocks.insert(index, active);
+                            self.active_text_index = Some(index);
+                            if !initial.is_empty() {
+                                frames.push(StreamFrame::json(json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": 0,
+                                    "delta": initial
+                                })));
+                            }
+                            return frames;
+                        }
+                    }
+                    self.blocks.insert(active_index, active);
+                }
+                self.active_text_index = None;
+            }
+
+            let output_index = self.allocate_output_index();
+            let item_id = format!("msg_{}_{}", response_id_suffix(&self.response_id), index);
+            self.blocks.insert(
+                index,
+                AnthropicResponsesBlock::Text {
+                    output_index,
+                    item_id: item_id.clone(),
+                    text: initial.clone(),
+                    annotations: Vec::new(),
+                    citation_block_start_byte: 0,
+                    citation_search_from_byte: 0,
+                    done: false,
+                },
+            );
+            self.active_text_index = Some(index);
+            frames.push(StreamFrame::json(json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+            })));
+            frames.push(StreamFrame::json(json!({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []}
+            })));
+            if !initial.is_empty() {
                 frames.push(StreamFrame::json(json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
-                })));
-                frames.push(StreamFrame::json(json!({
-                    "type": "response.content_part.added",
+                    "type": "response.output_text.delta",
                     "item_id": item_id,
                     "output_index": output_index,
                     "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []}
+                    "delta": initial
                 })));
-                if !initial.is_empty() {
-                    frames.push(StreamFrame::json(json!({
-                        "type": "response.output_text.delta",
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "delta": initial
-                    })));
-                }
             }
+            return frames;
+        }
+
+        frames.extend(self.finalize_active_text());
+        let output_index = self.allocate_output_index();
+        match block.get("type").and_then(Value::as_str) {
             Some("thinking" | "redacted_thinking") => {
                 let item_id = format!("rs_{}_{}", response_id_suffix(&self.response_id), index);
                 let text = block
@@ -5642,6 +5691,7 @@ impl AnthropicResponsesState {
                 item_id,
                 text,
                 annotations,
+                citation_block_start_byte,
                 citation_search_from_byte,
                 ..
             } => {
@@ -5666,7 +5716,13 @@ impl AnthropicResponsesState {
                     .unwrap_or_default();
                 let Some((start_index, end_index, end_byte)) =
                     scalar_range_for_cited_text(text, cited_text, *citation_search_from_byte)
-                        .or_else(|| scalar_range_for_cited_text(text, cited_text, 0))
+                        .or_else(|| {
+                            scalar_range_for_cited_text(
+                                text,
+                                cited_text,
+                                *citation_block_start_byte,
+                            )
+                        })
                 else {
                     return Vec::new();
                 };
@@ -5764,14 +5820,24 @@ impl AnthropicResponsesState {
         };
         if matches!(
             self.blocks.get(&index),
-            Some(AnthropicResponsesBlock::Search { .. })
+            Some(AnthropicResponsesBlock::Text { .. } | AnthropicResponsesBlock::Search { .. })
         ) {
             return Vec::new();
         }
         self.finalize_block(index)
     }
 
+    fn finalize_active_text(&mut self) -> Vec<StreamFrame> {
+        let Some(index) = self.active_text_index.take() else {
+            return Vec::new();
+        };
+        self.finalize_block(index)
+    }
+
     fn finalize_block(&mut self, index: i64) -> Vec<StreamFrame> {
+        if self.active_text_index == Some(index) {
+            self.active_text_index = None;
+        }
         let Some(block) = self.blocks.get_mut(&index) else {
             return Vec::new();
         };
@@ -8943,6 +9009,178 @@ mod tests {
                     Some("response.completed" | "response.incomplete")
                 )
         )));
+    }
+
+    #[test]
+    fn anthropic_adjacent_text_stream_reuses_one_item_and_scalar_citation_base() {
+        let mut state = AnthropicResponsesState::default();
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {"id": "msg_adjacent", "model": "claude", "usage": {"input_tokens": 1}}
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "🙂"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "e\u{301} "}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "same "}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "citations_delta", "citation": {
+                    "url": "https://example.test/unicode",
+                    "title": "Unicode",
+                    "cited_text": "🙂e\u{301}"
+                }}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "same "}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "citations_delta", "citation": {
+                    "url": "https://example.test/first",
+                    "title": "First",
+                    "cited_text": "same"
+                }}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "same"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "citations_delta", "citation": {
+                    "url": "https://example.test/second",
+                    "title": "Second",
+                    "cited_text": "same"
+                }}
+            }),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {"type": "text", "text": "!"}
+            }),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({
+                "type": "content_block_start",
+                "index": 3,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 3,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"}
+            }),
+            json!({"type": "content_block_stop", "index": 3}),
+            json!({
+                "type": "content_block_start",
+                "index": 4,
+                "content_block": {"type": "text", "text": "tail"}
+            }),
+            json!({"type": "content_block_stop", "index": 4}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2}
+            }),
+            json!({"type": "message_stop"}),
+        ];
+
+        let frames = events
+            .iter()
+            .flat_map(|event| state.transform(event))
+            .collect::<Vec<_>>();
+        let values = json_stream_frames(&frames);
+        for event_type in [
+            "response.content_part.added",
+            "response.output_text.done",
+            "response.content_part.done",
+        ] {
+            assert_eq!(
+                values
+                    .iter()
+                    .filter(|value| value["type"] == event_type)
+                    .count(),
+                2,
+                "one event is expected for each semantic text run"
+            );
+        }
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| {
+                    value["type"] == "response.output_item.added"
+                        && value.pointer("/item/type") == Some(&json!("message"))
+                })
+                .count(),
+            2
+        );
+        let completed = values
+            .iter()
+            .find(|value| value["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed.pointer("/response/output/0/type"),
+            Some(&json!("message"))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/0/content/0/text"),
+            Some(&json!("🙂e\u{301} same same same!"))
+        );
+        assert_eq!(
+            completed
+                .pointer("/response/output/0/content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            completed.pointer("/response/output/0/content/0/annotations/0/start_index"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/0/content/0/annotations/0/end_index"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/0/content/0/annotations/1/start_index"),
+            Some(&json!(9))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/0/content/0/annotations/2/start_index"),
+            Some(&json!(14))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/1/type"),
+            Some(&json!("function_call"))
+        );
+        assert_eq!(
+            completed.pointer("/response/output/2/content/0/text"),
+            Some(&json!("tail"))
+        );
     }
 
     #[test]
