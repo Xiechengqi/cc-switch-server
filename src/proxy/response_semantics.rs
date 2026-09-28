@@ -877,12 +877,23 @@ fn responses_event_is_filtered(
         return false;
     }
     let payload_type = value.get("type").and_then(Value::as_str);
-    [declared_event, payload_type]
+    let mut saw_event_name = false;
+    for name in [declared_event, payload_type]
         .into_iter()
         .flatten()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .any(|name| !responses_event_is_visible(visibility, name))
+    {
+        saw_event_name = true;
+        if !responses_event_is_visible(visibility, name) {
+            return true;
+        }
+    }
+    // A data-bearing JSON frame without either an SSE event name or a payload
+    // type is not part of the reviewed public Responses event set. `[DONE]`
+    // and comment/keepalive frames are handled by the transport decoder before
+    // this visibility boundary.
+    !saw_event_name
 }
 
 fn responses_event_is_visible(visibility: ResponsesEventVisibility, name: &str) -> bool {
@@ -1579,6 +1590,7 @@ mod tests {
             "event: responsesapi.websocket_timing\n",
             "data: {\"type\":\"responsesapi.websocket_timing\",\"latency_ms\":1}\n\n",
             "data: {\"type\":\"codex.response.metadata\",\"trace\":\"private\"}\n\n",
+            "data: {\"anonymous_private_payload\":true}\n\n",
             "event: codex.rate_limits\n",
             "data: {\"remaining\":1}\n\n",
             "event: response.future.delta\n",
@@ -1605,6 +1617,7 @@ mod tests {
         assert!(normalized.contains("response.completed"));
         assert!(!normalized.contains("responsesapi."));
         assert!(!normalized.contains("codex."));
+        assert!(!normalized.contains("anonymous_private_payload"));
         assert!(!normalized.contains("response.future.delta"));
     }
 

@@ -306,6 +306,9 @@ fn prune_codex_required_without_properties(object: &mut Map<String, Value>) {
     if required.is_empty() {
         return;
     }
+    if codex_composition_has_opaque_reference(object) {
+        return;
+    }
 
     let mut visible = BTreeSet::new();
     collect_codex_composition_property_names(object, &mut visible);
@@ -328,6 +331,34 @@ fn prune_codex_required_without_properties(object: &mut Map<String, Value>) {
     } else {
         object.insert("required".to_string(), Value::Array(retained));
     }
+}
+
+fn codex_composition_has_opaque_reference(object: &Map<String, Value>) -> bool {
+    for key in ["allOf", "anyOf", "oneOf", "then", "else"] {
+        let Some(branch) = object.get(key) else {
+            continue;
+        };
+        let branches: Box<dyn Iterator<Item = &Value> + '_> = match branch {
+            Value::Array(branches) => Box::new(branches.iter()),
+            Value::Object(_) => Box::new(std::iter::once(branch)),
+            _ => continue,
+        };
+        for branch in branches {
+            let Some(branch) = branch.as_object() else {
+                continue;
+            };
+            if ["$ref", "$dynamicRef"].into_iter().any(|reference| {
+                branch
+                    .get(reference)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            }) || codex_composition_has_opaque_reference(branch)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn collect_codex_composition_property_names(
@@ -1512,7 +1543,17 @@ mod tests {
                 },
                 "emptyObject": {"type": "object", "required": ["impossible"]},
                 "external": {"type": "object", "$ref": "#/$defs/external", "required": ["remote"]},
-                "dynamic": {"type": ["null", "object"], "$dynamicRef": "#node", "required": ["remote"]}
+                "dynamic": {"type": ["null", "object"], "$dynamicRef": "#node", "required": ["remote"]},
+                "composedExternal": {
+                    "type": "object",
+                    "required": ["remote", "opaque"],
+                    "allOf": [{"properties": {"visible": {"type": "string"}}}, {"$ref": "#/$defs/external"}]
+                },
+                "nestedDynamic": {
+                    "type": "object",
+                    "required": ["remote"],
+                    "anyOf": [{"oneOf": [{"$dynamicRef": "#node"}]}]
+                }
                 }
             }}}
         });
@@ -1531,6 +1572,14 @@ mod tests {
         );
         assert_eq!(
             schema.pointer("/$defs/dynamic/required"),
+            Some(&json!(["remote"]))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/composedExternal/required"),
+            Some(&json!(["remote", "opaque"]))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/nestedDynamic/required"),
             Some(&json!(["remote"]))
         );
 
