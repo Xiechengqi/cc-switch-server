@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "sourceWorktree": "only committed Git objects are evidence; local modifications are excluded",
@@ -23,6 +23,17 @@
       "repository": "OmniRoute",
       "headCommit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
       "headTree": "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": 22,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "omniroute-2026-09-28",
+      "sourceId": "omniroute",
+      "repository": "OmniRoute",
+      "headCommit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "headTree": "8d1c312f61d115767c9478416cb039750eaf113a",
       "worktreeClean": false,
       "worktreeChangesExcluded": true,
       "excludedWorktreeEntries": 22,
@@ -73,6 +84,65 @@
     "wireDelta": "none",
     "productionCodeChanged": false
   },
+  "incrementalReviewExtensions": [
+    {
+      "id": "CUR-N2-2026-09-28",
+      "sourceId": "omniroute",
+      "fromSnapshotId": "omniroute-2026-09-19",
+      "toSnapshotId": "omniroute-2026-09-28",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "fromCommit": "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+      "toCommit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "readMode": "read_only_committed_git_objects",
+      "status": "reviewed_no_wire_delta",
+      "wireDelta": "none",
+      "productionCodeChanged": false,
+      "reviewedCommittedObjects": 14,
+      "excludedWorktreeEntries": 22,
+      "changedCommittedPaths": [
+        "changelog.d/fixes/stream-timing-clock.md",
+        "changelog.d/fixes/transformers-webpack-ignore.md",
+        "config/quality/eslint-suppressions.json",
+        "electron/package-lock.json",
+        "electron/package.json",
+        "open-sse/utils/streamTiming.ts",
+        "package-lock.json",
+        "package.json",
+        "src/lib/memory/__tests__/optionalTransformers.test.ts",
+        "src/lib/memory/embedding/transformersLocal.ts",
+        "tests/_setup/transformersUnavailable.ts",
+        "tests/unit/build/optional-transformers-dependency.test.ts",
+        "tests/unit/stream-timing.test.ts",
+        "vitest.config.ts"
+      ],
+      "reviewedCursorWirePaths": [
+        "open-sse/utils/cursorAgentProtobuf.ts",
+        "open-sse/services/cursorSessionManager.ts",
+        "open-sse/executors/cursor.ts",
+        "tests/unit/cursor-agent-protobuf.test.ts",
+        "tests/unit/cursor-agent-session.test.ts",
+        "tests/unit/cursor-protobuf-wire-split.test.ts"
+      ],
+      "changedCursorWirePaths": [],
+      "facts": [
+        {
+          "disposition": "reviewed_no_wire_delta",
+          "paths": ["package.json", "package-lock.json", "electron/package.json", "electron/package-lock.json", "config/quality/eslint-suppressions.json", "vitest.config.ts"],
+          "contract": "dependency, lockfile, lint and test-runner maintenance does not change Cursor OAuth or API-key wire behavior"
+        },
+        {
+          "disposition": "reviewed_no_wire_delta",
+          "paths": ["open-sse/utils/streamTiming.ts", "tests/unit/stream-timing.test.ts", "changelog.d/fixes/stream-timing-clock.md"],
+          "contract": "shared stream timing uses a monotonic clock but does not change Cursor request, protobuf, auth, catalog, tool, session or terminal contracts"
+        },
+        {
+          "disposition": "reviewed_no_wire_delta",
+          "paths": ["src/lib/memory/embedding/transformersLocal.ts", "src/lib/memory/__tests__/optionalTransformers.test.ts", "tests/_setup/transformersUnavailable.ts", "tests/unit/build/optional-transformers-dependency.test.ts", "changelog.d/fixes/transformers-webpack-ignore.md"],
+          "contract": "optional local embedding dependency handling is outside the Cursor Provider data plane"
+        }
+      ]
+    }
+  ],
   "registryTruth": {
     "driverId": "special.cursor",
     "driverContractRevision": 4,

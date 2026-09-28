@@ -31,6 +31,14 @@ CX-N11 与 CX-N12 都先由差分 fixture 复现红灯，再做窄修复。Codex
 
 Codex 关键词回归 399 项及新增 steering、reported-model 专项均已通过；reference-delta 默认审计与 committed-object 复核通过。CX-N5～CX-N12 均只提升为 `fixture_verified`。GPT Image 2.5 三个 variant、WS prewarm、Astra entitlement 和其他真实账号 operation 仍各自保持 `receipt=null/live_pending`；本轮没有引入账号池、跨 Account/Provider/rail/site fallback，也没有以本地 fixture 代替真实 ChatGPT 验收。
 
+## 2026-09-28 Cursor OmniRoute no-wire refresh
+
+Cursor 的第二轮 append-only review 从 `OmniRoute@02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`（tree `25b36e4993a8cc52da22b3d0b0aa26bd4c60426b`）比较到 `443d66996d69d7ecf887fd61158404a3cca1b192`（tree `8d1c312f61d115767c9478416cb039750eaf113a`）。区间内 14 个 committed path 只涉及依赖/lockfile、可选本地 embedding、测试运行器和共享 `streamTiming` 的 monotonic clock；六个已冻结的 Cursor protobuf、session、executor 与对应 fixture path 均无变化，没有 OAuth/API-key header、ServerConfig、AgentService protobuf/gzip、模型目录、工具桥、park/resume 或 terminal wire 增量。
+
+`assets/contract/cursor-reference-delta.json` 新增第二个只读 snapshot 和不可变 `CUR-N2-2026-09-28` review extension，逐项固定 from/to commit/tree、14 个 changed path、六个 reviewed wire path 与 `changedCursorWirePaths=[]`。参考仓库当时 22 项未提交/未跟踪 Codex 内容全部排除；默认 audit 不读取外部 checkout，显式 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才复核 Git range、tree、路径清单和历史文件 SHA-256。
+
+结论保持 `reviewed_no_wire_delta`，因此不制造 Cursor 生产代码改动。既有 CUR-01/CUR-03、CORE-N1/N2 仍为 `fixture_verified`，OAuth 与 API-key 两条 CUR-N1 receipt 继续相互独立地保持 `null/live_pending`；共享 stream-timing 变化不能替代任何真实账号验收，也不能扩展 retry/fallback 边界。
+
 ## 2026-09-28 Claude text/citation and tool-name freeze
 
 CL-N5 与 CL-N6 冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0016`～`CL-OBS-0017`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）以及两个历史 committed object：`781a203b` 的相邻 Anthropic text/citation 合并、`75b854eb` 的 Claude 工具名语法。15 个 source delta 的文件摘要和 17 条 append-only observation 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。

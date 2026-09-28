@@ -191,15 +191,38 @@ const immutableSourceSnapshotDigests = new Map([
     "omniroute-2026-09-19",
     "821050b62be6a73e50f2d2c34272c3384cdd5fefdc1f64a418d32c891bc46638",
   ],
+  [
+    "omniroute-2026-09-28",
+    "ccbe64eba0971cafa2b8f7ede29b516857c3e182dc4221bdcc5e430beba60add",
+  ],
+]);
+const expectedSourceSnapshotHeads = new Map([
+  [
+    "omniroute-2026-09-19",
+    {
+      commit: "02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a",
+      tree: "25b36e4993a8cc52da22b3d0b0aa26bd4c60426b",
+    },
+  ],
+  [
+    "omniroute-2026-09-28",
+    {
+      commit: "443d66996d69d7ecf887fd61158404a3cca1b192",
+      tree: "8d1c312f61d115767c9478416cb039750eaf113a",
+    },
+  ],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of contract.sourceSnapshots ?? []) {
   assert(snapshot.id && !sourceSnapshotById.has(snapshot.id), "duplicate Cursor source snapshot");
   const source = sourceById.get(snapshot.sourceId);
   assert(source, `${snapshot.id} references an unknown source`);
+  const expectedHead = expectedSourceSnapshotHeads.get(snapshot.id);
   assert(
     snapshot.repository === "OmniRoute" &&
-      snapshot.headCommit === source.commit &&
+      expectedHead?.commit === snapshot.headCommit &&
+      expectedHead?.tree === snapshot.headTree &&
+      commitPattern.test(snapshot.headCommit) &&
       commitPattern.test(snapshot.headTree),
     `${snapshot.id} has invalid committed source identity`,
   );
@@ -264,6 +287,116 @@ if (checkSources) {
   ).trim();
   assert(changedReviewedPaths === "", "Cursor reviewed wire objects changed in the frozen range");
 }
+
+const immutableIncrementalReviewExtensionDigests = new Map([
+  [
+    "CUR-N2-2026-09-28",
+    "f2f39e18f9324d3ee942fa6d1f057916d3e86533eb65a9131175107c1f3a1e40",
+  ],
+]);
+const incrementalReviewExtensions = new Map();
+for (const review of contract.incrementalReviewExtensions ?? []) {
+  assert(
+    review.id && !incrementalReviewExtensions.has(review.id),
+    "duplicate Cursor incremental review extension",
+  );
+  const source = sourceById.get(review.sourceId);
+  const fromSnapshot = sourceSnapshotById.get(review.fromSnapshotId);
+  const toSnapshot = sourceSnapshotById.get(review.toSnapshotId);
+  assert(
+    source &&
+      fromSnapshot?.sourceId === review.sourceId &&
+      toSnapshot?.sourceId === review.sourceId &&
+      review.fromCommit === fromSnapshot.headCommit &&
+      review.toCommit === toSnapshot.headCommit,
+    `${review.id} has an invalid snapshot range`,
+  );
+  assert(
+    Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.readMode === "read_only_committed_git_objects" &&
+      review.status === "reviewed_no_wire_delta" &&
+      review.wireDelta === "none" &&
+      review.productionCodeChanged === false &&
+      review.reviewedCommittedObjects === 14 &&
+      review.excludedWorktreeEntries === 22,
+    `${review.id} changed the no-wire review boundary`,
+  );
+  assert(
+    Array.isArray(review.changedCommittedPaths) &&
+      review.changedCommittedPaths.length === review.reviewedCommittedObjects &&
+      new Set(review.changedCommittedPaths).size === review.changedCommittedPaths.length,
+    `${review.id} has an invalid committed-path inventory`,
+  );
+  review.changedCommittedPaths.forEach((value) => safeRelative(value, `${review.id}:${value}`));
+  const expectedWirePaths = source.files.map((file) => file.path);
+  assert(
+    JSON.stringify(review.reviewedCursorWirePaths) === JSON.stringify(expectedWirePaths) &&
+      Array.isArray(review.changedCursorWirePaths) &&
+      review.changedCursorWirePaths.length === 0,
+    `${review.id} changed the reviewed Cursor wire set`,
+  );
+  assert(
+    Array.isArray(review.facts) &&
+      review.facts.length === 3 &&
+      review.facts.every(
+        (fact) =>
+          fact.disposition === "reviewed_no_wire_delta" &&
+          typeof fact.contract === "string" &&
+          fact.contract.length > 0 &&
+          Array.isArray(fact.paths) &&
+          fact.paths.length > 0,
+      ),
+    `${review.id} has incomplete review facts`,
+  );
+  for (const fact of review.facts) {
+    fact.paths.forEach((value) => safeRelative(value, `${review.id}:${value}`));
+  }
+  assert(
+    immutableIncrementalReviewExtensionDigests.get(review.id) === objectDigest(review),
+    `${review.id} changed after it was recorded`,
+  );
+  if (checkSources) {
+    const sourceRoot = sourceRootById.get(review.sourceId);
+    const changedCommittedPaths = execFileSync(
+      "git",
+      ["-C", sourceRoot, "diff", "--name-only", `${review.fromCommit}..${review.toCommit}`],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert(
+      JSON.stringify(changedCommittedPaths) === JSON.stringify(review.changedCommittedPaths),
+      `${review.id} committed-path inventory drifted`,
+    );
+    const changedWirePaths = execFileSync(
+      "git",
+      [
+        "-C",
+        sourceRoot,
+        "diff",
+        "--name-only",
+        `${review.fromCommit}..${review.toCommit}`,
+        "--",
+        ...review.reviewedCursorWirePaths,
+      ],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert(
+      JSON.stringify(changedWirePaths) === JSON.stringify(review.changedCursorWirePaths),
+      `${review.id} Cursor wire delta drifted`,
+    );
+  }
+  incrementalReviewExtensions.set(review.id, review);
+}
+assert(
+  incrementalReviewExtensions.size === immutableIncrementalReviewExtensionDigests.size &&
+    incrementalReviewExtensions.has("CUR-N2-2026-09-28"),
+  "Cursor incremental review extension history is incomplete",
+);
 
 const immutableObservationDigests = new Map([
   ["CUR-OBS-0001", "f3732163de10712d240bae6265bc301a62cdf12be94500e837ee9381b3e17524"],
@@ -713,7 +846,7 @@ assert(
 );
 
 console.log(
-  `cursor reference delta audit ok (${immutableLegacyDigests.size} legacy fields, ${observationIds.size} immutable observations, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
+  `cursor reference delta audit ok (${immutableLegacyDigests.size} legacy fields, ${incrementalReviewExtensions.size} no-wire review extension, ${observationIds.size} immutable observations, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

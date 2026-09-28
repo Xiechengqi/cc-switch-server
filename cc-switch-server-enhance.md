@@ -354,7 +354,7 @@ CX-R1 明确拒绝从参考图片实现迁入商业计价、自动 driver-model 
 
 ### 7.1 对比结论
 
-OmniRoute 从旧冻结点到 02c663cdd0e85 没有新的 Cursor wire、protobuf、auth 或 session 专项提交。目标已经具备 OAuth/API-key 双 rail、protobuf/open-sse、session/continuation、模型目录和自包含 fixtures，因此 CUR-N2 没有发现需要新增生产 wire 的 confirmed_gap；后续实施的 CORE-N2 是独立横切容量治理，不改变该结论。
+OmniRoute 从旧冻结点到 `02c663cdd0e85`，以及第二轮从该点到 `443d66996d69`，均没有新的 Cursor wire、protobuf、auth 或 session 专项提交。目标已经具备 OAuth/API-key 双 rail、protobuf/open-sse、session/continuation、模型目录和自包含 fixtures，因此 CUR-N2 没有发现需要新增生产 wire 的 confirmed_gap；后续实施的 CORE-N2 是独立横切容量治理，不改变该结论。
 
 OmniRoute 工作树有 22 项本地修改，全部排除在证据之外。后续只能把新的已提交 Cursor 变更纳入 reference delta；不能引用工作树文件、截图或本地运行结果。
 
@@ -363,7 +363,7 @@ OmniRoute 工作树有 22 项本地修改，全部排除在证据之外。后续
 | ID | 状态 | 优先级 | 工作与退出条件 |
 | --- | --- | --- | --- |
 | CUR-N1 | live_pending | P1 | OAuth 与 API-key rail 仍需分别产生本仓库 receipt；一条成功不得外推另一条 |
-| CUR-N2 | reviewed_no_wire_delta | P2 | 已复核 OmniRoute@02c663c；六个 wire 对象无变化，22 项工作树修改排除，生产代码不变 |
+| CUR-N2 | reviewed_no_wire_delta | P2 | 已复核 OmniRoute@443d6699；14 个 committed changed path 均非 Cursor wire，六个 wire 对象无变化，22 项工作树修改排除，生产代码不变 |
 
 CUR-N1 继续保持 Account 固定绑定。credential kind、endpoint、session identity 和 model catalog 必须写入脱敏 receipt 的结构字段；token、machine identity 原值和 prompt 不得落盘。
 
@@ -373,7 +373,7 @@ CUR-N1 继续保持 Account 固定绑定。credential kind、endpoint、session 
 
 parked session 会保留 request reservation；continuation 先向新请求预算预留 session、parser 与 pending frame，再释放旧预算，close、expiry 与失败 guard 均清理 retained state。四种已提交 SSE Surface 使用稳定 `cc_switch_request_memory_exhausted` 终止码，usage 归类 `memory_capacity`，Provider outcome 归类 capacity shed。专项验证为 Cursor 304/304、request-memory 16/16、Clippy `-D warnings` 通过。
 
-Cursor reference delta 已迁为 append-only schema v2：原 schema v1 的十个历史字段逐项由 digest 固定；一个明确排除 22 项工作树改动的 OmniRoute committed-object snapshot 保持不变，当前共有 8 条不可变 observation，完整映射 CUR-01～03、CUR-N1/N2、CORE-N1、CORE-N2、LIVE-N1。`CUR-OBS-0008` 只把参考的 16 MiB frame ceiling、rolling-buffer splice、5 分钟/100 session 与 close cleanup 作为“retained state 应有界”的差分信号；`evidenceExtensions` 记录 `CORE-N2-CURSOR=fixture_verified`。每条记录绑定 source commit/tree/path/symbol/digest 与本仓库 committed target baseline/implementation object；默认审计不读取外部仓库，只有显式 `--check-sources` 才复核冻结对象。
+Cursor reference delta 已迁为 append-only schema v2：原 schema v1 的十个历史字段逐项由 digest 固定；两个明确排除 22 项工作树改动的 OmniRoute committed-object snapshot 分别冻结 `02c663cd` 与 `443d6699`，`CUR-N2-2026-09-28` review extension 固定其 14 个 committed changed path 和六个零变化 Cursor wire path。当前共有 8 条不可变 observation，完整映射 CUR-01～03、CUR-N1/N2、CORE-N1、CORE-N2、LIVE-N1。`CUR-OBS-0008` 只把参考的 16 MiB frame ceiling、rolling-buffer splice、5 分钟/100 session 与 close cleanup 作为“retained state 应有界”的差分信号；`evidenceExtensions` 记录 `CORE-N2-CURSOR=fixture_verified`。每条记录绑定 source commit/tree/path/symbol/digest 与本仓库 committed target baseline/implementation object；默认审计不读取外部仓库，只有显式 `--check-sources` 才复核冻结对象。
 
 ### 7.3 不采纳
 
@@ -978,6 +978,8 @@ CX-N11 与 CX-N12 的差分 fixture 均先复现红灯后再窄修复：WS write
 OmniRoute 从首轮 `02c663cdd0e85` 到 `443d66996d69` 的 committed delta 只涉及依赖和共享 stream-timing 工具，没有发现 Cursor OAuth/API-key 请求头、protobuf/gzip、Agent plan、模型目录、工具桥或 terminal wire 的变化。其工作树内 Codex 相关修改全部排除，不可作为 Cursor 证据。
 
 第二轮状态为 `reviewed_no_wire_delta`：不新增 CUR-N 实现项，不重写现有 executor。CUR-N1 的 OAuth/API-key 两条真实 rail、既有 request-memory 和 parked-session 合同继续按首轮状态验收。
+
+证据更新（2026-09-28）：`assets/contract/cursor-reference-delta.json` 已追加 `omniroute-2026-09-28` snapshot 与 `CUR-N2-2026-09-28` immutable review extension。默认 audit 与 `--check-sources` 均确认 14 个 committed path inventory 精确、六个 Cursor wire path 零变化；22 项工作树内容全部排除。该更新只冻结 `reviewed_no_wire_delta`，没有生产代码提交，也没有提升 OAuth/API-key 两条 `live_pending` rail。
 
 ### 17.7 Grok 增量差异
 
