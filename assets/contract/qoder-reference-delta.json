@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",
@@ -75,6 +75,36 @@
       "worktreeChangesExcluded": false,
       "excludedWorktreeEntries": 0,
       "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "referenceReviewExtensions": [
+    {
+      "id": "QODER-SKILL-GATE-2026-09-28",
+      "sourceId": "tokenrouter",
+      "repository": "TokenRouter",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "status": "unreviewed_skill_gate",
+      "headCommit": "6d676f1d100e11f2f068949f5779e960c862079c",
+      "headTree": "4b830127433aa21c8534891526b3617bf90d2b80",
+      "headDetached": true,
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": [
+        "UD AGENTS.md"
+      ],
+      "readMode": "repository_metadata_only",
+      "requiredSkill": "project-doc",
+      "skillAvailable": false,
+      "businessFilesRead": false,
+      "businessAnalysisPerformed": false,
+      "productionCodeChanged": false,
+      "lastTrustedSnapshotId": "tokenrouter-2026-09-19",
+      "lastTrustedCommit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+      "preservedLiveGates": [
+        "global_oauth",
+        "global_pat",
+        "cn_oauth"
+      ]
     }
   ],
   "incrementalReview": {

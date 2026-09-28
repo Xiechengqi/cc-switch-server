@@ -60,6 +60,8 @@ QD-N2 已把只读 TokenRouter 交叉核对刷新到 `7faf9469bc6957716923b5b4a9
 
 Qoder reference delta 已迁为 append-only schema v2：原 schema-v1 文件及 11 个内容字段分别由不可变摘要固定；TokenRouter snapshot 绑定 `7faf9469bc6957716923b5b4a98665c0fb9715e0` 与 tree `b205061c4f0d9b53fbffb0242f34796e10b18251`，并声明只读取干净工作树的 committed Git objects。11 条 observation 把 QD-01～03、QD-N1/N2、CORE-N1/N2、LIVE-N1 和 QD-R1～R3 映射到 source path/symbol/digest、处置理由及本仓库 committed baseline/implementation object。QD-OBS-0011 只把参考的 4 MiB 控制面读取、500 MiB 默认 SSE line ceiling 与非流事件数组作为 retained-state 差分信号；`CORE-N2-QODER=fixture_verified` 由本仓库独立 sticky budget 与 committed fixture 支持。QD-R1～R3 明确拒绝账号池/轮换/affinity 或跨边界 fallback、商业控制面，以及外仓运行时依赖、伪 live 与宽松 terminal；默认 audit 自包含，`--check-sources` 才读取 TokenRouter 冻结对象。
 
+2026-09-28 的 TokenRouter 最新 HEAD `6d676f1d100e11f2f068949f5779e960c862079c` / tree `4b830127433aa21c8534891526b3617bf90d2b80` 要求当前会话使用 `project-doc` skill，但该技能不可用；工作树中的 `UD AGENTS.md` 也被排除。`QODER-SKILL-GATE-2026-09-28` 仅冻结这些仓库元数据，并明确标记 `businessFilesRead=false`、`businessAnalysisPerformed=false`、`productionCodeChanged=false`，不能冒充 `reviewed_no_wire_delta`。最近可信 snapshot 仍为 `tokenrouter-2026-09-19`；Global OAuth、Global PAT、CN OAuth 三条 rail 继续独立 `live_pending`。
+
 CORE-N2 精确启用 `qoder_cosy`：Global OAuth、Global PAT、CN OAuth 和 Claude/Codex/Gemini 三 Surface 共享请求生命周期预算，覆盖 canonical/runtime/catalog/prepared payload、COSY 编码签名、错误响应、SSE decoder/canonical event、非流聚合与下游 retained state。耗尽为稳定 503/同码流终态和 `CapacityShed`，不 replay、refresh 或记为网络故障；真实 rail 状态不变，仍分别为 `live_pending`。
 
 ## CLI 升级门禁

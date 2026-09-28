@@ -319,6 +319,60 @@ assert(
   "Qoder source snapshot history is incomplete",
 );
 
+const immutableReferenceReviewExtensionDigests = new Map([
+  [
+    "QODER-SKILL-GATE-2026-09-28",
+    "144bec34e50584c740930da7c8b0304611f8b8bfe74ab780451f49ed84180e13",
+  ],
+]);
+const referenceReviewExtensions = new Map();
+for (const review of contract.referenceReviewExtensions ?? []) {
+  assert(
+    review.id && !referenceReviewExtensions.has(review.id),
+    "duplicate Qoder reference review extension",
+  );
+  assert(
+    review.sourceId === "tokenrouter" &&
+      sourceById.has(review.sourceId) &&
+      review.repository === "TokenRouter" &&
+      Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.status === "unreviewed_skill_gate" &&
+      review.headCommit === "6d676f1d100e11f2f068949f5779e960c862079c" &&
+      review.headTree === "4b830127433aa21c8534891526b3617bf90d2b80" &&
+      review.headDetached === true &&
+      review.worktreeClean === false &&
+      review.worktreeChangesExcluded === true &&
+      JSON.stringify(review.excludedWorktreeEntries) === JSON.stringify(["UD AGENTS.md"]) &&
+      review.readMode === "repository_metadata_only" &&
+      review.requiredSkill === "project-doc" &&
+      review.skillAvailable === false &&
+      review.businessFilesRead === false &&
+      review.businessAnalysisPerformed === false &&
+      review.productionCodeChanged === false &&
+      review.lastTrustedSnapshotId === "tokenrouter-2026-09-19" &&
+      review.lastTrustedCommit === "7faf9469bc6957716923b5b4a98665c0fb9715e0" &&
+      JSON.stringify(review.preservedLiveGates) ===
+        JSON.stringify(["global_oauth", "global_pat", "cn_oauth"]),
+    `${review.id} changed the unavailable-skill review boundary`,
+  );
+  assert(
+    sourceSnapshotById.has(review.lastTrustedSnapshotId) &&
+      sourceSnapshotById.get(review.lastTrustedSnapshotId).headCommit ===
+        review.lastTrustedCommit,
+    `${review.id} changed the last trusted Qoder snapshot`,
+  );
+  assert(
+    immutableReferenceReviewExtensionDigests.get(review.id) === objectDigest(review),
+    `${review.id} changed after it was recorded`,
+  );
+  referenceReviewExtensions.set(review.id, review);
+}
+assert(
+  referenceReviewExtensions.size === immutableReferenceReviewExtensionDigests.size &&
+    referenceReviewExtensions.has("QODER-SKILL-GATE-2026-09-28"),
+  "Qoder reference review extension history is incomplete",
+);
+
 assert(
   objectDigest(contract.reviewedRejections) ===
     "ca8d2aaee28cb226e4a5405738bbdba900572563ec4792de0a608959f7456c25",
@@ -844,5 +898,5 @@ for (const [rail, site] of [
 }
 
 console.log(
-  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
+  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${referenceReviewExtensions.size} gated reference review, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
 );

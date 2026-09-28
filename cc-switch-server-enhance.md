@@ -1009,6 +1009,8 @@ TokenRouter 最新 HEAD `6d676f1d100e` 的仓库指令要求 `project-doc` skill
 - 后续在 skill 可用时，从 `7faf9469bc695..6d676f1d100e` 做独立 committed-object 增量审计，再决定是否新增 QD-N 项；
 - 在此之前不改变 Global OAuth、Global PAT、CN OAuth 的任何 capability 或 `live_pending` 状态。
 
+证据更新（2026-09-28）：`assets/contract/qoder-reference-delta.json` 已追加不可变 `QODER-SKILL-GATE-2026-09-28` reference review extension，冻结最新 HEAD/tree、detached/非净工作树状态、被排除的 `UD AGENTS.md` 与缺失的 `project-doc` skill。该记录明确固定 `businessFilesRead=false`、`businessAnalysisPerformed=false` 和 `productionCodeChanged=false`，最近可信 snapshot 仍是 `tokenrouter-2026-09-19`；默认自包含 audit 通过后也只能证明门禁未被篡改，不能得出 no-wire 结论或提升三条真实 rail。本轮依仓库指令不运行会重新访问 TokenRouter 的 `--check-sources`。
+
 ### 17.10 CodeBuddy 增量差异
 
 cli2api 的新增提交大部分已被目标共享 bridge 覆盖，但 cache usage 存在一个可复现的端到端缺口。
