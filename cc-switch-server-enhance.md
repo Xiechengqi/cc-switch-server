@@ -754,7 +754,7 @@ RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh
 | `git diff --check`、docs index | 无 whitespace 错误；文档索引完整 | 通过 |
 | Antigravity 后续专项 | 67 个 Rust 关键词测试通过；13 个 Node 验收/环境门禁测试通过；13 个 source delta、17 条 v2 observation audit 通过 | CORE-N2 `fixture_verified`；两条 rail 仍为 `live_pending` |
 | Claude 后续专项 | 249 个 Rust Claude 关键词测试通过；12 个 Node receipt gate 测试通过；13 个 source delta、15 条 v2 observation 默认及 `--check-sources` audit 通过 | CORE-N2 `fixture_verified`；四个 operation 仍为 `live_pending` |
-| Codex 后续专项 | 389 个 Rust Codex 关键词测试通过；12 个 Node receipt gate 与 7 个付费探针安全测试通过；9 个 source delta、13 条 v2 observation audit 通过 | 通过；四个 operation 仍为 `live_pending` |
+| Codex 后续专项 | 399 个 Rust Codex 关键词测试及新增 steering/reported-model 专项通过；12 个 Node receipt gate 与 7 个付费探针安全测试通过；18 个 source delta、22 条 v2 observation 默认及 `--check-sources` audit 通过 | CX-N5～CX-N12 为 `fixture_verified`；五个真实 operation 仍为 `live_pending` |
 | Cursor 后续专项 | 304 个 Rust Cursor 关键词测试、16 个 request-memory 关键词测试通过；Clippy `-D warnings` 通过；7 个顶层 Node receipt gate/21 个断言保持通过；10 个 legacy 字段摘要、1 个 dirty-worktree-excluded snapshot、8 条 v2 observation 默认及 `--check-sources` audit 通过 | CORE-N2 `fixture_verified`；OAuth/API-key 两条 rail 仍为 `live_pending` |
 | Grok 后续专项 | 184 个 Rust Grok 关键词测试通过；6 个顶层 Node receipt gate/11 个断言通过；10 个 legacy 字段摘要、2 个 committed-object snapshot、11 条 v2 observation 的默认与 `--check-sources` audit 均通过 | CORE-N2 `fixture_verified`；inference/media/remote_compaction 三个 operation 仍为 `live_pending` |
 | Kiro 后续专项 | 102 个 Rust Kiro 关键词测试、21 个 request-memory 测试、14 个 Amazon Q 测试通过；5 个顶层 Node receipt gate 覆盖八个 scope；10 个 legacy 字段摘要、1 个干净 committed-object snapshot、14 条 v2 observation、`CORE-N2-KIRO` 与 3 条 reject 边界的默认及 `--check-sources` audit 均通过 | CORE-N2 `fixture_verified`；八个 auth-kind × region receipt、remote compaction 与 shared cache 仍为 `live_pending`/disabled |
@@ -916,9 +916,12 @@ CodeBuddy：
 | --- | --- | --- | --- |
 | P0 | AG-N7～N11 | `fixture_verified`（`aeeaf1a`） | reasoning 可见性、工具结果邻接/`$ref`、tool choice 与 ID 映射已在本地闭环；两条 live rail 未提升 |
 | P0/P1 | CL-N5、CL-N6 | `fixture_verified`（`7794033`） | 相邻 text/citation 与非法工具名可逆 alias 已闭环；真实 Claude OAuth operation 未提升 |
-| P0 | CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | 权限静默放宽、私有事件外泄、usage 丢失 |
-| P1 | CX-N8、CX-N10、GR-N3 | `planned_confirmed_gap` | 连续工具轮 reasoning 丢失、上游换模不可见、目录能力与运行时脱节 |
-| P1 | CX-N11、CX-N12、GR-N4 | `planned_differential_first` / `live_only` | WS 并发时序、strict response schema、Grok 客户身份/header 的静态证据不足 |
+| P0 | CX-N5～N7、CX-N9 | `fixture_verified`（`f890774`） | schema/item 精确清理与私有事件闭集已闭环；真实 rail 未提升 |
+| P0 | CB-N6 | `planned_confirmed_gap` | cache usage 丢失 |
+| P1 | CX-N8、CX-N10 | `fixture_verified`（`f890774`） | 真实 reasoning 复用与本地 reported-model 诊断已闭环；不改变路由/计费 |
+| P1 | GR-N3 | `planned_confirmed_gap` | 目录能力与运行时脱节 |
+| P1 | CX-N11、CX-N12 | `fixture_verified_after_red_differential`（`f890774`） | 红灯后完成有界 steering writer 与 strict response schema 窄修复 |
+| P1 | GR-N4 | `live_only` | Grok 客户身份/header 缺真实账号证据 |
 | 复核 | Cursor、Kiro、sub2api | `reviewed_no_wire_delta` | 不制造无意义生产改动，只刷新冻结证据 |
 | 受阻 | Qoder 最新 HEAD | `unreviewed_skill_gate` | 缺参考仓库要求的 skill；不得用猜测补结论 |
 
@@ -965,6 +968,10 @@ CL-N5 只修改 Responses 输出组织与 offset，不把不同语义 block 粘�
 | CX-N12 | codex2api `288a28cb` | 工具 schema 有保守归一化，但 `/text/format/schema` 未走等价处理；strict response schema 中“有 required、无本层 properties”的节点可能带 orphan key | `differential_first`：冻结 composition branch、纯 object、`$ref/$dynamicRef` 三形状。只在真实差分红灯后复用 schema-aware 算法：组合分支按可见字段裁剪、无字段来源的 object 删除 required、外部引用保持；禁止递归删除未知用户字段 |
 
 以下 Codex 变化不形成新实现项：service tier/routing hint 已由现有 policy 覆盖；WebSocket upstream relay 和 SSE event boundary 已有等价保护。WS prewarm 仍是独立 `live_pending`，第二轮静态审计不能把它提升为已支持。codex2api `e15cd28d` 删除 client harness scaffolding 会重写用户文本，标记 `not_adopted`；Windows attestation、浏览器/客户端指纹和未获真实证据的身份模拟也不复制。
+
+实施更新（2026-09-28）：CX-N5～CX-N12 已在 `f8907742b163b239a981cddcc3962410f0712677` 完成。schema sanitizer 识别活动 octal NUL 并保持非 schema decoy；Responses、Compact、WS 与 WS→HTTP fallback 共用精确 item/part metadata 清理。SSE 以 declared event + payload type 双重闭集过滤，连续工具轮只复用真实 reasoning。JSON/SSE/WS 的上游自报 model 以有界、终态优先方式写入本地 UsageLog/Web API，不覆盖 `actual_model`，不参与路由、计费、retry/fallback，也不进入 Router Share usage payload。
+
+CX-N11 与 CX-N12 的差分 fixture 均先复现红灯后再窄修复：WS writer 使用容量 8 的有界队列，大写入期间只接收精确顶层 `response.steer`，queue full 与伪装/第二 create/坏帧 fail closed，Ping/Pong 和取消保持响应；两个 text-format schema 入口会裁剪 composition orphan required，纯 object 无字段来源时删除 required，`$ref/$dynamicRef` 保持 opaque。Codex 关键词测试 399 项及新增 steering/reported-model 专项、Clippy、API contract、reference-delta 默认与 `--check-sources` 审计均通过；证据追加为 `CX-OBS-0014`～`CX-OBS-0022`，八项均为 `fixture_verified`。GPT Image 2.5、WS prewarm、Astra entitlement 等五个真实 operation 继续 `receipt=null/live_pending`。
 
 ### 17.6 Cursor 增量复核
 
@@ -1033,7 +1040,7 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 | CX-N7 | declared event 与 payload type 双重过滤；error/terminal/公开事件保留 | 原生 Codex metadata allowlist 如有变化需真实客户端 receipt |
 | CX-N8 | 连续 tool turn 复用真实 reasoning，用户边界清空，不伪造 placeholder | compat model 的真实接受性按现有 operation gate |
 | CX-N10 | JSON/SSE/WS reported model 只做审计；缺失/冲突/超长输入有界 | 告警阈值可用线上脱敏样本调优，但不阻塞离线正确性 |
-| CX-N11/N12 | 先冻结差分，绿灯不改代码 | WS 高并发与 strict schema 如需厂商确认，保持 pending |
+| CX-N11/N12 | 差分红灯已冻结；容量 8 steering 队列、control/cancel 公平性、composition/object/reference 三类 schema 窄修复全绿 | 生产 WS 高并发与厂商 strict schema 接受性仍需真实输入，不因 fixture 提升 |
 | GR-N3 | exact-scope catalog replace、generation drift、菜单/default/minimal/max、stale 不扩权 | 搜索、4.7 和 context/max 接受性分别验收 |
 | GR-N4 | UUID derivation 和 header 隔离可离线验证 | client version 与 group header 必须有 fixed-account fresh receipt |
 | CB-N6 | explicit zero、字段优先级、total 不双计、三 Surface 流/非流一致 | Intl/CN live 状态不变 |
@@ -1055,7 +1062,7 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 
 - Antigravity：CLIProxyAPI `6dea3dfa`（reasoning summary）、`3de5709d`（tool-result adjacency）、`5af6cd75`（function response `$ref`）、`49eec664`（tool choice fail closed）、`580df95a`（tool ID collision）。
 - Claude：CLIProxyAPI `781a203b`（相邻 text/citation）、`75b854eb`（Claude tool name sanitizer）。
-- Codex：CLIProxyAPI `320100ec`（octal NUL）、`3662d153`（nested cache breakpoint）、`dd013f9e`（private SSE event）、`40cc6489`（reasoning across tool turns）、`3b2882b7`（author/recipient metadata）、`25f40d8c`（reported model）、`42c9680e`（full duplex WS）、`7b6fafce`（mid-connection prewarm）；codex2api `288a28cb`（orphan required）。
+- Codex：CLIProxyAPI `320100ec`（octal NUL）、`3662d153`（nested cache breakpoint）、`dd013f9e`（private SSE event）、`40cc6489`（reasoning across tool turns）、`3b2882b7`（author/recipient metadata）、`25f40d8c`（reported model）、`42c9680e`（full duplex WS）、`7b6fafce`（mid-connection prewarm）；codex2api `dbfd3f89`（reported-model cross-check）、`288a28cb`（orphan required）。
 - Grok：grok2api `9dda42ae`（Build 1.0.40、conversation group 和 catalog capability）。
 - CodeBuddy：cli2api `a9da609`、`fff3419`（cache usage）、`f44e887`（incomplete terminal）、`aeaa4ac`（malformed arguments）、`b415dd0`（namespace identity）、`9f9b66e`（custom tools）。
 - Cursor：OmniRoute `443d66996d69`；Kiro：kiro.rs `be0c04219d9d`；sub2api：`ab99d56e9626`，均按上述 no-wire 边界解释。
@@ -1084,4 +1091,4 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
 8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
 
-第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11 与 Claude CL-N5～N6 已实施并达到 `fixture_verified`，其余项目仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6 与 Codex CX-N5～N12 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok 与 CodeBuddy 仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。

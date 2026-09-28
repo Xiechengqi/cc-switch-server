@@ -19,6 +19,18 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-28 Codex Responses compatibility and observability freeze
+
+CX-N5～CX-N12 冻结在 `assets/contract/codex-reference-delta.json` 的 `CX-OBS-0014`～`CX-OBS-0022`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）与 `codex2api@9368ed82e039ac8458f9c264b2298b47d0cbf833`（tree `d878a5e7b8a94665dad14631d40be639d923a345`），并固定 octal NUL schema、cache breakpoint、私有 SSE event、连续工具轮 reasoning、item metadata、上游自报模型、全双工 steering 与 orphan required 的九个历史 committed delta。当前合同共有 18 个 source delta 和 22 条不可变 observation；`node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可复核 commit/tree、文件 SHA-256 和符号，默认构建、测试、发布与运行时不读取外部 checkout。
+
+独立实现冻结在 `f8907742b163b239a981cddcc3962410f0712677`（tree `9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33`）。schema sanitizer 只在 schema `pattern` 识别活动 `\0` 与奇偶反斜线形态，保留 `\x00`、文本 `\u005c0` 和用户数据；Responses、Compact、WebSocket 与 WS→HTTP fallback 共用精确 item/part sanitizer，只删除协议位置的 `internal_chat_message_metadata_passthrough`、`author`、`recipient` 和 `prompt_cache_breakpoint`，arguments 与普通嵌套 JSON 不递归清理。SSE 同时检查 declared event 和 payload `type`：普通客户端只看到公开闭集，经过识别的原生 Codex 客户端额外只允许 `codex.response.metadata`，错误和终态不会被误吞。
+
+Responses→Chat 在同一连续工具轮中复用最近一次真实 reasoning，遇到 user/system 边界即清空，从不生成 `[reasoning unavailable]`。JSON、SSE、WebSocket 与 WS→HTTP fallback 会有界观察终态优先的上游自报 model，并把 model、来源、mismatch 与 conflict 写入本地 UsageLog；这些字段不覆盖 `actual_model`，不改变响应、路由、计费、retry/fallback，也不进入 Router Share 日志外部契约。WebSocket 只在真实终态提交该观察，断流和取消不把中间声明伪装成终态。
+
+CX-N11 与 CX-N12 都先由差分 fixture 复现红灯，再做窄修复。Codex WebSocket writer 使用容量 8 的有界队列；大写入期间只允许顶层 `type=response.steer` 的 Text/Binary 帧原样入队，每条仍计入请求内存预算，queue full、第二个 `response.create`、嵌套伪装、坏 JSON 和非 Codex 数据帧立即 fail closed，Ping/Pong 与取消不被写入阻塞。strict response schema 同时覆盖 `/text/format/schema` 与 `/text/format/json_schema/schema`：composition branch 按可见 properties 裁剪 required，纯 object 无字段来源时删除 orphan required，`$ref/$dynamicRef` 保持 opaque。
+
+Codex 关键词回归 399 项及新增 steering、reported-model 专项均已通过；reference-delta 默认审计与 committed-object 复核通过。CX-N5～CX-N12 均只提升为 `fixture_verified`。GPT Image 2.5 三个 variant、WS prewarm、Astra entitlement 和其他真实账号 operation 仍各自保持 `receipt=null/live_pending`；本轮没有引入账号池、跨 Account/Provider/rail/site fallback，也没有以本地 fixture 代替真实 ChatGPT 验收。
+
 ## 2026-09-28 Claude text/citation and tool-name freeze
 
 CL-N5 与 CL-N6 冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0016`～`CL-OBS-0017`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）以及两个历史 committed object：`781a203b` 的相邻 Anthropic text/citation 合并、`75b854eb` 的 Claude 工具名语法。15 个 source delta 的文件摘要和 17 条 append-only observation 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。

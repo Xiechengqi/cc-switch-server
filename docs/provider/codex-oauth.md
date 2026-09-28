@@ -162,6 +162,16 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 
 下游流式请求先创建 `usageState=pending` 的日志；终止后更新为 `observed`、`missing`、`parse_error` 或 `interrupted`，并递增 `usageRevision`。下游非流但上游被强制为 SSE 的请求直接创建一条同语义的终态日志。显式观测到的全零 usage 仍是 `observed`，与未收到 usage 严格区分。Router 只接受同一 `requestId` 的相同或更高 revision，避免迟到的 pending 覆盖终态。
 
+### Responses 兼容与诊断边界
+
+- 工具和 response-format schema 的清洗只发生在 schema-aware 节点。活动 `\p{}`、`\P{}` 与 octal NUL `\0` pattern 会被删除；偶数反斜线、文本 `\u005c0`、合法 `\x00`、description/default/enum 中的同名内容原样保留。`/text/format/schema` 与 `/text/format/json_schema/schema` 共用同一有界归一化：composition branch 只裁剪不可见的 required key，纯 object 在完全没有字段来源时才删除 orphan required，`$ref`/`$dynamicRef` 节点保持 opaque。
+- Codex OAuth 最终 sanitizer 只删除 `input[*]` item 顶层的 `internal_chat_message_metadata_passthrough`、`author`、`recipient`、`prompt_cache_breakpoint`，以及协议定义的 `content[*]`/`output[*]` part 上的 `prompt_cache_breakpoint`。普通嵌套 JSON、文本、arguments、字符串 output、顺序和顶层非 input 数据不会递归改写；Responses、Compact、WebSocket 与 WS→HTTP fallback 使用同一规则。
+- SSE framing 同时校验 declared `event` 与 JSON payload `type`。标准客户端只接收公开 Responses 事件闭集；通过官方 Codex identity 识别的原生客户端也只额外接收 `codex.response.metadata`。`responsesapi.*`、`codex.rate_limits`、其他私有/未知 `codex.*` 与任一名字不一致的伪装帧均被过滤，公开 error/terminal 仍保留。
+- Responses→Chat 的连续工具轮只复用最近一次真实 reasoning；新 reasoning 会替换缓存，user/system 边界会清空。没有真实内容时不添加字段，绝不生成 `[reasoning unavailable]` 占位文本。
+- JSON、SSE、WebSocket 和 WS→HTTP fallback 会有界记录上游自报 model、来源、与实发 model 的 mismatch，以及首帧/终态冲突。终态声明优先；WebSocket 只有真实终态才提交，断流和取消不提交中间观察。字段只写本地 UsageLog/Web API，不覆盖 `actualModel`，不改变响应、路由、计费、retry/fallback，也不扩展 Router Share usage payload。
+
+上述行为对应 CX-N5～CX-N12，状态均为 `fixture_verified`。它们只证明本地协议和诊断守恒，不证明模型 entitlement、生产 WebSocket 性能或真实上游对 schema/steering 的长期接受性。
+
 ### Images 兼容与资源边界
 
 Codex OAuth 图片桥覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游固定发送 `stream=true` 与唯一的 `Accept: text/event-stream`，所有成功 body 都按增量 SSE 消费，不用上游 `Content-Type` 选择 JSON/SSE 解析模式。generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
@@ -212,6 +222,7 @@ Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provid
 - fallback 复用原 `ProviderExecution`、账号、workspace、session、request body 和 in-flight lease，不重新进入 Router。
 - 首次握手/HTTP 401 只强刷原账号一次；不会借 fallback 获得额外的 refresh 或 Provider failover 次数。
 - `response.create` 一旦成功发送到上游，后续失败只终止当前 lifecycle，不重放整个请求。
+- 一个上游写入尚未完成时，writer actor 使用容量 8 的有界队列，只接受顶层 `type=response.steer` 的 Text/Binary 帧并保持原始 wire bytes。steering 计入同一请求内存预算；队列满、第二个 `response.create`、嵌套伪装、非法 JSON 和 Grok/其他 Provider 数据帧立即 fail closed，不阻塞 WebSocket Ping/Pong 或下游取消。
 - 上游 Text/Binary 业务帧必须是顶层 JSON object；坏 JSON、scalar 和 array 都按协议错误终止，即使 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 也不会绕过这项 transport 校验。WebSocket Ping/Pong/Close 控制帧仍按协议独立处理。
 - `codexWebsocketEnabled=false` 可关闭 WS，但不影响 POST Responses HTTP/SSE。
 

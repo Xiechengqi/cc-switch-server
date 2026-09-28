@@ -231,6 +231,8 @@ assert(
 const immutableSourceSnapshotDigests = new Map([
   ["cliproxyapi-2026-09-19", "7482b03b5422de54996015f0ba9073435e9568bedb801faeabac0bd5fce42b2d"],
   ["codex2api-2026-09-19", "392793aa5484f5995e76d864053967e7a48a0993bcc0687951278e2a20c7ec42"],
+  ["cliproxyapi-2026-09-28", "457a3245056c564ca51de67d8b92e189ef7c2e12ce0c257f643407c86c1ac28c"],
+  ["codex2api-2026-09-28", "c3fa197ffac5a51ff8ac8f2b32dfc0a5d855259c45bf9fb073420ae67130f99a"],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of baseline.sourceSnapshots ?? []) {
@@ -279,6 +281,15 @@ const immutableObservationDigests = new Map([
   ["CX-OBS-0011", "df783db25d767ed6cfb55138cdf227ada51b2fe8abc19e58ac46e0c80f8a85a9"],
   ["CX-OBS-0012", "10ae993de5900ca4c407c529a8d4fa52b87371f7b5dd81ad280d4c8ccf801a68"],
   ["CX-OBS-0013", "d83df5c1012b6538f174303dede9dfee026b9d530e8d3eee7c4c5d35c0c9ffc4"],
+  ["CX-OBS-0014", "c2a511de80fb9b7ace3704266a685ac70dddf2b7e966500e8767fea2dc7d4e3e"],
+  ["CX-OBS-0015", "04f104121ee2e9b7760ecdf3ab2ca604a20eec25fa862ff96d4f72092581da6f"],
+  ["CX-OBS-0016", "0e748059687a8959fae80bc79954499bf506c6021e2c5f119688ed79f1f79fb5"],
+  ["CX-OBS-0017", "0bc88a04a31a4a5ba923cd251ad0279153537d95bebe6542d029910a946915aa"],
+  ["CX-OBS-0018", "5706c5e448ce725fbc676ba173cb197425c748741bc02eb41847ee5514fefa4f"],
+  ["CX-OBS-0019", "0b5c6d756137d3794188c69d187a39a5239a1965e0bf3703eb5f1cb8130124fe"],
+  ["CX-OBS-0020", "9100430b5a592a49484743923e1b9a280297f0bb0da4697608d7d5271b5be403"],
+  ["CX-OBS-0021", "cce666da07a67fe7ea146680aa0baf44176018f066ec51b76e5b084af180a29f"],
+  ["CX-OBS-0022", "aecb122035f28544e22a22ce11a6f3086d66a3c25b73bbc18e7e1ae2fa1d6c1b"],
 ]);
 const expectedEnhancementIds = new Set([
   "CX-01",
@@ -291,6 +302,14 @@ const expectedEnhancementIds = new Set([
   "CX-N2",
   "CX-N3",
   "CX-N4",
+  "CX-N5",
+  "CX-N6",
+  "CX-N7",
+  "CX-N8",
+  "CX-N9",
+  "CX-N10",
+  "CX-N11",
+  "CX-N12",
   "CX-R1",
   "CORE-N1",
   "CORE-N2",
@@ -506,17 +525,22 @@ for (const id of ["CX-03", "CX-05", "CX-06"]) {
   assert(capability.runtimeEnabled === false, `${id} cannot be enabled without evidence`);
 }
 
+const incrementalEnhancementList = [
+  ...(baseline.incrementalEnhancements ?? []),
+  ...(baseline.incrementalEnhancementExtensions ?? []),
+];
 const incrementalEnhancements = new Map(
-  (baseline.incrementalEnhancements ?? []).map((enhancement) => [
+  incrementalEnhancementList.map((enhancement) => [
     enhancement.id,
     enhancement,
   ]),
 );
 assert(
-  incrementalEnhancements.size === 4,
-  "Codex incremental contract must contain CX-N1 through CX-N4",
+  incrementalEnhancements.size === incrementalEnhancementList.length &&
+    incrementalEnhancements.size === 12,
+  "Codex incremental contract must contain unique CX-N1 through CX-N12",
 );
-for (let index = 1; index <= 4; index += 1) {
+for (let index = 1; index <= 12; index += 1) {
   const id = `CX-N${index}`;
   const enhancement = incrementalEnhancements.get(id);
   assert(enhancement, `Codex incremental contract is missing ${id}`);
@@ -524,9 +548,13 @@ for (let index = 1; index <= 4; index += 1) {
     enhancement.status === "fixture_verified",
     `${id} must be fixture_verified without claiming live evidence`,
   );
+  const referenceDeltas = enhancement.referenceDeltas ??
+    [enhancement.referenceDelta].filter(Boolean);
   assert(
-    sourceDeltaIds.has(enhancement.referenceDelta),
-    `${id} references an unknown source delta`,
+    referenceDeltas.length > 0 &&
+      new Set(referenceDeltas).size === referenceDeltas.length &&
+      referenceDeltas.every((deltaId) => sourceDeltaIds.has(deltaId)),
+    `${id} references an unknown or duplicate source delta`,
   );
   assert(
     Array.isArray(enhancement.evidence) && enhancement.evidence.length > 0,
@@ -544,6 +572,23 @@ for (let index = 1; index <= 4; index += 1) {
     }
   }
 }
+assert(
+  incrementalEnhancements.get("CX-N10")?.authorityBoundary?.includes("diagnostic-only") &&
+    incrementalEnhancements.get("CX-N10")?.authorityBoundary?.includes("actual_model") &&
+    incrementalEnhancements.get("CX-N10")?.authorityBoundary?.includes("Router Share"),
+  "CX-N10 lost its diagnostic-only routing, billing, or Router boundary",
+);
+assert(
+  incrementalEnhancements.get("CX-N11")?.queueCapacity === 8 &&
+    incrementalEnhancements.get("CX-N11")?.pendingWriteAdmission?.includes("exact top-level response.steer") &&
+    incrementalEnhancements.get("CX-N11")?.pendingWriteAdmission?.includes("fail closed"),
+  "CX-N11 lost its bounded exact-steering admission contract",
+);
+assert(
+  incrementalEnhancements.get("CX-N12")?.referenceBoundary?.includes("$ref") &&
+    incrementalEnhancements.get("CX-N12")?.referenceBoundary?.includes("$dynamicRef"),
+  "CX-N12 lost its opaque reference boundary",
+);
 assert(
   incrementalEnhancements.get("CX-N3")?.replayBoundary?.includes("same Account") &&
     incrementalEnhancements.get("CX-N3")?.replayBoundary?.includes("never replayed"),

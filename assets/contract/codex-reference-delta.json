@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no credential-rail fallback; no cross-account fallback; no cross-Provider fallback",
@@ -642,7 +642,269 @@
       "lastFrozenSnapshot": "cliproxyapi-2026-09-19"
     }
   ],
-  "sourceExtensions": [],
+  "sourceExtensions": [
+    {
+      "sourceId": "cliproxyapi",
+      "deltas": [
+        {
+          "id": "octal_nul_schema_pattern",
+          "commits": ["320100ecf767f9807883b959550c954c5b075bff"],
+          "files": [
+            {
+              "commit": "320100ecf767f9807883b959550c954c5b075bff",
+              "path": "internal/runtime/executor/helps/codex_tool_schema.go",
+              "sha256": "1288436d041b65b4b5dd231a58b8b1996742b75d5700153b72aa7600dd00d82c"
+            },
+            {
+              "commit": "320100ecf767f9807883b959550c954c5b075bff",
+              "path": "internal/runtime/executor/helps/codex_tool_schema_test.go",
+              "sha256": "5ab7602d7141f2738b0ac67b5a439a6fb90a95248f201c0fcd6827d964c21427"
+            }
+          ]
+        },
+        {
+          "id": "nested_cache_breakpoint_scope",
+          "commits": ["3662d1535a8b5c86e3a96fdd41e9bab2e16018a5"],
+          "files": [
+            {
+              "commit": "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5",
+              "path": "internal/translator/codex/openai/responses/codex_openai-responses_request.go",
+              "sha256": "ac001333be4dd05c6982aefc1c223d66c7f5211cd52c0c3e7ad905ce82b67216"
+            },
+            {
+              "commit": "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5",
+              "path": "internal/translator/codex/openai/responses/codex_openai-responses_request_test.go",
+              "sha256": "14a4da02692690faeaf3c09c7f3487543d4597a462e2a143c5a6995208c39647"
+            }
+          ]
+        },
+        {
+          "id": "responses_private_event_filter",
+          "commits": ["dd013f9e2993ccb840ce9da74308dfe30ecce15c"],
+          "files": [
+            {
+              "commit": "dd013f9e2993ccb840ce9da74308dfe30ecce15c",
+              "path": "sdk/api/handlers/openai/openai_responses_handlers.go",
+              "sha256": "a54511e9d2228a75685e52cdc577b191c61d46ed9e2e848cd0bce32ad8ec5ad8"
+            },
+            {
+              "commit": "dd013f9e2993ccb840ce9da74308dfe30ecce15c",
+              "path": "sdk/api/handlers/openai/openai_responses_handlers_stream_test.go",
+              "sha256": "fcb606bcff43e1b15b62a7e93ade7edd174a86bb260dade71192d1d06db2623c"
+            }
+          ]
+        },
+        {
+          "id": "reasoning_across_tool_turns",
+          "commits": ["40cc6489879ad2e08f71384137ea650359d8bb9f"],
+          "files": [
+            {
+              "commit": "40cc6489879ad2e08f71384137ea650359d8bb9f",
+              "path": "internal/translator/openai/openai/responses/openai_openai-responses_request.go",
+              "sha256": "7aa6c606f35b2d6eab39d663b3c964da41f75a05544b678b5f59276e168942c0"
+            },
+            {
+              "commit": "40cc6489879ad2e08f71384137ea650359d8bb9f",
+              "path": "internal/translator/openai/openai/responses/openai_openai-responses_request_test.go",
+              "sha256": "062cbb6ef8b7b8722da6dcbaaabf1051ee60e5a6f5a976fddeac99c24ca67d8d"
+            }
+          ]
+        },
+        {
+          "id": "item_author_recipient_metadata_scope",
+          "commits": ["3b2882b72eeeea31f80062786644dbc930973dfb"],
+          "files": [
+            {
+              "commit": "3b2882b72eeeea31f80062786644dbc930973dfb",
+              "path": "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2.go",
+              "sha256": "d37be572b757f000453496651cabfcaf49b5fb0a4346531cf29f9d4b8d16d881"
+            },
+            {
+              "commit": "3b2882b72eeeea31f80062786644dbc930973dfb",
+              "path": "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2_test.go",
+              "sha256": "daf4039c3fb3a2aab79ac0cdaa29c194ad9d44fefade814e3c87cb681e30ae26"
+            }
+          ]
+        },
+        {
+          "id": "upstream_reported_model",
+          "commits": ["25f40d8cf8dfa8765e45873060cf41056cd1b112"],
+          "files": [
+            {
+              "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
+              "path": "internal/runtime/executor/helps/response_model.go",
+              "sha256": "a3234f311be6c41718cc4311ec30f69be3faaaa2ee2f5e94e2bc508e8409191f"
+            },
+            {
+              "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
+              "path": "internal/runtime/executor/helps/response_model_test.go",
+              "sha256": "efb3fbded21357e8d262084a114dc9bc6ceba9966e36bd32058283dcbc6ef82a"
+            },
+            {
+              "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
+              "path": "internal/runtime/executor/codex_response_model_test.go",
+              "sha256": "d8b82c4d14d43f7eb081f64781ae68650fe49234ad069854b5fb8cf45dd3272c"
+            }
+          ]
+        },
+        {
+          "id": "duplex_websocket_steering",
+          "commits": ["42c9680eee553b047e46ac85a6b1543e87e526e7"],
+          "files": [
+            {
+              "commit": "42c9680eee553b047e46ac85a6b1543e87e526e7",
+              "path": "internal/runtime/executor/codex_websockets_duplex.go",
+              "sha256": "f3007daf506683424cf24133d45d65d1005ae9967ec08336c150438b12a1294b"
+            },
+            {
+              "commit": "42c9680eee553b047e46ac85a6b1543e87e526e7",
+              "path": "internal/runtime/executor/codex_websockets_duplex_test.go",
+              "sha256": "cb89be3ba5f170e00355e82cc473057846feb0ef3ee28362c906e0068333ba37"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceId": "codex2api",
+      "deltas": [
+        {
+          "id": "upstream_reported_model_cross_check",
+          "commits": ["dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d"],
+          "files": [
+            {
+              "commit": "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d",
+              "path": "proxy/upstream_response_model.go",
+              "sha256": "c3d50b3c5fd728abc9a70de0cabf63ca7099f45869925139a0085c0c71afa293"
+            },
+            {
+              "commit": "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d",
+              "path": "proxy/upstream_response_model_test.go",
+              "sha256": "20035058242d087c7eac482c420dd00fff0d385931ff43bcc6db3123daa11978"
+            }
+          ]
+        },
+        {
+          "id": "response_schema_orphan_required",
+          "commits": ["288a28cb0275631d0f9e78024878cb05ed33085d"],
+          "files": [
+            {
+              "commit": "288a28cb0275631d0f9e78024878cb05ed33085d",
+              "path": "proxy/translator.go",
+              "sha256": "e8ca37b4168b008b9df5f8d87ca9361f1abb95dbe57bcd43105f5d9c7d6d0273"
+            },
+            {
+              "commit": "288a28cb0275631d0f9e78024878cb05ed33085d",
+              "path": "proxy/translator_test.go",
+              "sha256": "6af73bccb073cc4ba30f228388ea4179f21d45879c4325f36dd6597b8c21636f"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "incrementalEnhancementExtensions": [
+    {
+      "id": "CX-N5",
+      "status": "fixture_verified",
+      "referenceDeltas": ["octal_nul_schema_pattern"],
+      "evidence": [
+        {
+          "path": "src/proxy/tool_schema.rs",
+          "anchors": ["has_incompatible_codex_unicode_escape", "codex_strips_octal_nul_only_from_schema_patterns"]
+        }
+      ]
+    },
+    {
+      "id": "CX-N6",
+      "status": "fixture_verified",
+      "referenceDeltas": ["nested_cache_breakpoint_scope"],
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["sanitize_codex_oauth_input_item_metadata", "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+        }
+      ]
+    },
+    {
+      "id": "CX-N7",
+      "status": "fixture_verified",
+      "referenceDeltas": ["responses_private_event_filter"],
+      "evidence": [
+        {
+          "path": "src/proxy/response_semantics.rs",
+          "anchors": ["responses_event_is_filtered", "standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+        }
+      ]
+    },
+    {
+      "id": "CX-N8",
+      "status": "fixture_verified",
+      "referenceDeltas": ["reasoning_across_tool_turns"],
+      "evidence": [
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": ["remember_latest_real_reasoning", "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+        }
+      ]
+    },
+    {
+      "id": "CX-N9",
+      "status": "fixture_verified",
+      "referenceDeltas": ["item_author_recipient_metadata_scope"],
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+        }
+      ]
+    },
+    {
+      "id": "CX-N10",
+      "status": "fixture_verified",
+      "referenceDeltas": ["upstream_reported_model", "upstream_reported_model_cross_check"],
+      "evidence": [
+        {
+          "path": "src/proxy/response_semantics.rs",
+          "anchors": ["ReportedResponseModelObserver", "reported_response_model_is_bounded_and_terminal_authoritative"]
+        },
+        {
+          "path": "src/domain/usage/store.rs",
+          "anchors": ["reported_model_observation_round_trips_and_old_logs_default_to_unknown"]
+        },
+        {
+          "path": "tests/api_contract.rs",
+          "anchors": ["web_usage_requests_uses_stable_filters_and_cursor_pagination"]
+        }
+      ],
+      "authorityBoundary": "reported model is diagnostic-only and cannot change response bytes, routing, billing, retry, fallback, actual_model, or Router Share payloads"
+    },
+    {
+      "id": "CX-N11",
+      "status": "fixture_verified",
+      "referenceDeltas": ["duplex_websocket_steering"],
+      "evidence": [
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": ["RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY", "codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+        }
+      ],
+      "queueCapacity": 8,
+      "pendingWriteAdmission": "exact top-level response.steer only; malformed, nested, second response.create and non-Codex frames fail closed"
+    },
+    {
+      "id": "CX-N12",
+      "status": "fixture_verified",
+      "referenceDeltas": ["response_schema_orphan_required"],
+      "evidence": [
+        {
+          "path": "src/proxy/tool_schema.rs",
+          "anchors": ["prune_codex_required_without_properties", "codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+        }
+      ],
+      "referenceBoundary": "$ref and $dynamicRef nodes remain opaque"
+    }
+  ],
   "sourceSnapshots": [
     {
       "id": "cliproxyapi-2026-09-19",
@@ -660,6 +922,26 @@
       "repository": "codex2api",
       "headCommit": "de41a5e3dfe9ff51524af864532c42e37955346f",
       "headTree": "b767333ad809ee7bbe92c938be5bcce3ec0519c5",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "cliproxyapi-2026-09-28",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "acdace936fa7df2905500c7f5e0a97d683138dea",
+      "headTree": "f7e64bd57e383e31be75a7077ef918f5154f0ab8",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "codex2api-2026-09-28",
+      "sourceId": "codex2api",
+      "repository": "codex2api",
+      "headCommit": "9368ed82e039ac8458f9c264b2298b47d0cbf833",
+      "headTree": "d878a5e7b8a94665dad14631d40be639d923a345",
       "worktreeClean": true,
       "worktreeChangesExcluded": false,
       "readMode": "read_only_committed_git_objects"
@@ -1175,6 +1457,342 @@
         "fixtureIds": []
       },
       "reason": "Reject commercial pricing, automatic driver-model fallback, account-pool selection and cross-account recovery; Server keeps explicit Provider/Account identity and exact-model gates."
+    },
+    {
+      "id": "CX-OBS-0014",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "octal_nul_schema_pattern",
+        "objects": [
+          {
+            "commit": "320100ecf767f9807883b959550c954c5b075bff",
+            "tree": "c870e566adde2597bf7f54d8617e41d64bf1601a",
+            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
+            "symbols": ["stripIncompatiblePatternsFromJSON", "TestNormalizeCodexToolSchemas_StripsOctalNULPatternEscape"]
+          }
+        ],
+        "sourceDigest": "e0e2ba890c7c26a6eefa9771ab8cb8af8ce98a6c66c4e09c834a409f8cc4d10c"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N5"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/tool_schema.rs",
+            "anchors": ["has_incompatible_codex_unicode_escape", "codex_strips_octal_nul_only_from_schema_patterns"]
+          }
+        ],
+        "fixtureIds": ["codex_strips_octal_nul_only_from_schema_patterns"]
+      },
+      "reason": "Recognize active octal NUL and odd-backslash forms only in schema pattern nodes; preserve escaped text, x00 forms and non-schema lookalikes."
+    },
+    {
+      "id": "CX-OBS-0015",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "nested_cache_breakpoint_scope",
+        "objects": [
+          {
+            "commit": "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5",
+            "tree": "4b78f97e8da16252cbbc451355814e6999f4dc8a",
+            "paths": ["internal/translator/codex/openai/responses/codex_openai-responses_request.go", "internal/translator/codex/openai/responses/codex_openai-responses_request_test.go"],
+            "symbols": ["stripCodexResponsesCacheBreakpoints", "TestStripCodexResponsesCacheBreakpoints_CombinedItemAndPartLevel"]
+          }
+        ],
+        "sourceDigest": "9e3c09dc3f47e2f9349e9836f63d9e589e88c3fabf7f756972bbd0d5eba833eb"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N6"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["sanitize_codex_oauth_input_item_metadata", "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+          }
+        ],
+        "fixtureIds": ["codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+      },
+      "reason": "Strip exact cache-breakpoint hints only at Responses input-item and protocol part boundaries while preserving arguments and ordinary user JSON."
+    },
+    {
+      "id": "CX-OBS-0016",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "responses_private_event_filter",
+        "objects": [
+          {
+            "commit": "dd013f9e2993ccb840ce9da74308dfe30ecce15c",
+            "tree": "6fab73ac157b6786bd682c4d8ea20c90485218fb",
+            "paths": ["sdk/api/handlers/openai/openai_responses_handlers.go", "sdk/api/handlers/openai/openai_responses_handlers_stream_test.go"],
+            "symbols": ["shouldFilterPrivateEvent", "TestResponsesSSEFramer_FiltersUpstreamPrivateEvents"]
+          }
+        ],
+        "sourceDigest": "41e50c3a09ec920dbb598268739065610773c98a1226b2720bdda4501cbc743a"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N7"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/response_semantics.rs",
+            "anchors": ["responses_event_is_filtered", "standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+          }
+        ],
+        "fixtureIds": ["standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+      },
+      "reason": "Check declared SSE names and payload types together; standard clients receive only the public closed set and reviewed native clients gain only codex.response.metadata."
+    },
+    {
+      "id": "CX-OBS-0017",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "reasoning_across_tool_turns",
+        "objects": [
+          {
+            "commit": "40cc6489879ad2e08f71384137ea650359d8bb9f",
+            "tree": "6ccb4fb2832986a7ee71afe0700868face588224",
+            "paths": ["internal/translator/openai/openai/responses/openai_openai-responses_request.go", "internal/translator/openai/openai/responses/openai_openai-responses_request_test.go"],
+            "symbols": ["ConvertOpenAIResponsesRequestToOpenAIChatCompletions", "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesReasoningOnFollowUpToolTurns"]
+          }
+        ],
+        "sourceDigest": "9a745becb5f2ab116c0dd0f868b5045652fc899a0849d1a261805f845f70c13f"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N8"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": ["remember_latest_real_reasoning", "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+          }
+        ],
+        "fixtureIds": ["responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+      },
+      "reason": "Reuse only the most recent real reasoning across contiguous tool rounds, clear it at user or system boundaries, and reject the reference placeholder fabrication."
+    },
+    {
+      "id": "CX-OBS-0018",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "item_author_recipient_metadata_scope",
+        "objects": [
+          {
+            "commit": "3b2882b72eeeea31f80062786644dbc930973dfb",
+            "tree": "7b69a212e2a0f580c30c0a063f699262bc9140fd",
+            "paths": ["internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2.go", "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2_test.go"],
+            "symbols": ["rewriteCodexAgentMessageInput", "TestRewriteCodexMultiAgentV2Input_StripsAuthorAndRecipient_Issue6136"]
+          }
+        ],
+        "sourceDigest": "4871a70c1b54541e5521d163756a718f303e424ac3984bc982ccfd1359701922"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N9"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+          }
+        ],
+        "fixtureIds": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+      },
+      "reason": "Apply the exact input-item metadata sanitizer consistently to Responses, Compact, native WebSocket and WebSocket-to-HTTP fallback without traversing user content."
+    },
+    {
+      "id": "CX-OBS-0019",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "upstream_reported_model",
+        "objects": [
+          {
+            "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
+            "tree": "8eaef687b4c1c31045fe3d5d2dfb186cd8e19f4a",
+            "paths": ["internal/runtime/executor/helps/response_model.go", "internal/runtime/executor/helps/response_model_test.go", "internal/runtime/executor/codex_response_model_test.go"],
+            "symbols": ["extractCodexResponseModelEvent", "TestExtractCodexResponseModel", "TestObserveCodexTokenEventRecordsResponseModel"]
+          }
+        ],
+        "sourceDigest": "3c080746bdcb625d492f8e82db118e136e438da79b7ed2f86575022fe0b0406f"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CX-N10"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/response_semantics.rs",
+            "anchors": ["ReportedResponseModelObserver", "reported_response_model_is_bounded_and_terminal_authoritative"]
+          },
+          {
+            "path": "src/domain/usage/store.rs",
+            "anchors": ["reported_model_observation_round_trips_and_old_logs_default_to_unknown"]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["persist_codex_reported_model", "codex_websocket_logs_each_response_create_with_effective_policy"]
+          }
+        ],
+        "fixtureIds": ["reported_response_model_is_bounded_and_terminal_authoritative", "reported_model_observation_round_trips_and_old_logs_default_to_unknown", "codex_websocket_logs_each_response_create_with_effective_policy"]
+      },
+      "reason": "Record a bounded terminal-authoritative upstream model observation for local diagnostics only; it cannot overwrite actual_model or influence routing, billing, retry or fallback."
+    },
+    {
+      "id": "CX-OBS-0020",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-28",
+        "repository": "codex2api",
+        "deltaId": "upstream_reported_model_cross_check",
+        "objects": [
+          {
+            "commit": "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d",
+            "tree": "ca3fd8b4bf860df31e1d81e0131020584f6ba23c",
+            "paths": ["proxy/upstream_response_model.go", "proxy/upstream_response_model_test.go"],
+            "symbols": ["upstreamResponseModelObserver", "TestUpstreamResponseModelObserverFirstAndTerminal"]
+          }
+        ],
+        "sourceDigest": "a17ff1f3ed26759a22568ce5ae26a46f223929b2a791063f8733d708db30c1ae"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N10"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/response_semantics.rs",
+            "anchors": ["ReportedResponseModelObserver", "responses_inspector_observes_reported_model_without_changing_wire"]
+          },
+          {
+            "path": "tests/api_contract.rs",
+            "anchors": ["web_usage_requests_uses_stable_filters_and_cursor_pagination", "reportedModel"]
+          }
+        ],
+        "fixtureIds": ["responses_inspector_observes_reported_model_without_changing_wire", "web_usage_requests_uses_stable_filters_and_cursor_pagination"]
+      },
+      "reason": "Use the independent observer as a cross-check while keeping cc-switch-server's explicit source, mismatch and conflict fields local to its own usage API contract."
+    },
+    {
+      "id": "CX-OBS-0021",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "duplex_websocket_steering",
+        "objects": [
+          {
+            "commit": "42c9680eee553b047e46ac85a6b1543e87e526e7",
+            "tree": "11a866334cfca8f0d4940aee93e47ba7fb90e02c",
+            "paths": ["internal/runtime/executor/codex_websockets_duplex.go", "internal/runtime/executor/codex_websockets_duplex_test.go"],
+            "symbols": ["streamCodexDuplex", "TestCodexDuplexQueuedCreateDoesNotBlockSubsequentSteer"]
+          }
+        ],
+        "sourceDigest": "f0a7ed7b0325f0f836209c708737c42d32690cc4f91a2c92456d342a843713ab"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N11"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": ["RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY", "codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+          }
+        ],
+        "fixtureIds": ["codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+      },
+      "reason": "The differential fixture reproduced rejection during a pending large write, so add an eight-slot bounded writer queue and admit only exact Codex response.steer frames without starving ping or cancellation."
+    },
+    {
+      "id": "CX-OBS-0022",
+      "providerFamily": "codex",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "codex2api",
+        "snapshotId": "codex2api-2026-09-28",
+        "repository": "codex2api",
+        "deltaId": "response_schema_orphan_required",
+        "objects": [
+          {
+            "commit": "288a28cb0275631d0f9e78024878cb05ed33085d",
+            "tree": "cf4351a713ddacd125d22e61485997b89808e9c5",
+            "paths": ["proxy/translator.go", "proxy/translator_test.go"],
+            "symbols": ["alignRequiredWithProperties", "TestPrepareResponsesBody_AlignsRequiredWithProperties", "TestPrepareResponsesBody_PrunesRequiredOnNodesWithoutProperties"]
+          }
+        ],
+        "sourceDigest": "824337ab56dd0dac07b3dceadac885783a1c6e6df4e25df75c7edfec81ee4843"
+      },
+      "disposition": "differential",
+      "enhancementIds": ["CX-N12"],
+      "target": {
+        "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
+        "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
+        "implementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+        "implementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+        "contracts": [
+          {
+            "path": "src/proxy/tool_schema.rs",
+            "anchors": ["prune_codex_required_without_properties", "codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+          }
+        ],
+        "fixtureIds": ["codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+      },
+      "reason": "The strict text-format differential exposed orphan required keys, so apply the schema-aware narrow repair to composition and pure object nodes while keeping reference nodes opaque."
     }
   ],
   "wireGoldens": {
