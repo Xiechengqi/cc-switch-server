@@ -117,7 +117,11 @@ OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度�
 
 最终 HTTP sanitizer 只删除顶层精确 `type=response.create`，不会触碰 input/content/tool 中的嵌套 `type`。工具 schema walker 会递归删除 schema 内的 `type:null`，覆盖 `properties`、`items`、`$defs`/`definitions`、dependent schemas 和组合器，并同样处理 Responses Lite 的 `input[].type=additional_tools`；function 根 schema 缺 type 时补为 object。`collaboration.*` 保留工具在任何 sanitizer 前即跳过，保证声明原样透传。
 
-Responses Lite 请求信号在模型 policy 完成后，以最终映射模型的 manifest `use_responses_lite` 能力门控。明确不支持时同时删除 HTTP header 和 WS metadata marker，且不执行 Lite body mutation；明确支持时保留；未知模型保持兼容透传。内置快照中 Sol/Terra/Luna 和 `codex-auto-review` 支持 Lite，5.5/5.4/5.4-mini/5.3 Codex Spark/5.2 不支持；实时 manifest 的明确值优先。
+Responses Lite 请求信号在模型 policy 完成后，以最终映射模型的 manifest `use_responses_lite` 能力门控。明确不支持时同时删除 HTTP header 和 WS metadata marker，且不执行 Lite body mutation；明确支持时保留；未知模型保持兼容透传。内置快照中 `gpt-6-astra`、Sol/Terra/Luna 和 `codex-auto-review` 支持 Lite，5.5/5.4/5.4-mini/5.3 Codex Spark/5.2 不支持；实时 manifest 的明确值逐字段优先，且绑定 Account identity generation，内置项不代表当前账号 entitlement。
+
+`gpt-6-astra` 在冷启动目录中声明 text/image、`max` reasoning、priority 与 Responses Lite 兼容能力。结构化输出的字符串 `minLength` / `maxLength` 只在最终模型为 Astra、最终传输为原生 WebSocket 且 Lite 已启用时保留；HTTP、WS→HTTP fallback、非 Lite 和其他模型继续删除这些约束。该例外不作用于工具参数 schema。
+
+Codex 429 继续按证据决定作用域：`usage_limit_reached` 或已耗尽的 5h/7d 窗口冷却当前 Account；缺少账号额度证据的 model-capacity/模型限流只冷却 Share/runtime/model。`cc_switch_codex_rate_limit_scope_total` 以有界标签记录作用域、原因、证据与 `gpt_6_astra|other` 模型族。当前没有证据证明 Astra 的 `usage_limit_reached` 是独立额度，因此不会改为模型级，也不接入已被参考项目回退的 Prism 旁路。
 
 已有 `x-codex-turn-metadata` 和 body `client_metadata` 会在 HTTP、同账号 401 replay、原生 WebSocket、WS→HTTP fallback 与 Dedicated Images 的最终出站点统一清洗：workspace path 变为 account/auth-generation/workspace/runtime 分域的稳定占位符，remote URL 集合删除，非空 commit hash 变为稳定 40 位十六进制占位值。清洗幂等，不凭空新增客户端未携带的身份字段；malformed 或超过 32 KiB 的可选 turn metadata header 直接丢弃且不回显原文。
 

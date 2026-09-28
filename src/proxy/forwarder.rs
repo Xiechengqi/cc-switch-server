@@ -14846,7 +14846,22 @@ async fn prepare_codex_http_fallback_target(
             codex_fast_mode_enabled(execution),
             intent,
         )?;
-        adapter_request.body = super::codex_http::finalize_body(&body)?;
+        let mut body_value = serde_json::from_slice::<Value>(&body).map_err(|error| {
+            ProxyError::bad_request(format!("invalid finalized Codex Responses body: {error}"))
+        })?;
+        super::codex_models::normalize_structured_output_for_transport(
+            &mut body_value,
+            final_model.as_deref(),
+            false,
+            responses_lite,
+        );
+        adapter_request.body =
+            serde_json::to_vec(&body_value)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    ProxyError::bad_request(format!("encode Codex Responses body: {error}"))
+                })?;
+        adapter_request.body = super::codex_http::finalize_body(&adapter_request.body)?;
     }
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, &adapter_request)?;
     if grok {
@@ -15351,6 +15366,12 @@ async fn prepare_codex_responses_websocket_request(
         fast_mode_enabled,
         intent,
     )?;
+    super::codex_models::normalize_structured_output_for_transport(
+        target,
+        final_model.as_deref(),
+        true,
+        responses_lite,
+    );
     if let Some(scope) = metadata_scope {
         let decision = super::codex_metadata::scrub_body_value(&mut frame, scope);
         crate::metrics::record_codex_metadata_decision(decision.as_str());

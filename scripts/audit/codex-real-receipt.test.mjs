@@ -23,6 +23,14 @@ const serverSecret = "codex-server-secret-for-harness";
 const routerSecret = "codex-router-secret-for-harness";
 
 const specs = Object.freeze({
+  gpt_6_astra: Object.freeze({
+    kind: "model",
+    providerEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_SHARE_ID",
+    modelEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_MODEL",
+    receiptEnv: "CODEX_GPT_6_ASTRA_REAL_RECEIPT_FILE",
+    model: "gpt-6-astra",
+  }),
   gpt_image_2_5: Object.freeze({
     kind: "image",
     providerEnv: "CC_SWITCH_CODEX_GPT_IMAGE_2_5_PROVIDER_ID",
@@ -110,7 +118,14 @@ function expectedDecisions(value) {
         quotaCooldownScope: "usage_limit_account_else_share_runtime_model",
         capabilityAccess: "same_share_host_authenticated",
       }
-    : {
+    : value.spec.kind === "model"
+      ? {
+          ...common,
+          modelFallback: "disabled",
+          prismRoute: "disabled",
+          quotaCooldownScope: "usage_limit_account_else_share_runtime_model",
+        }
+      : {
         ...common,
         websocketHttpFallback: "pre_response_create_only",
         connectionReuse: "same_session_scope_only",
@@ -127,7 +142,15 @@ function measurements(value) {
         replicaCount: 2,
         cloudflareRuns: 1,
       }
-    : {
+    : value.spec.kind === "model"
+      ? {
+          httpRuns: 1,
+          sseRuns: 1,
+          websocketRuns: 1,
+          quotaRuns: 2,
+          siblingControlRuns: 1,
+        }
+      : {
         benchmarkSamples: 7,
         coldTtfbP50Ms: 220,
         prewarmedTtfbP50Ms: 140,
@@ -154,7 +177,12 @@ function scopeDigest(value) {
 }
 
 function receipt(value, overrides = {}) {
-  const operationContract = contract.realAcceptance.operations.find(
+  const operationContract = [
+    ...(contract.realAcceptance.operations || []),
+    ...(contract.realAcceptanceExtensions || []).flatMap(
+      (extension) => extension.operations || [],
+    ),
+  ].find(
     (candidate) => candidate.operation === value.operation,
   );
   return {
@@ -412,7 +440,10 @@ for (const operation of Object.keys(specs)) {
     assert.ok(seen.includes("/api/accounts"));
     assert.ok(seen.includes("/api/providers"));
     assert.ok(seen.includes("/api/shares"));
-    assert.equal(seen.includes("/v1/models"), operation === "ws_prewarm");
+    assert.equal(
+      seen.includes("/v1/models"),
+      operation === "ws_prewarm" || operation === "gpt_6_astra",
+    );
   });
 }
 

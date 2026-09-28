@@ -17,6 +17,7 @@ pub(crate) struct CodexModelCapability {
 }
 
 const GPT_56_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const GPT_6_ASTRA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const GPT_56_LUNA_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const STANDARD_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const TEXT_IMAGE: &[&str] = &["text", "image"];
@@ -25,6 +26,15 @@ const PRIORITY: &[&str] = &["priority"];
 const NO_SERVICE_TIERS: &[&str] = &[];
 
 pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
+    // Keep a cold-start capability for Astra. The bound account manifest still
+    // wins field-by-field and remains the entitlement authority.
+    CodexModelCapability {
+        id: "gpt-6-astra",
+        reasoning_efforts: GPT_6_ASTRA_EFFORTS,
+        input_modalities: TEXT_IMAGE,
+        service_tiers: PRIORITY,
+        use_responses_lite: true,
+    },
     CodexModelCapability {
         id: "gpt-5.6-sol",
         reasoning_efforts: GPT_56_EFFORTS,
@@ -103,6 +113,8 @@ pub(crate) struct ResolvedCodexModelCapability {
     pub input_modalities: Option<Vec<String>>,
     pub service_tiers: Option<Vec<String>>,
     pub use_responses_lite: Option<bool>,
+    pub context_window: Option<u64>,
+    pub supports_search_tool: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,8 @@ struct ManifestModelCapability {
     input_modalities: Option<Vec<String>>,
     service_tiers: Option<Vec<String>>,
     use_responses_lite: Option<bool>,
+    context_window: Option<u64>,
+    supports_search_tool: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +252,8 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
                 input_modalities: parse_string_capability_values(model, "input_modalities"),
                 service_tiers: parse_capability_values(model, "service_tiers", "id"),
                 use_responses_lite: model.get("use_responses_lite").and_then(Value::as_bool),
+                context_window: model.get("context_window").and_then(Value::as_u64),
+                supports_search_tool: model.get("supports_search_tool").and_then(Value::as_bool),
             },
         );
     }
@@ -321,6 +337,12 @@ pub(crate) fn resolved_capability_for_model(
             .as_ref()
             .and_then(|capability| capability.use_responses_lite)
             .or_else(|| builtin.map(|capability| capability.use_responses_lite)),
+        context_window: manifest
+            .as_ref()
+            .and_then(|capability| capability.context_window),
+        supports_search_tool: manifest
+            .as_ref()
+            .and_then(|capability| capability.supports_search_tool),
     })
 }
 
@@ -378,6 +400,48 @@ fn normalize_model_id(model: &str) -> String {
         .replace('_', "-")
 }
 
+/// Applies the transport-specific structured-output subset observed for Codex.
+/// String length constraints are accepted only by Astra on native Responses
+/// Lite WebSocket. Tool schemas are normalized separately and never use this
+/// exception.
+pub(crate) fn normalize_structured_output_for_transport(
+    body: &mut Value,
+    final_model: Option<&str>,
+    websocket: bool,
+    responses_lite: bool,
+) {
+    let preserve_string_lengths = websocket
+        && responses_lite
+        && final_model.is_some_and(|model| normalize_model_id(model) == "gpt-6-astra");
+    if preserve_string_lengths {
+        return;
+    }
+    let Some(format) = body.pointer_mut("/text/format") else {
+        return;
+    };
+    if let Some(schema) = format.get_mut("schema") {
+        strip_structured_string_lengths(schema);
+    }
+    if let Some(schema) = format.pointer_mut("/json_schema/schema") {
+        strip_structured_string_lengths(schema);
+    }
+}
+
+fn strip_structured_string_lengths(schema: &mut Value) {
+    let mut stack = vec![schema];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Object(object) => {
+                object.remove("minLength");
+                object.remove("maxLength");
+                stack.extend(object.values_mut());
+            }
+            Value::Array(values) => stack.extend(values.iter_mut()),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +485,67 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("gpt-5.5", "max"), "max");
         assert_eq!(normalize_reasoning_effort("vendor/model", "max"), "max");
         assert_eq!(BUILTIN_CODEX_MODELS[0].input_modalities, ["text", "image"]);
+        assert_eq!(BUILTIN_CODEX_MODELS[0].id, "gpt-6-astra");
+        assert!(BUILTIN_CODEX_MODELS[0].reasoning_efforts.contains(&"max"));
+        assert!(BUILTIN_CODEX_MODELS[0].use_responses_lite);
+    }
+
+    #[test]
+    fn astra_lite_websocket_preserves_structured_string_lengths_only() {
+        let template = json!({
+            "text": {"format": {"type": "json_schema", "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 2, "maxLength": 8}}
+            }}},
+            "tools": [{"type": "function", "parameters": {
+                "type": "object", "properties": {"query": {"type": "string", "minLength": 1}}
+            }}]
+        });
+
+        let mut astra_ws_lite = template.clone();
+        normalize_structured_output_for_transport(
+            &mut astra_ws_lite,
+            Some("gpt-6-astra"),
+            true,
+            true,
+        );
+        assert_eq!(
+            astra_ws_lite.pointer("/text/format/schema/properties/name/minLength"),
+            Some(&json!(2))
+        );
+
+        for (model, websocket, lite) in [
+            ("gpt-6-astra", false, true),
+            ("gpt-6-astra", true, false),
+            ("gpt-5.6-luna", true, true),
+        ] {
+            let mut body = template.clone();
+            normalize_structured_output_for_transport(&mut body, Some(model), websocket, lite);
+            assert!(body
+                .pointer("/text/format/schema/properties/name/minLength")
+                .is_none());
+            assert!(body
+                .pointer("/text/format/schema/properties/name/maxLength")
+                .is_none());
+            assert_eq!(
+                body.pointer("/tools/0/parameters/properties/query/minLength"),
+                Some(&json!(1))
+            );
+        }
+    }
+
+    #[test]
+    fn astra_builtin_is_overridden_field_by_field_by_manifest() {
+        let provider = manifest_provider("astra-manifest-account", 1);
+        update_manifest_models(
+            &provider,
+            br#"{"models":[{"slug":"gpt-6-astra","use_responses_lite":false,"service_tiers":[],"supported_reasoning_levels":[{"effort":"high"}]}]}"#,
+        );
+        let capability = resolved_capability_for_model(&provider, "gpt-6-astra").unwrap();
+        assert_eq!(capability.reasoning_efforts, Some(vec!["high".to_string()]));
+        assert_eq!(capability.service_tiers, Some(Vec::new()));
+        assert_eq!(capability.use_responses_lite, Some(false));
+        assert_eq!(capability.input_modalities, Some(strings(TEXT_IMAGE)));
     }
 
     #[test]
@@ -443,15 +568,19 @@ mod tests {
     #[test]
     fn manifest_preserves_explicit_empty_and_missing_capabilities() {
         let models = parse_manifest_models(
-            br#"{"models":[{"slug":"known-empty","service_tiers":[],"supported_reasoning_levels":[{"effort":"HIGH"}]},{"slug":"unknown-fields"}]}"#,
+            br#"{"models":[{"slug":"known-empty","service_tiers":[],"supported_reasoning_levels":[{"effort":"HIGH"}],"context_window":400000,"supports_search_tool":true},{"slug":"unknown-fields"}]}"#,
         )
         .unwrap();
         assert_eq!(models[0].id, "known-empty");
         assert_eq!(models[0].service_tiers, Some(Vec::new()));
         assert_eq!(models[0].reasoning_efforts, Some(vec!["high".to_string()]));
+        assert_eq!(models[0].context_window, Some(400000));
+        assert_eq!(models[0].supports_search_tool, Some(true));
         assert_eq!(models[1].id, "unknown-fields");
         assert_eq!(models[1].service_tiers, None);
         assert_eq!(models[1].reasoning_efforts, None);
+        assert_eq!(models[1].context_window, None);
+        assert_eq!(models[1].supports_search_tool, None);
     }
 
     #[test]
@@ -591,6 +720,8 @@ mod tests {
             input_modalities: None,
             service_tiers: None,
             use_responses_lite: None,
+            context_window: None,
+            supports_search_tool: None,
         }
     }
 }

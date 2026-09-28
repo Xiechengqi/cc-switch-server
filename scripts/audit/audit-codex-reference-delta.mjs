@@ -188,6 +188,46 @@ for (const extension of baseline.sourceExtensions ?? []) {
   for (const delta of extension.deltas) registerDelta(extension.sourceId, delta);
 }
 
+const reviewExtensions = new Map();
+for (const review of baseline.referenceReviewExtensions ?? []) {
+  assert(review.id && !reviewExtensions.has(review.id), "duplicate Codex reference review");
+  assert(sourceById.has(review.sourceId), `${review.id} references an unknown source`);
+  assert(Number.isFinite(Date.parse(review.reviewedAt)), `${review.id} has invalid reviewedAt`);
+  if (review.status === "checkout_unavailable") {
+    assert(
+      review.lastFrozenSnapshot && review.repository === "CLIProxyAPI",
+      `${review.id} has an invalid unavailable-source boundary`,
+    );
+  } else {
+    assert(
+      commitPattern.test(review.headCommit) && commitPattern.test(review.headTree) &&
+        review.readMode === "read_only_committed_git_objects",
+      `${review.id} has an invalid committed-object snapshot`,
+    );
+    assert(Array.isArray(review.facts) && review.facts.length >= 3, `${review.id} has no review facts`);
+    for (const fact of review.facts) {
+      assert(["adopt", "differential", "reject"].includes(fact.disposition), `${review.id} has an invalid disposition`);
+      assert(commitPattern.test(fact.commit), `${review.id} has an invalid fact commit`);
+      assert(Array.isArray(fact.paths) && fact.paths.length > 0, `${review.id} has no fact paths`);
+      fact.paths.forEach((value) => assertSafePath(value, `${review.id}:${value}`));
+      assert(typeof fact.contract === "string" && fact.contract.trim(), `${review.id} has no fact contract`);
+      if (fact.revertedBy) assert(commitPattern.test(fact.revertedBy), `${review.id} has an invalid revert`);
+    }
+    if (checkSources) {
+      assert(
+        gitTree(sourceRootById.get(review.sourceId), review.headCommit) === review.headTree,
+        `${review.id} HEAD tree drifted`,
+      );
+    }
+  }
+  reviewExtensions.set(review.id, review);
+}
+assert(
+  reviewExtensions.has("codex2api-gpt6-astra-2026-09-28") &&
+    reviewExtensions.has("cliproxyapi-unavailable-2026-09-28"),
+  "Codex GPT-6 reference review boundary is incomplete",
+);
+
 const immutableSourceSnapshotDigests = new Map([
   ["cliproxyapi-2026-09-19", "7482b03b5422de54996015f0ba9073435e9568bedb801faeabac0bd5fce42b2d"],
   ["codex2api-2026-09-19", "392793aa5484f5995e76d864053967e7a48a0993bcc0687951278e2a20c7ec42"],
@@ -571,20 +611,26 @@ assert(
   "Codex real-acceptance receipt schema changed",
 );
 const acceptanceOperations = new Map(
-  (realAcceptance.operations ?? []).map((operation) => [
+  [
+    ...(realAcceptance.operations ?? []),
+    ...(baseline.realAcceptanceExtensions ?? []).flatMap(
+      (extension) => extension.operations ?? [],
+    ),
+  ].map((operation) => [
     operation.operation,
     operation,
   ]),
 );
 assert(
-  acceptanceOperations.size === 4,
-  "Codex live gate must contain three image variants and WS prewarm",
+  acceptanceOperations.size === 5,
+  "Codex live gate must contain Astra, three image variants and WS prewarm",
 );
 const expectedOperations = new Map([
   ["gpt_image_2_5", "gpt-image-2.5"],
   ["gpt_image_2_5_flare", "gpt-image-2.5-flare"],
   ["gpt_image_2_5_sunburst", "gpt-image-2.5-sunburst"],
   ["ws_prewarm", null],
+  ["gpt_6_astra", "gpt-6-astra"],
 ]);
 for (const [operationId, expectedModel] of expectedOperations) {
   const operation = acceptanceOperations.get(operationId);
@@ -654,6 +700,25 @@ for (const check of [
   assert(
     acceptanceOperations.get("ws_prewarm").requiredChecks.includes(check),
     `ws_prewarm lost required check ${check}`,
+  );
+}
+for (const check of [
+  "account_manifest_entitlement",
+  "responses_http_json",
+  "responses_sse_terminal",
+  "responses_websocket_terminal",
+  "reasoning_max_accepted",
+  "responses_lite_accepted",
+  "structured_output_ws_lite_lengths",
+  "usage_limit_account_scope",
+  "model_capacity_share_model_scope",
+  "sibling_model_quota_control",
+  "no_prism_route",
+  "no_model_fallback",
+]) {
+  assert(
+    acceptanceOperations.get("gpt_6_astra").requiredChecks.includes(check),
+    `gpt_6_astra lost required check ${check}`,
   );
 }
 for (const publishPath of [

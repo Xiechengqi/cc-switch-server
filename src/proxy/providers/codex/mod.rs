@@ -36,22 +36,43 @@ pub(crate) async fn handle_rate_limit(
         return false;
     }
     let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    if !account_rate_limit_evidence(headers, body) {
+    let usage_limit = usage_limit_reached(body);
+    let exhausted_window = exhausted_window_reset_at_ms(headers, now).is_some();
+    let account_evidence = usage_limit || exhausted_window;
+    let model_family = if model.is_some_and(|model| {
+        model
+            .trim()
+            .to_ascii_lowercase()
+            .replace('_', "-")
+            .starts_with("gpt-6-astra")
+    }) {
+        "gpt_6_astra"
+    } else {
+        "other"
+    };
+    if !account_evidence {
         if let (Some(share_id), Some(model)) = (
             share_id.map(str::trim).filter(|value| !value.is_empty()),
             model.map(str::trim).filter(|value| !value.is_empty()),
         ) {
+            let reason = if model_capacity_error(body) {
+                "model_capacity"
+            } else {
+                "rate_limited_model"
+            };
             state.mark_share_model_cooldown(
                 share_id,
                 &execution.plan.runtime_fingerprint,
                 model,
                 now.saturating_add(DEFAULT_SHARE_MODEL_COOLDOWN_MS),
-                if model_capacity_error(body) {
-                    "model_capacity"
-                } else {
-                    "rate_limited_model"
-                },
+                reason,
                 now,
+            );
+            crate::metrics::record_codex_rate_limit_scope(
+                "share_model",
+                reason,
+                "no_account_quota_evidence",
+                model_family,
             );
             return true;
         }
@@ -64,6 +85,22 @@ pub(crate) async fn handle_rate_limit(
     let Some(until) = rate_limit_until(status, headers, body, now) else {
         return true;
     };
+    crate::metrics::record_codex_rate_limit_scope(
+        "account",
+        if usage_limit {
+            "usage_limit"
+        } else {
+            "rate_limit"
+        },
+        if usage_limit {
+            "usage_limit_reached"
+        } else if exhausted_window {
+            "exhausted_window"
+        } else {
+            "transient_or_retry_after"
+        },
+        model_family,
+    );
     state
         .mark_account_rate_limited_until_if_current(
             account_id,

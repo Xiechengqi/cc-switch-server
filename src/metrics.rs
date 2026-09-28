@@ -118,6 +118,22 @@ pub fn record_codex_responses_lite_decision(decision: &'static str) {
     .increment(1);
 }
 
+pub fn record_codex_rate_limit_scope(
+    scope: &'static str,
+    reason: &'static str,
+    evidence: &'static str,
+    model_family: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_codex_rate_limit_scope_total",
+        "scope" => scope,
+        "reason" => reason,
+        "evidence" => evidence,
+        "model_family" => model_family
+    )
+    .increment(1);
+}
+
 pub fn record_codex_metadata_decision(decision: &'static str) {
     metrics::counter!(
         "cc_switch_codex_metadata_total",

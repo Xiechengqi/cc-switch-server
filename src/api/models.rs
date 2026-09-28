@@ -186,7 +186,10 @@ pub(in crate::api) fn openai_model_list(
                             })
                         })
                 }),
-                context_window: claude_capability.map(|capability| capability.context_window),
+                context_window: capability
+                    .as_ref()
+                    .and_then(|capability| capability.context_window)
+                    .or_else(|| claude_capability.map(|capability| capability.context_window)),
                 supports_tools: claude_capability.map(|_| true),
             });
         }

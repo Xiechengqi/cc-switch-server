@@ -23,7 +23,7 @@
 | 日志采集 | Web `设置 → 高级 → 日志管理` 中控制，默认开启；仅当本地日志开启且级别为 `info` 时记录请求生命周期、Provider 选择、重试/切换和终态等脱敏结构化 INFO 审计事件，并通过 installation 身份签名批量上传到当前 Router；不上传请求/响应正文、凭据、邮箱或任意 tracing 文本 |
 | 持久日志 | `<config-dir>/log/cc-switch-server.log` 跨进程保留供本机诊断；单文件达到 8 MiB 后轮转，并在同目录保留最近 2 个备份，不按日志时间清理 |
 | 审计日志缓冲 | `<config-dir>/log/audit-events.jsonl` 是 Router 上传前的本地 spool；单文件达到 16 MiB 后轮转并保留最近 7 个备份，上传端按 cursor 增量读取且 batch 不跨 boot stream，cursor 通过私有临时文件写入、`fsync`、原子替换和父目录同步持久化；Router 不可用时按上限留存并指数退避重试；spool writer 遇到临时文件错误会保留待写事件并自动退避恢复，队列或 writer 不可用时新的推理请求保持 fail-closed，已接纳请求的 terminal 事件即使采集开关随后关闭或 writer 暂时降级仍会排队等待恢复，恢复后补记脱敏状态事件；规范化 Router API 地址或 installation 任一变化，以及 cursor 缺失或损坏时，都会先隔离既有 backlog，避免日志跨 Client 或跨 Router 泄露 |
-| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、Responses Lite/metadata/routing/文本 keepalive、Previous Response cache、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
+| Prometheus | `GET /metrics` 暴露账号并发、通用 retry/failover、Codex WS cache/fallback、Responses Lite/metadata/routing/文本 keepalive、Codex 限流作用域、Previous Response cache、图片 capability/心跳/静默时间、Provider outcome、warm-refresh 和版本闸门指标；公网部署需在反向代理层限制访问 |
 
 升级任务向 Router 回报状态时，`/metrics` 额外暴露两个低基数指标，用于发现 Client 已完成升级但 Router 状态未收敛的问题：
 

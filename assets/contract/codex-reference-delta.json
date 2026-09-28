@@ -549,6 +549,99 @@
       }
     ]
   },
+  "realAcceptanceExtensions": [
+    {
+      "schemaVersion": 1,
+      "observedAt": "2026-09-28T00:00:00Z",
+      "operations": [
+        {
+          "operation": "gpt_6_astra",
+          "model": "gpt-6-astra",
+          "status": "live_pending",
+          "receipt": null,
+          "requiredChecks": [
+            "bound_account_provider_share",
+            "exact_model_upstream_acceptance",
+            "account_manifest_entitlement",
+            "responses_http_json",
+            "responses_sse_terminal",
+            "responses_websocket_terminal",
+            "reasoning_max_accepted",
+            "responses_lite_accepted",
+            "structured_output_ws_lite_lengths",
+            "custom_tool_roundtrip",
+            "usage_present",
+            "usage_limit_account_scope",
+            "model_capacity_share_model_scope",
+            "sibling_model_quota_control",
+            "no_prism_route",
+            "no_model_fallback",
+            "no_post_commit_replay",
+            "decoy_zero_requests",
+            "secret_scan"
+          ],
+          "requiredBodyHashes": [
+            "manifest",
+            "responses_json",
+            "responses_sse",
+            "responses_websocket",
+            "structured_output",
+            "custom_tool",
+            "usage_limit_error",
+            "capacity_error",
+            "sibling_model_control"
+          ],
+          "requiredMeasurements": [
+            "httpRuns",
+            "sseRuns",
+            "websocketRuns",
+            "quotaRuns",
+            "siblingControlRuns"
+          ]
+        }
+      ]
+    }
+  ],
+  "referenceReviewExtensions": [
+    {
+      "id": "codex2api-gpt6-astra-2026-09-28",
+      "sourceId": "codex2api",
+      "repository": "codex2api",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "headCommit": "9368ed82e039ac8458f9c264b2298b47d0cbf833",
+      "headTree": "d878a5e7b8a94665dad14631d40be639d923a345",
+      "readMode": "read_only_committed_git_objects",
+      "facts": [
+        {
+          "disposition": "adopt",
+          "commit": "eb5873d234f690ed376bc9d3195f8bd2d274d3c3",
+          "paths": ["proxy/model_registry.go", "proxy/translator.go"],
+          "contract": "gpt-6-astra cold-start catalog and major-only max reasoning"
+        },
+        {
+          "disposition": "differential",
+          "commit": "b983742b211df0a8571a9866e4e977adf767c005",
+          "paths": ["proxy/schema_policy.go", "proxy/schema_policy_test.go"],
+          "contract": "Astra string lengths only on final native Lite WebSocket transport"
+        },
+        {
+          "disposition": "reject",
+          "commit": "370494145b314c495ffe2900e744face15033d53",
+          "revertedBy": "600636c8f9d9d8d6c56025ae1786522f6dfb0c4b",
+          "paths": ["proxy/prism_client.go", "proxy/prism_executor.go", "proxy/prism_integration.go"],
+          "contract": "Prism independent-quota bypass was reverted and is outside the fixed-binding protocol contract"
+        }
+      ]
+    },
+    {
+      "id": "cliproxyapi-unavailable-2026-09-28",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "status": "checkout_unavailable",
+      "lastFrozenSnapshot": "cliproxyapi-2026-09-19"
+    }
+  ],
   "sourceExtensions": [],
   "sourceSnapshots": [
     {

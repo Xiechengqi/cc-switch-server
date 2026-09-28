@@ -760,7 +760,21 @@ impl ProviderExecution {
             fast_mode_enabled,
             intent,
         )?;
-        request.body = super::codex_http::finalize_body(&body)?;
+        let mut body_value = serde_json::from_slice::<Value>(&body).map_err(|error| {
+            ProxyError::bad_request(format!("invalid finalized Codex Responses body: {error}"))
+        })?;
+        super::codex_models::normalize_structured_output_for_transport(
+            &mut body_value,
+            final_model.as_deref(),
+            false,
+            responses_lite,
+        );
+        request.body = serde_json::to_vec(&body_value)
+            .map(Bytes::from)
+            .map_err(|error| {
+                ProxyError::bad_request(format!("encode Codex Responses body: {error}"))
+            })?;
+        request.body = super::codex_http::finalize_body(&request.body)?;
         Ok(metadata)
     }
 

@@ -171,6 +171,12 @@ Server 独立实现只吸收已能证明的正确性合同：工具 schema walke
 
 GPT Image 2.5 三个 variant 不从外部项目的静态声明推导真实 entitlement。当前没有真实 receipt，因此 `gpt-image-2.5`、`-flare`、`-sunburst` 分别保持 `live_pending`，不发布到 registry/UI，Dedicated Images 在发网前失败关闭。WS prewarm 也因缺 upstream receipt 和 TTFB 基准保持未实现；2.5 专属 quota/cache 治理依赖同一真实门禁。没有迁入 codex2api 的商业计价、账号池、轮换、跨账号或跨 Provider fallback。
 
+## 2026-09-28 GPT-6 Astra differential extension
+
+本轮只读复核 `codex2api@9368ed82e039ac8458f9c264b2298b47d0cbf833`；推荐的 `CLIProxyAPI/` checkout 当前缺失，因此没有把其 2026-09-19 冻结快照外推为最新状态。参考主线已将 `gpt-6-astra` 放入冷启动模型目录，并用最终模型、Responses Lite 与原生 WebSocket 三重条件决定 structured-output 字符串长度约束。Server 独立加入 Astra 的 text/image、max reasoning、priority、Lite 冷启动能力，账号 manifest 仍按 Account identity generation 隔离并逐字段覆盖，静态目录不声称 entitlement。
+
+Astra 的 `usage_limit_reached` 继续按 Account 额度处理，只有缺少账号额度证据的 model-capacity/模型限流进入 Share/runtime/model cooldown；新增有界 Prometheus 标签用于积累真实作用域证据。参考仓库提交 `37049414` 的 Prism 独立额度旁路已由 `600636c8` 完整回退，且其 Responses、工具、commit 和 fallback 合同不完整，Server 明确拒绝迁移。`gpt_6_astra` 私有 receipt gate 要求精确模型、manifest、HTTP/SSE/WS、max、Lite、structured output、custom tool、usage、两类 429 和兄弟模型对照；真实输入缺失时保持 `live_pending`。
+
 ## 2026-09-18 Cursor OmniRoute differential refresh
 
 Cursor 差异合同冻结在 `assets/contract/cursor-reference-delta.json`。2026-09-18 从旧点 `a3ca33fa6442b59adc42976c795709eaf5351109` 复核到 OmniRoute `02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`：六个 Cursor protobuf/session/executor 提交对象的 SHA-256 均未变化，提交区间没有 Cursor wire、protobuf、auth 或 session 增量，因此 CUR-N2 结论为 `reviewed_no_wire_delta`，不修改生产 executor。参考仓库当时 22 项未提交/未跟踪内容全部排除。默认审计不读取外部仓库，只有人工运行 `node scripts/audit/audit-cursor-reference-delta.mjs --check-sources` 才会以冻结路径和 SHA-256 复核 object，外部 Node/Electron/SQLite/session UI 从不成为构建或运行时依赖。

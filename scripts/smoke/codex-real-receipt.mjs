@@ -32,6 +32,14 @@ process.on("uncaughtException", reportFailure);
 process.on("unhandledRejection", reportFailure);
 
 const operationSpecs = Object.freeze({
+  gpt_6_astra: Object.freeze({
+    kind: "model",
+    providerEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_SHARE_ID",
+    modelEnv: "CC_SWITCH_CODEX_GPT_6_ASTRA_MODEL",
+    receiptEnv: "CODEX_GPT_6_ASTRA_REAL_RECEIPT_FILE",
+    exactModel: "gpt-6-astra",
+  }),
   gpt_image_2_5: Object.freeze({
     kind: "image",
     providerEnv: "CC_SWITCH_CODEX_GPT_IMAGE_2_5_PROVIDER_ID",
@@ -132,7 +140,7 @@ if (!spec) {
       verificationState: "blocked_inputs",
       liveState: "live_pending",
       missingInputs: [
-        "--operation gpt_image_2_5|gpt_image_2_5_flare|gpt_image_2_5_sunburst|ws_prewarm",
+        "--operation gpt_6_astra|gpt_image_2_5|gpt_image_2_5_flare|gpt_image_2_5_sunburst|ws_prewarm",
       ],
     }),
   );
@@ -182,7 +190,7 @@ if (missingInputs.length > 0) {
   process.exit(0);
 }
 if (spec.exactModel && model !== spec.exactModel) {
-  fail("Codex image operation requires its exact canonical model");
+  fail("Codex operation requires its exact canonical model");
 }
 
 function safeOrigin(value, label, { share = false } = {}) {
@@ -407,7 +415,7 @@ async function validateBinding(account) {
 }
 
 async function validateWebsocketModel() {
-  if (spec.kind !== "websocket") return;
+  if (spec.kind !== "websocket" && spec.kind !== "model") return;
   const query = new URLSearchParams({ app: "codex", providerId });
   const catalog = await requestJson(
     shareUrl,
@@ -440,6 +448,14 @@ function expectedDecisions() {
       capabilityAccess: "same_share_host_authenticated",
     };
   }
+  if (spec.kind === "model") {
+    return {
+      ...common,
+      modelFallback: "disabled",
+      prismRoute: "disabled",
+      quotaCooldownScope: "usage_limit_account_else_share_runtime_model",
+    };
+  }
   return {
     ...common,
     websocketHttpFallback: "pre_response_create_only",
@@ -465,6 +481,14 @@ function validateMeasurements(measurements, operationContract) {
       measurements.replicaCount < 2
     ) {
       fail("Codex image receipt did not cover both modes and two replicas");
+    }
+    return;
+  }
+  if (spec.kind === "model") {
+    for (const key of operationContract.requiredMeasurements) {
+      if (!Number.isSafeInteger(measurements[key]) || measurements[key] < 1) {
+        fail(`Codex model measurement ${key} is invalid`);
+      }
     }
     return;
   }
@@ -513,7 +537,12 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
   if (containsSecret(JSON.stringify(receipt))) {
     fail("Codex receipt contained secret-like material");
   }
-  const operationContract = contract.realAcceptance.operations.find(
+  const operationContract = [
+    ...(contract.realAcceptance.operations || []),
+    ...(contract.realAcceptanceExtensions || []).flatMap(
+      (extension) => extension.operations || [],
+    ),
+  ].find(
     (candidate) => candidate.operation === operation,
   );
   if (
