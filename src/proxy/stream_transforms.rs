@@ -98,9 +98,17 @@ impl StreamEventTransformer {
             (Some(UpstreamFormat::OpenAiResponses), UpstreamFormat::AnthropicMessages) => Some(
                 StreamBridgeState::ResponsesAnthropic(ResponsesAnthropicState::default()),
             ),
-            (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::AnthropicMessages) => Some(
-                StreamBridgeState::ChatAnthropic(ChatAnthropicState::default()),
-            ),
+            (Some(UpstreamFormat::OpenAiChat), UpstreamFormat::AnthropicMessages) => {
+                // CodeBuddy emits finish_reason before its separate usage tail.
+                // Hold the Anthropic terminal until that tail (or [DONE]) so
+                // cache metering is not committed as zero.
+                let state = if stored.provider_type == ProviderType::CodeBuddyOAuth {
+                    ChatAnthropicState::deferred_terminal()
+                } else {
+                    ChatAnthropicState::default()
+                };
+                Some(StreamBridgeState::ChatAnthropic(state))
+            }
             (Some(UpstreamFormat::GeminiNative), UpstreamFormat::AnthropicMessages) => Some(
                 StreamBridgeState::GeminiAnthropic(GeminiAnthropicState::with_web_search_expected(
                     responses_tool_context.web_search_requested(),
@@ -490,7 +498,7 @@ impl StreamBridgeState {
             Self::AnthropicChat(state) if state.completed() => Ok(Vec::new()),
             Self::AnthropicResponses(state) if state.completed => Ok(Vec::new()),
             Self::ResponsesAnthropic(state) if state.completed => Ok(Vec::new()),
-            Self::ChatAnthropic(state) if state.completed => Ok(Vec::new()),
+            Self::ChatAnthropic(state) => state.finish_stream(),
             _ => {
                 protocol_error("done_before_terminal");
                 Err(ProxyError::bad_gateway(
@@ -2684,7 +2692,7 @@ impl ToGeminiState {
 
     fn chat() -> Self {
         Self {
-            source: ToAnthropicSource::Chat(ChatAnthropicState::deferred_for_gemini()),
+            source: ToAnthropicSource::Chat(ChatAnthropicState::deferred_terminal()),
             target: AnthropicGeminiState::default(),
         }
     }
@@ -3289,7 +3297,7 @@ impl ChatAnthropicState {
             )
     }
 
-    fn deferred_for_gemini() -> Self {
+    fn deferred_terminal() -> Self {
         Self {
             defer_terminal: true,
             ..Self::default()

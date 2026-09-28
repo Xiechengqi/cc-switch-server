@@ -6900,23 +6900,8 @@ pub(super) fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value 
     .unwrap_or(0);
     let output_tokens =
         usage_number(usage, &[&["completion_tokens"], &["output_tokens"]]).unwrap_or(0);
-    let cache_read = usage_number(
-        usage,
-        &[
-            &["prompt_tokens_details", "cached_tokens"],
-            &["input_tokens_details", "cached_tokens"],
-        ],
-    );
-    let cache_creation = usage_number(
-        usage,
-        &[
-            &["cache_creation_input_tokens"],
-            &["input_tokens_details", "cache_creation_tokens"],
-            &["input_tokens_details", "cache_write_tokens"],
-            &["prompt_tokens_details", "cache_creation_tokens"],
-            &["prompt_tokens_details", "cache_write_tokens"],
-        ],
-    );
+    let cache_read = openai_chat_cache_read_tokens(usage);
+    let cache_creation = openai_chat_cache_write_tokens(usage);
     let input_tokens = inclusive_input_tokens
         .saturating_sub(cache_read.unwrap_or(0))
         .saturating_sub(cache_creation.unwrap_or(0));
@@ -7072,14 +7057,7 @@ pub(super) fn openai_responses_usage_from_chat_usage(usage: Option<&Value>) -> V
         usage_number(usage, &[&["completion_tokens"], &["output_tokens"]]).unwrap_or(0);
     let total_tokens =
         usage_number(usage, &[&["total_tokens"]]).unwrap_or(input_tokens + output_tokens);
-    let cached_tokens = usage_number(
-        usage,
-        &[
-            &["prompt_tokens_details", "cached_tokens"],
-            &["input_tokens_details", "cached_tokens"],
-        ],
-    )
-    .unwrap_or(0);
+    let cached_tokens = openai_chat_cache_read_tokens(usage).unwrap_or(0);
 
     let mut output = Map::new();
     output.insert("input_tokens".to_string(), json!(input_tokens));
@@ -7089,15 +7067,7 @@ pub(super) fn openai_responses_usage_from_chat_usage(usage: Option<&Value>) -> V
         "input_tokens_details".to_string(),
         json!({"cached_tokens": cached_tokens}),
     );
-    if let Some(cache_creation) = usage_number(
-        usage,
-        &[
-            &["cache_creation_input_tokens"],
-            &["prompt_tokens_details", "cached_creation_tokens"],
-            &["prompt_tokens_details", "cache_creation_tokens"],
-            &["prompt_tokens_details", "cache_write_tokens"],
-        ],
-    ) {
+    if let Some(cache_creation) = openai_chat_cache_write_tokens(usage) {
         output.insert(
             "cache_creation_input_tokens".to_string(),
             json!(cache_creation),
@@ -7181,19 +7151,52 @@ fn gemini_usage_from_openai_usage(usage: Option<&Value>) -> Value {
     .unwrap_or(0);
     let output_tokens =
         usage_number(usage, &[&["completion_tokens"], &["output_tokens"]]).unwrap_or(0);
-    let cache_read = usage_number(
-        usage,
-        &[
-            &["prompt_tokens_details", "cached_tokens"],
-            &["input_tokens_details", "cached_tokens"],
-        ],
-    );
+    let cache_read = openai_chat_cache_read_tokens(usage);
     json!({
         "promptTokenCount": input_tokens,
         "candidatesTokenCount": output_tokens,
         "totalTokenCount": input_tokens + output_tokens,
         "cachedContentTokenCount": cache_read.unwrap_or(0)
     })
+}
+
+fn openai_chat_cache_read_tokens(usage: Option<&Value>) -> Option<i64> {
+    usage_number(
+        usage,
+        &[
+            &["cache_read_tokens"],
+            &["cacheReadTokens"],
+            &["prompt_tokens_details", "cached_tokens"],
+            &["input_tokens_details", "cached_tokens"],
+            &["cache_read_input_tokens"],
+            &["cacheReadInputTokens"],
+            &["cached_tokens"],
+            &["cachedTokens"],
+            &["prompt_cache_hit_tokens"],
+        ],
+    )
+}
+
+fn openai_chat_cache_write_tokens(usage: Option<&Value>) -> Option<i64> {
+    usage_number(
+        usage,
+        &[
+            &["cache_write_tokens"],
+            &["cacheWriteTokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
+            &["prompt_tokens_details", "cached_creation_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
+            &["input_tokens_details", "cache_creation_tokens"],
+            &["cache_creation_input_tokens"],
+            &["cacheCreationInputTokens"],
+            &["cache_creation_tokens"],
+            &["cacheCreationTokens"],
+            &["cacheWriteInputTokens"],
+            &["cache_write_input_tokens"],
+            &["prompt_cache_write_tokens"],
+        ],
+    )
 }
 
 fn usage_number(usage: Option<&Value>, paths: &[&[&str]]) -> Option<i64> {
@@ -9639,6 +9642,54 @@ mod tests {
         let responses_round_trip =
             openai_responses_usage_from_chat_usage(Some(&chat_with_metering));
         assert_eq!(responses_round_trip["credit_unit"], json!("credit"));
+    }
+
+    #[test]
+    fn codebuddy_cache_usage_explicit_zero_wins_across_all_surfaces() {
+        let chat = json!({
+            "id": "chatcmpl-codebuddy-cache-zero",
+            "model": "default-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "total_tokens": 13,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 6,
+                "prompt_tokens_details": {
+                    "cached_tokens": 5,
+                    "cache_write_tokens": 4
+                }
+            }
+        });
+
+        let claude = openai_chat_response_to_anthropic(&chat).unwrap();
+        assert_eq!(claude["usage"]["input_tokens"], 10);
+        assert_eq!(claude["usage"]["output_tokens"], 3);
+        assert_eq!(claude["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(claude["usage"]["cache_creation_input_tokens"], 0);
+
+        let codex = openai_chat_response_to_responses(&chat).unwrap();
+        assert_eq!(codex["usage"]["input_tokens"], 10);
+        assert_eq!(codex["usage"]["output_tokens"], 3);
+        assert_eq!(codex["usage"]["total_tokens"], 13);
+        assert_eq!(codex["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(
+            codex["usage"]["input_tokens_details"]["cache_write_tokens"],
+            0
+        );
+
+        let gemini = anthropic_response_to_gemini(&claude).unwrap();
+        assert_eq!(gemini["usageMetadata"]["promptTokenCount"], 10);
+        assert_eq!(gemini["usageMetadata"]["candidatesTokenCount"], 3);
+        assert_eq!(gemini["usageMetadata"]["totalTokenCount"], 13);
+        assert_eq!(gemini["usageMetadata"]["cachedContentTokenCount"], 0);
     }
 
     #[test]

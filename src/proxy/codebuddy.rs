@@ -329,6 +329,9 @@ impl CodeBuddySseDecoder {
         if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
             return Err(CodeBuddySseDecodeError::Upstream(error));
         }
+        if let Some(usage) = value.get_mut("usage") {
+            canonicalize_codebuddy_cache_usage(usage);
+        }
         if !sanitize_codebuddy_stream_chunk(&mut value, &mut self.sent_role)? {
             return Ok(());
         }
@@ -783,7 +786,9 @@ impl CodeBuddyChatSseAggregator {
                     "CodeBuddy Chat SSE usage must be an object",
                 ));
             }
-            self.usage = Some(usage.clone());
+            let mut usage = usage.clone();
+            canonicalize_codebuddy_cache_usage(&mut usage);
+            self.usage = Some(usage);
         }
         let choices = object
             .get("choices")
@@ -926,6 +931,89 @@ impl CodeBuddyChatSseAggregator {
             .transpose()
             .map_err(|error| error.into_proxy_error())
     }
+}
+
+fn canonicalize_codebuddy_cache_usage(usage: &mut Value) {
+    let cache_read = codebuddy_usage_number(
+        usage,
+        &[
+            &["cache_read_tokens"],
+            &["prompt_tokens_details", "cached_tokens"],
+            &["input_tokens_details", "cached_tokens"],
+            &["cache_read_input_tokens"],
+            &["cached_tokens"],
+            &["prompt_cache_hit_tokens"],
+        ],
+    );
+    let cache_write = codebuddy_usage_number(
+        usage,
+        &[
+            &["cache_write_tokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
+            &["prompt_tokens_details", "cached_creation_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
+            &["input_tokens_details", "cache_creation_tokens"],
+            &["cache_creation_input_tokens"],
+            &["cache_creation_tokens"],
+            &["prompt_cache_write_tokens"],
+        ],
+    );
+    if cache_read.is_none() && cache_write.is_none() {
+        return;
+    }
+    let Some(object) = usage.as_object_mut() else {
+        return;
+    };
+    if let Some(cache_read) = cache_read {
+        object
+            .entry("cache_read_tokens".to_string())
+            .or_insert_with(|| json!(cache_read));
+    }
+    if let Some(cache_write) = cache_write {
+        object
+            .entry("cache_write_tokens".to_string())
+            .or_insert_with(|| json!(cache_write));
+    }
+    let details = object
+        .entry("prompt_tokens_details".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    if let Some(cache_read) = cache_read {
+        details
+            .entry("cached_tokens".to_string())
+            .or_insert_with(|| json!(cache_read));
+    }
+    if let Some(cache_write) = cache_write {
+        details
+            .entry("cache_write_tokens".to_string())
+            .or_insert_with(|| json!(cache_write));
+    }
+}
+
+fn codebuddy_usage_number(usage: &Value, paths: &[&[&str]]) -> Option<u64> {
+    for path in paths {
+        let mut cursor = usage;
+        let mut found = true;
+        for key in *path {
+            let Some(next) = cursor.get(*key) else {
+                found = false;
+                break;
+            };
+            cursor = next;
+        }
+        if found {
+            if let Some(value) = cursor.as_u64() {
+                return Some(value);
+            }
+            if let Some(value) = cursor.as_i64().and_then(|value| u64::try_from(value).ok()) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn update_optional_string(
@@ -1251,6 +1339,48 @@ mod tests {
         );
         assert_eq!(response["usage"]["completion_thinking_tokens"], 2);
         assert_eq!(response["usage"]["credit"], 0.02);
+    }
+
+    #[test]
+    fn cache_usage_normalization_preserves_original_fields_and_explicit_zero() {
+        let mut usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_read_input_tokens": 7,
+            "cache_creation_input_tokens": 6,
+            "prompt_tokens_details": {
+                "cached_tokens": 5,
+                "cache_write_tokens": 4
+            }
+        });
+        canonicalize_codebuddy_cache_usage(&mut usage);
+
+        assert_eq!(usage["cache_read_tokens"], 0);
+        assert_eq!(usage["cache_write_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 7);
+        assert_eq!(usage["cache_creation_input_tokens"], 6);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(usage["prompt_tokens_details"]["cache_write_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 13);
+
+        let mut legacy = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13,
+            "cache_read_input_tokens": 3,
+            "prompt_cache_write_tokens": 2
+        });
+        canonicalize_codebuddy_cache_usage(&mut legacy);
+        assert_eq!(legacy["cache_read_tokens"], 3);
+        assert_eq!(legacy["cache_write_tokens"], 2);
+        assert_eq!(legacy["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(legacy["prompt_tokens_details"]["cache_write_tokens"], 2);
+        assert_eq!(legacy["cache_read_input_tokens"], 3);
+        assert_eq!(legacy["prompt_cache_write_tokens"], 2);
+        assert_eq!(legacy["total_tokens"], 13);
     }
 
     #[test]

@@ -253,6 +253,8 @@ fn tool_chunks() -> Vec<Bytes> {
                     "total_tokens": 13,
                     "credit": 0.02,
                     "completion_thinking_tokens": 2,
+                    "cache_read_tokens": 3,
+                    "cache_write_tokens": 2,
                     "cached_tokens": 1,
                     "cache_read_input_tokens": 1,
                     "cache_creation_input_tokens": 0,
@@ -260,7 +262,10 @@ fn tool_chunks() -> Vec<Bytes> {
                     "prompt_cache_miss_tokens": 9,
                     "prompt_cache_write_tokens": 0,
                     "completion_tokens_details": {},
-                    "prompt_tokens_details": {}
+                    "prompt_tokens_details": {
+                        "cached_tokens": 2,
+                        "cache_write_tokens": 1
+                    }
                 }
             })
         )),
@@ -726,6 +731,72 @@ async fn collect(response: Response) -> Vec<u8> {
         .to_vec()
 }
 
+fn codebuddy_response_payloads(body: &str, stream_requested: bool) -> Vec<Value> {
+    if !stream_requested {
+        return vec![serde_json::from_str(body).unwrap()];
+    }
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect()
+}
+
+fn assert_codebuddy_cache_usage(app: AppKind, stream_requested: bool, body: &str) {
+    let payloads = codebuddy_response_payloads(body, stream_requested);
+    match app {
+        AppKind::Claude => {
+            let usage = if stream_requested {
+                payloads
+                    .iter()
+                    .find(|payload| {
+                        payload.get("type").and_then(Value::as_str) == Some("message_delta")
+                            && payload.get("usage").is_some()
+                    })
+                    .and_then(|payload| payload.get("usage"))
+                    .unwrap()
+            } else {
+                payloads[0].get("usage").unwrap()
+            };
+            assert_eq!(usage["input_tokens"], 5, "{body}");
+            assert_eq!(usage["output_tokens"], 3);
+            assert_eq!(usage["cache_read_input_tokens"], 3);
+            assert_eq!(usage["cache_creation_input_tokens"], 2);
+        }
+        AppKind::Codex => {
+            let usage = if stream_requested {
+                payloads
+                    .iter()
+                    .find(|payload| {
+                        matches!(
+                            payload.get("type").and_then(Value::as_str),
+                            Some("response.completed" | "response.incomplete")
+                        )
+                    })
+                    .and_then(|payload| payload.pointer("/response/usage"))
+                    .unwrap()
+            } else {
+                payloads[0].get("usage").unwrap()
+            };
+            assert_eq!(usage["input_tokens"], 10);
+            assert_eq!(usage["output_tokens"], 3);
+            assert_eq!(usage["total_tokens"], 13);
+            assert_eq!(usage["input_tokens_details"]["cached_tokens"], 3);
+            assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 2);
+        }
+        AppKind::Gemini => {
+            let usage = payloads
+                .iter()
+                .find_map(|payload| payload.get("usageMetadata"))
+                .unwrap();
+            assert_eq!(usage["promptTokenCount"], 10);
+            assert_eq!(usage["candidatesTokenCount"], 3);
+            assert_eq!(usage["totalTokenCount"], 13);
+            assert_eq!(usage["cachedContentTokenCount"], 3);
+        }
+    }
+}
+
 fn run_codebuddy_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -849,6 +920,7 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
                     assert!(body.contains("ready"), "{name}: {body}");
                     assert!(body.contains("lookup"), "{name}: {body}");
                     assert!(body.contains("think"), "{name}: {body}");
+                    assert_codebuddy_cache_usage(app, stream_requested, &body);
                     if stream_requested {
                         assert!(
                             body.contains("message_stop")

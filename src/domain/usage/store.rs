@@ -1275,67 +1275,71 @@ pub fn usage_from_json_with_semantics(
             (None, None) => None,
         }
     });
-    let cache_read_tokens = first_u64(
-        usage,
-        &[
-            "cache_read_input_tokens",
-            "cacheReadInputTokens",
-            "cache_read_tokens",
-            "cacheReadTokens",
-            "cached_tokens",
-            "cachedTokens",
-            "cachedContentTokenCount",
-            "cached_content_token_count",
-        ],
-    )
-    .or_else(|| {
-        usage
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(serde_json::Value::as_u64)
-    });
-    let cache_creation_tokens = first_u64(
-        usage,
-        &[
-            "cache_creation_input_tokens",
-            "cacheCreationInputTokens",
-            "cache_creation_tokens",
-            "cacheCreationTokens",
-            "cacheWriteInputTokens",
-            "cache_write_input_tokens",
-            "cache_write_tokens",
-            "cacheWriteTokens",
-        ],
-    )
-    .or_else(|| {
-        usage
-            .pointer("/input_tokens_details/cache_creation_tokens")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/input_tokens_details/cache_write_tokens")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/prompt_tokens_details/cache_creation_tokens")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/prompt_tokens_details/cached_creation_tokens")
-            .and_then(serde_json::Value::as_u64)
-    })
-    .or_else(|| {
-        usage
-            .pointer("/prompt_tokens_details/cache_write_tokens")
-            .and_then(serde_json::Value::as_u64)
-    });
+    let cache_read_tokens = first_u64(usage, &["cache_read_tokens", "cacheReadTokens"])
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            first_u64(
+                usage,
+                &[
+                    "cache_read_input_tokens",
+                    "cacheReadInputTokens",
+                    "cached_tokens",
+                    "cachedTokens",
+                    "prompt_cache_hit_tokens",
+                    "cachedContentTokenCount",
+                    "cached_content_token_count",
+                ],
+            )
+        });
+    let cache_creation_tokens = first_u64(usage, &["cache_write_tokens", "cacheWriteTokens"])
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_creation_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_creation_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .pointer("/input_tokens_details/cache_creation_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            first_u64(
+                usage,
+                &[
+                    "cache_creation_input_tokens",
+                    "cacheCreationInputTokens",
+                    "cache_creation_tokens",
+                    "cacheCreationTokens",
+                    "cacheWriteInputTokens",
+                    "cache_write_input_tokens",
+                    "prompt_cache_write_tokens",
+                ],
+            )
+        });
     let semantics = match semantics {
         InputTokenSemantics::Auto => infer_input_token_semantics(usage),
         explicit => explicit,
@@ -1955,6 +1959,58 @@ mod tests {
             InputTokenSemantics::Inclusive,
         );
         assert_eq!(zero.cache_creation_tokens, Some(0));
+    }
+
+    #[test]
+    fn codebuddy_cache_usage_priority_preserves_zero_and_total_conservation() {
+        let usage = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 8,
+                    "total_tokens": 108,
+                    "cache_read_tokens": 60,
+                    "cache_write_tokens": 20,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 5,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 50,
+                        "cache_write_tokens": 10
+                    }
+                }
+            }),
+            InputTokenSemantics::Inclusive,
+        );
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.raw_input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.cache_read_tokens, Some(60));
+        assert_eq!(usage.cache_creation_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(108));
+
+        let zero = usage_from_json_with_semantics(
+            &json!({
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 8,
+                    "total_tokens": 108,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 5,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 50,
+                        "cache_write_tokens": 10
+                    }
+                }
+            }),
+            InputTokenSemantics::Inclusive,
+        );
+        assert_eq!(zero.input_tokens, Some(100));
+        assert_eq!(zero.raw_input_tokens, Some(100));
+        assert_eq!(zero.cache_read_tokens, Some(0));
+        assert_eq!(zero.cache_creation_tokens, Some(0));
+        assert_eq!(zero.total_tokens, Some(108));
     }
 
     #[test]
