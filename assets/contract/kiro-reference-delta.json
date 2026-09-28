@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",
@@ -168,6 +168,59 @@
       "worktreeChangesExcluded": false,
       "excludedWorktreeEntries": 0,
       "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "kiro-rs-2026-09-28",
+      "sourceId": "kiro-rs-head",
+      "repository": "kiro.rs",
+      "headCommit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+      "headTree": "5e656c1bf70aac0224a68251b2065966db01e933",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "excludedWorktreeEntries": 0,
+      "readMode": "read_only_committed_git_objects"
+    }
+  ],
+  "incrementalReviewExtensions": [
+    {
+      "id": "KIRO-NO-WIRE-2026-09-28",
+      "sourceId": "kiro-rs-head",
+      "fromSnapshotId": "kiro-rs-2026-09-19",
+      "toSnapshotId": "kiro-rs-2026-09-28",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "fromCommit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+      "toCommit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
+      "fromTree": "5e656c1bf70aac0224a68251b2065966db01e933",
+      "toTree": "5e656c1bf70aac0224a68251b2065966db01e933",
+      "readMode": "read_only_committed_git_objects",
+      "status": "reviewed_no_wire_delta",
+      "wireDelta": "none",
+      "productionCodeChanged": false,
+      "reviewedCommittedObjects": 15,
+      "changedCommittedPaths": [],
+      "reviewedKiroWirePaths": [
+        "src/anthropic/cache_metering.rs",
+        "src/anthropic/stream.rs",
+        "src/anthropic/responses.rs",
+        "src/anthropic/responses_compaction.rs",
+        "src/anthropic/handlers.rs",
+        "src/kiro/token_manager.rs",
+        "src/kiro/provider.rs",
+        "src/kiro/model/credentials.rs",
+        "src/kiro/auth/idc.rs",
+        "src/kiro/auth/social.rs",
+        "src/kiro/endpoint/cli.rs",
+        "src/kiro/endpoint/ide.rs",
+        "src/kiro/session_affinity.rs",
+        "src/kiro/parser/decoder.rs",
+        "src/kiro/parser/frame.rs"
+      ],
+      "changedKiroWirePaths": [],
+      "preservedLiveGates": [
+        "remote_compaction",
+        "shared_cache",
+        "auth_kind_region_receipts"
+      ]
     }
   ],
   "capabilities": [

@@ -51,6 +51,14 @@ Cursor 的第二轮 append-only review 从 `OmniRoute@02c663cdd0e8577bdcf2b01a44
 
 结论保持 `reviewed_no_wire_delta`，因此不制造 Cursor 生产代码改动。既有 CUR-01/CUR-03、CORE-N1/N2 仍为 `fixture_verified`，OAuth 与 API-key 两条 CUR-N1 receipt 继续相互独立地保持 `null/live_pending`；共享 stream-timing 变化不能替代任何真实账号验收，也不能扩展 retry/fallback 边界。
 
+## 2026-09-28 Kiro no-wire refresh
+
+推荐参考仓库 `kiro.rs` 的第二轮 HEAD 仍为首轮冻结的 `be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863`，tree 仍为 `5e656c1bf70aac0224a68251b2065966db01e933`，工作树干净。首轮与第二轮 snapshot 的 committed range 因而为空；模型/凭据、Builder ID/IdC/Social、profile ARN、CLI/IDE endpoint、prompt-cache、remote-compaction、session affinity 和 EventStream decoder/frame 等 15 个冻结对象均无新提交可吸收。
+
+`assets/contract/kiro-reference-delta.json` 追加 `kiro-rs-2026-09-28` snapshot 与不可变 `KIRO-NO-WIRE-2026-09-28` review extension，固定相同的 from/to commit/tree、完整 15-path reviewed set、`changedCommittedPaths=[]`、`changedKiroWirePaths=[]` 和 `productionCodeChanged=false`。默认审计只验证本仓库冻结摘要，显式 `node scripts/audit/audit-kiro-reference-delta.mjs --check-sources` 才以只读 Git object 复核 tree、文件 SHA-256 与空提交区间；外部仓库仍不进入构建、测试、发布或运行时。
+
+结论为 `reviewed_no_wire_delta`，不创建 Kiro 生产代码提交。KI-N3 remote compaction 和 KI-05 shared cache 继续 runtime disabled；Builder ID、IdC、Social、API Key × `us-east-1`、`eu-central-1` 的八份私密 receipt 继续各自为 `null/live_pending`。参考仓库没有变化不能替代固定 Account、auth kind、region、Provider/Share generation 的真实验收，也不能扩大同账号 pre-commit 恢复边界。
+
 ## 2026-09-28 Claude text/citation and tool-name freeze
 
 CL-N5 与 CL-N6 冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0016`～`CL-OBS-0017`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）以及两个历史 committed object：`781a203b` 的相邻 Anthropic text/citation 合并、`75b854eb` 的 Claude 工具名语法。15 个 source delta 的文件摘要和 17 条 append-only observation 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。

@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）和 Grok GR-N3（`a0f567a`）；Cursor 第二轮冻结为 `reviewed_no_wire_delta`（`6118169`），GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。其余第二轮 Provider 仍按第 17 节状态推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）和 Grok GR-N3（`a0f567a`）；Cursor 与 Kiro 第二轮均冻结为 `reviewed_no_wire_delta`，GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。其余第二轮 Provider 仍按第 17 节状态推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -997,6 +997,8 @@ GR-N3 的 capability 只影响模型展示、请求校验和受证 upstream cont
 ### 17.8 Kiro 增量复核
 
 kiro.rs 的第二轮 HEAD 仍是 `be0c04219d9d`，与首轮冻结点一致。没有新的 committed wire 可比较，因此状态为 `reviewed_no_wire_delta`。KI-N3 的 remote compaction、auth-kind × region receipt 和 KI-05 shared cache 继续保持 `live_pending`/disabled；“参考仓库没变化”不能替代这些真实验收。
+
+证据更新（2026-09-28）：`assets/contract/kiro-reference-delta.json` 已追加同 commit/tree 的 `kiro-rs-2026-09-28` snapshot 与 `KIRO-NO-WIRE-2026-09-28` immutable review extension。15 个已冻结的 Kiro wire/evidence path 全部重新核对，提交区间、`changedCommittedPaths` 与 `changedKiroWirePaths` 均为空；默认 audit 与 `--check-sources` 均通过。该复核没有生产代码改动，也没有提升八个 auth-kind × region receipt、remote compaction 或 shared cache。
 
 ### 17.9 Qoder 审计边界
 

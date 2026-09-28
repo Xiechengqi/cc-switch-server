@@ -285,6 +285,10 @@ const immutableSourceSnapshotDigests = new Map([
     "kiro-rs-2026-09-19",
     "8ff18226bce2f55aa6225b8ada7135374116c078ded3fb51ca2c7ba5c358c479",
   ],
+  [
+    "kiro-rs-2026-09-28",
+    "84002fb918a44895c97c2ae34edf600280b792d2c305bee135e145a7ce9752cf",
+  ],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of contract.sourceSnapshots ?? []) {
@@ -316,6 +320,89 @@ for (const snapshot of contract.sourceSnapshots ?? []) {
 assert(
   sourceSnapshotById.size === immutableSourceSnapshotDigests.size,
   "Kiro source snapshot history is incomplete",
+);
+
+const immutableIncrementalReviewExtensionDigests = new Map([
+  [
+    "KIRO-NO-WIRE-2026-09-28",
+    "af8f3ed006a47c7ea7bf25bb42b907a2de2b812e9cc66f9ed3a68f08dab6842e",
+  ],
+]);
+const incrementalReviewExtensions = new Map();
+for (const review of contract.incrementalReviewExtensions ?? []) {
+  assert(
+    review.id && !incrementalReviewExtensions.has(review.id),
+    "duplicate Kiro incremental review extension",
+  );
+  const source = sourceById.get(review.sourceId);
+  const fromSnapshot = sourceSnapshotById.get(review.fromSnapshotId);
+  const toSnapshot = sourceSnapshotById.get(review.toSnapshotId);
+  assert(
+    source === currentSource &&
+      fromSnapshot?.sourceId === review.sourceId &&
+      toSnapshot?.sourceId === review.sourceId &&
+      review.fromCommit === fromSnapshot.headCommit &&
+      review.toCommit === toSnapshot.headCommit &&
+      review.fromTree === fromSnapshot.headTree &&
+      review.toTree === toSnapshot.headTree,
+    `${review.id} has an invalid committed snapshot range`,
+  );
+  assert(
+    Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.readMode === "read_only_committed_git_objects" &&
+      review.status === "reviewed_no_wire_delta" &&
+      review.wireDelta === "none" &&
+      review.productionCodeChanged === false &&
+      review.reviewedCommittedObjects === currentSource.files.length &&
+      Array.isArray(review.changedCommittedPaths) &&
+      review.changedCommittedPaths.length === 0,
+    `${review.id} changed the no-wire review boundary`,
+  );
+  const expectedWirePaths = currentSource.files.map((file) => file.path);
+  assert(
+    JSON.stringify(review.reviewedKiroWirePaths) === JSON.stringify(expectedWirePaths) &&
+      Array.isArray(review.changedKiroWirePaths) &&
+      review.changedKiroWirePaths.length === 0 &&
+      JSON.stringify(review.preservedLiveGates) ===
+        JSON.stringify(["remote_compaction", "shared_cache", "auth_kind_region_receipts"]),
+    `${review.id} changed the reviewed Kiro wire set or live gates`,
+  );
+  for (const value of review.reviewedKiroWirePaths) {
+    safeRelative(value, `${review.id}:${value}`);
+  }
+  assert(
+    immutableIncrementalReviewExtensionDigests.get(review.id) === objectDigest(review),
+    `${review.id} changed after it was recorded`,
+  );
+  if (checkSources) {
+    const sourceRoot = sourceRootById.get(review.sourceId);
+    assert(
+      gitTree(sourceRoot, review.fromCommit) === review.fromTree &&
+        gitTree(sourceRoot, review.toCommit) === review.toTree,
+      `${review.id} source trees drifted`,
+    );
+    const changedPaths = execFileSync(
+      "git",
+      ["-C", sourceRoot, "diff", "--name-only", `${review.fromCommit}..${review.toCommit}`],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert(
+      JSON.stringify(changedPaths) === JSON.stringify(review.changedCommittedPaths) &&
+        JSON.stringify(
+          changedPaths.filter((value) => review.reviewedKiroWirePaths.includes(value)),
+        ) === JSON.stringify(review.changedKiroWirePaths),
+      `${review.id} committed-object delta drifted`,
+    );
+  }
+  incrementalReviewExtensions.set(review.id, review);
+}
+assert(
+  incrementalReviewExtensions.size === immutableIncrementalReviewExtensionDigests.size &&
+    incrementalReviewExtensions.has("KIRO-NO-WIRE-2026-09-28"),
+  "Kiro incremental review extension history is incomplete",
 );
 
 assert(
@@ -875,7 +962,7 @@ assert(
 );
 
 console.log(
-  `kiro reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${receipts.length} pending receipts${
+  `kiro reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${receipts.length} pending receipts${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );
