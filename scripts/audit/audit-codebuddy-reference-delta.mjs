@@ -241,9 +241,24 @@ assert(
   "CodeBuddy incremental source delta set changed",
 );
 
+const immutableSourceExtensionDigests = new Map([
+  ["cli2api-head", "35c3940fb1c21492d2a11437aa8a97fc6f687b809a090082cf0571d5a46090f4"],
+  [
+    "cli2api-head-2026-09-28",
+    "4b04aa05b08776cf93e17a7a5989768cfb4a29bb16c19afb3977ebcac9bfad6d",
+  ],
+]);
 assert(
-  objectDigest(contract.sourceExtensions) ===
-    "a5e9294c1ef1f4cfdbac046c774f395032c698bdf244211e091757c14be64ba2",
+  objectDigest([
+    contract.sourceExtensions?.find((source) => source.id === "cli2api-head"),
+  ]) === "a5e9294c1ef1f4cfdbac046c774f395032c698bdf244211e091757c14be64ba2",
+  "CodeBuddy original source extension history changed",
+);
+assert(
+  contract.sourceExtensions?.length === immutableSourceExtensionDigests.size &&
+    contract.sourceExtensions.every(
+      (source) => immutableSourceExtensionDigests.get(source.id) === objectDigest(source),
+    ),
   "CodeBuddy source extension history changed",
 );
 const sourceById = new Map();
@@ -281,7 +296,9 @@ for (const source of [...(contract.sources ?? []), ...(contract.sourceExtensions
   sourceFileById.set(source.id, fileByPath);
 }
 assert(
-  sourceById.size === 4 && sourceById.has("cli2api-head"),
+  sourceById.size === 5 &&
+    sourceById.has("cli2api-head") &&
+    sourceById.has("cli2api-head-2026-09-28"),
   "CodeBuddy source set changed",
 );
 const currentSource = sourceById.get("cli2api-head");
@@ -291,12 +308,72 @@ assert(
     currentSource.files.length === 15,
   "CodeBuddy current committed source history changed",
 );
+const secondRoundSource = sourceById.get("cli2api-head-2026-09-28");
+assert(
+  secondRoundSource.commit === "34c91b899aa2289f5ee49618d2d300f3eeaffedb" &&
+    secondRoundSource.extendsSourceId === "cli2api-head" &&
+    secondRoundSource.files.length === 11,
+  "CodeBuddy second-round committed source changed",
+);
+const secondRoundDeltaIds = new Set();
+for (const delta of secondRoundSource.deltas ?? []) {
+  assert(
+    delta.id && !secondRoundDeltaIds.has(delta.id),
+    "duplicate CodeBuddy second-round source delta",
+  );
+  secondRoundDeltaIds.add(delta.id);
+  assert(
+    Array.isArray(delta.commits) &&
+      delta.commits.length > 0 &&
+      delta.commits.every((commit) => commitPattern.test(commit)),
+    `${delta.id} has invalid committed objects`,
+  );
+  assert(delta.files?.length > 0, `${delta.id} has no frozen evidence files`);
+  for (const file of delta.files) {
+    safeRelative(file.path, `${delta.id} evidence path`);
+    assert(
+      delta.commits.includes(file.commit) && digestPattern.test(file.sha256),
+      `${delta.id}:${file.path} has invalid frozen identity`,
+    );
+    if (checkSources) {
+      const content = gitFile(
+        sourceRootById.get(secondRoundSource.id),
+        file.commit,
+        file.path,
+        null,
+      );
+      assert(
+        sha256(content) === file.sha256,
+        `${delta.id}:${file.path} drifted from the reviewed Git object`,
+      );
+    }
+  }
+}
+assert(
+  JSON.stringify([...secondRoundDeltaIds].sort()) ===
+    JSON.stringify([
+      "cache_usage_conservation",
+      "custom_tool_round_trip",
+      "malformed_arguments_permissive_drop",
+      "namespace_identity_round_trip",
+      "responses_incomplete_terminal",
+    ]),
+  "CodeBuddy second-round source delta set changed",
+);
 
 const immutableSourceSnapshotDigests = new Map([
   [
     "cli2api-2026-09-19",
     "a99ec47f17e63557ca58b24bda178c9185205c2678087d7ae337bec197862f8e",
   ],
+  [
+    "cli2api-2026-09-28",
+    "6571fa366c35e12180bbd074823f987cf2eaf4088910ab8211a7840404efec0d",
+  ],
+]);
+const expectedSourceSnapshotTrees = new Map([
+  ["cli2api-2026-09-19", "c2f02a394e1381adf8291949822ce4b08a48dfb3"],
+  ["cli2api-2026-09-28", "a0a1a3e6530e160284dba8eb18b85555ceab6a10"],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of contract.sourceSnapshots ?? []) {
@@ -309,7 +386,7 @@ for (const snapshot of contract.sourceSnapshots ?? []) {
   assert(
     snapshot.repository === "cli2api" &&
       snapshot.headCommit === source.commit &&
-      snapshot.headTree === "c2f02a394e1381adf8291949822ce4b08a48dfb3" &&
+      snapshot.headTree === expectedSourceSnapshotTrees.get(snapshot.id) &&
       snapshot.worktreeClean === false &&
       snapshot.worktreeChangesExcluded === true &&
       snapshot.excludedWorktreeEntries === 2 &&
@@ -379,6 +456,7 @@ const immutableObservationDigests = new Map([
   ["CB-OBS-0013", "a7c5bdcf34082c3b2a1e24d7cfe21d5186931ac53a54f40c9cb071f81189e02a"],
   ["CB-OBS-0014", "d93a801d31e2be1cebab486a77dbd676b0ef83456f8a3b49bc32073dd0d4020f"],
   ["CB-OBS-0015", "427a1fb0f6197d2d4a2cfa23fb939c6af031053321f3b613617e2f4c20c5f442"],
+  ["CB-OBS-0016", "1d3651b13418cd50d1755ae7b918e93bd8edadff3b805cfac244abc32cdbc7fe"],
 ]);
 const expectedEnhancementIds = new Set([
   "CB-01",
@@ -390,6 +468,7 @@ const expectedEnhancementIds = new Set([
   "CB-N3",
   "CB-N4",
   "CB-N5",
+  "CB-N6",
   "CORE-N1",
   "CORE-N2",
   "LIVE-N1",
@@ -413,6 +492,7 @@ const expectedDispositions = new Map([
   ["CB-OBS-0013", "reject"],
   ["CB-OBS-0014", "reject"],
   ["CB-OBS-0015", "differential"],
+  ["CB-OBS-0016", "differential"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -585,6 +665,116 @@ assert(
   JSON.stringify([...observedEnhancementIds].sort()) ===
     JSON.stringify([...expectedEnhancementIds].sort()),
   "CodeBuddy enhancement observation coverage is incomplete",
+);
+
+assert(
+  objectDigest(contract.incrementalEnhancementExtensions) ===
+    "ced81939de2cf9ad4e67d789af1a3efe438287c7c56bbc6ec2b69877c8daaee1",
+  "CodeBuddy second-round enhancement history changed",
+);
+const cacheUsageEnhancement = contract.incrementalEnhancementExtensions?.find(
+  (entry) => entry.id === "CB-N6",
+);
+assert(
+  contract.incrementalEnhancementExtensions?.length === 1 &&
+    cacheUsageEnhancement?.status === "fixture_verified" &&
+    secondRoundDeltaIds.has(cacheUsageEnhancement.referenceDelta) &&
+    cacheUsageEnhancement.providerType === "codebuddy_oauth" &&
+    JSON.stringify(cacheUsageEnhancement.sites) === JSON.stringify(["intl", "cn"]) &&
+    JSON.stringify(cacheUsageEnhancement.surfaces) ===
+      JSON.stringify(["claude", "codex", "gemini"]) &&
+    JSON.stringify(cacheUsageEnhancement.modes) ===
+      JSON.stringify(["stream", "non_stream"]) &&
+    JSON.stringify(cacheUsageEnhancement.readPriority) ===
+      JSON.stringify(["cache_read_tokens", "nested_cached_tokens", "vendor_legacy"]) &&
+    JSON.stringify(cacheUsageEnhancement.writePriority) ===
+      JSON.stringify(["cache_write_tokens", "nested_cache_write_tokens", "vendor_legacy"]) &&
+    cacheUsageEnhancement.explicitZeroPreserved === true &&
+    cacheUsageEnhancement.invalidCacheNumbersRejected === true &&
+    cacheUsageEnhancement.totalTokensDoubleCounted === false &&
+    cacheUsageEnhancement.trailingUsageCapturedBeforeStrictTerminal === true &&
+    cacheUsageEnhancement.strictDoneAndEofBeforeTerminal === true &&
+    cacheUsageEnhancement.incrementalToolDeltasPreserved === true &&
+    cacheUsageEnhancement.internalUsageUsesSamePriority === true &&
+    cacheUsageEnhancement.liveReceiptState === "live_pending" &&
+    cacheUsageEnhancement.evidence?.length === 5,
+  "CB-N6 cache-usage boundary changed",
+);
+for (const evidence of cacheUsageEnhancement.evidence) {
+  safeRelative(evidence.path, "CB-N6 local path");
+  const source = gitFile(
+    repoRoot,
+    "4f8c937a7ad19366d01f36bb994cb84959f129c4",
+    evidence.path,
+  );
+  assert(
+    Array.isArray(evidence.anchors) &&
+      evidence.anchors.length > 0 &&
+      evidence.anchors.every((anchor) => source.includes(anchor)),
+    `CB-N6 is missing a committed local anchor in ${evidence.path}`,
+  );
+}
+
+assert(
+  objectDigest(contract.secondRoundReviews) ===
+    "5cea90fcb4563779741592b7d220a35037b72377f6bcea760bd7d218fdc49b9d",
+  "CodeBuddy second-round review history changed",
+);
+const secondRoundReview = contract.secondRoundReviews?.[0];
+assert(
+  contract.secondRoundReviews?.length === 1 &&
+    secondRoundReview?.id === "CODEBUDDY-R2-2026-09-28" &&
+    secondRoundReview.status === "reviewed" &&
+    secondRoundReview.sourceId === secondRoundSource.id &&
+    secondRoundReview.snapshotId === "cli2api-2026-09-28" &&
+    secondRoundReview.targetReviewCommit ===
+      "4f8c937a7ad19366d01f36bb994cb84959f129c4" &&
+    secondRoundReview.targetReviewTree ===
+      "dc5ad894db16e71fb5e48aa395edff6bd9e8a98e" &&
+    gitTree(repoRoot, secondRoundReview.targetReviewCommit) ===
+      secondRoundReview.targetReviewTree &&
+    secondRoundReview.productionDelta === "CB-N6 only" &&
+    secondRoundReview.liveReceiptState?.intl === "live_pending" &&
+    secondRoundReview.liveReceiptState?.cn === "live_pending",
+  "CodeBuddy second-round review identity changed",
+);
+const reviewedFindingDispositions = new Map(
+  (secondRoundReview.findings ?? []).map((finding) => [finding.deltaId, finding]),
+);
+for (const [deltaId, disposition] of [
+  ["responses_incomplete_terminal", "fixture_verified_existing_shared_bridge"],
+  ["namespace_identity_round_trip", "fixture_verified_existing_shared_bridge"],
+  ["custom_tool_round_trip", "fixture_verified_existing_shared_bridge"],
+  ["malformed_arguments_permissive_drop", "rejected_permissive_drop"],
+]) {
+  const finding = reviewedFindingDispositions.get(deltaId);
+  assert(
+    secondRoundDeltaIds.has(deltaId) &&
+      finding?.disposition === disposition &&
+      finding.providerBranchAdded === false &&
+      finding.evidence?.length > 0,
+    `CodeBuddy second-round finding ${deltaId} changed`,
+  );
+  for (const evidence of finding.evidence) {
+    safeRelative(evidence.path, `${deltaId} local path`);
+    const source = gitFile(
+      repoRoot,
+      secondRoundReview.targetReviewCommit,
+      evidence.path,
+    );
+    assert(
+      evidence.anchors?.length > 0 &&
+        evidence.anchors.every((anchor) => source.includes(anchor)),
+      `${deltaId} is missing a committed shared-bridge anchor`,
+    );
+  }
+}
+assert(
+  reviewedFindingDispositions.size === 4 &&
+    reviewedFindingDispositions
+      .get("malformed_arguments_permissive_drop")
+      ?.reason.includes("does not silently erase"),
+  "CodeBuddy permissive malformed-argument behavior was not explicitly rejected",
 );
 
 assert(
@@ -813,7 +1003,7 @@ for (const [relativePath, anchors] of [
 }
 
 console.log(
-  `codebuddy reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} dirty-worktree-excluded snapshot, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, ${enhancements.size} enhancements, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}${
+  `codebuddy reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} dirty-worktree-excluded snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, ${enhancements.size + contract.incrementalEnhancementExtensions.length} enhancements, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

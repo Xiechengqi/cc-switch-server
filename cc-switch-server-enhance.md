@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）和 Grok GR-N3（`a0f567a`）；Cursor 与 Kiro 第二轮均冻结为 `reviewed_no_wire_delta`，GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。其余第二轮 Provider 仍按第 17 节状态推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）、Grok GR-N3（`a0f567a`）和 CodeBuddy CB-N6（最终复核 `4f8c937`）；Cursor 与 Kiro 第二轮均冻结为 `reviewed_no_wire_delta`，GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。Qoder 最新 HEAD 仍按第 17 节的 `unreviewed_skill_gate` 等待合规补审。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -62,7 +62,7 @@ Cursor 与 Qoder 本轮没有发现新的可静态确认生产缺口；Grok 的�
 | Grok | GR-N1 `fixture_verified`（观察-only）、CORE-N2 `fixture_verified`；CORE-N1 Provider lifecycle 与 reference-delta v2 已完成 | GR-N2 inference/media/remote_compaction 三个 operation 独立 `live_pending` |
 | Kiro | KI-N1/N2 `fixture_verified`；KI-N3 fail-closed fixture；CORE-N1 Provider facade、CORE-N2 与 reference-delta v2 已完成 | KI-N3 启用与 auth kind × region receipt `live_pending`；KI-05 shared cache 继续关闭 |
 | Qoder | QD-N2 `reviewed_no_wire_delta`、CORE-N2 `fixture_verified`；CORE-N1 Provider facade 与 reference-delta v2 已完成 | QD-N1 三 rail 独立 `live_pending` |
-| CodeBuddy | CB-N1/N2 `fixture_verified`；CB-N3/N5 共享实现已覆盖；CORE-N1 Provider facade、CORE-N2、Intl/CN schema-v2 私有 receipt gate 与 reference-delta v2 已完成 | CB-N4 与两站真实 receipt `live_pending`，v4.1 runtime disabled |
+| CodeBuddy | CB-N1/N2/N6 `fixture_verified`；CB-N3/N5 与第二轮 incomplete/namespace/custom-tool 由共享实现覆盖；CORE-N1 Provider facade、CORE-N2、Intl/CN schema-v2 私有 receipt gate 与 reference-delta v2 已完成 | CB-N4 与两站真实 receipt `live_pending`，v4.1 runtime disabled；malformed arguments 宽松丢弃明确不采纳 |
 
 CORE-N2、CORE-N1 与 EVID-N1 均已完成八个 Provider 切片，Phase 3 的 `state.rs` / `server_sqlite.rs` 本地纯结构拆分也已完成。所有缺真实凭据的 LIVE-N1 operation/rail/site 继续保持门禁；本地容量合同或结构验收完成不等于任何真实订阅状态提升。
 
@@ -917,7 +917,7 @@ CodeBuddy：
 | P0 | AG-N7～N11 | `fixture_verified`（`aeeaf1a`） | reasoning 可见性、工具结果邻接/`$ref`、tool choice 与 ID 映射已在本地闭环；两条 live rail 未提升 |
 | P0/P1 | CL-N5、CL-N6 | `fixture_verified`（`7794033`） | 相邻 text/citation 与非法工具名可逆 alias 已闭环；真实 Claude OAuth operation 未提升 |
 | P0 | CX-N5～N7、CX-N9 | `fixture_verified`（`f890774`） | schema/item 精确清理与私有事件闭集已闭环；真实 rail 未提升 |
-| P0 | CB-N6 | `planned_confirmed_gap` | cache usage 丢失 |
+| P0 | CB-N6 | `fixture_verified`（`4f8c937`） | cache usage 已在双站、三 Surface、流/非流闭环；真实站点状态未提升 |
 | P1 | CX-N8、CX-N10 | `fixture_verified`（`f890774`） | 真实 reasoning 复用与本地 reported-model 诊断已闭环；不改变路由/计费 |
 | P1 | GR-N3 | `fixture_verified`（`a0f567a`） | exact-scope 目录能力与 HTTP/WS 运行时闭环已完成；真实 entitlement 未提升 |
 | P1 | CX-N11、CX-N12 | `fixture_verified_after_red_differential`（`f890774`） | 红灯后完成有界 steering writer 与 strict response schema 窄修复 |
@@ -1024,6 +1024,10 @@ cli2api 的新增提交大部分已被目标共享 bridge 覆盖，但 cache usa
 
 cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控制面，不是本仓库固定 Provider/Account 的反代 wire，不进入本轮计划。Intl/CN 两站 receipt 与 CB-N4 仍各自 `live_pending`/disabled；cache fixture 通过不能提升任何站点的 live 状态。
 
+实施更新（2026-09-28）：CB-N6 的最终复核实现在 `4f8c937a7ad19366d01f36bb994cb84959f129c4` 完成。CodeBuddy decoder 与非流 aggregator 在 canonical 边界归一 cache read/write，顶层显式字段优先于 nested 与 vendor legacy，显式零保持权威，非法负数、小数与越界整数不参与计量；Claude、Codex、Gemini 输出和内部 UsageLog 使用同一优先级，inclusive total 不重复计 cache。Chat→Claude stream 保持工具参数增量输出，捕获 finish_reason 后的独立 usage 尾帧，并仅在唯一 `[DONE]` 与 EOF 均验证后提交成功 terminal。Intl/CN × 三 Surface × stream/non-stream 的 loopback fixture 同时覆盖非零冲突与显式零，usage-tail 截断不会先成功后报错；CodeBuddy 聚焦回归 70/70、Clippy 通过。
+
+证据更新追加 `cli2api-2026-09-28` snapshot、五个 committed source delta、`CB-N6` enhancement、`CB-OBS-0016` 与独立 second-round review。后者冻结 incomplete terminal、namespace identity、custom tool 已由共享 bridge 覆盖且没有 Provider 私有分支，并明确拒绝 malformed arguments 的静默整对丢弃。默认 audit 与 `--check-sources` 均通过；Intl/CN 仍分别为 `receipt=null/live_pending`，CB-N4 继续 runtime disabled。
+
 ### 17.11 实施批次与依赖
 
 | 批次 | 范围 | 进入条件 | 退出条件 |
@@ -1101,4 +1105,4 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
 8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
 
-第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6、Codex CX-N5～N12 与 Grok GR-N3 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok GR-N4 保持 `live_pending_no_wire_change`，CodeBuddy 仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6、Codex CX-N5～N12、Grok GR-N3 与 CodeBuddy CB-N6 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok GR-N4 保持 `live_pending_no_wire_change`。CodeBuddy 的 incomplete/namespace/custom-tool 复核为共享 bridge 已覆盖，malformed arguments 宽松丢弃明确不采纳；Intl/CN 仍为 `live_pending`。任何 fixture 或参考项目行为都不能解释为真实账号验收。

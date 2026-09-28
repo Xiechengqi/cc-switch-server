@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-28 CodeBuddy cache-usage conservation freeze
+
+CB-N6 冻结在 `assets/contract/codebuddy-reference-delta.json` 的 `CB-OBS-0016` 与 `incrementalEnhancementExtensions.CB-N6`。一次性只读证据取自 `cli2api@34c91b899aa2289f5ee49618d2d300f3eeaffedb`（tree `a0a1a3e6530e160284dba8eb18b85555ceab6a10`）及 `a9da609`、`fff3419` 的缓存 usage 历史对象；参考工作树中的 `proxy.html`、`proxy.md` 两个未跟踪文件继续全部排除。新增 snapshot 同时冻结 `f44e887` 的 incomplete terminal、`b415dd0` 的 namespace identity、`9f9b66e` 的 custom tool，以及 `aeaa4ac` 的 malformed arguments 宽松丢弃行为。默认审计完全自包含，显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才复核上述 committed object、文件 SHA-256 和符号。
+
+独立实现冻结在 `4f8c937a7ad19366d01f36bb994cb84959f129c4`（tree `dc5ad894db16e71fb5e48aa395edff6bd9e8a98e`）。CodeBuddy decoder 与非流 aggregator 会先把缓存读写归一到稳定顶层/详情字段，再进入共享转换与 usage 日志。读取优先级固定为显式顶层 `cache_read_tokens` / `cache_write_tokens`、协议 nested details、最后才是 vendor legacy alias；显式 `0` 是权威值，非法负数、小数和越界整数不参与优先级。Claude 输出把 inclusive prompt 拆成 fresh/read/write，Codex Responses 保留 inclusive `input_tokens` 与 details，Gemini 保留 inclusive prompt 和 cached count；三者的 total 都不把缓存量重复相加。CodeBuddy 的 Chat→Claude 流会持续增量输出工具参数、捕获独立 usage 尾帧，并只在唯一 `[DONE]` 与上游 EOF 均验证后提交成功 terminal，避免 finish_reason 先到时把 cache usage 固化为零或截断流先成功后报错。
+
+Intl/CN × Claude/Codex/Gemini × stream/non-stream 的 loopback fixture 已统一校验 cache read/write、显式零、冲突优先级和总量守恒；内部 usage parser 使用相同优先级。参考的 incomplete terminal、namespace identity 与 custom tool 行为已经由共享 Responses bridge 的既有 fixture 覆盖，没有增加 CodeBuddy 私有分支。`aeaa4ac` 对已完成 malformed call/result 的静默整对丢弃明确不采纳：目标继续在任何 done/completed 前稳定 fail closed，不伪造 `{}`，也不隐藏损坏数据。
+
+本地 CodeBuddy 聚焦回归为 70/70，Clippy 与 reference-delta 默认/committed-object 复核通过。CB-N6 只提升为 `fixture_verified`；Intl/CN 两站仍分别为 `receipt=null/live_pending`，CB-N4 继续 runtime disabled。此次修复不改变 Provider/Share/Account/site binding、attempt budget、计费权威或同账号 pre-commit 401 边界，也未引入账号池、轮换或跨身份 fallback。
+
 ## 2026-09-28 Codex Responses compatibility and observability freeze
 
 CX-N5～CX-N12 冻结在 `assets/contract/codex-reference-delta.json` 的 `CX-OBS-0014`～`CX-OBS-0022`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）与 `codex2api@9368ed82e039ac8458f9c264b2298b47d0cbf833`（tree `d878a5e7b8a94665dad14631d40be639d923a345`），并固定 octal NUL schema、cache breakpoint、私有 SSE event、连续工具轮 reasoning、item metadata、上游自报模型、全双工 steering 与 orphan required 的九个历史 committed delta。当前合同共有 18 个 source delta 和 22 条不可变 observation；`node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可复核 commit/tree、文件 SHA-256 和符号，默认构建、测试、发布与运行时不读取外部 checkout。
@@ -351,12 +361,13 @@ oracle 的 `verification` 单源仍维护 65 项既有 Rust Qoder 专项、9 项
 
 2026-09-19 的 CORE-N1 只调整 Server 内部所有权：`src/proxy/providers/codebuddy/` 统一持有 exact `codebuddy_oauth` Account binding、canonical request/model、Intl/CN live-catalog capability 与 payload preparation，以及 Provider/Account generation fence。共享 forwarder 继续拥有 Share/Account lease、usage、terminal、共享 attempt budget 和是否执行同账号 pre-commit 401 replay；endpoint、header、wire、错误记录路径与恢复次数没有变化。LIVE-N1 同时新增 Intl/CN 两份相互独立的 schema-v2 私有 receipt validator，绑定当前 target commit/harness、Account auth/token generation、三个 Surface Provider revision/runtime digest、Share revision/binding digest、exact model、三份 fresh `codebuddy_live_model_catalog` snapshot 与六个 body hash。16 项检查必须全部通过才可在真实模式接受 `live_verified`；fixture 永远只能得到 `contract_verified/live_pending`。当前未提供两站真实 receipt，合同中的 receipt 继续为 `null`，CB-N4、企业与多模态也不会被 receipt 自动启用。
 
-EVID-N1 随后把 CodeBuddy reference delta 迁为 append-only schema v2。`d81056c786196357c1074336a06a6cb847c9f9d6` 中原 schema-v1 文件 SHA-256、target commit/tree、全部 11 个历史字段的 canonical/逐字段 digest 均已冻结；新增 `cli2api@624874a0331f5e8f012ef104b633e69826487458` / tree `c2f02a394e1381adf8291949822ce4b08a48dfb3` committed-object snapshot，并明确记录工作树不干净、`proxy.html` 与 `proxy.md` 两个未跟踪文件全部排除。当前 15 条不可变 observation 一一映射 CB-01～04、CB-N1～N5、CORE-N1/N2、LIVE-N1 与 CB-R1～R3，绑定 source path/symbol/digest、处置理由和本仓库 committed baseline/implementation object。三条 reject 固定账号池/轮换/affinity 与跨 domain/site/Account/Provider fallback、签到/企业运营/prompt rewrite/商业 Key/多租户后台，以及未经验证的企业/图像/视频能力、外仓运行时依赖、fixture 冒充 live 和缺唯一 terminal + EOF 仍成功。默认审计不读取外部 checkout，只有显式 `--check-sources` 才复核冻结 Git object。
+EVID-N1 随后把 CodeBuddy reference delta 迁为 append-only schema v2。`d81056c786196357c1074336a06a6cb847c9f9d6` 中原 schema-v1 文件 SHA-256、target commit/tree、全部 11 个历史字段的 canonical/逐字段 digest 均已冻结；新增 `cli2api@624874a0331f5e8f012ef104b633e69826487458` / tree `c2f02a394e1381adf8291949822ce4b08a48dfb3` committed-object snapshot，并明确记录工作树不干净、`proxy.html` 与 `proxy.md` 两个未跟踪文件全部排除。该次首轮冻结的 15 条不可变 observation 一一映射 CB-01～04、CB-N1～N5、CORE-N1/N2、LIVE-N1 与 CB-R1～R3，绑定 source path/symbol/digest、处置理由和本仓库 committed baseline/implementation object。三条 reject 固定账号池/轮换/affinity 与跨 domain/site/Account/Provider fallback、签到/企业运营/prompt rewrite/商业 Key/多租户后台，以及未经验证的企业/图像/视频能力、外仓运行时依赖、fixture 冒充 live 和缺唯一 terminal + EOF 仍成功。默认审计不读取外部 checkout，只有显式 `--check-sources` 才复核冻结 Git object。
 
 1. CodeBuddy CLI `2.142.0` bundle、站点 overlay，以及国际个人订阅账号的脱敏真实流量；
 2. 本仓库 [`docs/provider/codebuddy-oauth.md`](docs/provider/codebuddy-oauth.md) 已冻结的端点、OAuth、refresh、目录、计费与 terminal 约束；
 3. `cli2api` commit `9b18f2d` 的 WorkBuddy CN/Global adapter，仅作为国内实现、payload、错误投影与缺陷的交叉样本。
 4. `cli2api@624874a0331f5e8f012ef104b633e69826487458` 的提交态增量，只用于 CB-N1～CB-N5 差分，不覆盖前两级证据。
+5. `cli2api@34c91b899aa2289f5ee49618d2d300f3eeaffedb` 及五个历史 committed delta 的第二轮只读增量，只用于 CB-N6 与共享 Responses bridge 复核，同样不覆盖前两级证据。
 
 实现不得在构建或运行时读取上述外部源码。国际站固定为 `https://www.codebuddy.ai`，国内站固定为 `https://copilot.tencent.com`；站点属于账号身份，不允许失败后换 host。CLI `2.142.0` 证据优先于 `cli2api` 使用的旧 `2.139.0` wire。国际 fixture 可据此标为离线通过；国内真实数据面、企业账号、图像/视频与本仓库真实订阅 receipt 仍是 `live_pending`。
 

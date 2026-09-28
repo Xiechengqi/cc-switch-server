@@ -347,11 +347,13 @@ prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_cache_write_tokens
 
 `credit` 是计费信号，`completion_thinking_tokens` 单独计推理 token。**U15 已关闭。**
 
+CB-N6 对缓存 usage 再做一层守恒归一化。read 固定按顶层 `cache_read_tokens` → `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` → vendor legacy 字段取第一个有效非负整数，write 同理先取顶层 `cache_write_tokens`，再取 nested creation/write，最后取 legacy。显式 `0` 是权威值，不允许被后面的非零 alias 覆盖；负数、小数和越界整数不进入 token 计量。Claude Messages 将 inclusive prompt 拆成 fresh/read/write；Codex Responses 保持 inclusive `input_tokens` 并在 details 写 read/write；Gemini 保持 inclusive prompt 和 cached count。三类 Surface 的 total 都按 inclusive input/output 守恒，不重复加入 cache token。
+
 ### 5.8 Provider lifecycle facade
 
 CORE-N1 将精确 `codebuddy_oauth` Account binding、canonical request/model、站点绑定的 live catalog capability、payload preparation 和 Provider/Account generation fence 收敛到 `src/proxy/providers/codebuddy/`。共享 `forwarder.rs` 仍拥有 Share/Account lease、usage、terminal、统一 attempt budget，以及是否允许原账号在下游提交前执行一次 401 refresh/replay。此次拆分不改变 endpoint、header、payload bytes、错误记录分支、恢复次数或 terminal + EOF 合同，也不引入 Account、Provider、site、domain 或 rail fallback。
 
-EVID-N1 冻结 `d81056c` 中原 schema-v1 文件及全部 11 个历史字段，追加 `cli2api@624874a` / tree `c2f02a3` 的 committed-object snapshot，并明确排除参考工作树中的 `proxy.html`、`proxy.md`。当前 15 条 observation 分别记录 differential、live gate 或 reject，绑定 source path/symbol/digest、本仓库 baseline/implementation commit/tree、合同锚点和 fixture；默认 audit 完全自包含，只有显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才读取外部已提交对象。CB-R1～R3 拒绝账号调度与跨边界 fallback、运营/商业控制面，以及未验证能力、伪 live 和弱化 terminal + EOF。
+EVID-N1 冻结 `d81056c` 中原 schema-v1 文件及全部 11 个历史字段，追加 `cli2api@624874a` / tree `c2f02a3` 的 committed-object snapshot，并明确排除参考工作树中的 `proxy.html`、`proxy.md`。首轮 15 条 observation 分别记录 differential、live gate 或 reject，绑定 source path/symbol/digest、本仓库 baseline/implementation commit/tree、合同锚点和 fixture；默认 audit 完全自包含，只有显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才读取外部已提交对象。CB-R1～R3 拒绝账号调度与跨边界 fallback、运营/商业控制面，以及未验证能力、伪 live 和弱化 terminal + EOF。
 
 ### 5.9 请求生命周期内存预算
 
@@ -362,6 +364,14 @@ CORE-N2 只对精确的 `codebuddy_oauth` Provider 启用；普通 `claude`、`c
 容量耗尽是 sticky 的：未提交响应返回稳定 `503`、`Retry-After: 1` 与 `cc_switch_request_memory_exhausted`；已提交 200 的 stream 只输出一个不含预算内部细节的 terminal。当前上游被取消，不 refresh/replay，不切 Account、Provider 或 site；usage 记录 `memory_capacity`，Provider outcome 归为 `CapacityShed` 而不是普通 `NetworkFailure`。分发边界对 `forward_codebuddy` future 做堆化，使默认 Tokio 测试线程栈无需额外 `RUST_MIN_STACK` 才能承载该状态机。
 
 `CB-OBS-0015` 只把 `cli2api` 的 1/16 MiB body 读取上限、16 MiB 单条 SSE line ceiling 和 retained non-stream aggregation 当作差分信号；参考项目没有证明统一生命周期预算、payload/header 副本、下游 transform、容量分类或上述恢复语义。`CORE-N2-CODEBUDDY=fixture_verified` 绑定本仓库 `573dc47` 的独立实现和 66 个 CodeBuddy、26 个 request-memory、15 个 memory-exhaustion 专项测试。它不构成 Intl/CN 真实长流或内存压力 receipt，两站仍分别为 `null/live_pending`。
+
+### 5.10 第二轮 cache usage 与共享 Responses 复核
+
+2026-09-28 的 committed-object snapshot 冻结 `cli2api@34c91b899aa2289f5ee49618d2d300f3eeaffedb` / tree `a0a1a3e6530e160284dba8eb18b85555ceab6a10`，仍排除未跟踪的 `proxy.html`、`proxy.md`。`a9da609` 与 `fff3419` 暴露的 cache usage 丢失由 CB-N6 独立修复：decoder 和非流 aggregator 先规范化 usage，内部日志与三个下游 Surface 使用同一字段优先级；CodeBuddy Chat→Claude stream 持续增量发送工具参数、捕获独立 usage 尾帧，并只在唯一 `[DONE]` 与 EOF 都验证后提交成功终态。Intl/CN × 三 Surface × stream/non-stream 的 loopback fixture 同时跑非零与显式零场景，覆盖 read/write、冲突字段与 total 守恒；另有 usage-tail 截断 fixture 证明不会先成功后报错，状态为 `fixture_verified`。
+
+同一轮复核确认 `f44e887` 的 `finish_reason=length`、`b415dd0` 的 namespace identity 和 `9f9b66e` 的 custom tool 已由共享 Responses bridge 的流/非流 fixture 覆盖，无需增加 Provider 私有状态机。`aeaa4ac` 对已完成 malformed function call/result 的静默丢弃不采纳；本仓库继续在任何 done/completed 前 fail closed，不把坏 arguments 改成 `{}`，也不隐藏损坏数据。
+
+reference delta 现在保留原 15 条 observation 并追加 `CB-OBS-0016`、CB-N6 enhancement 与独立 second-round review；默认 audit 不读取外部仓库，`--check-sources` 才验证新旧 committed objects。该结果不提升 Intl/CN receipt，也不开放 CB-N4、企业或多模态能力。
 
 ---
 

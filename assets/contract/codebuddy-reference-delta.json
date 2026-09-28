@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "policy": {
     "scope": "single bound Provider/Share/Account and immutable site; same-account same-rail pre-commit recovery only; no pool, no rotation, no credential fallback, no domain fallback, no cross-account fallback, no cross-Provider fallback",
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
@@ -201,6 +201,204 @@
   ],
   "sourceExtensions": [
     {
+      "id": "cli2api-head-2026-09-28",
+      "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
+      "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
+      "commit": "34c91b899aa2289f5ee49618d2d300f3eeaffedb",
+      "extendsSourceId": "cli2api-head",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/client.go",
+          "sha256": "ec771152dca4f7f44195e636c7751741a3c2a55f9075cf05aa38f7b72c0f081c"
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "470cb1beebe7eb2d273ffff61df190a9409d68d87c76dd7eb0df776fa9503418"
+        },
+        {
+          "path": "internal/gateway/compat.go",
+          "sha256": "b5453cdd59e38eab773cd4d7041b4c8b89aea0369fca9a6272193dbbd2acc986"
+        },
+        {
+          "path": "internal/gateway/compat_stream.go",
+          "sha256": "e9c746e57233083ad0fe119db7fc2379b1375308821a9e0636ba22ef0154ddec"
+        },
+        {
+          "path": "internal/gateway/openai_stream.go",
+          "sha256": "d8f7d419e673a777b62c928ac1dd9b0a47b2b337487dce5651ff7a3ccde6b929"
+        },
+        {
+          "path": "internal/gateway/responses.go",
+          "sha256": "01df868c83ab36457137c418bcc0fa4af2beca2fac6b97ad1b6ddf78b36f876b"
+        },
+        {
+          "path": "internal/gateway/responses_test.go",
+          "sha256": "6e75b4ade170207c8cd3e5b1680cf5169515b13e2b6b163099081c2aeb26dc3d"
+        },
+        {
+          "path": "internal/translate/compat.go",
+          "sha256": "55a3f94b1821b94aef30246984dc2a647b26fd8d5d0ba45cd05c527f47b4ddf1"
+        },
+        {
+          "path": "internal/translate/compat_test.go",
+          "sha256": "7f1a6e0b4b89a3c4864ea12fc59b9345773bdcf8a501f0688b9635c09a9338c3"
+        },
+        {
+          "path": "internal/translate/tools.go",
+          "sha256": "e436f65d863793c5cb65a7f0d39d6997a4f4507c9e3ba5118827cb53cd759e09"
+        },
+        {
+          "path": "internal/translate/tools_test.go",
+          "sha256": "ddc582949b9269681f4db2c5b0d4d27671c9d06d658041cd6c512fca2b5d0116"
+        }
+      ],
+      "deltas": [
+        {
+          "id": "cache_usage_conservation",
+          "commits": [
+            "a9da609e370d4aba6353afe02419eccfa25ff520",
+            "fff3419b2a7aee0a744ce93229c3d0860d485262"
+          ],
+          "files": [
+            {
+              "commit": "a9da609e370d4aba6353afe02419eccfa25ff520",
+              "path": "internal/providers/workbuddy/client.go",
+              "sha256": "ac308fe60ce86c74b0a2ed7fa66c21410b173b9d01613b86ffc82e060aa6667d"
+            },
+            {
+              "commit": "a9da609e370d4aba6353afe02419eccfa25ff520",
+              "path": "internal/providers/workbuddy/client_test.go",
+              "sha256": "61ee2d51acb938eda2eb568da08c2fd081cd0d0dd6bee6f31389ea1f6a0cf8c7"
+            },
+            {
+              "commit": "fff3419b2a7aee0a744ce93229c3d0860d485262",
+              "path": "internal/gateway/compat_stream.go",
+              "sha256": "264528051195ec4655aecd921f9c501b4071045817c0b447fd071d81f994cfd7"
+            },
+            {
+              "commit": "fff3419b2a7aee0a744ce93229c3d0860d485262",
+              "path": "internal/gateway/openai_stream.go",
+              "sha256": "5d4f696c01eb91f482aab14f5891d982274ced024a85c321f5d193d038dc080f"
+            },
+            {
+              "commit": "fff3419b2a7aee0a744ce93229c3d0860d485262",
+              "path": "internal/gateway/responses.go",
+              "sha256": "f2752a339a237c12799b7a6dcbb55a7771ab109a0ce45f5885c6a8b4b2c31c17"
+            },
+            {
+              "commit": "fff3419b2a7aee0a744ce93229c3d0860d485262",
+              "path": "internal/gateway/responses_test.go",
+              "sha256": "41f6a5ac7b52f73d551df4165d2dc45b25ba747dd81563f2cf61495d6ecfc74c"
+            }
+          ]
+        },
+        {
+          "id": "responses_incomplete_terminal",
+          "commits": ["f44e887a4fdc3a16017730e0156d6a153077bd60"],
+          "files": [
+            {
+              "commit": "f44e887a4fdc3a16017730e0156d6a153077bd60",
+              "path": "internal/gateway/compat_stream.go",
+              "sha256": "0ff9f9e524062bb0142b198810c030cebecb57403173463b2c30e13f0604d328"
+            },
+            {
+              "commit": "f44e887a4fdc3a16017730e0156d6a153077bd60",
+              "path": "internal/gateway/openai_stream.go",
+              "sha256": "4297636a7661e5fcd592453a57b61ed4a7575feb9acf44ff8f4d30e27346e1de"
+            },
+            {
+              "commit": "f44e887a4fdc3a16017730e0156d6a153077bd60",
+              "path": "internal/gateway/responses.go",
+              "sha256": "e2a8c9eeef0ea49fb75e36a918816b826d17a94ff88722124321ce91aad664ce"
+            },
+            {
+              "commit": "f44e887a4fdc3a16017730e0156d6a153077bd60",
+              "path": "internal/gateway/responses_test.go",
+              "sha256": "4e78be82d6d2152f9e162da4dd63cf02df9168a55b92a26258d6c3c2eb4861c8"
+            }
+          ]
+        },
+        {
+          "id": "malformed_arguments_permissive_drop",
+          "commits": ["aeaa4ac5b9d085f3880069cddff270e9947064a4"],
+          "files": [
+            {
+              "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
+              "path": "internal/gateway/compat.go",
+              "sha256": "b5453cdd59e38eab773cd4d7041b4c8b89aea0369fca9a6272193dbbd2acc986"
+            },
+            {
+              "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
+              "path": "internal/gateway/compat_stream.go",
+              "sha256": "b07186e7651431b5932917649ab2e0630f436124052043cb5303b38a4472b473"
+            },
+            {
+              "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
+              "path": "internal/gateway/responses_test.go",
+              "sha256": "1cd6d66615d0bd1aacb06efc67feb0704b3ca14eb36a859bc42d11936605b884"
+            },
+            {
+              "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
+              "path": "internal/translate/compat.go",
+              "sha256": "11ac327ae1d6c02e77bafb82942745f90e016652271ab4e9260f7fed60409923"
+            },
+            {
+              "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
+              "path": "internal/translate/compat_test.go",
+              "sha256": "7f1a6e0b4b89a3c4864ea12fc59b9345773bdcf8a501f0688b9635c09a9338c3"
+            }
+          ]
+        },
+        {
+          "id": "namespace_identity_round_trip",
+          "commits": ["b415dd0460bbf07d58bcb476adc2192f5fe3b4f6"],
+          "files": [
+            {
+              "commit": "b415dd0460bbf07d58bcb476adc2192f5fe3b4f6",
+              "path": "internal/translate/compat.go",
+              "sha256": "9f86b7ec4f9c0f84415886c02380f71803271980e8ec3da7fc0e9fe1db724787"
+            },
+            {
+              "commit": "b415dd0460bbf07d58bcb476adc2192f5fe3b4f6",
+              "path": "internal/translate/tools.go",
+              "sha256": "59ff68eb3e871c16c7c1c05b66989e0328abc4c27430c9cfdf024e8c7f5e50fb"
+            },
+            {
+              "commit": "b415dd0460bbf07d58bcb476adc2192f5fe3b4f6",
+              "path": "internal/translate/tools_test.go",
+              "sha256": "1fbbc1254ccb63ec6a3ef7fabfb807b6f046002e810e6a589b48c071bc81cf68"
+            }
+          ]
+        },
+        {
+          "id": "custom_tool_round_trip",
+          "commits": ["9f9b66ef60ff97b20cd602475665bc854a7b9cf0"],
+          "files": [
+            {
+              "commit": "9f9b66ef60ff97b20cd602475665bc854a7b9cf0",
+              "path": "internal/translate/compat.go",
+              "sha256": "ac10aa8bc291f21d6fe84def0511642b8e61ba5d148cf8152f1bbdb46621f80c"
+            },
+            {
+              "commit": "9f9b66ef60ff97b20cd602475665bc854a7b9cf0",
+              "path": "internal/translate/tools.go",
+              "sha256": "bad7f9805f2fad533f8ec62c27a4360998b8ad71294287ee1cf543d9e0aa7c1c"
+            },
+            {
+              "commit": "9f9b66ef60ff97b20cd602475665bc854a7b9cf0",
+              "path": "internal/translate/tools_test.go",
+              "sha256": "b68b5598ecf2a8ce59b2b18ab0f1153fbc71e755f118c1e28a2bd1eeec925b84"
+            },
+            {
+              "commit": "9f9b66ef60ff97b20cd602475665bc854a7b9cf0",
+              "path": "internal/providers/workbuddy/client_test.go",
+              "sha256": "2047edf3a88063156a514ba8f589900263292c7adbd3cd4402e7d8823b7b2f3c"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "id": "cli2api-head",
       "rootEnv": "CODEBUDDY_REFERENCE_ROOT",
       "defaultRelativeRoot": "../proxy/CodeBuddy/cli2api",
@@ -270,6 +468,171 @@
       ]
     }
   ],
+  "incrementalEnhancementExtensions": [
+    {
+      "id": "CB-N6",
+      "status": "fixture_verified",
+      "referenceDelta": "cache_usage_conservation",
+      "providerType": "codebuddy_oauth",
+      "sites": [
+        "intl",
+        "cn"
+      ],
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "modes": [
+        "stream",
+        "non_stream"
+      ],
+      "readPriority": [
+        "cache_read_tokens",
+        "nested_cached_tokens",
+        "vendor_legacy"
+      ],
+      "writePriority": [
+        "cache_write_tokens",
+        "nested_cache_write_tokens",
+        "vendor_legacy"
+      ],
+      "explicitZeroPreserved": true,
+      "invalidCacheNumbersRejected": true,
+      "totalTokensDoubleCounted": false,
+      "trailingUsageCapturedBeforeStrictTerminal": true,
+      "strictDoneAndEofBeforeTerminal": true,
+      "incrementalToolDeltasPreserved": true,
+      "internalUsageUsesSamePriority": true,
+      "liveReceiptState": "live_pending",
+      "evidence": [
+        {
+          "path": "src/proxy/codebuddy.rs",
+          "anchors": [
+            "fn canonicalize_codebuddy_cache_usage(",
+            "cache_usage_normalization_preserves_original_fields_and_explicit_zero"
+          ]
+        },
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "fn openai_chat_cache_read_tokens(",
+            "fn openai_chat_cache_write_tokens(",
+            "codebuddy_cache_usage_explicit_zero_wins_across_all_surfaces"
+          ]
+        },
+        {
+          "path": "src/proxy/stream_transforms.rs",
+          "anchors": [
+            "CodeBuddy emits finish_reason before its separate usage tail.",
+            "ChatAnthropicState::deferred_terminal()",
+            "codebuddy_deferred_terminal_keeps_tool_deltas_incremental"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+          "anchors": [
+            "fn assert_codebuddy_cache_usage(",
+            "codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes",
+            "codebuddy_truncation_before_done_is_never_reported_as_success"
+          ]
+        },
+        {
+          "path": "src/domain/usage/store.rs",
+          "anchors": [
+            "codebuddy_cache_usage_priority_preserves_zero_and_total_conservation"
+          ]
+        }
+      ]
+    }
+  ],
+  "secondRoundReviews": [
+    {
+      "id": "CODEBUDDY-R2-2026-09-28",
+      "status": "reviewed",
+      "sourceId": "cli2api-head-2026-09-28",
+      "snapshotId": "cli2api-2026-09-28",
+      "targetReviewCommit": "4f8c937a7ad19366d01f36bb994cb84959f129c4",
+      "targetReviewTree": "dc5ad894db16e71fb5e48aa395edff6bd9e8a98e",
+      "productionDelta": "CB-N6 only",
+      "findings": [
+        {
+          "deltaId": "responses_incomplete_terminal",
+          "disposition": "fixture_verified_existing_shared_bridge",
+          "providerBranchAdded": false,
+          "evidence": [
+            {
+              "path": "src/proxy/transforms.rs",
+              "anchors": [
+                "Some(\"length\") => \"incomplete\"",
+                "anthropic_response_maps_max_tokens_stop_reason_to_openai_length"
+              ]
+            },
+            {
+              "path": "src/proxy/stream_transforms.rs",
+              "anchors": [
+                "if self.finish_reason.as_deref() == Some(\"length\")",
+                "chat_reasoning_closes_before_text_and_maps_length_terminal"
+              ]
+            }
+          ]
+        },
+        {
+          "deltaId": "namespace_identity_round_trip",
+          "disposition": "fixture_verified_existing_shared_bridge",
+          "providerBranchAdded": false,
+          "evidence": [
+            {
+              "path": "src/proxy/transforms.rs",
+              "anchors": [
+                "responses_namespace_tools_round_trip_through_chat_and_anthropic",
+                "long_namespace_tool_names_are_stable_and_byte_bounded"
+              ]
+            }
+          ]
+        },
+        {
+          "deltaId": "custom_tool_round_trip",
+          "disposition": "fixture_verified_existing_shared_bridge",
+          "providerBranchAdded": false,
+          "evidence": [
+            {
+              "path": "src/proxy/transforms.rs",
+              "anchors": [
+                "responses_custom_tools_round_trip_through_anthropic",
+                "chat_custom_tool_response_is_restored_to_responses_item"
+              ]
+            },
+            {
+              "path": "src/proxy/stream_transforms.rs",
+              "anchors": [
+                "chat_custom_tool_stream_unwraps_native_input_once"
+              ]
+            }
+          ]
+        },
+        {
+          "deltaId": "malformed_arguments_permissive_drop",
+          "disposition": "rejected_permissive_drop",
+          "providerBranchAdded": false,
+          "evidence": [
+            {
+              "path": "src/proxy/transforms.rs",
+              "anchors": [
+                "openai_chat_to_anthropic_validates_arguments_and_demotes_orphan_outputs",
+                "invalid completed arguments must fail closed"
+              ]
+            }
+          ],
+          "reason": "Completed malformed function arguments remain a stable protocol error; the server does not silently erase the call/result pair or fabricate an empty object."
+        }
+      ],
+      "liveReceiptState": {
+        "intl": "live_pending",
+        "cn": "live_pending"
+      }
+    }
+  ],
   "sourceSnapshots": [
     {
       "id": "cli2api-2026-09-19",
@@ -277,6 +640,21 @@
       "repository": "cli2api",
       "headCommit": "624874a0331f5e8f012ef104b633e69826487458",
       "headTree": "c2f02a394e1381adf8291949822ce4b08a48dfb3",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": 2,
+      "excludedWorktreePaths": [
+        "proxy.html",
+        "proxy.md"
+      ],
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "cli2api-2026-09-28",
+      "sourceId": "cli2api-head-2026-09-28",
+      "repository": "cli2api",
+      "headCommit": "34c91b899aa2289f5ee49618d2d300f3eeaffedb",
+      "headTree": "a0a1a3e6530e160284dba8eb18b85555ceab6a10",
       "worktreeClean": false,
       "worktreeChangesExcluded": true,
       "excludedWorktreeEntries": 2,
@@ -1161,6 +1539,93 @@
         ]
       },
       "reason": "cli2api proves only that several control-plane and error-body reads plus individual SSE lines have explicit ceilings, while non-stream aggregation retains content, reasoning, and tool-call maps. Treat that as a differential signal that reads, lines, and retained aggregation must be bounded; it does not establish one sticky request-lifecycle budget, payload or header copies, downstream transforms, capacity classification, or 401 recovery semantics. The local implementation independently accounts those states for both sites and all three surfaces."
+    },
+    {
+      "id": "CB-OBS-0016",
+      "providerFamily": "codebuddy",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cli2api-head-2026-09-28",
+        "snapshotId": "cli2api-2026-09-28",
+        "repository": "cli2api",
+        "deltaId": "cache_usage_conservation",
+        "commit": "34c91b899aa2289f5ee49618d2d300f3eeaffedb",
+        "tree": "a0a1a3e6530e160284dba8eb18b85555ceab6a10",
+        "paths": [
+          "internal/providers/workbuddy/client.go",
+          "internal/providers/workbuddy/client_test.go",
+          "internal/gateway/compat_stream.go",
+          "internal/gateway/openai_stream.go",
+          "internal/gateway/responses.go",
+          "internal/gateway/responses_test.go"
+        ],
+        "symbols": [
+          "outcomeFromAggregate",
+          "TestOutcomeFromAggregatePreservesCacheUsage",
+          "ParseStreamUsageLine",
+          "responsesUsage",
+          "TestResponsesUsagePreservesCachedInputTokens"
+        ],
+        "sourceDigest": "0a521fd556bae1d20b3ead30d0b8fd4f4107071c33e2c48bb23e6df43492a7e6"
+      },
+      "disposition": "differential",
+      "enhancementIds": [
+        "CB-N6"
+      ],
+      "target": {
+        "baselineCommit": "4354c5390cedb3879afe7f2c18153192fe17170c",
+        "baselineTree": "9d335f9748f9841bb5790955e14ee3b25efb9a2e",
+        "implementationCommit": "4f8c937a7ad19366d01f36bb994cb84959f129c4",
+        "implementationTree": "dc5ad894db16e71fb5e48aa395edff6bd9e8a98e",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy.rs",
+            "anchors": [
+              "fn canonicalize_codebuddy_cache_usage(",
+              "cache_usage_normalization_preserves_original_fields_and_explicit_zero"
+            ]
+          },
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "fn openai_chat_cache_read_tokens(",
+              "fn openai_chat_cache_write_tokens(",
+              "codebuddy_cache_usage_explicit_zero_wins_across_all_surfaces"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "CodeBuddy emits finish_reason before its separate usage tail.",
+              "ChatAnthropicState::deferred_terminal()",
+              "codebuddy_deferred_terminal_keeps_tool_deltas_incremental"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+            "anchors": [
+              "fn assert_codebuddy_cache_usage(",
+              "codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes",
+              "codebuddy_truncation_before_done_is_never_reported_as_success"
+            ]
+          },
+          {
+            "path": "src/domain/usage/store.rs",
+            "anchors": [
+              "codebuddy_cache_usage_priority_preserves_zero_and_total_conservation"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "cache_usage_normalization_preserves_original_fields_and_explicit_zero",
+          "codebuddy_cache_usage_explicit_zero_wins_across_all_surfaces",
+          "codebuddy_deferred_terminal_keeps_tool_deltas_incremental",
+          "codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes",
+          "codebuddy_truncation_before_done_is_never_reported_as_success",
+          "codebuddy_cache_usage_priority_preserves_zero_and_total_conservation"
+        ]
+      },
+      "reason": "Adopt cache-usage conservation at the CodeBuddy canonical boundary and every downstream surface. Explicit top-level read/write fields win even when zero, invalid numeric shapes are rejected, nested fields precede vendor legacy aliases, and total tokens remain inclusive. The Claude stream captures the separate usage tail without delaying tool deltas, but commits success only after the unique [DONE] marker and upstream EOF."
     }
   ],
   "evidenceExtensions": [
