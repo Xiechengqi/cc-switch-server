@@ -89,6 +89,7 @@ for (const source of baseline.sources ?? []) {
 const immutableSourceSnapshotDigests = new Map([
   ["cliproxyapi-2026-09-18", "d4265b7924bb87c6b0963717128542fed0f04c997e35cfccdfdb912414c07d5c"],
   ["antigravity-manager-2026-09-18", "fd27d23c4b2c06b572c4ba57ff419cc2f7f0129f303b1eb226f3f8e80f335e19"],
+  ["cliproxyapi-2026-09-28", "15e780d74d1498fe47743f2a6aeda0d1819d335e0a46a837217c126f59ed14e0"],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of baseline.sourceSnapshots ?? []) {
@@ -132,6 +133,11 @@ const immutableObservationDigests = new Map([
   ["AG-OBS-0015", "664d7883c8005f7ea3285077125ca0fedf50c34ee51edc70f1e14e9b62788cec"],
   ["AG-OBS-0016", "fc8cb48e2fe0035a41a142937561b71a447bad933a5eeaf99aa3580314af8880"],
   ["AG-OBS-0017", "01c34d7e48885c8dfd99aae78094698408c7398b293748d4696bbd61fd96c646"],
+  ["AG-OBS-0018", "1d2dc9748ef0f7df7eb57f599a256a7c89d3732adcbeb0b3ab6765691d493d79"],
+  ["AG-OBS-0019", "2ff6d969016dca4cf7f6baccb29c055485cc84de8822894772f7003790927e53"],
+  ["AG-OBS-0020", "c40e0ab9be522b350510059e3b3d506e03266578f8ca10e4f187d139f19851b6"],
+  ["AG-OBS-0021", "bcdd8e99a5bb8c9c20b89870b5e50a57027b36d454e3a7a7a4c980334a94f2a4"],
+  ["AG-OBS-0022", "59df4acb20f4d00fcf5dc393bd39f7b9cea359683d5551330d46e914aa0587ef"],
 ]);
 const capabilityIds = new Set((baseline.capabilities ?? []).map((capability) => capability.id));
 const observationIds = new Set();
@@ -263,6 +269,11 @@ const expectedCapabilities = new Map([
   ["AG-N4", "fixture_verified"],
   ["AG-N5", "fixture_verified"],
   ["AG-N6", "live_pending"],
+  ["AG-N7", "fixture_verified"],
+  ["AG-N8", "fixture_verified"],
+  ["AG-N9", "fixture_verified"],
+  ["AG-N10", "fixture_verified"],
+  ["AG-N11", "fixture_verified"],
   ["CORE-N2-ANTIGRAVITY", "fixture_verified"],
 ]);
 for (const capability of baseline.capabilities ?? []) {

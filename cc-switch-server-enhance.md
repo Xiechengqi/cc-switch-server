@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-19。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮 Antigravity AG-N7～N11 已由 `aeeaf1a` 完成代码与 fixture，证据状态见 `AG-OBS-0018`～`AG-OBS-0022`；其余第二轮 Provider 仍按第 17 节状态推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -891,7 +891,7 @@ CodeBuddy：
 
 ## 17. 第二轮增量审计（2026-09-28）
 
-本节是对第 0～16 节的追加审计，不回写、覆盖或重新解释首轮已经冻结的实现状态。第二轮目标基线为 `cc-switch-server@6b9b838`；外部参考只读取 Git 提交对象，不把外部工作树、测试目录或运行时代码引入本仓库。首轮的 `fixture_verified`、`live_pending` 和 reject 结论全部继续有效；下文新增的 N 编号均处于计划阶段，不能倒推为已经实现。
+本节是对第 0～16 节的追加审计，不回写、覆盖或重新解释首轮已经冻结的实现状态。第二轮目标基线为 `cc-switch-server@6b9b838`；外部参考只读取 Git 提交对象，不把外部工作树、测试目录或运行时代码引入本仓库。首轮的 `fixture_verified`、`live_pending` 和 reject 结论全部继续有效。除明确带“实施更新”的项目外，下文新增 N 编号仍处于计划阶段，不能倒推为已经实现。
 
 ### 17.1 参考冻结点与审计完整性
 
@@ -914,7 +914,8 @@ CodeBuddy：
 
 | 优先级 | 新项目 | 当前状态 | 主要风险 |
 | --- | --- | --- | --- |
-| P0 | AG-N7～N11、CL-N5、CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | reasoning 可见性错误、工具结果错配/拒绝、权限静默放宽、私有事件外泄、usage 丢失 |
+| P0 | AG-N7～N11 | `fixture_verified`（`aeeaf1a`） | reasoning 可见性、工具结果邻接/`$ref`、tool choice 与 ID 映射已在本地闭环；两条 live rail 未提升 |
+| P0 | CL-N5、CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | citation/tool 语义丢失、权限静默放宽、私有事件外泄、usage 丢失 |
 | P1 | CL-N6、CX-N8、CX-N10、GR-N3 | `planned_confirmed_gap` | 非法工具名拒绝、连续工具轮 reasoning 丢失、上游换模不可见、目录能力与运行时脱节 |
 | P1 | CX-N11、CX-N12、GR-N4 | `planned_differential_first` / `live_only` | WS 并发时序、strict response schema、Grok 客户身份/header 的静态证据不足 |
 | 复核 | Cursor、Kiro、sub2api | `reviewed_no_wire_delta` | 不制造无意义生产改动，只刷新冻结证据 |
@@ -935,6 +936,8 @@ CodeBuddy：
 | AG-N11 | CLIProxyAPI `580df95a` 的请求级 ID 清洗和 collision map | Antigravity 的 call/result ID 没有完整的请求级 raw↔wire canonical map；非法字符清洗后可能碰撞，`call573` 与 `call_573` 兼容形态也缺少受控 lookup | 建立仅存活于单请求的映射：合法 ID 原样保留，非法 ID 稳定清洗，碰撞加确定性后缀，response 始终按 raw ID 取回结果；兼容 lookup 只在唯一候选时生效，歧义 fail closed。禁止全局缓存或跨请求复用 |
 
 AG-N7～N11 都先以目标当前输出生成红灯 fixture，再做最小 Provider/转换层修复。Antigravity-Manager 的签名字段位置、daily quota endpoint 和请求身份差异仍列为 differential/live gate；没有两条 OAuth rail 各自的新鲜 receipt 时，不改变现有 rail 或 capability 状态。参考中的音频、视频、文件和 Interactions 支持也不直接采纳，因为本产品尚无对应的 Provider 合同和真实验收范围。
+
+实施更新（2026-09-28）：AG-N7～N11 已在 `aeeaf1a61e20d8e55c0569c67894fb31dfd54feb` 完成。新增 Provider-local 最终 wire 归一化，覆盖 Responses summary 可见性、混合 tool result 邻接、递归 `$ref` opaque 编码、source/native Gemini tool choice 拒绝、工具名碰撞以及请求级 raw↔wire tool-call ID 映射；reasoning replay 补回签名调用后会再次执行同一归一化。Antigravity 关键词测试 69/69、全量 Rust（64 MiB 正式测试栈）、Clippy、reference-delta 默认/`--check-sources` 与静态 Provider/coverage/docs 审计均通过。证据追加为 `AG-OBS-0018`～`AG-OBS-0022`，五项状态均为 `fixture_verified`；两条 OAuth rail、AG-N6 与 compaction 继续 `live_pending`/disabled。
 
 ### 17.4 Claude 增量差异
 

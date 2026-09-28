@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-11T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider, Share, Account, rail, and credential generation; no pool; no rotation; no credential fallback; no cross-account fallback; no cross-Provider fallback",
@@ -33,6 +33,15 @@
       "repository": "Antigravity-Manager",
       "headCommit": "08402030c81d1a521f5746d802029b3b1b7b271d",
       "headTree": "299fed98c8eb107a77c3a5e0b4c648980201fbe2",
+      "worktreeClean": true,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "cliproxyapi-2026-09-28",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "acdace936fa7df2905500c7f5e0a97d683138dea",
+      "headTree": "f7e64bd57e383e31be75a7077ef918f5154f0ab8",
       "worktreeClean": true,
       "readMode": "read_only_committed_git_objects"
     }
@@ -115,6 +124,44 @@
           "commit": "fd3e6623761d0d276f5ee6c5dbaf0996d4c6cd3f",
           "files": [
             {"path": "internal/translator/antigravity/claude/antigravity_claude_response.go", "sha256": "259bcdd33344a17aa8b14557ea97d3c457cce17c3a6652bab395ef732ee4f25a"}
+          ]
+        },
+        {
+          "id": "responses_reasoning_summary_visibility",
+          "commit": "6dea3dfa13a906a06f575f411d15c41ad032b595",
+          "files": [
+            {"path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go", "sha256": "7610fe3db0179d8ccf894f51b9793f9b6096b3fdd5ae73dc6203cc7d14b45b79"}
+          ]
+        },
+        {
+          "id": "function_response_turn_adjacency",
+          "commit": "3de5709db14c43e147025bcc27ae61ff4821fc0d",
+          "files": [
+            {"path": "internal/translator/antigravity/claude/antigravity_claude_request.go", "sha256": "c70553dabee6703babf3793a2548641655e12a17edb4a5c5d9359007525bd6bc"},
+            {"path": "internal/translator/common/gemini.go", "sha256": "e53f3bc92e63f58abb363bd89f3e7646d27a08d9edca5a80f98fe91d95dfd994"}
+          ]
+        },
+        {
+          "id": "function_response_json_ref",
+          "commit": "5af6cd7582ee7c15d60c8672ea709c6be05c89b2",
+          "files": [
+            {"path": "internal/translator/common/gemini.go", "sha256": "4f7eb84fe4c8b29ed9403caf2783ad881951740b85c730975ee6a7fe3b11642f"},
+            {"path": "internal/translator/antigravity/claude/antigravity_claude_request.go", "sha256": "062aa7bb126ab1d3df6eb914d5eed5b6e5813113747cc7481132861bbc7154f0"}
+          ]
+        },
+        {
+          "id": "tool_choice_fail_closed",
+          "commit": "49eec664f419f891d365908383a6ef8582433eef",
+          "files": [
+            {"path": "internal/translator/gemini/openai/chat-completions/gemini_openai_request.go", "sha256": "5b6470bdda355723e8527218edc75b115b6939700c85950ab73c534c9e7742a4"}
+          ]
+        },
+        {
+          "id": "tool_call_id_collision_map",
+          "commit": "580df95a946b05d9171ced80667bf13cb0b60edf",
+          "files": [
+            {"path": "internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go", "sha256": "e36e2e957729eb584b4da8adae2ca7ca827d725b209339e39dd27788699d9141"},
+            {"path": "internal/util/claude_tool_id.go", "sha256": "df45309755d299bc4f6e48a2f8a26b39cadd6b5f92c778304e824a6c936407e3"}
           ]
         }
       ]
@@ -612,6 +659,156 @@
         "fixtureIds": ["existing_reservation_can_follow_the_accounted_bytes", "replay_stream_budget_is_sticky_and_releases_on_cancel", "replay_stream_accounting_follows_accumulator_lifetime", "antigravity_transform_reports_buffered_web_search_state", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]
       },
       "reason": "The reference proves bounded replay cache and accumulator state, but not a unified request lifecycle budget. Adopt the bounds as a signal while accounting raw/decoded/normalized bodies, replay clones and accumulators, and grounding/citation bridge state under one sticky Provider-scoped budget."
+    },
+    {
+      "id": "AG-OBS-0018",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "responses_reasoning_summary_visibility",
+        "commit": "6dea3dfa13a906a06f575f411d15c41ad032b595",
+        "tree": "2179b71e67167bcaa7690611227242ece8b31854",
+        "paths": ["internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"],
+        "symbols": ["enableAntigravityResponsesThinkingSummary", "includeThoughts"],
+        "sourceDigest": "fb67a899653924e8a8fa930f05bf64eedec87926551acb24e28912a962f21a0b"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N7"],
+      "target": {
+        "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
+        "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
+        "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
+        "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
+        "contracts": [
+          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["apply_responses_reasoning_summary", "responses_reasoning_summary_is_independent_from_reasoning_effort"]},
+          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]}
+        ],
+        "fixtureIds": ["responses_reasoning_summary_is_independent_from_reasoning_effort", "antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]
+      },
+      "reason": "Adopt separate Responses reasoning-effort and summary-visibility semantics so explicit none/null suppress visible thoughts without disabling the thinking budget."
+    },
+    {
+      "id": "AG-OBS-0019",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "function_response_turn_adjacency",
+        "commit": "3de5709db14c43e147025bcc27ae61ff4821fc0d",
+        "tree": "077d21fe871b53b8756eda4ed21faff7fd30c6f5",
+        "paths": ["internal/translator/antigravity/claude/antigravity_claude_request.go", "internal/translator/common/gemini.go"],
+        "symbols": ["SplitGeminiFunctionResponseTurns", "ContentHasGeminiFunctionResponse"],
+        "sourceDigest": "0ef5cb3f37e40087eb05d44f835c0ac048b666b1437c7829a904ae0dfab664dc"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N8"],
+      "target": {
+        "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
+        "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
+        "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
+        "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
+        "contracts": [
+          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["preserve_function_response_adjacency", "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"]},
+          {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_replay_mixed_continuation_request", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+        ],
+        "fixtureIds": ["wire_normalization_preserves_adjacency_refs_and_collision_safe_ids", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]
+      },
+      "reason": "Adopt request-local function response splitting and ordering so matched results immediately follow their model calls while text and media retain their relative order."
+    },
+    {
+      "id": "AG-OBS-0020",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "function_response_json_ref",
+        "commit": "5af6cd7582ee7c15d60c8672ea709c6be05c89b2",
+        "tree": "9714002384412502cb391a995c578b2c78dd4493",
+        "paths": ["internal/translator/common/gemini.go", "internal/translator/antigravity/claude/antigravity_claude_request.go"],
+        "symbols": ["ContainsJSONRef", "SetGeminiFunctionResponseResult"],
+        "sourceDigest": "9a48fb6cc86c96c20d6bc61555a7cec57f8e4989118f27ed17f1cd0b17b0eb60"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N9"],
+      "target": {
+        "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
+        "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
+        "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
+        "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
+        "contracts": [
+          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["stringify_ref_function_responses", "contains_string_json_ref", "wire_normalization_rejects_name_collisions_and_preserves_decoys"]},
+          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]}
+        ],
+        "fixtureIds": ["wire_normalization_rejects_name_collisions_and_preserves_decoys", "antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]
+      },
+      "reason": "Adopt bounded recursive $ref detection only at Gemini functionResponse response boundaries and encode matching results as opaque JSON strings."
+    },
+    {
+      "id": "AG-OBS-0021",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "tool_choice_fail_closed",
+        "commit": "49eec664f419f891d365908383a6ef8582433eef",
+        "tree": "5fd4028f5d852ac1143b4a6f1db5ec53d2650628",
+        "paths": ["internal/translator/gemini/openai/chat-completions/gemini_openai_request.go"],
+        "symbols": ["tool_choice mapping", "Unrecognized tool_choice type: fail-closed"],
+        "sourceDigest": "7d9aa583ee3f0e7041e472d81140943365fd5f4e50c59ec21cf2aa1842123e1a"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N10"],
+      "target": {
+        "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
+        "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
+        "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
+        "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
+        "contracts": [
+          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["validate_source_tool_choice", "validate_gemini_tool_choice", "source_tool_choice_rejects_unknown_empty_and_undeclared_names"]},
+          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]}
+        ],
+        "fixtureIds": ["source_tool_choice_rejects_unknown_empty_and_undeclared_names", "antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]
+      },
+      "reason": "Adopt a stricter boundary than the reference fallback: malformed, unknown, empty, undeclared, or colliding tool restrictions return 400 and never silently widen to auto."
+    },
+    {
+      "id": "AG-OBS-0022",
+      "providerFamily": "antigravity",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "tool_call_id_collision_map",
+        "commit": "580df95a946b05d9171ced80667bf13cb0b60edf",
+        "tree": "a2e2b10e26602aba454af6a1debede8e6cfd24cc",
+        "paths": ["internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go", "internal/util/claude_tool_id.go"],
+        "symbols": ["SanitizeClaudeToolID", "usedToolCallIDs", "turnToolResponses[call.rawID]"],
+        "sourceDigest": "f7d34e4a4777fe139bc8d094a5f2be20fd24e9df62b668d4e285d6c71b41bb55"
+      },
+      "disposition": "adopt",
+      "capabilityIds": ["AG-N11"],
+      "target": {
+        "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
+        "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
+        "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
+        "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
+        "contracts": [
+          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["normalize_tool_call_ids", "response_binding_candidates", "wire_normalization_uses_only_unique_compatibility_ids"]},
+          {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["Antigravity replay produced invalid JSON", "wire::normalize_wire_request"]}
+        ],
+        "fixtureIds": ["wire_normalization_preserves_adjacency_refs_and_collision_safe_ids", "wire_normalization_uses_only_unique_compatibility_ids"]
+      },
+      "reason": "Adopt a request-scoped raw-to-wire ID map with deterministic collision suffixes, raw-first result lookup, unique-only compatibility matching, and a second pass after replay restoration."
     }
   ],
   "capabilities": [
@@ -699,6 +896,46 @@
       "contracts": [
         {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]},
         {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\""]}
+      ]
+    },
+    {
+      "id": "AG-N7",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["apply_responses_reasoning_summary", "responses_reasoning_summary_is_independent_from_reasoning_effort"]},
+        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]}
+      ]
+    },
+    {
+      "id": "AG-N8",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["preserve_function_response_adjacency", "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"]},
+        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_replay_mixed_continuation_request", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+      ]
+    },
+    {
+      "id": "AG-N9",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["stringify_ref_function_responses", "contains_string_json_ref", "wire_normalization_rejects_name_collisions_and_preserves_decoys"]},
+        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]}
+      ]
+    },
+    {
+      "id": "AG-N10",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["validate_source_tool_choice", "validate_gemini_tool_choice", "source_tool_choice_rejects_unknown_empty_and_undeclared_names"]},
+        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]}
+      ]
+    },
+    {
+      "id": "AG-N11",
+      "status": "fixture_verified",
+      "contracts": [
+        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["normalize_tool_call_ids", "response_binding_candidates", "wire_normalization_uses_only_unique_compatibility_ids"]},
+        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["Antigravity replay produced invalid JSON", "wire::normalize_wire_request"]}
       ]
     },
     {

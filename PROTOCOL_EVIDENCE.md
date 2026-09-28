@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-28 Antigravity reasoning and tool-wire freeze
+
+AG-N7～AG-N11 冻结在 `assets/contract/antigravity-reference-delta.json` 的 `AG-OBS-0018`～`AG-OBS-0022`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）及五个历史 committed object：`6dea3dfa` 的 Responses reasoning summary、`3de5709d` 的 function-response 邻接、`5af6cd75` 的 `$ref` 结果保护、`49eec664` 的 tool choice fail-closed、`580df95a` 的 tool-call ID 碰撞映射。18 个 source delta 的文件摘要和 22 条 append-only observation 可由 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。
+
+独立实现冻结在 `aeeaf1a61e20d8e55c0569c67894fb31dfd54feb`（tree `80784c56b02fd565dae0795463d24861397fba60`）。Responses 的 reasoning effort 与 summary 可见性分别处理；显式 `summary:none/null` 关闭 `includeThoughts`，但不删除 thinking budget。最终 Antigravity wire 边界会把与当前 model function call 匹配的结果前移并合并到紧邻 user turn，同时保留其余文本/媒体顺序；replay 后会再次执行同一归一化，避免补回签名调用后破坏邻接。
+
+Gemini function response 的 `response` 内递归出现字符串 `$ref` 时，完整结果会在有深度和节点上限的检查后编码为 opaque `response.result`；普通用户 JSON、tool arguments 与 declaration schema 不受影响。未知、空白或未声明的 source tool choice，以及原生 Gemini 的非法 mode、空/未知 `allowedFunctionNames` 和清洗后工具名冲突，均在发网前稳定返回 400，不会静默放宽成 auto。tool call ID 映射只存活于单请求：合法值保留、非法字符稳定清洗、碰撞使用确定性后缀，result 优先按 raw ID 匹配；`call573`/`call_573` 一类兼容匹配只有唯一候选时才接受，歧义拒绝。
+
+Antigravity 关键词回归为 69/69；reference-delta 默认审计与 committed-object 复核均通过。AG-N7～AG-N11 只提升为 `fixture_verified`，没有真实 Google 凭据，因此 `antigravity_oauth`、`agy_oauth`、AG-N6 requestType、compaction 和既有 live receipt 仍保持 `live_pending`/runtime disabled；本轮没有引入账号池、跨 Account/Provider/rail/site fallback。
+
 ## 2026-09-19 CodeBuddy request-lifecycle memory freeze
 
 CORE-N2 的 CodeBuddy 切片冻结在 `assets/contract/codebuddy-reference-delta.json` 的 `CB-OBS-0015` 与 `CORE-N2-CODEBUDDY` evidence extension。一次性只读证据继续只取 `cli2api@624874a0331f5e8f012ef104b633e69826487458`（tree `c2f02a394e1381adf8291949822ce4b08a48dfb3`）的 committed object，并继续排除工作树中的 `proxy.html`、`proxy.md`。参考实现为若干控制面/error body 设置 1 MiB 上限、为非流 chat body 设置 16 MiB 上限、为单条 SSE line 设置 16 MiB 上限，同时用 `strings.Builder` 和 tool-call map 聚合非流内容。它只提供“读取、单行和 retained aggregation 应有界”的差分信号，不证明统一 sticky request-lifecycle budget、payload/header 副本、下游 transform、capacity 分类或 401 恢复语义。默认审计不读取外部 checkout，只有显式 `node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才复核冻结 Git object。
