@@ -161,6 +161,10 @@ const immutableSourceSnapshotDigests = new Map([
     "cliproxyapi-2026-09-19",
     "7482b03b5422de54996015f0ba9073435e9568bedb801faeabac0bd5fce42b2d",
   ],
+  [
+    "cliproxyapi-2026-09-28",
+    "457a3245056c564ca51de67d8b92e189ef7c2e12ce0c257f643407c86c1ac28c",
+  ],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of baseline.sourceSnapshots ?? []) {
@@ -208,6 +212,8 @@ const immutableObservationDigests = new Map([
   ["CL-OBS-0013", "668063ac2a715cafb46980165278cb5b31277e1a48645186c9351da356e4af7f"],
   ["CL-OBS-0014", "f1e71a3c98544d255b560b9cf087f9b4bab0e486af777308d33d140bdd63443a"],
   ["CL-OBS-0015", "9af39e8156399d207a2fe39d2e7b7adbb556c3967149cff7e04f1c5870d5abf6"],
+  ["CL-OBS-0016", "e64b3864c18cc985b1b087f58e5bcf3d29078336de91463ffe11c96ec6e4a463"],
+  ["CL-OBS-0017", "0f9dc7a8fe98c61ddf17df77e16e4dfea0f753bd49277389706890768473a446"],
 ]);
 const expectedEnhancementIds = new Set([
   "CL-01",
@@ -220,6 +226,8 @@ const expectedEnhancementIds = new Set([
   "CL-N2",
   "CL-N3",
   "CL-N4",
+  "CL-N5",
+  "CL-N6",
   "CL-R1",
   "CORE-N1",
   "CORE-N2",
@@ -380,6 +388,8 @@ assert(
 const expectedCapabilities = new Map([
   ["CORE-N2-CLAUDE", "fixture_verified"],
   ["CLAUDE-OPUS-5-5", "fixture_verified"],
+  ["CL-N5", "fixture_verified"],
+  ["CL-N6", "fixture_verified"],
 ]);
 for (const capability of baseline.capabilities ?? []) {
   assert(

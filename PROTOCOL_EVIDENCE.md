@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-09-28 Claude text/citation and tool-name freeze
+
+CL-N5 与 CL-N6 冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-OBS-0016`～`CL-OBS-0017`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）以及两个历史 committed object：`781a203b` 的相邻 Anthropic text/citation 合并、`75b854eb` 的 Claude 工具名语法。15 个 source delta 的文件摘要和 17 条 append-only observation 可由 `node scripts/audit/audit-claude-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。
+
+独立实现冻结在 `77940334fda6291706d3807d0d3cdcb49c767d65`（tree `96d2d8dd85812e90a490426d32867ca262cbe84d`）。Anthropic→Responses 的流式与非流式转换会把相邻 text block 合并为一个 assistant message/output item；citation 的 `start_index` / `end_index` 以累计 Unicode scalar 计算，并在新上游 text block 处重置局部搜索起点，避免重复 cited text 回指前一 block。thinking、tool、server tool、refusal 与 terminal 仍是明确边界，不会跨语义粘连。
+
+Claude OAuth 对不符合 `^[A-Za-z0-9_-]{1,64}$` 的普通 custom/MCP 名称默认生成有域分离的请求级可逆 alias；合法自定义名逐字节保留，既有 Claude Code builtin canonical case 和 server tool 行为不变。declaration、forced choice、历史 `tool_use` / `tool_reference`、JSON 和碎片化 SSE 响应共用同一 map；大小写声明、既有合法 wire 名或 alias 碰撞全部在发网前返回 400，不做有损截断。`CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=disabled` 只保留为事故回滚。
+
+Claude 关键词回归为 270/270，Anthropic 关键词回归为 131/131；Clippy、wire profile、reference-delta 默认审计与 committed-object 复核均通过。CL-N5/CL-N6 只提升为 `fixture_verified`；没有真实 Anthropic 凭据，`oauth_inference`、Max 5x/20x、Fable 5.1、Opus 5.5 和非法 MCP 名称的真实接受性仍保持各自 `live_pending`，本轮没有引入账号池或跨 Account/Provider/rail/site fallback。
+
 ## 2026-09-28 Antigravity reasoning and tool-wire freeze
 
 AG-N7～AG-N11 冻结在 `assets/contract/antigravity-reference-delta.json` 的 `AG-OBS-0018`～`AG-OBS-0022`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）及五个历史 committed object：`6dea3dfa` 的 Responses reasoning summary、`3de5709d` 的 function-response 邻接、`5af6cd75` 的 `$ref` 结果保护、`49eec664` 的 tool choice fail-closed、`580df95a` 的 tool-call ID 碰撞映射。18 个 source delta 的文件摘要和 22 条 append-only observation 可由 `node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 可选复核；默认构建、测试、发布和运行时不读取外部 checkout。

@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
@@ -330,6 +330,34 @@
               "sha256": "a4615ad501ec42c45931fc22002d33ce91be881b978f75a39e1a84e74fdf8d0a"
             }
           ]
+        },
+        {
+          "id": "adjacent_text_citations",
+          "commit": "781a203b99fa14b94303f52d1798821148849ab8",
+          "files": [
+            {
+              "path": "internal/translator/claude/openai/responses/claude_openai-responses_response.go",
+              "sha256": "bf12d3d40fd0b92981458734783a5ae33471e955e462b1e73c25c512f3d13030"
+            },
+            {
+              "path": "internal/translator/claude/openai/responses/claude_openai-responses_citations_test.go",
+              "sha256": "28acc2b8d7d0b1f34645f742772d09da2f7e455e39b3930ad8294b95b7b56595"
+            }
+          ]
+        },
+        {
+          "id": "claude_tool_name_sanitizer",
+          "commit": "75b854eb2e63730814d8775fbc6f85a3d0854995",
+          "files": [
+            {
+              "path": "internal/util/claude_tool_id.go",
+              "sha256": "bebbffc398562d2b914eb5973dac377ca35d53815241f4d08cfe2e43ea0a2691"
+            },
+            {
+              "path": "internal/util/sanitize_test.go",
+              "sha256": "7cd98b60d8344106b0a182749866a6068a4f65e0205809e34f3a01342260d868"
+            }
+          ]
         }
       ]
     }
@@ -357,6 +385,16 @@
       "repository": "CLIProxyAPI",
       "headCommit": "b773607e3e7756dc6020a291825e4eb08899595a",
       "headTree": "a740e14d0b3efea8877f901301d0f9926c39258b",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "cliproxyapi-2026-09-28",
+      "sourceId": "cliproxyapi",
+      "repository": "CLIProxyAPI",
+      "headCommit": "acdace936fa7df2905500c7f5e0a97d683138dea",
+      "headTree": "f7e64bd57e383e31be75a7077ef918f5154f0ab8",
       "worktreeClean": true,
       "worktreeChangesExcluded": false,
       "readMode": "read_only_committed_git_objects"
@@ -858,6 +896,78 @@
         "fixtureIds": ["request_memory_scope_is_exact_to_codex_antigravity_and_claude_oauth", "claude_oauth_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "claude_oauth_compressed_sse_expansion_exhaustion_is_sticky_and_not_retried", "claude_oauth_retained_tool_json_exhaustion_terminates_committed_stream_without_retry", "claude_streaming_decoder_budgets_wire_and_decoded_bytes_until_last_view_drop"]
       },
       "reason": "The reference proves bounded retained Claude replay state (8 MiB per session, 64 turns, 512 blocks per turn, 256 MiB process total, one-hour TTL and CAS replacement), but not a unified Claude OAuth request-lifecycle budget; adopt the bounded-state signal while independently covering raw, decoded and normalized bodies, compressed SSE expansion, per-chunk parser and tool-patcher state, sticky exhaustion, and last-view release on the exact ClaudeOAuth Provider type."
+    },
+    {
+      "id": "CL-OBS-0016",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "adjacent_text_citations",
+        "commit": "781a203b99fa14b94303f52d1798821148849ab8",
+        "tree": "cd62bb1c2ff2c7ce238b41e99879158b0e9025e1",
+        "paths": ["internal/translator/claude/openai/responses/claude_openai-responses_response.go", "internal/translator/claude/openai/responses/claude_openai-responses_citations_test.go"],
+        "symbols": ["finalizeAssistantMessage", "TestClaudeResponsesAdjacentCitedTextBlocksShareMessage"],
+        "sourceDigest": "d3b830c29961522aa4ac3fabc5d35f668bbdf7c493f6e2fbb50f09bc43c1fa6a"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-N5"],
+      "target": {
+        "baselineCommit": "63e2b8bf7c3777bea9995c10ba6f77c0e783016c",
+        "baselineTree": "df3964ae991ded4affd39dd0f517c436267a5a74",
+        "implementationCommit": "77940334fda6291706d3807d0d3cdcb49c767d65",
+        "implementationTree": "96d2d8dd85812e90a490426d32867ca262cbe84d",
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": ["append_anthropic_text_to_response_content", "anthropic_response_to_responses_merges_adjacent_text_with_scalar_citations"]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": ["active_text_index", "citation_block_start_byte", "anthropic_adjacent_text_stream_reuses_one_item_and_scalar_citation_base"]
+          }
+        ],
+        "fixtureIds": ["anthropic_response_to_responses_merges_adjacent_text_with_scalar_citations", "anthropic_adjacent_text_stream_reuses_one_item_and_scalar_citation_base"]
+      },
+      "reason": "Adopt one Responses message item for each adjacent Anthropic text run, accumulate Unicode-scalar citation offsets across blocks, and finalize only at reasoning, tool, server-tool, refusal, or terminal boundaries."
+    },
+    {
+      "id": "CL-OBS-0017",
+      "providerFamily": "claude",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "cliproxyapi",
+        "snapshotId": "cliproxyapi-2026-09-28",
+        "repository": "CLIProxyAPI",
+        "deltaId": "claude_tool_name_sanitizer",
+        "commit": "75b854eb2e63730814d8775fbc6f85a3d0854995",
+        "tree": "eee9f165b810c49cd375ee894063d69e87c16026",
+        "paths": ["internal/util/claude_tool_id.go", "internal/util/sanitize_test.go"],
+        "symbols": ["SanitizeClaudeFunctionName", "TestSanitizeClaudeFunctionName"],
+        "sourceDigest": "70a92ac4e837a899b89bf9c4a8945067384cc8ac393c8f30212663d00fba7a73"
+      },
+      "disposition": "adopt",
+      "enhancementIds": ["CL-N6"],
+      "target": {
+        "baselineCommit": "63e2b8bf7c3777bea9995c10ba6f77c0e783016c",
+        "baselineTree": "df3964ae991ded4affd39dd0f517c436267a5a74",
+        "implementationCommit": "77940334fda6291706d3807d0d3cdcb49c767d65",
+        "implementationTree": "96d2d8dd85812e90a490426d32867ca262cbe84d",
+        "contracts": [
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": ["claude_tool_name_is_legal", "forward_contract_aliases_only_invalid_custom_names_by_default", "invalid_custom_tool_alias_rejects_reserved_wire_collision", "claude_tool_name_stream_patcher_restores_fragmented_sse_events"]
+          },
+          {
+            "path": "assets/contract/claude-oauth-wire-profile.json",
+            "anchors": ["invalid_custom_names_only", "CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS"]
+          }
+        ],
+        "fixtureIds": ["forward_contract_aliases_only_invalid_custom_names_by_default", "invalid_custom_tool_alias_is_stable_scoped_and_round_trips", "invalid_custom_tool_alias_rejects_reserved_wire_collision", "claude_tool_name_stream_patcher_restores_fragmented_sse_events"]
+      },
+      "reason": "Adopt the Claude name grammar while using a request-local reversible hash alias instead of lossy truncation: legal custom names and server tools stay unchanged, declarations/history/choice/JSON/SSE share one map, and every case-insensitive or wire collision fails closed."
     }
   ],
   "capabilities": [
@@ -910,6 +1020,34 @@
         {
           "path": "scripts/smoke/claude-real-receipt.mjs",
           "anchors": ["opus_5_5", "CLAUDE_OPUS_5_5_REAL_RECEIPT_FILE", "context1mProbe"]
+        }
+      ]
+    },
+    {
+      "id": "CL-N5",
+      "status": "fixture_verified",
+      "contracts": [
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": ["append_anthropic_text_to_response_content", "anthropic_response_to_responses_merges_adjacent_text_with_scalar_citations"]
+        },
+        {
+          "path": "src/proxy/stream_transforms.rs",
+          "anchors": ["active_text_index", "citation_block_start_byte", "anthropic_adjacent_text_stream_reuses_one_item_and_scalar_citation_base"]
+        }
+      ]
+    },
+    {
+      "id": "CL-N6",
+      "status": "fixture_verified",
+      "contracts": [
+        {
+          "path": "src/proxy/claude_oauth.rs",
+          "anchors": ["claude_tool_name_is_legal", "forward_contract_aliases_only_invalid_custom_names_by_default", "invalid_custom_tool_alias_rejects_reserved_wire_collision", "claude_tool_name_stream_patcher_restores_fragmented_sse_events"]
+        },
+        {
+          "path": "assets/contract/claude-oauth-wire-profile.json",
+          "anchors": ["invalid_custom_names_only", "CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS"]
         }
       ]
     }

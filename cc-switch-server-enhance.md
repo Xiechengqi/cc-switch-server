@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮 Antigravity AG-N7～N11 已由 `aeeaf1a` 完成代码与 fixture，证据状态见 `AG-OBS-0018`～`AG-OBS-0022`；其余第二轮 Provider 仍按第 17 节状态推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮 Antigravity AG-N7～N11 已由 `aeeaf1a` 完成，Claude CL-N5～N6 已由 `7794033` 完成；证据分别见 `AG-OBS-0018`～`AG-OBS-0022` 与 `CL-OBS-0016`～`CL-OBS-0017`。其余第二轮 Provider 仍按第 17 节状态推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -915,8 +915,9 @@ CodeBuddy：
 | 优先级 | 新项目 | 当前状态 | 主要风险 |
 | --- | --- | --- | --- |
 | P0 | AG-N7～N11 | `fixture_verified`（`aeeaf1a`） | reasoning 可见性、工具结果邻接/`$ref`、tool choice 与 ID 映射已在本地闭环；两条 live rail 未提升 |
-| P0 | CL-N5、CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | citation/tool 语义丢失、权限静默放宽、私有事件外泄、usage 丢失 |
-| P1 | CL-N6、CX-N8、CX-N10、GR-N3 | `planned_confirmed_gap` | 非法工具名拒绝、连续工具轮 reasoning 丢失、上游换模不可见、目录能力与运行时脱节 |
+| P0/P1 | CL-N5、CL-N6 | `fixture_verified`（`7794033`） | 相邻 text/citation 与非法工具名可逆 alias 已闭环；真实 Claude OAuth operation 未提升 |
+| P0 | CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | 权限静默放宽、私有事件外泄、usage 丢失 |
+| P1 | CX-N8、CX-N10、GR-N3 | `planned_confirmed_gap` | 连续工具轮 reasoning 丢失、上游换模不可见、目录能力与运行时脱节 |
 | P1 | CX-N11、CX-N12、GR-N4 | `planned_differential_first` / `live_only` | WS 并发时序、strict response schema、Grok 客户身份/header 的静态证据不足 |
 | 复核 | Cursor、Kiro、sub2api | `reviewed_no_wire_delta` | 不制造无意义生产改动，只刷新冻结证据 |
 | 受阻 | Qoder 最新 HEAD | `unreviewed_skill_gate` | 缺参考仓库要求的 skill；不得用猜测补结论 |
@@ -947,6 +948,8 @@ AG-N7～N11 都先以目标当前输出生成红灯 fixture，再做最小 Provi
 | CL-N6 | CLIProxyAPI `75b854eb`；目标 `normalize_claude_oauth_tool_names` | 目标已具备稳定 alias 和响应恢复，但只有 `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=1` 才为普通自定义工具启用；默认路径仍可能把不符合 `^[A-Za-z0-9_-]{1,64}$` 的名称发往 Claude OAuth | 对“确实非法”的自定义工具名默认自动 alias；已经合法的名称逐字节保留，内建/server tool 不改。声明、tool_choice、历史 tool_use/tool_reference、流式和非流式响应共用请求级 map；case-insensitive/截断碰撞 fail closed。保留 incident rollback，但不再要求正常用户主动开 flag |
 
 CL-N5 只修改 Responses 输出组织与 offset，不把不同语义 block 粘在一起。CL-N6 不迁入参考项目的 credential cloaking、浏览器伪装或指纹逻辑；Opus 5.5 / Claude Code 2.1.280 已由既有提交覆盖，本轮不得重复实施。
+
+实施更新（2026-09-28）：CL-N5～CL-N6 已在 `77940334fda6291706d3807d0d3cdcb49c767d65` 完成。流式和非流式 Anthropic→Responses 现在按语义边界聚合相邻 text block，citation 以 Unicode scalar 累计且每个新 block 从其自身文本起点搜索；重复 cited text、组合字符、emoji、无 citation 与中途 tool/reasoning 边界均有 fixture。Claude OAuth 默认只 alias 真正非法的普通 custom/MCP 名称，合法名称逐字节保留，server tool 不改；declaration、choice、history、JSON/SSE 回映共享请求级 map，大小写和 wire alias 碰撞 fail closed，并保留 `disabled` 事故回滚。Claude 关键词测试 270/270、Anthropic 关键词测试 131/131、Clippy、wire profile、reference-delta 默认/`--check-sources` 审计均通过；证据追加为 `CL-OBS-0016`～`CL-OBS-0017`，两项均为 `fixture_verified`，五个真实 operation 与非法 MCP live acceptance 仍为 `live_pending`。
 
 ### 17.5 Codex 增量差异
 
@@ -1081,4 +1084,4 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
 8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
 
-第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；新项目均尚未实施。本文可以作为下一阶段实现队列，但不能把任何 `planned_*`、fixture 或参考项目行为解释为生产支持或真实账号验收。
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11 与 Claude CL-N5～N6 已实施并达到 `fixture_verified`，其余项目仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。
