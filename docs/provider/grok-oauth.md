@@ -7,7 +7,7 @@
 - 文本入口使用 Router Share URL 下的 `POST /v1/responses` 和 `POST /v1/chat/completions`。
 - Responses WebSocket 使用同一 Share URL 下的 `GET /v1/responses`。
 - 媒体入口包括图片生成/编辑和视频生成/状态查询；这些能力按账号 fail closed。
-- 模型目录通过同一 Share URL 下的 `GET /v1/models` 返回，并附带 Grok catalog 的来源和新鲜度。
+- 模型目录通过同一 Share URL 下的 `GET /v1/models` 返回，并附带 Grok catalog 的来源、新鲜度和 capability manifest v2。
 - Models、Responses HTTP/WS、Chat 和媒体入口都要求 Router 签名验证且必须携带 Share 身份。Server 不接受本地推理 token，也不提供 Provider 专属公开路径。
 - 每个 `grok_oauth` Provider 必须绑定一个明确的 `grok_oauth` Account。
 - 同一个生成请求只允许使用该 Provider 的绑定账号；任何错误都不能触发账号轮换或通用 Provider failover。
@@ -51,9 +51,9 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 
 - OpenAI Chat Completions 先无损规范化为 Responses，请求上游固定使用 Grok CLI `/v1/responses`；非流式和 SSE 再恢复为 Chat contract。Grok 数据面不再向上游发送 `/v1/chat/completions`。
 - Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.6`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
-- 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。
+- 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。当前 reviewed identity 仍是 `grok-shell/0.2.111`，未发送 `x-grok-conv-group-id`；参考项目的 Build `1.0.40` 与 group header 在固定账号真实验收前不得直接替换本合同。
 - 账号 `extraHeaders` 不能覆盖 Authorization、CLI identity、conversation/cache identity、turn、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。
-- Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
+- Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。有精确 fresh catalog capability 时，HTTP、WebSocket 与 WS→HTTP fallback 的 effort 只接受该模型有序菜单中的 `none|minimal|low|medium|high|xhigh|max`；显式 `supports_reasoning_effort=false` 会删除 effort，但保留独立的 summary 控制。没有 fresh capability 时沿用既有保守静态判断，stale catalog 不能扩大权限。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
 - Claude Messages 的客户端 function tools 会转换为 xAI Responses 的扁平声明（顶层 `name` / `description` / `parameters`），Anthropic hosted web search 会转换为 xAI `web_search`，不会把 Chat Completions 专用的嵌套 `function` 对象发给 xAI。
 - 普通 Responses HTTP/WS body 的 `prompt_cache_key` 由 Server 强制绑定到隔离后的 conversation id，客户端值不能覆盖；compact 请求只保留会话 header，body 必须省略 `prompt_cache_key`。
 - 首次 401 允许对原账号强制 refresh 一次，再用新 Authorization 重放原请求；第二次 401 直接返回并只冷却原账号。
@@ -116,7 +116,7 @@ CORE-N1 将上述 scope 派生、cache snapshot ownership、CAS 清理/提交以
 
 本地 HTTP、分片 CRLF SSE 与 WebSocket loopback 已覆盖捕获、下一轮注入、并行 calls、一次明确拒绝恢复和 post-commit 禁止恢复；这只能建立 `fixture_verified`。推理、媒体与 remote compaction receipt 必须分别留证，缺少任一真实 receipt 时对应 operation 保持 `live_pending`。
 
-EVID-N1 已把 Grok reference delta 迁为 append-only schema v2。原 schema-v1 文件及十个历史字段由 `269850a` committed object、文件 SHA-256 和 canonical digest 固定；两个 source snapshot 分别绑定干净的 grok2api 提交态与排除 6 项本地修改的 sub2api 提交态。11 条不可变 observation 将 GR-01～05、GR-N1、CORE-N1/N2、LIVE-N1、GR-R1 绑定到 source/target committed object；`CORE-N2-GROK=fixture_verified` 只证明本仓库 HTTP/SSE/WS/media sticky request-memory 合同，不提升真实 operation receipt。默认审计不读取外部仓库，只有显式 `--check-sources` 才复核外部 Git object。sub2api 的账号池/轮换、商业路由/计价和 soft quota gate 仅作为 reject evidence，不构成运行时能力。
+EVID-N1 已把 Grok reference delta 迁为 append-only schema v2。原 schema-v1 文件及十个历史字段由 `269850a` committed object、文件 SHA-256 和 canonical digest 固定；三个 source snapshot 分别绑定两次干净的 grok2api 提交态与排除 6 项本地修改的 sub2api 提交态。13 条不可变 observation 现将 GR-01～05、GR-N1/N3/N4、CORE-N1/N2、LIVE-N1、GR-R1 绑定到 source/target committed object；`CORE-N2-GROK` 与 `GR-N3` 的 `fixture_verified` 只证明本仓库容量合同和 exact-scope catalog/runtime 闭环，GR-N4 仍为 `live_pending` 且没有生产 wire 改动。默认审计不读取外部仓库，只有显式 `--check-sources` 才复核外部 Git object。sub2api 的账号池/轮换、商业路由/计价和 soft quota gate 仅作为 reject evidence，不构成运行时能力。
 
 ## 脱敏质量观测
 
@@ -158,11 +158,17 @@ Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号
 - 没有可用缓存时返回静态 `grok-4.6` fallback。
 - 上游目录响应体上限为 1 MiB，超限按上游失败处理。
 - entry 支持纯字符串以及 `id`、`model`、`modelId`、`name`、`_meta.model`、`_meta.modelId`，按该优先级选取标识；`hidden=true` 或 `_meta.hidden=true` 不对外发布。
+- model ID 与 capability 在同一个 snapshot 中原子替换；scope 同时覆盖 App、Provider ID/revision/runtime fingerprint、Account、`authIdentityGeneration` 与 `tokenRefreshGeneration`，任一维度漂移都不能读取旧 capability。
+- capability parser 保留上游 reasoning menu 顺序并去重，过滤未知 effort；menu 内首个 `default=true` 优先，否则使用 top-level default，但 default 不属于过滤后菜单时丢弃。`false`/`0` 与字段缺失保持不同语义。
+- 成功空目录是权威结果并清空旧 model/capability；last-known-good 只用于展示，`stale=true` 时运行时 capability lookup 必须 miss。
+- 每个模型的 `capabilityManifestVersion=2` 展示 `supportsReasoningEffort`、`reasoningEfforts`、`reasoningDefault`、`contextWindow`、`maxOutputTokens` 和 `supportsBackendSearch`；这些元数据不会自动开启 hosted search、remote compaction，也不会改变本地 request-memory budget。
 - 顶层元数据 `source`、`stale`、`fetchedAtMs` 用于区分 upstream、fresh cache、304、last-known-good 和 static fallback。
 
 模型目录降级不会绕过 single-model policy，也不会选择另一个 Grok 账号。credential persistence degraded 时不会访问上游目录，只返回明确来源的静态 fallback；刷新前已 degraded 和本次 refresh 因旋转 token 落盘失败而刚进入 degraded 都执行同一零上游门禁。生成数据面仍返回 `503`。
 
 Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
+
+GR-N3 的本地 fixture 已覆盖菜单顺序/去重、minimal/max、default membership、显式 false/zero、权威空目录、stale 不扩权、七个 scope 维度漂移、HTTP/WS 共用菜单，以及 Provider API manifest 与 `ServerState` 运行时读取闭环。它只建立 `fixture_verified`；搜索、Grok 4.7 entitlement 和 context/max 的真实接受性仍需固定账号 receipt。
 
 不存在不带 Share 身份的公共模型列表；未签名或签名但无 Share 的 `/v1/models` 请求分别返回 `401` 或 `403`。
 
@@ -233,6 +239,8 @@ node scripts/smoke/grok-real-receipt.mjs
 
 三次运行都要求 `RUN_REAL=1`、控制面和 Share URL、固定 `GROK_OAUTH_TEST_ACCOUNT`、operation 对应的 Provider/Share/model、`CC_SWITCH_GROK_SIGNED_USER`、`CC_SWITCH_GROK_SESSION_ID`、`CC_SWITCH_GROK_TURN_INDEX`，以及仓库外权限 `0600` 的私有 receipt。validator 绑定当前 target commit、Provider revision/runtime、Account auth/token generation、Share revision、签名用户 namespace、精确 model/session/turn 和 fresh catalog；同时逐项核对 checks、body hashes、measurements、恢复决策、decoy 计数与 secret scan。fixture 只能得到 `contract_verified/live_pending`，三个 operation 不互相继承。
 
+GR-N4 还要求同一个固定 Account 分别留下 catalog 与 inference 对身份/header 的接受证据。只有明确的 version-rejected signal 或 current-commit fresh receipt 才能评审将默认 `0.2.111` 更新为参考项目的 Build `1.0.40`；`x-grok-conv-group-id` 也必须单独证明接受性和 Share/Account 隔离。静态 UUIDv5 向量只能验证派生算法，不能把状态提升为 live，也不能授权发送新 header。
+
 `remote_compaction` receipt 只证明上游协议证据，绝不自动开启运行时。即使 receipt 验证通过，`runtimeEnabled=false` 仍保持不变，后续还必须独立完成 scope、versioned AEAD、TTL、失败语义与降级设计评审。缺少任一输入或 receipt 时仅输出 `blocked_inputs/live_pending`。
 
 401 强刷、WS handshake/fallback、429/cooldown、version gate 和“不跨 Provider”需要受控上游故障或抓包环境，不能由正常成功 smoke 证明，按 `docs/acceptance/real-acceptance-runbook.md` 单独留证。
@@ -242,6 +250,7 @@ node scripts/smoke/grok-real-receipt.mjs
 - 不实现多账号调度、轮询、权重、健康 failover 或 quota spillover。
 - 不实现 grok.com Web cookie 反代，不迁移 Grok Web、Tauri、Skill、MCP 或 Desktop 行为。
 - 不启用 remote compaction；本地 reasoning replay 不是远程压缩、摘要服务或跨账号历史。
+- 不因参考项目使用 Build `1.0.40` 或 `x-grok-conv-group-id` 就更新生产身份；GR-N4 在固定账号证据齐备前保持 `live_pending`。
 - 不允许生产配置任意 OAuth、WebSocket、models 或 inference upstream。
 - 本地 mock 测试不能证明真实 xAI OAuth、订阅权限、模型、媒体、WebSocket 和限流语义可用。
 - Capability evidence 证明某账号曾成功使用能力，不保证其订阅未来始终保有该能力；真实 403/429 和 entitlement 变化仍需告警与人工处理。

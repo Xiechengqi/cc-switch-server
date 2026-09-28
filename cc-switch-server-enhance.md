@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮 Antigravity AG-N7～N11 已由 `aeeaf1a` 完成，Claude CL-N5～N6 已由 `7794033` 完成；证据分别见 `AG-OBS-0018`～`AG-OBS-0022` 与 `CL-OBS-0016`～`CL-OBS-0017`。其余第二轮 Provider 仍按第 17 节状态推进。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）和 Grok GR-N3（`a0f567a`）；Cursor 第二轮冻结为 `reviewed_no_wire_delta`（`6118169`），GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。其余第二轮 Provider 仍按第 17 节状态推进。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -919,9 +919,9 @@ CodeBuddy：
 | P0 | CX-N5～N7、CX-N9 | `fixture_verified`（`f890774`） | schema/item 精确清理与私有事件闭集已闭环；真实 rail 未提升 |
 | P0 | CB-N6 | `planned_confirmed_gap` | cache usage 丢失 |
 | P1 | CX-N8、CX-N10 | `fixture_verified`（`f890774`） | 真实 reasoning 复用与本地 reported-model 诊断已闭环；不改变路由/计费 |
-| P1 | GR-N3 | `planned_confirmed_gap` | 目录能力与运行时脱节 |
+| P1 | GR-N3 | `fixture_verified`（`a0f567a`） | exact-scope 目录能力与 HTTP/WS 运行时闭环已完成；真实 entitlement 未提升 |
 | P1 | CX-N11、CX-N12 | `fixture_verified_after_red_differential`（`f890774`） | 红灯后完成有界 steering writer 与 strict response schema 窄修复 |
-| P1 | GR-N4 | `live_only` | Grok 客户身份/header 缺真实账号证据 |
+| P1 | GR-N4 | `live_pending_no_wire_change` | Grok 客户身份/header 缺固定账号真实证据 |
 | 复核 | Cursor、Kiro、sub2api | `reviewed_no_wire_delta` | 不制造无意义生产改动，只刷新冻结证据 |
 | 受阻 | Qoder 最新 HEAD | `unreviewed_skill_gate` | 缺参考仓库要求的 skill；不得用猜测补结论 |
 
@@ -989,6 +989,10 @@ OmniRoute 从首轮 `02c663cdd0e85` 到 `443d66996d69` 的 committed delta 只�
 | GR-N4 | grok2api `9dda42ae` | 参考使用 Build `1.0.40` 并派生 `x-grok-conv-group-id`；目标默认身份仍为 `grok-shell/0.2.111`，只发 `x-grok-conv-id`，但两个版本谱系是否可直接替换没有真实证据 | `differential_first/live_only`：先用同一固定 Account 分别验证 catalog 与 inference 的 accepted identity/header。只有明确 version-rejected signal 或 fresh receipt 才更新 reviewed 常量；group id 若启用，按已 namespace 的 root session 做稳定 UUIDv5，不能暴露原始用户/session，也不能跨 Share/Account 合并 |
 
 GR-N3 的 capability 只影响模型展示、请求校验和受证 upstream control，不把 catalog context window 当成本地内存预算，也不自动开启搜索/compaction。参考项目把 Grok 4.7 暂按 4.6 定价是作者推断，缺 xAI 权威价格，因此明确 `not_adopted`。sub2api 在首轮冻结点之后无提交，工作树内容继续排除。
+
+实施更新（2026-09-28）：GR-N3 已在 `a0f567a60d6285cbd9d1e6b4b8396ee95582be3c` 完成。model ID 与 `GrokModelCapability` 在同一个 exact-scope snapshot 中原子替换；parser 保留已知 effort 的上游顺序并去重，default 必须属于菜单，显式 false/zero 与缺失值分开。成功空目录权威清除旧能力，stale 只可展示；HTTP、WebSocket 和 WS→HTTP fallback 只读取当前 App、Provider ID/revision/runtime、Account、auth/token generation 的 fresh capability。API manifest v2 展示 reasoning/context/max/search，但不自动开启搜索、compaction 或改变本地内存预算，也未复制 process-global profile map。
+
+证据更新追加 `grok2api-2026-09-28` snapshot、两个 committed source delta、`GR-OBS-0012`～`GR-OBS-0013` 和 `GR-N3/GR-N4` evidence extension。Grok 关键词回归 224 项、Clippy、默认 audit 与 `--check-sources` 均通过。GR-N3 达到 `fixture_verified`；GR-N4 明确保持 `live_pending`，继续使用 `0.2.111` 且不发送 `x-grok-conv-group-id`，直到同一固定 Account 的 catalog/inference fresh receipt 或明确 version-rejected signal 齐备。
 
 ### 17.8 Kiro 增量复核
 
@@ -1093,4 +1097,4 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
 8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
 
-第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6 与 Codex CX-N5～N12 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok 与 CodeBuddy 仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6、Codex CX-N5～N12 与 Grok GR-N3 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok GR-N4 保持 `live_pending_no_wire_change`，CodeBuddy 仍按表中状态推进。任何 `planned_*`、fixture 或参考项目行为都不能解释为真实账号验收。

@@ -378,7 +378,7 @@
     ]
   },
   "legacySchemaVersion": 1,
-  "updatedAt": "2026-09-19T00:00:00Z",
+  "updatedAt": "2026-09-28T00:00:00Z",
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",
@@ -443,6 +443,68 @@
       ]
     }
   ],
+  "sourceDeltaExtensions": [
+    {
+      "id": "catalog_driven_model_capabilities",
+      "sourceId": "grok2api",
+      "snapshotId": "grok2api-2026-09-28",
+      "repository": "grok2api",
+      "commit": "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e",
+      "tree": "889cf18ab5363fe8d6d408b16c734625e1065d24",
+      "files": [
+        {
+          "path": "backend/internal/domain/model/reasoning.go",
+          "sha256": "060c99ec00c11bd948b9097460939f827e2a625193daba75176e9669d0e19273"
+        },
+        {
+          "path": "backend/internal/domain/model/upstream_profile.go",
+          "sha256": "bb7c3be44647dc1641d80d32319f7e20aa847adb531766847cafa46db82ae3be"
+        },
+        {
+          "path": "backend/internal/domain/model/upstream_profile_test.go",
+          "sha256": "f015614d6a098f2870730aeb80f971b2c5372eb3898a4527081195231b525d23"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/adapter.go",
+          "sha256": "1d4d505f17b73a425f3c5290a772e06396f81ede013e728707b46005264cd694"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/adapter_test.go",
+          "sha256": "b18bab575bc6f68e8c774ce2732f87a5aa923c620d35121d03d749a50c4ba248"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/testdata/build_models_catalog.json",
+          "sha256": "8025621a5e86272f1b3ba3b0d9bdc6032e62c09410f08a763f957809ad5f1c38"
+        }
+      ]
+    },
+    {
+      "id": "build_identity_and_conversation_group",
+      "sourceId": "grok2api",
+      "snapshotId": "grok2api-2026-09-28",
+      "repository": "grok2api",
+      "commit": "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e",
+      "tree": "889cf18ab5363fe8d6d408b16c734625e1065d24",
+      "files": [
+        {
+          "path": "backend/internal/infra/config/config.go",
+          "sha256": "776250199235718682abe23dae7924be49fd89a0c41b355bd90f735a4e34c96a"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/adapter.go",
+          "sha256": "1d4d505f17b73a425f3c5290a772e06396f81ede013e728707b46005264cd694"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/adapter_test.go",
+          "sha256": "b18bab575bc6f68e8c774ce2732f87a5aa923c620d35121d03d749a50c4ba248"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/session_id_test.go",
+          "sha256": "4415fe110d71638a00076154b54c704763362c56119e305cb66cdbacdb01b1fc"
+        }
+      ]
+    }
+  ],
   "sourceSnapshots": [
     {
       "id": "grok2api-2026-09-19",
@@ -464,6 +526,18 @@
       "worktreeClean": false,
       "worktreeChangesExcluded": true,
       "excludedWorktreeEntries": 6,
+      "readMode": "read_only_committed_git_objects"
+    },
+    {
+      "id": "grok2api-2026-09-28",
+      "sourceId": "grok2api",
+      "repository": "grok2api",
+      "headCommit": "5e5ad75556b61a2c4a8fcf344d83bfe7760f2b42",
+      "reviewedCommit": "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e",
+      "headTree": "889cf18ab5363fe8d6d408b16c734625e1065d24",
+      "worktreeClean": true,
+      "worktreeChangesExcluded": false,
+      "excludedWorktreeEntries": 0,
       "readMode": "read_only_committed_git_objects"
     }
   ],
@@ -1103,6 +1177,153 @@
         ]
       },
       "reason": "grok2api proves count-, TTL-, scope- and LRU-bounded reasoning cache state, but not a byte ceiling per proof or one request-lifecycle budget. Adopt that bounded-state signal while independently accounting exact Grok OAuth HTTP, SSE, WebSocket and media body/parse/replay/retained state under one sticky budget with stable capacity terminals and no retry, rotation or NetworkFailure classification after exhaustion."
+    },
+    {
+      "id": "GR-OBS-0012",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-28",
+        "repository": "grok2api",
+        "sourceDeltaId": "catalog_driven_model_capabilities",
+        "deltaId": "catalog_driven_model_capabilities",
+        "commit": "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e",
+        "tree": "889cf18ab5363fe8d6d408b16c734625e1065d24",
+        "paths": [
+          "backend/internal/domain/model/reasoning.go",
+          "backend/internal/domain/model/upstream_profile.go",
+          "backend/internal/domain/model/upstream_profile_test.go",
+          "backend/internal/infra/provider/cli/adapter.go",
+          "backend/internal/infra/provider/cli/adapter_test.go",
+          "backend/internal/infra/provider/cli/testdata/build_models_catalog.json"
+        ],
+        "symbols": [
+          "UpstreamModelProfile",
+          "NormalizeUpstreamProfile",
+          "RegisterUpstreamModelProfile",
+          "buildModelCatalogEntry",
+          "reasoningMenu",
+          "TestListModelsRegistersUpstreamReasoningMenu",
+          "supports_backend_search"
+        ],
+        "sourceDigest": "e7fdd9a4ee507c9dbbabe64c3c2565c2ac01b7edabd7e89de473f0ac4de6f1f8"
+      },
+      "disposition": "adopt",
+      "enhancementIds": [
+        "GR-N3"
+      ],
+      "target": {
+        "baselineCommit": "6118169a65928e3031864bca07763e35ed88a9dc",
+        "baselineTree": "65fbd747035e4a05c14bece3cab2dae4aeea6843",
+        "implementationCommit": "a0f567a60d6285cbd9d1e6b4b8396ee95582be3c",
+        "implementationTree": "b469c3292585b28497490f969a9e55dd99abf0ef",
+        "contracts": [
+          {
+            "path": "src/clients/oauth/grok_models.rs",
+            "anchors": [
+              "pub struct GrokModelCapability",
+              "parses_scoped_capability_menu_without_losing_order_or_explicit_zeroes",
+              "catalog_default_must_be_a_member_of_the_filtered_menu",
+              "authorization_empty_and_malformed_results_are_authoritative_and_fail_closed",
+              "fresh_capability_lookup_is_exact_across_every_scope_dimension"
+            ]
+          },
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "catalog_reasoning_menu_is_ordered_exact_and_supports_minimal_and_max",
+              "explicit_catalog_false_blocks_effort_without_discarding_summary_controls",
+              "websocket_uses_the_same_fresh_catalog_reasoning_menu"
+            ]
+          },
+          {
+            "path": "src/api/providers.rs",
+            "anchors": [
+              "grok_model_discovery_exposes_source_stale_and_fetch_time",
+              "capabilityManifestVersion",
+              "supportsBackendSearch"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "parses_scoped_capability_menu_without_losing_order_or_explicit_zeroes",
+          "catalog_default_must_be_a_member_of_the_filtered_menu",
+          "authorization_empty_and_malformed_results_are_authoritative_and_fail_closed",
+          "fresh_capability_lookup_is_exact_across_every_scope_dimension",
+          "catalog_reasoning_menu_is_ordered_exact_and_supports_minimal_and_max",
+          "explicit_catalog_false_blocks_effort_without_discarding_summary_controls",
+          "websocket_uses_the_same_fresh_catalog_reasoning_menu",
+          "grok_model_discovery_exposes_source_stale_and_fetch_time"
+        ]
+      },
+      "reason": "Adopt catalog-driven model capability metadata while binding the model ids and profiles to one exact App, Provider revision/runtime, Account and auth/token generation snapshot. Fresh menus drive only validated reasoning controls and display metadata; stale catalogs cannot authorize wire behavior, explicit false/zero values remain distinct from missing fields, and the reference process-global profile map is not copied."
+    },
+    {
+      "id": "GR-OBS-0013",
+      "providerFamily": "grok",
+      "observedAt": "2026-09-28T00:00:00Z",
+      "reference": {
+        "sourceId": "grok2api",
+        "snapshotId": "grok2api-2026-09-28",
+        "repository": "grok2api",
+        "sourceDeltaId": "build_identity_and_conversation_group",
+        "deltaId": "build_identity_and_conversation_group",
+        "commit": "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e",
+        "tree": "889cf18ab5363fe8d6d408b16c734625e1065d24",
+        "paths": [
+          "backend/internal/infra/config/config.go",
+          "backend/internal/infra/provider/cli/adapter.go",
+          "backend/internal/infra/provider/cli/adapter_test.go",
+          "backend/internal/infra/provider/cli/session_id_test.go"
+        ],
+        "symbols": [
+          "RecommendedBuildClientVersion",
+          "x-grok-conv-group-id",
+          "grokConversationGroupIDNamespace",
+          "grokConversationGroupID",
+          "TestGrokConversationGroupIDMatchesGrokBuildDerivation"
+        ],
+        "sourceDigest": "d59c0ccc2a4868a27b50f4123397bae3c376f4762c5428504542dbb5be878333"
+      },
+      "disposition": "live_gate",
+      "enhancementIds": [
+        "GR-N4"
+      ],
+      "target": {
+        "baselineCommit": "a0f567a60d6285cbd9d1e6b4b8396ee95582be3c",
+        "baselineTree": "b469c3292585b28497490f969a9e55dd99abf0ef",
+        "implementationCommit": null,
+        "implementationTree": null,
+        "productionCodeChanged": false,
+        "contracts": [
+          {
+            "path": "src/domain/grok_cli.rs",
+            "anchors": [
+              "DEFAULT_GROK_CLI_VERSION: &str = \"0.2.111\"",
+              "CC_SWITCH_GROK_CLI_VERSION",
+              "invalid_header_overrides_fall_back"
+            ]
+          },
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "x-grok-conv-id",
+              "composer_initial_attempt_isolates_client_session_ids"
+            ]
+          },
+          {
+            "path": "scripts/smoke/grok-real-receipt.mjs",
+            "anchors": [
+              "operationSpecs",
+              "live_pending",
+              "Grok receipt file must stay outside the repository"
+            ]
+          }
+        ],
+        "fixtureIds": []
+      },
+      "reason": "Keep Build 1.0.40 and x-grok-conv-group-id behind a fixed-account live gate. The reference proves its own identity and deterministic group derivation, but it does not prove that replacing this server's reviewed 0.2.111 lineage or adding the header is accepted by the same account; no production wire change is claimed without a fresh catalog-and-inference receipt."
     }
   ],
   "evidenceExtensions": [
@@ -1158,6 +1379,114 @@
             "capture_response",
             "ReplayStreamWrite",
             "RequestMemoryComponent::ReasoningReplay"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "GR-N3",
+      "status": "fixture_verified",
+      "catalogManifestVersion": 2,
+      "scopeDimensions": [
+        "app",
+        "provider_id",
+        "provider_revision",
+        "runtime_fingerprint",
+        "account_id",
+        "auth_identity_generation",
+        "token_refresh_generation"
+      ],
+      "knownReasoningEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "atomicCatalogReplace": true,
+      "authoritativeEmptyCatalog": true,
+      "staleCatalogDisplayOnly": true,
+      "explicitFalseAndZeroPreserved": true,
+      "defaultMustBelongToMenu": true,
+      "searchAutoEnabled": false,
+      "compactionAutoEnabled": false,
+      "catalogBudgetAutoApplied": false,
+      "liveReceiptState": "live_pending",
+      "localEvidence": [
+        {
+          "path": "src/clients/oauth/grok_models.rs",
+          "anchors": [
+            "pub struct GrokModelCapability",
+            "parses_scoped_capability_menu_without_losing_order_or_explicit_zeroes",
+            "catalog_default_must_be_a_member_of_the_filtered_menu",
+            "etag_304_and_same_scope_last_known_good_are_preserved",
+            "authorization_empty_and_malformed_results_are_authoritative_and_fail_closed",
+            "fresh_capability_lookup_is_exact_across_every_scope_dimension"
+          ]
+        },
+        {
+          "path": "src/proxy/grok.rs",
+          "anchors": [
+            "catalog_reasoning_menu_is_ordered_exact_and_supports_minimal_and_max",
+            "explicit_catalog_false_blocks_effort_without_discarding_summary_controls",
+            "websocket_uses_the_same_fresh_catalog_reasoning_menu"
+          ]
+        },
+        {
+          "path": "src/api/providers.rs",
+          "anchors": [
+            "grok_model_discovery_exposes_source_stale_and_fetch_time",
+            "capabilityManifestVersion",
+            "supportsBackendSearch"
+          ]
+        },
+        {
+          "path": "src/state.rs",
+          "anchors": [
+            "fresh_grok_reasoning_capability",
+            "GrokReasoningCapabilityScope"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "GR-N4",
+      "status": "live_pending",
+      "productionCodeChanged": false,
+      "reviewedReferenceVersion": "1.0.40",
+      "currentServerVersion": "0.2.111",
+      "conversationGroupHeaderEnabled": false,
+      "requiredLiveEvidence": [
+        "same_fixed_account",
+        "fresh_catalog_identity_acceptance",
+        "fresh_inference_identity_acceptance",
+        "version_rejected_signal_or_current_commit_receipt",
+        "group_header_isolation_and_acceptance"
+      ],
+      "localEvidence": [
+        {
+          "path": "src/domain/grok_cli.rs",
+          "anchors": [
+            "DEFAULT_GROK_CLI_VERSION: &str = \"0.2.111\"",
+            "CC_SWITCH_GROK_CLI_VERSION",
+            "invalid_header_overrides_fall_back"
+          ]
+        },
+        {
+          "path": "src/proxy/grok.rs",
+          "anchors": [
+            "x-grok-conv-id",
+            "composer_initial_attempt_isolates_client_session_ids"
+          ]
+        },
+        {
+          "path": "scripts/smoke/grok-real-receipt.mjs",
+          "anchors": [
+            "operationSpecs",
+            "live_pending",
+            "Grok receipt file must stay outside the repository"
           ]
         }
       ]

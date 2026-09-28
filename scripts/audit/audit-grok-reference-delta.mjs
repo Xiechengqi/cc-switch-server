@@ -169,7 +169,7 @@ assert(
 );
 
 assert(
-  objectDigest(contract.sourceExtensions) ===
+  objectDigest((contract.sourceExtensions ?? []).slice(0, 1)) ===
     "948594aa54e0483eb22de484c840b269ad527366d0a64a63879ec1c88d7846ea",
   "Grok source extension history changed",
 );
@@ -227,19 +227,80 @@ assert(
   "sub2api rejected-source history changed",
 );
 
+const immutableSourceDeltaDigests = new Map([
+  [
+    "catalog_driven_model_capabilities",
+    "9d4006f1dae3da5ec40eaa0b34c412dd86a0b58f330c5e4b0c119a8bf9e53042",
+  ],
+  [
+    "build_identity_and_conversation_group",
+    "85efd1df73b2413e0d7b531764ff38655ab8eb9b9af28d1e82e894ab3cea233f",
+  ],
+]);
+const sourceDeltaById = new Map();
+for (const delta of contract.sourceDeltaExtensions ?? []) {
+  assert(delta.id && !sourceDeltaById.has(delta.id), "duplicate Grok source delta");
+  assert(
+    delta.sourceId === "grok2api" &&
+      delta.repository === "grok2api" &&
+      delta.snapshotId === "grok2api-2026-09-28" &&
+      delta.commit === "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e" &&
+      delta.tree === "889cf18ab5363fe8d6d408b16c734625e1065d24" &&
+      Array.isArray(delta.files) &&
+      delta.files.length >= 2,
+    `${delta.id} has invalid committed source identity`,
+  );
+  const fileByPath = new Map();
+  for (const file of delta.files) {
+    safeRelative(file.path, `${delta.id} evidence path`);
+    assert(!fileByPath.has(file.path), `${delta.id} repeats ${file.path}`);
+    assert(digestPattern.test(file.sha256), `${delta.id}:${file.path} has invalid SHA-256`);
+    fileByPath.set(file.path, file);
+    if (checkSources) {
+      const content = gitFile(sourceRootById.get(delta.sourceId), delta.commit, file.path, null);
+      assert(
+        sha256(content) === file.sha256,
+        `${delta.id}:${file.path} drifted from the reviewed Git object`,
+      );
+    }
+  }
+  assert(
+    immutableSourceDeltaDigests.get(delta.id) === objectDigest(delta),
+    `${delta.id} changed after it was recorded`,
+  );
+  if (checkSources) {
+    assert(
+      gitTree(sourceRootById.get(delta.sourceId), delta.commit) === delta.tree,
+      `${delta.id} source tree drifted`,
+    );
+  }
+  sourceDeltaById.set(delta.id, { ...delta, fileByPath });
+}
+assert(
+  sourceDeltaById.size === immutableSourceDeltaDigests.size,
+  "Grok source delta history is incomplete",
+);
+
 const immutableSourceSnapshotDigests = new Map([
   ["grok2api-2026-09-19", "d9a5a4cccc9c5decb96f033bdc696b9a6af647b4602a3a3fbc8278744c2590d8"],
   ["sub2api-2026-09-19", "c837f83cee57f13f6fd14510402c7b996777f9ad7d1b878751c65e7dcfcb6b77"],
+  ["grok2api-2026-09-28", "70c5275ae5afa26b367b50d625330c619f2129f2ed1ad101a51a5eb9569dd4dc"],
 ]);
 const sourceSnapshotById = new Map();
 for (const snapshot of contract.sourceSnapshots ?? []) {
   assert(snapshot.id && !sourceSnapshotById.has(snapshot.id), "duplicate Grok source snapshot");
   const source = sourceById.get(snapshot.sourceId);
   assert(source, `${snapshot.id} references an unknown source`);
+  const latestGrokSnapshot = snapshot.id === "grok2api-2026-09-28";
   assert(
-    snapshot.headCommit === source.commit &&
+    commitPattern.test(snapshot.headCommit) &&
       commitPattern.test(snapshot.headTree) &&
-      snapshot.readMode === "read_only_committed_git_objects",
+      snapshot.readMode === "read_only_committed_git_objects" &&
+      (latestGrokSnapshot
+        ? snapshot.headCommit === "5e5ad75556b61a2c4a8fcf344d83bfe7760f2b42" &&
+          snapshot.reviewedCommit === "9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e" &&
+          snapshot.headTree === "889cf18ab5363fe8d6d408b16c734625e1065d24"
+        : snapshot.headCommit === source.commit && snapshot.reviewedCommit === undefined),
     `${snapshot.id} has invalid committed source identity`,
   );
   if (snapshot.sourceId === "grok2api") {
@@ -312,6 +373,8 @@ const immutableObservationDigests = new Map([
   ["GR-OBS-0009", "af09e7c34cff0d9699e8956fb58a766c186e3dfb93f4e4a39ae83193c3adbc75"],
   ["GR-OBS-0010", "f4c6f439470de9db744c0387d56679aeb3d1b70d40424a56221b456211d47404"],
   ["GR-OBS-0011", "eaab1e5d64f900ad0b23344ec5a0bbd5b7ed9e6aad34f25db43b908af9dd9116"],
+  ["GR-OBS-0012", "ac1fd98235931cce6e12d0c7b9233f55deb5d366173fbbd158731cd6eab20440"],
+  ["GR-OBS-0013", "d3f8f3700b33e68552adaed790fef309d0be39175a3e05628da019ef7604a8fb"],
 ]);
 const expectedEnhancementIds = new Set([
   "GR-01",
@@ -324,6 +387,8 @@ const expectedEnhancementIds = new Set([
   "CORE-N2",
   "LIVE-N1",
   "GR-R1",
+  "GR-N3",
+  "GR-N4",
 ]);
 const expectedDispositions = new Map([
   ["GR-OBS-0001", "adopt"],
@@ -337,6 +402,8 @@ const expectedDispositions = new Map([
   ["GR-OBS-0009", "live_gate"],
   ["GR-OBS-0010", "reject"],
   ["GR-OBS-0011", "differential"],
+  ["GR-OBS-0012", "adopt"],
+  ["GR-OBS-0013", "live_gate"],
 ]);
 const observationIds = new Set();
 const observedEnhancementIds = new Set();
@@ -375,8 +442,24 @@ for (const observation of contract.observations ?? []) {
       commitPattern.test(reference.tree),
     `${observation.id} changed committed source identity`,
   );
+  const sourceDelta = reference.sourceDeltaId
+    ? sourceDeltaById.get(reference.sourceDeltaId)
+    : undefined;
+  if (reference.sourceDeltaId) {
+    assert(
+      sourceDelta &&
+        sourceDelta.sourceId === reference.sourceId &&
+        sourceDelta.snapshotId === reference.snapshotId &&
+        sourceDelta.repository === reference.repository &&
+        sourceDelta.commit === reference.commit &&
+        sourceDelta.tree === reference.tree &&
+        sourceDelta.id === reference.deltaId,
+      `${observation.id} references an invalid source delta extension`,
+    );
+  }
   const allowedCommits = new Set([source.commit]);
   if (source.qualityPolicyCommit) allowedCommits.add(source.qualityPolicyCommit);
+  if (sourceDelta) allowedCommits.add(sourceDelta.commit);
   assert(allowedCommits.has(reference.commit), `${observation.id} references an unfrozen source commit`);
   assert(
     typeof reference.deltaId === "string" &&
@@ -391,7 +474,7 @@ for (const observation of contract.observations ?? []) {
       new Set(reference.paths).size === reference.paths.length,
     `${observation.id} has invalid source paths`,
   );
-  const fileByPath = sourceFileById.get(reference.sourceId);
+  const fileByPath = sourceDelta?.fileByPath ?? sourceFileById.get(reference.sourceId);
   const files = reference.paths.map((sourcePath) => {
     safeRelative(sourcePath, `${observation.id}:${sourcePath ?? "<missing>"}`);
     const file = fileByPath.get(sourcePath);
@@ -426,6 +509,8 @@ for (const observation of contract.observations ?? []) {
     `${observation.id} has an invalid target baseline object`,
   );
   const rejected = observation.disposition === "reject";
+  const unchangedLiveGate =
+    observation.disposition === "live_gate" && target.productionCodeChanged === false;
   if (rejected) {
     assert(
       target.implementationCommit === null && target.implementationTree === null,
@@ -434,6 +519,14 @@ for (const observation of contract.observations ?? []) {
     assert(
       Array.isArray(target.fixtureIds) && target.fixtureIds.length === 0,
       `${observation.id} rejected behavior must not claim fixtures`,
+    );
+  } else if (unchangedLiveGate) {
+    assert(
+      target.implementationCommit === null &&
+        target.implementationTree === null &&
+        Array.isArray(target.fixtureIds) &&
+        target.fixtureIds.length === 0,
+      `${observation.id} unchanged live gate must not claim an implementation or fixtures`,
     );
   } else {
     assert(
@@ -448,7 +541,9 @@ for (const observation of contract.observations ?? []) {
       `${observation.id} has no implementation fixtures`,
     );
   }
-  const contractCommit = rejected ? target.baselineCommit : target.implementationCommit;
+  const contractCommit = rejected || unchangedLiveGate
+    ? target.baselineCommit
+    : target.implementationCommit;
   const targetSources = [];
   for (const localContract of target.contracts ?? []) {
     safeRelative(localContract.path, `${observation.id}:${localContract.path ?? "<missing>"}`);
@@ -462,7 +557,7 @@ for (const observation of contract.observations ?? []) {
     );
   }
   assert(targetSources.length > 0, `${observation.id} has no target contracts`);
-  if (!rejected) {
+  if (!rejected && !unchangedLiveGate) {
     assert(
       target.fixtureIds.every((fixture) =>
         targetSources.some((targetSource) => targetSource.includes(fixture)),
@@ -505,16 +600,31 @@ assert(
 );
 
 assert(
-  objectDigest(contract.evidenceExtensions) ===
+  objectDigest((contract.evidenceExtensions ?? []).slice(0, 1)) ===
     "facc1d19b75c002cbadb1d333bcbd57b68a195c5dc0c23515f951c27fd11a919",
   "Grok evidence extension history changed",
 );
 const evidenceExtensions = new Map(
   (contract.evidenceExtensions ?? []).map((extension) => [extension.id, extension]),
 );
+const immutableEvidenceExtensionDigests = new Map([
+  ["CORE-N2-GROK", "c48da2fb28c1c624cf93f04179098fbc3ef7638d35ed3a050ce40e29dadf388d"],
+  ["GR-N3", "0766b5f9c1183c2440723c9ab5b545c9d214207cc8c8475709947ea01d8ce7b1"],
+  ["GR-N4", "c33f95457a922468b09fec5c665e6af4b0adced859ac1159045ec7ddf5a11163"],
+]);
+for (const [id, extension] of evidenceExtensions) {
+  assert(
+    immutableEvidenceExtensionDigests.get(id) === objectDigest(extension),
+    `${id} evidence extension changed after it was recorded`,
+  );
+}
+assert(
+  evidenceExtensions.size === immutableEvidenceExtensionDigests.size,
+  "Grok evidence extension history is incomplete",
+);
 const requestMemoryExtension = evidenceExtensions.get("CORE-N2-GROK");
 assert(
-  evidenceExtensions.size === 1 &&
+  evidenceExtensions.size === 3 &&
     requestMemoryExtension?.status === "fixture_verified" &&
     JSON.stringify(requestMemoryExtension.rails) === JSON.stringify(["oauth"]) &&
     JSON.stringify(requestMemoryExtension.transports) ===
@@ -538,6 +648,69 @@ for (const evidence of requestMemoryExtension.localEvidence) {
       evidence.anchors.every((anchor) => source.includes(anchor)),
     `CORE-N2-GROK is missing a local anchor in ${evidence.path}`,
   );
+}
+
+const catalogCapabilityExtension = evidenceExtensions.get("GR-N3");
+assert(
+  catalogCapabilityExtension?.status === "fixture_verified" &&
+    catalogCapabilityExtension.catalogManifestVersion === 2 &&
+    JSON.stringify(catalogCapabilityExtension.scopeDimensions) ===
+      JSON.stringify([
+        "app",
+        "provider_id",
+        "provider_revision",
+        "runtime_fingerprint",
+        "account_id",
+        "auth_identity_generation",
+        "token_refresh_generation",
+      ]) &&
+    JSON.stringify(catalogCapabilityExtension.knownReasoningEfforts) ===
+      JSON.stringify(["none", "minimal", "low", "medium", "high", "xhigh", "max"]) &&
+    catalogCapabilityExtension.atomicCatalogReplace === true &&
+    catalogCapabilityExtension.authoritativeEmptyCatalog === true &&
+    catalogCapabilityExtension.staleCatalogDisplayOnly === true &&
+    catalogCapabilityExtension.explicitFalseAndZeroPreserved === true &&
+    catalogCapabilityExtension.defaultMustBelongToMenu === true &&
+    catalogCapabilityExtension.searchAutoEnabled === false &&
+    catalogCapabilityExtension.compactionAutoEnabled === false &&
+    catalogCapabilityExtension.catalogBudgetAutoApplied === false &&
+    catalogCapabilityExtension.liveReceiptState === "live_pending" &&
+    catalogCapabilityExtension.localEvidence?.length === 4,
+  "GR-N3 catalog capability evidence boundary changed",
+);
+
+const identityGateExtension = evidenceExtensions.get("GR-N4");
+assert(
+  identityGateExtension?.status === "live_pending" &&
+    identityGateExtension.productionCodeChanged === false &&
+    identityGateExtension.reviewedReferenceVersion === "1.0.40" &&
+    identityGateExtension.currentServerVersion === "0.2.111" &&
+    identityGateExtension.conversationGroupHeaderEnabled === false &&
+    JSON.stringify(identityGateExtension.requiredLiveEvidence) ===
+      JSON.stringify([
+        "same_fixed_account",
+        "fresh_catalog_identity_acceptance",
+        "fresh_inference_identity_acceptance",
+        "version_rejected_signal_or_current_commit_receipt",
+        "group_header_isolation_and_acceptance",
+      ]) &&
+    identityGateExtension.localEvidence?.length === 3,
+  "GR-N4 identity live gate changed",
+);
+
+for (const extension of [catalogCapabilityExtension, identityGateExtension]) {
+  for (const evidence of extension.localEvidence) {
+    safeRelative(evidence.path, `${extension.id} local path`);
+    const localPath = path.join(repoRoot, evidence.path);
+    assert(fs.existsSync(localPath), `${extension.id} local path is unavailable: ${evidence.path}`);
+    const source = fs.readFileSync(localPath, "utf8");
+    assert(
+      Array.isArray(evidence.anchors) &&
+        evidence.anchors.length > 0 &&
+        evidence.anchors.every((anchor) => source.includes(anchor)),
+      `${extension.id} is missing a local anchor in ${evidence.path}`,
+    );
+  }
 }
 
 const capabilities = new Map(

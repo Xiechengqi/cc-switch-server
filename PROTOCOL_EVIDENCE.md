@@ -31,6 +31,18 @@ CX-N11 与 CX-N12 都先由差分 fixture 复现红灯，再做窄修复。Codex
 
 Codex 关键词回归 399 项及新增 steering、reported-model 专项均已通过；reference-delta 默认审计与 committed-object 复核通过。CX-N5～CX-N12 均只提升为 `fixture_verified`。GPT Image 2.5 三个 variant、WS prewarm、Astra entitlement 和其他真实账号 operation 仍各自保持 `receipt=null/live_pending`；本轮没有引入账号池、跨 Account/Provider/rail/site fallback，也没有以本地 fixture 代替真实 ChatGPT 验收。
 
+## 2026-09-28 Grok catalog capability and identity-gate freeze
+
+GR-N3 与 GR-N4 冻结在 `assets/contract/grok-reference-delta.json` 的 `GR-OBS-0012`～`GR-OBS-0013`。一次性只读证据取自干净的 `grok2api@5e5ad75556b61a2c4a8fcf344d83bfe7760f2b42`；实际评审的功能提交是 `9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e`，两者共享 tree `889cf18ab5363fe8d6d408b16c734625e1065d24`。两个追加式 source delta 分别固定目录能力和 Build 1.0.40/conversation-group 身份的八个 committed object；默认审计不读取外部 checkout，显式 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核 commit/tree、文件 SHA-256 与符号。`sub2api@ab99d56e` 的六项工作树修改仍全部排除。
+
+GR-N3 的独立实现冻结在 `a0f567a60d6285cbd9d1e6b4b8396ee95582be3c`（tree `b469c3292585b28497490f969a9e55dd99abf0ef`）。`GrokModelCapability` 与 model ID 在同一个目录 snapshot 中原子替换，并精确绑定 App、Provider ID/revision/runtime fingerprint、Account、auth identity generation 与 token refresh generation。解析保留上游 reasoning menu 顺序并去重，只接受 `none|minimal|low|medium|high|xhigh|max`；default 必须属于过滤后的菜单，显式 `false`/`0` 与字段缺失保持不同语义。成功空目录权威清除旧能力，stale catalog 只可展示，不能向 HTTP、WebSocket 或 WS→HTTP fallback 扩大运行时权限。
+
+目录 manifest v2 展示 reasoning menu/default、context window、max completion 与 backend search；这些字段不会自动开启搜索、remote compaction，也不会把上游 context/max 当作本地请求内存预算。fresh capability 下的 reasoning effort 只能来自当前菜单；显式 `supports_reasoning_effort=false` 只移除 effort，不误删独立 summary 控制。没有 fresh capability 时继续使用既有保守静态判断。实现没有复制参考项目的 process-global profile map，也没有采用缺少 xAI 权威价格的 Grok 4.7 临时计价推断。
+
+GR-N4 保持 `live_pending` 且没有生产 wire 改动：Server 继续使用已评审的 `grok-shell/0.2.111` 身份，只发送隔离后的 `x-grok-conv-id`，不新增 `x-grok-conv-group-id`。参考项目自身采用 Build `1.0.40` 和稳定 UUIDv5 group id，不能证明同一固定账号会接受目标项目直接替换身份。只有 catalog 与 inference 的 current-commit 私密 receipt，或明确可复现的 version-rejected signal，才能触发后续常量/header 变更；一个 operation 的结果不能外推到 media、remote compaction、其他 Account/Provider/Share/rail。
+
+Grok 关键词回归为 224/224，Clippy、格式、reference-delta 默认审计与 committed-object 复核均通过。合同现有 13 条 append-only observation；`GR-N3=fixture_verified` 只证明本地目录/运行时闭环，inference、media、remote compaction 与 GR-N4 身份/header 接受性仍分别保持 `receipt=null/live_pending`。
+
 ## 2026-09-28 Cursor OmniRoute no-wire refresh
 
 Cursor 的第二轮 append-only review 从 `OmniRoute@02c663cdd0e8577bdcf2b01a44046bcd46dc6a7a`（tree `25b36e4993a8cc52da22b3d0b0aa26bd4c60426b`）比较到 `443d66996d69d7ecf887fd61158404a3cca1b192`（tree `8d1c312f61d115767c9478416cb039750eaf113a`）。区间内 14 个 committed path 只涉及依赖/lockfile、可选本地 embedding、测试运行器和共享 `streamTiming` 的 monotonic clock；六个已冻结的 Cursor protobuf、session、executor 与对应 fixture path 均无变化，没有 OAuth/API-key header、ServerConfig、AgentService protobuf/gzip、模型目录、工具桥、park/resume 或 terminal wire 增量。
