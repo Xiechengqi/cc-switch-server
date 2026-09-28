@@ -33461,6 +33461,26 @@ mod tests {
         )
     }
 
+    fn antigravity_replay_mixed_continuation_request(streaming: bool) -> Bytes {
+        Bytes::from(
+            json!({
+                "contents": [
+                    {"role": "user", "parts": [{"text": "look up"}]},
+                    {"role": "user", "parts": [
+                        {"text": "keep this after the tool result"},
+                        {"functionResponse": {
+                            "id": "call-a",
+                            "name": "lookup",
+                            "response": {"ok": true}
+                        }}
+                    ]}
+                ],
+                "stream": streaming
+            })
+            .to_string(),
+        )
+    }
+
     fn request_has_antigravity_replay(body: &Value) -> bool {
         body.pointer("/request/contents/1/parts/0/thoughtSignature")
             .and_then(Value::as_str)
@@ -34224,7 +34244,7 @@ mod tests {
             provider_id,
             path,
             antigravity_replay_headers(share_id, "stream-session"),
-            antigravity_replay_continuation_request(true),
+            antigravity_replay_mixed_continuation_request(true),
         )
         .await
         .unwrap();
@@ -34234,6 +34254,18 @@ mod tests {
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 2);
         assert!(request_has_antigravity_replay(&observations[1].body));
+        assert_eq!(
+            observations[1]
+                .body
+                .pointer("/request/contents/3/parts/0/text"),
+            Some(&json!("keep this after the tool result"))
+        );
+        assert_eq!(
+            observations[1]
+                .body
+                .pointer("/request/contents/2/parts/0/functionResponse/id"),
+            Some(&json!("call-a"))
+        );
         drop(observations);
         server.abort();
     }

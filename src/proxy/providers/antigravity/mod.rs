@@ -24,6 +24,12 @@ use super::super::request_memory::{
 use super::super::router::ProxyRoute;
 use super::super::{bounded_upstream_rate_limit_until, ProxyError};
 
+mod wire;
+
+pub(crate) use wire::{
+    apply_responses_reasoning_summary, normalize_wire_request, validate_source_tool_choice,
+};
+
 pub(crate) fn is_provider(provider_type: ProviderType) -> bool {
     matches!(
         provider_type,
@@ -351,7 +357,17 @@ pub(crate) async fn prepare_reasoning_replay(
     if let Some(chain) = previous_chain.as_ref() {
         let result = antigravity_replay::apply_replay(body, chain);
         if result.applied {
-            *body = result.body;
+            let mut replayed = serde_json::from_slice::<Value>(&result.body).map_err(|error| {
+                ProxyError::bad_request(format!(
+                    "Antigravity replay produced invalid JSON: {error}"
+                ))
+            })?;
+            wire::normalize_wire_request(&mut replayed).map_err(ProxyError::bad_request)?;
+            *body = serde_json::to_vec(&replayed)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    ProxyError::bad_request(format!("Antigravity replay encode failed: {error}"))
+                })?;
             replay_applied = true;
             crate::metrics::record_antigravity_reasoning_replay("hit", 1);
         } else if result.context_mismatch {

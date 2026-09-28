@@ -1117,7 +1117,18 @@ fn transform_body_for_upstream(
             "request body must be valid json for transform: {error}"
         ))
     })?;
-    let output = match (stored.app, upstream_format) {
+    let antigravity = super::providers::antigravity::is_provider(stored.provider_type);
+    if antigravity && stored.app != AppKind::Gemini {
+        super::providers::antigravity::validate_source_tool_choice(&input)
+            .map_err(ProxyError::bad_request)?;
+    }
+    let antigravity_responses_reasoning = (antigravity
+        && stored.app == AppKind::Codex
+        && upstream_format == UpstreamFormat::GeminiNative
+        && input.get("messages").is_none())
+    .then(|| input.get("reasoning").cloned())
+    .flatten();
+    let mut output = match (stored.app, upstream_format) {
         (AppKind::Claude, UpstreamFormat::OpenAiResponses) => {
             if stored.provider_type == ProviderType::CodexOAuth {
                 transforms::anthropic_to_openai_responses_with_instructions(&input)
@@ -1182,6 +1193,14 @@ fn transform_body_for_upstream(
         _ => Ok(input),
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
+
+    if let Some(reasoning) = antigravity_responses_reasoning {
+        super::providers::antigravity::apply_responses_reasoning_summary(
+            &json!({"reasoning": reasoning}),
+            &mut output,
+        )
+        .map_err(ProxyError::bad_request)?;
+    }
 
     serde_json::to_vec(&output)
         .map(Bytes::from)
@@ -2486,6 +2505,8 @@ fn sanitize_gemini_v1internal_request(
         ));
     }
     if inject_antigravity_identity {
+        super::providers::antigravity::normalize_wire_request(value)
+            .map_err(ProxyError::bad_request)?;
         normalize_antigravity_request_schemas(value);
     } else {
         normalize_gemini_tool_schemas(value);
@@ -5776,6 +5797,173 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::AntigravityOAuth, json!({}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::AntigravityOAuth);
+        for (reasoning, expected) in [
+            (json!({"effort": "high"}), true),
+            (json!({"effort": "high", "summary": "auto"}), true),
+            (
+                json!({"effort": "high", "generate_summary": "detailed"}),
+                true,
+            ),
+            (json!({"effort": "high", "summary": "none"}), false),
+            (json!({"effort": "high", "summary": null}), false),
+        ] {
+            let request = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gemini-3.5-pro",
+                            "input": "ping",
+                            "reasoning": reasoning
+                        }))
+                        .unwrap(),
+                    ),
+                    &stored,
+                    ProxyRoute::CodexResponses,
+                    None,
+                )
+                .unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body.pointer("/generationConfig/thinkingConfig/includeThoughts"),
+                Some(&json!(expected))
+            );
+            assert!(body
+                .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+                .is_some());
+        }
+
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(br#"{"model":"gemini-3.5-pro","input":"ping"}"#),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(body.pointer("/generationConfig/thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn antigravity_unknown_tool_choice_fails_before_wire_finalization() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::AntigravityOAuth, json!({}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::AntigravityOAuth);
+        for choice in [
+            json!("future_permission"),
+            json!({"type": "function", "name": ""}),
+            json!({"type": "function", "name": "undeclared"}),
+        ] {
+            let error = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        serde_json::to_vec(&json!({
+                            "model": "gemini-3.5-pro",
+                            "input": "ping",
+                            "tools": [{
+                                "type": "function",
+                                "name": "lookup",
+                                "parameters": {"type": "object"}
+                            }],
+                            "tool_choice": choice
+                        }))
+                        .unwrap(),
+                    ),
+                    &stored,
+                    ProxyRoute::CodexResponses,
+                    None,
+                )
+                .err()
+                .expect("invalid Antigravity tool choice must fail");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("tool_choice"));
+        }
+    }
+
+    #[test]
+    fn antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary() {
+        let stored = stored_provider(AppKind::Claude, ProviderType::AntigravityOAuth, json!({}));
+        let adapter = adapter_for(AppKind::Claude, ProviderType::AntigravityOAuth);
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from_static(
+                    br##"{
+                        "model":"gemini-3.5-pro",
+                        "messages":[
+                            {"role":"assistant","content":[
+                                {"type":"thinking","thinking":"private","signature":"sig"},
+                                {"type":"tool_use","id":"call_a|b","name":"lookup","input":{}}
+                            ]},
+                            {"role":"user","content":[
+                                {"type":"text","text":"continue after result"},
+                                {"type":"tool_result","tool_use_id":"call_a|b","content":{
+                                    "schema":{"$ref":"#/components/schemas/Error"}
+                                }}
+                            ]}
+                        ]
+                    }"##,
+                ),
+                &stored,
+                ProxyRoute::ClaudeMessages,
+                None,
+            )
+            .unwrap();
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        sanitize_gemini_v1internal_request(&mut body, true).unwrap();
+
+        assert_eq!(
+            body.pointer("/contents/0/parts/1/functionCall/id"),
+            Some(&json!("call_a_b"))
+        );
+        assert_eq!(
+            body.pointer("/contents/1/parts/0/functionResponse/id"),
+            Some(&json!("call_a_b"))
+        );
+        assert!(body
+            .pointer("/contents/1/parts/0/functionResponse/response/result")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains("#/components/schemas/Error")));
+        assert_eq!(
+            body.pointer("/contents/2/parts/0/text"),
+            Some(&json!("continue after result"))
+        );
+        assert_eq!(
+            body.pointer("/contents/0/parts/0/thoughtSignature"),
+            Some(&json!("sig"))
+        );
+    }
+
+    #[test]
+    fn antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary() {
+        let cases = [
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+                "toolConfig": {"functionCallingConfig": {"mode": "FUTURE"}}
+            }),
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+                "toolConfig": {"functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": []
+                }}
+            }),
+        ];
+
+        for mut request in cases {
+            let error = sanitize_gemini_v1internal_request(&mut request, true)
+                .expect_err("invalid native Gemini tool choice must fail closed");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                error.message.contains("mode") || error.message.contains("allowedFunctionNames")
+            );
+        }
     }
 
     #[test]
