@@ -615,7 +615,18 @@ fn restore_claude_tool_names_in_value(
             changed |= restore_claude_tool_name_field(nested, "name", aliases);
         }
     }
-    for child in object.values_mut() {
+    for (key, child) in object.iter_mut() {
+        // Tool arguments are caller/model data, not protocol structure. The
+        // same alias-looking shape may legitimately occur inside that JSON and
+        // must remain byte-semantically opaque to response name restoration.
+        if matches!(key.as_str(), "input" | "arguments" | "args") {
+            continue;
+        }
+        // Gemini function responses carry arbitrary tool output below this
+        // boundary and never contain an assistant call name to restore.
+        if matches!(key.as_str(), "functionResponse" | "function_response") {
+            continue;
+        }
         changed |= restore_claude_tool_names_in_value(child, aliases);
     }
     changed
@@ -4425,13 +4436,37 @@ mod tests {
 
         let response = Bytes::from(
             serde_json::to_vec(&json!({
-                "content": [{"type": "tool_use", "name": custom_alias, "input": {}}]
+                "content": [{
+                    "type": "tool_use",
+                    "name": custom_alias,
+                    "input": {
+                        "function": {"name": custom_alias},
+                        "functionCall": {"name": custom_alias, "args": {"name": custom_alias}},
+                        "nested": {"type": "function_call", "name": custom_alias}
+                    }
+                }]
             }))
             .unwrap(),
         );
         let restored = restore_claude_tool_names_in_response_bytes(response, &aliases);
         let restored: Value = serde_json::from_slice(&restored).unwrap();
         assert_eq!(restored["content"][0]["name"], "custom.lookup");
+        assert_eq!(
+            restored.pointer("/content/0/input/function/name"),
+            Some(&json!(custom_alias))
+        );
+        assert_eq!(
+            restored.pointer("/content/0/input/functionCall/name"),
+            Some(&json!(custom_alias))
+        );
+        assert_eq!(
+            restored.pointer("/content/0/input/functionCall/args/name"),
+            Some(&json!(custom_alias))
+        );
+        assert_eq!(
+            restored.pointer("/content/0/input/nested/name"),
+            Some(&json!(custom_alias))
+        );
     }
 
     #[test]
@@ -4601,10 +4636,11 @@ mod tests {
             ))
             .is_empty());
         let output = patcher.push(Bytes::from_static(
-            b"beef\",\"input\":{}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+            b"beef\",\"input\":{\"function\":{\"name\":\"cc_tool_deadbeef\"}}}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
         ));
         let output = std::str::from_utf8(&output).unwrap();
         assert!(output.contains("\"name\":\"mcp.server:read\""));
+        assert!(output.contains("\"function\":{\"name\":\"cc_tool_deadbeef\"}"));
         assert!(output.contains("event: content_block_start\r\n"));
         assert!(output.contains("data: {\"type\":\"message_stop\"}"));
         assert!(patcher.finish().is_empty());
