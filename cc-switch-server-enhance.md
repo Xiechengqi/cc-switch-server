@@ -2,7 +2,7 @@
 
 > 文档性质：八类反代的增量差异分析与实施路线图，不是架构或协议真值。架构以 docs/architecture/overview.md 为准，Provider 身份与能力以 assets/contract/provider-registry.json 为准，wire 证据以 PROTOCOL_EVIDENCE.md、厂商材料和本仓库冻结 fixture 为准。
 >
-> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）、Grok GR-N3（`a0f567a`）和 CodeBuddy CB-N6（最终复核 `4f8c937`）；Cursor 与 Kiro 第二轮均冻结为 `reviewed_no_wire_delta`，GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。Qoder 最新 HEAD 仍按第 17 节的 `unreviewed_skill_gate` 等待合规补审。
+> 分析日期：2026-09-18，实施状态更新至 2026-09-28。分析起点：`origin/main@7c9ef35`；Provider 生产差分起点为 `4712ca063930fea507910c37749595c8d6acc073`。首轮生产行为与协议证据冻结到 `db65188`，验证门禁收口到 `248e7c2`。后续已按 Provider 完成 Antigravity（`e5bfc34`）、Claude（`6b0a0fe`）、Codex（`069f3ef`）、Cursor（`8f72bb9`）、Grok（`269850a`）、Kiro（`1124082`）、Qoder（`2cc8a01`）与 CodeBuddy（`d81056c`）的首批 CORE-N1/LIVE-N1 切片，并完成八类 EVID-N1 迁移；CORE-N2 最后由 Qoder（`3485571`）和 CodeBuddy（`573dc47`）收口。Phase 3 的本地结构项由 SQLite 关注点拆分（`7f2c531`）、state 并发准入拆分（`4237756`）和后台调度拆分（`a0ec1ea`）收口。第二轮已完成 Antigravity AG-N7～N11（`aeeaf1a`）、Claude CL-N5～N6（`7794033`）、Codex CX-N5～N12（`f890774`）、Grok GR-N3（`a0f567a`）和 CodeBuddy CB-N6（最终复核 `4f8c937`）；整体 review 又以 `05d498c` 收紧 Claude alias 回映的 payload opacity，以 `26eb389` 收紧 Codex 匿名 SSE 和组合引用边界。Cursor 与 Kiro 第二轮均冻结为 `reviewed_no_wire_delta`，GR-N4 因缺固定账号证据保持 `live_pending` 且不改 wire。Qoder 最新 HEAD 仍按第 17 节的 `unreviewed_skill_gate` 等待合规补审。
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
@@ -954,6 +954,8 @@ CL-N5 只修改 Responses 输出组织与 offset，不把不同语义 block 粘�
 
 实施更新（2026-09-28）：CL-N5～CL-N6 已在 `77940334fda6291706d3807d0d3cdcb49c767d65` 完成。流式和非流式 Anthropic→Responses 现在按语义边界聚合相邻 text block，citation 以 Unicode scalar 累计且每个新 block 从其自身文本起点搜索；重复 cited text、组合字符、emoji、无 citation 与中途 tool/reasoning 边界均有 fixture。Claude OAuth 默认只 alias 真正非法的普通 custom/MCP 名称，合法名称逐字节保留，server tool 不改；declaration、choice、history、JSON/SSE 回映共享请求级 map，大小写和 wire alias 碰撞 fail closed，并保留 `disabled` 事故回滚。Claude 关键词测试 270/270、Anthropic 关键词测试 131/131、Clippy、wire profile、reference-delta 默认/`--check-sources` 审计均通过；证据追加为 `CL-OBS-0016`～`CL-OBS-0017`，两项均为 `fixture_verified`，五个真实 operation 与非法 MCP live acceptance 仍为 `live_pending`。
 
+整体 review 追加修复（2026-09-28）：`05d498cf7bbcf1d4e1e67fd1f422c09bf9e8a456` 修复了 response alias 回映递归进入工具参数的问题。`input`、`arguments`、`args` 与 Gemini `functionResponse/function_response` 以下现在保持 opaque；只有协议定义的 call-name 位置可以回映，参数里伪装成 `function.name`、`functionCall.name` 或嵌套 call 的 decoy 保持原值，JSON 与分片 SSE 均有回归。该结论冻结为 `CLAUDE-R2-FINAL-2026-09-28`，不新增能力、不改变固定绑定，也不提升任何真实 operation。
+
 ### 17.5 Codex 增量差异
 
 | ID | 参考证据 | 目标差异 | 计划与验收 |
@@ -972,6 +974,8 @@ CL-N5 只修改 Responses 输出组织与 offset，不把不同语义 block 粘�
 实施更新（2026-09-28）：CX-N5～CX-N12 已在 `f8907742b163b239a981cddcc3962410f0712677` 完成。schema sanitizer 识别活动 octal NUL 并保持非 schema decoy；Responses、Compact、WS 与 WS→HTTP fallback 共用精确 item/part metadata 清理。SSE 以 declared event + payload type 双重闭集过滤，连续工具轮只复用真实 reasoning。JSON/SSE/WS 的上游自报 model 以有界、终态优先方式写入本地 UsageLog/Web API，不覆盖 `actual_model`，不参与路由、计费、retry/fallback，也不进入 Router Share usage payload。
 
 CX-N11 与 CX-N12 的差分 fixture 均先复现红灯后再窄修复：WS writer 使用容量 8 的有界队列，大写入期间只接收精确顶层 `response.steer`，queue full 与伪装/第二 create/坏帧 fail closed，Ping/Pong 和取消保持响应；两个 text-format schema 入口会裁剪 composition orphan required，纯 object 无字段来源时删除 required，`$ref/$dynamicRef` 保持 opaque。Codex 关键词测试 399 项及新增 steering/reported-model 专项、Clippy、API contract、reference-delta 默认与 `--check-sources` 审计均通过；证据追加为 `CX-OBS-0014`～`CX-OBS-0022`，八项均为 `fixture_verified`。GPT Image 2.5、WS prewarm、Astra entitlement 等五个真实 operation 继续 `receipt=null/live_pending`。
+
+整体 review 追加修复（2026-09-28）：`26eb389e5b0c8457f64bb70f60614ff5b1c1a140` 关闭两处保守性缺口。CX-N7 对同时缺少 SSE `event:` 和 payload `type` 的 JSON 数据帧默认过滤，`[DONE]` 与 keepalive 仍由 transport 层处理；CX-N12 在 `allOf/anyOf/oneOf/then/else` 的任意嵌套分支含 `$ref/$dynamicRef` 时保留当前节点 `required`，避免把引用提供的字段误判成 orphan。两项均有聚焦 fixture，冻结为 `CODEX-R2-FINAL-2026-09-28`；五个真实 operation 状态不变。
 
 ### 17.6 Cursor 增量复核
 
@@ -1105,4 +1109,4 @@ cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控�
 7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
 8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
 
-第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6、Codex CX-N5～N12、Grok GR-N3 与 CodeBuddy CB-N6 已实施并达到 `fixture_verified`，Cursor/Kiro 已完成 no-wire 复核，Grok GR-N4 保持 `live_pending_no_wire_change`。CodeBuddy 的 incomplete/namespace/custom-tool 复核为共享 bridge 已覆盖，malformed arguments 宽松丢弃明确不采纳；Intl/CN 仍为 `live_pending`。任何 fixture 或参考项目行为都不能解释为真实账号验收。
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；Antigravity AG-N7～N11、Claude CL-N5～N6、Codex CX-N5～N12、Grok GR-N3 与 CodeBuddy CB-N6 已实施并达到 `fixture_verified`，整体 review 发现的 Claude payload opacity、Codex 匿名 SSE 与组合引用保守性缺口也已窄修复并冻结。Cursor/Kiro 已完成 no-wire 复核，Grok GR-N4 保持 `live_pending_no_wire_change`。CodeBuddy 的 incomplete/namespace/custom-tool 复核为共享 bridge 已覆盖，malformed arguments 宽松丢弃明确不采纳；Intl/CN 仍为 `live_pending`。任何 fixture 或参考项目行为都不能解释为真实账号验收。

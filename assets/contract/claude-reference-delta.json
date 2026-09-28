@@ -970,6 +970,39 @@
       "reason": "Adopt the Claude name grammar while using a request-local reversible hash alias instead of lossy truncation: legal custom names and server tools stay unchanged, declarations/history/choice/JSON/SSE share one map, and every case-insensitive or wire collision fails closed."
     }
   ],
+  "secondRoundReviews": [
+    {
+      "id": "CLAUDE-R2-FINAL-2026-09-28",
+      "status": "reviewed_and_fixed",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "sourceObservationIds": ["CL-OBS-0017"],
+      "reviewedImplementationCommit": "77940334fda6291706d3807d0d3cdcb49c767d65",
+      "reviewedImplementationTree": "96d2d8dd85812e90a490426d32867ca262cbe84d",
+      "targetReviewCommit": "05d498cf7bbcf1d4e1e67fd1f422c09bf9e8a456",
+      "targetReviewTree": "8f7dc1c70d514d49d05144f271a06d41330530f1",
+      "productionDelta": "CL-N6 response alias restoration boundary only",
+      "findings": [
+        {
+          "id": "tool_payload_alias_decoy",
+          "enhancementId": "CL-N6",
+          "disposition": "fixed_fixture_verified",
+          "opaqueKeys": ["input", "arguments", "args", "functionResponse", "function_response"],
+          "reason": "Tool arguments and function responses are caller/model payloads, so alias-looking protocol shapes below those keys must remain opaque while actual response call-name positions are restored.",
+          "evidence": [
+            {
+              "path": "src/proxy/claude_oauth.rs",
+              "anchors": [
+                "restore_claude_tool_names_in_value",
+                "invalid_custom_tool_alias_is_stable_scoped_and_round_trips",
+                "claude_tool_name_stream_patcher_restores_fragmented_sse_events"
+              ]
+            }
+          ]
+        }
+      ],
+      "liveReceiptState": "unchanged_live_pending"
+    }
+  ],
   "capabilities": [
     {
       "id": "CORE-N2-CLAUDE",

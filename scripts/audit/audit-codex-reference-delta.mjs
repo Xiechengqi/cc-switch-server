@@ -495,6 +495,76 @@ assert(
   "Codex frozen source deltas are not fully mapped to observations",
 );
 
+assert(
+  objectDigest(baseline.secondRoundReviews) ===
+    "6351b9ce9744d8cf422497deed9b8291ea45aff6b879727a4445d14096f62a87",
+  "Codex second-round review history changed",
+);
+const secondRoundReview = baseline.secondRoundReviews?.[0];
+assert(
+  baseline.secondRoundReviews?.length === 1 &&
+    secondRoundReview?.id === "CODEX-R2-FINAL-2026-09-28" &&
+    secondRoundReview.status === "reviewed_and_fixed" &&
+    secondRoundReview.reviewedAt === "2026-09-28T00:00:00Z" &&
+    JSON.stringify(secondRoundReview.sourceObservationIds) ===
+      JSON.stringify(["CX-OBS-0016", "CX-OBS-0022"]) &&
+    secondRoundReview.sourceObservationIds.every((id) => observationIds.has(id)) &&
+    secondRoundReview.reviewedImplementationCommit ===
+      "f8907742b163b239a981cddcc3962410f0712677" &&
+    secondRoundReview.reviewedImplementationTree ===
+      "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33" &&
+    gitTree(repoRoot, secondRoundReview.reviewedImplementationCommit) ===
+      secondRoundReview.reviewedImplementationTree &&
+    secondRoundReview.targetReviewCommit ===
+      "26eb389e5b0c8457f64bb70f60614ff5b1c1a140" &&
+    secondRoundReview.targetReviewTree ===
+      "a94fe6d6249e7a2f10bfded310cb8c0da36cd1d0" &&
+    gitTree(repoRoot, secondRoundReview.targetReviewCommit) ===
+      secondRoundReview.targetReviewTree &&
+    secondRoundReview.productionDelta ===
+      "CX-N7 and CX-N12 boundary corrections only" &&
+    secondRoundReview.liveReceiptState === "unchanged_live_pending",
+  "Codex second-round review identity changed",
+);
+const finalReviewFindings = new Map(
+  (secondRoundReview.findings ?? []).map((finding) => [finding.id, finding]),
+);
+for (const [id, enhancementId] of [
+  ["anonymous_responses_sse_frame", "CX-N7"],
+  ["composition_reference_required", "CX-N12"],
+]) {
+  const finding = finalReviewFindings.get(id);
+  assert(
+    finding?.enhancementId === enhancementId &&
+      finding.disposition === "fixed_fixture_verified" &&
+      finding.evidence?.length === 1,
+    `Codex final-review finding ${id} changed`,
+  );
+  for (const evidence of finding.evidence) {
+    assertSafePath(evidence.path, `${id} evidence path`);
+    const source = gitFile(
+      repoRoot,
+      secondRoundReview.targetReviewCommit,
+      evidence.path,
+    );
+    assert(
+      evidence.anchors?.length > 0 &&
+        evidence.anchors.every((anchor) => source.includes(anchor)),
+      `${id} is missing a committed target anchor`,
+    );
+  }
+}
+assert(
+  finalReviewFindings.size === 2 &&
+    finalReviewFindings
+      .get("anonymous_responses_sse_frame")
+      ?.reason.includes("must fail closed") &&
+    finalReviewFindings
+      .get("composition_reference_required")
+      ?.reason.includes("conservatively preserved"),
+  "Codex final-review boundary reasons changed",
+);
+
 const capabilities = new Map(
   (baseline.capabilities ?? []).map((capability) => [capability.id, capability]),
 );

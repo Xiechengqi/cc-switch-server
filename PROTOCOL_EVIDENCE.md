@@ -41,6 +41,8 @@ CX-N11 与 CX-N12 都先由差分 fixture 复现红灯，再做窄修复。Codex
 
 Codex 关键词回归 399 项及新增 steering、reported-model 专项均已通过；reference-delta 默认审计与 committed-object 复核通过。CX-N5～CX-N12 均只提升为 `fixture_verified`。GPT Image 2.5 三个 variant、WS prewarm、Astra entitlement 和其他真实账号 operation 仍各自保持 `receipt=null/live_pending`；本轮没有引入账号池、跨 Account/Provider/rail/site fallback，也没有以本地 fixture 代替真实 ChatGPT 验收。
 
+整体 review 在 `26eb389e5b0c8457f64bb70f60614ff5b1c1a140` 又关闭两处边界：缺少 declared event 与 payload type 的 JSON SSE 数据帧不属于公开闭集，默认过滤；composition 内任意嵌套 `$ref/$dynamicRef` 都可能提供当前节点的 required 字段，因此 schema repair 保守保留 required。`CODEX-R2-FINAL-2026-09-28` 以 committed target tree 和两条 fixture 冻结该修复；它是 CX-N7/CX-N12 的实现复核扩展，不是新增外部 source observation，也不改变五个真实 operation 的 `live_pending` 状态。
+
 ## 2026-09-28 Grok catalog capability and identity-gate freeze
 
 GR-N3 与 GR-N4 冻结在 `assets/contract/grok-reference-delta.json` 的 `GR-OBS-0012`～`GR-OBS-0013`。一次性只读证据取自干净的 `grok2api@5e5ad75556b61a2c4a8fcf344d83bfe7760f2b42`；实际评审的功能提交是 `9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e`，两者共享 tree `889cf18ab5363fe8d6d408b16c734625e1065d24`。两个追加式 source delta 分别固定目录能力和 Build 1.0.40/conversation-group 身份的八个 committed object；默认审计不读取外部 checkout，显式 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核 commit/tree、文件 SHA-256 与符号。`sub2api@ab99d56e` 的六项工作树修改仍全部排除。
@@ -78,6 +80,8 @@ CL-N5 与 CL-N6 冻结在 `assets/contract/claude-reference-delta.json` 的 `CL-
 Claude OAuth 对不符合 `^[A-Za-z0-9_-]{1,64}$` 的普通 custom/MCP 名称默认生成有域分离的请求级可逆 alias；合法自定义名逐字节保留，既有 Claude Code builtin canonical case 和 server tool 行为不变。declaration、forced choice、历史 `tool_use` / `tool_reference`、JSON 和碎片化 SSE 响应共用同一 map；大小写声明、既有合法 wire 名或 alias 碰撞全部在发网前返回 400，不做有损截断。`CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=disabled` 只保留为事故回滚。
 
 Claude 关键词回归为 270/270，Anthropic 关键词回归为 131/131；Clippy、wire profile、reference-delta 默认审计与 committed-object 复核均通过。CL-N5/CL-N6 只提升为 `fixture_verified`；没有真实 Anthropic 凭据，`oauth_inference`、Max 5x/20x、Fable 5.1、Opus 5.5 和非法 MCP 名称的真实接受性仍保持各自 `live_pending`，本轮没有引入账号池或跨 Account/Provider/rail/site fallback。
+
+整体 review 在 `05d498cf7bbcf1d4e1e67fd1f422c09bf9e8a456` 进一步限定 CL-N6 的 response alias 回映边界：`input`、`arguments`、`args` 与 `functionResponse/function_response` 以下属于 caller/model payload，必须保持 opaque；只有已审查的协议 call-name 位置可以恢复原工具名。`CLAUDE-R2-FINAL-2026-09-28` 绑定 committed target tree、JSON 与分片 SSE decoy fixture；这项窄修复不改变五个真实 operation 的 `live_pending` 状态。
 
 ## 2026-09-28 Antigravity reasoning and tool-wire freeze
 

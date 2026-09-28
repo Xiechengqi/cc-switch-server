@@ -385,6 +385,68 @@ assert(
   "Claude frozen source deltas are not fully mapped to observations",
 );
 
+assert(
+  objectDigest(baseline.secondRoundReviews) ===
+    "1483ba1ead15a3d2c9052da3d1df56aebd41cfa6974000986346e51f5fa91bdd",
+  "Claude second-round review history changed",
+);
+const secondRoundReview = baseline.secondRoundReviews?.[0];
+assert(
+  baseline.secondRoundReviews?.length === 1 &&
+    secondRoundReview?.id === "CLAUDE-R2-FINAL-2026-09-28" &&
+    secondRoundReview.status === "reviewed_and_fixed" &&
+    secondRoundReview.reviewedAt === "2026-09-28T00:00:00Z" &&
+    JSON.stringify(secondRoundReview.sourceObservationIds) ===
+      JSON.stringify(["CL-OBS-0017"]) &&
+    secondRoundReview.sourceObservationIds.every((id) => observationIds.has(id)) &&
+    secondRoundReview.reviewedImplementationCommit ===
+      "77940334fda6291706d3807d0d3cdcb49c767d65" &&
+    secondRoundReview.reviewedImplementationTree ===
+      "96d2d8dd85812e90a490426d32867ca262cbe84d" &&
+    gitTree(root, secondRoundReview.reviewedImplementationCommit) ===
+      secondRoundReview.reviewedImplementationTree &&
+    secondRoundReview.targetReviewCommit ===
+      "05d498cf7bbcf1d4e1e67fd1f422c09bf9e8a456" &&
+    secondRoundReview.targetReviewTree ===
+      "8f7dc1c70d514d49d05144f271a06d41330530f1" &&
+    gitTree(root, secondRoundReview.targetReviewCommit) ===
+      secondRoundReview.targetReviewTree &&
+    secondRoundReview.productionDelta ===
+      "CL-N6 response alias restoration boundary only" &&
+    secondRoundReview.liveReceiptState === "unchanged_live_pending",
+  "Claude second-round review identity changed",
+);
+const aliasPayloadFinding = secondRoundReview.findings?.[0];
+assert(
+  secondRoundReview.findings?.length === 1 &&
+    aliasPayloadFinding?.id === "tool_payload_alias_decoy" &&
+    aliasPayloadFinding.enhancementId === "CL-N6" &&
+    aliasPayloadFinding.disposition === "fixed_fixture_verified" &&
+    JSON.stringify(aliasPayloadFinding.opaqueKeys) ===
+      JSON.stringify([
+        "input",
+        "arguments",
+        "args",
+        "functionResponse",
+        "function_response",
+      ]) &&
+    aliasPayloadFinding.reason.includes("must remain opaque"),
+  "Claude alias payload opacity review changed",
+);
+for (const evidence of aliasPayloadFinding.evidence ?? []) {
+  assertSafePath(evidence.path, "Claude final-review evidence path");
+  const source = gitFile(root, secondRoundReview.targetReviewCommit, evidence.path);
+  assert(
+    evidence.anchors?.length > 0 &&
+      evidence.anchors.every((anchor) => source.includes(anchor)),
+    `Claude final review is missing a committed anchor in ${evidence.path}`,
+  );
+}
+assert(
+  aliasPayloadFinding.evidence?.length === 1,
+  "Claude alias payload opacity review has incomplete evidence",
+);
+
 const expectedCapabilities = new Map([
   ["CORE-N2-CLAUDE", "fixture_verified"],
   ["CLAUDE-OPUS-5-5", "fixture_verified"],

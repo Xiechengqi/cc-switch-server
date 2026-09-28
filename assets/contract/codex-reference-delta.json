@@ -1795,6 +1795,54 @@
       "reason": "The strict text-format differential exposed orphan required keys, so apply the schema-aware narrow repair to composition and pure object nodes while keeping reference nodes opaque."
     }
   ],
+  "secondRoundReviews": [
+    {
+      "id": "CODEX-R2-FINAL-2026-09-28",
+      "status": "reviewed_and_fixed",
+      "reviewedAt": "2026-09-28T00:00:00Z",
+      "sourceObservationIds": ["CX-OBS-0016", "CX-OBS-0022"],
+      "reviewedImplementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
+      "reviewedImplementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
+      "targetReviewCommit": "26eb389e5b0c8457f64bb70f60614ff5b1c1a140",
+      "targetReviewTree": "a94fe6d6249e7a2f10bfded310cb8c0da36cd1d0",
+      "productionDelta": "CX-N7 and CX-N12 boundary corrections only",
+      "findings": [
+        {
+          "id": "anonymous_responses_sse_frame",
+          "enhancementId": "CX-N7",
+          "disposition": "fixed_fixture_verified",
+          "reason": "A JSON data frame without either a declared SSE event or payload type is outside the reviewed public event set and must fail closed; DONE and keepalive handling remains at the transport boundary.",
+          "evidence": [
+            {
+              "path": "src/proxy/response_semantics.rs",
+              "anchors": [
+                "responses_event_is_filtered",
+                "anonymous_private_payload",
+                "standard_responses_stream_filters_private_and_unknown_events_by_both_names"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "composition_reference_required",
+          "enhancementId": "CX-N12",
+          "disposition": "fixed_fixture_verified",
+          "reason": "A composition branch may obtain required fields through an opaque $ref or $dynamicRef, so required is conservatively preserved whenever those references occur in allOf, anyOf, oneOf, then, or else branches.",
+          "evidence": [
+            {
+              "path": "src/proxy/tool_schema.rs",
+              "anchors": [
+                "codex_composition_has_opaque_reference",
+                "composedExternal",
+                "codex_response_schema_prunes_only_evidenced_orphan_required_keys"
+              ]
+            }
+          ]
+        }
+      ],
+      "liveReceiptState": "unchanged_live_pending"
+    }
+  ],
   "wireGoldens": {
     "capacityFailure": {
       "input": {
