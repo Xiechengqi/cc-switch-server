@@ -888,3 +888,194 @@ CodeBuddy：
 12. 外部仓库没有进入构建、测试、CI、发布或运行时依赖。
 
 当前判定：第 1～7、9～12 项已在本地范围内满足；第 8 项仍按 LIVE-N1 保持 `live_pending`，因为没有提供真实凭据、Router/Share 环境和部署输入。八类 Provider 已全部完成 CORE-N1、CORE-N2 与 EVID-N1，Phase 3 的 state/SQLite 纯结构拆分也已通过完整本地门禁。因此可以关闭首轮静态差分、P0/P1 离线实施、八类 Provider lifecycle/request-memory 拆分、证据迁移及本地架构切片；完整计划仍不能标记为全部完成，唯一剩余类别是必须由真实环境输入逐 rail 关闭的 LIVE-N1。
+
+## 17. 第二轮增量审计（2026-09-28）
+
+本节是对第 0～16 节的追加审计，不回写、覆盖或重新解释首轮已经冻结的实现状态。第二轮目标基线为 `cc-switch-server@6b9b838`；外部参考只读取 Git 提交对象，不把外部工作树、测试目录或运行时代码引入本仓库。首轮的 `fixture_verified`、`live_pending` 和 reject 结论全部继续有效；下文新增的 N 编号均处于计划阶段，不能倒推为已经实现。
+
+### 17.1 参考冻结点与审计完整性
+
+| 类别 | 推荐参考 | 第二轮冻结 HEAD | 工作树与读取方式 | 相对首轮结论 |
+| --- | --- | --- | --- | --- |
+| Antigravity | CLIProxyAPI、Antigravity-Manager | `acdace936fa7d`、`0269f045f4e35` | 均按 committed object 读取 | CLIProxyAPI 有新的请求转换缺陷修复；Manager 的签名位置和 daily endpoint 差异仍需真实差分 |
+| Claude | CLIProxyAPI | `acdace936fa7d` | committed object | 新增相邻文本/citation 与非法工具名处理证据 |
+| Codex | CLIProxyAPI、codex2api | `acdace936fa7d`、`9368ed82e039` | committed object | 新增 schema、nested cache hint、私有事件、reasoning、metadata、model 观测和 WS 证据 |
+| Cursor | OmniRoute | `443d66996d69` | 工作树有本地修改；全部排除，只读取 HEAD | 提交态只有依赖/流时序工具变化，没有 Cursor Provider wire 增量 |
+| Grok | grok2api、sub2api | `5e5ad75556b6`、`ab99d56e9626` | grok2api committed object；sub2api 工作树修改全部排除 | grok2api 新增 Build 1.0.40 与 catalog-driven capability；sub2api 无新提交 |
+| Kiro | kiro.rs | `be0c04219d9d` | committed object | 与首轮冻结点相同，无新增提交 |
+| Qoder | TokenRouter | `6d676f1d100e` | 当前 HEAD 的 AGENTS 要求使用 `project-doc` skill；本环境不可用，且工作树非净，因此未读取该 HEAD 的业务文件 | 保留首轮 `7faf9469bc695` 冻结证据；第二轮最新 HEAD 明确标记 `unreviewed_skill_gate`，不能写成 no-wire |
+| CodeBuddy | cli2api | `34c91b899aa2` | 两个未跟踪文件 `proxy.html`、`proxy.md` 排除；只读取 committed object | 新增 cache usage、incomplete terminal、malformed arguments、namespace/custom-tool 证据 |
+
+这里的“无新增 wire”只表示两个冻结点之间没有发现 Provider 请求/响应协议行为变化，不表示真实账号已验收。Qoder 的限制也不是推测性“无变化”：最新 HEAD 尚未完成合规读取，必须在 `project-doc` 可用后单独补审。
+
+### 17.2 第二轮执行结论
+
+第二轮共确认 15 个静态缺口；另有 3 个正式编号的先差分或真实验收项（CX-N11、CX-N12、GR-N4），以及 1 组未编号的 Antigravity Manager 差异对比。最紧急的不是增加新 Provider，而是防止 reasoning/citation/tool 语义丢失、未知 tool choice 权限放宽、Codex 私有事件泄漏以及 CodeBuddy cache usage 丢账。
+
+| 优先级 | 新项目 | 当前状态 | 主要风险 |
+| --- | --- | --- | --- |
+| P0 | AG-N7～N11、CL-N5、CX-N5～N7、CX-N9、CB-N6 | `planned_confirmed_gap` | reasoning 可见性错误、工具结果错配/拒绝、权限静默放宽、私有事件外泄、usage 丢失 |
+| P1 | CL-N6、CX-N8、CX-N10、GR-N3 | `planned_confirmed_gap` | 非法工具名拒绝、连续工具轮 reasoning 丢失、上游换模不可见、目录能力与运行时脱节 |
+| P1 | CX-N11、CX-N12、GR-N4 | `planned_differential_first` / `live_only` | WS 并发时序、strict response schema、Grok 客户身份/header 的静态证据不足 |
+| 复核 | Cursor、Kiro、sub2api | `reviewed_no_wire_delta` | 不制造无意义生产改动，只刷新冻结证据 |
+| 受阻 | Qoder 最新 HEAD | `unreviewed_skill_gate` | 缺参考仓库要求的 skill；不得用猜测补结论 |
+
+音频、视频、文件输入、Gemini Interactions、客户端指纹/attestation、商业定价、账号池和跨身份 fallback 均不因参考项目出现而进入本轮实现范围。
+
+### 17.3 Antigravity 增量差异
+
+目标已有 grounding/citation、模型能力快照、固定 Account/rail、reasoning replay 和完整的请求内存边界，但第二轮参考修复暴露了五个更窄的转换问题。
+
+| ID | 参考证据 | 目标差异 | 计划与验收 |
+| --- | --- | --- | --- |
+| AG-N7 | CLIProxyAPI `6dea3dfa` 的 `enableAntigravityResponsesThinkingSummary` | Responses 的 `reasoning.summary` / `generate_summary` 没有穿过 Responses→Anthropic→Gemini 链；只要 effort 开启，目标可能仍发 `includeThoughts=true`，显式 `summary:none/null` 也无法关闭可见 thought | 冻结 effort-only、auto/detailed、none、null、无 reasoning 五组 fixture；把“是否推理”和“是否展示 summary”分开解析。显式关闭必须得到 `includeThoughts=false`，未指定且 effort 开启时才采用受证默认；不得把 summary 文本写日志 |
+| AG-N8 | CLIProxyAPI `3de5709d` 的 `SplitGeminiFunctionResponseTurns` | 混合 `tool_result + text/reminder/media` 当前会落在同一个 Gemini user content 中，不能保证 functionResponse 紧邻产生它的 model functionCall | 只在紧随含 functionCall 的 model turn 的连续 user run 内拆分和重排：先合并匹配的 functionResponse，再保留原 text/reminder 顺序；覆盖并行结果、跨多条 user message、thinking signature、错配/孤立结果，绝不伪造 pairing |
+| AG-N9 | CLIProxyAPI `5af6cd75` 的 `ContainsJSONRef` / `SetGeminiFunctionResponseResult` | function response 内递归出现字符串 `$ref` 时仍作为结构化对象发送，Gemini/Vertex 可能把它解释为媒体引用并以 400 拒绝 | 仅在 Gemini functionResponse 的 result/response 边界递归检测 `$ref`，命中后把完整结果作为 opaque JSON 字符串置于 `response.result`；普通用户 JSON、tool arguments、schema declaration 不受影响，并受既有深度/字节预算约束 |
+| AG-N10 | CLIProxyAPI `49eec664` 的 fail-closed tool-choice mapping | 未知字符串/对象类型或缺失名称会被省略，等价于把调用方限制静默放宽为 auto | 未知类型、空 named choice、清洗后冲突必须稳定 400；若兼容路径不能返回错误，最宽也只能显式 `none`，不得变成 auto。`none/auto/required/named` 与 parallel 标志分别做 mutation fixture |
+| AG-N11 | CLIProxyAPI `580df95a` 的请求级 ID 清洗和 collision map | Antigravity 的 call/result ID 没有完整的请求级 raw↔wire canonical map；非法字符清洗后可能碰撞，`call573` 与 `call_573` 兼容形态也缺少受控 lookup | 建立仅存活于单请求的映射：合法 ID 原样保留，非法 ID 稳定清洗，碰撞加确定性后缀，response 始终按 raw ID 取回结果；兼容 lookup 只在唯一候选时生效，歧义 fail closed。禁止全局缓存或跨请求复用 |
+
+AG-N7～N11 都先以目标当前输出生成红灯 fixture，再做最小 Provider/转换层修复。Antigravity-Manager 的签名字段位置、daily quota endpoint 和请求身份差异仍列为 differential/live gate；没有两条 OAuth rail 各自的新鲜 receipt 时，不改变现有 rail 或 capability 状态。参考中的音频、视频、文件和 Interactions 支持也不直接采纳，因为本产品尚无对应的 Provider 合同和真实验收范围。
+
+### 17.4 Claude 增量差异
+
+| ID | 参考证据 | 目标差异 | 计划与验收 |
+| --- | --- | --- | --- |
+| CL-N5 | CLIProxyAPI `781a203b` | Anthropic→Responses 的流式与非流式转换会把相邻 text block 当成独立 content part；每个 block 调用 citation 映射时 base 都从 0 开始，合并后的文本与 annotation offset 不一致 | 相邻 text block 共用一个 assistant message/output item，并以累计 Unicode scalar 长度推进 citation base；thinking、tool、server tool 或 refusal 才切断合并。覆盖跨 chunk、重复 cited text、组合字符、emoji、无 citation 和中途 tool block |
+| CL-N6 | CLIProxyAPI `75b854eb`；目标 `normalize_claude_oauth_tool_names` | 目标已具备稳定 alias 和响应恢复，但只有 `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS=1` 才为普通自定义工具启用；默认路径仍可能把不符合 `^[A-Za-z0-9_-]{1,64}$` 的名称发往 Claude OAuth | 对“确实非法”的自定义工具名默认自动 alias；已经合法的名称逐字节保留，内建/server tool 不改。声明、tool_choice、历史 tool_use/tool_reference、流式和非流式响应共用请求级 map；case-insensitive/截断碰撞 fail closed。保留 incident rollback，但不再要求正常用户主动开 flag |
+
+CL-N5 只修改 Responses 输出组织与 offset，不把不同语义 block 粘在一起。CL-N6 不迁入参考项目的 credential cloaking、浏览器伪装或指纹逻辑；Opus 5.5 / Claude Code 2.1.280 已由既有提交覆盖，本轮不得重复实施。
+
+### 17.5 Codex 增量差异
+
+| ID | 参考证据 | 目标差异 | 计划与验收 |
+| --- | --- | --- | --- |
+| CX-N5 | CLIProxyAPI `320100ec` | `has_incompatible_codex_unicode_escape` 只识别活动 `\p{}` / `\P{}`，不识别严格校验器拒绝的 octal NUL `\0` | 在 schema-aware 节点内识别活动 `\0`（含奇偶反斜线和 JSON 解码后的形态）并只删除该 `pattern`；合法 `\x00`、普通 regex 及 default/enum/description 内同名字段保持，归一化须幂等 |
+| CX-N6 | CLIProxyAPI `3662d153` | Codex OAuth sanitizer 没有移除 `prompt_cache_breakpoint`；item 顶层、message `content[]` 和 function output `output[]` 都会原样发网 | 只在 `input[*]` 顶层及其协议 content/output part 删除精确字段；字符串 output、文本、顺序、arguments 内同名 JSON 和其他嵌套用户数据原样保留 |
+| CX-N7 | CLIProxyAPI `dd013f9e` | Responses 同格式流存在原样/数据帧透传分支，未知 `responsesapi.*`、`codex.rate_limits` 或私有 `codex.*` 事件可能下泄 | 在统一 SSE framing 边界同时检查 declared event 与 payload `type`：总是过滤 `responsesapi.*` 和 `codex.rate_limits`；普通客户端只允许公开 Responses 闭集，明确识别的原生 Codex 客户端也只放行必要 metadata allowlist；error/terminal 不得误吞 |
+| CX-N8 | CLIProxyAPI `40cc6489` | Responses→Chat 只把真实 reasoning 附到第一个工具轮；同一逻辑 turn 的后续连续 tool call 没有新 reasoning 时不会复用最近一次真实 reasoning | 请求内维护“最近真实 reasoning”，连续工具轮复用，遇到新 reasoning 更新，遇到 user/system 边界清空；无历史 reasoning 时保持缺省，明确禁止参考实现中的 `[reasoning unavailable]` 伪造文本 |
+| CX-N9 | CLIProxyAPI `3b2882b7` | `sanitize_codex_oauth_request_body` 目前只删 item 顶层 `internal_chat_message_metadata_passthrough`，未删同层 `author`、`recipient` | 扩展为精确 item-level 三字段清理；content 内普通同名键、arguments 字符串/对象和顶层非 input 数据不删。覆盖 Responses、Compact、WS→HTTP fallback，并保持幂等 |
+| CX-N10 | CLIProxyAPI `25f40d8c`、codex2api `dbfd3f89` | usage 记录的是选择后/实际发送的 `actual_model`，没有从 JSON 响应或 stream terminal 观察上游真实 model，静默换模不可见 | 增加有界 response-model observer，分别记录 requested/sent/reported model 与来源；仅告警和审计，不改变响应、计费或路由，不触发 retry/fallback；缺字段保持 unknown，不猜测 |
+| CX-N11 | CLIProxyAPI `42c9680e` | 目标 WS 已能转发 steering，但当前一次 upstream write 未完成时会拒绝新的 downstream data；是否在真实 Codex 并发上传中造成拒绝尚无本地证据 | `differential_first`：用受控 WS fixture 并发发送碎片化 tool input、steering、ping/pong 与 cancel，量化当前拒绝/延迟；只有红灯才拆成全双工 reader/writer actor，队列继续有界且 control frame 优先 |
+| CX-N12 | codex2api `288a28cb` | 工具 schema 有保守归一化，但 `/text/format/schema` 未走等价处理；strict response schema 中“有 required、无本层 properties”的节点可能带 orphan key | `differential_first`：冻结 composition branch、纯 object、`$ref/$dynamicRef` 三形状。只在真实差分红灯后复用 schema-aware 算法：组合分支按可见字段裁剪、无字段来源的 object 删除 required、外部引用保持；禁止递归删除未知用户字段 |
+
+以下 Codex 变化不形成新实现项：service tier/routing hint 已由现有 policy 覆盖；WebSocket upstream relay 和 SSE event boundary 已有等价保护。WS prewarm 仍是独立 `live_pending`，第二轮静态审计不能把它提升为已支持。codex2api `e15cd28d` 删除 client harness scaffolding 会重写用户文本，标记 `not_adopted`；Windows attestation、浏览器/客户端指纹和未获真实证据的身份模拟也不复制。
+
+### 17.6 Cursor 增量复核
+
+OmniRoute 从首轮 `02c663cdd0e85` 到 `443d66996d69` 的 committed delta 只涉及依赖和共享 stream-timing 工具，没有发现 Cursor OAuth/API-key 请求头、protobuf/gzip、Agent plan、模型目录、工具桥或 terminal wire 的变化。其工作树内 Codex 相关修改全部排除，不可作为 Cursor 证据。
+
+第二轮状态为 `reviewed_no_wire_delta`：不新增 CUR-N 实现项，不重写现有 executor。CUR-N1 的 OAuth/API-key 两条真实 rail、既有 request-memory 和 parked-session 合同继续按首轮状态验收。
+
+### 17.7 Grok 增量差异
+
+| ID | 参考证据 | 目标差异 | 计划与验收 |
+| --- | --- | --- | --- |
+| GR-N3 | grok2api `9dda42ae` | `GrokModelCatalog` 只保存 model ID；目录里的 reasoning menu/default、`supports_reasoning_effort`、context window、max completion 和 backend search 被丢弃。运行时 `grok_model_supports_reasoning_effort` 仍是静态前缀表，不含 Grok 4.7、minimal/max 的目录约束 | 新增 `GrokModelCapability`，与现有 `GrokModelCatalogScope` 一起按 App+Provider revision/runtime+Account+auth/token generation 原子替换；reasoning 只接受当前精确 snapshot 公布的有序菜单，explicit zero/empty/unknown 分开处理。stale catalog 可展示但不得扩大运行时权限；成功空目录权威替换。不要复制参考的 process-global profile map |
+| GR-N4 | grok2api `9dda42ae` | 参考使用 Build `1.0.40` 并派生 `x-grok-conv-group-id`；目标默认身份仍为 `grok-shell/0.2.111`，只发 `x-grok-conv-id`，但两个版本谱系是否可直接替换没有真实证据 | `differential_first/live_only`：先用同一固定 Account 分别验证 catalog 与 inference 的 accepted identity/header。只有明确 version-rejected signal 或 fresh receipt 才更新 reviewed 常量；group id 若启用，按已 namespace 的 root session 做稳定 UUIDv5，不能暴露原始用户/session，也不能跨 Share/Account 合并 |
+
+GR-N3 的 capability 只影响模型展示、请求校验和受证 upstream control，不把 catalog context window 当成本地内存预算，也不自动开启搜索/compaction。参考项目把 Grok 4.7 暂按 4.6 定价是作者推断，缺 xAI 权威价格，因此明确 `not_adopted`。sub2api 在首轮冻结点之后无提交，工作树内容继续排除。
+
+### 17.8 Kiro 增量复核
+
+kiro.rs 的第二轮 HEAD 仍是 `be0c04219d9d`，与首轮冻结点一致。没有新的 committed wire 可比较，因此状态为 `reviewed_no_wire_delta`。KI-N3 的 remote compaction、auth-kind × region receipt 和 KI-05 shared cache 继续保持 `live_pending`/disabled；“参考仓库没变化”不能替代这些真实验收。
+
+### 17.9 Qoder 审计边界
+
+TokenRouter 最新 HEAD `6d676f1d100e` 的仓库指令要求 `project-doc` skill。本环境没有该 skill，本轮也不能绕过指令直接读取业务代码；其非净工作树更不能充当证据。因此：
+
+- 首轮基于 `TokenRouter@7faf9469bc695` 的 QD-N1/QD-N2、CORE-N1/N2 和三 rail live gate 保持有效；
+- 最新 HEAD 只记录 commit identity，不给出“已复核无 wire 变化”的结论；
+- 后续在 skill 可用时，从 `7faf9469bc695..6d676f1d100e` 做独立 committed-object 增量审计，再决定是否新增 QD-N 项；
+- 在此之前不改变 Global OAuth、Global PAT、CN OAuth 的任何 capability 或 `live_pending` 状态。
+
+### 17.10 CodeBuddy 增量差异
+
+cli2api 的新增提交大部分已被目标共享 bridge 覆盖，但 cache usage 存在一个可复现的端到端缺口。
+
+| ID/结论 | 参考证据 | 目标判定 | 计划与验收 |
+| --- | --- | --- | --- |
+| CB-N6 | cli2api `a9da609`、`fff3419` | `CodeBuddyChatSseAggregator` 会保存完整 usage，`usage_from_json_with_semantics` 也能给内部日志识别 `cache_read_tokens/cache_write_tokens`；但 `openai_responses_usage_from_chat_usage` 和 `anthropic_usage_from_openai_usage` 不读取这两个顶层字段，因此 Chat→Responses/Messages 的下游 usage 丢失 cache read/write | 在 CodeBuddy canonical SSE/aggregate 边界规范化 usage，同时保留原始字段：read 优先级为显式 `cache_read_tokens` → nested cached → vendor legacy，write 同理；显式 0 不得变 unknown。覆盖 stream/non-stream、Chat/Responses/Messages、top-level-vs-nested 冲突和 total token 不重复相加 |
+| 已覆盖 | cli2api `f44e887` | 非流 `openai_chat_response_to_responses` 与流式 `ChatResponsesState::finish_stream` 已把 `finish_reason=length` 转为 `response.incomplete` + `max_output_tokens` | 补 CodeBuddy 专项差分 fixture 即可，不复制 Provider 私有 terminal 状态机 |
+| 已覆盖 | cli2api `b415dd0`、`9f9b66e` | 共享 `ResponsesToolContext` 已覆盖 namespace identity、custom tool 声明/history/choice、流与非流响应恢复，并有 collision/长名称测试 | 状态保持 `fixture_verified_existing_shared_bridge`；只补一条 CodeBuddy 端到端 fixture，避免重复分支 |
+| 不采纳 | cli2api `aeaa4ac` | 参考对请求历史中的 malformed function call/result 可整对跳过，非流响应还会静默丢弃坏 call；目标对已完成的 malformed arguments 稳定 fail closed | 保持目标更严格策略；stream 必须在任何 done/completed 前失败，非流返回稳定协议错误，不隐藏损坏数据，也不伪造 `{}` |
+
+cli2api 的统一 check-in、套餐到期展示和账号路由属于运营/控制面，不是本仓库固定 Provider/Account 的反代 wire，不进入本轮计划。Intl/CN 两站 receipt 与 CB-N4 仍各自 `live_pending`/disabled；cache fixture 通过不能提升任何站点的 live 状态。
+
+### 17.11 实施批次与依赖
+
+| 批次 | 范围 | 进入条件 | 退出条件 |
+| --- | --- | --- | --- |
+| R2-0 证据冻结 | 为新 ID 增加 append-only observation、最小脱敏 fixture 和 target/source digest | 本文合入后 | 所有 confirmed gap 在未修前稳定红灯；外部仓库不成为测试依赖 |
+| R2-1 安全与拒绝面 | AG-N10、CX-N7、CX-N9、CX-N5、CX-N6 | R2-0 完成 | 未知权限不放宽、私有事件不泄漏、精确 sanitizer mutation tests 全绿 |
+| R2-2 语义守恒 | AG-N7～N9、AG-N11、CL-N5、CB-N6 | R2-0 完成，可与 R2-1 分 Provider 并行 | reasoning、citation、tool ID/result、cache usage 在流/非流和三 Surface 守恒 |
+| R2-3 兼容与观测 | CL-N6、CX-N8、CX-N10、GR-N3 | 对应失败 fixture 已冻结 | 合法输入不改写；新增 alias/reasoning/model/catalog 行为均有作用域、代际和内存边界 |
+| R2-4 差分/真实验收 | CX-N11、CX-N12、GR-N4、Antigravity Manager 差异、既有 LIVE-N1 | 有目标 fixture 或真实凭据 | 差分绿则只记证据；差分红才做窄修复；live receipt 按 rail/site/operation 独立判定 |
+| R2-Q Qoder 补审 | TokenRouter 最新增量 | `project-doc` skill 可用且仅读 committed object | 形成明确 `reviewed_no_wire_delta` 或新增 QD-N，不允许长期用“未知”冒充完成 |
+
+每个批次按 Provider 小提交落地，不能顺便重构 4 万行 forwarder。共享 helper 只有在至少两个 Provider 的合同完全相同且 mutation fixture 能证明边界时才抽取；否则保留 Provider-local policy。
+
+### 17.12 新增验收矩阵
+
+| 范围 | 离线必须证明 | 仍需真实输入的部分 |
+| --- | --- | --- |
+| AG-N7 | summary none/null 不展示 thought；auto/default 映射稳定；effort 不被误关 | 不提升 Antigravity 两条 rail |
+| AG-N8/N9/N11 | 混合 turn 邻接、并行/冲突 ID、`$ref` opaque result、无跨请求状态 | 厂商接受性异常才补 receipt，不以 fixture 宣称 live |
+| AG-N10 | unknown/empty/collision 不会变 auto；合法 choice 不回归 | 无 |
+| CL-N5 | Unicode scalar citation offset、相邻 block 合并、流/非流事件顺序一致 | Claude OAuth operation 仍按既有 receipt gate |
+| CL-N6 | 只有非法名称 alias；声明/history/choice/response 可逆；碰撞 fail closed | 至少一个真实非法 MCP 名称 receipt 才能移除 incident gate |
+| CX-N5/N6/N9 | schema 与 item-level 精确 mutation；arguments/用户内容 decoy 不变 | 无 |
+| CX-N7 | declared event 与 payload type 双重过滤；error/terminal/公开事件保留 | 原生 Codex metadata allowlist 如有变化需真实客户端 receipt |
+| CX-N8 | 连续 tool turn 复用真实 reasoning，用户边界清空，不伪造 placeholder | compat model 的真实接受性按现有 operation gate |
+| CX-N10 | JSON/SSE/WS reported model 只做审计；缺失/冲突/超长输入有界 | 告警阈值可用线上脱敏样本调优，但不阻塞离线正确性 |
+| CX-N11/N12 | 先冻结差分，绿灯不改代码 | WS 高并发与 strict schema 如需厂商确认，保持 pending |
+| GR-N3 | exact-scope catalog replace、generation drift、菜单/default/minimal/max、stale 不扩权 | 搜索、4.7 和 context/max 接受性分别验收 |
+| GR-N4 | UUID derivation 和 header 隔离可离线验证 | client version 与 group header 必须有 fixed-account fresh receipt |
+| CB-N6 | explicit zero、字段优先级、total 不双计、三 Surface 流/非流一致 | Intl/CN live 状态不变 |
+
+所有 fixture 成功只允许状态到 `fixture_verified`。任何 rail/site/operation 没有 fresh、脱敏、scope 完整的 receipt 时，仍为 `live_pending`；一个站点或 rail 的成功不能外推到另一个。
+
+### 17.13 第二轮不可破坏边界
+
+- Provider、Account、rail、site、Share 和 auth identity generation 继续固定；本轮任何 retry、catalog、alias 或 WS 改动都不得引入池、轮换或跨身份 fallback。
+- Sanitizer 必须按协议位置和字段名精确命中，不能递归清理整棵用户 JSON；arguments、prompt、tool output 原文不得进入日志和指标。
+- Catalog capability 是精确 scope 的快照，不是进程全局 truth；成功空结果权威，stale 只在既有合同允许的展示场景使用。
+- 外部代码只作为研究证据。实现、fixture、CI、构建、发布和运行时都必须自包含于本仓库。
+- 能力变化需同步合同源、`PROTOCOL_EVIDENCE.md` 和 reference-delta；`docs/provider/coverage.md` 仍是生成文件，禁止手工编辑。
+- 本轮文档/静态审计不运行 UI 自动化或部署测试；将来生产代码实现按第 14 节运行风险相称的 Rust、Node、smoke 和 readiness 门禁。
+
+### 17.14 第二轮证据索引
+
+外部提交：
+
+- Antigravity：CLIProxyAPI `6dea3dfa`（reasoning summary）、`3de5709d`（tool-result adjacency）、`5af6cd75`（function response `$ref`）、`49eec664`（tool choice fail closed）、`580df95a`（tool ID collision）。
+- Claude：CLIProxyAPI `781a203b`（相邻 text/citation）、`75b854eb`（Claude tool name sanitizer）。
+- Codex：CLIProxyAPI `320100ec`（octal NUL）、`3662d153`（nested cache breakpoint）、`dd013f9e`（private SSE event）、`40cc6489`（reasoning across tool turns）、`3b2882b7`（author/recipient metadata）、`25f40d8c`（reported model）、`42c9680e`（full duplex WS）、`7b6fafce`（mid-connection prewarm）；codex2api `288a28cb`（orphan required）。
+- Grok：grok2api `9dda42ae`（Build 1.0.40、conversation group 和 catalog capability）。
+- CodeBuddy：cli2api `a9da609`、`fff3419`（cache usage）、`f44e887`（incomplete terminal）、`aeaa4ac`（malformed arguments）、`b415dd0`（namespace identity）、`9f9b66e`（custom tools）。
+- Cursor：OmniRoute `443d66996d69`；Kiro：kiro.rs `be0c04219d9d`；sub2api：`ab99d56e9626`，均按上述 no-wire 边界解释。
+- Qoder：最新 TokenRouter `6d676f1d100e` 仅记录身份，业务内容未审；可依赖的最近冻结对象仍是 `7faf9469bc695`。
+
+目标代码锚点：
+
+| 主题 | 目标路径/符号 |
+| --- | --- |
+| Antigravity reasoning/tool turn/function response | `src/proxy/transforms.rs` 的 reasoning→Gemini、`anthropic_message_to_gemini_content`、Gemini history ID helpers |
+| Claude text/citation | `anthropic_response_to_openai_responses_with_tool_context`、`anthropic_citations_to_responses_annotations`、stream `AnthropicResponsesState` |
+| Claude tool alias | `src/proxy/claude_oauth.rs` 的 `normalize_claude_oauth_tool_names` / response restore patcher |
+| Codex schema/sanitizer | `src/proxy/tool_schema.rs`、`src/proxy/forwarder.rs` 的 `sanitize_codex_oauth_request_body` |
+| Codex stream/WS/model observation | `src/proxy/responses_transport.rs`、`stream_transforms.rs`、`forwarder.rs` 的 Codex HTTP/WS lifecycle |
+| Grok catalog/runtime | `src/clients/oauth/grok_models.rs`、`src/proxy/grok.rs`、`src/domain/grok_cli.rs` |
+| CodeBuddy usage | `src/proxy/codebuddy.rs`、`openai_responses_usage_from_chat_usage`、`anthropic_usage_from_openai_usage`、`usage_from_json_with_semantics` |
+
+### 17.15 第二轮完成定义
+
+1. AG-N7～N11、CL-N5、CX-N5～N7、CX-N9、CB-N6 均先有失败 fixture，再有最小修复和 decoy/mutation 回归；不能只按参考代码形状重写。
+2. CL-N6、CX-N8、CX-N10、GR-N3 的作用域、碰撞、代际、内存和取消边界均有专项测试；合法既有请求逐字节或语义等价。
+3. CX-N11、CX-N12、GR-N4 必须留下明确的绿灯/红灯/`live_pending` 判定；静态证据不足时保持不变。
+4. Cursor、Kiro、sub2api 保持 `reviewed_no_wire_delta`，不产生伪工作；Qoder 最新 HEAD 在 skill 可用前保持 `unreviewed_skill_gate`，不得假装完成。
+5. 新增 usage/model/catalog 观测不得记录 secret、prompt、tool arguments、reasoning 或原始身份，也不得改变固定路由和计费权威。
+6. 所有实现仍遵守 pre-commit 恢复、同 Provider/Account/rail/site、总 attempt/time/memory budget 和 post-commit 禁止透明 replay。
+7. reference-delta、合同源、`PROTOCOL_EVIDENCE.md`、registry/UI matrix 与生成 coverage 一致，外部仓库未进入依赖或日常 CI。
+8. 缺真实凭据的 LIVE-N1、AG-N6、WS prewarm、Grok GR-N4、Kiro compaction/cache、Qoder 三 rail、CodeBuddy 双站继续诚实保持 pending/disabled。
+
+第二轮当前判定：除 Qoder 最新 HEAD 因仓库要求的 skill 不可用而明确受阻外，七类参考和 Qoder 既有冻结证据的 committed-object 增量分析已完成；新项目均尚未实施。本文可以作为下一阶段实现队列，但不能把任何 `planned_*`、fixture 或参考项目行为解释为生产支持或真实账号验收。
