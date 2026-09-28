@@ -2692,7 +2692,7 @@ impl ToGeminiState {
 
     fn chat() -> Self {
         Self {
-            source: ToAnthropicSource::Chat(ChatAnthropicState::deferred_terminal()),
+            source: ToAnthropicSource::Chat(ChatAnthropicState::deferred_for_gemini()),
             target: AnthropicGeminiState::default(),
         }
     }
@@ -3227,6 +3227,8 @@ struct ChatAnthropicState {
     usage: Option<Value>,
     pending_finish_reason: Option<String>,
     defer_terminal: bool,
+    finish_on_usage_tail: bool,
+    defer_tools: bool,
     saw_tool: bool,
     completed: bool,
 }
@@ -3304,6 +3306,15 @@ impl ChatAnthropicState {
         }
     }
 
+    fn deferred_for_gemini() -> Self {
+        Self {
+            defer_terminal: true,
+            finish_on_usage_tail: true,
+            defer_tools: true,
+            ..Self::default()
+        }
+    }
+
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
         if self.completed {
             return Vec::new();
@@ -3317,7 +3328,11 @@ impl ChatAnthropicState {
             self.usage = Some(usage.clone());
         }
         let Some(choice) = input.pointer("/choices/0") else {
-            if self.defer_terminal && usage_only && self.pending_finish_reason.is_some() {
+            if self.defer_terminal
+                && self.finish_on_usage_tail
+                && usage_only
+                && self.pending_finish_reason.is_some()
+            {
                 return self.finish_pending();
             }
             return Vec::new();
@@ -3352,7 +3367,7 @@ impl ChatAnthropicState {
                     protocol_error("missing_tool_index");
                     continue;
                 };
-                if self.defer_terminal {
+                if self.defer_tools {
                     frames.extend(self.deferred_tool_delta(tool_index, tool_call));
                     continue;
                 }
@@ -3418,7 +3433,7 @@ impl ChatAnthropicState {
         if tool_calls.is_none_or(|tool_calls| tool_calls.is_empty()) {
             if let Some(tool_call) = transforms::openai_chat_legacy_tool_delta(delta) {
                 let tool_index = 0;
-                if self.defer_terminal {
+                if self.defer_tools {
                     frames.extend(self.deferred_tool_delta(tool_index, &tool_call));
                 } else {
                     if !self.tools.contains_key(&tool_index) {
@@ -9888,6 +9903,69 @@ mod tests {
                 .and_then(Value::as_str)
                 == Some("max_tokens")
         }));
+    }
+
+    #[test]
+    fn codebuddy_deferred_terminal_keeps_tool_deltas_incremental() {
+        let mut state = ChatAnthropicState::deferred_terminal();
+        let tool = state.transform(&json!({
+            "id": "chatcmpl_codebuddy_tool",
+            "model": "default-model",
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_lookup",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]},
+                "finish_reason": null
+            }]
+        }));
+        assert!(tool.iter().any(|frame| {
+            frame.payload_json()["type"] == "content_block_start"
+                && frame.payload_json()["content_block"]["type"] == "tool_use"
+        }));
+        assert!(tool.iter().any(|frame| {
+            frame
+                .payload_json()
+                .pointer("/delta/type")
+                .and_then(Value::as_str)
+                == Some("input_json_delta")
+        }));
+        assert!(!tool
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "message_stop"));
+
+        let finish = state.transform(&json!({
+            "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+        }));
+        assert!(!finish
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "message_stop"));
+
+        let usage_tail = state.transform(&json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "cache_read_tokens": 3,
+                "cache_write_tokens": 2
+            }
+        }));
+        assert!(!usage_tail
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "message_stop"));
+        let terminal = state.finish_stream().expect("strict upstream terminal");
+        let usage = terminal
+            .iter()
+            .find(|frame| frame.payload_json()["type"] == "message_delta")
+            .map(|frame| frame.payload_json()["usage"].clone())
+            .expect("usage terminal");
+        assert_eq!(usage["input_tokens"], 5);
+        assert_eq!(usage["cache_read_input_tokens"], 3);
+        assert_eq!(usage["cache_creation_input_tokens"], 2);
+        assert!(terminal
+            .iter()
+            .any(|frame| frame.payload_json()["type"] == "message_stop"));
     }
 
     #[test]

@@ -966,14 +966,10 @@ fn canonicalize_codebuddy_cache_usage(usage: &mut Value) {
         return;
     };
     if let Some(cache_read) = cache_read {
-        object
-            .entry("cache_read_tokens".to_string())
-            .or_insert_with(|| json!(cache_read));
+        set_codebuddy_usage_number(object, "cache_read_tokens", cache_read);
     }
     if let Some(cache_write) = cache_write {
-        object
-            .entry("cache_write_tokens".to_string())
-            .or_insert_with(|| json!(cache_write));
+        set_codebuddy_usage_number(object, "cache_write_tokens", cache_write);
     }
     let details = object
         .entry("prompt_tokens_details".to_string())
@@ -982,14 +978,10 @@ fn canonicalize_codebuddy_cache_usage(usage: &mut Value) {
         return;
     };
     if let Some(cache_read) = cache_read {
-        details
-            .entry("cached_tokens".to_string())
-            .or_insert_with(|| json!(cache_read));
+        set_codebuddy_usage_number(details, "cached_tokens", cache_read);
     }
     if let Some(cache_write) = cache_write {
-        details
-            .entry("cache_write_tokens".to_string())
-            .or_insert_with(|| json!(cache_write));
+        set_codebuddy_usage_number(details, "cache_write_tokens", cache_write);
     }
 }
 
@@ -1005,15 +997,26 @@ fn codebuddy_usage_number(usage: &Value, paths: &[&[&str]]) -> Option<u64> {
             cursor = next;
         }
         if found {
-            if let Some(value) = cursor.as_u64() {
-                return Some(value);
-            }
-            if let Some(value) = cursor.as_i64().and_then(|value| u64::try_from(value).ok()) {
+            if let Some(value) = valid_codebuddy_usage_number(cursor) {
                 return Some(value);
             }
         }
     }
     None
+}
+
+fn valid_codebuddy_usage_number(value: &Value) -> Option<u64> {
+    value.as_u64().filter(|value| *value <= i64::MAX as u64)
+}
+
+fn set_codebuddy_usage_number(object: &mut serde_json::Map<String, Value>, key: &str, value: u64) {
+    if object
+        .get(key)
+        .and_then(valid_codebuddy_usage_number)
+        .is_none()
+    {
+        object.insert(key.to_string(), json!(value));
+    }
 }
 
 fn update_optional_string(
@@ -1381,6 +1384,18 @@ mod tests {
         assert_eq!(legacy["cache_read_input_tokens"], 3);
         assert_eq!(legacy["prompt_cache_write_tokens"], 2);
         assert_eq!(legacy["total_tokens"], 13);
+
+        let mut invalid_canonical = json!({
+            "cache_read_tokens": -1,
+            "cache_write_tokens": 1.5,
+            "prompt_tokens_details": {
+                "cached_tokens": 5,
+                "cache_write_tokens": 4
+            }
+        });
+        canonicalize_codebuddy_cache_usage(&mut invalid_canonical);
+        assert_eq!(invalid_canonical["cache_read_tokens"], 5);
+        assert_eq!(invalid_canonical["cache_write_tokens"], 4);
     }
 
     #[test]

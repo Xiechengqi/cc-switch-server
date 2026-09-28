@@ -22,6 +22,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeBuddyGenerationReply {
     Success,
+    SuccessZeroCache,
     HttpUnauthorized,
     OversizedHttpUnauthorized,
     LateUnauthorized,
@@ -30,6 +31,7 @@ enum CodeBuddyGenerationReply {
     DuplicateDone,
     DataAfterDone,
     TruncatedBeforeDone,
+    UsageTailBeforeDoneTruncated,
     StallBeforeDone,
     StallAfterDone,
 }
@@ -200,7 +202,7 @@ fn chat_chunk(content: &str, finish_reason: Option<&str>) -> Bytes {
     ))
 }
 
-fn tool_chunks() -> Vec<Bytes> {
+fn tool_chunks_with_cache(cache_read_tokens: u64, cache_write_tokens: u64) -> Vec<Bytes> {
     vec![
         Bytes::from(format!(
             "data: {}\n\n",
@@ -253,8 +255,8 @@ fn tool_chunks() -> Vec<Bytes> {
                     "total_tokens": 13,
                     "credit": 0.02,
                     "completion_thinking_tokens": 2,
-                    "cache_read_tokens": 3,
-                    "cache_write_tokens": 2,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_write_tokens": cache_write_tokens,
                     "cached_tokens": 1,
                     "cache_read_input_tokens": 1,
                     "cache_creation_input_tokens": 0,
@@ -270,6 +272,10 @@ fn tool_chunks() -> Vec<Bytes> {
             })
         )),
     ]
+}
+
+fn tool_chunks() -> Vec<Bytes> {
+    tool_chunks_with_cache(3, 2)
 }
 
 fn sse_response(chunks: Vec<Bytes>) -> Response {
@@ -311,6 +317,13 @@ fn success_response() -> Response {
     let mut chunks = tool_chunks();
     // Split the terminal across network body frames. The decoder must not
     // publish it until the following EOF validates the complete lifecycle.
+    chunks.push(Bytes::from_static(b"data: [DO"));
+    chunks.push(Bytes::from_static(b"NE]\n\n"));
+    sse_response(chunks)
+}
+
+fn zero_cache_success_response() -> Response {
+    let mut chunks = tool_chunks_with_cache(0, 0);
     chunks.push(Bytes::from_static(b"data: [DO"));
     chunks.push(Bytes::from_static(b"NE]\n\n"));
     sse_response(chunks)
@@ -382,6 +395,7 @@ async fn codebuddy_generation(
         .unwrap_or(CodeBuddyGenerationReply::Success);
     match reply {
         CodeBuddyGenerationReply::Success => success_response(),
+        CodeBuddyGenerationReply::SuccessZeroCache => zero_cache_success_response(),
         CodeBuddyGenerationReply::HttpUnauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(CONTENT_TYPE, "application/json")
@@ -415,6 +429,7 @@ async fn codebuddy_generation(
         CodeBuddyGenerationReply::TruncatedBeforeDone => {
             sse_response(vec![chat_chunk("truncated", None)])
         }
+        CodeBuddyGenerationReply::UsageTailBeforeDoneTruncated => sse_response(tool_chunks()),
         CodeBuddyGenerationReply::StallBeforeDone => stalling_sse_response(
             chat_chunk("cancel-before-done", None),
             Arc::clone(&state.upstream_body_dropped),
@@ -742,7 +757,13 @@ fn codebuddy_response_payloads(body: &str, stream_requested: bool) -> Vec<Value>
         .collect()
 }
 
-fn assert_codebuddy_cache_usage(app: AppKind, stream_requested: bool, body: &str) {
+fn assert_codebuddy_cache_usage(
+    app: AppKind,
+    stream_requested: bool,
+    body: &str,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) {
     let payloads = codebuddy_response_payloads(body, stream_requested);
     match app {
         AppKind::Claude => {
@@ -758,10 +779,14 @@ fn assert_codebuddy_cache_usage(app: AppKind, stream_requested: bool, body: &str
             } else {
                 payloads[0].get("usage").unwrap()
             };
-            assert_eq!(usage["input_tokens"], 5, "{body}");
+            assert_eq!(
+                usage["input_tokens"],
+                10_u64.saturating_sub(cache_read_tokens + cache_write_tokens),
+                "{body}"
+            );
             assert_eq!(usage["output_tokens"], 3);
-            assert_eq!(usage["cache_read_input_tokens"], 3);
-            assert_eq!(usage["cache_creation_input_tokens"], 2);
+            assert_eq!(usage["cache_read_input_tokens"], cache_read_tokens);
+            assert_eq!(usage["cache_creation_input_tokens"], cache_write_tokens);
         }
         AppKind::Codex => {
             let usage = if stream_requested {
@@ -781,8 +806,14 @@ fn assert_codebuddy_cache_usage(app: AppKind, stream_requested: bool, body: &str
             assert_eq!(usage["input_tokens"], 10);
             assert_eq!(usage["output_tokens"], 3);
             assert_eq!(usage["total_tokens"], 13);
-            assert_eq!(usage["input_tokens_details"]["cached_tokens"], 3);
-            assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 2);
+            assert_eq!(
+                usage["input_tokens_details"]["cached_tokens"],
+                cache_read_tokens
+            );
+            assert_eq!(
+                usage["input_tokens_details"]["cache_write_tokens"],
+                cache_write_tokens
+            );
         }
         AppKind::Gemini => {
             let usage = payloads
@@ -792,7 +823,7 @@ fn assert_codebuddy_cache_usage(app: AppKind, stream_requested: bool, body: &str
             assert_eq!(usage["promptTokenCount"], 10);
             assert_eq!(usage["candidatesTokenCount"], 3);
             assert_eq!(usage["totalTokenCount"], 13);
-            assert_eq!(usage["cachedContentTokenCount"], 3);
+            assert_eq!(usage["cachedContentTokenCount"], cache_read_tokens);
         }
     }
 }
@@ -883,59 +914,74 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
         for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
             for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
                 for stream_requested in [false, true] {
-                    let name = format!(
-                        "codebuddy-{}-{}-{}",
-                        site.as_str(),
-                        app.as_str(),
-                        if stream_requested { "stream" } else { "json" }
-                    );
-                    let (address, fixture, server) =
-                        spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success])
-                            .await;
-                    let state = codebuddy_test_state(&name);
-                    let origin = format!("http://{address}");
-                    let (provider_id, _) =
-                        install_codebuddy_provider(&state, &name, app, site, &origin).await;
-                    let share_id = format!("{name}-share");
-                    install_codebuddy_share(
-                        &state,
-                        &share_id,
-                        app,
-                        &provider_id,
-                        "owner@example.com",
-                    )
-                    .await;
-
-                    let response = forward_codebuddy_surface(
-                        state,
-                        app,
-                        provider_id,
-                        &share_id,
-                        stream_requested,
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(response.status(), StatusCode::OK, "{name}");
-                    let body = String::from_utf8(collect(response).await).unwrap();
-                    assert!(body.contains("ready"), "{name}: {body}");
-                    assert!(body.contains("lookup"), "{name}: {body}");
-                    assert!(body.contains("think"), "{name}: {body}");
-                    assert_codebuddy_cache_usage(app, stream_requested, &body);
-                    if stream_requested {
-                        assert!(
-                            body.contains("message_stop")
-                                || body.contains("response.completed")
-                                || body.contains("finishReason"),
-                            "{name}: {body}"
+                    for (cache_case, reply, cache_read_tokens, cache_write_tokens) in [
+                        ("cache", CodeBuddyGenerationReply::Success, 3, 2),
+                        (
+                            "explicit-zero",
+                            CodeBuddyGenerationReply::SuccessZeroCache,
+                            0,
+                            0,
+                        ),
+                    ] {
+                        let name = format!(
+                            "codebuddy-{}-{}-{}-{cache_case}",
+                            site.as_str(),
+                            app.as_str(),
+                            if stream_requested { "stream" } else { "json" }
                         );
+                        let (address, fixture, server) =
+                            spawn_codebuddy_upstream(site, vec![reply]).await;
+                        let state = codebuddy_test_state(&name);
+                        let origin = format!("http://{address}");
+                        let (provider_id, _) =
+                            install_codebuddy_provider(&state, &name, app, site, &origin).await;
+                        let share_id = format!("{name}-share");
+                        install_codebuddy_share(
+                            &state,
+                            &share_id,
+                            app,
+                            &provider_id,
+                            "owner@example.com",
+                        )
+                        .await;
+
+                        let response = forward_codebuddy_surface(
+                            state,
+                            app,
+                            provider_id,
+                            &share_id,
+                            stream_requested,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(response.status(), StatusCode::OK, "{name}");
+                        let body = String::from_utf8(collect(response).await).unwrap();
+                        assert!(body.contains("ready"), "{name}: {body}");
+                        assert!(body.contains("lookup"), "{name}: {body}");
+                        assert!(body.contains("think"), "{name}: {body}");
+                        assert_codebuddy_cache_usage(
+                            app,
+                            stream_requested,
+                            &body,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                        );
+                        if stream_requested {
+                            assert!(
+                                body.contains("message_stop")
+                                    || body.contains("response.completed")
+                                    || body.contains("finishReason"),
+                                "{name}: {body}"
+                            );
+                        }
+                        assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                        assert_eq!(fixture.count(&fixture.config_requests), 1, "{name}");
+                        assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                        let observations = fixture.generation_observations();
+                        assert_eq!(observations.len(), 1, "{name}");
+                        assert_generation_observation(&observations[0], site);
+                        server.abort();
                     }
-                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
-                    assert_eq!(fixture.count(&fixture.config_requests), 1, "{name}");
-                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
-                    let observations = fixture.generation_observations();
-                    assert_eq!(observations.len(), 1, "{name}");
-                    assert_generation_observation(&observations[0], site);
-                    server.abort();
                 }
             }
         }
@@ -1472,6 +1518,60 @@ fn codebuddy_truncation_before_done_is_never_reported_as_success() {
         assert!(body.contains("truncated"), "{body}");
         assert!(body.contains("response.failed"), "{body}");
         assert!(!body.contains("response.completed"), "{body}");
+        let usage = state.usage_snapshot().await;
+        assert_eq!(
+            usage
+                .logs
+                .last()
+                .and_then(|log| log.stream_status.as_deref()),
+            Some("upstream_error")
+        );
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        server.abort();
+
+        let (address, fixture, server) = spawn_codebuddy_upstream(
+            CodeBuddySite::Intl,
+            vec![CodeBuddyGenerationReply::UsageTailBeforeDoneTruncated],
+        )
+        .await;
+        let state = codebuddy_test_state("codebuddy-usage-tail-truncated-stream");
+        let (provider_id, _) = install_codebuddy_provider(
+            &state,
+            "codebuddy-usage-tail-truncated-stream",
+            AppKind::Claude,
+            CodeBuddySite::Intl,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = "codebuddy-usage-tail-truncated-stream-share";
+        install_codebuddy_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+        let response =
+            forward_codebuddy_surface(state.clone(), AppKind::Claude, provider_id, share_id, true)
+                .await
+                .unwrap();
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("a CodeBuddy usage tail without DONE must terminate with an error frame")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("exactly one [DONE]"), "{body}");
+        assert!(!body.contains("event: message_delta"), "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+        assert!(
+            body.find("event: error") < body.find("event: message_stop"),
+            "{body}"
+        );
         let usage = state.usage_snapshot().await;
         assert_eq!(
             usage

@@ -7161,7 +7161,7 @@ fn gemini_usage_from_openai_usage(usage: Option<&Value>) -> Value {
 }
 
 fn openai_chat_cache_read_tokens(usage: Option<&Value>) -> Option<i64> {
-    usage_number(
+    nonnegative_integer_usage_number(
         usage,
         &[
             &["cache_read_tokens"],
@@ -7178,7 +7178,7 @@ fn openai_chat_cache_read_tokens(usage: Option<&Value>) -> Option<i64> {
 }
 
 fn openai_chat_cache_write_tokens(usage: Option<&Value>) -> Option<i64> {
-    usage_number(
+    nonnegative_integer_usage_number(
         usage,
         &[
             &["cache_write_tokens"],
@@ -7197,6 +7197,28 @@ fn openai_chat_cache_write_tokens(usage: Option<&Value>) -> Option<i64> {
             &["prompt_cache_write_tokens"],
         ],
     )
+}
+
+fn nonnegative_integer_usage_number(usage: Option<&Value>, paths: &[&[&str]]) -> Option<i64> {
+    let usage = usage?;
+    for path in paths {
+        let mut cursor = usage;
+        let mut found = true;
+        for key in *path {
+            if let Some(next) = cursor.get(*key) {
+                cursor = next;
+            } else {
+                found = false;
+                break;
+            }
+        }
+        if found {
+            if let Some(value) = cursor.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn usage_number(usage: Option<&Value>, paths: &[&[&str]]) -> Option<i64> {
@@ -9690,6 +9712,21 @@ mod tests {
         assert_eq!(gemini["usageMetadata"]["candidatesTokenCount"], 3);
         assert_eq!(gemini["usageMetadata"]["totalTokenCount"], 13);
         assert_eq!(gemini["usageMetadata"]["cachedContentTokenCount"], 0);
+
+        let invalid_top_level = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "cache_read_tokens": -1,
+            "cache_write_tokens": 1.5,
+            "prompt_tokens_details": {
+                "cached_tokens": 5,
+                "cache_write_tokens": 4
+            }
+        });
+        let normalized = anthropic_usage_from_openai_usage(Some(&invalid_top_level));
+        assert_eq!(normalized["input_tokens"], 1);
+        assert_eq!(normalized["cache_read_input_tokens"], 5);
+        assert_eq!(normalized["cache_creation_input_tokens"], 4);
     }
 
     #[test]
