@@ -11,6 +11,117 @@ const MAX_SEMANTIC_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEMANTIC_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const RESPONSES_CONTENT_REPEAT_LIMIT: usize = 128;
 const RESPONSES_REASONING_REPEAT_LIMIT: usize = 256;
+const REPORTED_RESPONSE_MODEL_MAX_BYTES: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReportedResponseModel {
+    pub(super) model: String,
+    pub(super) conflict: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ReportedResponseModelObserver {
+    first: Option<String>,
+    terminal: Option<String>,
+    conflict: bool,
+}
+
+impl ReportedResponseModelObserver {
+    pub(super) fn observe_json_bytes(&mut self, bytes: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str).is_some() {
+            self.observe_event_value(&value);
+        } else {
+            self.observe_document_value(&value);
+        }
+    }
+
+    pub(super) fn observe_document_value(&mut self, value: &Value) {
+        let model = value
+            .get("model")
+            .or_else(|| value.pointer("/response/model"));
+        self.observe_model_value(model, true);
+    }
+
+    pub(super) fn observe_event_value(&mut self, value: &Value) {
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let terminal = matches!(
+            event_type,
+            "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.cancelled"
+                | "response.canceled"
+                | "response.done"
+        );
+        if !terminal
+            && !matches!(
+                event_type,
+                "response.created" | "response.in_progress" | "response.queued"
+            )
+        {
+            return;
+        }
+        self.observe_model_value(value.pointer("/response/model"), terminal);
+    }
+
+    pub(super) fn observation(&self) -> Option<ReportedResponseModel> {
+        self.terminal
+            .as_ref()
+            .or(self.first.as_ref())
+            .map(|model| ReportedResponseModel {
+                model: model.clone(),
+                conflict: self.conflict,
+            })
+    }
+
+    pub(super) fn terminal_observation(&self) -> Option<ReportedResponseModel> {
+        self.terminal.as_ref().map(|model| ReportedResponseModel {
+            model: model.clone(),
+            conflict: self.conflict,
+        })
+    }
+
+    fn observe_model_value(&mut self, value: Option<&Value>, terminal: bool) {
+        let Some(model) = value.and_then(valid_reported_response_model) else {
+            return;
+        };
+        if self
+            .terminal
+            .as_ref()
+            .or(self.first.as_ref())
+            .is_some_and(|existing| !existing.eq_ignore_ascii_case(&model))
+        {
+            self.conflict = true;
+        }
+        if terminal {
+            if self.terminal.is_none() {
+                self.terminal = Some(model);
+            }
+        } else if self.first.is_none() {
+            self.first = Some(model);
+        }
+    }
+}
+
+fn valid_reported_response_model(value: &Value) -> Option<String> {
+    let model = value.as_str()?.trim();
+    if model.is_empty()
+        || model.len() > REPORTED_RESPONSE_MODEL_MAX_BYTES
+        || !model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+    {
+        return None;
+    }
+    Some(model.to_string())
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ResponsesRepeatTracker {
@@ -487,7 +598,17 @@ pub(super) struct ResponsesSseInspector {
     done_seen: bool,
     repeats: ResponsesRepeatTracker,
     repeat_guard_enabled: bool,
+    event_visibility: ResponsesEventVisibility,
+    reported_model: ReportedResponseModelObserver,
     started: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ResponsesEventVisibility {
+    #[default]
+    Unfiltered,
+    StandardClient,
+    NativeCodexClient,
 }
 
 #[derive(Debug, Default)]
@@ -522,6 +643,8 @@ impl Default for ResponsesSseInspector {
             done_seen: false,
             repeats: ResponsesRepeatTracker::default(),
             repeat_guard_enabled: false,
+            event_visibility: ResponsesEventVisibility::Unfiltered,
+            reported_model: ReportedResponseModelObserver::default(),
             started: false,
         }
     }
@@ -531,6 +654,17 @@ impl ResponsesSseInspector {
     pub(super) fn with_repeat_guard(enabled: bool) -> Self {
         Self {
             repeat_guard_enabled: enabled,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_repeat_guard_and_visibility(
+        enabled: bool,
+        event_visibility: ResponsesEventVisibility,
+    ) -> Self {
+        Self {
+            repeat_guard_enabled: enabled,
+            event_visibility,
             ..Self::default()
         }
     }
@@ -621,6 +755,10 @@ impl ResponsesSseInspector {
         self.transport.retained_bytes()
     }
 
+    pub(super) fn reported_model(&self) -> Option<ReportedResponseModel> {
+        self.reported_model.observation()
+    }
+
     pub(super) fn synthesized_failure_from_error_frame(&self) -> Option<&SemanticFailure> {
         match self.terminal.as_ref() {
             Some(SemanticTerminal::Failure(failure)) if self.terminal_from_error_frame => {
@@ -655,6 +793,18 @@ impl ResponsesSseInspector {
                     value,
                 } => {
                     if self.terminal.is_some() {
+                        continue;
+                    }
+                    self.reported_model.observe_event_value(&value);
+                    if responses_event_is_filtered(
+                        self.event_visibility,
+                        declared_event.as_deref(),
+                        &value,
+                    ) {
+                        crate::metrics::record_responses_sse_transport(
+                            "event_visibility",
+                            "filtered_private_event",
+                        );
                         continue;
                     }
                     self.observe_repeat(&value)?;
@@ -716,6 +866,110 @@ impl ResponsesSseInspector {
         }
         Some(failure)
     }
+}
+
+fn responses_event_is_filtered(
+    visibility: ResponsesEventVisibility,
+    declared_event: Option<&str>,
+    value: &Value,
+) -> bool {
+    if visibility == ResponsesEventVisibility::Unfiltered {
+        return false;
+    }
+    let payload_type = value.get("type").and_then(Value::as_str);
+    [declared_event, payload_type]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .any(|name| !responses_event_is_visible(visibility, name))
+}
+
+fn responses_event_is_visible(visibility: ResponsesEventVisibility, name: &str) -> bool {
+    if name.starts_with("responsesapi.") || name == "codex.rate_limits" {
+        return false;
+    }
+    if name.starts_with("codex.") {
+        return visibility == ResponsesEventVisibility::NativeCodexClient
+            && name == "codex.response.metadata";
+    }
+    public_responses_stream_event(name)
+}
+
+/// Closed public event set from the official Responses streaming reference.
+/// Unknown future events remain hidden until their downstream contract is
+/// reviewed; protocol errors and terminal events are explicitly retained.
+fn public_responses_stream_event(name: &str) -> bool {
+    matches!(
+        name,
+        "error"
+            | "response.audio.delta"
+            | "response.audio.done"
+            | "response.audio.transcript.delta"
+            | "response.audio.transcript.done"
+            | "response.cancelled"
+            | "response.canceled"
+            | "response.code_interpreter_call.completed"
+            | "response.code_interpreter_call.in_progress"
+            | "response.code_interpreter_call.interpreting"
+            | "response.code_interpreter_call_code.delta"
+            | "response.code_interpreter_call_code.done"
+            | "response.compaction"
+            | "response.compaction.compacting"
+            | "response.completed"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.created"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done"
+            | "response.done"
+            | "response.failed"
+            | "response.file_search_call.completed"
+            | "response.file_search_call.in_progress"
+            | "response.file_search_call.searching"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.image_generation_call.completed"
+            | "response.image_generation_call.generating"
+            | "response.image_generation_call.in_progress"
+            | "response.image_generation_call.partial_image"
+            | "response.in_progress"
+            | "response.incomplete"
+            | "response.mcp_approval_request"
+            | "response.mcp_call.completed"
+            | "response.mcp_call.failed"
+            | "response.mcp_call.in_progress"
+            | "response.mcp_call_arguments.delta"
+            | "response.mcp_call_arguments.done"
+            | "response.mcp_list_tools.completed"
+            | "response.mcp_list_tools.failed"
+            | "response.mcp_list_tools.in_progress"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.output_text.annotation.added"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.queued"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.shell_call_command.added"
+            | "response.shell_call_command.delta"
+            | "response.shell_call_command.done"
+            | "response.shell_call_output_content.delta"
+            | "response.shell_call_output_content.done"
+            | "response.steer.accepted"
+            | "response.steer.failed"
+            | "response.steer.pending"
+            | "response.web_search_call.completed"
+            | "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+    )
 }
 
 #[cfg(test)]
@@ -1317,6 +1571,132 @@ mod tests {
         assert_eq!(observations, vec![SemanticObservation::IncompleteTerminal]);
         assert_eq!(inspector.terminal(), Some(&SemanticTerminal::Incomplete));
         inspector.finish().unwrap();
+    }
+
+    #[test]
+    fn standard_responses_stream_filters_private_and_unknown_events_by_both_names() {
+        let stream = concat!(
+            "event: responsesapi.websocket_timing\n",
+            "data: {\"type\":\"responsesapi.websocket_timing\",\"latency_ms\":1}\n\n",
+            "data: {\"type\":\"codex.response.metadata\",\"trace\":\"private\"}\n\n",
+            "event: codex.rate_limits\n",
+            "data: {\"remaining\":1}\n\n",
+            "event: response.future.delta\n",
+            "data: {\"type\":\"response.future.delta\",\"delta\":\"private until reviewed\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"public\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut inspector = ResponsesSseInspector::with_repeat_guard_and_visibility(
+            false,
+            ResponsesEventVisibility::StandardClient,
+        );
+        let mut normalized = inspector
+            .push_normalized(stream.as_bytes())
+            .unwrap()
+            .normalized;
+        let tail = inspector.finish_normalized().unwrap().normalized;
+        normalized = [normalized.as_ref(), tail.as_ref()].concat().into();
+        let normalized = String::from_utf8(normalized.to_vec()).unwrap();
+
+        assert!(normalized.contains("response.output_text.delta"));
+        assert!(normalized.contains("response.completed"));
+        assert!(!normalized.contains("responsesapi."));
+        assert!(!normalized.contains("codex."));
+        assert!(!normalized.contains("response.future.delta"));
+    }
+
+    #[test]
+    fn native_codex_stream_allows_only_reviewed_metadata_beyond_public_events() {
+        let stream = concat!(
+            "data: {\"type\":\"codex.response.metadata\",\"response_id\":\"resp_1\"}\n\n",
+            "event: codex.rate_limits\n",
+            "data: {\"type\":\"codex.rate_limits\",\"remaining\":1}\n\n",
+            "data: {\"type\":\"codex.secret.future\",\"value\":true}\n\n",
+            "event: responsesapi.telemetry\n",
+            "data: {\"type\":\"responsesapi.telemetry\"}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"visible failure\"}}}\n\n"
+        );
+        let mut inspector = ResponsesSseInspector::with_repeat_guard_and_visibility(
+            false,
+            ResponsesEventVisibility::NativeCodexClient,
+        );
+        let batch = inspector.push_normalized(stream.as_bytes()).unwrap();
+        let normalized = String::from_utf8(batch.normalized.to_vec()).unwrap();
+
+        assert!(normalized.contains("codex.response.metadata"));
+        assert!(normalized.contains("response.failed"));
+        assert!(normalized.contains("visible failure"));
+        assert!(!normalized.contains("codex.rate_limits"));
+        assert!(!normalized.contains("codex.secret.future"));
+        assert!(!normalized.contains("responsesapi.telemetry"));
+        assert!(matches!(
+            inspector.terminal(),
+            Some(SemanticTerminal::Failure(_))
+        ));
+        inspector.finish().unwrap();
+    }
+
+    #[test]
+    fn reported_response_model_is_bounded_and_terminal_authoritative() {
+        let mut observer = ReportedResponseModelObserver::default();
+        observer.observe_event_value(&json!({
+            "type": "response.created",
+            "response": {"model": "gpt-5.5"}
+        }));
+        assert_eq!(observer.terminal_observation(), None);
+        observer.observe_event_value(&json!({
+            "type": "response.output_text.delta",
+            "response": {"model": "ignored-business-frame"}
+        }));
+        observer.observe_event_value(&json!({
+            "type": "response.completed",
+            "response": {"model": "gpt-5.5-2026-09-01"}
+        }));
+        assert_eq!(
+            observer.observation(),
+            Some(ReportedResponseModel {
+                model: "gpt-5.5-2026-09-01".to_string(),
+                conflict: true,
+            })
+        );
+        assert_eq!(observer.terminal_observation(), observer.observation());
+
+        let mut invalid = ReportedResponseModelObserver::default();
+        invalid.observe_document_value(&json!({"model": "gpt-5.5\nsecret"}));
+        invalid.observe_document_value(&json!({
+            "model": "x".repeat(REPORTED_RESPONSE_MODEL_MAX_BYTES + 1)
+        }));
+        assert_eq!(invalid.observation(), None);
+    }
+
+    #[test]
+    fn responses_inspector_observes_reported_model_without_changing_wire() {
+        let mut inspector = ResponsesSseInspector::with_repeat_guard_and_visibility(
+            false,
+            ResponsesEventVisibility::StandardClient,
+        );
+        inspector
+            .push_normalized(
+                concat!(
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.5\"}}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"model\":\"gpt-5.5\"}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            inspector.reported_model(),
+            Some(ReportedResponseModel {
+                model: "gpt-5.5".to_string(),
+                conflict: false,
+            })
+        );
     }
 
     #[test]

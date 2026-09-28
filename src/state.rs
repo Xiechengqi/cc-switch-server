@@ -22776,6 +22776,10 @@ mod tests {
             },
         );
         log.first_token_ms = Some(42);
+        log.reported_model = Some("gpt-5.5-2026-09-01".to_string());
+        log.reported_model_source = Some("sse.response.model".to_string());
+        log.reported_model_mismatch = Some(true);
+        log.reported_model_conflict = Some(true);
         log.apply_context(UsageLogContext {
             request_id: Some("req_router_1".to_string()),
             share_id: Some("share-1".to_string()),
@@ -22820,6 +22824,11 @@ mod tests {
         assert_eq!(entry.cache_creation_tokens, 5);
         assert!(entry.cache_usage_observed);
         assert!(!entry.usage_estimated);
+        let router_payload = serde_json::to_value(&entry).unwrap();
+        assert!(router_payload.get("reportedModel").is_none());
+        assert!(router_payload.get("reportedModelSource").is_none());
+        assert!(router_payload.get("reportedModelMismatch").is_none());
+        assert!(router_payload.get("reportedModelConflict").is_none());
     }
 
     #[tokio::test]

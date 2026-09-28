@@ -27,6 +27,11 @@ pub(crate) fn normalize_codex_function_parameters(parameters: Option<&Value>) ->
 }
 
 pub(crate) fn normalize_codex_tool_schemas(request: &mut Value) {
+    for pointer in ["/text/format/schema", "/text/format/json_schema/schema"] {
+        if let Some(schema) = request.pointer_mut(pointer) {
+            normalize_codex_schema_node(schema);
+        }
+    }
     if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
             normalize_codex_tool_schema(tool);
@@ -124,6 +129,7 @@ fn normalize_codex_schema_node_inner(value: &mut Value) {
     {
         object.remove("pattern");
     }
+    prune_codex_required_without_properties(object);
     simplify_codex_const_union(object);
 
     if let Some(children) = object
@@ -236,9 +242,10 @@ fn codex_schema_within_limits(root: &Value) -> bool {
     true
 }
 
-/// Detects active `\p{` / `\P{` escapes after JSON decoding, including a
-/// textual `\u005c` spelling of the introducing backslash. Even backslash runs
-/// are literals and remain compatible.
+/// Detects active `\p{` / `\P{` and octal-NUL `\0` escapes after JSON
+/// decoding, including a textual `\u005c` spelling of the introducing
+/// backslash. Even backslash runs are literals and remain compatible; `\x00`
+/// is the accepted NUL spelling and is deliberately preserved.
 fn has_incompatible_codex_unicode_escape(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut index = 0;
@@ -260,16 +267,100 @@ fn has_incompatible_codex_unicode_escape(pattern: &str) -> bool {
         {
             return true;
         }
-        if index + 6 < bytes.len()
+        if bytes.get(index) == Some(&b'0') {
+            return true;
+        }
+        if index + 5 < bytes.len()
             && matches!(bytes[index], b'u' | b'U')
             && bytes[index + 1..index + 5].eq_ignore_ascii_case(b"005c")
-            && matches!(bytes[index + 5], b'p' | b'P')
-            && bytes[index + 6] == b'{'
+            && (bytes[index + 5] == b'0'
+                || (index + 6 < bytes.len()
+                    && matches!(bytes[index + 5], b'p' | b'P')
+                    && bytes[index + 6] == b'{'))
         {
             return true;
         }
     }
     false
+}
+
+/// Removes only `required` entries that provably have no field source when a
+/// schema node has no local `properties`. References are opaque and therefore
+/// preserved. Composition branches provide a conservative visible-name union;
+/// missing names are never backfilled because that would change composition
+/// semantics.
+fn prune_codex_required_without_properties(object: &mut Map<String, Value>) {
+    if object.contains_key("properties")
+        || ["$ref", "$dynamicRef"].into_iter().any(|key| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    {
+        return;
+    }
+    let Some(required) = object.get("required").and_then(Value::as_array) else {
+        return;
+    };
+    if required.is_empty() {
+        return;
+    }
+
+    let mut visible = BTreeSet::new();
+    collect_codex_composition_property_names(object, &mut visible);
+    if visible.is_empty() {
+        if codex_schema_declares_object(object) {
+            object.remove("required");
+        }
+        return;
+    }
+
+    let mut seen = BTreeSet::new();
+    let retained = required
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| visible.contains(*name) && seen.insert((*name).to_string()))
+        .map(|name| Value::String(name.to_string()))
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        object.remove("required");
+    } else {
+        object.insert("required".to_string(), Value::Array(retained));
+    }
+}
+
+fn collect_codex_composition_property_names(
+    object: &Map<String, Value>,
+    names: &mut BTreeSet<String>,
+) {
+    for key in ["allOf", "anyOf", "oneOf", "then", "else"] {
+        let Some(branch) = object.get(key) else {
+            continue;
+        };
+        let branches: Box<dyn Iterator<Item = &Value> + '_> = match branch {
+            Value::Array(branches) => Box::new(branches.iter()),
+            Value::Object(_) => Box::new(std::iter::once(branch)),
+            _ => continue,
+        };
+        for branch in branches {
+            let Some(branch) = branch.as_object() else {
+                continue;
+            };
+            if let Some(properties) = branch.get("properties").and_then(Value::as_object) {
+                names.extend(properties.keys().cloned());
+            }
+            collect_codex_composition_property_names(branch, names);
+        }
+    }
+}
+
+fn codex_schema_declares_object(object: &Map<String, Value>) -> bool {
+    match object.get("type") {
+        Some(Value::String(value)) => value == "object",
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some("object")),
+        _ => false,
+    }
 }
 
 fn simplify_codex_const_union(object: &mut Map<String, Value>) {
@@ -1335,6 +1426,13 @@ mod tests {
             (r"\u005cp{L}", true),
             (r"\U005CP{L}", true),
             (r"\\u005cp{L}", false),
+            (r"\0", true),
+            (r"^[^\0]*$", true),
+            (r"\\0", false),
+            (r"\\\0", true),
+            (r"\u005c0", true),
+            (r"\\u005c0", false),
+            (r"\x00", false),
             (r"^[0-9a-f]{32}$", false),
         ] {
             assert_eq!(
@@ -1343,6 +1441,102 @@ mod tests {
                 "pattern mutation {pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn codex_strips_octal_nul_only_from_schema_patterns() {
+        let mut request = json!({
+            "tools": [{
+                "type": "function",
+                "name": "Artifact",
+                "parameters": {
+                    "type": "object",
+                    "description": "keep \\0",
+                    "default": {"pattern": "^[^\\0]*$"},
+                    "enum": ["\\0"],
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024,
+                                "pattern": "^[^\\0]*$"
+                            }
+                        },
+                        "escaped": {"type": "string", "pattern": "^\\\\0$"},
+                        "hex_nul": {"type": "string", "pattern": "^[^\\x00]*$"}
+                    }
+                }
+            }]
+        });
+
+        normalize_codex_tool_schemas(&mut request);
+        let schema = request.pointer("/tools/0/parameters").unwrap();
+        assert!(schema
+            .pointer("/properties/file_paths/items/pattern")
+            .is_none());
+        assert_eq!(
+            schema.pointer("/properties/file_paths/items/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(schema["description"], "keep \\0");
+        assert_eq!(schema["default"], json!({"pattern": "^[^\\0]*$"}));
+        assert_eq!(schema["enum"], json!(["\\0"]));
+        assert_eq!(
+            schema.pointer("/properties/escaped/pattern"),
+            Some(&json!(r"^\\0$"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/hex_nul/pattern"),
+            Some(&json!(r"^[^\x00]*$"))
+        );
+
+        let once = request.clone();
+        normalize_codex_tool_schemas(&mut request);
+        assert_eq!(request, once);
+    }
+
+    #[test]
+    fn codex_response_schema_prunes_only_evidenced_orphan_required_keys() {
+        let mut request = json!({
+            "text": {"format": {"type": "json_schema", "schema": {
+                "type": "object",
+                "required": ["alpha", "ghost", "beta", "alpha"],
+                "allOf": [{"properties": {"alpha": {"type": "string"}}}],
+                "anyOf": [{"oneOf": [{"properties": {"beta": {"type": "number"}}}]}],
+                "$defs": {"propertiesHolder": {
+                    "type": "object",
+                    "properties": {"kept": {"type": "string"}},
+                    "required": ["kept", "not_pruned_here"]
+                },
+                "emptyObject": {"type": "object", "required": ["impossible"]},
+                "external": {"type": "object", "$ref": "#/$defs/external", "required": ["remote"]},
+                "dynamic": {"type": ["null", "object"], "$dynamicRef": "#node", "required": ["remote"]}
+                }
+            }}}
+        });
+
+        normalize_codex_tool_schemas(&mut request);
+        let schema = request.pointer("/text/format/schema").unwrap();
+        assert_eq!(schema["required"], json!(["alpha", "beta"]));
+        assert_eq!(
+            schema.pointer("/$defs/propertiesHolder/required"),
+            Some(&json!(["kept", "not_pruned_here"]))
+        );
+        assert!(schema.pointer("/$defs/emptyObject/required").is_none());
+        assert_eq!(
+            schema.pointer("/$defs/external/required"),
+            Some(&json!(["remote"]))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/dynamic/required"),
+            Some(&json!(["remote"]))
+        );
+
+        let once = request.clone();
+        normalize_codex_tool_schemas(&mut request);
+        assert_eq!(request, once);
     }
 
     #[test]

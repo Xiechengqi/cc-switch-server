@@ -629,6 +629,10 @@ export interface UsageLog {
   requestedModel?: string | null;
   actualModel?: string | null;
   actualModelSource?: string | null;
+  reportedModel?: string | null;
+  reportedModelSource?: string | null;
+  reportedModelMismatch?: boolean | null;
+  reportedModelConflict?: boolean | null;
   requestedReasoningEffort?: string | null;
   effectiveReasoningEffort?: string | null;
   clientServiceTier?: string | null;

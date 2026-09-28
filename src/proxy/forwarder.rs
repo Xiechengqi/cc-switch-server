@@ -17,7 +17,7 @@ use axum::response::Response;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::stream::{self, BoxStream};
+use futures_util::stream::{self, BoxStream, FuturesUnordered};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -119,7 +119,8 @@ use super::request_memory::{
     RequestMemoryReservation,
 };
 use super::response_semantics::{
-    self, FailureOrigin, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
+    self, FailureOrigin, ReportedResponseModel, ReportedResponseModelObserver,
+    ResponsesEventVisibility, ResponsesRepeatTracker, ResponsesSseInspector, SemanticFailure,
     SemanticObservation, SemanticProtocolError, SemanticTerminal,
 };
 use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
@@ -309,7 +310,7 @@ impl Drop for ImageTransportMetrics {
 type RawResponsesUpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const RESPONSES_WEBSOCKET_WRITE_CHUNK_BYTES: usize = 32 * 1024;
-const RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY: usize = 1;
+const RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY: usize = 8;
 const RESPONSES_WEBSOCKET_READ_QUEUE_CAPACITY: usize = 128;
 
 struct ResponsesWebSocketWrite {
@@ -335,6 +336,11 @@ struct ResponsesUpstreamWebSocket {
     peer_terminal_observed: Arc<AtomicBool>,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
+}
+
+enum ResponsesWebSocketTrySendError {
+    Full,
+    Closed,
 }
 
 impl ResponsesUpstreamWebSocket {
@@ -429,6 +435,30 @@ impl ResponsesUpstreamWebSocket {
             .await
             .map_err(|_| responses_websocket_channel_closed("write queue closed"))?;
         Ok(completed)
+    }
+
+    fn try_start_send(
+        &self,
+        message: TungsteniteMessage,
+        memory: Option<RequestMemoryReservation>,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<(), TungsteniteError>>,
+        ResponsesWebSocketTrySendError,
+    > {
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        match self.writes.try_send(ResponsesWebSocketWrite {
+            message,
+            completion,
+            _memory: memory,
+        }) {
+            Ok(()) => Ok(completed),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(ResponsesWebSocketTrySendError::Full)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(ResponsesWebSocketTrySendError::Closed)
+            }
+        }
     }
 
     async fn send(&self, message: TungsteniteMessage) -> Result<(), TungsteniteError> {
@@ -3637,9 +3667,19 @@ async fn forward_with_attempt(
                 && (response_semantics::semantic_guard_enabled() || mandatory_semantic_contract)
                 && route == ProxyRoute::ClaudeMessages
                 && upstream_format == UpstreamFormat::AnthropicMessages;
+            let responses_event_visibility = if normalize_responses_transport {
+                if is_native_codex_responses_client(&headers) {
+                    ResponsesEventVisibility::NativeCodexClient
+                } else {
+                    ResponsesEventVisibility::StandardClient
+                }
+            } else {
+                ResponsesEventVisibility::Unfiltered
+            };
             let mut responses_semantics = inspect_responses_semantics.then(|| {
-                ResponsesSseInspector::with_repeat_guard(
+                ResponsesSseInspector::with_repeat_guard_and_visibility(
                     stored.provider_type == ProviderType::GrokOAuth,
+                    responses_event_visibility,
                 )
             });
             let mut anthropic_semantics =
@@ -5721,6 +5761,20 @@ async fn forward_with_attempt(
         };
         let is_count_tokens_request =
             route == ProxyRoute::ClaudeCountTokens || adapter_request.is_gemini_count_tokens();
+        let codex_reported_model = if execution.driver_is("oauth.openai_codex")
+            && semantic_upstream_format == UpstreamFormat::OpenAiResponses
+        {
+            let mut observer = ReportedResponseModelObserver::default();
+            observer.observe_json_bytes(&bytes);
+            observer.observation()
+        } else {
+            None
+        };
+        let codex_sent_model = adapter_request
+            .actual_model
+            .as_deref()
+            .or(adapter_request.model.as_deref())
+            .map(str::to_string);
         let kimi_thinking_replay_content = status
             .is_success()
             .then(|| kimi_thinking_replay_content_from_response(&bytes))
@@ -5817,7 +5871,7 @@ async fn forward_with_attempt(
             crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
         } else if !is_count_tokens_request {
             let user_email_for_record = request_context.user_email.clone();
-            log_usage(
+            let request_id = log_usage(
                 &state,
                 &stored,
                 status_code,
@@ -5828,6 +5882,14 @@ async fn forward_with_attempt(
                     is_streaming: adapter_request.stream_requested,
                     ..request_context
                 },
+            )
+            .await;
+            persist_codex_reported_model(
+                &state,
+                &request_id,
+                codex_sent_model.as_deref(),
+                codex_reported_model,
+                "json.model",
             )
             .await;
             record_share_invocation_result(
@@ -10673,6 +10735,8 @@ struct ResponsesWebsocketUsageTurn {
     first_token_ms: Option<u128>,
     usage: TokenUsage,
     accumulator: Option<StreamUsageAccumulator>,
+    sent_model: Option<String>,
+    reported_model: ReportedResponseModelObserver,
     retry_count: u32,
     audit_admitted: bool,
     armed: bool,
@@ -10838,6 +10902,7 @@ impl ResponsesWebsocketUsageTurn {
         mut request_context: UsageLogContext,
         connection_id: &str,
     ) -> Result<Self, ProxyError> {
+        let sent_model = model.actual_model.clone().or_else(|| model.model.clone());
         let parent_request_id = request_context.request_id.clone();
         let turn_id = new_audit_correlation_id("turn");
         request_context.request_id = Some(turn_id.clone());
@@ -10944,6 +11009,8 @@ impl ResponsesWebsocketUsageTurn {
             accumulator: Some(StreamUsageAccumulator::new(
                 adapters::usage_input_semantics_for(stored, ProxyRoute::CodexResponses),
             )),
+            sent_model,
+            reported_model: ReportedResponseModelObserver::default(),
             retry_count: 0,
             audit_admitted,
             armed: true,
@@ -11005,6 +11072,9 @@ impl ResponsesWebsocketUsageTurn {
     }
 
     fn observe_payload(&mut self, payload: &[u8], business: bool) {
+        if self.stored.provider_type == ProviderType::CodexOAuth {
+            self.reported_model.observe_json_bytes(payload);
+        }
         if let Some(accumulator) = self.accumulator.as_mut() {
             accumulator.push(payload);
             self.usage = accumulator.push(b"\n");
@@ -11060,6 +11130,16 @@ impl ResponsesWebsocketUsageTurn {
             error.as_deref(),
         )
         .await;
+        if self.stored.provider_type == ProviderType::CodexOAuth {
+            persist_codex_reported_model(
+                &self.state,
+                &self.request_id,
+                self.sent_model.as_deref(),
+                self.reported_model.terminal_observation(),
+                "websocket.response.model",
+            )
+            .await;
+        }
         emit_websocket_turn_terminal(
             &self.state,
             self.audit_admitted,
@@ -12063,12 +12143,13 @@ async fn bridge_responses_websocket_inner(
                         .set_request_memory(active_attempt.request_memory().cloned());
                     send_responses_upstream_while_serving_downstream(
                         &entry
-                        .as_ref()
-                        .expect("upstream websocket is connected")
-                        .socket,
+                            .as_ref()
+                            .expect("upstream websocket is connected")
+                            .socket,
                         &mut downstream,
                         message,
                         active_attempt.request_memory(),
+                        matches!(mode, ResponsesWebsocketMode::Codex),
                     )
                         .await
                 };
@@ -12794,6 +12875,7 @@ async fn bridge_responses_websocket_inner(
                         &mut downstream,
                         retry_message,
                         active_attempt.request_memory(),
+                        false,
                     )
                     .await;
                     drop(grok_reasoning_retry_memory);
@@ -13356,6 +13438,7 @@ async fn send_responses_upstream_while_serving_downstream(
     downstream: &mut WebSocket,
     message: TungsteniteMessage,
     request_memory: Option<&RequestMemoryBudget>,
+    allow_codex_steering: bool,
 ) -> Result<ResponsesWebsocketSendOutcome, ResponsesWebsocketSendFailure> {
     let write_memory = request_memory
         .map(|budget| {
@@ -13366,32 +13449,39 @@ async fn send_responses_upstream_while_serving_downstream(
         })
         .transpose()
         .map_err(|error| ResponsesWebsocketSendFailure::Memory(error.into_proxy_error()))?;
-    let mut completion = upstream
+    let completion = upstream
         .start_send(message, write_memory)
         .await
         .map_err(ResponsesWebsocketSendFailure::Upstream)?;
-    loop {
+    let mut completions = FuturesUnordered::new();
+    completions.push(completion);
+    while !completions.is_empty() {
         tokio::select! {
             biased;
-            result = &mut completion => {
+            result = completions.next() => {
+                let Some(result) = result else {
+                    break;
+                };
                 let result = match result {
                     Ok(result) => result,
                     Err(_) => Err(responses_websocket_channel_closed(
                         "writer stopped before completion",
                     )),
                 };
-                return match result {
-                    Ok(()) => Ok(ResponsesWebsocketSendOutcome::Sent),
+                match result {
+                    Ok(()) => {}
                     // The old single-task transport could successfully queue a request
                     // before observing an already-buffered peer Close. The split reader
                     // sees that Close sooner, so retain the same conservative commit
                     // boundary: once a peer terminal races a write, do not replay the
                     // request through HTTP as if it were known to be unsent.
                     Err(_) if upstream.peer_terminal_observed() => {
-                        Ok(ResponsesWebsocketSendOutcome::Sent)
+                        return Ok(ResponsesWebsocketSendOutcome::Sent);
                     }
-                    Err(error) => Err(ResponsesWebsocketSendFailure::Upstream(error)),
-                };
+                    Err(error) => {
+                        return Err(ResponsesWebsocketSendFailure::Upstream(error));
+                    }
+                }
             }
             message = downstream.next() => {
                 let Some(message) = message else {
@@ -13429,16 +13519,79 @@ async fn send_responses_upstream_while_serving_downstream(
                     }
                     AxumWsMessage::Pong(_) => {}
                     AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {
-                        return Err(ResponsesWebsocketSendFailure::Downstream(
-                            ProxyError::bad_request(
-                                "responses websocket received data while the previous upstream write was pending",
-                            ),
-                        ));
+                        let steering = codex_steering_message_while_write_pending(
+                            message,
+                            allow_codex_steering,
+                        )
+                        .map_err(ResponsesWebsocketSendFailure::Downstream)?;
+                        let steering_memory = request_memory
+                            .map(|budget| {
+                                budget.reserve(
+                                    RequestMemoryComponent::WebSocketWriteQueue,
+                                    websocket_message_payload_len(&steering),
+                                )
+                            })
+                            .transpose()
+                            .map_err(|error| {
+                                ResponsesWebsocketSendFailure::Memory(error.into_proxy_error())
+                            })?;
+                        let completion = upstream
+                            .try_start_send(steering, steering_memory)
+                            .map_err(|error| match error {
+                                ResponsesWebSocketTrySendError::Full => {
+                                    ResponsesWebsocketSendFailure::Downstream(
+                                        ProxyError::bad_request(
+                                            "responses websocket steering queue capacity exceeded",
+                                        ),
+                                    )
+                                }
+                                ResponsesWebSocketTrySendError::Closed => {
+                                    ResponsesWebsocketSendFailure::Upstream(
+                                        responses_websocket_channel_closed("write queue closed"),
+                                    )
+                                }
+                            })?;
+                        completions.push(completion);
                     }
                 }
             }
         }
     }
+    Ok(ResponsesWebsocketSendOutcome::Sent)
+}
+
+fn codex_steering_message_while_write_pending(
+    message: AxumWsMessage,
+    allow_codex_steering: bool,
+) -> Result<TungsteniteMessage, ProxyError> {
+    if !allow_codex_steering {
+        return Err(ProxyError::bad_request(
+            "responses websocket received data while the previous upstream write was pending",
+        ));
+    }
+    let (payload, message) = match message {
+        AxumWsMessage::Text(text) => (text.as_bytes().to_vec(), TungsteniteMessage::Text(text)),
+        AxumWsMessage::Binary(bytes) => {
+            (bytes.to_vec(), TungsteniteMessage::Binary(bytes.to_vec()))
+        }
+        _ => unreachable!("only websocket data messages reach steering validation"),
+    };
+    let is_steering = serde_json::from_slice::<Value>(&payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(Value::as_str)
+                .map(|event_type| event_type == "response.steer")
+        })
+        .unwrap_or(false);
+    if !is_steering {
+        return Err(ProxyError::bad_request(
+            "only response.steer may be sent while the previous upstream write is pending",
+        ));
+    }
+    Ok(message)
 }
 
 async fn next_responses_websocket_message(
@@ -23535,6 +23688,26 @@ fn codex_allowed_client_signature(originator: &str, user_agent: &str) -> bool {
     }
 }
 
+fn is_native_codex_responses_client(headers: &HeaderMap) -> bool {
+    let user_agent = optional_header(headers, "user-agent").unwrap_or_default();
+    let originator = optional_header(headers, "originator").unwrap_or_default();
+    if codex_allowed_client_signature(&originator, &user_agent) {
+        return true;
+    }
+    let user_agent_lower = user_agent.trim().to_ascii_lowercase();
+    if codex_official_user_agent_shape(&user_agent)
+        && ["codex_cli_rs/", "codex-tui/", "codex/"]
+            .iter()
+            .any(|prefix| user_agent_lower.starts_with(prefix))
+    {
+        return true;
+    }
+    let originator = originator.trim().to_ascii_lowercase();
+    ["codex desktop", "codex-tui", "codex_cli_rs"]
+        .iter()
+        .any(|prefix| originator == *prefix || originator.starts_with(&format!("{prefix}/")))
+}
+
 fn codex_official_user_agent_shape(user_agent: &str) -> bool {
     let Some((prefix, rest)) = user_agent.split_once(' ') else {
         return false;
@@ -24979,9 +25152,7 @@ fn sanitize_codex_oauth_request_body(body: &mut Value) {
                 && item.get("type").and_then(Value::as_str) != Some("item_reference")
         });
         for item in input {
-            if let Some(object) = item.as_object_mut() {
-                object.remove("internal_chat_message_metadata_passthrough");
-            }
+            sanitize_codex_oauth_input_item_metadata(item);
             let has_server_item_id = item
                 .get("id")
                 .and_then(Value::as_str)
@@ -25122,6 +25293,32 @@ fn sanitize_codex_oauth_request_body(body: &mut Value) {
             body["tool_choice"] = choice;
         } else if let Some(object) = body.as_object_mut() {
             object.remove("tool_choice");
+        }
+    }
+}
+
+/// Removes only Codex-incompatible fields at protocol-owned positions. Tool
+/// arguments and arbitrary nested user JSON are intentionally opaque.
+fn sanitize_codex_oauth_input_item_metadata(item: &mut Value) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "internal_chat_message_metadata_passthrough",
+        "author",
+        "recipient",
+        "prompt_cache_breakpoint",
+    ] {
+        object.remove(field);
+    }
+    for field in ["content", "output"] {
+        let Some(parts) = object.get_mut(field).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(part) = part.as_object_mut() {
+                part.remove("prompt_cache_breakpoint");
+            }
         }
     }
 }
@@ -25946,6 +26143,73 @@ async fn update_terminal_usage_error(state: &ServerState, request_id: &str, mess
         .await;
 }
 
+async fn persist_codex_reported_model(
+    state: &ServerState,
+    request_id: &str,
+    sent_model: Option<&str>,
+    observation: Option<ReportedResponseModel>,
+    source: &'static str,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+    let mismatch = codex::reported_model_mismatch(sent_model, &observation.model);
+    let reported_model = observation.model;
+    let conflict = observation.conflict;
+    let reported_for_update = reported_model.clone();
+    let source_for_update = source.to_string();
+    let persisted = state
+        .update_usage_log(request_id, move |log| {
+            log.reported_model = Some(reported_for_update);
+            log.reported_model_source = Some(source_for_update);
+            log.reported_model_mismatch = mismatch;
+            log.reported_model_conflict = conflict.then_some(true);
+        })
+        .await;
+    match persisted {
+        Ok(Some(_)) => {
+            state.emit_event(
+                crate::state::ServerEvent::new("usage.updated", "usage")
+                    .id(request_id.to_string())
+                    .message("reported_model"),
+            );
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                request_id,
+                error = %error,
+                "failed to persist Codex upstream reported model"
+            );
+            return;
+        }
+    }
+
+    if mismatch == Some(true) || conflict {
+        tracing::warn!(
+            target: "cc_switch_server::request_audit",
+            event = "inference.upstream.model_observed",
+            request_id,
+            sent_model = sent_model.unwrap_or("unknown"),
+            reported_model,
+            source,
+            mismatch = mismatch.unwrap_or(false),
+            conflict,
+            "Codex upstream model observation differs from the sent model"
+        );
+    } else {
+        tracing::debug!(
+            target: "cc_switch_server::request_audit",
+            event = "inference.upstream.model_observed",
+            request_id,
+            sent_model = sent_model.unwrap_or("unknown"),
+            reported_model,
+            source,
+            "Codex upstream model observation recorded"
+        );
+    }
+}
+
 impl StreamForwardState {
     fn terminate_transform_error_boxed(
         self: Box<Self>,
@@ -26127,6 +26391,10 @@ impl StreamForwardState {
             .as_ref()
             .and_then(ResponsesSseInspector::terminal)
             .cloned();
+        let reported_model = self
+            .responses_semantics
+            .as_ref()
+            .and_then(ResponsesSseInspector::reported_model);
         let anthropic_terminal = self
             .anthropic_semantics
             .as_ref()
@@ -26227,6 +26495,16 @@ impl StreamForwardState {
             Some(stream_status),
         )
         .await;
+        if let Some(context) = self.codex_rate_limit.as_ref() {
+            persist_codex_reported_model(
+                &self.state,
+                &self.request_id,
+                context.model.as_deref(),
+                reported_model,
+                "sse.response.model",
+            )
+            .await;
+        }
         if let Some(message) = terminal_error_message {
             update_terminal_usage_error(&self.state, &self.request_id, message).await;
         }
@@ -37924,6 +38202,11 @@ mod tests {
         assert_eq!(log.usage_revision, 1);
         assert_eq!(log.stream_status.as_deref(), Some("completed"));
         assert!(!log.is_streaming);
+        assert_eq!(log.actual_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(log.reported_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(log.reported_model_source.as_deref(), Some("json.model"));
+        assert_eq!(log.reported_model_mismatch, Some(false));
+        assert_eq!(log.reported_model_conflict, None);
 
         upstream.server.abort();
     }
@@ -39447,6 +39730,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                     }
                                     _ => None,
                                 };
+                                let reported_model = observed
+                                    .as_ref()
+                                    .and_then(|value| value.get("model"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("gpt-5.4")
+                                    .to_string();
                                 if let Some(observed) = observed {
                                     observations.lock().unwrap().push(observed);
                                 }
@@ -39462,6 +39751,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                                                     "response": {
                                                         "id": format!("resp-ws-{request_index}"),
                                                         "status": "completed",
+                                                        "model": reported_model,
                                                         "output": []
                                                     }
                                                 })
@@ -39608,7 +39898,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                         let sse = concat!(
                             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-http\",\"status\":\"in_progress\"}}\n\n",
                             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback\"}\n\n",
-                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n",
                             "data: [DONE]\n\n"
                         );
                         let provider_failure_sse = concat!(
@@ -41454,6 +41744,123 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(body["input"][3], "plain input");
     }
 
+    #[test]
+    fn codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints() {
+        let mut body = json!({
+            "author": "top-level-author",
+            "recipient": "top-level-recipient",
+            "prompt_cache_breakpoint": {"type": "ephemeral"},
+            "internal_chat_message_metadata_passthrough": {"outside": true},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "author": "agent-a",
+                    "recipient": "agent-b",
+                    "prompt_cache_breakpoint": {"type": "ephemeral"},
+                    "internal_chat_message_metadata_passthrough": {"turn": 1},
+                    "content": [{
+                        "type": "input_text",
+                        "text": "keep",
+                        "prompt_cache_breakpoint": {"type": "ephemeral"},
+                        "author": "nested-author",
+                        "recipient": "nested-recipient",
+                        "internal_chat_message_metadata_passthrough": {"nested": true}
+                    }]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "author": null,
+                    "recipient": "tool",
+                    "prompt_cache_breakpoint": true,
+                    "output": [{
+                        "type": "input_text",
+                        "text": "tool output",
+                        "prompt_cache_breakpoint": false,
+                        "author": "nested-output-author"
+                    }]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-2",
+                    "output": "unchanged string output",
+                    "arguments": {
+                        "author": "user-json",
+                        "recipient": "user-json",
+                        "prompt_cache_breakpoint": "user-json",
+                        "internal_chat_message_metadata_passthrough": "user-json"
+                    }
+                }
+            ]
+        });
+
+        sanitize_codex_oauth_request_body(&mut body);
+
+        for field in [
+            "author",
+            "recipient",
+            "prompt_cache_breakpoint",
+            "internal_chat_message_metadata_passthrough",
+        ] {
+            assert!(body["input"][0].get(field).is_none(), "{field}");
+        }
+        assert!(body["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(body["input"][0]["content"][0]["author"], "nested-author");
+        assert_eq!(
+            body["input"][0]["content"][0]["recipient"],
+            "nested-recipient"
+        );
+        assert!(body["input"][1].get("prompt_cache_breakpoint").is_none());
+        assert!(body["input"][1]["output"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(
+            body["input"][1]["output"][0]["author"],
+            "nested-output-author"
+        );
+        assert_eq!(body["input"][2]["output"], "unchanged string output");
+        assert_eq!(
+            body["input"][2]["arguments"]["prompt_cache_breakpoint"],
+            "user-json"
+        );
+        assert_eq!(body["author"], "top-level-author");
+        assert_eq!(body["recipient"], "top-level-recipient");
+        assert!(body.get("prompt_cache_breakpoint").is_some());
+        assert!(body
+            .get("internal_chat_message_metadata_passthrough")
+            .is_some());
+
+        let once = body.clone();
+        sanitize_codex_oauth_request_body(&mut body);
+        assert_eq!(body, once);
+    }
+
+    #[test]
+    fn codex_compact_request_uses_the_exact_item_metadata_sanitizer() {
+        let normalized = normalize_codex_oauth_compact_body_bytes(&Bytes::from_static(
+            br#"{"model":"gpt-5.5","input":[{"type":"message","role":"user","author":"strip","recipient":"strip","prompt_cache_breakpoint":true,"content":[{"type":"input_text","text":"keep","prompt_cache_breakpoint":true,"author":"nested-keep"}],"arguments":{"author":"opaque-keep"}}]}"#,
+        ))
+        .unwrap();
+        let normalized: Value = serde_json::from_slice(&normalized).unwrap();
+
+        assert!(normalized["input"][0].get("author").is_none());
+        assert!(normalized["input"][0].get("recipient").is_none());
+        assert!(normalized["input"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert!(normalized["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(
+            normalized["input"][0]["content"][0]["author"],
+            "nested-keep"
+        );
+        assert_eq!(normalized["input"][0]["arguments"]["author"], "opaque-keep");
+    }
+
     #[tokio::test]
     async fn codex_websocket_request_uses_the_same_sanitizer() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
@@ -41473,7 +41880,20 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 "input": [
                     "msg_stored_message",
                     {"type": "item_reference", "id": "item_1"},
-                    {"type": "message", "id": "msg_stored_message", "role": "system", "content": "be precise"}
+                    {
+                        "type": "message",
+                        "id": "msg_stored_message",
+                        "role": "system",
+                        "author": "strip",
+                        "recipient": "strip",
+                        "prompt_cache_breakpoint": true,
+                        "content": [{
+                            "type": "input_text",
+                            "text": "be precise",
+                            "prompt_cache_breakpoint": true,
+                            "author": "nested-keep"
+                        }]
+                    }
                 ],
                 "previous_response_id": "resp_previous",
                 "reasoning_effort": "max",
@@ -41506,6 +41926,18 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(prepared["response"]["input"].as_array().unwrap().len(), 1);
         assert_eq!(prepared["response"]["input"][0]["role"], "developer");
         assert!(prepared["response"]["input"][0].get("id").is_none());
+        assert!(prepared["response"]["input"][0].get("author").is_none());
+        assert!(prepared["response"]["input"][0].get("recipient").is_none());
+        assert!(prepared["response"]["input"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert!(prepared["response"]["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(
+            prepared["response"]["input"][0]["content"][0]["author"],
+            "nested-keep"
+        );
         assert!(prepared["response"].get("previous_response_id").is_none());
         assert!(prepared["response"].get("metadata").is_none());
         assert_eq!(
@@ -42971,6 +43403,27 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", HeaderValue::from_static("curl/8.0"));
         validate_codex_allowed_client(&stored, ProxyRoute::CodexResponses, &headers, true).unwrap();
+    }
+
+    #[test]
+    fn codex_native_response_event_visibility_uses_reviewed_client_signatures() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_native_codex_responses_client(&headers));
+
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(
+                "codex_cli_rs/0.144.1 (Ubuntu 22.04.0; x86_64) xterm-256color",
+            ),
+        );
+        assert!(is_native_codex_responses_client(&headers));
+
+        headers.insert("originator", HeaderValue::from_static("postman"));
+        headers.insert("user-agent", HeaderValue::from_static("PostmanRuntime/7"));
+        assert!(!is_native_codex_responses_client(&headers));
+
+        headers.insert("originator", HeaderValue::from_static("codex desktop/1.2"));
+        assert!(is_native_codex_responses_client(&headers));
     }
 
     #[test]
@@ -45064,6 +45517,224 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         upstream_server.abort();
     }
 
+    #[test]
+    fn codex_pending_write_accepts_only_exact_text_or_binary_steering() {
+        let text = json!({
+            "type": "response.steer",
+            "previous_response_id": "resp-1",
+            "extension": {"opaque": true}
+        })
+        .to_string();
+        let accepted =
+            codex_steering_message_while_write_pending(AxumWsMessage::Text(text.clone()), true)
+                .unwrap();
+        assert_eq!(accepted, TungsteniteMessage::Text(text));
+
+        let binary = json!({"type":"response.steer","input":[]})
+            .to_string()
+            .into_bytes();
+        let accepted =
+            codex_steering_message_while_write_pending(AxumWsMessage::Binary(binary.clone()), true)
+                .unwrap();
+        assert_eq!(accepted, TungsteniteMessage::Binary(binary));
+
+        for rejected in [
+            json!({"type":"response.create","input":"second"}).to_string(),
+            json!({"payload":{"type":"response.steer"}}).to_string(),
+            "not-json".to_string(),
+        ] {
+            let error =
+                codex_steering_message_while_write_pending(AxumWsMessage::Text(rejected), true)
+                    .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("only response.steer"));
+        }
+
+        let error = codex_steering_message_while_write_pending(
+            AxumWsMessage::Text(json!({"type":"response.steer"}).to_string()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error
+            .message
+            .contains("previous upstream write was pending"));
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_large_upload_accepts_bounded_steering_while_write_pending() {
+        const UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = listener.local_addr().unwrap();
+        let upstream_connected = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upstream_connected_for_server = std::sync::Arc::clone(&upstream_connected);
+        let observed_types = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_types_for_server = std::sync::Arc::clone(&observed_types);
+        let upstream_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            upstream_connected_for_server.notify_one();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            while observed_types_for_server.lock().unwrap().len() < 2 {
+                let Some(message) = websocket.next().await else {
+                    break;
+                };
+                let message = message.unwrap();
+                let bytes = match message {
+                    TungsteniteMessage::Text(text) => text.into_bytes(),
+                    TungsteniteMessage::Binary(bytes) => bytes,
+                    TungsteniteMessage::Ping(payload) => {
+                        websocket
+                            .send(TungsteniteMessage::Pong(payload))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    TungsteniteMessage::Close(_) => break,
+                    TungsteniteMessage::Pong(_) | TungsteniteMessage::Frame(_) => continue,
+                };
+                if let Some(event_type) =
+                    serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                {
+                    observed_types_for_server.lock().unwrap().push(event_type);
+                }
+            }
+            if observed_types_for_server
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "response.steer")
+            {
+                websocket
+                    .send(TungsteniteMessage::Text(
+                        json!({
+                            "type": "response.steer.accepted",
+                            "steer": {"id": "steer-1", "previous_response_id": "resp-pressure"}
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                websocket
+                    .send(TungsteniteMessage::Text(
+                        json!({
+                            "type": "response.incomplete",
+                            "response": {
+                                "id": "resp-pressure",
+                                "status": "incomplete",
+                                "model": "gpt-5.4",
+                                "output": []
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let endpoint = format!("http://{upstream_address}");
+        let (state, execution) = codex_bridge_test_context("ws-steer-pressure", endpoint).await;
+        let (bridge_address, bridge_server) = spawn_test_responses_bridge_with_timeouts(
+            state,
+            execution,
+            format!("ws://{upstream_address}"),
+            None,
+            "steer-pressure-session",
+            Some(Duration::from_secs(3)),
+            Some(Duration::from_secs(3)),
+        )
+        .await;
+
+        let (mut downstream, _) =
+            tokio_tungstenite::connect_async(format!("ws://{bridge_address}/bridge"))
+                .await
+                .unwrap();
+        downstream
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": [{
+                        "type": "function_call",
+                        "call_id": "call-steer-pressure",
+                        "name": "upload",
+                        "arguments": "x".repeat(UPLOAD_BYTES)
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), upstream_connected.notified())
+            .await
+            .expect("the bridge must establish its upstream steering probe");
+        downstream
+            .send(TungsteniteMessage::Ping(b"before-steer".to_vec()))
+            .await
+            .unwrap();
+        downstream
+            .send(TungsteniteMessage::Text(
+                json!({
+                    "type": "response.steer",
+                    "previous_response_id": "resp-pressure",
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call-steer-pressure",
+                        "output": "continue"
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let mut accepted = false;
+        let mut terminal = false;
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_secs(4), downstream.next()).await
+        {
+            match message.unwrap() {
+                TungsteniteMessage::Text(text) => {
+                    let event_type = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                    accepted |= event_type.as_deref() == Some("response.steer.accepted");
+                    terminal |= event_type.as_deref() == Some("response.incomplete");
+                    if terminal {
+                        break;
+                    }
+                }
+                TungsteniteMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        assert!(accepted, "steering acknowledgement must reach the client");
+        assert!(terminal, "the steered response must reach a terminal event");
+        assert_eq!(
+            observed_types.lock().unwrap().as_slice(),
+            ["response.create", "response.steer"]
+        );
+
+        bridge_server.abort();
+        upstream_server.abort();
+    }
+
     fn capacity_shed_sse(id: &str) -> String {
         format!(
             concat!(
@@ -45686,6 +46357,10 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(log.input_tokens, Some(1));
         assert_eq!(log.output_tokens, Some(1));
         assert_eq!(log.total_tokens, Some(2));
+        assert_eq!(log.actual_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(log.reported_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(log.reported_model_source.as_deref(), Some("json.model"));
+        assert_eq!(log.reported_model_mismatch, Some(false));
 
         upstream.server.abort();
         refresh.server.abort();
@@ -45701,7 +46376,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             "text/event-stream",
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-refreshed-sse\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-refreshed-sse\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-refreshed-sse\",\"status\":\"completed\",\"model\":\"gpt-5.4-2026-09-01\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
                 "data: [DONE]\n\n"
             )
             .to_string(),
@@ -45760,6 +46435,12 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(log.input_tokens, Some(1));
         assert_eq!(log.output_tokens, Some(1));
         assert_eq!(log.total_tokens, Some(2));
+        assert_eq!(log.reported_model.as_deref(), Some("gpt-5.4-2026-09-01"));
+        assert_eq!(
+            log.reported_model_source.as_deref(),
+            Some("sse.response.model")
+        );
+        assert_eq!(log.reported_model_mismatch, Some(false));
 
         upstream.server.abort();
         refresh.server.abort();
@@ -47201,6 +47882,12 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let first = &usage.logs[0];
         assert_eq!(first.requested_reasoning_effort.as_deref(), Some("max"));
         assert_eq!(first.effective_reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(first.reported_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            first.reported_model_source.as_deref(),
+            Some("websocket.response.model")
+        );
+        assert_eq!(first.reported_model_mismatch, Some(false));
         assert_eq!(first.client_service_tier.as_deref(), Some("default"));
         assert_eq!(first.effective_service_tier.as_deref(), Some("priority"));
         assert_eq!(
@@ -47212,6 +47899,8 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(second.actual_model.as_deref(), Some("gpt-5.4"));
         assert_eq!(second.requested_reasoning_effort.as_deref(), Some("low"));
         assert_eq!(second.effective_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(second.reported_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(second.reported_model_mismatch, Some(false));
         assert_eq!(second.client_service_tier, None);
         assert_eq!(second.effective_service_tier.as_deref(), Some("priority"));
         assert_eq!(
@@ -47221,6 +47910,8 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let third = &usage.logs[2];
         assert_eq!(third.requested_reasoning_effort.as_deref(), Some("ultra"));
         assert_eq!(third.effective_reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(third.reported_model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(third.reported_model_mismatch, Some(false));
         assert_eq!(third.client_service_tier.as_deref(), Some("priority"));
         assert_eq!(third.effective_service_tier, None);
         assert_eq!(
@@ -47276,7 +47967,19 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             json!({
                 "type": "response.create",
                 "model": "gpt-5.4",
-                "input": "fallback usage",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "author": "strip",
+                    "recipient": "strip",
+                    "prompt_cache_breakpoint": true,
+                    "content": [{
+                        "type": "input_text",
+                        "text": "fallback usage",
+                        "prompt_cache_breakpoint": true,
+                        "author": "nested-keep"
+                    }]
+                }],
                 "reasoning": {"effort": "high"}
             }),
         )
@@ -47293,6 +47996,12 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         assert_eq!(log.requested_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(log.effective_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(log.effective_service_tier.as_deref(), Some("priority"));
+        assert_eq!(log.reported_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            log.reported_model_source.as_deref(),
+            Some("websocket.response.model")
+        );
+        assert_eq!(log.reported_model_mismatch, Some(false));
         assert_eq!(
             log.service_tier_decision.as_deref(),
             Some("server_forced_priority")
@@ -47301,6 +48010,18 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let observations = upstream.http_observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].2["service_tier"], "priority");
+        assert!(observations[0].2["input"][0].get("author").is_none());
+        assert!(observations[0].2["input"][0].get("recipient").is_none());
+        assert!(observations[0].2["input"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert!(observations[0].2["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert_eq!(
+            observations[0].2["input"][0]["content"][0]["author"],
+            "nested-keep"
+        );
         assert_eq!(
             observations[0].2.pointer("/reasoning/effort"),
             Some(&json!("high"))

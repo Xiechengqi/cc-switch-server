@@ -275,6 +275,16 @@ pub struct UsageLog {
     pub actual_model: Option<String>,
     #[serde(default)]
     pub actual_model_source: Option<String>,
+    /// Bounded model identifier reported by the upstream response. This is
+    /// local diagnostic evidence and is deliberately not a routing decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model_mismatch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model_conflict: Option<bool>,
     #[serde(default)]
     pub requested_reasoning_effort: Option<String>,
     #[serde(default)]
@@ -933,6 +943,10 @@ impl UsageLog {
             requested_model: model.requested_model,
             actual_model: model.actual_model,
             actual_model_source: model.actual_model_source,
+            reported_model: None,
+            reported_model_source: None,
+            reported_model_mismatch: None,
+            reported_model_conflict: None,
             requested_reasoning_effort: None,
             effective_reasoning_effort: None,
             client_service_tier: None,
@@ -2609,6 +2623,58 @@ mod tests {
                 .request_count,
             2
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reported_model_observation_round_trips_and_old_logs_default_to_unknown() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-reported-model-usage-test-{}",
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = UsageStore::default();
+        store.save(&dir).unwrap();
+
+        let created_at_ms = now_ms();
+        let mut log = persisted_test_log("req_reported_model", created_at_ms);
+        log.reported_model = Some("gpt-5.5-2026-09-01".to_string());
+        log.reported_model_source = Some("sse.response.model".to_string());
+        log.reported_model_mismatch = Some(false);
+        log.reported_model_conflict = Some(true);
+        persist_test_append(&mut store, &dir, log);
+
+        let journal = fs::read_to_string(usage_event_path(&dir, created_at_ms)).unwrap();
+        assert!(journal.contains("\"reportedModel\":\"gpt-5.5-2026-09-01\""));
+        assert!(journal.contains("\"reportedModelConflict\":true"));
+
+        let loaded = UsageStore::load_or_default(&dir).unwrap();
+        let loaded = loaded
+            .logs
+            .iter()
+            .find(|log| log.request_id == "req_reported_model")
+            .unwrap();
+        assert_eq!(loaded.reported_model.as_deref(), Some("gpt-5.5-2026-09-01"));
+        assert_eq!(
+            loaded.reported_model_source.as_deref(),
+            Some("sse.response.model")
+        );
+        assert_eq!(loaded.reported_model_mismatch, Some(false));
+        assert_eq!(loaded.reported_model_conflict, Some(true));
+
+        let mut old_shape = serde_json::to_value(loaded).unwrap();
+        let old_shape = old_shape.as_object_mut().unwrap();
+        old_shape.remove("reportedModel");
+        old_shape.remove("reportedModelSource");
+        old_shape.remove("reportedModelMismatch");
+        old_shape.remove("reportedModelConflict");
+        let old_shape: UsageLog =
+            serde_json::from_value(serde_json::Value::Object(old_shape.clone())).unwrap();
+        assert_eq!(old_shape.reported_model, None);
+        assert_eq!(old_shape.reported_model_source, None);
+        assert_eq!(old_shape.reported_model_mismatch, None);
+        assert_eq!(old_shape.reported_model_conflict, None);
 
         fs::remove_dir_all(&dir).unwrap();
     }

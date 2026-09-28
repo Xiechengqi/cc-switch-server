@@ -1209,6 +1209,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
     let mut messages = Vec::new();
     let mut pending_media = Vec::new();
     let mut pending_reasoning = Vec::new();
+    let mut latest_real_reasoning = None;
     let mut last_assistant_index = None;
     if let Some(instructions) = input.get("instructions") {
         if let Some(text) = response_instruction_text(instructions) {
@@ -1227,6 +1228,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
                     &mut messages,
                     &mut pending_media,
                     &mut pending_reasoning,
+                    &mut latest_real_reasoning,
                     &mut last_assistant_index,
                 );
             }
@@ -1237,6 +1239,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
             &mut messages,
             &mut pending_media,
             &mut pending_reasoning,
+            &mut latest_real_reasoning,
             &mut last_assistant_index,
         ),
         _ => return Err(TransformError::new("openai responses input is required")),
@@ -3595,6 +3598,7 @@ fn append_response_input_item_to_chat_messages(
     messages: &mut Vec<Value>,
     pending_media: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
+    latest_real_reasoning: &mut Option<String>,
     last_assistant_index: &mut Option<usize>,
 ) {
     match item.get("type").and_then(Value::as_str) {
@@ -3604,6 +3608,7 @@ fn append_response_input_item_to_chat_messages(
             messages,
             pending_media,
             pending_reasoning,
+            latest_real_reasoning,
             last_assistant_index,
         ),
         Some("function_call_output") => {
@@ -3620,6 +3625,7 @@ fn append_response_input_item_to_chat_messages(
             messages,
             pending_media,
             pending_reasoning,
+            latest_real_reasoning,
             last_assistant_index,
         ),
         Some("custom_tool_call_output") => {
@@ -3636,6 +3642,7 @@ fn append_response_input_item_to_chat_messages(
             messages,
             pending_media,
             pending_reasoning,
+            latest_real_reasoning,
             last_assistant_index,
         ),
         Some("tool_search_output") => {
@@ -3656,11 +3663,14 @@ fn append_response_input_item_to_chat_messages(
                 "content": response_content_to_chat_content(role, item.get("content"))
             });
             if chat_role == "assistant" {
-                append_pending_reasoning(
-                    pending_reasoning,
-                    openai_chat_message_reasoning_text(item),
-                );
+                let item_reasoning = openai_chat_message_reasoning_text(item);
+                remember_latest_real_reasoning(latest_real_reasoning, item_reasoning.as_deref());
+                append_pending_reasoning(pending_reasoning, item_reasoning);
                 attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
+                remember_latest_real_reasoning(
+                    latest_real_reasoning,
+                    message.get("reasoning_content").and_then(Value::as_str),
+                );
                 *last_assistant_index = Some(messages.len());
             } else {
                 attach_pending_reasoning_to_previous_assistant(
@@ -3668,13 +3678,16 @@ fn append_response_input_item_to_chat_messages(
                     *last_assistant_index,
                     pending_reasoning,
                 );
+                *latest_real_reasoning = None;
                 *last_assistant_index = None;
             }
             messages.push(message);
         }
         Some("reasoning") => {
             flush_chat_media(messages, pending_media);
-            append_pending_reasoning(pending_reasoning, Some(reasoning_summary_text(item)));
+            let reasoning = reasoning_summary_text(item);
+            remember_latest_real_reasoning(latest_real_reasoning, Some(&reasoning));
+            append_pending_reasoning(pending_reasoning, Some(reasoning));
         }
         _ => {
             flush_chat_media(messages, pending_media);
@@ -3687,6 +3700,10 @@ fn append_response_input_item_to_chat_messages(
                 });
                 if chat_role == "assistant" {
                     attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
+                    remember_latest_real_reasoning(
+                        latest_real_reasoning,
+                        message.get("reasoning_content").and_then(Value::as_str),
+                    );
                     *last_assistant_index = Some(messages.len());
                 } else {
                     attach_pending_reasoning_to_previous_assistant(
@@ -3694,6 +3711,7 @@ fn append_response_input_item_to_chat_messages(
                         *last_assistant_index,
                         pending_reasoning,
                     );
+                    *latest_real_reasoning = None;
                     *last_assistant_index = None;
                 }
                 messages.push(message);
@@ -3708,10 +3726,16 @@ fn append_response_tool_call_to_chat(
     messages: &mut Vec<Value>,
     pending_media: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
+    latest_real_reasoning: &mut Option<String>,
     last_assistant_index: &mut Option<usize>,
 ) {
     flush_chat_media(messages, pending_media);
-    append_pending_reasoning(pending_reasoning, openai_chat_message_reasoning_text(item));
+    let item_reasoning = openai_chat_message_reasoning_text(item);
+    remember_latest_real_reasoning(latest_real_reasoning, item_reasoning.as_deref());
+    append_pending_reasoning(pending_reasoning, item_reasoning);
+    if pending_reasoning.is_empty() {
+        append_pending_reasoning(pending_reasoning, latest_real_reasoning.clone());
+    }
     let Some(tool_call) = openai_response_function_call_to_chat(item, tool_context) else {
         return;
     };
@@ -3735,6 +3759,15 @@ fn append_response_tool_call_to_chat(
     attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
     *last_assistant_index = Some(messages.len());
     messages.push(message);
+}
+
+fn remember_latest_real_reasoning(latest: &mut Option<String>, reasoning: Option<&str>) {
+    let Some(reasoning) = reasoning.map(str::trim).filter(|value| {
+        !value.is_empty() && !value.eq_ignore_ascii_case("[reasoning unavailable]")
+    }) else {
+        return;
+    };
+    *latest = Some(reasoning.to_string());
 }
 
 fn append_pending_reasoning(pending: &mut Vec<String>, reasoning: Option<String>) {
@@ -11214,6 +11247,38 @@ mod tests {
             output.pointer("/messages/0/tool_calls/0/function/name"),
             Some(&json!("lookup"))
         );
+    }
+
+    #[test]
+    fn responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds() {
+        let output = openai_responses_to_chat(&json!({
+            "model": "gpt-5.5",
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "real reasoning"}]
+                },
+                {"type": "function_call", "call_id": "call_1", "name": "first", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "one"},
+                {"type": "function_call", "call_id": "call_2", "name": "second", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "two"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "new turn"}]},
+                {"type": "function_call", "call_id": "call_3", "name": "third", "arguments": "{}"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            output.pointer("/messages/0/reasoning_content"),
+            Some(&json!("real reasoning"))
+        );
+        assert_eq!(
+            output.pointer("/messages/2/reasoning_content"),
+            Some(&json!("real reasoning"))
+        );
+        assert!(output.pointer("/messages/5/reasoning_content").is_none());
+        assert!(!output.to_string().contains("[reasoning unavailable]"));
     }
 
     #[test]

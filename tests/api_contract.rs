@@ -7120,6 +7120,10 @@ async fn web_usage_requests_uses_stable_filters_and_cursor_pagination() {
         );
         log.request_agent = Some("codex-cli".to_string());
         log.first_token_ms = Some(42);
+        log.reported_model = Some("gpt-5.5-2026-09-01".to_string());
+        log.reported_model_source = Some("sse.response.model".to_string());
+        log.reported_model_mismatch = Some(false);
+        log.reported_model_conflict = Some(true);
         log.apply_context(UsageLogContext {
             request_id: Some(request_id.to_string()),
             share_id: Some("share-1".to_string()),
@@ -7202,6 +7206,27 @@ async fn web_usage_requests_uses_stable_filters_and_cursor_pagination() {
     assert_eq!(newest["totalTokens"], 23);
     assert_eq!(newest["shareId"], "share-1");
     assert_eq!(newest["userEmail"], "reader@example.com");
+    assert_eq!(newest["reportedModel"], "gpt-5.5-2026-09-01");
+    assert_eq!(newest["reportedModelSource"], "sse.response.model");
+    assert_eq!(newest["reportedModelMismatch"], false);
+    assert_eq!(newest["reportedModelConflict"], true);
+
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/web-api/usage/requests/req-new",
+            json!({}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail = json_body(detail).await;
+    assert_eq!(detail["data"]["reportedModel"], "gpt-5.5-2026-09-01");
+    assert_eq!(detail["data"]["reportedModelSource"], "sse.response.model");
+    assert_eq!(detail["data"]["reportedModelMismatch"], false);
+    assert_eq!(detail["data"]["reportedModelConflict"], true);
 
     let second_page = app
         .clone()

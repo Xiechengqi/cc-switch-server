@@ -198,6 +198,43 @@ pub(crate) fn account_rate_limit_evidence(headers: &HeaderMap, body: &[u8]) -> b
     usage_limit_reached(body) || exhausted_window_reset_at_ms(headers, 0).is_some()
 }
 
+/// Compares the exact model sent upstream with the bounded model reported by
+/// the response. A dated snapshot of the same base model is not treated as a
+/// silent substitution. Missing values stay unknown rather than being guessed.
+pub(crate) fn reported_model_mismatch(sent: Option<&str>, reported: &str) -> Option<bool> {
+    let sent = sent.map(str::trim).filter(|value| !value.is_empty())?;
+    let reported = reported.trim();
+    if reported.is_empty() {
+        return None;
+    }
+    let sent = sent.to_ascii_lowercase();
+    let reported = reported.to_ascii_lowercase();
+    Some(
+        sent != reported
+            && !codex_dated_model_alias(&sent, &reported)
+            && !codex_dated_model_alias(&reported, &sent),
+    )
+}
+
+fn codex_dated_model_alias(base: &str, dated: &str) -> bool {
+    let Some(suffix) = dated
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let bytes = suffix.as_bytes();
+    (bytes.len() == 8 && bytes.iter().all(u8::is_ascii_digit))
+        || (bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[..4]
+                .iter()
+                .chain(&bytes[5..7])
+                .chain(&bytes[8..])
+                .all(u8::is_ascii_digit))
+}
+
 pub(crate) fn usage_limit_reached(body: &[u8]) -> bool {
     openai_payload_values(body).iter().any(|value| {
         [
@@ -300,4 +337,31 @@ pub(crate) fn rate_limit_reset_at_ms(body: &[u8], now_ms: i64) -> Option<i64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reported_model_mismatch;
+
+    #[test]
+    fn reported_model_mismatch_preserves_unknown_and_accepts_dated_aliases() {
+        assert_eq!(reported_model_mismatch(None, "gpt-5.5"), None);
+        assert_eq!(reported_model_mismatch(Some("gpt-5.5"), ""), None);
+        assert_eq!(
+            reported_model_mismatch(Some("gpt-5.5"), "GPT-5.5"),
+            Some(false)
+        );
+        assert_eq!(
+            reported_model_mismatch(Some("gpt-5.5"), "gpt-5.5-2026-09-01"),
+            Some(false)
+        );
+        assert_eq!(
+            reported_model_mismatch(Some("gpt-5.5-20260901"), "gpt-5.5"),
+            Some(false)
+        );
+        assert_eq!(
+            reported_model_mismatch(Some("gpt-5.5"), "gpt-5.4"),
+            Some(true)
+        );
+    }
 }
