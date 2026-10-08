@@ -25372,13 +25372,16 @@ fn sanitize_codex_oauth_input_item_metadata(item: &mut Value) {
     let Some(object) = item.as_object_mut() else {
         return;
     };
+    let native_agent_message = object.get("type").and_then(Value::as_str) == Some("agent_message");
     for field in [
         "internal_chat_message_metadata_passthrough",
-        "author",
-        "recipient",
         "prompt_cache_breakpoint",
     ] {
         object.remove(field);
+    }
+    if !native_agent_message {
+        object.remove("author");
+        object.remove("recipient");
     }
     for field in ["content", "output"] {
         let Some(parts) = object.get_mut(field).and_then(Value::as_array_mut) else {
@@ -41860,6 +41863,14 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                         "prompt_cache_breakpoint": "user-json",
                         "internal_chat_message_metadata_passthrough": "user-json"
                     }
+                },
+                {
+                    "type": "agent_message",
+                    "author": "/root/count_to_ten",
+                    "recipient": "/root",
+                    "prompt_cache_breakpoint": true,
+                    "internal_chat_message_metadata_passthrough": {"turn": 2},
+                    "content": [{"type": "input_text", "text": "1 2 3 4 5 6 7 8 9 10"}]
                 }
             ]
         });
@@ -41895,6 +41906,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             body["input"][2]["arguments"]["prompt_cache_breakpoint"],
             "user-json"
         );
+        assert_eq!(body["input"][3]["author"], "/root/count_to_ten");
+        assert_eq!(body["input"][3]["recipient"], "/root");
+        assert!(body["input"][3].get("prompt_cache_breakpoint").is_none());
+        assert!(body["input"][3]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
         assert_eq!(body["author"], "top-level-author");
         assert_eq!(body["recipient"], "top-level-recipient");
         assert!(body.get("prompt_cache_breakpoint").is_some());
@@ -41930,6 +41947,32 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert_eq!(normalized["input"][0]["arguments"]["author"], "opaque-keep");
     }
 
+    #[test]
+    fn codex_agent_message_identity_survives_http_and_compact_preparation() {
+        let request = Bytes::from_static(
+            br#"{"model":"gpt-5.5","input":[{"type":"agent_message","author":"/root/count_to_ten","recipient":"/root","prompt_cache_breakpoint":true,"internal_chat_message_metadata_passthrough":{"turn":1},"content":[{"type":"input_text","text":"1 2 3 4 5 6 7 8 9 10"}]}]}"#,
+        );
+        let http = normalize_codex_oauth_responses_body_bytes(
+            &request,
+            None,
+            CodexImageToolStripPolicy::Never,
+        )
+        .unwrap();
+        let compact = normalize_codex_oauth_compact_body_bytes(&request).unwrap();
+
+        for prepared in [http, compact] {
+            let prepared: Value = serde_json::from_slice(&prepared).unwrap();
+            let item = &prepared["input"][0];
+            assert_eq!(item["type"], "agent_message");
+            assert_eq!(item["author"], "/root/count_to_ten");
+            assert_eq!(item["recipient"], "/root");
+            assert!(item.get("prompt_cache_breakpoint").is_none());
+            assert!(item
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none());
+        }
+    }
+
     #[tokio::test]
     async fn codex_websocket_request_uses_the_same_sanitizer() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
@@ -41962,6 +42005,13 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                             "prompt_cache_breakpoint": true,
                             "author": "nested-keep"
                         }]
+                    },
+                    {
+                        "type": "agent_message",
+                        "author": "/root/count_to_ten",
+                        "recipient": "/root",
+                        "prompt_cache_breakpoint": true,
+                        "content": [{"type": "input_text", "text": "1 2 3 4 5 6 7 8 9 10"}]
                     }
                 ],
                 "previous_response_id": "resp_previous",
@@ -41992,7 +42042,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             panic!("prepared request must remain a text frame");
         };
         let prepared: Value = serde_json::from_str(&prepared).unwrap();
-        assert_eq!(prepared["response"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(prepared["response"]["input"].as_array().unwrap().len(), 2);
         assert_eq!(prepared["response"]["input"][0]["role"], "developer");
         assert!(prepared["response"]["input"][0].get("id").is_none());
         assert!(prepared["response"]["input"][0].get("author").is_none());
@@ -42007,6 +42057,14 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             prepared["response"]["input"][0]["content"][0]["author"],
             "nested-keep"
         );
+        assert_eq!(
+            prepared["response"]["input"][1]["author"],
+            "/root/count_to_ten"
+        );
+        assert_eq!(prepared["response"]["input"][1]["recipient"], "/root");
+        assert!(prepared["response"]["input"][1]
+            .get("prompt_cache_breakpoint")
+            .is_none());
         assert!(prepared["response"].get("previous_response_id").is_none());
         assert!(prepared["response"].get("metadata").is_none());
         assert_eq!(
@@ -48038,10 +48096,10 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 "type": "response.create",
                 "model": "gpt-5.4",
                 "input": [{
-                    "type": "message",
+                    "type": "agent_message",
                     "role": "user",
-                    "author": "strip",
-                    "recipient": "strip",
+                    "author": "/root/count_to_ten",
+                    "recipient": "/root",
                     "prompt_cache_breakpoint": true,
                     "content": [{
                         "type": "input_text",
@@ -48080,8 +48138,11 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let observations = upstream.http_observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].2["service_tier"], "priority");
-        assert!(observations[0].2["input"][0].get("author").is_none());
-        assert!(observations[0].2["input"][0].get("recipient").is_none());
+        assert_eq!(
+            observations[0].2["input"][0]["author"],
+            "/root/count_to_ten"
+        );
+        assert_eq!(observations[0].2["input"][0]["recipient"], "/root");
         assert!(observations[0].2["input"][0]
             .get("prompt_cache_breakpoint")
             .is_none());

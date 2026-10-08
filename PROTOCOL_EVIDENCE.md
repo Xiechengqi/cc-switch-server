@@ -43,6 +43,8 @@ Codex 关键词回归 399 项及新增 steering、reported-model 专项均已通
 
 整体 review 在 `26eb389e5b0c8457f64bb70f60614ff5b1c1a140` 又关闭两处边界：缺少 declared event 与 payload type 的 JSON SSE 数据帧不属于公开闭集，默认过滤；composition 内任意嵌套 `$ref/$dynamicRef` 都可能提供当前节点的 required 字段，因此 schema repair 保守保留 required。`CODEX-R2-FINAL-2026-09-28` 以 committed target tree 和两条 fixture 冻结该修复；它是 CX-N7/CX-N12 的实现复核扩展，不是新增外部 source observation，也不改变五个真实 operation 的 `live_pending` 状态。
 
+2026-10-08 子 agent 回放差分修正上一段 item metadata 结论：`input[*].type=agent_message` 的 `author` 是上游必填身份字段，无条件删除会得到 `Missing required parameter: input[N].author`。只读参考 `codex2api@b1bfe1b4` 的 `PrepareResponsesBody` 与原生 agent-context fixture 保留 `author` / `recipient`。Server 因此仅对该精确 item 类型保留两个字段，普通 message/tool item 继续清理；HTTP、Compact、原生 WebSocket 与 WS→HTTP fallback 共用同一 sanitizer，不引入账号、Provider 或路由变化。真实凭据复测仍待完成。
+
 ## 2026-09-28 Grok catalog capability and identity-gate freeze
 
 GR-N3 与 GR-N4 冻结在 `assets/contract/grok-reference-delta.json` 的 `GR-OBS-0012`～`GR-OBS-0013`。一次性只读证据取自干净的 `grok2api@5e5ad75556b61a2c4a8fcf344d83bfe7760f2b42`；实际评审的功能提交是 `9dda42ae41fbb3d7e1948aef5f1a4dab2d270b7e`，两者共享 tree `889cf18ab5363fe8d6d408b16c734625e1065d24`。两个追加式 source delta 分别固定目录能力和 Build 1.0.40/conversation-group 身份的八个 committed object；默认审计不读取外部 checkout，显式 `node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核 commit/tree、文件 SHA-256 与符号。`sub2api@ab99d56e` 的六项工作树修改仍全部排除。
