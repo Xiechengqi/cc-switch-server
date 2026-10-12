@@ -2064,7 +2064,7 @@ async fn refresh_codex_quota(
         .lookup
         .as_ref()
         .and_then(|lookup| lookup.plan_type.clone());
-    let resolution = reconcile_chatgpt_subscription(
+    let mut resolution = reconcile_chatgpt_subscription(
         usage_plan_type.as_deref(),
         usage_allowed,
         trusted_workspace.is_some(),
@@ -2072,6 +2072,16 @@ async fn refresh_codex_quota(
         subscription_probe.lookup.clone(),
         now_ms,
     );
+    let usage_expiry = constrain_chatgpt_subscription_lookup(
+        codex_usage_expiry_lookup(&body),
+        usage_plan_type.as_deref(),
+        usage_allowed,
+        trusted_workspace.is_some(),
+        now_ms,
+        "wham_usage",
+        &mut resolution.discarded_reasons,
+    );
+    resolution.subscription = merge_subscription_lookup(usage_expiry, resolution.subscription);
     if !resolution.discarded_reasons.is_empty() {
         tracing::warn!(
             account_id = %account.id,
@@ -2101,7 +2111,13 @@ async fn refresh_codex_quota(
         .and_then(|item| item.expiry_availability.as_deref());
     let expiry_warning_code = match expiry_availability {
         Some("workspace_unverified") => Some("codex_subscription_workspace_unverified"),
-        Some("probe_unavailable") => Some("codex_subscription_probe_unavailable"),
+        Some("unauthorized") => Some("codex_subscription_probe_unauthorized"),
+        Some("forbidden") => Some("codex_subscription_probe_forbidden"),
+        Some("anti_bot_challenge") => Some("codex_subscription_probe_anti_bot_challenge"),
+        Some("rate_limited") => Some("codex_subscription_probe_rate_limited"),
+        Some("upstream_error") => Some("codex_subscription_probe_upstream_error"),
+        Some("network_error") => Some("codex_subscription_probe_network_error"),
+        Some("parse_error") => Some("codex_subscription_probe_parse_error"),
         _ => None,
     };
     let subscription_json = subscription.as_ref().map(|item| {
@@ -6061,7 +6077,12 @@ enum ChatGptProbeStatus {
     Success,
     NotProvided,
     SkippedNoTrustedWorkspace,
-    HttpError,
+    Unauthorized,
+    Forbidden,
+    AntiBotChallenge,
+    NotFound,
+    RateLimited,
+    UpstreamError,
     NetworkError,
     ParseError,
 }
@@ -6095,7 +6116,12 @@ impl ChatGptProbeStatus {
             Self::Success => "success",
             Self::NotProvided => "not_provided",
             Self::SkippedNoTrustedWorkspace => "skipped_no_trusted_workspace",
-            Self::HttpError => "http_error",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::AntiBotChallenge => "anti_bot_challenge",
+            Self::NotFound => "not_found",
+            Self::RateLimited => "rate_limited",
+            Self::UpstreamError => "upstream_error",
             Self::NetworkError => "network_error",
             Self::ParseError => "parse_error",
         }
@@ -6104,9 +6130,47 @@ impl ChatGptProbeStatus {
     fn unavailable(self) -> bool {
         matches!(
             self,
-            Self::HttpError | Self::NetworkError | Self::ParseError
+            Self::Unauthorized
+                | Self::Forbidden
+                | Self::AntiBotChallenge
+                | Self::RateLimited
+                | Self::UpstreamError
+                | Self::NetworkError
+                | Self::ParseError
         )
     }
+}
+
+fn chatgpt_http_probe_status(status: reqwest::StatusCode, anti_bot: bool) -> ChatGptProbeStatus {
+    match status.as_u16() {
+        _ if anti_bot => ChatGptProbeStatus::AntiBotChallenge,
+        401 => ChatGptProbeStatus::Unauthorized,
+        403 => ChatGptProbeStatus::Forbidden,
+        404 => ChatGptProbeStatus::NotFound,
+        429 => ChatGptProbeStatus::RateLimited,
+        _ => ChatGptProbeStatus::UpstreamError,
+    }
+}
+
+async fn classify_chatgpt_http_error(response: &mut reqwest::Response) -> ChatGptProbeStatus {
+    let status = response.status();
+    let content_type_is_html = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"));
+    let body =
+        crate::infra::http::read_response_body_limited(response, MAX_QUOTA_RESPONSE_BODY_BYTES)
+            .await
+            .ok();
+    let body_is_challenge = body.as_deref().is_some_and(|body| {
+        let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+        text.contains("cloudflare")
+            || text.contains("cf-chl-")
+            || text.contains("just a moment")
+            || text.contains("challenge-platform")
+    });
+    chatgpt_http_probe_status(status, content_type_is_html || body_is_challenge)
 }
 
 #[derive(Debug, Clone)]
@@ -6141,15 +6205,15 @@ async fn fetch_chatgpt_account_lookup(
     now_ms: i64,
     request_timeout: Duration,
 ) -> ChatGptSubscriptionProbe {
-    let mut response = match http
-        .get(CHATGPT_ACCOUNTS_CHECK_URL)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header("Origin", "https://chatgpt.com")
-        .header("Referer", "https://chatgpt.com/")
-        .header(ACCEPT, "application/json")
-        .timeout(request_timeout)
-        .send()
-        .await
+    let mut response = match codex_authenticated_get(
+        http,
+        CHATGPT_ACCOUNTS_CHECK_URL,
+        access_token,
+        account_id,
+        request_timeout,
+    )
+    .send()
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -6163,9 +6227,11 @@ async fn fetch_chatgpt_account_lookup(
         }
     };
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let probe_status = classify_chatgpt_http_error(&mut response).await;
         return ChatGptSubscriptionProbe {
-            status: ChatGptProbeStatus::HttpError,
-            http_status: Some(response.status().as_u16()),
+            status: probe_status,
+            http_status: Some(status),
             lookup: None,
             workspace_candidates: Vec::new(),
         };
@@ -6205,16 +6271,16 @@ async fn fetch_chatgpt_subscription_lookup(
     let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return ChatGptSubscriptionProbe::skipped_no_trusted_workspace();
     };
-    let mut response = match http
-        .get(CHATGPT_SUBSCRIPTIONS_URL)
-        .query(&[("account_id", account_id)])
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header("Origin", "https://chatgpt.com")
-        .header("Referer", "https://chatgpt.com/")
-        .header(ACCEPT, "application/json")
-        .timeout(request_timeout)
-        .send()
-        .await
+    let mut response = match codex_authenticated_get(
+        http,
+        CHATGPT_SUBSCRIPTIONS_URL,
+        access_token,
+        Some(account_id),
+        request_timeout,
+    )
+    .query(&[("account_id", account_id)])
+    .send()
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -6228,9 +6294,11 @@ async fn fetch_chatgpt_subscription_lookup(
         }
     };
     if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let probe_status = classify_chatgpt_http_error(&mut response).await;
         return ChatGptSubscriptionProbe {
-            status: ChatGptProbeStatus::HttpError,
-            http_status: Some(response.status().as_u16()),
+            status: probe_status,
+            http_status: Some(status),
             lookup: None,
             workspace_candidates: Vec::new(),
         };
@@ -6424,10 +6492,12 @@ fn finalize_codex_subscription(
     let mut subscription = subscription;
     let availability = if trusted_workspace.is_none() {
         "workspace_unverified"
-    } else if account_probe.status.unavailable() || subscription_probe.status.unavailable() {
-        "probe_unavailable"
     } else {
-        "upstream_not_provided"
+        [subscription_probe.status, account_probe.status]
+            .into_iter()
+            .find(|status| status.unavailable())
+            .map(ChatGptProbeStatus::as_str)
+            .unwrap_or("upstream_not_provided")
     };
 
     if let Some(item) = subscription.as_mut() {
@@ -6462,11 +6532,48 @@ fn finalize_codex_subscription(
         return (subscription, Some(codex_expiry_snapshot_json(snapshot)));
     }
 
+    if let Some(expires_at) =
+        verified_codex_claim_expiry(account, trusted_workspace, usage_plan_type)
+            .filter(|expires_at| !chatgpt_expiry_is_past(expires_at, now_ms))
+    {
+        let item = subscription.get_or_insert_with(ChatGptSubscriptionLookup::default);
+        item.expires_at = Some(expires_at);
+        item.expires_source = Some("verified_token_claim".to_string());
+        item.expires_kind = Some("subscription".to_string());
+        item.expiry_availability = Some("available".to_string());
+        item.expiry_stale = true;
+        let snapshot = codex_expiry_snapshot_from_lookup(
+            item,
+            trusted_workspace,
+            usage_plan_type,
+            now_ms,
+            true,
+        );
+        return (subscription, snapshot.map(codex_expiry_snapshot_json));
+    }
+
     if let Some(item) = subscription.as_mut() {
         item.expiry_availability = Some(availability.to_string());
         item.expiry_stale = false;
     }
     (subscription, None)
+}
+
+fn verified_codex_claim_expiry(
+    account: &Account,
+    trusted_workspace: Option<&crate::domain::accounts::store::TrustedCodexWorkspace>,
+    usage_plan_type: Option<&str>,
+) -> Option<String> {
+    let claims = account.profile.as_ref()?.get("verifiedOpenAiClaims")?;
+    let workspace = claims.get("chatgpt_account_id")?.as_str()?.trim();
+    if workspace != trusted_workspace?.id {
+        return None;
+    }
+    let claim_plan = claims.get("chatgpt_plan_type")?.as_str()?;
+    if !chatgpt_plan_types_match(claim_plan, usage_plan_type?) {
+        return None;
+    }
+    flexible_expiry_value(claims.get("subscription_expires_at")?)
 }
 
 fn codex_expiry_snapshot_from_lookup(
@@ -6699,6 +6806,56 @@ fn parse_chatgpt_subscription_lookup(body: &Value) -> Option<ChatGptSubscription
     })
 }
 
+fn codex_usage_expiry_lookup(body: &Value) -> Option<ChatGptSubscriptionLookup> {
+    for (field, source) in [
+        ("subscription_expires_at", "wham_subscription_expires_at"),
+        (
+            "subscription_active_until",
+            "wham_subscription_active_until",
+        ),
+        (
+            "chatgpt_subscription_active_until",
+            "wham_chatgpt_subscription_active_until",
+        ),
+    ] {
+        if let Some(expires_at) = body.get(field).and_then(flexible_expiry_value) {
+            return Some(ChatGptSubscriptionLookup {
+                plan_type: body
+                    .get("plan_type")
+                    .and_then(Value::as_str)
+                    .map(normalize_chatgpt_plan_type),
+                plan_label: None,
+                expires_at: Some(expires_at),
+                expires_source: Some(source.to_string()),
+                expires_kind: Some("subscription".to_string()),
+                expiry_availability: None,
+                expiry_stale: false,
+            });
+        }
+    }
+    None
+}
+
+fn flexible_expiry_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => normalize_rfc3339_string(value).or_else(|| {
+            value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(timestamp_number_to_unix_ms)
+                .and_then(|timestamp| Utc.timestamp_millis_opt(timestamp).single())
+                .map(|date| date.to_rfc3339())
+        }),
+        Value::Number(value) => value
+            .as_f64()
+            .and_then(timestamp_number_to_unix_ms)
+            .and_then(|timestamp| Utc.timestamp_millis_opt(timestamp).single())
+            .map(|date| date.to_rfc3339()),
+        _ => None,
+    }
+}
+
 fn chatgpt_lookup_from_account(account: &Value) -> Option<ChatGptSubscriptionLookup> {
     let plan_type = account
         .pointer("/account/plan_type")
@@ -6782,7 +6939,7 @@ fn reconcile_chatgpt_subscription(
         discarded_reasons.push("subscription_sources_plan_mismatch".to_string());
     }
 
-    let mut subscription = merge_subscription_lookup(account_lookup, subscription_lookup);
+    let mut subscription = merge_subscription_lookup(subscription_lookup, account_lookup);
     if let Some(usage_plan_type) = usage_plan_type {
         let resolved = subscription.get_or_insert_with(ChatGptSubscriptionLookup::default);
         resolved.plan_label = Some(format_chatgpt_plan_label(&usage_plan_type));
@@ -9269,6 +9426,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_subscription_reconciliation_prefers_subscriptions_over_accounts_check() {
+        let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
+        let account_lookup = chatgpt_lookup_from_account(&json!({
+            "account": {"plan_type": "pro"},
+            "entitlement": {"expires_at": "2026-08-20T00:00:00Z"}
+        }));
+        let subscription_lookup = parse_chatgpt_subscription_lookup(&json!({
+            "plan_type": "pro",
+            "active_until": "2026-09-20T00:00:00Z"
+        }));
+        let resolution = reconcile_chatgpt_subscription(
+            Some("pro"),
+            Some(true),
+            true,
+            account_lookup,
+            subscription_lookup,
+            now_ms,
+        );
+        let subscription = resolution.subscription.unwrap();
+        assert_eq!(
+            subscription.expires_at.as_deref(),
+            Some("2026-09-20T00:00:00+00:00")
+        );
+        assert_eq!(
+            subscription.expires_source.as_deref(),
+            Some("subscriptions_active_until")
+        );
+    }
+
+    #[test]
     fn codex_subscription_reconciliation_drops_past_expiry_when_usage_is_available() {
         let now_ms = rfc3339_to_unix_ms("2026-07-20T00:00:00Z").unwrap();
         let subscription_lookup = parse_chatgpt_subscription_lookup(&json!({
@@ -9374,7 +9561,7 @@ mod tests {
         assert!(!chatgpt_probe_matches_usage(&matching, None));
 
         let failed = ChatGptSubscriptionProbe {
-            status: ChatGptProbeStatus::HttpError,
+            status: ChatGptProbeStatus::Forbidden,
             http_status: Some(403),
             lookup: matching.lookup.clone(),
             workspace_candidates: Vec::new(),
@@ -9414,7 +9601,7 @@ mod tests {
             source: "verified_id_token".to_string(),
         };
         let failed = ChatGptSubscriptionProbe {
-            status: ChatGptProbeStatus::HttpError,
+            status: ChatGptProbeStatus::NotFound,
             http_status: Some(404),
             lookup: None,
             workspace_candidates: Vec::new(),
@@ -9430,7 +9617,7 @@ mod tests {
         );
         assert_eq!(
             subscription.unwrap().expiry_availability.as_deref(),
-            Some("probe_unavailable")
+            Some("upstream_not_provided")
         );
     }
 
@@ -9548,6 +9735,113 @@ mod tests {
         assert_eq!(snapshot["workspaceId"], "workspace-1");
         assert_eq!(snapshot["planFamily"], "pro");
         assert_eq!(snapshot["stale"], false);
+    }
+
+    #[test]
+    fn codex_usage_expiry_accepts_all_known_fields_and_timestamp_shapes() {
+        let cases = [
+            (
+                json!({"subscription_expires_at": "2026-08-20T00:00:00.123Z"}),
+                "wham_subscription_expires_at",
+                1_787_184_000_123,
+            ),
+            (
+                json!({"subscription_active_until": 1787184000_i64}),
+                "wham_subscription_active_until",
+                1_787_184_000_000,
+            ),
+            (
+                json!({"chatgpt_subscription_active_until": 1787184000000_i64}),
+                "wham_chatgpt_subscription_active_until",
+                1_787_184_000_000,
+            ),
+        ];
+        for (body, source, expected_timestamp) in cases {
+            let lookup = codex_usage_expiry_lookup(&body).unwrap();
+            assert_eq!(lookup.expires_source.as_deref(), Some(source));
+            assert!(lookup
+                .expires_at
+                .as_deref()
+                .is_some_and(|value| rfc3339_to_unix_ms(value) == Some(expected_timestamp)));
+        }
+    }
+
+    #[test]
+    fn codex_usage_expiry_field_order_is_stable() {
+        let lookup = codex_usage_expiry_lookup(&json!({
+            "subscription_expires_at": "2026-08-20T00:00:00Z",
+            "subscription_active_until": "2026-09-20T00:00:00Z",
+            "chatgpt_subscription_active_until": "2026-10-20T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            lookup.expires_source.as_deref(),
+            Some("wham_subscription_expires_at")
+        );
+        assert_eq!(
+            lookup.expires_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn codex_probe_http_statuses_remain_diagnostic() {
+        use reqwest::StatusCode;
+
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::UNAUTHORIZED, false),
+            ChatGptProbeStatus::Unauthorized
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::FORBIDDEN, true),
+            ChatGptProbeStatus::AntiBotChallenge
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::SERVICE_UNAVAILABLE, true),
+            ChatGptProbeStatus::AntiBotChallenge
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::FORBIDDEN, false),
+            ChatGptProbeStatus::Forbidden
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::NOT_FOUND, false),
+            ChatGptProbeStatus::NotFound
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::TOO_MANY_REQUESTS, false),
+            ChatGptProbeStatus::RateLimited
+        );
+        assert_eq!(
+            chatgpt_http_probe_status(StatusCode::BAD_GATEWAY, false),
+            ChatGptProbeStatus::UpstreamError
+        );
+    }
+
+    #[test]
+    fn codex_verified_claim_expiry_is_scoped_to_workspace_and_plan() {
+        let mut account = imported_account(ProviderType::CodexOAuth, json!({}));
+        account.profile = Some(json!({
+            "verifiedOpenAiClaims": {
+                "chatgpt_account_id": "workspace-1",
+                "chatgpt_plan_type": "pro",
+                "subscription_expires_at": 1787184000_i64
+            }
+        }));
+        let trusted = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-1".to_string(),
+            source: "verified_openai_token".to_string(),
+        };
+        assert_eq!(
+            verified_codex_claim_expiry(&account, Some(&trusted), Some("pro")).as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+        assert!(verified_codex_claim_expiry(&account, Some(&trusted), Some("plus")).is_none());
+        let other = crate::domain::accounts::store::TrustedCodexWorkspace {
+            id: "workspace-2".to_string(),
+            source: "user_selected".to_string(),
+        };
+        assert!(verified_codex_claim_expiry(&account, Some(&other), Some("pro")).is_none());
     }
 
     #[test]

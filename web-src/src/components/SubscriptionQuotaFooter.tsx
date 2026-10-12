@@ -137,7 +137,7 @@ export function formatExpireDistance(
   return t ? t("subscription.expiresIn", { time }) : `expire in ${time}`;
 }
 
-function formatSubscriptionExpirySummary(
+export function formatSubscriptionExpirySummary(
   subscription: SubscriptionInfo,
   t?: (key: string, options?: Record<string, unknown>) => string,
   nowMs = Date.now(),
@@ -157,7 +157,25 @@ function formatSubscriptionExpirySummary(
       return t
         ? t("subscription.expiryNotProvided")
         : "subscription expiry not provided";
-    case "probe_unavailable":
+    case "anti_bot_challenge":
+      return t
+        ? t("subscription.expiryAntiBotChallenge")
+        : "subscription probe blocked by an upstream challenge";
+    case "unauthorized":
+      return t
+        ? t("subscription.expiryUnauthorized")
+        : "reconnect the OpenAI account";
+    case "forbidden":
+      return t
+        ? t("subscription.expiryForbidden")
+        : "subscription probe forbidden upstream";
+    case "rate_limited":
+      return t
+        ? t("subscription.expiryRateLimited")
+        : "subscription probe rate limited";
+    case "upstream_error":
+    case "network_error":
+    case "parse_error":
       return t
         ? t("subscription.expiryUnavailable")
         : "subscription expiry unavailable";

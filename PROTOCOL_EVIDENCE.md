@@ -31,6 +31,10 @@ Intl/CN × Claude/Codex/Gemini × stream/non-stream 的 loopback fixture 已统�
 
 ## 2026-09-28 Codex Responses compatibility and observability freeze
 
+### 2026-10-12 Codex subscription-expiry source and probe identity correction
+
+只读复核 `codex2api@b1bfe1b4` 的 WHAM expiry 与 subscription sync：当前服务端 `/backend-api/wham/usage` 已可能直接返回 `subscription_expires_at`、`subscription_active_until` 或 `chatgpt_subscription_active_until`，而 `/backend-api/subscriptions` 对维护请求身份和出口挑战更敏感。Server 已将同一绑定 Account/workspace 的新鲜 WHAM 日期置于 `/subscriptions.active_until` 与 `/accounts/check.entitlement.expires_at` 之前，并复用现有 Codex maintenance identity；历史快照和已验证 token claim 只能作为同 workspace/plan 的 stale fallback，不能覆盖更新日期或授权路由。HTTP/网络/JSON/anti-bot/not-provided 保持分离，真实账号验收前仍为 `live_pending`。
+
 CX-N5～CX-N12 冻结在 `assets/contract/codex-reference-delta.json` 的 `CX-OBS-0014`～`CX-OBS-0022`。一次性只读证据取自干净的 `CLIProxyAPI@acdace936fa7df2905500c7f5e0a97d683138dea`（tree `f7e64bd57e383e31be75a7077ef918f5154f0ab8`）与 `codex2api@9368ed82e039ac8458f9c264b2298b47d0cbf833`（tree `d878a5e7b8a94665dad14631d40be639d923a345`），并固定 octal NUL schema、cache breakpoint、私有 SSE event、连续工具轮 reasoning、item metadata、上游自报模型、全双工 steering 与 orphan required 的九个历史 committed delta。当前合同共有 18 个 source delta 和 22 条不可变 observation；`node scripts/audit/audit-codex-reference-delta.mjs --check-sources` 可复核 commit/tree、文件 SHA-256 和符号，默认构建、测试、发布与运行时不读取外部 checkout。
 
 独立实现冻结在 `f8907742b163b239a981cddcc3962410f0712677`（tree `9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33`）。schema sanitizer 只在 schema `pattern` 识别活动 `\0` 与奇偶反斜线形态，保留 `\x00`、文本 `\u005c0` 和用户数据；Responses、Compact、WebSocket 与 WS→HTTP fallback 共用精确 item/part sanitizer，只删除协议位置的 `internal_chat_message_metadata_passthrough`、`author`、`recipient` 和 `prompt_cache_breakpoint`，arguments 与普通嵌套 JSON 不递归清理。SSE 同时检查 declared event 和 payload `type`：普通客户端只看到公开闭集，经过识别的原生 Codex 客户端额外只允许 `codex.response.metadata`，错误和终态不会被误吞。

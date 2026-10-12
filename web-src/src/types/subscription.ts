@@ -76,7 +76,13 @@ export interface SubscriptionInfo {
   expiryAvailability?:
     | "available"
     | "upstream_not_provided"
-    | "probe_unavailable"
+    | "unauthorized"
+    | "forbidden"
+    | "anti_bot_challenge"
+    | "rate_limited"
+    | "upstream_error"
+    | "network_error"
+    | "parse_error"
     | "workspace_unverified"
     | null;
 }

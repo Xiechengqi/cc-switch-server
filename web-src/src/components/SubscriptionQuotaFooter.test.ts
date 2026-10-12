@@ -3,10 +3,32 @@ import { describe, expect, it } from "vitest";
 import {
   formatBankedResetSummary,
   formatQuotaSummary,
+  formatSubscriptionExpirySummary,
 } from "./SubscriptionQuotaFooter";
 import type { SubscriptionQuota } from "@/types/subscription";
 
 describe("SubscriptionQuotaFooter summaries", () => {
+  it("keeps Codex subscription probe failures actionable", () => {
+    expect(
+      formatSubscriptionExpirySummary({
+        expiryCapability: "automatic",
+        expiryAvailability: "anti_bot_challenge",
+      }),
+    ).toBe("subscription probe blocked by an upstream challenge");
+    expect(
+      formatSubscriptionExpirySummary({
+        expiryCapability: "automatic",
+        expiryAvailability: "unauthorized",
+      }),
+    ).toBe("reconnect the OpenAI account");
+    expect(
+      formatSubscriptionExpirySummary({
+        expiryCapability: "automatic",
+        expiryAvailability: "rate_limited",
+      }),
+    ).toBe("subscription probe rate limited");
+  });
+
   it("shows a read-only Banked Reset count and distinct expiries", () => {
     const now = Date.parse("2026-08-24T00:00:00Z");
     const summary = formatBankedResetSummary(
