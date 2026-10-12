@@ -10,8 +10,8 @@ use crate::domain::accounts::claude_quota::{
 };
 use crate::domain::accounts::grok_subscription::canonical_grok_subscription_level;
 use crate::domain::accounts::store::{
-    active_account_usage_block_for_share, Account, AccountQuotaTier, AccountStore,
-    AccountUsageBlock,
+    active_account_usage_block_for_share, effective_codex_workspace_id, Account, AccountQuotaTier,
+    AccountStore, AccountUsageBlock,
 };
 use crate::domain::accounts::subscription_expiry::resolved_subscription_expiry;
 use crate::domain::health;
@@ -538,6 +538,116 @@ pub struct ShareUpstreamQuota {
     pub tiers: Vec<ShareUpstreamQuotaTier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banked_reset: Option<ShareBankedResetSummary>,
+}
+
+/// Display-only Codex reset-credit evidence. Never use this for quota or scheduling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareBankedResetSummary {
+    pub available_count: u32,
+    pub details_available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expires_at: Vec<String>,
+}
+
+pub fn codex_banked_reset_share_summary(
+    account: &Account,
+    now_ms: i64,
+) -> Option<ShareBankedResetSummary> {
+    if account.provider_type != ProviderType::CodexOAuth {
+        return None;
+    }
+    let workspace = effective_codex_workspace_id(account)?;
+    let cached = account
+        .quota
+        .as_ref()
+        .and_then(|quota| quota.extra_usage.as_ref())
+        .and_then(|extra| {
+            extra
+                .get("bankedReset")
+                .or_else(|| extra.get("codexBankedReset"))
+        });
+    let snapshot = cached.or_else(|| {
+        account.raw.as_ref().and_then(|raw| {
+            [
+                "bankedReset",
+                "banked_reset",
+                "codexBankedReset",
+                "codex_banked_reset",
+                "rateLimitResetCredits",
+                "rate_limit_reset_credits",
+            ]
+            .into_iter()
+            .find_map(|key| raw.get(key))
+        })
+    })?;
+    if snapshot
+        .get("workspaceId")
+        .or_else(|| snapshot.get("workspace_id"))
+        .and_then(Value::as_str)
+        != Some(workspace.as_str())
+    {
+        return None;
+    }
+    let count_value = snapshot
+        .get("availableCount")
+        .or_else(|| snapshot.get("available_count"))?;
+    let count = u32::try_from(count_value.as_u64().or_else(|| {
+        count_value
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+    })?)
+    .ok()?;
+    if count == 0 {
+        return None;
+    }
+    let details_available = cached.is_some()
+        && snapshot.get("detailsAvailable").and_then(Value::as_bool) == Some(true)
+        && snapshot.get("detailsStale").and_then(Value::as_bool) != Some(true);
+    let mut expiries = Vec::new();
+    if details_available {
+        let candidates = std::iter::once(snapshot.get("nextExpiresAt")).chain(
+            snapshot
+                .get("credits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|credit| {
+                    credit
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("available"))
+                })
+                .map(|credit| credit.get("expiresAt")),
+        );
+        for candidate in candidates.flatten() {
+            let timestamp = candidate
+                .as_i64()
+                .or_else(|| candidate.as_str().and_then(|text| text.parse::<i64>().ok()))
+                .or_else(|| {
+                    candidate.as_str().and_then(|text| {
+                        chrono::DateTime::parse_from_rfc3339(text)
+                            .ok()
+                            .map(|date| date.timestamp_millis())
+                    })
+                });
+            if let Some(timestamp) = timestamp.filter(|timestamp| *timestamp > now_ms) {
+                if let Some(date) = Utc.timestamp_millis_opt(timestamp).single() {
+                    expiries.push(date.to_rfc3339());
+                }
+            }
+        }
+        expiries.sort();
+        expiries.dedup();
+        expiries.truncate(3);
+    }
+    Some(ShareBankedResetSummary {
+        available_count: count,
+        details_available,
+        expires_at: expiries,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1520,6 +1630,7 @@ fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
 
 fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<ShareUpstreamQuota> {
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let banked_reset = codex_banked_reset_share_summary(account, now_ms);
     let subscription_period_end = account_subscription_expires_at(account);
     let block = current_account_usage_block(account, share);
     let availability = block
@@ -1539,7 +1650,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         .map(share_upstream_quota_tier_hint_from_account)
         .collect::<Vec<_>>();
     let Some(quota) = projection.quota else {
-        if subscription_period_end.is_none() && block.is_none() {
+        if subscription_period_end.is_none() && block.is_none() && banked_reset.is_none() {
             return None;
         }
         return Some(ShareUpstreamQuota {
@@ -1557,6 +1668,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             blocked_scope,
             tiers: Vec::new(),
             unobserved_tiers,
+            banked_reset,
         });
     };
     if quota.tiers.is_empty()
@@ -1564,6 +1676,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         && !quota.success
         && subscription_period_end.is_none()
         && block.is_none()
+        && banked_reset.is_none()
     {
         return None;
     }
@@ -1597,6 +1710,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             .map(share_upstream_quota_tier_from_account)
             .collect(),
         unobserved_tiers,
+        banked_reset,
     })
 }
 
@@ -2529,6 +2643,107 @@ mod tests {
 
         assert_eq!(quota.tiers[0].label, "5h");
         assert_eq!(quota.tiers[0].utilization, 1.0);
+    }
+
+    #[test]
+    fn codex_banked_reset_projection_is_workspace_fenced_and_display_only() {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let mut account = test_account(ProviderType::CodexOAuth);
+        account.profile = Some(
+            json!({"codexWorkspaceProvenance": {"workspaceId": "workspace-a", "source": "authenticated_discovery"}}),
+        );
+        account.quota.as_mut().unwrap().extra_usage = Some(json!({"bankedReset": {
+            "workspaceId": "workspace-a", "availableCount": 3, "detailsAvailable": true,
+            "detailsStale": false, "queriedAt": 123,
+            "nextExpiresAt": now_ms + 86_400_000,
+            "credits": [
+                {"id": "secret-credit", "status": "available", "expiresAt": now_ms + 86_400_000},
+                {"status": "available", "expiresAt": now_ms + 172_800_000},
+                {"status": "used", "expiresAt": now_ms + 259_200_000}
+            ]
+        }}));
+        let summary = codex_banked_reset_share_summary(&account, now_ms).unwrap();
+        assert_eq!(summary.available_count, 3);
+        assert_eq!(summary.expires_at.len(), 2);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("workspaceId").is_none());
+        assert!(wire.get("credits").is_none());
+        assert!(wire.get("queriedAt").is_none());
+        let share = test_share(ProviderType::CodexOAuth, None);
+        let providers = ProviderStore {
+            providers: vec![test_provider(ProviderType::CodexOAuth)],
+            ..Default::default()
+        };
+        let accounts = AccountStore {
+            accounts: vec![account.clone()],
+            ..Default::default()
+        };
+        let descriptor =
+            descriptor_for_share_with_accounts_and_usage(&share, &providers, Some(&accounts), None);
+        let quota = descriptor.app_runtimes.codex.unwrap().quota.unwrap();
+        assert_eq!(quota.banked_reset, Some(summary));
+        assert!(serde_json::to_value(&quota)
+            .unwrap()
+            .pointer("/bankedReset/credits")
+            .is_none());
+
+        let mut refreshed = account.clone();
+        refreshed
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["bankedReset"]["queriedAt"] = json!(456);
+        assert_eq!(
+            codex_banked_reset_share_summary(&account, now_ms),
+            codex_banked_reset_share_summary(&refreshed, now_ms)
+        );
+
+        refreshed
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["bankedReset"]["detailsStale"] = json!(true);
+        let stale = codex_banked_reset_share_summary(&refreshed, now_ms).unwrap();
+        assert!(!stale.details_available);
+        assert!(stale.expires_at.is_empty());
+
+        refreshed
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["bankedReset"]["availableCount"] = Value::Null;
+        assert!(codex_banked_reset_share_summary(&refreshed, now_ms).is_none());
+        let mut imported = account.clone();
+        imported.quota = None;
+        imported.raw = Some(json!({"codexBankedReset": {
+            "workspaceId": "workspace-a", "availableCount": "2",
+            "detailsAvailable": true, "credits": [{"status": "available", "expiresAt": now_ms + 86_400_000}]
+        }}));
+        let imported_summary = codex_banked_reset_share_summary(&imported, now_ms).unwrap();
+        assert_eq!(imported_summary.available_count, 2);
+        assert!(!imported_summary.details_available);
+        assert!(imported_summary.expires_at.is_empty());
+        refreshed
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["bankedReset"]["availableCount"] = json!(3);
+        refreshed
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["bankedReset"]["workspaceId"] = json!("workspace-b");
+        assert!(codex_banked_reset_share_summary(&refreshed, now_ms).is_none());
     }
 
     #[test]

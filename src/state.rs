@@ -12920,7 +12920,14 @@ impl ServerStateInner {
         let quota_visual_changed = after.provider_type == ProviderType::ClaudeOAuth
             && claude_quota_visual_fingerprint(before, before.quota.as_ref(), now_ms)
                 != claude_quota_visual_fingerprint(after, after.quota.as_ref(), now_ms);
-        if !expiry_changed && !usage_block_changed && !quota_visual_changed {
+        let banked_reset_changed = after.provider_type == ProviderType::CodexOAuth
+            && crate::domain::sharing::router_contract::codex_banked_reset_share_summary(
+                before, now_ms,
+            ) != crate::domain::sharing::router_contract::codex_banked_reset_share_summary(
+                after, now_ms,
+            );
+        if !expiry_changed && !usage_block_changed && !quota_visual_changed && !banked_reset_changed
+        {
             return Ok(false);
         }
 
@@ -32387,6 +32394,144 @@ mod tests {
                 .await,
             ClaudeQuotaObservationCommit::StaleIdentity
         );
+    }
+
+    #[tokio::test]
+    async fn codex_banked_reset_change_refreshes_bound_share_without_timestamp_churn() {
+        fn account(count: u32, queried_at: i64) -> Account {
+            serde_json::from_value(json!({
+                "id": "codex-reset-refresh-account", "providerType": "codex_oauth",
+                "authIdentityGeneration": 1, "tokenRefreshGeneration": 1,
+                "email": "owner@example.com", "accessToken": "access",
+                "profile": {"codexWorkspaceProvenance": {"workspaceId": "workspace-a", "source": "authenticated_discovery"}},
+                "quota": {"success": true, "credentialMessage": "ChatGPT Pro 20x", "tiers": [],
+                    "extraUsage": {"bankedReset": {
+                        "workspaceId": "workspace-a", "availableCount": count,
+                        "detailsAvailable": false, "detailsStale": false, "queriedAt": queried_at
+                    }}}
+            })).unwrap()
+        }
+
+        let state = test_state();
+        let before = account(1, 100);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![before.clone()],
+                ..Default::default()
+            })
+            .await;
+        state
+            .replace_provider_store_for_test(ProviderStore {
+                providers: vec![StoredProvider {
+                    app: AppKind::Codex,
+                    provider: Provider {
+                        id: "codex-reset-refresh-provider".to_string(),
+                        name: "Codex OAuth".to_string(),
+                        settings_config: json!({}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            auth_binding: Some(AuthBinding {
+                                source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.to_string()),
+                                auth_provider: Some("codex_oauth".to_string()),
+                                account_id: Some(before.id.clone()),
+                                auth_identity_generation: Some(before.auth_identity_generation),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: BTreeMap::new(),
+                    },
+                    provider_type: ProviderType::CodexOAuth,
+                    provider_type_id: "codex_oauth".to_string(),
+                    resource: ProviderResourceMetadata::default(),
+                }],
+                ..Default::default()
+            })
+            .await;
+        let mut share_input =
+            router_sync_share_input("codex-reset-refresh-share", "codex-reset-refresh-provider");
+        share_input.provider_type = ProviderType::CodexOAuth;
+        share_input.bindings = vec![ShareBinding {
+            app: AppKind::Codex,
+            provider_id: "codex-reset-refresh-provider".to_string(),
+            provider_type: ProviderType::CodexOAuth,
+        }];
+        state
+            .mutate_shares_immediate(|shares| shares.upsert(share_input))
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .refresh_account_subscription_metadata(ProviderType::CodexOAuth, Some(&before.id))
+            .await
+            .unwrap();
+        let initial = state
+            .shares
+            .read()
+            .await
+            .get("codex-reset-refresh-share")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            initial.runtime_snapshot.as_ref().unwrap()["upstreamProvider"]["quota"]["bankedReset"]
+                ["availableCount"],
+            1
+        );
+
+        let timestamp_only = account(1, 200);
+        assert!(!state
+            .refresh_account_runtime_metadata_if_changed(&before, &timestamp_only)
+            .await
+            .unwrap());
+
+        let after = account(3, 300);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![after.clone()],
+                ..Default::default()
+            })
+            .await;
+        assert!(state
+            .refresh_account_runtime_metadata_if_changed(&before, &after)
+            .await
+            .unwrap());
+        let refreshed = state
+            .shares
+            .read()
+            .await
+            .get("codex-reset-refresh-share")
+            .cloned()
+            .unwrap();
+        assert!(refreshed.config_revision > initial.config_revision);
+        assert_eq!(
+            refreshed.runtime_snapshot.as_ref().unwrap()["upstreamProvider"]["quota"]
+                ["bankedReset"]["availableCount"],
+            3
+        );
+        let exhausted = account(0, 400);
+        state
+            .replace_account_store_for_test(AccountStore {
+                accounts: vec![exhausted.clone()],
+                ..Default::default()
+            })
+            .await;
+        assert!(state
+            .refresh_account_runtime_metadata_if_changed(&after, &exhausted)
+            .await
+            .unwrap());
+        let cleared = state
+            .shares
+            .read()
+            .await
+            .get("codex-reset-refresh-share")
+            .cloned()
+            .unwrap();
+        assert!(cleared.config_revision > refreshed.config_revision);
+        assert!(cleared
+            .runtime_snapshot
+            .as_ref()
+            .unwrap()
+            .pointer("/upstreamProvider/quota/bankedReset")
+            .is_none());
     }
 
     #[tokio::test]
