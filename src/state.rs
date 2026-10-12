@@ -2005,6 +2005,7 @@ fn ollama_cloud_share_projection(
             blocked_until: None,
             blocked_reason: None,
             blocked_scope: None,
+            banked_reset: None,
             tiers,
             unobserved_tiers: Vec::new(),
         },
