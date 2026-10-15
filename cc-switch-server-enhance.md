@@ -6,7 +6,7 @@
 >
 > Provider 协议差异定位从 ae7fc88 开始；提交前 main 新增 6799870（备份保留策略）和 4712ca0（tunnel rotation），已复核其提交态差异，不涉及本文八类 Provider 的协议锚点。本文只分析已提交状态；有本地修改的参考仓库只读取 HEAD 提交态。
 
-> 当前状态索引（2026-10-15）：上方 9 月快照及第 0～17 节是各自日期的历史判定，不代表当前待办。八类 Provider 的本轮离线实施与整体 review 见 §18.322～18.334；TokenRouter 当前工作树删除根 `AGENTS.md` 后，Qoder 最新可达源码已补审，旧 `project-doc` 门禁不再限制当前只读研究，但恢复该文件时须重新核对。真实账号验收已明确排除在本 goal 外，各 rail/operation 仍保持 `live_pending`。当前实现仍在未提交工作树中，§18.331～18.334 的验证不能冒充新增 `committed-target` 证据。
+> 当前状态索引（2026-10-15）：上方 9 月快照及第 0～17 节是各自日期的历史判定，不代表当前待办。八类 Provider 的本轮离线实施与整体 review 见 §18.322～18.334，随后提交态冻结见 §18.335；TokenRouter 当前工作树删除根 `AGENTS.md` 后，Qoder 最新可达源码已补审，旧 `project-doc` 门禁不再限制当前只读研究，但恢复该文件时须重新核对。真实账号验收已明确排除在本 goal 外，各 rail/operation 仍保持 `live_pending`。§18.331～18.334 所记未提交状态是当时的历史判定，不代表 §18.335 的当前提交态。
 
 ## 0. 执行结论
 
@@ -3587,3 +3587,11 @@ TokenRouter 当前工作树的根 `AGENTS.md` 是未暂存删除（HEAD 仍追�
 §18.333 只改变 Claude 续线程历史工具定义的本地发网前门槛及对应测试/文档，不改变其余七类 Provider、共享身份/预算/终态合同或任何真实状态。本节对照 §18.331 的八类合并审计和 §18.2～18.4 的当前可离线项复验：完整 `CARGO_INCREMENTAL=0 RUST_MIN_STACK=16777216 cargo test -q` 为 Rust library 3628 passed / 1 ignored、API 合同 124/124、其余两项集成各 1/1；`node --test scripts/audit/*.test.mjs` 为 1896/1896，`node --test scripts/smoke/*.test.mjs` 为 13/13。八类 reference-delta `--check-sources` 均通过；Qoder CLI oracle、Provider conformance/contract/Phase 0/coverage、SQLite authority、coding-plan/web-session registry、产品/Web/source 边界、transform coverage、UI Provider **静态矩阵**与文档索引均通过。Claude 定向 alias 16/16、私有 receipt 离线夹具 252/252、`cargo fmt --check`、严格 Clippy `--all-targets -- -D warnings` 和差分空白检查也通过。
 
 本轮没有发现 Claude 修复引起的新跨 Provider 离线缺口，但这仍是**当前工作树**结论：目标 `HEAD` 与 `origin/main` 仍为 `65451910144b8460ed5fa36d2c9c926936022de6`，94 个任务相关路径（93 个已修改、1 个未跟踪实现）尚未形成新的 implementation commit/tree，旧 reference-delta observation 不能证明本次工作树已提交。真实账号验收不在本 goal 内，各 rail/operation 保持 `live_pending`；没有做真实请求、UI 自动化或部署测试。完整 `scripts/static-checks.sh` 包含 Web UI 测试，按禁令未运行。本 goal 若要求提交态交付，剩余步骤仍是确定提交范围、复核 staged/committed tree 并追加真实的不可变 target observation；不得把本节的离线绿灯写成提交态或 live 证据。
+
+### 18.335 八类实现提交态冻结（2026-10-15）
+
+在用户明确要求 `commit push` 后，精确复核并暂存 §18.334 的 94 个任务路径，`git diff --cached --check` 通过；实现提交为 `b9ef3c9abf8123ea36d0438bd027952e56ad9284`，父提交 `65451910144b8460ed5fa36d2c9c926936022de6`，tree `0ed8f7e6bdbf6da1e2076800b0673a4ed6f52da1`。此前八类逐项与整体复核的工作树现在对应一个真实、可读取的 Git 对象；这不追溯改变 §18.331～18.334 当时“未提交”的事实。
+
+新增独立的 append-only 提交态 revision `assets/contract/provider-enhancement-committed-target.json`，逐类固定该实现提交、各自 reference-delta 的已提交 SHA-256、实现路径与离线 fixture 锚点；`scripts/audit/audit-provider-enhancement-committed-target.mjs` 校验 revision 摘要、提交父子/tree、八类清单、Git 对象内容及实现/fixture 确实位于父子差分，并接入常规静态检查。八个原有 reference-delta 历史 observation 均保持原样；此索引只补当前实现的 `committed-target` 证据，不能提升任何真实 rail/operation。
+
+在相同生产代码的提交态上复跑：Rust library 3628 passed / 1 ignored、API 合同 124/124、另两项集成各 1/1；后端 Node audit 1896/1896、smoke 13/13。八类 reference-delta `--check-sources`、新增提交态审计、Qoder CLI oracle、Provider coverage、UI Provider **静态矩阵**、文档索引、`cargo fmt --check`、脚本语法和差分空白检查均通过。完整 `scripts/static-checks.sh` 含 Web UI 测试，仍未运行；没有真实账号请求、UI 自动化或部署测试。推送是否成功只以远端核对结果为准，不由本地提交态推断。

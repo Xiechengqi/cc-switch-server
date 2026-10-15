@@ -1,0 +1,77 @@
+{
+  "format": "cc-switch-provider-enhancement-committed-target",
+  "schemaVersion": 1,
+  "observedAt": "2026-10-15T00:00:00Z",
+  "baselineCommit": "65451910144b8460ed5fa36d2c9c926936022de6",
+  "implementationCommit": "b9ef3c9abf8123ea36d0438bd027952e56ad9284",
+  "implementationTree": "0ed8f7e6bdbf6da1e2076800b0673a4ed6f52da1",
+  "readMode": "committed_git_objects",
+  "evidenceClass": "offline_fixture_only",
+  "liveAcceptance": "live_pending_outside_this_goal",
+  "providers": [
+    {
+      "family": "antigravity",
+      "referenceDeltaPath": "assets/contract/antigravity-reference-delta.json",
+      "referenceDeltaSha256": "b4f50b1882ff7b2819e36316f0b09eee8e61974e102c7b44e0aa38cdd8731e4e",
+      "implementationPath": "src/proxy/antigravity_replay.rs",
+      "fixturePath": "src/proxy/antigravity_replay.rs",
+      "fixtureAnchor": "captures_signature_alias_after_null_primary_in_both_response_paths"
+    },
+    {
+      "family": "claude",
+      "referenceDeltaPath": "assets/contract/claude-reference-delta.json",
+      "referenceDeltaSha256": "ac10669d62421a17e6250493f1275d95b33bfac5bb091d5f28b3fcda7c672da2",
+      "implementationPath": "src/proxy/claude_thread_alias.rs",
+      "fixturePath": "src/proxy/claude_thread_alias.rs",
+      "fixtureAnchor": "claude_thread_alias_partial_declarations_need_prior_state"
+    },
+    {
+      "family": "codex",
+      "referenceDeltaPath": "assets/contract/codex-reference-delta.json",
+      "referenceDeltaSha256": "c903e2fe20a27dca4fdc6b93b06b7019b320857a1f0155f08f3717a86c746365",
+      "implementationPath": "src/proxy/forwarder.rs",
+      "fixturePath": "src/proxy/forwarder.rs",
+      "fixtureAnchor": "codex_http_fallback_error_precedes_matching_interrupt_outcome"
+    },
+    {
+      "family": "cursor",
+      "referenceDeltaPath": "assets/contract/cursor-reference-delta.json",
+      "referenceDeltaSha256": "302ca6631e14ea20a9f2067c1a26d50cbf546c68cfdadde687394783ac36784f",
+      "implementationPath": "src/proxy/cursor/agent_driver.rs",
+      "fixturePath": "src/proxy/cursor/agent_driver.rs",
+      "fixtureAnchor": "marker_only_tool_rejection_does_not_echo_upstream_name"
+    },
+    {
+      "family": "grok",
+      "referenceDeltaPath": "assets/contract/grok-reference-delta.json",
+      "referenceDeltaSha256": "0b04e9b32be3c483af73575c50d3452b17e44ec1497ffb20cb33a0ef076f861f",
+      "implementationPath": "src/proxy/grok.rs",
+      "fixturePath": "src/proxy/grok.rs",
+      "fixtureAnchor": "responses_sse_ping_filter_only_rewrites_unambiguous_ping_frames"
+    },
+    {
+      "family": "kiro",
+      "referenceDeltaPath": "assets/contract/kiro-reference-delta.json",
+      "referenceDeltaSha256": "eb65a9b6586934429db3c75eb75a4b4b0b3b80d3306886e281c1c6a1b6498dc9",
+      "implementationPath": "src/proxy/kiro.rs",
+      "fixturePath": "src/proxy/kiro.rs",
+      "fixtureAnchor": "ambiguous_bare_tool_error_does_not_echo_name_across_output_paths"
+    },
+    {
+      "family": "qoder",
+      "referenceDeltaPath": "assets/contract/qoder-reference-delta.json",
+      "referenceDeltaSha256": "a012dd9974f11824cfb77ff39d7fc8d7edefb4198ff1bcb499d558c209ba029a",
+      "implementationPath": "src/proxy/qoder.rs",
+      "fixturePath": "src/proxy/qoder.rs",
+      "fixtureAnchor": "qoder_usage_fills_zero_primary_counts_from_nonzero_aliases"
+    },
+    {
+      "family": "codebuddy",
+      "referenceDeltaPath": "assets/contract/codebuddy-reference-delta.json",
+      "referenceDeltaSha256": "b82aaad745f0435619ca18bc7b128bd5a9697b1d81211660419990cd1071ba44",
+      "implementationPath": "src/proxy/codebuddy.rs",
+      "fixturePath": "src/proxy/forwarder/codebuddy_http_tests.rs",
+      "fixtureAnchor": "codebuddy_terminal_authorization_codes_on_http_401_never_refresh"
+    }
+  ]
+}

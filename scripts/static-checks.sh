@@ -76,6 +76,7 @@ node scripts/audit/audit-cursor-reference-delta.mjs
 node scripts/audit/audit-grok-reference-delta.mjs
 node scripts/audit/audit-kiro-reference-delta.mjs
 node scripts/audit/audit-qoder-reference-delta.mjs
+node scripts/audit/audit-provider-enhancement-committed-target.mjs
 node scripts/audit/audit-server-provider-contract.mjs
 node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
