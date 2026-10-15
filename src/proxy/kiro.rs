@@ -170,9 +170,9 @@ impl KiroToolNameRegistry {
         }
         match self.namespaced_children.get(upstream_name) {
             Some(candidates) if candidates.len() == 1 => Ok(candidates[0].clone()),
-            Some(candidates) if candidates.len() > 1 => Err(kiro_wire_contract_error(format!(
-                "Kiro returned ambiguous bare tool name {upstream_name:?} for multiple current request declarations"
-            ))),
+            Some(candidates) if candidates.len() > 1 => Err(kiro_wire_contract_error(
+                "Kiro returned an ambiguous bare tool name for multiple current request declarations",
+            )),
             _ => Ok(upstream_name.to_string()),
         }
     }
@@ -291,14 +291,11 @@ pub(crate) struct KiroCallContext {
 }
 
 impl KiroCallContext {
-    fn fallback(account: &Account, body: &Value) -> Self {
-        let runtime_region =
-            crate::domain::providers::kiro::operational_runtime_identity_from_account(account)
-                .ok()
-                .map(|identity| identity.runtime_region)
-                .unwrap_or_else(|| "unresolved".to_string());
+    fn fallback(account: &Account, body: &Value) -> Result<Self, ProxyError> {
+        let account_data = KiroAccountData::from_account(account)?;
+        let request_identity = prompt_cache_request_identity(account, &account_data)?;
         let session = cache_scope_seed(body);
-        Self {
+        Ok(Self {
             ide_version: endpoint::FALLBACK_IDE_VERSION.to_string(),
             claude_code_tools: false,
             cache_namespace: crate::proxy::kiro_prompt_cache::PromptCacheScope {
@@ -307,19 +304,21 @@ impl KiroCallContext {
                 provider_revision: 0,
                 runtime_fingerprint: "direct",
                 account_id: &account.id,
+                account_owner_id: "direct-unbound",
                 auth_identity_generation: account.auth_identity_generation,
                 token_refresh_generation: account.token_refresh_generation,
+                request_identity: &request_identity,
                 share_id: "direct",
                 signed_user: "anonymous",
                 route: "direct",
-                runtime_region: &runtime_region,
+                runtime_region: &account_data.api_region,
                 session: &session,
             }
             .namespace(),
             catalog_model_id: None,
             catalog_max_input_tokens: None,
             session_id: None,
-        }
+        })
     }
 }
 
@@ -483,11 +482,42 @@ impl KiroAccountData {
     }
 }
 
+pub(crate) fn prompt_cache_request_identity(
+    account: &Account,
+    account_data: &KiroAccountData,
+) -> Result<String, ProxyError> {
+    let access_token = account_data.access_token(account)?;
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:kiro-prompt-cache-request-identity:v1\0");
+    let product = match account_data.product {
+        CodeWhispererProduct::Kiro => "kiro",
+        CodeWhispererProduct::AmazonQ => "amazon_q",
+    };
+    for component in [
+        product,
+        access_token,
+        account_data.refresh_token.as_str(),
+        account_data.machine_id.as_deref().unwrap_or(""),
+        account_data.profile_arn.as_deref().unwrap_or(""),
+        account_data.auth_region.as_str(),
+        account_data.api_region.as_str(),
+        account_data.endpoint.as_deref().unwrap_or(""),
+        account_data.auth_method.as_deref().unwrap_or(""),
+        account_data.provider.as_deref().unwrap_or(""),
+        account.token_type.as_deref().unwrap_or(""),
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    digest.update([u8::from(account.needs_relogin)]);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 pub(crate) fn prepare_kiro_request(
     account: &Account,
     body: &Value,
 ) -> Result<KiroPreparedRequest, ProxyError> {
-    let context = KiroCallContext::fallback(account, body);
+    let context = KiroCallContext::fallback(account, body)?;
     prepare_kiro_request_with_context(account, body, &context)
 }
 
@@ -601,6 +631,13 @@ fn anthropic_to_kiro_request_with_catalog(
         .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
         .ok_or_else(|| ProxyError::bad_request("missing user message"))?;
     let messages = &raw_messages[..=last_user_idx];
+    if tool_mode == ToolCompatibilityMode::ClaudeCode
+        && contains_colliding_builtin_tool_inputs(messages)
+    {
+        return Err(ProxyError::bad_request(
+            "Kiro Claude Code tool input has colliding mapped keys",
+        ));
+    }
 
     let mut tool_name_map = HashMap::new();
     let mut tool_name_registry = KiroToolNameRegistry::default();
@@ -674,6 +711,26 @@ fn contains_unsupported_read_pages(messages: &[Value]) -> bool {
                         && block
                             .pointer("/input/pages")
                             .is_some_and(|pages| !pages.is_null())
+                })
+            })
+    })
+}
+
+fn contains_colliding_builtin_tool_inputs(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .zip(block.get("input"))
+                            .is_some_and(|(name, input)| {
+                                tool_bridge::input_has_key_collision(name, input)
+                            })
                 })
             })
     })
@@ -824,10 +881,28 @@ fn convert_tools(
         }
         if tool_mode == ToolCompatibilityMode::ClaudeCode
             && name.eq_ignore_ascii_case("Read")
-            && tool.pointer("/input_schema/properties/pages").is_some()
+            && tool
+                .get("input_schema")
+                .is_some_and(read_schema_declares_pages)
         {
             return Err(ProxyError::bad_request(
                 "Kiro Claude Code tool bridge cannot preserve Read.pages",
+            ));
+        }
+        let schema = tool
+            .get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        if ambiguous_top_level_tool_schema(&schema) {
+            return Err(ProxyError::bad_request(
+                "Kiro tool input_schema has ambiguous top-level alternatives",
+            ));
+        }
+        if tool_mode == ToolCompatibilityMode::ClaudeCode
+            && tool_bridge::schema_has_key_collision(name, &schema)
+        {
+            return Err(ProxyError::bad_request(
+                "Kiro Claude Code tool input_schema has colliding mapped keys",
             ));
         }
         let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
@@ -856,10 +931,6 @@ fn convert_tools(
             description = name.to_string();
         }
         description = truncate_chars(description, 10_000);
-        let schema = tool
-            .get("input_schema")
-            .cloned()
-            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
         let schema = if tool_mode == ToolCompatibilityMode::ClaudeCode {
             tool_bridge::schema_to_kiro(name, schema)
         } else {
@@ -874,6 +945,60 @@ fn convert_tools(
         }));
     }
     Ok(converted)
+}
+
+fn read_schema_declares_pages(schema: &Value) -> bool {
+    schema.pointer("/properties/pages").is_some()
+        || ["oneOf", "anyOf", "allOf"].iter().any(|key| {
+            schema
+                .get(*key)
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(read_schema_declares_pages))
+        })
+}
+
+fn ambiguous_top_level_tool_schema(schema: &Value) -> bool {
+    let Some(root) = schema.as_object() else {
+        return false;
+    };
+    let mut combinators = 0;
+    for name in ["oneOf", "anyOf", "allOf"] {
+        let Some(value) = root.get(name) else {
+            continue;
+        };
+        let Some(variants) = value.as_array() else {
+            return true;
+        };
+        combinators += 1;
+        if combinators > 1
+            || variants.len() != 1
+            || ["properties", "required", "additionalProperties"]
+                .iter()
+                .any(|key| root.contains_key(*key))
+        {
+            return true;
+        }
+        let Some(variant) = variants[0].as_object() else {
+            return true;
+        };
+        if variant.get("type").and_then(Value::as_str) != Some("object") {
+            return true;
+        }
+        if variant.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "type"
+                    | "properties"
+                    | "required"
+                    | "additionalProperties"
+                    | "description"
+                    | "title"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalize_schema(schema: Value) -> Value {
@@ -1533,10 +1658,16 @@ struct LeakedToolUse {
 struct ToolLeakFilter {
     carry: String,
     leaked_tools: Vec<LeakedToolUse>,
+    literal_tool_use: LiteralToolUseFilter,
 }
 
 impl ToolLeakFilter {
     fn push_text(&mut self, text: &str, flush: bool) -> Vec<String> {
+        let visible = self.literal_tool_use.push_text(text, flush);
+        self.push_invoke_text(&visible, flush)
+    }
+
+    fn push_invoke_text(&mut self, text: &str, flush: bool) -> Vec<String> {
         self.carry.push_str(text);
         let mut visible = Vec::new();
 
@@ -1608,6 +1739,7 @@ impl ToolLeakFilter {
     fn retained_bytes(&self) -> usize {
         self.carry
             .capacity()
+            .saturating_add(self.literal_tool_use.carry.capacity())
             .saturating_add(
                 self.leaked_tools
                     .capacity()
@@ -1619,6 +1751,81 @@ impl ToolLeakFilter {
                     .saturating_add(retained_json_bytes(&leaked.input))
             }))
     }
+}
+
+const LITERAL_TOOL_USE_OPEN: &str = "<tool_use";
+const LITERAL_TOOL_USE_CLOSE: &str = "</tool_use>";
+
+#[derive(Default)]
+struct LiteralToolUseFilter {
+    carry: String,
+    stripping: bool,
+}
+
+impl LiteralToolUseFilter {
+    fn push_text(&mut self, text: &str, flush: bool) -> String {
+        self.carry.push_str(text);
+        let mut visible = String::new();
+        loop {
+            if self.stripping {
+                if let Some(end) = self.carry.find(LITERAL_TOOL_USE_CLOSE) {
+                    self.carry.drain(..end + LITERAL_TOOL_USE_CLOSE.len());
+                    self.stripping = false;
+                    continue;
+                }
+                if flush {
+                    self.carry.clear();
+                } else {
+                    let keep = marker_suffix_len(&self.carry, LITERAL_TOOL_USE_CLOSE);
+                    let discard_len = self.carry.len() - keep;
+                    self.carry.drain(..discard_len);
+                }
+                return visible;
+            }
+
+            let Some(start) = self.carry.find(LITERAL_TOOL_USE_OPEN) else {
+                let keep = if flush {
+                    0
+                } else {
+                    marker_suffix_len(&self.carry, LITERAL_TOOL_USE_OPEN)
+                };
+                let emit_len = self.carry.len() - keep;
+                visible.push_str(&self.carry[..emit_len]);
+                self.carry.drain(..emit_len);
+                return visible;
+            };
+            visible.push_str(&self.carry[..start]);
+            self.carry.drain(..start);
+            let after_open = &self.carry[LITERAL_TOOL_USE_OPEN.len()..];
+            let Some(next) = after_open.chars().next() else {
+                if flush {
+                    self.carry.clear();
+                }
+                return visible;
+            };
+            if next != '>' && !next.is_whitespace() {
+                visible.push_str(LITERAL_TOOL_USE_OPEN);
+                self.carry.drain(..LITERAL_TOOL_USE_OPEN.len());
+                continue;
+            }
+            if let Some(end) = self.carry.find('>') {
+                self.carry.drain(..end + 1);
+            } else {
+                self.carry.clear();
+            }
+            self.stripping = true;
+        }
+    }
+}
+
+fn marker_suffix_len(value: &str, marker: &str) -> usize {
+    let max = marker.len().saturating_sub(1).min(value.len());
+    for len in (1..=max).rev() {
+        if value.ends_with(&marker[..len]) {
+            return len;
+        }
+    }
+    0
 }
 
 fn parse_leaked_invoke(value: &str) -> Option<LeakedToolUse> {
@@ -1976,6 +2183,16 @@ impl SseBuilder {
         let Some((id, kiro_name, name, parsed_input)) = completed else {
             return Ok(Vec::new());
         };
+        self.completed_tool_events(id, kiro_name, name, parsed_input)
+    }
+
+    fn completed_tool_events(
+        &mut self,
+        id: String,
+        kiro_name: String,
+        name: String,
+        parsed_input: Value,
+    ) -> Result<Vec<Bytes>, KiroToolJsonError> {
         let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
         let mut out = Vec::new();
         out.extend(self.stop_thinking_block());
@@ -2024,11 +2241,12 @@ impl SseBuilder {
     }
 
     fn finish_events(&mut self) -> Result<Vec<Bytes>, KiroToolJsonError> {
-        if let Err(error) = self.tool_json.finish() {
-            self.tool_json.reject(&error);
-            self.tool_errors.push(error);
+        let recovered = self.tool_json.finish(&self.tool_name_registry)?;
+        let mut events = Vec::new();
+        for (id, kiro_name, name, input) in recovered {
+            events.extend(self.completed_tool_events(id, kiro_name, name, input)?);
         }
-        let events = self.final_events();
+        events.extend(self.final_events());
         if self.next_index == 0 && !self.tool_errors.is_empty() {
             return Err(self.tool_errors.remove(0));
         }
@@ -2271,21 +2489,10 @@ impl KiroToolJsonError {
 impl std::fmt::Display for KiroToolJsonError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid {
-                tool_use_id,
-                name,
-                message,
-            } => write!(
+            Self::Invalid { .. } => formatter.write_str("upstream returned invalid tool JSON"),
+            Self::Incomplete { bytes, .. } => write!(
                 formatter,
-                "upstream returned invalid JSON for tool_use {tool_use_id} ({name}): {message}"
-            ),
-            Self::Incomplete {
-                tool_use_id,
-                name,
-                bytes,
-            } => write!(
-                formatter,
-                "upstream ended before completing tool_use {tool_use_id} ({name}) JSON input; buffered {bytes} bytes"
+                "upstream ended before completing tool JSON input; buffered {bytes} bytes"
             ),
             Self::Limit {
                 tool_use_id: _,
@@ -2305,16 +2512,27 @@ impl std::error::Error for KiroToolJsonError {}
 
 impl From<wire::WireError> for KiroToolJsonError {
     fn from(error: wire::WireError) -> Self {
-        Self::Wire {
-            code: error.code(),
-            message: error.to_string(),
-        }
+        let code = error.code();
+        // AWS diagnostics, event names, and header names are untrusted. They
+        // may echo request credentials, so never put them on the client rail.
+        let message = match &error {
+            wire::WireError::Upstream { .. } => "Kiro upstream stream error".to_string(),
+            wire::WireError::InvalidEventPayload { .. } => {
+                "Kiro EventStream payload is invalid".to_string()
+            }
+            wire::WireError::DuplicateHeader(_) => {
+                "Kiro EventStream has a duplicate header".to_string()
+            }
+            _ => error.to_string(),
+        };
+        Self::Wire { code, message }
     }
 }
 
 struct ToolJsonAccumulator {
     pending: HashMap<String, (String, String)>,
     rejected: HashSet<String>,
+    completed: HashSet<String>,
     buffered_bytes: usize,
     max_buffered_bytes: usize,
 }
@@ -2324,6 +2542,7 @@ impl Default for ToolJsonAccumulator {
         Self {
             pending: HashMap::new(),
             rejected: HashSet::new(),
+            completed: HashSet::new(),
             buffered_bytes: 0,
             max_buffered_bytes: MAX_TOOL_JSON_BYTES,
         }
@@ -2347,8 +2566,20 @@ impl ToolJsonAccumulator {
         stop: bool,
         tool_name_registry: &KiroToolNameRegistry,
     ) -> Result<Option<(String, String, String, Value)>, KiroToolJsonError> {
+        if self.completed.contains(tool_use_id) {
+            return Err(kiro_wire_contract_error(
+                "Kiro toolUseEvent reused a completed toolUseId",
+            ));
+        }
         if self.rejected.contains(tool_use_id) {
             return Ok(None);
+        }
+        if self.pending.get(tool_use_id).is_some_and(|(existing, _)| {
+            !existing.is_empty() && !name.is_empty() && existing != name
+        }) {
+            return Err(kiro_wire_contract_error(
+                "Kiro toolUseEvent changed the name for a toolUseId",
+            ));
         }
         let buffered_bytes = self.buffered_bytes.saturating_add(input.len());
         if buffered_bytes > self.max_buffered_bytes {
@@ -2377,6 +2608,11 @@ impl ToolJsonAccumulator {
             .remove(tool_use_id)
             .unwrap_or_else(|| (name.to_string(), input.to_string()));
         self.buffered_bytes = self.buffered_bytes.saturating_sub(input.len());
+        if kiro_name.trim().is_empty() {
+            return Err(kiro_wire_contract_error(
+                "Kiro toolUseEvent completed without a tool name",
+            ));
+        }
         let original_name = original_tool_name(&kiro_name, tool_name_registry)?;
         let parsed = if input.trim().is_empty() {
             json!({})
@@ -2387,6 +2623,7 @@ impl ToolJsonAccumulator {
                 message: error.to_string(),
             })?
         };
+        self.completed.insert(tool_use_id.to_string());
         Ok(Some((
             tool_use_id.to_string(),
             kiro_name.clone(),
@@ -2408,22 +2645,37 @@ impl ToolJsonAccumulator {
         self.rejected.insert(tool_use_id.clone());
     }
 
-    fn finish(&mut self) -> Result<(), KiroToolJsonError> {
-        let pending = self
-            .pending
-            .iter()
-            .max_by_key(|(_, (_, input))| input.len())
-            .map(|(id, (name, input))| (id.clone(), name.clone(), input.len()));
-        let Some((tool_use_id, name, bytes)) = pending else {
-            return Ok(());
-        };
-        self.pending.clear();
+    fn finish(
+        &mut self,
+        tool_name_registry: &KiroToolNameRegistry,
+    ) -> Result<Vec<(String, String, String, Value)>, KiroToolJsonError> {
+        let pending = std::mem::take(&mut self.pending);
         self.buffered_bytes = 0;
-        Err(KiroToolJsonError::Incomplete {
-            tool_use_id,
-            name,
-            bytes,
-        })
+        if let Some((tool_use_id, (name, input))) = pending
+            .iter()
+            .filter(|(_, (_, input))| !input.trim().is_empty())
+            .max_by_key(|(_, (_, input))| input.len())
+        {
+            return Err(KiroToolJsonError::Incomplete {
+                tool_use_id: tool_use_id.clone(),
+                name: name.clone(),
+                bytes: input.len(),
+            });
+        }
+        let mut recovered = pending.into_iter().collect::<Vec<_>>();
+        recovered.sort_by(|left, right| left.0.cmp(&right.0));
+        recovered
+            .into_iter()
+            .map(|(tool_use_id, (kiro_name, _))| {
+                if kiro_name.trim().is_empty() {
+                    return Err(kiro_wire_contract_error(
+                        "Kiro toolUseEvent completed without a tool name",
+                    ));
+                }
+                let original_name = original_tool_name(&kiro_name, tool_name_registry)?;
+                Ok((tool_use_id, kiro_name, original_name, json!({})))
+            })
+            .collect()
     }
 
     fn retained_bytes(&self) -> usize {
@@ -2450,6 +2702,15 @@ impl ToolJsonAccumulator {
                             .saturating_add(std::mem::size_of::<usize>() * 2),
                     )
                     .saturating_add(self.rejected.iter().map(String::capacity).sum::<usize>()),
+            )
+            .saturating_add(
+                self.completed
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<String>()
+                            .saturating_add(std::mem::size_of::<usize>() * 2),
+                    )
+                    .saturating_add(self.completed.iter().map(String::capacity).sum::<usize>()),
             )
     }
 }
@@ -2834,19 +3095,6 @@ fn kiro_event_stream_to_anthropic_sse(
             if let Some(memory) = stream_memory.as_ref() {
                 memory.release_decoded_frames(&decoder)?;
             }
-            if saw_end {
-                if let Some(memory) = stream_memory.as_ref() {
-                    memory.preflight_finish(&decoder)?;
-                }
-                let trailing = decoder
-                    .finish()
-                    .map_err(|error| kiro_stream_io_error(error.into()))?;
-                if let Some(memory) = stream_memory.as_ref() {
-                    memory.after_decode(&decoder, 0, &trailing)?;
-                    memory.release_decoded_frames(&decoder)?;
-                }
-                break;
-            }
         }
         if let Some(memory) = stream_memory.as_ref() {
             memory.preflight_finish(&decoder)?;
@@ -3111,9 +3359,10 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
             "Kiro EventStream ended before endEvent",
         ));
     }
-    if let Err(error) = tool_accumulator.finish() {
-        tool_accumulator.reject(&error);
-        tool_errors.push(error);
+    for (id, kiro_name, name, input) in tool_accumulator.finish(tool_name_registry)? {
+        let input = tool_bridge::input_from_kiro(&kiro_name, input);
+        seen_tool_signatures.insert(tool_signature(&name, &input));
+        tools.push((id, name, input));
     }
     for visible in tool_leak_filter.push_text("", true) {
         text.push_str(&visible);
@@ -3247,6 +3496,7 @@ struct KiroUsageAccumulator {
     context_window: u64,
     context_input_tokens: Option<i32>,
     metrics_input_tokens: Option<i32>,
+    has_provider_token_usage: bool,
     output_tokens: Option<i32>,
     cache_read_tokens: Option<i32>,
     cache_creation_tokens: Option<i32>,
@@ -3268,6 +3518,7 @@ impl KiroUsageAccumulator {
             context_window: context_window.max(1),
             context_input_tokens: None,
             metrics_input_tokens: None,
+            has_provider_token_usage: false,
             output_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
@@ -3337,7 +3588,7 @@ impl KiroUsageAccumulator {
             .get("messageMetadataEvent")
             .or_else(|| payload.get("metadataEvent"))
             .unwrap_or(payload);
-        if let Some(token_usage) = metadata.get("tokenUsage") {
+        if let Some(token_usage) = metadata.get("tokenUsage").filter(|value| value.is_object()) {
             let uncached = number_field(
                 token_usage,
                 &[
@@ -3370,39 +3621,35 @@ impl KiroUsageAccumulator {
             let input_total = uncached
                 .saturating_add(cache_read)
                 .saturating_add(cache_creation);
-            if input_total > 0 {
-                self.metrics_input_tokens = Some(input_total);
-            }
+            // tokenUsage is a final snapshot: zero is authoritative and a
+            // later metrics/context fallback must not replace it.
+            self.metrics_input_tokens = Some(input_total);
+            self.has_provider_token_usage = true;
             // The presence of tokenUsage is authoritative, including explicit
             // zero cache buckets. Never replace upstream zero with a local hit.
             self.cache_read_tokens = Some(cache_read);
             self.cache_creation_tokens = Some(cache_creation);
-            if let Some(tokens) = number_field(
-                token_usage,
-                &[
-                    "outputTokens",
-                    "output_tokens",
-                    "completionTokens",
-                    "completion_tokens",
-                ],
-            ) {
-                self.output_tokens = Some(tokens);
-            }
-            if let Some(percentage) = number_f64_field(
-                token_usage,
-                &["contextUsagePercentage", "context_usage_percentage"],
-            ) {
-                let tokens = (percentage * self.context_window as f64 / 100.0).floor() as i32;
-                if tokens > 0 && self.metrics_input_tokens.is_none() {
-                    self.context_input_tokens = Some(tokens);
-                }
-            }
+            self.output_tokens = Some(
+                number_field(
+                    token_usage,
+                    &[
+                        "outputTokens",
+                        "output_tokens",
+                        "completionTokens",
+                        "completion_tokens",
+                    ],
+                )
+                .unwrap_or(0),
+            );
         } else {
             self.apply_metrics(metadata);
         }
     }
 
     fn apply_metrics(&mut self, payload: &Value) {
+        if self.has_provider_token_usage {
+            return;
+        }
         let metrics = payload.get("metricsEvent").unwrap_or(payload);
         if let Some(tokens) = number_field(
             metrics,
@@ -4055,6 +4302,92 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_scope_does_not_reuse_same_generation_after_bearer_change() {
+        let mut account = server_account();
+        let body = json!({"model": "claude-sonnet-4", "metadata": {"session_id": "stable-session"}, "messages": []});
+        let original = KiroCallContext::fallback(&account, &body)
+            .unwrap()
+            .cache_namespace;
+        account.access_token = Some("replacement-access-token".to_string());
+        let replacement = KiroCallContext::fallback(&account, &body)
+            .unwrap()
+            .cache_namespace;
+        assert_ne!(original, replacement);
+        assert!(!original.contains("access-token"));
+        assert!(!replacement.contains("replacement-access-token"));
+        account.access_token = Some("access-token".to_string());
+        assert_eq!(
+            KiroCallContext::fallback(&account, &body)
+                .unwrap()
+                .cache_namespace,
+            original
+        );
+        account.profile.as_mut().unwrap()["machineId"] = json!("different-machine");
+        assert_ne!(
+            KiroCallContext::fallback(&account, &body)
+                .unwrap()
+                .cache_namespace,
+            original
+        );
+    }
+
+    #[test]
+    fn prompt_cache_identity_survives_sqlite_restart_but_not_credential_change() {
+        let account = server_account();
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "metadata": {"session_id": "stable-session"},
+            "system": [{
+                "type": "text",
+                "text": "stable system prompt ".repeat(100),
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            }],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let namespace = KiroCallContext::fallback(&account, &body)
+            .unwrap()
+            .cache_namespace;
+        let base = std::env::temp_dir().join(format!(
+            "cc-switch-kiro-prompt-identity-{}",
+            request_scoped_session_id()
+        ));
+        {
+            let cache = KiroPromptCache::new(Some(base.clone()));
+            assert_eq!(
+                cache.compute_usage(&body, &namespace).cache_read_estimate,
+                0
+            );
+        }
+        let cache = KiroPromptCache::new(Some(base.clone()));
+        let restored_namespace = KiroCallContext::fallback(&account.clone(), &body)
+            .unwrap()
+            .cache_namespace;
+        assert_eq!(namespace, restored_namespace);
+        assert!(
+            cache
+                .compute_usage(&body, &restored_namespace)
+                .cache_read_estimate
+                > 0
+        );
+        let mut changed = account;
+        changed.access_token = Some("replacement-access-token".to_string());
+        let changed_namespace = KiroCallContext::fallback(&changed, &body)
+            .unwrap()
+            .cache_namespace;
+        assert_eq!(
+            cache
+                .compute_usage(&body, &changed_namespace)
+                .cache_read_estimate,
+            0
+        );
+        drop(cache);
+        let sqlite_path = base.with_extension("sqlite");
+        let _ = std::fs::remove_file(&sqlite_path);
+        let _ = std::fs::remove_file(sqlite_path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(sqlite_path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
     fn account_data_from_server_account_preserves_kiro_profile() {
         let account = server_account();
         let data = KiroAccountData::from_account(&account).unwrap();
@@ -4210,6 +4543,70 @@ mod tests {
             Some(&json!("claude-sonnet-4.8"))
         );
         assert!(request.tool_name_map.is_empty());
+    }
+
+    #[test]
+    fn prepared_request_rejects_images_in_positions_it_cannot_carry() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let image =
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}});
+        for body in [
+            json!({
+                "model":"claude-sonnet-4-8",
+                "system":[image.clone()],
+                "messages":[{"role":"user","content":"describe this"}]
+            }),
+            json!({
+                "model":"claude-sonnet-4-8",
+                "messages":[
+                    {"role":"assistant","content":[image.clone()]},
+                    {"role":"user","content":"describe this"}
+                ]
+            }),
+            json!({
+                "model":"claude-sonnet-4-8",
+                "messages":[{"role":"user","content":image.clone()}]
+            }),
+            json!({
+                "model":"claude-sonnet-4-8",
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"describe this"},
+                    {"type":"tool_result","tool_use_id":"tool-1","content":image.clone()}
+                ]}]
+            }),
+        ] {
+            let error = prepare_kiro_request(&server_account(), &body).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("image"));
+            assert!(!error.message.contains(PNG));
+        }
+    }
+
+    #[test]
+    fn prepared_request_keeps_supported_user_and_tool_result_images() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let image =
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}});
+        for content in [
+            json!([{"type":"text","text":"describe this"}, image.clone()]),
+            json!([{"type":"text","text":"describe this"}, {
+                "type":"tool_result","tool_use_id":"tool-1","content":[image.clone()]
+            }]),
+        ] {
+            let body = json!({
+                "model":"claude-sonnet-4-8",
+                "messages":[{"role":"user","content":content}]
+            });
+            let request = prepare_kiro_request(&server_account(), &body).unwrap();
+            assert_eq!(
+                request
+                    .body
+                    .pointer("/conversationState/currentMessage/userInputMessage/images")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                Some(1)
+            );
+        }
     }
 
     #[test]
@@ -4550,6 +4947,61 @@ mod tests {
         assert_eq!(builtin.resolve("fs_write").unwrap(), "Write");
     }
 
+    #[tokio::test]
+    async fn ambiguous_bare_tool_error_does_not_echo_name_across_output_paths() {
+        let upstream_name = "private-child-name";
+        let mut registry = KiroToolNameRegistry::default();
+        registry.register(
+            "mcp__alpha__private-child-name",
+            "mcp__alpha__private-child-name",
+        );
+        registry.register(
+            "mcp__beta__private-child-name",
+            "mcp__beta__private-child-name",
+        );
+        let bytes = event_stream_bytes(vec![(
+            "toolUseEvent",
+            json!({"toolUseId":"toolu_private","name":upstream_name,"input":"{}","stop":true}),
+        )]);
+        let error = kiro_event_bytes_to_anthropic_json_with_context_window(
+            &bytes,
+            "claude-sonnet-4-8",
+            &registry,
+            KiroPromptCacheUsage::default(),
+            200_000,
+        )
+        .expect_err("ambiguous tool must fail non-stream conversion");
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+        assert!(!error.to_string().contains(upstream_name));
+
+        let upstream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(bytes))]);
+        let output = kiro_event_stream_to_anthropic_sse(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            registry,
+            Ok(KiroPromptCacheUsage::default()),
+            None,
+            None,
+            200_000,
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let errors = output
+            .iter()
+            .filter_map(|item| item.as_ref().err())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("KIRO_EVENT_STREAM_INVALID"));
+        assert!(!errors[0].contains(upstream_name));
+        assert!(!output
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .any(|chunk| String::from_utf8_lossy(chunk).contains("event: message_stop")));
+    }
+
     #[test]
     fn request_tool_registry_excludes_names_seen_only_in_history() {
         let historical_name = format!("mcp__history__{}", "read".repeat(24));
@@ -4670,6 +5122,57 @@ mod tests {
         assert_eq!(leaked[0].name, "Read");
         assert_eq!(leaked[0].input["file_path"], json!("Cargo.toml"));
         assert_eq!(leaked[0].input["query"], json!("a & b <c>"));
+    }
+
+    #[test]
+    fn kiro_literal_tool_use_xml_does_not_escape_alongside_native_tool_event() {
+        let bytes = event_stream_bytes(vec![
+            (
+                "assistantResponseEvent",
+                json!({"content":"before <tool_use id=\"toolu_native\" name=\"Read\">{\"file_path\":\"Cargo.toml\"}</tool_use> after"}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_native","name":"Read","input":"{\"file_path\":\"Cargo.toml\"}","stop":true}),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            message.pointer("/content/0/text"),
+            Some(&json!("before  after"))
+        );
+        assert_eq!(message.pointer("/content/1/type"), Some(&json!("tool_use")));
+        assert_eq!(message["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn kiro_literal_tool_use_filter_handles_split_tags_and_preserves_lookalikes() {
+        let mut filter = ToolLeakFilter::default();
+        let visible = [
+            filter.push_text("before <tool_", false),
+            filter.push_text("use id=\"x\">secret</tool_", false),
+            filter.push_text("use> after <tool_user> stays", false),
+            filter.push_text("", true),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<String>();
+        assert_eq!(visible, "before  after <tool_user> stays");
+        assert!(filter.take_deduped(&mut HashSet::new()).is_empty());
+
+        let mut truncated = ToolLeakFilter::default();
+        let visible = truncated
+            .push_text("safe <tool_use id=\"x\">private", false)
+            .into_iter()
+            .chain(truncated.push_text("", true))
+            .collect::<String>();
+        assert_eq!(visible, "safe ");
     }
 
     #[test]
@@ -4823,6 +5326,56 @@ mod tests {
             Some(&json!("redacted_thinking"))
         );
         assert_eq!(message.pointer("/content/0/data"), Some(&json!("opaque")));
+    }
+
+    #[tokio::test]
+    async fn malformed_reasoning_fields_fail_both_response_rails_without_a_success_terminal() {
+        let bytes = event_stream_bytes(vec![
+            ("assistantResponseEvent", json!({"content":"visible"})),
+            (
+                "reasoningContentEvent",
+                json!({"reasoningContentEvent":{"redactedContent":{"secret":"kiro-reasoning-secret"}}}),
+            ),
+        ]);
+        let error = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-opus-4-6",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+        assert!(!error.to_string().contains("kiro-reasoning-secret"));
+
+        let upstream =
+            futures_util::stream::iter([Bytes::from(bytes)]).map(Ok::<Bytes, reqwest::Error>);
+        let output = kiro_event_stream_to_anthropic_sse(
+            upstream,
+            "claude-opus-4-6".to_string(),
+            KiroToolNameRegistry::default(),
+            Ok(KiroPromptCacheUsage::default()),
+            None,
+            None,
+            1_000_000,
+            None,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let errors = output
+            .iter()
+            .filter_map(|item| item.as_ref().err())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("KIRO_EVENT_STREAM_INVALID")));
+        assert!(errors
+            .iter()
+            .all(|error| !error.contains("kiro-reasoning-secret")));
+        assert!(!output
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .any(|chunk| { String::from_utf8_lossy(chunk).contains("message_stop") }));
     }
 
     #[test]
@@ -5024,6 +5577,52 @@ mod tests {
     }
 
     #[test]
+    fn kiro_metadata_zero_input_snapshot_overrides_context_and_prior_metrics() {
+        let mut usage = KiroUsageAccumulator::with_context_window(1_000_000);
+        usage.apply_event(
+            "contextUsageEvent",
+            &json!({ "contextUsagePercentage": 2.0 }),
+        );
+        usage.apply_event("metricsEvent", &json!({ "inputTokens": 123 }));
+        usage.apply_event(
+            "metadataEvent",
+            &json!({ "tokenUsage": { "outputTokens": 9 } }),
+        );
+
+        let final_usage = usage.final_usage(1);
+        assert_eq!(final_usage.input_tokens, 0);
+        assert_eq!(final_usage.output_tokens, 9);
+        assert_eq!(final_usage.cache_read_tokens, 0);
+        assert_eq!(final_usage.cache_creation_tokens, 0);
+        assert_eq!(final_usage.cache_usage_source, "upstream_token_usage");
+
+        usage.apply_event(
+            "metricsEvent",
+            &json!({ "inputTokens": 77, "outputTokens": 77 }),
+        );
+        usage.apply_event(
+            "contextUsageEvent",
+            &json!({ "contextUsagePercentage": 5.0 }),
+        );
+        assert_eq!(usage.final_usage(1).input_tokens, 0);
+        assert_eq!(usage.final_usage(1).output_tokens, 9);
+
+        usage.apply_event(
+            "metadataEvent",
+            &json!({ "tokenUsage": { "uncachedInputTokens": 42, "outputTokens": 3 } }),
+        );
+        assert_eq!(usage.final_usage(1).input_tokens, 42);
+        assert_eq!(usage.final_usage(1).output_tokens, 3);
+
+        usage.apply_event(
+            "metadataEvent",
+            &json!({ "tokenUsage": { "uncachedInputTokens": 4 } }),
+        );
+        assert_eq!(usage.final_usage(1).input_tokens, 4);
+        assert_eq!(usage.final_usage(1).output_tokens, 0);
+    }
+
+    #[test]
     fn kiro_metrics_input_overrides_context_usage_when_available() {
         let mut usage = KiroUsageAccumulator::with_context_window(1_000_000);
         usage.apply_event(
@@ -5055,6 +5654,35 @@ mod tests {
         let usage = usage.final_usage(1);
         assert_eq!(usage.input_tokens, 123);
         assert_eq!(usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn kiro_context_output_subtraction_remains_shadow_only_without_live_receipt() {
+        let mut usage = KiroUsageAccumulator::with_context_window(100);
+        usage.apply_event(
+            "contextUsageEvent",
+            &json!({ "contextUsagePercentage": 80.0 }),
+        );
+        usage.apply_event("metricsEvent", &json!({ "outputTokens": 9 }));
+        let reported = usage.final_usage(9);
+        let shadow_input = usage
+            .context_input_tokens
+            .unwrap()
+            .saturating_sub(reported.output_tokens)
+            .max(0);
+        assert_eq!((reported.input_tokens, reported.output_tokens), (80, 9));
+        assert_eq!(shadow_input, 71);
+
+        usage.apply_event("metricsEvent", &json!({ "inputTokens": 123 }));
+        assert_eq!(usage.final_usage(9).input_tokens, 123);
+        usage.apply_event(
+            "messageMetadataEvent",
+            &json!({ "tokenUsage": { "uncachedInputTokens": 100, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 9 } }),
+        );
+        let reported = usage.final_usage(9);
+        assert_eq!(reported.input_tokens, 100);
+        assert_eq!(reported.cache_read_tokens, 0);
+        assert_eq!(reported.cache_creation_tokens, 0);
     }
 
     #[test]
@@ -5175,6 +5803,151 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_rejects_ambiguous_top_level_object_alternatives() {
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            let mut schema = json!({});
+            schema[combinator] = json!([
+                {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            ]);
+            let tools = json!([{"name":"lookup","input_schema":schema}]);
+            let error = convert_tools(
+                Some(&tools),
+                &mut HashMap::new(),
+                &mut KiroToolNameRegistry::default(),
+                ToolCompatibilityMode::Raw,
+            )
+            .expect_err("multiple object branches cannot be collapsed to one tool schema");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn tool_schema_rejects_top_level_combinators_without_one_explicit_object() {
+        for schema in [
+            json!({"oneOf": [{"type": "string"}, {"type": "number"}]}),
+            json!({"oneOf": [{"type": "object"}, {"type": "string"}]}),
+            json!({"oneOf": [{"properties": {"path": {"type": "string"}}}]}),
+            json!({"oneOf": []}),
+            json!({"oneOf": {"type": "object"}}),
+            json!({"oneOf": [{"type": ["object", "string"]}]}),
+            json!({"allOf": [{"type": "object"}], "properties": {"path": {"type": "string"}}}),
+        ] {
+            let tools = json!([{"name": "lookup", "input_schema": schema}]);
+            let error = convert_tools(
+                Some(&tools),
+                &mut HashMap::new(),
+                &mut KiroToolNameRegistry::default(),
+                ToolCompatibilityMode::Raw,
+            )
+            .expect_err("unsupported top-level combination cannot be silently stripped");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn claude_code_single_object_variant_maps_builtin_property_names() {
+        let tools = json!([{
+            "name": "Read",
+            "input_schema": {
+                "oneOf": [{
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                }]
+            }
+        }]);
+        let converted = convert_tools(
+            Some(&tools),
+            &mut HashMap::new(),
+            &mut KiroToolNameRegistry::default(),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
+        let schema = &converted[0]["toolSpecification"]["inputSchema"]["json"];
+        assert_eq!(converted[0]["toolSpecification"]["name"], "read_file");
+        assert!(schema.pointer("/properties/path").is_some());
+        assert_eq!(schema["required"], json!(["path"]));
+        assert!(schema.pointer("/properties/file_path").is_none());
+    }
+
+    #[test]
+    fn claude_code_builtin_schema_rejects_colliding_alias_properties() {
+        let tools = json!([{
+            "name": "Write",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "path": {"type": "integer"}
+                },
+                "required": ["file_path", "path"]
+            }
+        }]);
+        let error = convert_tools(
+            Some(&tools),
+            &mut HashMap::new(),
+            &mut KiroToolNameRegistry::default(),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .expect_err("two client properties cannot map onto one Kiro property");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn claude_code_history_rejects_colliding_builtin_input_aliases() {
+        let body = json!({
+            "model": "claude-sonnet-4-8",
+            "messages": [
+                {"role":"user","content":"write a file"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"toolu_alias","name":"Write",
+                    "input":{"file_path":"safe.txt","path":"other.txt","content":"hello"}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"toolu_alias","content":"ok"
+                }]}
+            ],
+            "tools":[{"name":"Write","input_schema":{
+                "type":"object","properties":{"file_path":{"type":"string"}}
+            }}]
+        });
+        let result =
+            anthropic_to_kiro_request(&body, &test_account(), ToolCompatibilityMode::ClaudeCode);
+        assert!(
+            result.is_err(),
+            "ambiguous history input must fail before wire encoding"
+        );
+    }
+
+    #[test]
+    fn claude_code_read_pages_inside_single_object_variant_is_rejected() {
+        let tools = json!([{
+            "name": "Read",
+            "input_schema": {"oneOf": [{
+                "type": "object",
+                "properties": {"pages": {"type": "string"}}
+            }]}
+        }]);
+        let error = convert_tools(
+            Some(&tools),
+            &mut HashMap::new(),
+            &mut KiroToolNameRegistry::default(),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .expect_err("Read.pages cannot be preserved through oneOf expansion");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn non_streaming_tool_json_requires_valid_stopped_input() {
         let valid = event_stream_bytes(vec![
             (
@@ -5244,6 +6017,88 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "TOOL_JSON_INCOMPLETE");
         assert!(!error.to_string().contains("file_path"));
+    }
+
+    #[tokio::test]
+    async fn tool_use_fragments_preserve_one_id_and_name_binding() {
+        for events in [
+            vec![
+                json!({"toolUseId":"toolu_bound","name":"Read","input":"{\"x\":","stop":false}),
+                json!({"toolUseId":"toolu_bound","name":"Write","input":"1}","stop":true}),
+            ],
+            vec![
+                json!({"toolUseId":"toolu_bound","name":"Read","input":"{}","stop":true}),
+                json!({"toolUseId":"toolu_bound","name":"Read","input":"{}","stop":true}),
+            ],
+        ] {
+            let bytes = event_stream_bytes(
+                events
+                    .iter()
+                    .cloned()
+                    .map(|event| ("toolUseEvent", event))
+                    .collect(),
+            );
+            let error = kiro_event_bytes_to_anthropic_json(
+                &bytes,
+                "claude-sonnet-4-8",
+                &HashMap::new(),
+                KiroPromptCacheUsage::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+
+            let upstream =
+                futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(bytes))]);
+            let output = kiro_event_stream_to_claude_sse(
+                upstream,
+                "claude-sonnet-4-8".to_string(),
+                HashMap::new(),
+                &json!({"model":"claude-sonnet-4-8","messages":[]}),
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert!(output.iter().any(|item| item
+                .as_ref()
+                .is_err_and(|error| { error.to_string().contains("KIRO_EVENT_STREAM_INVALID") })));
+            assert!(!output
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .any(|chunk| { String::from_utf8_lossy(chunk).contains("event: message_stop") }));
+
+            let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+            let mut rejected = false;
+            for event in events {
+                rejected |= builder
+                    .tool_delta(
+                        "toolu_bound",
+                        event["name"].as_str().unwrap(),
+                        event["input"].as_str().unwrap(),
+                        event["stop"].as_bool().unwrap(),
+                    )
+                    .is_err();
+            }
+            assert!(rejected, "streaming builder must reject identity drift");
+        }
+
+        let completed = event_stream_bytes(vec![
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_bound","name":"","input":"{\"x\":","stop":false}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_bound","name":"Read","input":"1}","stop":true}),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &completed,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(message["content"][0]["name"], "Read");
+        assert_eq!(message["content"][0]["input"], json!({"x":1}));
     }
 
     #[test]
@@ -5319,6 +6174,257 @@ mod tests {
         );
         assert_eq!(message.pointer("/content/1"), None);
         assert_eq!(message.get("stop_reason"), Some(&json!("end_turn")));
+    }
+
+    #[test]
+    fn kiro_unstopped_zero_byte_tools_recover_in_both_surfaces() {
+        let bytes = event_stream_bytes(vec![
+            ("assistantResponseEvent", json!({"content":"before"})),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_z","name":"Read","input":"","stop":false}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_a","name":"Write","input":"","stop":false}),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(message["content"][0]["text"], "before");
+        assert_eq!(message["content"][1]["id"], "toolu_a");
+        assert_eq!(message["content"][1]["input"], json!({}));
+        assert_eq!(message["content"][2]["id"], "toolu_z");
+        assert_eq!(message["content"][2]["input"], json!({}));
+        assert_eq!(message["stop_reason"], "tool_use");
+
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        let mut output = builder.assistant_delta("before");
+        assert!(builder
+            .tool_delta("toolu_z", "Read", "", false)
+            .unwrap()
+            .is_empty());
+        assert!(builder
+            .tool_delta("toolu_a", "Write", "", false)
+            .unwrap()
+            .is_empty());
+        output.extend(builder.finish_events().unwrap());
+        let output = output
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.find("toolu_a").unwrap() < output.find("toolu_z").unwrap());
+        assert!(output.contains("\"stop_reason\":\"tool_use\""));
+        assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn kiro_unstopped_whitespace_only_tool_matches_stopped_empty_input() {
+        let bytes = event_stream_bytes(vec![(
+            "toolUseEvent",
+            json!({"toolUseId":"toolu_whitespace","name":"Read","input":" \n\t ","stop":false}),
+        )]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(message["content"][0]["id"], "toolu_whitespace");
+        assert_eq!(message["content"][0]["input"], json!({}));
+
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        assert!(builder
+            .tool_delta("toolu_whitespace", "Read", " \n\t ", false)
+            .unwrap()
+            .is_empty());
+        let output = builder
+            .finish_events()
+            .unwrap()
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("toolu_whitespace"));
+        assert!(output.contains("\"stop_reason\":\"tool_use\""));
+        assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn kiro_unstopped_nonempty_tool_is_error_before_success_terminal() {
+        let bytes = event_stream_bytes(vec![
+            ("assistantResponseEvent", json!({"content":"before"})),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_empty","name":"Read","input":"","stop":false}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_half","name":"Write","input":"{\"x\":" ,"stop":false}),
+            ),
+        ]);
+        let error = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "TOOL_JSON_INCOMPLETE");
+
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+        builder.assistant_delta("before");
+        assert!(builder
+            .tool_delta("toolu_empty", "Read", "", false)
+            .unwrap()
+            .is_empty());
+        assert!(builder
+            .tool_delta("toolu_half", "Write", "{\"x\":", false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            builder.finish_events().unwrap_err().code(),
+            "TOOL_JSON_INCOMPLETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_errors_do_not_echo_upstream_identifiers() {
+        for (input, stop, code) in [
+            ("{\"x\":", true, "TOOL_JSON_INVALID"),
+            ("{\"x\":", false, "TOOL_JSON_INCOMPLETE"),
+        ] {
+            let secret = "Bearer_tool_private_marker";
+            let bytes = event_stream_bytes(vec![(
+                "toolUseEvent",
+                json!({"toolUseId": secret, "name": secret, "input": input, "stop": stop}),
+            )]);
+            let error = kiro_event_bytes_to_anthropic_json(
+                &bytes,
+                "claude-sonnet-4-8",
+                &HashMap::new(),
+                KiroPromptCacheUsage::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), code);
+            assert!(!error.to_string().contains(secret));
+
+            let upstream =
+                futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(bytes))]);
+            let output = kiro_event_stream_to_claude_sse(
+                upstream,
+                "claude-sonnet-4-8".to_string(),
+                HashMap::new(),
+                &json!({"model": "claude-sonnet-4-8", "messages": []}),
+            );
+            tokio::pin!(output);
+            assert!(output.next().await.unwrap().is_ok());
+            let error = output.next().await.unwrap().unwrap_err();
+            assert!(!error.to_string().contains(secret));
+        }
+    }
+
+    #[test]
+    fn kiro_unstopped_empty_tool_restores_request_scoped_namespace() {
+        let mut tool_name_map = HashMap::new();
+        tool_name_map.insert("mcp__repo__read".to_string(), "mcp__repo__read".to_string());
+        let bytes = event_stream_bytes(vec![(
+            "toolUseEvent",
+            json!({"toolUseId":"toolu_namespace","name":"read","input":"","stop":false}),
+        )]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &tool_name_map,
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(message["content"][0]["name"], "mcp__repo__read");
+        assert_eq!(message["content"][0]["input"], json!({}));
+
+        let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), tool_name_map);
+        builder
+            .tool_delta("toolu_namespace", "read", "", false)
+            .unwrap();
+        let output = builder
+            .finish_events()
+            .unwrap()
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(output.contains("mcp__repo__read"));
+    }
+
+    #[test]
+    fn kiro_tool_without_any_name_cannot_become_a_successful_tool_call() {
+        for (label, tool_event) in [
+            (
+                "stopped",
+                json!({"toolUseId":"toolu_missing","input":"{}","stop":true}),
+            ),
+            (
+                "unstopped empty",
+                json!({"toolUseId":"toolu_missing","input":"","stop":false}),
+            ),
+        ] {
+            let bytes = event_stream_bytes(vec![("toolUseEvent", tool_event)]);
+            let error = kiro_event_bytes_to_anthropic_json(
+                &bytes,
+                "claude-sonnet-4-8",
+                &HashMap::new(),
+                KiroPromptCacheUsage::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID", "{label}");
+
+            let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
+            if label == "stopped" {
+                assert_eq!(
+                    builder
+                        .tool_delta("toolu_missing", "", "{}", true)
+                        .unwrap_err()
+                        .code(),
+                    "KIRO_EVENT_STREAM_INVALID"
+                );
+            } else {
+                assert!(builder
+                    .tool_delta("toolu_missing", "", "", false)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    builder.finish_events().unwrap_err().code(),
+                    "KIRO_EVENT_STREAM_INVALID"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_tool_continuation_may_omit_a_previously_supplied_name() {
+        let bytes = event_stream_bytes(vec![
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_named","name":"Read","input":"{","stop":false}),
+            ),
+            (
+                "toolUseEvent",
+                json!({"toolUseId":"toolu_named","input":"}","stop":true}),
+            ),
+        ]);
+        let message = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap();
+        assert_eq!(message["content"][0]["name"], "Read");
+        assert_eq!(message["content"][0]["input"], json!({}));
     }
 
     #[test]
@@ -5521,6 +6627,65 @@ mod tests {
         assert!(error.to_string().contains("between complete frames"));
     }
 
+    #[tokio::test]
+    async fn streaming_end_event_requires_upstream_eof_without_trailing_bytes() {
+        let prefix = [
+            fixture_event_frame("assistantResponseEvent", &json!({"content": "ok"})),
+            fixture_event_frame("endEvent", &json!({})),
+        ]
+        .concat();
+        let late = fixture_event_frame("assistantResponseEvent", &json!({"content": "late"}));
+        for (name, tail) in [
+            ("complete_frame", late.clone()),
+            ("truncated_frame", late[..late.len() - 1].to_vec()),
+        ] {
+            let upstream =
+                futures_util::stream::iter([Bytes::from(prefix.clone()), Bytes::from(tail)])
+                    .map(Ok::<Bytes, reqwest::Error>);
+            let stream = kiro_event_stream_to_anthropic_sse(
+                upstream,
+                "claude-sonnet-4-8".to_string(),
+                KiroToolNameRegistry::default(),
+                Ok(KiroPromptCacheUsage::default()),
+                None,
+                None,
+                1_000_000,
+                None,
+            );
+            let output: Vec<_> = stream.collect().await;
+            assert!(
+                output.iter().any(Result::is_err),
+                "{name}: endEvent must not hide trailing bytes"
+            );
+            assert!(
+                !output
+                    .iter()
+                    .filter_map(|item| item.as_ref().ok())
+                    .any(|chunk| String::from_utf8_lossy(chunk).contains("message_stop")),
+                "{name}: a failed stream must not emit message_stop"
+            );
+        }
+
+        let upstream =
+            futures_util::stream::iter([Bytes::from(prefix)]).map(Ok::<Bytes, reqwest::Error>);
+        let stream = kiro_event_stream_to_anthropic_sse(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            KiroToolNameRegistry::default(),
+            Ok(KiroPromptCacheUsage::default()),
+            None,
+            None,
+            1_000_000,
+            None,
+        );
+        let output: Vec<_> = stream.collect().await;
+        assert!(output.iter().all(Result::is_ok));
+        assert!(output
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .any(|chunk| String::from_utf8_lossy(chunk).contains("message_stop")));
+    }
+
     #[test]
     fn detects_terminal_kiro_client_validation_reasons() {
         assert!(is_client_validation_error(
@@ -5660,18 +6825,151 @@ mod tests {
         assert!(error.to_string().contains("after endEvent"));
     }
 
+    #[test]
+    fn upstream_event_stream_errors_do_not_echo_untrusted_diagnostics() {
+        for message_type in ["error", "exception"] {
+            let error = wire::WireError::Upstream {
+                message_type: message_type.to_string(),
+                code: Some("Bearer kiro-header-secret".to_string()),
+                message: "Authorization: Bearer kiro-body-secret".to_string(),
+            };
+            let downstream = KiroToolJsonError::from(error);
+            assert_eq!(downstream.code(), "KIRO_UPSTREAM_STREAM_ERROR");
+            assert_eq!(downstream.to_string(), "Kiro upstream stream error");
+            assert_eq!(
+                kiro_stream_io_error(downstream).to_string(),
+                "[KIRO_UPSTREAM_STREAM_ERROR] Kiro upstream stream error"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_event_stream_diagnostics_do_not_echo_untrusted_header_values() {
+        for error in [
+            wire::WireError::InvalidEventPayload {
+                event_type: "Bearer kiro-event-secret".to_string(),
+                message: "invalid JSON".to_string(),
+            },
+            wire::WireError::DuplicateHeader("Bearer kiro-header-secret".to_string()),
+        ] {
+            let downstream = KiroToolJsonError::from(error);
+            assert_eq!(downstream.code(), "KIRO_EVENT_STREAM_INVALID");
+            assert!(!downstream.to_string().contains("kiro-"));
+            assert!(!kiro_stream_io_error(downstream)
+                .to_string()
+                .contains("kiro-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_event_stream_frames_are_redacted_on_both_output_paths() {
+        let mut unknown_event_headers = Vec::new();
+        push_string_header(
+            &mut unknown_event_headers,
+            ":event-type",
+            "Bearer kiro-event-secret",
+        );
+        let mut duplicate_headers = Vec::new();
+        push_string_header(
+            &mut duplicate_headers,
+            ":event-type",
+            "assistantResponseEvent",
+        );
+        for _ in 0..2 {
+            push_string_header(&mut duplicate_headers, "kiro-header-secret", "value");
+        }
+        for frame in [
+            event_frame_with_headers(&unknown_event_headers, b"{invalid-json"),
+            event_frame_with_headers(&duplicate_headers, br#"{"content":"ok"}"#),
+        ] {
+            let error = kiro_event_bytes_to_anthropic_json(
+                &frame,
+                "claude-sonnet-4-8",
+                &HashMap::new(),
+                KiroPromptCacheUsage::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+            assert!(!error.to_string().contains("kiro-event-secret"));
+            assert!(!error.to_string().contains("kiro-header-secret"));
+
+            let upstream =
+                futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(frame))]);
+            let output = kiro_event_stream_to_claude_sse(
+                upstream,
+                "claude-sonnet-4-8".to_string(),
+                HashMap::new(),
+                &json!({"model":"claude-sonnet-4-8","messages":[]}),
+            )
+            .collect::<Vec<_>>()
+            .await;
+            let errors = output
+                .iter()
+                .filter_map(|item| item.as_ref().err())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert!(errors
+                .iter()
+                .any(|message| message.contains("KIRO_EVENT_STREAM_INVALID")));
+            assert!(errors
+                .iter()
+                .all(|message| !message.contains("kiro-event-secret")));
+            assert!(errors
+                .iter()
+                .all(|message| !message.contains("kiro-header-secret")));
+        }
+    }
+
+    #[tokio::test]
+    async fn fractional_metadata_token_usage_fails_both_output_paths_without_success_terminal() {
+        let bytes = event_stream_bytes(vec![
+            ("assistantResponseEvent", json!({"content":"hello"})),
+            ("metadataEvent", json!({"tokenUsage":{"outputTokens":2.75}})),
+        ]);
+        let error = kiro_event_bytes_to_anthropic_json(
+            &bytes,
+            "claude-sonnet-4-8",
+            &HashMap::new(),
+            KiroPromptCacheUsage::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "KIRO_EVENT_STREAM_INVALID");
+
+        let upstream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(bytes))]);
+        let output = kiro_event_stream_to_claude_sse(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            HashMap::new(),
+            &json!({"model":"claude-sonnet-4-8","messages":[]}),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().any(|item| item
+            .as_ref()
+            .is_err_and(|error| { error.to_string().contains("KIRO_EVENT_STREAM_INVALID") })));
+        assert!(!output
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .any(|chunk| { String::from_utf8_lossy(chunk).contains("event: message_stop") }));
+    }
+
     fn event_frame(event_type: &str, payload: Value) -> Vec<u8> {
         let mut headers = Vec::new();
         push_string_header(&mut headers, ":event-type", event_type);
         let payload = serde_json::to_vec(&payload).unwrap();
+        event_frame_with_headers(&headers, &payload)
+    }
+
+    fn event_frame_with_headers(headers: &[u8], payload: &[u8]) -> Vec<u8> {
         let total_len = 12 + headers.len() + payload.len() + 4;
         let mut frame = Vec::with_capacity(total_len);
         frame.extend_from_slice(&(total_len as u32).to_be_bytes());
         frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
         let prelude_crc = crc32(&frame[..8]);
         frame.extend_from_slice(&prelude_crc.to_be_bytes());
-        frame.extend_from_slice(&headers);
-        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(headers);
+        frame.extend_from_slice(payload);
         let message_crc = crc32(&frame);
         frame.extend_from_slice(&message_crc.to_be_bytes());
         frame

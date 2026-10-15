@@ -18,6 +18,19 @@ const contract = JSON.parse(
 const HARNESS_REVISION = 1;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const PLAN_MAX_AGE_MS = 15 * 60 * 1_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + 5 * 60_000;
+}
+
+function freshPlanTimestamp(observedAtMs, now = Date.now()) {
+  return Number.isFinite(observedAtMs) &&
+    observedAtMs >= now - PLAN_MAX_AGE_MS &&
+    observedAtMs <= now + 60_000;
+}
 
 const operationSpecs = Object.freeze({
   oauth_inference: Object.freeze({
@@ -218,16 +231,119 @@ if (!/^(authorization|x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
 if (!path.isAbsolute(receiptFile)) {
   fail("Claude receipt file must be an absolute path");
 }
-const receiptPath = path.resolve(receiptFile);
-const receiptRelative = path.relative(repoRoot, receiptPath);
+const requestedReceiptPath = path.resolve(receiptFile);
+const receiptRelative = path.relative(repoRoot, requestedReceiptPath);
 if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("Claude receipt file must stay outside the repository");
 }
-if (!fs.existsSync(receiptPath) || !fs.statSync(receiptPath).isFile()) {
+if (!fs.existsSync(requestedReceiptPath) || !fs.statSync(requestedReceiptPath).isFile()) {
   fail("Claude receipt file is unavailable");
 }
-if (!fixtureMode && (fs.statSync(receiptPath).mode & 0o777) !== 0o600) {
+let receiptPath;
+try {
+  receiptPath = fs.realpathSync(requestedReceiptPath);
+} catch {
+  fail("Claude receipt file is unavailable");
+}
+const resolvedReceiptRelative = path.relative(repoRoot, receiptPath);
+if (!resolvedReceiptRelative.startsWith("..") && !path.isAbsolute(resolvedReceiptRelative)) {
+  fail("Claude receipt file must stay outside the repository");
+}
+const receiptStat = fs.statSync(receiptPath);
+if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("Claude receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("Claude receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Claude receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("Claude receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("Claude receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("Claude receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("Claude receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Claude receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("Claude receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("Claude receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -263,10 +379,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -314,10 +451,16 @@ async function validateAccount() {
     !Number.isSafeInteger(account.tokenRefreshGeneration) ||
     account.tokenRefreshGeneration < 0 ||
     account.hasAccessToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false
   ) {
     fail("Claude Account is not a live OAuth identity generation");
+  }
+  if (
+    (operation === "oauth_inference" || spec.expectedPlan !== null) &&
+    (account.credentialCapability !== "refreshable_oauth" || account.hasRefreshToken !== true)
+  ) {
+    fail("Claude operation requires a refreshable OAuth Account");
   }
   return account;
 }
@@ -365,27 +508,36 @@ async function validateBinding(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Claude Share",
   );
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
-  if (
-    !bindings.some(
-      (binding) =>
-        binding?.app === "claude" &&
-        binding?.providerId === providerId &&
-        binding?.providerType === "claude_oauth",
-    )
-  ) {
-    fail("Claude Share is not fixed to the selected Provider");
+  if (share.enabled !== true || share.status !== "active") {
+    fail("selected Claude Share is not active");
   }
-  const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-  const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
-  const shareRevision = share.configRevision ?? 0;
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
+  if (
+    primaryBindings.length !== 1 ||
+    primaryBindings[0]?.providerId !== share.providerId ||
+    primaryBindings[0]?.providerType !== share.providerType
+  ) {
+    fail("Claude Share primary fields do not match its one App binding");
+  }
+  const claudeBindings = bindings.filter((binding) => binding?.app === "claude");
+  if (
+    claudeBindings.length !== 1 ||
+    claudeBindings[0]?.providerId !== providerId ||
+    claudeBindings[0]?.providerType !== "claude_oauth"
+  ) {
+    fail("Claude Share does not have one exact selected Provider binding");
+  }
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
+  const shareRevision = share.configRevision;
   if (
     !Number.isSafeInteger(providerRevision) ||
     providerRevision < 0 ||
-    !runtimeFingerprint ||
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim() ||
     !Number.isSafeInteger(shareRevision) ||
     shareRevision < 0
   ) {
@@ -395,19 +547,46 @@ async function validateBinding(account) {
 }
 
 async function validateModel() {
-  const query = new URLSearchParams({ app: "claude", providerId });
+  const query = new URLSearchParams({
+    app: "claude",
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
     shareHeaders(),
     "Claude model catalog",
   );
-  if (!Array.isArray(catalog?.data)) {
+  if (
+    !Array.isArray(catalog?.data) ||
+    catalog.source !== "claude_code_wire_profile" ||
+    catalog.stale !== false ||
+    !Number.isSafeInteger(catalog.fetchedAtMs) ||
+    catalog.fetchedAtMs <= 0
+  ) {
     fail("Claude model catalog violated the public contract");
+  }
+  const modelIds = catalog.data.map((entry) => entry?.id);
+  if (
+    modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+    new Set(modelIds).size !== modelIds.length
+  ) {
+    fail("Claude model catalog has incomplete or duplicate model IDs");
   }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail("Claude model catalog did not preserve the exact selected model");
   }
+  return {
+    source: catalog.source,
+    stale: catalog.stale,
+    fetchedAtMs: catalog.fetchedAtMs,
+    digest: digest(
+      "cc-switch-server:claude-model-catalog:v1",
+      [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
+  };
 }
 
 async function validatePlan(account) {
@@ -452,11 +631,7 @@ async function validatePlan(account) {
   ) {
     fail("Claude canonical plan evidence is stale, conflicting, or incomplete");
   }
-  const now = Date.now();
-  if (
-    subscription.planObservedAt < now - PLAN_MAX_AGE_MS ||
-    subscription.planObservedAt > now + 60_000
-  ) {
+  if (!freshPlanTimestamp(subscription.planObservedAt)) {
     fail("Claude canonical plan evidence is outside the freshness window");
   }
   return {
@@ -557,12 +732,7 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding, p
     fail("Claude receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("Claude receipt timestamp is outside the acceptance window");
   }
   const checkKeys = Object.keys(receipt.checks || {}).sort();
@@ -617,13 +787,18 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding, p
   ) {
     fail("Claude receipt did not prove isolation and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  if (receiptStat.nlink !== 1) {
+    fail("Claude receipt file must have one filesystem link");
+  }
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBinding(account);
-  await validateModel();
+  const catalogSnapshot = await validateModel();
   const plan = await validatePlan(account);
   const scopeDigest = digest("cc-switch-server:claude-real-scope:v1", {
     operation,
@@ -642,11 +817,41 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("Claude receipt file is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest, targetCommit, account, binding, plan);
+  const recordedAt = validateReceipt(receipt, scopeDigest, targetCommit, account, binding, plan);
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBinding(finalAccount);
+  if (!sameCanonical(
+    {
+      accountId: finalAccount.id,
+      authIdentityGeneration: finalAccount.authIdentityGeneration,
+      tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
+      binding: finalBinding,
+    },
+    {
+      accountId: account.id,
+      authIdentityGeneration: account.authIdentityGeneration,
+      tokenRefreshGeneration: account.tokenRefreshGeneration,
+      binding,
+    },
+  )) {
+    fail("Claude Account, Provider, or Share scope drifted during acceptance");
+  }
+  const finalCatalogSnapshot = await validateModel();
+  if (!sameCanonical(finalCatalogSnapshot, catalogSnapshot)) {
+    fail("Claude model catalog changed during acceptance");
+  }
+  const acceptanceNow = Date.now();
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("Claude receipt expired during acceptance");
+  }
+  if (plan && !freshPlanTimestamp(plan.observedAt, acceptanceNow)) {
+    fail("Claude canonical plan expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(

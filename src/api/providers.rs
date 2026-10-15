@@ -3544,10 +3544,10 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             .map(str::to_string);
         #[cfg(not(test))]
         let endpoint_override: Option<String> = None;
-        let mut account = state
-            .find_account_for_provider(provider_type, account_id)
+        let (mut account, mut account_incarnation) = state
+            .find_antigravity_account_with_incarnation(provider_type, account_id)
             .await
-            .filter(|account| account.auth_identity_generation == expected_generation)
+            .filter(|(account, _)| account.auth_identity_generation == expected_generation)
             .ok_or_else(|| {
                 ApiError::conflict("bound Antigravity account identity changed during discovery")
             })?;
@@ -3573,6 +3573,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         let mut catalog = crate::clients::oauth::antigravity_models::model_catalog(
             &http,
             &account,
+            account_incarnation,
             timeout,
             endpoint_override.as_deref(),
         )
@@ -3592,10 +3593,10 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                 )
                 .await
                 .map_err(map_managed_account_refresh_error)?;
-            account = state
-                .find_account_for_provider(provider_type, account_id)
+            (account, account_incarnation) = state
+                .find_antigravity_account_with_incarnation(provider_type, account_id)
                 .await
-                .filter(|account| account.auth_identity_generation == expected_generation)
+                .filter(|(account, _)| account.auth_identity_generation == expected_generation)
                 .ok_or_else(|| {
                     ApiError::conflict(
                         "bound Antigravity account identity changed during auth recovery",
@@ -3604,6 +3605,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             catalog = crate::clients::oauth::antigravity_models::model_catalog(
                 &http,
                 &account,
+                account_incarnation,
                 timeout,
                 endpoint_override.as_deref(),
             )
@@ -3618,7 +3620,11 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                 error = %error,
                 "Antigravity model discovery failed"
             );
-            ApiError::bad_gateway("Antigravity model discovery failed for the bound account")
+            if error.is_superseded_identity() {
+                ApiError::conflict("Antigravity model discovery identity was superseded")
+            } else {
+                ApiError::bad_gateway("Antigravity model discovery failed for the bound account")
+            }
         })?;
         let current_plan = state
             .provider_runtime_plan(stored.app, &stored.provider.id)
@@ -3644,11 +3650,29 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                 "Provider account binding changed during Antigravity model discovery",
             ));
         }
-        state
+        let (current_account, current_incarnation) = state
+            .find_antigravity_account_with_incarnation(provider_type, account_id)
+            .await
+            .ok_or_else(|| ApiError::conflict("bound Antigravity account disappeared"))?;
+        if current_incarnation != account_incarnation
+            || current_account.auth_identity_generation != expected_generation
+            || current_account.token_refresh_generation != account.token_refresh_generation
+            || crate::clients::oauth::antigravity_models::request_identity_fingerprint(
+                &current_account,
+            ) != crate::clients::oauth::antigravity_models::request_identity_fingerprint(
+                &account,
+            )
+            || crate::domain::accounts::store::gemini_v1internal_project_id(&current_account)
+                != crate::domain::accounts::store::gemini_v1internal_project_id(&account)
+        {
+            return Err(ApiError::conflict(
+                "bound Antigravity account scope changed during discovery",
+            ));
+        }
+        let published = state
             .record_antigravity_model_catalog_observations_for_generation(
-                provider_type,
-                account_id,
-                expected_generation,
+                &account,
+                account_incarnation,
                 &catalog,
             )
             .await
@@ -3659,6 +3683,11 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                     "Antigravity model evidence could not be durably persisted",
                 )
             })?;
+        if !published {
+            return Err(ApiError::conflict(
+                "newer Antigravity model discovery already published",
+            ));
+        }
         return Ok(antigravity_provider_models_fetch_result(catalog));
     }
     if stored.provider_type == ProviderType::KiroOAuth {
@@ -4205,16 +4234,32 @@ pub(in crate::api) async fn fetch_bound_grok_model_catalog(
         .map_err(map_managed_account_refresh_error)?;
     ensure_stored_provider_outbound_allowed(state, &execution.stored).await?;
 
-    let mut account =
-        current_grok_catalog_account(state, execution, account_id, expected_generation, None)
-            .await?;
-    let mut scope = grok_model_catalog_scope(execution, &account);
+    let (mut account, mut account_incarnation) = current_grok_catalog_account(
+        state,
+        execution,
+        account_id,
+        expected_generation,
+        None,
+        None,
+    )
+    .await?;
+    let mut scope = grok_model_catalog_scope(execution, &account, account_incarnation)?;
+    ensure_grok_catalog_scope_current(state, execution, account_id, expected_generation, &scope)
+        .await?;
     let mut catalog =
         fetch_grok_model_catalog_once(state, execution, &scope, &account, timeout).await;
     if catalog
         .as_ref()
         .is_err_and(crate::clients::oauth::grok_models::GrokModelCatalogFailure::is_unauthorized)
     {
+        ensure_grok_catalog_scope_current(
+            state,
+            execution,
+            account_id,
+            expected_generation,
+            &scope,
+        )
+        .await?;
         state
             .refresh_managed_account_now_for_generation(
                 ProviderType::GrokOAuth,
@@ -4224,21 +4269,39 @@ pub(in crate::api) async fn fetch_bound_grok_model_catalog(
             .await
             .map_err(map_managed_account_refresh_error)?;
         ensure_stored_provider_outbound_allowed(state, &execution.stored).await?;
-        account =
-            current_grok_catalog_account(state, execution, account_id, expected_generation, None)
-                .await?;
-        scope = grok_model_catalog_scope(execution, &account);
+        (account, account_incarnation) = current_grok_catalog_account(
+            state,
+            execution,
+            account_id,
+            expected_generation,
+            None,
+            None,
+        )
+        .await?;
+        scope = grok_model_catalog_scope(execution, &account, account_incarnation)?;
+        ensure_grok_catalog_scope_current(
+            state,
+            execution,
+            account_id,
+            expected_generation,
+            &scope,
+        )
+        .await?;
         catalog = fetch_grok_model_catalog_once(state, execution, &scope, &account, timeout).await;
     }
     let catalog = catalog.map_err(grok_model_catalog_error_to_api_error)?;
-    current_grok_catalog_account(
-        state,
-        execution,
-        account_id,
-        expected_generation,
-        Some(scope.token_refresh_generation),
+    ensure_grok_catalog_scope_current(state, execution, account_id, expected_generation, &scope)
+        .await?;
+    if !crate::clients::oauth::grok_models::catalog_revision_is_current(
+        &scope,
+        catalog.request_revision,
     )
-    .await?;
+    .await
+    {
+        return Err(ApiError::conflict(
+            "Newer Grok model discovery already published",
+        ));
+    }
     Ok(catalog)
 }
 
@@ -4248,7 +4311,8 @@ async fn current_grok_catalog_account(
     account_id: &str,
     expected_generation: u64,
     expected_token_generation: Option<u64>,
-) -> Result<crate::domain::accounts::store::Account, ApiError> {
+    expected_incarnation: Option<u64>,
+) -> Result<(crate::domain::accounts::store::Account, u64), ApiError> {
     let current_plan = state
         .provider_runtime_plan(execution.stored.app, &execution.stored.provider.id)
         .await
@@ -4272,11 +4336,16 @@ async fn current_grok_catalog_account(
             "Provider account binding changed during Grok model discovery",
         ));
     }
-    let account = state
-        .find_account_for_provider(ProviderType::GrokOAuth, account_id)
+    let (account, account_incarnation) = state
+        .find_account_for_provider_with_incarnation(ProviderType::GrokOAuth, account_id)
         .await
-        .filter(|account| account.auth_identity_generation == expected_generation)
+        .filter(|(account, _)| account.auth_identity_generation == expected_generation)
         .ok_or_else(|| ApiError::conflict("Bound Grok account changed during model discovery"))?;
+    if expected_incarnation.is_some_and(|incarnation| incarnation != account_incarnation) {
+        return Err(ApiError::conflict(
+            "Bound Grok account incarnation changed during model discovery",
+        ));
+    }
     if expected_token_generation
         .is_some_and(|generation| account.token_refresh_generation != generation)
     {
@@ -4294,22 +4363,54 @@ async fn current_grok_catalog_account(
             "Bound Grok account has no usable access token",
         ));
     }
-    Ok(account)
+    Ok((account, account_incarnation))
 }
 
 fn grok_model_catalog_scope(
     execution: &proxy::provider_ops::ProviderExecution,
     account: &crate::domain::accounts::store::Account,
-) -> crate::clients::oauth::grok_models::GrokModelCatalogScope {
-    crate::clients::oauth::grok_models::GrokModelCatalogScope {
+    account_incarnation: u64,
+) -> Result<crate::clients::oauth::grok_models::GrokModelCatalogScope, ApiError> {
+    Ok(crate::clients::oauth::grok_models::GrokModelCatalogScope {
         app: execution.stored.app.as_str().to_string(),
         provider_id: execution.stored.provider.id.clone(),
         provider_revision: execution.plan.provider_revision,
         runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
         account_id: account.id.clone(),
+        account_incarnation,
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        request_identity_fingerprint:
+            crate::clients::oauth::grok_models::request_identity_fingerprint(account).ok_or_else(
+                || ApiError::unauthorized("Bound Grok account has no usable access token"),
+            )?,
+    })
+}
+
+async fn ensure_grok_catalog_scope_current(
+    state: &ServerState,
+    execution: &proxy::provider_ops::ProviderExecution,
+    account_id: &str,
+    expected_generation: u64,
+    scope: &crate::clients::oauth::grok_models::GrokModelCatalogScope,
+) -> Result<(), ApiError> {
+    let (account, _) = current_grok_catalog_account(
+        state,
+        execution,
+        account_id,
+        expected_generation,
+        Some(scope.token_refresh_generation),
+        Some(scope.account_incarnation),
+    )
+    .await?;
+    if crate::clients::oauth::grok_models::request_identity_fingerprint(&account)
+        != Some(scope.request_identity_fingerprint)
+    {
+        return Err(ApiError::conflict(
+            "Bound Grok account request identity changed during model discovery",
+        ));
     }
+    Ok(())
 }
 
 async fn fetch_grok_model_catalog_once(
@@ -7692,6 +7793,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grok_catalog_same_generation_token_change_cannot_reuse_old_capability() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: HeaderMap| {
+                let calls = std::sync::Arc::clone(&observed);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let token = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok());
+                    match token {
+                        Some("Bearer grok-token-a") => axum::Json(json!({"data":[{
+                            "id":"grok-token-a-model", "reasoning_efforts":["high"]
+                        }]})),
+                        Some("Bearer grok-token-b") => axum::Json(json!({"data":[{
+                            "id":"grok-token-b-model", "reasoning_efforts":["max"]
+                        }]})),
+                        _ => axum::Json(json!({"data":[]})),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = provider_api_test_state("grok-same-generation-token-catalog");
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id":"grok-same-generation-account",
+                        "providerType":"grok_oauth",
+                        "accessToken":"grok-token-a",
+                        "expiresAt":i64::MAX / 2,
+                        "profile":{"verifiedGrokClaims":{"subject":"same-subject"}}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-same-generation-provider".into(),
+                        name: "Grok same-generation token".into(),
+                        settings_config: json!({"testGrokModelsUrl":url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".into()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".into()),
+                                auth_provider: Some("grok_oauth".into()),
+                                account_id: Some("grok-same-generation-account".into()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution = resolve_provider_execution_by_key(
+            &state,
+            AppKind::Codex,
+            "grok-same-generation-provider",
+        )
+        .await
+        .unwrap();
+        let first =
+            fetch_bound_grok_model_catalog(&state, &execution, std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(first.models, ["grok-token-a-model"]);
+        let (account_before, incarnation_before) = state
+            .find_account_for_provider_with_incarnation(
+                ProviderType::GrokOAuth,
+                "grok-same-generation-account",
+            )
+            .await
+            .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "grok-same-generation-account")
+                    .unwrap()
+                    .access_token = Some("grok-token-b".into());
+            })
+            .await
+            .unwrap();
+        let (account, incarnation_after) = state
+            .find_account_for_provider_with_incarnation(
+                ProviderType::GrokOAuth,
+                "grok-same-generation-account",
+            )
+            .await
+            .unwrap();
+        assert_eq!(incarnation_after, incarnation_before);
+        assert_eq!(
+            account.auth_identity_generation,
+            account_before.auth_identity_generation
+        );
+        assert_eq!(
+            account.token_refresh_generation,
+            account_before.token_refresh_generation
+        );
+        let capability = state
+            .fresh_grok_reasoning_capability(
+                crate::state::GrokReasoningCapabilityScope {
+                    app: AppKind::Codex,
+                    provider_id: "grok-same-generation-provider",
+                    provider_revision: execution.plan.provider_revision,
+                    runtime_fingerprint: &execution.plan.runtime_fingerprint,
+                    account_id: "grok-same-generation-account",
+                    auth_identity_generation: account.auth_identity_generation,
+                    token_refresh_generation: account.token_refresh_generation,
+                },
+                "grok-token-a-model",
+            )
+            .await;
+        assert!(capability.is_none());
+        let second =
+            fetch_bound_grok_model_catalog(&state, &execution, std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(second.models, ["grok-token-b-model"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn grok_catalog_rejects_deleted_and_recreated_same_id_account() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let route_calls = calls.clone();
+        let route_started = started.clone();
+        let route_release = release.clone();
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || {
+                let calls = route_calls.clone();
+                let started = route_started.clone();
+                let release = route_release.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                        axum::Json(json!({"data":[{"id":"old-model"}]}))
+                    } else {
+                        axum::Json(json!({"data":[{"id":"new-model"}]}))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = provider_api_test_state("grok-recreated-account-catalog");
+        let account = || {
+            serde_json::from_value(json!({
+                "id":"grok-recreated-account", "providerType":"grok_oauth",
+                "accessToken":"same-token", "expiresAt":i64::MAX / 2,
+                "profile":{"verifiedGrokClaims":{"subject":"same-subject"}}
+            }))
+            .unwrap()
+        };
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(account());
+            })
+            .await
+            .unwrap();
+        let url = format!("http://{address}/models");
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Codex,
+                    Provider {
+                        id: "grok-recreated-provider".to_string(),
+                        name: "Grok recreated account".to_string(),
+                        settings_config: json!({"testGrokModelsUrl":url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("grok_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("grok_oauth".to_string()),
+                                account_id: Some("grok-recreated-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Codex, "grok-recreated-provider")
+                .await
+                .unwrap();
+        let old_started = started.notified();
+        let old_state = state.clone();
+        let old_execution = execution.clone();
+        let old_task = tokio::spawn(async move {
+            fetch_bound_grok_model_catalog(
+                &old_state,
+                &old_execution,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        old_started.await;
+        let (_, old_incarnation) = state
+            .find_account_for_provider_with_incarnation(
+                ProviderType::GrokOAuth,
+                "grok-recreated-account",
+            )
+            .await
+            .unwrap();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                assert!(accounts.delete("grok-recreated-account"));
+                accounts.upsert(account());
+            })
+            .await
+            .unwrap();
+        let (recreated, new_incarnation) = state
+            .find_account_for_provider_with_incarnation(
+                ProviderType::GrokOAuth,
+                "grok-recreated-account",
+            )
+            .await
+            .unwrap();
+        assert_ne!(old_incarnation, new_incarnation);
+        assert_eq!(recreated.auth_identity_generation, 1);
+        let fresh =
+            fetch_bound_grok_model_catalog(&state, &execution, std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(fresh.models, ["new-model"]);
+        release.notify_one();
+        assert_eq!(
+            old_task.await.unwrap().unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn grok_model_discovery_401_refreshes_and_replays_only_the_bound_account_once() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -7699,8 +8070,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model_authorizations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let drift_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let drift_release = std::sync::Arc::new(tokio::sync::Notify::new());
         let token_requests_for_route = std::sync::Arc::clone(&token_requests);
         let authorizations_for_route = std::sync::Arc::clone(&model_authorizations);
+        let drift_started_for_route = std::sync::Arc::clone(&drift_started);
+        let drift_release_for_route = std::sync::Arc::clone(&drift_release);
         let app = axum::Router::new()
             .route(
                 "/token",
@@ -7721,6 +8096,8 @@ mod tests {
                 "/models",
                 axum::routing::get(move |headers: HeaderMap| {
                     let authorizations = std::sync::Arc::clone(&authorizations_for_route);
+                    let drift_started = std::sync::Arc::clone(&drift_started_for_route);
+                    let drift_release = std::sync::Arc::clone(&drift_release_for_route);
                     async move {
                         let authorization = headers
                             .get(axum::http::header::AUTHORIZATION)
@@ -7728,6 +8105,14 @@ mod tests {
                             .unwrap_or_default()
                             .to_string();
                         authorizations.lock().unwrap().push(authorization.clone());
+                        if authorization == "Bearer drifting-token" {
+                            drift_started.notify_one();
+                            drift_release.notified().await;
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error": "stale credential"})),
+                            );
+                        }
                         if authorization == "Bearer initial-bound-grok-token" {
                             (
                                 StatusCode::UNAUTHORIZED,
@@ -7843,6 +8228,55 @@ mod tests {
         assert_eq!(
             distractor.access_token.as_deref(),
             Some("distractor-grok-token")
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "grok-model-401-bound")
+                    .unwrap()
+                    .access_token = Some("drifting-token".into());
+            })
+            .await
+            .unwrap();
+        let drift_wait = drift_started.notified();
+        let drift_state = state.clone();
+        let drift_execution = execution.clone();
+        let drift_task = tokio::spawn(async move {
+            fetch_bound_grok_model_catalog(
+                &drift_state,
+                &drift_execution,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        drift_wait.await;
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "grok-model-401-bound")
+                    .unwrap()
+                    .access_token = Some("current-token".into());
+            })
+            .await
+            .unwrap();
+        drift_release.notify_one();
+        assert_eq!(
+            drift_task.await.unwrap().unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(token_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .find_account_for_provider(ProviderType::GrokOAuth, "grok-model-401-bound")
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("current-token")
         );
         server.abort();
     }
@@ -8024,6 +8458,347 @@ mod tests {
             conformance.discovery,
             crate::domain::providers::registry::ConformanceState::FixtureVerified
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_late_old_token_cannot_replace_empty_catalog_or_evidence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let old_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let old_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_old = std::sync::Arc::new(tokio::sync::Notify::new());
+        let old_calls_route = old_calls.clone();
+        let old_started_route = old_started.clone();
+        let release_old_route = release_old.clone();
+        let app = axum::Router::new().fallback(axum::routing::post(move |headers: HeaderMap| {
+            let old_calls = old_calls_route.clone();
+            let old_started = old_started_route.clone();
+            let release_old = release_old_route.clone();
+            async move {
+                let token = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                if token == "Bearer old" {
+                    if old_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                        old_started.notify_one();
+                        release_old.notified().await;
+                    }
+                    axum::Json(json!({"models": {"old-model": {"supportsWebSearch": true}}}))
+                } else {
+                    assert_eq!(token, "Bearer new");
+                    axum::Json(json!({"models": {}}))
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = provider_api_test_state("antigravity-catalog-fence");
+        let model_url = format!("http://{address}/v1internal:fetchAvailableModels");
+        let account_model_url = model_url.clone();
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "ag-fence-account",
+                        "providerType": "antigravity_oauth",
+                        "email": "same@example.test",
+                        "accessToken": "old",
+                        "expiresAt": i64::MAX / 2,
+                        "raw": {"projectId": "project-fence", "testAntigravityModelsUrl": account_model_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_providers_immediate(move |providers| {
+                providers.upsert(
+                    AppKind::Gemini,
+                    Provider {
+                        id: "ag-fence-provider".to_string(),
+                        name: "AG fence provider".to_string(),
+                        settings_config: json!({"testAntigravityModelsUrl": model_url}),
+                        category: None,
+                        meta: Some(ProviderMeta {
+                            provider_type: Some("antigravity_oauth".to_string()),
+                            auth_binding: Some(AuthBinding {
+                                source: Some("account_store".to_string()),
+                                auth_provider: Some("antigravity_oauth".to_string()),
+                                account_id: Some("ag-fence-account".to_string()),
+                                auth_identity_generation: Some(1),
+                            }),
+                            ..Default::default()
+                        }),
+                        extra: Default::default(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let execution =
+            resolve_provider_execution_by_key(&state, AppKind::Gemini, "ag-fence-provider")
+                .await
+                .unwrap();
+        let first = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert_eq!(first.models[0].id, "old-model");
+
+        let old_wait = old_started.notified();
+        let old_state = state.clone();
+        let old_execution = execution.clone();
+        let old_task = tokio::spawn(async move {
+            fetch_provider_models_inner(&old_state, &old_execution, Some(2_000)).await
+        });
+        old_wait.await;
+        let account_model_url = format!("http://{address}/v1internal:fetchAvailableModels");
+        state
+            .mutate_accounts_immediate(move |accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "ag-fence-account",
+                        "providerType": "antigravity_oauth",
+                        "email": "same@example.test",
+                        "accessToken": "new",
+                        "expiresAt": i64::MAX / 2,
+                        "raw": {"projectId": "project-fence", "testAntigravityModelsUrl": account_model_url}
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        let new_result = fetch_provider_models_inner(&state, &execution, Some(2_000))
+            .await
+            .unwrap();
+        assert!(new_result.models.is_empty());
+        release_old.notify_one();
+        let old_error = old_task.await.unwrap().unwrap_err();
+        assert_eq!(old_error.status, StatusCode::CONFLICT);
+
+        let (account, account_incarnation) = state
+            .find_antigravity_account_with_incarnation(
+                ProviderType::AntigravityOAuth,
+                "ag-fence-account",
+            )
+            .await
+            .unwrap();
+        let catalog_key = crate::domain::accounts::capability_evidence::observation_key(
+            crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+            crate::domain::accounts::capability_evidence::MODEL_CATALOG_DIMENSION,
+        );
+        assert_eq!(
+            account.capability_observations[&catalog_key].state,
+            crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported
+        );
+        assert!(!account.capability_observations.values().any(|observation| {
+            observation.dimension.starts_with(
+                crate::domain::accounts::capability_evidence::ANTIGRAVITY_MODEL_SEARCH_DIMENSION_PREFIX,
+            )
+        }));
+        let older_same_generation =
+            crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                descriptors: Vec::new(),
+                source: "authenticated_fetch_available_models",
+                source_url: format!("http://{address}/v1internal:fetchAvailableModels"),
+                stale: false,
+                fetched_at_ms: chrono::Utc::now().timestamp_millis(),
+                request_revision: 0,
+            };
+        assert!(!state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &account,
+                account_incarnation,
+                &older_same_generation,
+            )
+            .await
+            .unwrap());
+        let stale = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+            stale: true,
+            ..older_same_generation
+        };
+        assert!(state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &account,
+                account_incarnation,
+                &stale,
+            )
+            .await
+            .unwrap());
+        let after_stale = state
+            .find_account_for_provider(ProviderType::AntigravityOAuth, "ag-fence-account")
+            .await
+            .unwrap();
+        assert_eq!(
+            after_stale.capability_observations,
+            account.capability_observations
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == "ag-fence-account")
+                    .unwrap()
+                    .access_token = Some("newer-with-same-generation".to_string());
+            })
+            .await
+            .unwrap();
+        let same_generation_live =
+            crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                stale: false,
+                request_revision: u64::MAX,
+                ..stale.clone()
+            };
+        assert!(!state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &account,
+                account_incarnation,
+                &stale,
+            )
+            .await
+            .unwrap());
+        assert!(state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &account,
+                account_incarnation,
+                &same_generation_live,
+            )
+            .await
+            .is_err());
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == "ag-fence-account")
+                    .unwrap()
+                    .access_token = Some("new".to_string());
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "ag-fence-account")
+                    .unwrap()
+                    .raw
+                    .as_mut()
+                    .unwrap()["projectId"] = json!("other-project");
+            })
+            .await
+            .unwrap();
+        let old_live = state
+            .find_account_for_provider(ProviderType::AntigravityOAuth, "ag-fence-account")
+            .await
+            .unwrap();
+        let old_project_catalog =
+            crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                request_revision: u64::MAX,
+                ..stale
+            };
+        let old_project_catalog =
+            crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                stale: false,
+                ..old_project_catalog
+            };
+        assert!(state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &account,
+                account_incarnation,
+                &old_project_catalog,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            state
+                .find_account_for_provider(ProviderType::AntigravityOAuth, "ag-fence-account")
+                .await
+                .unwrap()
+                .capability_observations,
+            account.capability_observations
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let previous = accounts
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == "ag-fence-account")
+                    .unwrap()
+                    .clone();
+                assert!(accounts.delete("ag-fence-account"));
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "ag-fence-account",
+                        "providerType": "antigravity_oauth",
+                        "email": "same@example.test",
+                        "accessToken": "new",
+                        "expiresAt": i64::MAX / 2,
+                        "raw": {"projectId": "other-project"}
+                    }))
+                    .unwrap(),
+                );
+                let recreated = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == "ag-fence-account")
+                    .unwrap();
+                recreated.auth_identity_generation = previous.auth_identity_generation;
+                recreated.token_refresh_generation = previous.token_refresh_generation;
+            })
+            .await
+            .unwrap();
+        let (recreated, recreated_incarnation) = state
+            .find_antigravity_account_with_incarnation(
+                ProviderType::AntigravityOAuth,
+                "ag-fence-account",
+            )
+            .await
+            .unwrap();
+        assert_ne!(recreated_incarnation, account_incarnation);
+        assert_eq!(
+            recreated.auth_identity_generation,
+            account.auth_identity_generation
+        );
+        assert_eq!(
+            recreated.token_refresh_generation,
+            account.token_refresh_generation
+        );
+        assert!(state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &old_live,
+                account_incarnation,
+                &old_project_catalog,
+            )
+            .await
+            .is_err());
+        let stale_old_incarnation =
+            crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                stale: true,
+                ..old_project_catalog
+            };
+        assert!(!state
+            .record_antigravity_model_catalog_observations_for_generation(
+                &old_live,
+                account_incarnation,
+                &stale_old_incarnation,
+            )
+            .await
+            .unwrap());
+        assert!(state
+            .find_account_for_provider(ProviderType::AntigravityOAuth, "ag-fence-account")
+            .await
+            .unwrap()
+            .capability_observations
+            .is_empty());
         server.abort();
     }
 

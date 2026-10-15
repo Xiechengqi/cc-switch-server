@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+use crate::domain::accounts::store::Account;
 
 pub const GROK_MODELS_URL: &str = "https://cli-chat-proxy.grok.com/v1/models";
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -11,6 +15,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MODELS_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CACHED_CATALOGS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GrokModelCatalogScope {
@@ -19,8 +24,10 @@ pub struct GrokModelCatalogScope {
     pub provider_revision: u64,
     pub runtime_fingerprint: String,
     pub account_id: String,
+    pub account_incarnation: u64,
     pub auth_identity_generation: u64,
     pub token_refresh_generation: u64,
+    pub request_identity_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +38,7 @@ pub struct GrokModelCatalog {
     pub source_url: String,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
+    pub request_revision: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,11 +82,100 @@ struct CachedCatalog {
     fetched_at: Instant,
     fresh_for: Duration,
     fetched_at_ms: i64,
+    request_revision: u64,
+}
+
+static REQUEST_REVISION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn request_identity_fingerprint(account: &Account) -> Option<[u8; 32]> {
+    let bearer = account.access_token.as_deref()?.trim();
+    if bearer.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:grok-model-request-identity:v1\0");
+    digest.update((bearer.len() as u64).to_be_bytes());
+    digest.update(bearer.as_bytes());
+    digest.update([u8::from(account.needs_relogin)]);
+    Some(digest.finalize().into())
 }
 
 fn cache() -> &'static Mutex<BTreeMap<GrokModelCatalogScope, CachedCatalog>> {
     static CACHE: OnceLock<Mutex<BTreeMap<GrokModelCatalogScope, CachedCatalog>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn publish_catalog(
+    entries: &mut BTreeMap<GrokModelCatalogScope, CachedCatalog>,
+    scope: &GrokModelCatalogScope,
+    catalog: CachedCatalog,
+) -> bool {
+    let same_owner = |candidate: &GrokModelCatalogScope| {
+        candidate.app == scope.app
+            && candidate.provider_id == scope.provider_id
+            && candidate.account_id == scope.account_id
+    };
+    let superseded = entries.iter().any(|(candidate, cached)| {
+        let candidate_generation = (
+            candidate.account_incarnation,
+            candidate.provider_revision,
+            candidate.auth_identity_generation,
+            candidate.token_refresh_generation,
+        );
+        let incoming_generation = (
+            scope.account_incarnation,
+            scope.provider_revision,
+            scope.auth_identity_generation,
+            scope.token_refresh_generation,
+        );
+        same_owner(candidate)
+            && (candidate_generation > incoming_generation
+                || (candidate_generation == incoming_generation
+                    && candidate == scope
+                    && cached.request_revision > catalog.request_revision))
+    });
+    if superseded {
+        return false;
+    }
+    entries.retain(|candidate, _| {
+        if !same_owner(candidate) {
+            return true;
+        }
+        let candidate_generation = (
+            candidate.account_incarnation,
+            candidate.provider_revision,
+            candidate.auth_identity_generation,
+            candidate.token_refresh_generation,
+        );
+        let incoming_generation = (
+            scope.account_incarnation,
+            scope.provider_revision,
+            scope.auth_identity_generation,
+            scope.token_refresh_generation,
+        );
+        candidate_generation > incoming_generation
+            || (candidate_generation == incoming_generation && candidate != scope)
+    });
+    entries.insert(scope.clone(), catalog);
+    while entries.len() > MAX_CACHED_CATALOGS {
+        let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, cached)| (cached.fetched_at_ms, cached.request_revision))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        entries.remove(&oldest);
+    }
+    true
+}
+
+pub async fn catalog_revision_is_current(scope: &GrokModelCatalogScope, revision: u64) -> bool {
+    cache()
+        .lock()
+        .await
+        .get(scope)
+        .is_some_and(|cached| cached.request_revision == revision)
 }
 
 pub async fn fresh_grok_model_capability(
@@ -144,6 +241,7 @@ async fn fetch_catalog(
             return Ok(catalog_from_cache(cached, "cache_fresh", false));
         }
     }
+    let request_revision = REQUEST_REVISION.fetch_add(1, Ordering::Relaxed);
 
     let mut request = http
         .get(url)
@@ -195,8 +293,16 @@ async fn fetch_catalog(
         cached.fetched_at = Instant::now();
         cached.fetched_at_ms = chrono::Utc::now().timestamp_millis();
         cached.fresh_for = ttl;
+        cached.request_revision = request_revision;
         let result = catalog_from_cache(&cached, "upstream_not_modified", false);
-        cache().lock().await.insert(scope.clone(), cached);
+        let mut entries = cache().lock().await;
+        if !publish_catalog(&mut entries, scope, cached) {
+            return Err(GrokModelCatalogFailure::new(
+                409,
+                false,
+                "Grok model discovery was superseded",
+            ));
+        }
         crate::metrics::record_grok_model_catalog("upstream_not_modified");
         return Ok(result);
     }
@@ -266,14 +372,9 @@ async fn fetch_catalog(
     let source_url = url.to_string();
     {
         let mut entries = cache().lock().await;
-        entries.retain(|candidate, _| {
-            candidate.app != scope.app
-                || candidate.provider_id != scope.provider_id
-                || candidate.account_id != scope.account_id
-                || candidate == scope
-        });
-        entries.insert(
-            scope.clone(),
+        if !publish_catalog(
+            &mut entries,
+            scope,
             CachedCatalog {
                 models: models.clone(),
                 capabilities: capabilities.clone(),
@@ -282,8 +383,15 @@ async fn fetch_catalog(
                 fetched_at: Instant::now(),
                 fresh_for: ttl,
                 fetched_at_ms,
+                request_revision,
             },
-        );
+        ) {
+            return Err(GrokModelCatalogFailure::new(
+                409,
+                false,
+                "Grok model discovery was superseded",
+            ));
+        }
     }
     crate::metrics::record_grok_model_catalog("upstream");
     Ok(GrokModelCatalog {
@@ -293,6 +401,7 @@ async fn fetch_catalog(
         source_url,
         stale: false,
         fetched_at_ms: Some(fetched_at_ms),
+        request_revision,
     })
 }
 
@@ -327,6 +436,7 @@ fn catalog_from_cache(
         source_url: cached.source_url.clone(),
         stale,
         fetched_at_ms: Some(cached.fetched_at_ms),
+        request_revision: cached.request_revision,
     }
 }
 
@@ -499,9 +609,179 @@ mod tests {
             provider_revision: 1,
             runtime_fingerprint: format!("runtime-{name}"),
             account_id: format!("account-{name}"),
+            account_incarnation: 1,
             auth_identity_generation: generation,
             token_refresh_generation: 0,
+            request_identity_fingerprint: [1; 32],
         }
+    }
+
+    #[test]
+    fn catalog_publication_prioritizes_account_lifecycle_over_request_order() {
+        let old = scope("publication-order", 1);
+        let refreshed = GrokModelCatalogScope {
+            token_refresh_generation: 2,
+            ..old.clone()
+        };
+        let recreated = GrokModelCatalogScope {
+            account_incarnation: 2,
+            ..old.clone()
+        };
+        let cached = |revision| CachedCatalog {
+            models: vec!["model".to_string()],
+            capabilities: BTreeMap::new(),
+            source_url: "https://example.test/models".to_string(),
+            etag: None,
+            fetched_at: Instant::now(),
+            fresh_for: DEFAULT_CACHE_TTL,
+            fetched_at_ms: 1,
+            request_revision: revision,
+        };
+        let mut entries = BTreeMap::new();
+        assert!(publish_catalog(&mut entries, &refreshed, cached(2)));
+        assert!(!publish_catalog(&mut entries, &old, cached(100)));
+        assert!(publish_catalog(&mut entries, &recreated, cached(1)));
+        assert!(!publish_catalog(&mut entries, &refreshed, cached(200)));
+        assert!(!publish_catalog(&mut entries, &recreated, cached(0)));
+        assert!(publish_catalog(&mut entries, &recreated, cached(3)));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.get(&recreated).unwrap().request_revision, 3);
+        let updated_provider = GrokModelCatalogScope {
+            provider_revision: 2,
+            ..recreated.clone()
+        };
+        assert!(publish_catalog(&mut entries, &updated_provider, cached(4)));
+        assert!(!publish_catalog(&mut entries, &recreated, cached(1000)));
+        assert!(entries.contains_key(&updated_provider));
+    }
+
+    #[test]
+    fn same_generation_bearers_keep_separate_bounded_catalog_entries() {
+        let first = scope("bearer-isolation", 1);
+        let second = GrokModelCatalogScope {
+            request_identity_fingerprint: [2; 32],
+            ..first.clone()
+        };
+        let cached = |revision: u64| CachedCatalog {
+            models: vec![format!("model-{revision}")],
+            capabilities: BTreeMap::new(),
+            source_url: "https://example.test/models".into(),
+            etag: None,
+            fetched_at: Instant::now(),
+            fresh_for: DEFAULT_CACHE_TTL,
+            fetched_at_ms: revision as i64,
+            request_revision: revision,
+        };
+        let mut entries = BTreeMap::new();
+        assert!(publish_catalog(&mut entries, &first, cached(1)));
+        assert!(publish_catalog(&mut entries, &second, cached(2)));
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&first));
+        assert!(entries.contains_key(&second));
+        assert!(publish_catalog(&mut entries, &first, cached(3)));
+        assert!(entries.contains_key(&second));
+        for index in 3..=MAX_CACHED_CATALOGS + 1 {
+            let variant = GrokModelCatalogScope {
+                request_identity_fingerprint: [index as u8; 32],
+                ..first.clone()
+            };
+            assert!(publish_catalog(
+                &mut entries,
+                &variant,
+                cached(index as u64 + 1)
+            ));
+        }
+        assert_eq!(entries.len(), MAX_CACHED_CATALOGS);
+        assert!(!entries.contains_key(&second));
+    }
+
+    #[test]
+    fn request_identity_fingerprint_tracks_bearer_and_relogin_without_exposing_token() {
+        let mut account: Account = serde_json::from_value(serde_json::json!({
+            "id":"grok-fingerprint-account",
+            "providerType":"grok_oauth",
+            "accessToken":"grok-secret-a"
+        }))
+        .unwrap();
+        let original = request_identity_fingerprint(&account).unwrap();
+        account.access_token = Some("grok-secret-b".into());
+        assert_ne!(request_identity_fingerprint(&account).unwrap(), original);
+        account.access_token = Some("grok-secret-a".into());
+        account.needs_relogin = true;
+        assert_ne!(request_identity_fingerprint(&account).unwrap(), original);
+        account.access_token = None;
+        assert_eq!(request_identity_fingerprint(&account), None);
+    }
+
+    #[tokio::test]
+    async fn late_old_token_catalog_cannot_evict_new_token_capabilities() {
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let old_started = Arc::new(tokio::sync::Notify::new());
+        let release_old = Arc::new(tokio::sync::Notify::new());
+        let old_started_route = Arc::clone(&old_started);
+        let release_old_route = Arc::clone(&release_old);
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let old_started = Arc::clone(&old_started_route);
+                let release_old = Arc::clone(&release_old_route);
+                async move {
+                    if headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer old-token")
+                    {
+                        old_started.notify_one();
+                        release_old.notified().await;
+                        axum::Json(serde_json::json!({"data":[{"id":"old-model"}]}))
+                    } else {
+                        axum::Json(serde_json::json!({"data":[{"id":"new-model"}]}))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{address}/v1/models");
+        let client = reqwest::Client::new();
+        let old = scope(address.port().to_string(), 1);
+        let new = GrokModelCatalogScope {
+            token_refresh_generation: 1,
+            ..old.clone()
+        };
+        let old_client = client.clone();
+        let old_url = url.clone();
+        let old_task = tokio::spawn(async move {
+            fetch_catalog(
+                &old_client,
+                &old,
+                "old-token",
+                &old_url,
+                DEFAULT_CACHE_TTL,
+                DEFAULT_REQUEST_TIMEOUT,
+            )
+            .await
+        });
+        old_started.notified().await;
+        let published = fetch_catalog(
+            &client,
+            &new,
+            "new-token",
+            &url,
+            DEFAULT_CACHE_TTL,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published.models, ["new-model"]);
+        release_old.notify_one();
+        assert_eq!(old_task.await.unwrap().unwrap_err().status_code, 409);
+        assert!(fresh_grok_model_capability(&new, "new-model")
+            .await
+            .is_some());
+        server.abort();
     }
 
     #[test]

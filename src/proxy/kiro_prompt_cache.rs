@@ -197,8 +197,10 @@ pub(super) struct PromptCacheScope<'a> {
     pub(super) provider_revision: u64,
     pub(super) runtime_fingerprint: &'a str,
     pub(super) account_id: &'a str,
+    pub(super) account_owner_id: &'a str,
     pub(super) auth_identity_generation: u64,
     pub(super) token_refresh_generation: u64,
+    pub(super) request_identity: &'a str,
     pub(super) share_id: &'a str,
     pub(super) signed_user: &'a str,
     pub(super) route: &'a str,
@@ -214,8 +216,10 @@ impl PromptCacheScope<'_> {
             "providerRevision": self.provider_revision,
             "runtimeFingerprint": self.runtime_fingerprint,
             "accountId": self.account_id,
+            "accountOwnerId": self.account_owner_id,
             "authIdentityGeneration": self.auth_identity_generation,
             "tokenRefreshGeneration": self.token_refresh_generation,
+            "requestIdentity": self.request_identity,
             "shareId": self.share_id,
             "signedUser": self.signed_user,
             "route": self.route,
@@ -728,7 +732,9 @@ fn cumulative_prompt(
     body: &Value,
 ) -> (Vec<u32>, Vec<u64>) {
     let mut hasher = Sha256::new();
-    hash_frame(&mut hasher, b"cc-switch-kiro-cache-v3");
+    // v4 prevents legacy entries that ignored nested schema fields from
+    // colliding with a request whose nested field is now absent.
+    hash_frame(&mut hasher, b"cc-switch-kiro-cache-v4");
     hash_frame(&mut hasher, namespace.as_bytes());
     hash_frame(&mut hasher, &global_cache_context(body));
     let mut tokens = Vec::with_capacity(blocks.len());
@@ -747,13 +753,13 @@ fn cumulative_prompt(
 }
 
 fn global_cache_context(body: &Value) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
+    let context = serde_json::json!({
         "model": body.get("model"),
         "tool_choice": body.get("tool_choice"),
         "thinking": body.get("thinking"),
         "output_config": body.get("output_config"),
-    }))
-    .unwrap_or_default()
+    });
+    serde_json::to_vec(&canonical_cache_value(&context, false)).unwrap_or_default()
 }
 
 fn lookback_start_index(blocks: &[PromptBlock], breakpoint_index: usize) -> usize {
@@ -784,21 +790,28 @@ fn block_signature(section: &str, role: Option<&str>, value: &Value) -> Vec<u8> 
 }
 
 fn canonical_without_cache_control(value: &Value) -> Value {
+    canonical_cache_value(value, true)
+}
+
+fn canonical_cache_value(value: &Value, strip_block_control: bool) -> Value {
     match value {
         Value::Object(object) => {
             let mut keys = object.keys().collect::<Vec<_>>();
             keys.sort_unstable();
             let mut canonical = serde_json::Map::new();
             for key in keys {
-                if key != "cache_control" {
-                    canonical.insert(key.clone(), canonical_without_cache_control(&object[key]));
+                if !strip_block_control || key != "cache_control" {
+                    canonical.insert(key.clone(), canonical_cache_value(&object[key], false));
                 }
             }
             Value::Object(canonical)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(canonical_without_cache_control).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| canonical_cache_value(item, false))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -1316,6 +1329,62 @@ mod tests {
     }
 
     #[test]
+    fn nested_cache_control_in_tool_schema_changes_cached_prefix() {
+        let cache = KiroPromptCache::new(None);
+        let tool = |description: &str| {
+            serde_json::json!({
+                "tools": [{
+                    "name": "inspect",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "cache_control": {"type": "string", "description": description}
+                        }
+                    },
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{"role": "user", "content": "inspect"}]
+            })
+        };
+        let original = tool("original schema");
+        let changed = tool("changed schema");
+
+        let first = cache.compute_usage(&original, "same-bound-identity");
+        assert!(first.cache_covered_estimate > 0);
+        assert_eq!(first.cache_read_estimate, 0);
+        let changed_first = cache.compute_usage(&changed, "same-bound-identity");
+        assert_eq!(changed_first.cache_read_estimate, 0);
+        let changed_second = cache.compute_usage(&changed, "same-bound-identity");
+        assert_eq!(
+            changed_second.cache_read_estimate,
+            changed_second.cache_covered_estimate
+        );
+    }
+
+    #[test]
+    fn global_cache_context_ignores_nested_object_key_order() {
+        let cache = KiroPromptCache::new(None);
+        let first: Value = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4","thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"format":{"type":"json_schema","name":"report"}},"system":[{"type":"text","text":"stable system prompt","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hello"}]}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4","thinking":{"budget_tokens":1024,"type":"enabled"},"output_config":{"format":{"name":"report","type":"json_schema"}},"system":[{"type":"text","text":"stable system prompt","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hello"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(first["thinking"], reordered["thinking"]);
+        assert_eq!(first["output_config"], reordered["output_config"]);
+        let initial = cache.compute_usage(&first, "same-bound-identity");
+        assert_eq!(initial.cache_read_estimate, 0);
+        let repeated = cache.compute_usage(&reordered, "same-bound-identity");
+        assert!(repeated.cache_read_estimate > 0);
+        let mut changed = reordered;
+        changed["thinking"]["budget_tokens"] = serde_json::json!(2048);
+        let changed_first = cache.compute_usage(&changed, "same-bound-identity");
+        assert_eq!(changed_first.cache_read_estimate, 0);
+    }
+
+    #[test]
     fn namespace_isolated_by_every_binding_and_runtime_component() {
         let base = PromptCacheScope {
             app: "claude",
@@ -1323,8 +1392,10 @@ mod tests {
             provider_revision: 1,
             runtime_fingerprint: "runtime-a",
             account_id: "account-a",
+            account_owner_id: "owner-a",
             auth_identity_generation: 2,
             token_refresh_generation: 3,
+            request_identity: "identity-a",
             share_id: "share-a",
             signed_user: "user-a",
             route: "Messages",
@@ -1354,11 +1425,19 @@ mod tests {
                 ..base
             },
             PromptCacheScope {
+                account_owner_id: "owner-b",
+                ..base
+            },
+            PromptCacheScope {
                 auth_identity_generation: 3,
                 ..base
             },
             PromptCacheScope {
                 token_refresh_generation: 4,
+                ..base
+            },
+            PromptCacheScope {
+                request_identity: "identity-b",
                 ..base
             },
             PromptCacheScope {
@@ -1385,6 +1464,75 @@ mod tests {
         for variant in variants {
             assert_ne!(variant.namespace(), expected);
         }
+    }
+
+    #[test]
+    fn recreated_identical_kiro_account_does_not_read_previous_local_estimate() {
+        use crate::domain::accounts::store::{AccountStore, UpsertAccountInput};
+
+        let input: UpsertAccountInput = serde_json::from_value(serde_json::json!({
+            "id":"kiro-cache-owner",
+            "providerType":"kiro_oauth",
+            "accessToken":"same-access",
+            "refreshToken":"same-refresh"
+        }))
+        .unwrap();
+        let mut accounts = AccountStore::default();
+        let first = accounts.upsert(input.clone());
+        let namespace =
+            |accounts: &AccountStore, account: &crate::domain::accounts::store::Account| {
+                PromptCacheScope {
+                    app: "claude",
+                    provider_id: "kiro-provider",
+                    provider_revision: 1,
+                    runtime_fingerprint: "same-runtime",
+                    account_id: &account.id,
+                    account_owner_id: accounts.kiro_prompt_cache_owner_id(&account.id).unwrap(),
+                    auth_identity_generation: account.auth_identity_generation,
+                    token_refresh_generation: account.token_refresh_generation,
+                    request_identity: "same-request-identity",
+                    share_id: "same-share",
+                    signed_user: "same-user",
+                    route: "Messages",
+                    runtime_region: "us-east-1",
+                    session: "same-session",
+                }
+                .namespace()
+            };
+        let first_namespace = namespace(&accounts, &first);
+        let cache = KiroPromptCache::new(None);
+        let body = explicit_body();
+        assert_eq!(
+            cache
+                .compute_usage(&body, &first_namespace)
+                .cache_read_estimate,
+            0
+        );
+        assert!(
+            cache
+                .compute_usage(&body, &first_namespace)
+                .cache_read_estimate
+                > 0
+        );
+
+        assert!(accounts.delete(&first.id));
+        let recreated = accounts.upsert(input);
+        assert_eq!(
+            recreated.auth_identity_generation,
+            first.auth_identity_generation
+        );
+        assert_eq!(
+            recreated.token_refresh_generation,
+            first.token_refresh_generation
+        );
+        let recreated_namespace = namespace(&accounts, &recreated);
+        assert_ne!(recreated_namespace, first_namespace);
+        assert_eq!(
+            cache
+                .compute_usage(&body, &recreated_namespace)
+                .cache_read_estimate,
+            0
+        );
     }
 
     #[test]

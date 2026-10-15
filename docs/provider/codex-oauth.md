@@ -98,6 +98,10 @@ Share 不存在、没有 Codex binding、Surface 已禁用、绑定过期、账�
 
 models manifest、alpha search、Provider 网络测试、模型发现、Images、HTTP、SSE、WebSocket 和 WS 到 HTTP fallback 使用同一 Bundle 绑定账号规则。账号中心 quota refresh 可独立使用 active account；credential persistence degraded 时，需要 OAuth 凭据的出站操作在网络前返回 `503`。
 
+`/v1/models?client_version=...` 的 Codex manifest 由 Router 签名 Share 选择绑定账号。私有真实验收会额外发送 `expectedShareId`、`expectedProviderId`；Server 在任何上游 manifest 请求前，将它们与签名 Share 和实际选中的 Provider 比较，不一致返回冲突。普通 Codex 客户端无需发送这两个可选的验收作用域参数；它们不会转发给 OpenAI，也不能替代 Router 签名。
+
+`gpt_6_astra` 与 `ws_prewarm` 私有验收中的前置普通 `/v1/models?app=codex` 目录也携带同一对预期 Share/Provider 参数，并要求恰好一次目录请求。普通 `providerId` 查询不决定 Server 选择的 Provider；目录作用域与绑定账号 manifest 必须分别核对。公开 [OpenAI Docs 的 List models](https://developers.openai.com/api/reference/resources/models/methods/list) 只定义平台模型列表信息，不能代替此处的 Router Share 绑定或 ChatGPT 订阅账号真实 entitlement。
+
 ## Share 执行策略
 
 OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度器中。Bundle Share 和单 Provider Share 都可独立配置：
@@ -117,6 +121,8 @@ OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度�
 
 最终 HTTP sanitizer 只删除顶层精确 `type=response.create`，不会触碰 input/content/tool 中的嵌套 `type`。工具 schema walker 会递归删除 schema 内的 `type:null`，覆盖 `properties`、`items`、`$defs`/`definitions`、dependent schemas 和组合器，并同样处理 Responses Lite 的 `input[].type=additional_tools`；function 根 schema 缺 type 时补为 object。`collaboration.*` 保留工具在任何 sanitizer 前即跳过，保证声明原样透传。
 
+Codex OAuth 的最终工具数组为空或缺失时，出站 body 删除 `parallel_tool_calls`，不把无工具请求伪装成需要并行工具控制的请求。此规则在普通 Responses、Compact、Responses Lite、原生 WebSocket 和 WS→HTTP fallback 的准备路径生效；工具清洗（包括可选的图片工具剔除）之后再判断。有非空工具数组时保留已有设置，Lite 仍按其既有规则关闭并行工具调用。
+
 Responses Lite 请求信号在模型 policy 完成后，以最终映射模型的 manifest `use_responses_lite` 能力门控。明确不支持时同时删除 HTTP header 和 WS metadata marker，且不执行 Lite body mutation；明确支持时保留；未知模型保持兼容透传。内置快照中 `gpt-6-astra`、Sol/Terra/Luna 和 `codex-auto-review` 支持 Lite，5.5/5.4/5.4-mini/5.3 Codex Spark/5.2 不支持；实时 manifest 的明确值逐字段优先，且绑定 Account identity generation，内置项不代表当前账号 entitlement。
 
 `gpt-6-astra` 在冷启动目录中声明 text/image、`max` reasoning、priority 与 Responses Lite 兼容能力。结构化输出的字符串 `minLength` / `maxLength` 只在最终模型为 Astra、最终传输为原生 WebSocket 且 Lite 已启用时保留；HTTP、WS→HTTP fallback、非 Lite 和其他模型继续删除这些约束。该例外不作用于工具参数 schema。
@@ -131,9 +137,12 @@ Codex 429 继续按证据决定作用域：`usage_limit_reached` 或已耗尽的
 
 OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share 显式开启续传缓存后，Server 会在最终 body 清洗前尝试展开本地上下文，并在成功 `response.completed` 后记录下一轮所需的工具项：
 
-- namespace 为 Share id、规范化签名 principal、RuntimePlan fingerprint、verified workspace 和 response id；缺 principal 时禁用，不创建匿名共享空间。
+- namespace 为 Share id、规范化签名 principal、Provider id/revision、RuntimePlan fingerprint、Account id/进程内实例/身份与刷新代次、凭据摘要、verified workspace 和 response id；缺 principal 时禁用，不创建匿名共享空间。同 workspace 下更换账号或同代次直接变更凭据不会复用旧工具上下文；摘要不保留明文凭据。
+- `previous_response_id` 是不透明身份，读取时保留客户端原文；缓存键只接受非空、长度至多 512 字节且无首尾空白的精确 ID，不把 `" resp"` 与 `"resp"` 合并。上游返回的 ID 也不裁剪后入库。带未配对 tool output 的无效/未命中 ID 仍在发网前按下述 `response_context_unavailable` 失败关闭。
+- HTTP 在最终 OAuth Authorization 确定后复核作用域：已注入历史上下文而身份漂移时发网前返回 409；不依赖旧上下文的成功请求只在最终凭据作用域写入。WebSocket 每轮核对连接 Authorization 与当前账号，不一致时要求重连。
 - 只缓存 tool call 和 tool call output，要求非空 `call_id` 并删除上游 server item `id`；message、reasoning、`encrypted_content`、image 和 web-search 内容都不缓存。
 - 当前 input 已有同一 `(type, call_id)` 时不重复注入。普通 continuation 的 cache miss 保持原有清洗/转发行为；只有请求同时携带 `previous_response_id` 和当前未配对 tool output、因而确实依赖旧 call context 时，cache miss 才在下游提交前返回稳定 `409 invalid_request_error`，`code=response_context_unavailable`、`param=previous_response_id`。
+- 工具 `call_id` 同样是不透明身份：只用裁剪结果判断是否全空，缓存、注入、判重和缺历史判断均保留原始字节；`" call-a "` 与 `"call-a"` 不合并。工具结果还须匹配对应调用类型，单有相同 ID 的另一种工具调用不构成可续链的配对。`tool_search_output` 与兼容的 `tool_search_call_output` 都只匹配 `tool_search_call`；带 `previous_response_id` 却缺历史调用时，两种结果均在 HTTP/WS 发网前按 409 失败关闭。
 - HTTP 非流聚合、SSE、WebSocket 和 WS 到 HTTP fallback 共用该语义；只有 completed 写入，failed/incomplete/error 清空当前轮状态。
 - TTL 为 10 分钟；单条最多 8 MiB、200 items，全进程最多 64 MiB、2000 条，并按最近最少使用淘汰。expired、按条目/字节淘汰和 oversized/item-limit 拒绝会留下最多 2 分钟、全进程最多 4000 个且带完整 scope 的 tombstone；Prometheus 同时发布 current/high-water entries/bytes、tombstone、hit/miss/expiry/eviction/rejection 和 required-context-unavailable 统计。
 
@@ -149,11 +158,17 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 - `server_is_overloaded` / `slow_down` 是请求级容量降载，不是账号故障。HTTP SSE、下游非流聚合、Images 和 WS→HTTP fallback 在尚未向下游提交业务输出时，允许对同一 binding 做有界重试（最多再发两次，含短抖动，仍受总 retry 预算约束）。Share pin 禁止换号，但不禁止这条同账号重试。重试成功不得留下第一次失败的 Provider outcome；用尽后也不得因此写入账号 cooldown。
 - 已向下游提交业务输出后绝不透明重放完整生成。此时把 `server_is_overloaded` / `slow_down` 改写为客户端可退避的 `server_error`，保留原始 message；`rate_limit_exceeded` 与 `invalid_request` 不改码、不走容量重试。
 - `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 时没有生命周期缓冲，无法静默重试，只做已写出帧的错误码改写。
+- 启动期 `response.content_part.added` / `response.output_item.added` 只有在已知文本 part 真正为空时才按 Lifecycle 缓冲：`text` 为空且 `annotations`、`logprobs` 均缺失或为空数组；非空引用、logprobs 或未知 part 字段视为 Business。可缓冲的 message/reasoning/function_call/custom_tool_call 输出项本身也只接受各自已知的身份、状态及空内容字段；未知 item 字段或非字符串身份元数据视为 Business，立即关闭透明恢复窗口。正常空数组公告仍保留兼容；HTTP JSON/SSE、WebSocket 和 WS→HTTP fallback 复用同一分类器。官方 [Responses 类型参考](https://developers.openai.com/api/reference/resources/responses) 列出 `output_text.annotations`；这不证明私有 Codex 订阅实际会发该组合。
 - Token 换票 / refresh / Device 流使用与推理同源的官方 `originator` + User-Agent，凭据面不发 `version` 头。推理面继续配对 `originator` / User-Agent / `version`。关闭 Codex 版本同步并长期停在内置 `0.144.1` 会提高被上游优先降载的概率。
 - 非流式 `response.failed` 和 SSE semantic failure 会保留 OpenAI 错误语义；容量降载的改码是唯一例外。
-- Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和空 `response.completed.output` 恢复使用同一执行身份。
+- Responses Lite、custom/freeform tool、`tool_search`、usage 四桶和 `response.completed.output` 恢复使用同一执行身份：空 output 可按已完成项的索引顺序重建，索引缺失项另行追加；非空 output 保持终态字段权威，只用相同索引的 `response.output_item.done.item.id` 补缺失、`null` 或空白 ID，不覆盖已有 ID、工具参数和其他内容。HTTP SSE、下游非流聚合与 WebSocket 采用相同规则。
 - 普通 Responses HTTP/SSE、下游非流聚合、Dedicated Images 和 WS→HTTP fallback 共用有界增量 transport decoder：支持任意 chunk 边界、LF/CRLF/单 CR、多行 `data` 与 EOF tail，业务载荷必须是 UTF-8 JSON object。只丢弃 comment、无 data 控制帧、精确 `ping`/`keepalive` 以及仅含对应 `type` 的 JSON liveness；HTML、普通文本、JSON scalar/array、冲突 liveness 和其他坏 payload 均 fail closed。下游 Responses SSE 被重编码为单行 JSON data 的 canonical event，并固定使用 `text/event-stream; charset=utf-8`、`no-store/no-transform`、`X-Accel-Buffering: no` 与 `nosniff`。
 - `response.completed`、`response.failed` 和 `response.incomplete` 是 Responses 终态；`[DONE]` 与非标准 `response.done` 都不能单独证明成功。提交后协议故障使用合法 `response.failed` 帧和 `upstream_stream_protocol_error`，不再追加 `[DONE]`；usage 记录 `protocol_error`，而不是把坏 SSE 伪装成普通断流。
+- Codex OAuth 普通 Responses 的 HTTP 与原生 WS 出站 `include` 只包含必需的 `reasoning.encrypted_content`，以及客户端在数组中显式请求时的 `web_search_call.action.sources`。其他或畸形值不会透传，重复项合并；不会仅因声明 `web_search` 工具就自动请求来源。该边界不改变独立 Images 和 compact 请求。
+- 普通 HTTP Responses 上游 SSE 若先发 `error` 帧再发 `response.completed` 或 `response.incomplete`，流式语义检查以先到错误为失败终态，非流聚合也拒绝把该序列汇成正常 JSON；原错误码和消息保留用于内部失败分类，公开容量拒绝码仍按既有策略映射为 `server_error`。单独 `error` 后 EOF、`[DONE]` 或后续 `response.failed` 仍走既有失败路径；没有先到错误的正常 `response.incomplete` 保持未完成终态。这是本地冲突终态门禁，不推断厂商真实会发送该序列。
+- `response.completed` 若显式携带 `response.status`，其值必须为 `completed`；`incomplete`、其他状态及非字符串值均为矛盾终态，在 JSON/SSE 语义提交前按协议错误拒绝。缺少 status 的既有兼容响应仍按完成事件处理；直接分类器也不会把显式矛盾状态判成成功。
+- 同一已解码上游批次内，终态后最多接受一个可选 `[DONE]`；重复结束标记会在转发或非流聚合前判为协议错误，不把两个 `[DONE]` 都传给下游。流式转发在确认终态后主动结束并取消上游 body，因此此检查不宣称观察到随后才到达的批次，也不要求上游必须发送 `[DONE]`。官方 OpenAI Docs 的 [Responses streaming 指南](https://developers.openai.com/api/docs/guides/streaming-responses) 以 `response.completed` 作为成功完成事件；`[DONE]` 是此处的兼容性尾标记，不是成功依据。
+- 同一已解码上游批次内，`response.completed` 等首个终态之后若又出现完成、失败、不完整或错误帧，流式检查和非流聚合均按本地协议错误失败；不会把先成功后失败的矛盾批次记为成功。普通后置 JSON 与单个可选 `[DONE]` 仍沿用既有处理。流式转发可能在首批终态后取消上游 body，因此此门槛只承诺已解码批次内的一致性，不声称能观察后续网络批次；离线反例也不能证明真实订阅账号权益。
 - 首事件 timeout 是每次实际上游尝试从发送请求之前开始的一次绝对预算，HTTP headers、lifecycle 和 liveness 都不重置；首个业务/终态事件之后才切换到 business-idle 预算。OAuth refresh 属于请求准备，使用独立 30 秒有界 singleflight，不消耗首事件预算；原账号首次 401 强刷后重放时会为这次新尝试创建一份完整的新预算，但仍不得更换账号或 Provider。SSE 未完成事件和完整事件分别受 2 MiB 与 128 MiB 上限约束，Dedicated Images 继续使用自身更严格的累计上限。
 - 普通文本 SSE 只在首个业务或终态事件已经提交后启动 `: keepalive`，默认 15 秒；首包前不发 comment。心跳有独立下游时钟，不推进上游 first-event/idle deadline，因而不会把真实上游静默伪装成健康流。`CC_SWITCH_CODEX_RESPONSES_KEEPALIVE_MS=0` 可关闭，非零值限制为 5 到 60 秒。
 - `CC_SWITCH_CODEX_RESPONSES_SSE_NORMALIZER_ENABLED=0` 仅用于事故回滚，默认必须开启。`CC_SWITCH_OUTBOUND_HTTP2_KEEPALIVE_ENABLED=1` 可实验性启用活动 HTTP/2 连接的协议级 PING，默认关闭；interval/timeout 默认 45/20 秒并分别限制为 10..300 秒与 5..60 秒。它不替代 Responses 业务首事件、idle 和 terminal 判定。
@@ -222,7 +237,8 @@ Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provid
 - fallback 复用原 `ProviderExecution`、账号、workspace、session、request body 和 in-flight lease，不重新进入 Router。
 - 首次握手/HTTP 401 只强刷原账号一次；不会借 fallback 获得额外的 refresh 或 Provider failover 次数。
 - `response.create` 一旦成功发送到上游，后续失败只终止当前 lifecycle，不重放整个请求。
-- 一个上游写入尚未完成时，writer actor 使用容量 8 的有界队列，只接受顶层 `type=response.steer` 的 Text/Binary 帧并保持原始 wire bytes。steering 计入同一请求内存预算；队列满、第二个 `response.create`、嵌套伪装、非法 JSON 和 Grok/其他 Provider 数据帧立即 fail closed，不阻塞 WebSocket Ping/Pong 或下游取消。
+- 一个上游写入尚未完成时，writer actor 使用容量 8 的有界队列，只接受顶层 `type=response.steer`，或带非空字符串 `response_id` 的 `type=response.interrupt` Text/Binary 帧，并保持原始 wire bytes；控制帧计入同一请求内存预算。队列满、第二个 `response.create`、嵌套伪装及 Grok/其他 Provider 数据帧仍按原有规则拒绝，不阻塞 WebSocket Ping/Pong 或下游取消。
+- 当前 WebSocket 桥接只向活动上游连接转发 `response.interrupt`；同一物理连接内已观测终态的响应 ID，其迟到中断幂等忽略，未知空闲 ID 则收到不含 ID 的本地错误帧。终态 ID 记录有界且不跨连接复用。HTTP fallback 的发送、退避及 SSE 读取期间收到顶层 `response.interrupt` 时，会返回不回显客户端 ID 的本地错误帧并继续当前 HTTP 轮次；无效 ID 也只返回本地错误。此路径尚不能通过 WebSocket 数据帧取消本地 HTTP 请求，不是完整的跨传输中断实现。
 - 上游 Text/Binary 业务帧必须是顶层 JSON object；坏 JSON、scalar 和 array 都按协议错误终止，即使 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 也不会绕过这项 transport 校验。WebSocket Ping/Pong/Close 控制帧仍按协议独立处理。
 - `codexWebsocketEnabled=false` 可关闭 WS，但不影响 POST Responses HTTP/SSE。
 
@@ -264,6 +280,20 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - 旧的成功重试不能清除更新一代持久化失败。
 - `refresh_token_reused` 立即隔离账号；不会通过切换账号继续请求。
 
+五项私有 receipt 的 `recordedAt` 都必须在最终接受时仍处于 24 小时窗口（未来时钟偏差最多五分钟）。validator 在内容校验时和末次 Account/Provider/Share 绑定复核后各检查一次；复核期间过期即拒绝该 operation。此规则不自动开启 Images 或 WS prewarm，也不改变生产 Codex wire 或 receipt schema v1/revision 1；末次快照不是跨 API 原子事务。
+
+五项 validator 还按 Server 的真实 Share 投影校验控制面绑定：`bindings` 已包含 `share.app` 主条目，Codex App 必须在原始数组中恰好一条精确匹配所选 Provider；主字段也必须与其对应的唯一条目一致，Share 须明确 `enabled=true/status=active`。重复、冲突或停用时，在模型目录或 Account manifest 请求前失败关闭。此检查只收紧私有验收证据，不改变生产 Share 选择，也不使多次控制面读取成为原子快照。
+
+五项 validator 还要求控制面按真实 `ProviderView` 明确提供顶层 `revision` 与 runtime `providerRevision`，两者均为非负安全整数且相等；Share `configRevision` 也必须明确为非负安全整数，runtime `runtimeFingerprint` 必须是非空白字符串。旧 mock 的虚构顶层 `providerRevision`、缺失或冲突的真实两份 revision 不能补齐 scope 或 Provider binding digest。Astra、三个 Image 2.5 变体与 WS prewarm 的缺 revision、空白 fingerprint 和旧式字段反例均在模型目录或 Account manifest 发网前脱敏拒绝。该门槛只提高证据作用域完整性，不改变生产 wire、receipt schema v1/revision 1，亦不把离线 fixture 提升为真实账号接受性。
+
+`gpt_6_astra` 与 `ws_prewarm` 的私有验收在末次 Account/Provider/Share 复核后，还会通过同一签名 Share 和预期 Provider 栅栏重读普通 Codex 目录及绑定账号 manifest。两次完整目录 `data` 的所有模型 id、manifest `models` 的所有 slug 均须为非空字符串、无首尾空白且各自唯一，所选模型在两份列表中也须恰好一次；目录与 manifest 分别按 id/slug 确定性排序后比较完整摘要。模型增删或能力字段变化会拒绝接受，单纯行顺序变化不会。现有 schema-v1 receipt 不含这两份摘要，因此此门槛只证明一次验收期间的稳定性，不是跨 API 原子快照或真实账号权益证明。三个 Image 2.5 operation 不走这条模型/WS 门槛，仍需各自独立真实 receipt。
+
+私有 receipt 在任何控制面请求前，从同一只读描述符限量读取。读取前后还比较设备号、inode、链接数、大小、权限以及纳秒级 mtime/ctime；同 inode 等长原位改写若改变这些元数据，也会脱敏拒绝。此门槛不能证明恶意元数据复原下的原子文件快照，亦不能替代真实账号的厂商接受性证据。
+
+最终接受前还会重新解析配置的 receipt 路径，并将当前文件的设备号、inode、链接数、大小、权限及纳秒级 mtime/ctime 与读取后的指纹比较。控制面校验期间若换成另一文件，或原文件被等长原位改写并留下元数据变化，验收失败关闭。末次检查不是跨 API 和文件系统的原子事务；恶意元数据复原及检查后的变化仍需依赖私有文件位置与运行环境防护。
+
+末次复核还会经 `O_NOFOLLOW` 只读描述符重读至多 1 MiB 的完整 receipt 原始字节与 EOF，并与最初验收的字节逐一比较；读前、读后以及配置路径的文件身份继续核对。Astra、三个 Image 2.5 变体与 WS prewarm 五项对抗 fixture 在控制面请求期间等长改写文件、让末次元数据读取返回旧值时，旧流程会错误接受，现在全部脱敏拒绝。元数据伪装只证明不能用元数据代替内容比较，不代表普通用户能恢复真实 `ctime`；末次检查后的并发变化、跨 API 原子性以及真实上游接受性仍不由此保证。
+
 ## 验收清单
 
 - 0/1/2 个 Codex OAuth 账号分别得到 `unconfigured`、自动 `ready`、`needs_selection`，这些状态只约束账号中心操作。
@@ -282,6 +312,14 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 - SSE/WS 续传只保留 tool call/call output，failed/incomplete 不写入，缺签名 principal 时始终 cache miss。
 
 真实 OAuth、compact body-signal、Lite capability、routing hint、订阅权限、图片能力和长连接生产可用性仍需要按 [`real-acceptance-runbook.md`](../acceptance/real-acceptance-runbook.md) 使用专用测试账号取证；当前没有可用真实 OAuth 凭据时统一标记为 `live_pending`，离线测试不能替代真实上游验收。
+
+## Responses 检查器失败状态（2026-10-10）
+
+本地 Responses SSE 检查器一旦在 `push` 或 `finish` 拒绝协议、容量或缺失终态错误，后续调用不能将同一条流恢复为成功，已记录的成功终态也不再对外可见。首次错误保留原有分类，后续错误使用固定本地文字；正常 `response.completed`、失败/不完整终态和可选唯一 `[DONE]` 的处理不变。此规则不修改 Codex OAuth 出站 wire，也不能替代五项真实 operation receipt。
+
+## WebSocket 降级 HTTP 后的中断（2026-10-13）
+
+Codex WebSocket 转 HTTP 流式回退后，只有当前 HTTP 响应已发出带非空、有界 `response.id` 的 `response.created`，且下游 `response.interrupt.response_id` 与它精确相等，才在本地停止读取该轮 HTTP 流。若上游尚未报错，桥接先补发尚未提交的生命周期帧，再发送 `response.incomplete`（`incomplete_details.reason=interrupted`），保留已完成的输出项；用量记录为 499/`client_cancelled`。若上游 `error` 已先到达，即使随后收到匹配 ID 的中断，也以 `response.failed` 和 Provider 失败结算，不把既有错误改记为客户端取消。同一客户端 WebSocket 可开始下一轮。未知、非法或未观测 ID 继续收到不回显 ID 的本地错误，原 HTTP 轮次不受影响；普通并发请求仍禁止。合成终态不声称包含上游最终 usage，也不保证私有上游接受以该响应 ID 续链；真实账号验收不在当前实施 goal 内，相关 rail 仍为 `live_pending`。
 
 ## 非目标
 

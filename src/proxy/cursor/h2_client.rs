@@ -596,6 +596,15 @@ fn validate_cursor_terminal(
 ) -> Result<(), ProxyError> {
     if let Some(status) = grpc_status {
         if status != 0 {
+            if status == 8 {
+                return Err(
+                    if grpc_message.is_some_and(cursor_resource_exhausted_is_size) {
+                        ProxyError::bad_request("Cursor AgentService request is too large")
+                    } else {
+                        ProxyError::rate_limited("Cursor AgentService resource exhausted", 60)
+                    },
+                );
+            }
             return Err(cursor_forward_error(format!(
                 "Cursor AgentService terminated with grpc-status {status}: {}",
                 grpc_message.unwrap_or("upstream returned no grpc-message")
@@ -603,6 +612,19 @@ fn validate_cursor_terminal(
         }
     }
     if let Some(Err(message)) = connect_end_stream {
+        let code = message
+            .split_once(':')
+            .map_or(message.as_str(), |(code, _)| code)
+            .trim();
+        if code.eq_ignore_ascii_case("resource_exhausted")
+            || code.eq_ignore_ascii_case("resource exhausted")
+        {
+            return Err(if cursor_resource_exhausted_is_size(message) {
+                ProxyError::bad_request("Cursor AgentService request is too large")
+            } else {
+                ProxyError::rate_limited("Cursor AgentService resource exhausted", 60)
+            });
+        }
         let message = cursor_transport_diagnostic(message);
         return Err(cursor_forward_error(format!(
             "Cursor AgentService returned an invalid or failed Connect-RPC terminal envelope: {}",
@@ -615,6 +637,39 @@ fn validate_cursor_terminal(
     Err(cursor_forward_error(
         "Cursor AgentService response ended without a valid Connect-RPC terminal envelope or grpc-status",
     ))
+}
+
+pub(super) fn cursor_resource_exhausted_is_size(message: &str) -> bool {
+    let lower = message
+        .chars()
+        .take(512)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if [
+        "quota",
+        "rate limit",
+        "too many requests",
+        "throttl",
+        "out of usage",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+    {
+        return false;
+    }
+    [
+        "tool catalog too large",
+        "tool registration too large",
+        "too many tools",
+        "message too large",
+        "payload too large",
+        "request too large",
+        "maximum allowed size",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+        || (lower.contains("request exceeds") && lower.contains("size"))
+        || (lower.contains("request body exceeds") && lower.contains("limit"))
 }
 
 fn parse_connect_end_stream(payload: &[u8]) -> Result<(), String> {
@@ -840,6 +895,33 @@ mod tests {
             .contains("without a valid Connect-RPC terminal"));
         validate_cursor_terminal(None, Some(&Ok(())), None).unwrap();
         validate_cursor_terminal(Some(0), None, None).unwrap();
+    }
+
+    #[test]
+    fn grpc_resource_exhausted_is_rate_limited_not_a_transport_failure() {
+        let error = validate_cursor_terminal(
+            Some(8),
+            Some(&Ok(())),
+            Some("quota exhausted; authorization=secret"),
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!error.message.contains("secret"));
+        let too_large = validate_cursor_terminal(
+            Some(8),
+            None,
+            Some("request too large; authorization=secret"),
+        )
+        .unwrap_err();
+        assert_eq!(too_large.status, StatusCode::BAD_REQUEST);
+        assert!(!too_large.message.contains("secret"));
+
+        let envelope = parse_connect_end_stream(
+            br#"{"error":{"code":"resource_exhausted","message":"quota exhausted; authorization=secret"}}"#,
+        );
+        let envelope_error = validate_cursor_terminal(None, Some(&envelope), None).unwrap_err();
+        assert_eq!(envelope_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!envelope_error.message.contains("secret"));
     }
 
     #[test]

@@ -35,7 +35,7 @@ hex = "0.4"
 hmac = "0.12"
 hkdf = "0.12"
 imagesize = "0.13"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 jsonwebtoken = "9"
 libc = "0.2"
 metrics = "0.24"

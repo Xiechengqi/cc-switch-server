@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub(in crate::api) struct ModelsQuery {
     #[serde(default)]
     pub(in crate::api) app: Option<AppKind>,
+    #[serde(default)]
+    pub(in crate::api) expected_share_id: Option<String>,
+    #[serde(default)]
+    pub(in crate::api) expected_provider_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

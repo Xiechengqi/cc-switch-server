@@ -61,17 +61,11 @@ pub(super) fn account_header_override_blocked(name: &str, provider_type: Provide
         return true;
     }
     if provider_type == ProviderType::GrokOAuth
-        && matches!(
-            normalized.as_str(),
-            "x-xai-token-auth"
-                | "x-grok-client-identifier"
-                | "x-grok-client-version"
-                | "x-grok-client-surface"
-                | "x-authenticateresponse"
-                | "x-grok-conv-id"
-                | "x-grok-cache-identity"
-                | "x-grok-turn-idx"
-        )
+        && (normalized.starts_with("x-grok-")
+            || matches!(
+                normalized.as_str(),
+                "x-xai-token-auth" | "x-authenticateresponse"
+            ))
     {
         return true;
     }

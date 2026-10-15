@@ -16,6 +16,12 @@ Cursor 的一次性外部差异基线保存在 `assets/contract/cursor-reference
 
 Antigravity 的外部差异基线保存在 `assets/contract/antigravity-reference-delta.json`。schema v2 原样保留 v1 的 `CLIProxyAPI` reasoning replay、schema subset、transport scope、compaction 风险证据和 `Antigravity-Manager` conversation session 样本，并追加不可变 observation ledger，映射 source commit/tree/digest、处置、target baseline、implementation commit 与 fixture。默认审计只检查本仓库，`node scripts/audit/audit-antigravity-reference-delta.mjs --check-sources` 才按 SHA-256 读取外部已提交 Git object。`scripts/smoke/antigravity-real.mjs` 对 `antigravity_oauth`、`agy_oauth` 分开接受仓库外私有 receipt；fixture 只能证明 harness contract。AG-01..03 为本地 `fixture_verified`；两条 rail 与 AG-04 compaction 仍为 `live_pending`，compaction 运行时固定关闭。
 
+AG-D3 replay 的本地回归还要求工具结果的显式非空 ID 与非空名称共同关联同一缓存调用；ID 改变时不得以同名回退，名称改变时不得仅凭 ID 注入旧签名。双 rail Gemini HTTP 回环仅验证本地请求边界，不能代替上述私有 receipt 或将 AG-D3 标为厂商接受。
+
+双 rail 私有验收器要求控制面明确提供两个 Provider 的非负安全整数 `providerRevision`、非空 `runtimeFingerprint` 与 Share 的非负安全整数 `configRevision`。缺字段不能默认为 `0` 或空字符串后再用自洽 receipt 通过；这只保证本地证据作用域完整，不证明真实厂商接受性或跨 API 原子快照。
+
+双 rail 私有 receipt 在控制面请求前限量快照，读取前后核对文件指纹；最终接受前还重新解析配置路径，并比对当前文件的设备、inode、链接数、大小、权限与纳秒级 mtime/ctime。控制面验证期间的普通路径替换或原位改写会被拒绝，但末次文件检查并非跨 API/文件系统原子事务，也不构成真实 Google 账号验收。
+
 Grok 的一次性外部差异基线保存在 `assets/contract/grok-reference-delta.json`。append-only schema v2 固定 `269850a` 中原 schema-v1 文件 SHA-256、target commit/tree、全部十个历史字段的 canonical/逐字段 digest，新增 `grok2api@906b9493` 干净 snapshot、明确排除 6 项工作树修改的 `sub2api@ab99d56e` snapshot，以及映射 GR-01～05、GR-N1、CORE-N1/N2、LIVE-N1、GR-R1 的 11 条不可变 observation。只读 evidence 绑定 source commit/tree/path/symbol/digest 与本仓库 committed target object；sub2api 的账号池/轮换、商业复合路由/计价和 soft quota gate 只形成 reject 记录，不进入实现。默认审计只检查本仓库及其 committed Git object，`node scripts/audit/audit-grok-reference-delta.mjs --check-sources` 才复核外部已提交 object。GR-01..03 与 CORE-N1/N2 为本地 fixture verified；推理、媒体与 remote compaction receipt 分离，GR-04/05 在真实输入缺失时保持 `live_pending`，remote compaction 的运行时开关固定关闭。
 
 Claude OAuth 的当前脱敏 wire capture 保存在 `assets/contract/claude-oauth-wire-profile.json`。它只保留 Claude Code/Stainless/Node/Axios 公开版本、endpoint identity family、token endpoint 顺序、billing fingerprint/CCH/beta 合同、静态模型 ID，以及不含账号或业务内容的合成 CCH golden body；token、账号标识、真实/原始请求响应 body 与未验证的私有 build metadata 明确排除。Rust 的 `ClaudeWireProfile`、Messages/CountTokens beta 矩阵、profile/bootstrap/roles 请求身份和静态模型目录以该 capture 为共同证据，任一项变化都必须同步更新 fixture、实现、测试和 `PROTOCOL_EVIDENCE.md`。

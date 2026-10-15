@@ -88,6 +88,7 @@ fn image_ref_bytes(image: &ImageRef) -> usize {
     size_of::<ImageRef>().saturating_add(match image {
         ImageRef::DataUri(value) | ImageRef::HttpUrl(value) => value.capacity(),
         ImageRef::Inline { mime, data } => mime.capacity().saturating_add(data.len()),
+        ImageRef::Detailed { source, .. } => image_ref_bytes(source),
     })
 }
 
@@ -208,6 +209,7 @@ pub(crate) fn session_retained_bytes(session: &CursorSession) -> usize {
     );
 
     size_of::<CursorSession>()
+        .saturating_add(session.key.retained_key_bytes())
         .saturating_add(string_slice_bytes(&session.declared_tool_names))
         .saturating_add(tools_bytes(&session.declared_tools))
         .saturating_add(string_slice_bytes(&session.custom_tool_names))
@@ -216,6 +218,7 @@ pub(crate) fn session_retained_bytes(session: &CursorSession) -> usize {
         .saturating_add(session.local_task_state.origin_turn_digest.capacity())
         .saturating_add(session.working_directory.capacity())
         .saturating_add(pending_tool_calls_bytes(&session.pending_tool_calls))
+        .saturating_add(session.index_retained_bytes)
         .saturating_add(completed)
         .saturating_add(blobs)
 }

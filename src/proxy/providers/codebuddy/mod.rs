@@ -228,6 +228,8 @@ pub(crate) async fn runtime_is_current(
             &prepared_runtime.account_id,
             prepared_runtime.auth_identity_generation,
             prepared_runtime.token_refresh_generation,
+            prepared_runtime.account_incarnation,
+            &prepared_runtime.scope,
         )
         .await
 }
@@ -262,6 +264,8 @@ mod tests {
             &domain,
             7,
             11,
+            13,
+            "fixture-request",
         )
         .unwrap();
         let fetched = parse_codebuddy_model_catalog(
@@ -298,6 +302,7 @@ mod tests {
             account_id: "codebuddy-account".to_string(),
             auth_identity_generation: 7,
             token_refresh_generation: 11,
+            account_incarnation: 13,
         }
     }
 

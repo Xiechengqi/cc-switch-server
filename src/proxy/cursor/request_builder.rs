@@ -163,23 +163,23 @@ fn validate_mcp_tool_schemas(tools: &[McpToolDef]) -> Result<(), String> {
 
 /// Validate tool-result context for AgentService routing. Returns an error
 /// message if the request carries a `function_call_output` / `tool_result`
-/// whose `call_id` is empty — Cursor's AgentService cannot match it to a
+/// whose `call_id` is empty or padded — Cursor's AgentService cannot match it to a
 /// pending exec_id and the turn would silently fail. Mirrors sub2api's
 /// `validateFunctionCallOutputRequest` guard.
 pub fn validate_tool_result_context(plan: &AgentRunPlan) -> Result<(), String> {
     let mut seen = std::collections::HashMap::<&str, (&str, bool)>::new();
     for tr in &plan.tool_results {
-        let call_id = tr.tool_call_id.trim();
-        if call_id.is_empty() {
-            return Err("function_call_output requires a non-empty call_id; \
-                 continuation via previous_response_id without call_id is not supported"
+        let call_id = tr.tool_call_id.as_str();
+        if call_id.is_empty() || call_id.trim() != call_id {
+            return Err("tool result requires a non-empty, unpadded call_id; \
+                 continuation without an exact call_id is not supported"
                 .to_string());
         }
         if let Some((content, is_error)) = seen.insert(call_id, (&tr.content, tr.is_error)) {
             if content != tr.content || is_error != tr.is_error {
-                return Err(format!(
-                    "conflicting tool results for call_id `{call_id}` are not supported"
-                ));
+                return Err(
+                    "conflicting tool results for the same call_id are not supported".to_string(),
+                );
             }
         }
     }
@@ -328,8 +328,6 @@ fn active_gemini_tool_results(body: &Value) -> (Vec<ToolResultBlock>, ToolContin
                 tool_call_id: response
                     .get("id")
                     .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
                     .unwrap_or(name)
                     .to_string(),
                 content: response
@@ -507,9 +505,10 @@ fn tool_call_context_complete(
             }
         }
     }
-    active_results
-        .iter()
-        .all(|result| call_ids.contains(result.tool_call_id.trim()))
+    active_results.iter().all(|result| {
+        let id = result.tool_call_id.as_str();
+        !id.is_empty() && id.trim() == id && call_ids.contains(id)
+    })
 }
 
 fn completed_tool_calls(
@@ -897,6 +896,8 @@ pub fn validate_tool_choice_contract(plan: &AgentRunPlan) -> Result<(), String> 
 /// version (after `apply_model_mapping`), so `model_id` here is what cursor
 /// will see on the wire.
 pub fn try_build_plan(protocol: InboundProtocol, body: &Value) -> Result<AgentRunPlan, String> {
+    validate_explicit_images(protocol, body)?;
+    validate_explicit_tool_choice(protocol, body)?;
     let model_id = body
         .get("model")
         .and_then(Value::as_str)
@@ -1016,6 +1017,197 @@ pub fn try_build_plan(protocol: InboundProtocol, body: &Value) -> Result<AgentRu
     })
 }
 
+/// The decomposers intentionally ignore unknown content kinds, but a declared
+/// image must not disappear and turn a multimodal request into a text-only one.
+fn validate_explicit_images(protocol: InboundProtocol, body: &Value) -> Result<(), String> {
+    const INVALID: &str = "Cursor image input is missing, malformed, or unsupported";
+    let valid_url = |url: Option<&str>| {
+        url.is_some_and(|url| {
+            crate::proxy::remote_image::is_data_image_uri(url)
+                || crate::proxy::remote_image::is_http_image_url(url)
+        })
+    };
+    match protocol {
+        InboundProtocol::AnthropicMessages => {
+            if body
+                .get("system")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+                })
+            {
+                return Err(INVALID.to_string());
+            }
+            for message in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if message.get("content").is_some_and(|content| {
+                    content.get("type").and_then(Value::as_str) == Some("image")
+                }) {
+                    return Err(INVALID.to_string());
+                }
+                for block in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if block.get("type").and_then(Value::as_str) != Some("image") {
+                        continue;
+                    }
+                    let Some(image) = anthropic_image_to_ref(block) else {
+                        return Err(INVALID.to_string());
+                    };
+                    if let ImageRef::HttpUrl(url) = image {
+                        if !valid_url(Some(&url)) {
+                            return Err(INVALID.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        InboundProtocol::OpenAiChat => {
+            for message in body
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if message.get("content").is_some_and(|content| {
+                    content.get("type").and_then(Value::as_str) == Some("image_url")
+                }) {
+                    return Err(INVALID.to_string());
+                }
+                for part in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                        continue;
+                    }
+                    if message
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user")
+                        != "user"
+                    {
+                        return Err(INVALID.to_string());
+                    }
+                    let url = part.get("image_url").and_then(|value| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("url").and_then(Value::as_str))
+                    });
+                    if !valid_url(url) {
+                        return Err(INVALID.to_string());
+                    }
+                }
+            }
+        }
+        InboundProtocol::OpenAiResponses => {
+            for item in body
+                .get("input")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if item.get("type").and_then(Value::as_str) == Some("input_image")
+                    || item.get("content").is_some_and(|content| {
+                        content.get("type").and_then(Value::as_str) == Some("input_image")
+                    })
+                {
+                    return Err(INVALID.to_string());
+                }
+                let is_message = matches!(
+                    item.get("type").and_then(Value::as_str),
+                    None | Some("message") | Some("")
+                );
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if part.get("type").and_then(Value::as_str) != Some("input_image") {
+                        continue;
+                    }
+                    if !is_message {
+                        return Err(INVALID.to_string());
+                    }
+                    let url = part
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("url").and_then(Value::as_str));
+                    if !valid_url(url) {
+                        return Err(INVALID.to_string());
+                    }
+                }
+            }
+        }
+        InboundProtocol::GeminiNative => {
+            if let Some(system) = body
+                .get("systemInstruction")
+                .or_else(|| body.get("system_instruction"))
+            {
+                let parts = system.get("parts").unwrap_or(system);
+                let has_image = gemini_part_values(parts).into_iter().any(|part| {
+                    part.get("inlineData")
+                        .or_else(|| part.get("inline_data"))
+                        .is_some()
+                        || part
+                            .get("fileData")
+                            .or_else(|| part.get("file_data"))
+                            .is_some()
+                });
+                if has_image {
+                    return Err(INVALID.to_string());
+                }
+            }
+            for content in body
+                .get("contents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for part in gemini_part_values(content.get("parts").unwrap_or(&Value::Null)) {
+                    if part
+                        .get("inlineData")
+                        .or_else(|| part.get("inline_data"))
+                        .is_some()
+                        && gemini_inline_image(part).is_none()
+                    {
+                        return Err(INVALID.to_string());
+                    }
+                    if part
+                        .get("fileData")
+                        .or_else(|| part.get("file_data"))
+                        .is_some()
+                        && gemini_file_image(part).is_none()
+                    {
+                        return Err(INVALID.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn gemini_part_values(parts: &Value) -> Vec<&Value> {
+    match parts {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![parts],
+        _ => Vec::new(),
+    }
+}
+
 /// Test helper for request bodies whose contract has already been validated.
 /// Production paths use [`try_build_plan`] so an invalid tool inventory can
 /// never be silently replaced with an empty one.
@@ -1054,6 +1246,7 @@ pub fn validate_request_contract(
     body: &Value,
     compact: bool,
 ) -> Result<(), String> {
+    validate_explicit_tool_choice(protocol, body)?;
     if body
         .get("n")
         .filter(|value| !value.is_null())
@@ -1197,9 +1390,7 @@ pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("tool_call_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+            .and_then(Value::as_str);
         if matches!(
             kind,
             "function_call"
@@ -1208,13 +1399,16 @@ pub fn prepend_response_context(body: &mut Value, previous: &[Value]) -> Result<
                 | "custom_tool_call_output"
         ) {
             let call_id = call_id
-                .ok_or_else(|| format!("Responses {kind} item requires a non-empty call_id"))?;
+                .filter(|id| !id.is_empty() && id.trim() == *id)
+                .ok_or_else(|| {
+                    format!("Responses {kind} item requires an exact, unpadded call_id")
+                })?;
             let key = (kind.to_string(), call_id.to_string());
             let semantic_item = response_call_memory_semantic_item(item);
             if let Some(existing) = call_memory.get(&key) {
                 if existing != &semantic_item {
                     return Err(format!(
-                        "Responses continuation contains conflicting {kind} items for call_id `{call_id}`"
+                        "Responses continuation contains conflicting {kind} items for the same call_id"
                     ));
                 }
                 continue;
@@ -1572,7 +1766,16 @@ fn openai_content_parts(v: &Value) -> (String, Vec<ImageRef>) {
                             .or_else(|| part.get("image_url").filter(|v| v.is_string()))
                             .and_then(Value::as_str);
                         if let Some(url) = url {
-                            push_image_ref(url, &mut images);
+                            let high_detail = part
+                                .get("image_url")
+                                .and_then(|value| value.get("detail"))
+                                .or_else(|| part.get("detail"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|detail| {
+                                    detail.eq_ignore_ascii_case("high")
+                                        || detail.eq_ignore_ascii_case("original")
+                                });
+                            push_image_ref(url, high_detail, &mut images);
                         }
                     }
                     _ => {}
@@ -1584,17 +1787,30 @@ fn openai_content_parts(v: &Value) -> (String, Vec<ImageRef>) {
     (texts.join("\n"), images)
 }
 
-fn push_image_ref(url: &str, out: &mut Vec<ImageRef>) {
-    if crate::proxy::remote_image::is_data_image_uri(url) {
-        out.push(ImageRef::DataUri(url.to_string()));
+fn push_image_ref(url: &str, high_detail: bool, out: &mut Vec<ImageRef>) {
+    let source = if crate::proxy::remote_image::is_data_image_uri(url) {
+        Some(ImageRef::DataUri(url.to_string()))
     } else if crate::proxy::remote_image::is_http_image_url(url) {
-        out.push(ImageRef::HttpUrl(url.to_string()));
+        Some(ImageRef::HttpUrl(url.to_string()))
+    } else {
+        None
+    };
+    if let Some(source) = source {
+        out.push(if high_detail {
+            ImageRef::Detailed {
+                source: Box::new(source),
+                high_detail,
+            }
+        } else {
+            source
+        });
     }
 }
 
 fn inline_base64_image_ref(mime: &str, data: &str) -> Option<ImageRef> {
     let data = data.trim();
-    let max_encoded_bytes = (super::image::MAX_IMAGE_BYTES.saturating_add(2) / 3).saturating_mul(4);
+    let max_encoded_bytes =
+        (super::image::MAX_INPUT_IMAGE_BYTES.saturating_add(2) / 3).saturating_mul(4);
     if data.len() > max_encoded_bytes {
         return None;
     }
@@ -1770,7 +1986,14 @@ fn openai_responses_content_parts(v: &Value) -> (String, Vec<ImageRef>) {
                             .and_then(Value::as_str)
                             .or_else(|| part.get("url").and_then(Value::as_str));
                         if let Some(url) = url {
-                            push_image_ref(url, &mut images);
+                            let high_detail = part
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .is_some_and(|detail| {
+                                    detail.eq_ignore_ascii_case("high")
+                                        || detail.eq_ignore_ascii_case("original")
+                                });
+                            push_image_ref(url, high_detail, &mut images);
                         }
                     }
                     _ => {}
@@ -1826,8 +2049,6 @@ fn decompose_gemini_native(
             let call_id = function_call
                 .get("id")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
                 .unwrap_or(name);
             let args = function_call
                 .get("args")
@@ -1849,8 +2070,6 @@ fn decompose_gemini_native(
             let tool_call_id = function_response
                 .get("id")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| name.clone());
             let response = function_response
@@ -2024,6 +2243,93 @@ pub enum ExtractedToolChoice {
     Named(String),
 }
 
+fn validate_explicit_tool_choice(protocol: InboundProtocol, body: &Value) -> Result<(), String> {
+    const INVALID: &str =
+        "invalid cursor tool_choice: explicit tool selection is malformed or unsupported";
+    if protocol == InboundProtocol::GeminiNative {
+        let Some(config) = body
+            .pointer("/toolConfig/functionCallingConfig")
+            .or_else(|| body.pointer("/tool_config/function_calling_config"))
+        else {
+            return Ok(());
+        };
+        if !config.is_object() || config.get("mode").is_some_and(|mode| !mode.is_string()) {
+            return Err(INVALID.to_string());
+        }
+        let mode = config.get("mode").and_then(Value::as_str).unwrap_or("AUTO");
+        if !matches!(mode.to_ascii_uppercase().as_str(), "AUTO" | "NONE" | "ANY") {
+            return Err(INVALID.to_string());
+        }
+        let allowed = config
+            .get("allowedFunctionNames")
+            .or_else(|| config.get("allowed_function_names"));
+        if let Some(allowed) = allowed {
+            let Some(names) = allowed.as_array() else {
+                return Err(INVALID.to_string());
+            };
+            if names.len() > 1
+                || names
+                    .iter()
+                    .any(|name| name.as_str().is_none_or(|name| name.trim().is_empty()))
+                || (!mode.eq_ignore_ascii_case("ANY") && !names.is_empty())
+            {
+                return Err(INVALID.to_string());
+            }
+        }
+        return Ok(());
+    }
+    let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) else {
+        return Ok(());
+    };
+    if protocol == InboundProtocol::AnthropicMessages {
+        let Some(kind) = choice.get("type").and_then(Value::as_str) else {
+            return Err(INVALID.to_string());
+        };
+        if matches!(kind, "auto" | "none" | "any") {
+            return Ok(());
+        }
+        return if kind == "tool"
+            && choice
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        {
+            Ok(())
+        } else {
+            Err(INVALID.to_string())
+        };
+    }
+    if matches!(choice.as_str(), Some("auto" | "none" | "required")) {
+        return Ok(());
+    }
+    let Some(kind) = choice.get("type").and_then(Value::as_str) else {
+        return Err(INVALID.to_string());
+    };
+    if matches!(kind, "auto" | "none" | "required") {
+        return Ok(());
+    }
+    if kind != "function" {
+        return Err(INVALID.to_string());
+    }
+    if choice
+        .get("function")
+        .is_some_and(|function| !function.is_object())
+    {
+        return Err(INVALID.to_string());
+    }
+    let nested = choice.pointer("/function/name");
+    let flat = choice.get("name");
+    let name = nested.or(flat).and_then(Value::as_str);
+    if name.is_none_or(|name| name.trim().is_empty())
+        || nested
+            .zip(flat)
+            .is_some_and(|(nested, flat)| nested != flat)
+    {
+        return Err(INVALID.to_string());
+    }
+    Ok(())
+}
+
 pub fn extract_tool_choice(body: &Value, protocol: InboundProtocol) -> ExtractedToolChoice {
     if protocol == InboundProtocol::GeminiNative {
         let config = body
@@ -2077,6 +2383,10 @@ pub fn extract_tool_choice(body: &Value, protocol: InboundProtocol) -> Extracted
             if raw.as_str() == Some("none") {
                 ExtractedToolChoice::None
             } else if raw.as_str() == Some("required") {
+                ExtractedToolChoice::Required
+            } else if raw.get("type").and_then(Value::as_str) == Some("none") {
+                ExtractedToolChoice::None
+            } else if raw.get("type").and_then(Value::as_str) == Some("required") {
                 ExtractedToolChoice::Required
             } else if raw.get("type").and_then(Value::as_str) == Some("function") {
                 let name = raw
@@ -2640,6 +2950,165 @@ pub fn estimate_input_tokens(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_invalid_image_inputs_cannot_be_silently_dropped() {
+        for (protocol, body) in [
+            (
+                InboundProtocol::OpenAiChat,
+                json!({
+                    "model":"cursor","messages":[{"role":"user","content":[
+                        {"type":"text","text":"describe this"},
+                        {"type":"image_url","image_url":{"url":"ftp://example.com/a.png"}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "model":"cursor","input":[{"role":"user","content":[
+                        {"type":"input_text","text":"describe this"},
+                        {"type":"input_image","image_url":"ftp://example.com/a.png"}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::AnthropicMessages,
+                json!({
+                    "model":"cursor","messages":[{"role":"user","content":[
+                        {"type":"text","text":"describe this"},
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"not-base64"}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::GeminiNative,
+                json!({
+                    "model":"cursor","contents":[{"role":"user","parts":[
+                        {"text":"describe this"},
+                        {"fileData":{"fileUri":"ftp://example.com/a.png"}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiChat,
+                json!({
+                    "model":"cursor","messages":[{"role":"assistant","content":[
+                        {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "model":"cursor","input":[{"type":"message","role":"user","content":[
+                        {"type":"input_image"}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::GeminiNative,
+                json!({
+                    "model":"cursor","systemInstruction":{"parts":[
+                        {"fileData":{"fileUri":"https://example.com/a.png"}}
+                    ]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]
+                }),
+            ),
+            (
+                InboundProtocol::AnthropicMessages,
+                json!({
+                    "model":"cursor","system":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}],
+                    "messages":[{"role":"user","content":"hi"}]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiChat,
+                json!({
+                    "model":"cursor","messages":[{"role":"user","content":
+                        {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+                    }]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "model":"cursor","input":[{"type":"input_image","image_url":"https://example.com/a.png"}]
+                }),
+            ),
+        ] {
+            let error = try_build_plan(protocol, &body).unwrap_err();
+            assert!(error.contains("image"), "{protocol:?}: {error}");
+            assert!(!error.contains("example.com"), "{protocol:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn valid_explicit_image_inputs_remain_in_plan() {
+        for (protocol, body) in [
+            (
+                InboundProtocol::OpenAiChat,
+                json!({
+                    "model":"cursor","messages":[{"content":[
+                        {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "model":"cursor","input":[{"role":"user","content":[
+                        {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::AnthropicMessages,
+                json!({
+                    "model":"cursor","messages":[{"role":"user","content":[
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}
+                    ]}]
+                }),
+            ),
+            (
+                InboundProtocol::GeminiNative,
+                json!({
+                    "model":"cursor","contents":[{"role":"user","parts":[
+                        {"fileData":{"fileUri":"https://example.com/a.png"}}
+                    ]}]
+                }),
+            ),
+        ] {
+            let plan = try_build_plan(protocol, &body).unwrap();
+            assert_eq!(plan.images.len(), 1, "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn openai_image_detail_reaches_the_cursor_image_preparer() {
+        for (protocol, body) in [
+            (
+                InboundProtocol::OpenAiChat,
+                json!({"model":"cursor","messages":[{"role":"user","content":[
+                    {"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"high"}}
+                ]}]}),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({"model":"cursor","input":[{"role":"user","content":[
+                    {"type":"input_image","image_url":"https://example.com/a.png","detail":"original"}
+                ]}]}),
+            ),
+        ] {
+            let plan = try_build_plan(protocol, &body).unwrap();
+            assert!(matches!(
+                plan.images.first(),
+                Some(ImageRef::Detailed {
+                    high_detail: true,
+                    ..
+                })
+            ));
+        }
+    }
     use serde_json::json;
 
     #[test]
@@ -2753,8 +3222,8 @@ mod tests {
     #[test]
     fn image_url_classification_accepts_case_insensitive_schemes() {
         let mut images = Vec::new();
-        push_image_ref("HTTPS://example.com/x.png", &mut images);
-        push_image_ref("DATA:image/png;base64,iVBORw0KGgo=", &mut images);
+        push_image_ref("HTTPS://example.com/x.png", false, &mut images);
+        push_image_ref("DATA:image/png;base64,iVBORw0KGgo=", false, &mut images);
         assert!(matches!(images.first(), Some(ImageRef::HttpUrl(_))));
         assert!(matches!(images.get(1), Some(ImageRef::DataUri(_))));
     }
@@ -3326,6 +3795,20 @@ mod tests {
     }
 
     #[test]
+    fn padded_tool_result_id_cannot_match_a_different_call() {
+        let body = json!({
+            "model":"gpt-5",
+            "input":[
+                {"type":"function_call","call_id":"call-a","name":"run","arguments":"{}"},
+                {"type":"function_call_output","call_id":" call-a ","output":"done"}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
+        assert!(!plan.cold_resume_ready);
+        assert!(validate_tool_result_context(&plan).is_err());
+    }
+
+    #[test]
     fn validate_tool_result_context_rejects_conflicting_duplicate_call_id() {
         let body = json!({
             "input": [
@@ -3355,6 +3838,88 @@ mod tests {
         let plan = build_plan(InboundProtocol::OpenAiResponses, &body);
         assert!(plan.tools.is_empty());
         assert!(!plan.user_text.contains("executable tools"));
+    }
+
+    #[test]
+    fn explicit_named_tool_choice_cannot_silently_become_auto() {
+        let cases = [
+            (
+                InboundProtocol::OpenAiChat,
+                json!({
+                    "messages":[{"role":"user","content":"run"}],
+                    "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+                    "tool_choice":{"type":"function","function":{"name":42}}
+                }),
+            ),
+            (
+                InboundProtocol::OpenAiResponses,
+                json!({
+                    "input":"run",
+                    "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
+                    "tool_choice":{"type":"function","name":null}
+                }),
+            ),
+            (
+                InboundProtocol::AnthropicMessages,
+                json!({
+                    "messages":[{"role":"user","content":"run"}],
+                    "tools":[{"name":"shell","input_schema":{"type":"object"}}],
+                    "tool_choice":{"type":"tool","name":42}
+                }),
+            ),
+            (
+                InboundProtocol::GeminiNative,
+                json!({
+                    "contents":[{"role":"user","parts":[{"text":"run"}]}],
+                    "tools":[{"functionDeclarations":[{"name":"shell","parameters":{"type":"object"}}]}],
+                    "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["shell",42]}}
+                }),
+            ),
+        ];
+        for (protocol, body) in cases {
+            assert!(try_build_plan(protocol, &body).is_err(), "{protocol:?}");
+            assert!(
+                validate_request_contract(protocol, &body, false).is_err(),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_explicit_tool_choice_remains_constrained() {
+        let chat = json!({
+            "messages":[{"role":"user","content":"run"}],
+            "tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+            "tool_choice":{"type":"function","function":{"name":"shell"}}
+        });
+        let responses = json!({
+            "input":"run",
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"shell"}
+        });
+        let anthropic = json!({
+            "messages":[{"role":"user","content":"run"}],
+            "tools":[{"name":"shell","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool","name":"shell"}
+        });
+        let gemini = json!({
+            "contents":[{"role":"user","parts":[{"text":"run"}]}],
+            "tools":[{"functionDeclarations":[{"name":"shell","parameters":{"type":"object"}}]}],
+            "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["shell"]}}
+        });
+        for (protocol, body) in [
+            (InboundProtocol::OpenAiChat, chat),
+            (InboundProtocol::OpenAiResponses, responses),
+            (InboundProtocol::AnthropicMessages, anthropic),
+            (InboundProtocol::GeminiNative, gemini),
+        ] {
+            validate_request_contract(protocol, &body, false).unwrap();
+            let plan = try_build_plan(protocol, &body).unwrap();
+            assert_eq!(plan.tool_choice, ExtractedToolChoice::Named("shell".into()));
+        }
+        let object_none = json!({"input":"run","tool_choice":{"type":"none"}});
+        let plan = try_build_plan(InboundProtocol::OpenAiResponses, &object_none).unwrap();
+        assert_eq!(plan.tool_choice, ExtractedToolChoice::None);
     }
 
     #[test]
@@ -3497,6 +4062,22 @@ mod tests {
     }
 
     #[test]
+    fn gemini_explicit_padded_tool_id_cannot_match_another_call() {
+        let body = json!({
+            "model":"gemini-2.5-pro",
+            "contents":[
+                {"role":"model","parts":[{"functionCall":{"id":"call-a","name":"lookup","args":{}}}]},
+                {"role":"user","parts":[{"functionResponse":{"id":" call-a ","name":"lookup","response":{"ok":true}}}]}
+            ]
+        });
+        let plan = build_plan(InboundProtocol::GeminiNative, &body);
+        assert_eq!(plan.tool_results[0].tool_call_id, " call-a ");
+        assert!(!plan.cold_resume_ready);
+        let error = validate_tool_result_context(&plan).unwrap_err();
+        assert!(!error.contains("call-a"));
+    }
+
+    #[test]
     fn estimate_input_tokens_nonzero_for_text() {
         assert!(estimate_input_tokens("hello world this is a test") > 0);
         assert_eq!(estimate_input_tokens(""), 0);
@@ -3553,6 +4134,30 @@ mod tests {
             "input":[{"type":"function_call","call_id":"call_1","name":"other","arguments":"{}"}]
         });
         assert!(prepend_response_context(&mut conflicting, &previous).is_err());
+    }
+
+    #[test]
+    fn completed_response_context_rejects_padded_call_ids() {
+        let previous = vec![json!({
+            "type":"function_call", "call_id":"call_1", "name":"lookup", "arguments":"{}"
+        })];
+        for kind in [
+            "function_call",
+            "function_call_output",
+            "custom_tool_call",
+            "custom_tool_call_output",
+        ] {
+            let mut current = json!({"input":[{"type":kind,"call_id":" call_1 ","output":"ok"}]});
+            let error = prepend_response_context(&mut current, &previous).unwrap_err();
+            assert!(error.contains("unpadded call_id"));
+            assert!(!error.contains("call_1"));
+        }
+        let mut previous_padded = json!({"input":[]});
+        assert!(prepend_response_context(
+            &mut previous_padded,
+            &[json!({"type":"function_call","call_id":"call_1 ","name":"lookup","arguments":"{}"})]
+        )
+        .is_err());
     }
 
     #[test]

@@ -15,7 +15,14 @@ const TOMBSTONE_MAX_ENTRIES: usize = 4_000;
 pub struct PreviousResponseCacheScope {
     pub share_id: String,
     pub principal: String,
+    pub provider_id: String,
+    pub provider_revision: u64,
     pub runtime_fingerprint: String,
+    pub account_id: String,
+    pub account_incarnation: u64,
+    pub auth_identity_generation: u64,
+    pub token_refresh_generation: u64,
+    pub credential_fingerprint: [u8; 32],
     pub workspace_id: String,
 }
 
@@ -286,8 +293,10 @@ fn cache_key(
     scope: &PreviousResponseCacheScope,
     response_id: &str,
 ) -> Option<PreviousResponseCacheKey> {
-    let response_id = response_id.trim();
-    if response_id.is_empty() || response_id.len() > CACHE_MAX_RESPONSE_ID_LEN {
+    if response_id.is_empty()
+        || response_id.len() > CACHE_MAX_RESPONSE_ID_LEN
+        || response_id.trim() != response_id
+    {
         return None;
     }
     Some(PreviousResponseCacheKey {
@@ -313,7 +322,14 @@ mod tests {
         PreviousResponseCacheScope {
             share_id: share_id.to_string(),
             principal: principal.to_string(),
+            provider_id: "provider-a".to_string(),
+            provider_revision: 1,
             runtime_fingerprint: "runtime-a".to_string(),
+            account_id: "account-a".to_string(),
+            account_incarnation: 1,
+            auth_identity_generation: 1,
+            token_refresh_generation: 1,
+            credential_fingerprint: [1; 32],
             workspace_id: "workspace-a".to_string(),
         }
     }
@@ -342,7 +358,29 @@ mod tests {
         let mut different_workspace = base.clone();
         different_workspace.workspace_id = "workspace-b".to_string();
         assert!(cache.get(&different_workspace, "resp-a", 1_001).is_none());
+        let mut different_account = base.clone();
+        different_account.account_id = "account-b".to_string();
+        assert!(cache.get(&different_account, "resp-a", 1_001).is_none());
+        let mut recreated_account = base.clone();
+        recreated_account.account_incarnation += 1;
+        assert!(cache.get(&recreated_account, "resp-a", 1_001).is_none());
+        let mut changed_credential = base.clone();
+        changed_credential.credential_fingerprint[0] ^= 1;
+        assert!(cache.get(&changed_credential, "resp-a", 1_001).is_none());
         assert!(cache.get(&base, "resp-a", 1_000 + CACHE_TTL_MS).is_none());
+    }
+
+    #[test]
+    fn response_ids_are_opaque_and_padding_cannot_reuse_tool_context() {
+        let mut cache = PreviousResponseCache::default();
+        let scope = scope("share-a", "user@example.com");
+        let items = vec![json!({"type":"function_call","call_id":"call-a"})];
+        assert!(cache.insert(scope.clone(), "resp-a", items.clone(), 1_000));
+        for padded in [" resp-a", "resp-a ", "\tresp-a", "resp-a\n"] {
+            assert!(cache.get(&scope, padded, 1_001).is_none());
+            assert!(!cache.insert(scope.clone(), padded, items.clone(), 1_001));
+        }
+        assert_eq!(cache.get(&scope, "resp-a", 1_002), Some(items));
     }
 
     #[test]

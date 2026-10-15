@@ -353,6 +353,27 @@ assert(
   "Antigravity compaction gate opened without a receipt",
 );
 
+const currentAcceptance = baseline.realAcceptanceExtensions ?? [];
+assert(
+  currentAcceptance.length === 1 &&
+    currentAcceptance[0].id === "AG-LIVE-V2-2026-10-08" &&
+    currentAcceptance[0].receiptSchemaVersion === 2 &&
+    currentAcceptance[0].harnessRevision === 2 &&
+    currentAcceptance[0].scopeDigestDomain === "cc-switch-server:antigravity-real-scope:v2" &&
+    currentAcceptance[0].catalogDigestDomainPattern ===
+      "cc-switch-server:antigravity-{app}-catalog:v2" &&
+    currentAcceptance[0].catalogMaxAgeMs === 7_200_000 &&
+    currentAcceptance[0].receiptMaxAgeMs === 86_400_000 &&
+    currentAcceptance[0].clockSkewMs === 300_000 &&
+    JSON.stringify(currentAcceptance[0].catalogSnapshotFields) ===
+      JSON.stringify(["app", "model", "source", "stale", "fetchedAtMs", "digest"]) &&
+    JSON.stringify(currentAcceptance[0].rails.map((entry) => entry.rail).sort()) ===
+      JSON.stringify(["agy_oauth", "antigravity_oauth"]) &&
+    currentAcceptance[0].rails.every((entry) => entry.status === "live_pending" && entry.receipt === null) &&
+    currentAcceptance[0].compactionAutoEnable === false,
+  "Antigravity current receipt extension or live gate changed",
+);
+
 console.log(
   `antigravity reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations${
     checkSources ? ", external objects verified" : ", external check optional"

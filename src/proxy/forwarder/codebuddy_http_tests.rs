@@ -24,16 +24,30 @@ enum CodeBuddyGenerationReply {
     Success,
     SuccessZeroCache,
     HttpUnauthorized,
+    HttpUnauthorizedWithLimitCode,
+    HttpUnauthorizedWithTerminalCode(i64),
     OversizedHttpUnauthorized,
-    LateUnauthorized,
+    LateLicenseRejected,
     LargeAggregate,
     LargeToolStream,
+    MixedSseLineEndings,
+    UsageTailWithoutChoices,
+    WhitespaceFragments,
     DuplicateDone,
     DataAfterDone,
+    DataAfterFinishReason,
+    InvalidChoiceIndex,
+    DuplicateChoice,
+    InvalidToolIndex,
+    InvalidToolCallsShape,
+    LegacyFunctionCall,
+    InvalidUsageShape,
+    BusinessErrorWithChoices,
     TruncatedBeforeDone,
     UsageTailBeforeDoneTruncated,
     StallBeforeDone,
     StallAfterDone,
+    StallAfterFinishReason,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +292,17 @@ fn tool_chunks() -> Vec<Bytes> {
     tool_chunks_with_cache(3, 2)
 }
 
+fn mixed_line_ending_stream() -> Response {
+    let mut bytes = Vec::new();
+    for (index, chunk) in tool_chunks().into_iter().enumerate() {
+        let chunk = chunk.as_ref();
+        bytes.extend_from_slice(chunk.strip_suffix(b"\n\n").unwrap());
+        bytes.extend_from_slice(if index % 2 == 0 { b"\n\r\n" } else { b"\r\n\n" });
+    }
+    bytes.extend_from_slice(b"data: [DONE]\r\r");
+    sse_response(vec![Bytes::from(bytes)])
+}
+
 fn sse_response(chunks: Vec<Bytes>) -> Response {
     let stream = async_stream::stream! {
         for chunk in chunks {
@@ -401,6 +426,20 @@ async fn codebuddy_generation(
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(json!({"message": "expired"}).to_string()))
             .unwrap(),
+        CodeBuddyGenerationReply::HttpUnauthorizedWithLimitCode => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"code": 14003, "msg": "too many requests"}).to_string(),
+            ))
+            .unwrap(),
+        CodeBuddyGenerationReply::HttpUnauthorizedWithTerminalCode(code) => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"code": code, "msg": "authorization unavailable"}).to_string(),
+            ))
+            .unwrap(),
         CodeBuddyGenerationReply::OversizedHttpUnauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header(CONTENT_TYPE, "application/json")
@@ -408,12 +447,32 @@ async fn codebuddy_generation(
                 json!({"message": "x".repeat(256 * 1024)}).to_string(),
             ))
             .unwrap(),
-        CodeBuddyGenerationReply::LateUnauthorized => sse_response(vec![
+        CodeBuddyGenerationReply::LateLicenseRejected => sse_response(vec![
             chat_chunk("discard-me", None),
             Bytes::from_static(b"data: {\"code\":12005,\"message\":\"expired\"}\n\n"),
         ]),
         CodeBuddyGenerationReply::LargeAggregate => large_memory_response(true),
         CodeBuddyGenerationReply::LargeToolStream => large_memory_response(false),
+        CodeBuddyGenerationReply::MixedSseLineEndings => mixed_line_ending_stream(),
+        CodeBuddyGenerationReply::UsageTailWithoutChoices => {
+            let mut chunks = tool_chunks();
+            chunks.pop();
+            chunks.push(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"usage": {
+                    "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13,
+                    "cache_read_tokens": 3, "cache_write_tokens": 2
+                }})
+            )));
+            chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            sse_response(chunks)
+        }
+        CodeBuddyGenerationReply::WhitespaceFragments => sse_response(vec![
+            chat_chunk("left", None),
+            chat_chunk(" ", None),
+            chat_chunk("right", Some("stop")),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
         CodeBuddyGenerationReply::DuplicateDone => {
             let mut chunks = tool_chunks();
             chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -426,6 +485,53 @@ async fn codebuddy_generation(
             chunks.push(chat_chunk("too-late", Some("stop")));
             sse_response(chunks)
         }
+        CodeBuddyGenerationReply::DataAfterFinishReason => sse_response(vec![
+            chat_chunk("finished", Some("stop")),
+            chat_chunk("too-late", None),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::InvalidChoiceIndex => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":\"invalid\",\"delta\":{\"content\":\"misleading\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::DuplicateChoice => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"left\"},\"finish_reason\":null},{\"index\":0,\"delta\":{\"content\":\"right\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::InvalidToolIndex => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":null,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::InvalidToolCallsShape => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::LegacyFunctionCall => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},\"finish_reason\":\"function_call\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::InvalidUsageShape => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"misleading\"},\"finish_reason\":\"stop\"}],\"usage\":-1}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
+        CodeBuddyGenerationReply::BusinessErrorWithChoices => sse_response(vec![
+            Bytes::from_static(
+                b"data: {\"code\":14003,\"msg\":\"too many requests\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"misleading\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]),
         CodeBuddyGenerationReply::TruncatedBeforeDone => {
             sse_response(vec![chat_chunk("truncated", None)])
         }
@@ -436,6 +542,11 @@ async fn codebuddy_generation(
         ),
         CodeBuddyGenerationReply::StallAfterDone => {
             let mut first = chat_chunk("cancel-after-done", None).to_vec();
+            first.extend_from_slice(b"data: [DONE]\n\n");
+            stalling_sse_response(Bytes::from(first), Arc::clone(&state.upstream_body_dropped))
+        }
+        CodeBuddyGenerationReply::StallAfterFinishReason => {
+            let mut first = chat_chunk("cancel-after-finish", Some("stop")).to_vec();
             first.extend_from_slice(b"data: [DONE]\n\n");
             stalling_sse_response(Bytes::from(first), Arc::clone(&state.upstream_body_dropped))
         }
@@ -946,7 +1057,7 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
                         .await;
 
                         let response = forward_codebuddy_surface(
-                            state,
+                            state.clone(),
                             app,
                             provider_id,
                             &share_id,
@@ -973,6 +1084,10 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
                                     || body.contains("finishReason"),
                                 "{name}: {body}"
                             );
+                            let usage = state.usage_snapshot().await;
+                            let log = usage.logs.last().expect("CodeBuddy stream usage log");
+                            assert_eq!(log.stream_status.as_deref(), Some("completed"), "{name}");
+                            assert_eq!(log.status_code, 200, "{name}");
                         }
                         assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
                         assert_eq!(fixture.count(&fixture.config_requests), 1, "{name}");
@@ -983,6 +1098,247 @@ fn codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes() {
                         server.abort();
                     }
                 }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_whitespace_fragments_reach_both_sites_and_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name =
+                        format!("codebuddy-whitespace-{}-{app:?}-{streaming}", site.as_str());
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::WhitespaceFragments],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let response =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{name}");
+                    let body = String::from_utf8(collect(response).await).unwrap();
+                    if streaming {
+                        assert!(body.contains(":\" \""), "{name}: {body}");
+                    } else {
+                        assert!(body.contains("left right"), "{name}: {body}");
+                    }
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_mixed_sse_line_endings_reach_all_surfaces_without_losing_usage() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for stream_requested in [false, true] {
+                    let name = format!(
+                        "codebuddy-mixed-lines-{}-{}-{}",
+                        site.as_str(),
+                        app.as_str(),
+                        if stream_requested { "stream" } else { "json" }
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::MixedSseLineEndings],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let response = forward_codebuddy_surface(
+                        state.clone(),
+                        app,
+                        provider_id,
+                        &share_id,
+                        stream_requested,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{name}");
+                    let body = String::from_utf8(collect(response).await).unwrap();
+                    assert!(body.contains("ready"), "{name}: {body}");
+                    assert!(body.contains("lookup"), "{name}: {body}");
+                    assert_codebuddy_cache_usage(app, stream_requested, &body, 3, 2);
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_usage_tail_without_choices_reaches_both_sites_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-usage-no-choices-{}-{}-{streaming}",
+                        site.as_str(),
+                        app.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::UsageTailWithoutChoices],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let response =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{name}");
+                    let body = String::from_utf8(collect(response).await).unwrap();
+                    assert!(body.contains("ready"), "{name}: {body}");
+                    assert_codebuddy_cache_usage(app, streaming, &body, 3, 2);
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_catalog_refetches_for_same_generation_credential_and_profile_changes() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for changed in ["credential", "profile"] {
+                let name = format!("codebuddy-cache-{}-{changed}", site.as_str());
+                let (address, fixture, server) =
+                    spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success]).await;
+                let state = codebuddy_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, account_id) =
+                    install_codebuddy_provider(&state, &name, AppKind::Codex, site, &origin).await;
+                let share_id = format!("{name}-share");
+                install_codebuddy_share(
+                    &state,
+                    &share_id,
+                    AppKind::Codex,
+                    &provider_id,
+                    "owner@example.com",
+                )
+                .await;
+                let first = forward_codebuddy_surface(
+                    state.clone(),
+                    AppKind::Codex,
+                    provider_id.clone(),
+                    &share_id,
+                    false,
+                )
+                .await
+                .unwrap();
+                let _ = collect(first).await;
+                assert_eq!(fixture.count(&fixture.config_requests), 1);
+                let original_account = state.find_account_by_id(&account_id).await.unwrap();
+
+                state
+                    .mutate_accounts_immediate(|accounts| {
+                        let account = accounts
+                            .accounts
+                            .iter_mut()
+                            .find(|account| account.id == account_id)
+                            .unwrap();
+                        match changed {
+                            "credential" => {
+                                account.access_token = Some("same-generation-new-token".to_string())
+                            }
+                            "profile" => {
+                                account.profile.as_mut().unwrap()["uid"] =
+                                    json!("fixture-user-next")
+                            }
+                            _ => unreachable!(),
+                        }
+                    })
+                    .await
+                    .unwrap();
+                let second = forward_codebuddy_surface(
+                    state.clone(),
+                    AppKind::Codex,
+                    provider_id.clone(),
+                    &share_id,
+                    false,
+                )
+                .await
+                .unwrap();
+                let _ = collect(second).await;
+                assert_eq!(fixture.count(&fixture.config_requests), 2, "{name}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 2, "{name}");
+                let account = state.find_account_by_id(&account_id).await.unwrap();
+                assert_eq!(
+                    account.auth_identity_generation,
+                    original_account.auth_identity_generation
+                );
+                assert_eq!(
+                    account.token_refresh_generation,
+                    original_account.token_refresh_generation
+                );
+                server.abort();
             }
         }
     });
@@ -1248,12 +1604,12 @@ fn codebuddy_both_sites_keep_one_request_budget_across_401_recovery() {
 }
 
 #[test]
-fn codebuddy_nonstream_recovers_late_auth_once_on_only_the_bound_account() {
+fn codebuddy_nonstream_late_license_rejection_never_refreshes_or_uses_decoy() {
     run_codebuddy_async_test(async {
         let (address, fixture, server) = spawn_codebuddy_upstream(
             CodeBuddySite::Intl,
             vec![
-                CodeBuddyGenerationReply::LateUnauthorized,
+                CodeBuddyGenerationReply::LateLicenseRejected,
                 CodeBuddyGenerationReply::Success,
             ],
         )
@@ -1261,11 +1617,11 @@ fn codebuddy_nonstream_recovers_late_auth_once_on_only_the_bound_account() {
         let (decoy_address, decoy, decoy_server) =
             spawn_codebuddy_upstream(CodeBuddySite::Cn, vec![CodeBuddyGenerationReply::Success])
                 .await;
-        let state = codebuddy_test_state("codebuddy-late-auth");
+        let state = codebuddy_test_state("codebuddy-late-license");
         let origin = format!("http://{address}");
         let (provider_id, account_id) = install_codebuddy_provider(
             &state,
-            "codebuddy-late-auth",
+            "codebuddy-late-license",
             AppKind::Codex,
             CodeBuddySite::Intl,
             &origin,
@@ -1279,7 +1635,7 @@ fn codebuddy_nonstream_recovers_late_auth_once_on_only_the_bound_account() {
             &format!("http://{decoy_address}"),
         )
         .await;
-        let share_id = "codebuddy-late-auth-share";
+        let share_id = "codebuddy-late-license-share";
         install_codebuddy_share(
             &state,
             share_id,
@@ -1294,39 +1650,27 @@ fn codebuddy_nonstream_recovers_late_auth_once_on_only_the_bound_account() {
             .unwrap()
             .token_refresh_generation;
 
-        let response =
+        let error =
             forward_codebuddy_surface(state.clone(), AppKind::Codex, provider_id, share_id, false)
                 .await
-                .unwrap();
-        let body = String::from_utf8(collect(response).await).unwrap();
-        assert!(body.contains("ready"), "{body}");
-        assert!(!body.contains("discard-me"), "{body}");
-        assert_eq!(fixture.count(&fixture.generation_requests), 2);
-        assert_eq!(fixture.count(&fixture.refresh_requests), 1);
+                .expect_err("license rejection must not be recovered");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        assert_eq!(fixture.count(&fixture.refresh_requests), 0);
         assert_eq!(decoy.count(&decoy.generation_requests), 0);
         assert_eq!(decoy.count(&decoy.config_requests), 0);
         assert_eq!(decoy.count(&decoy.refresh_requests), 0);
         let account = state.find_account_by_id(&account_id).await.unwrap();
         assert_eq!(account.auth_identity_generation, 1);
-        assert_eq!(
-            account.token_refresh_generation,
-            initial_token_generation + 1
-        );
+        assert_eq!(account.token_refresh_generation, initial_token_generation);
         let observations = fixture.generation_observations();
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 1);
         assert_eq!(
             observations[0]
                 .headers
                 .get("authorization")
                 .map(String::as_str),
             Some("Bearer initial-access")
-        );
-        assert_eq!(
-            observations[1]
-                .headers
-                .get("authorization")
-                .map(String::as_str),
-            Some("Bearer refreshed-access-0")
         );
         server.abort();
         decoy_server.abort();
@@ -1339,6 +1683,7 @@ fn codebuddy_rejects_duplicate_or_post_terminal_data_across_http_chunks() {
         for reply in [
             CodeBuddyGenerationReply::DuplicateDone,
             CodeBuddyGenerationReply::DataAfterDone,
+            CodeBuddyGenerationReply::DataAfterFinishReason,
         ] {
             let name = format!("codebuddy-terminal-{reply:?}");
             let (address, fixture, server) =
@@ -1374,11 +1719,496 @@ fn codebuddy_rejects_duplicate_or_post_terminal_data_across_http_chunks() {
 }
 
 #[test]
-fn codebuddy_stream_never_refreshes_after_first_business_output_and_second_auth_is_terminal() {
+fn codebuddy_both_sites_reject_business_error_with_choices_before_success() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for streaming in [false, true] {
+                let name = format!("codebuddy-mixed-error-{}-{streaming}", site.as_str());
+                let (address, fixture, server) = spawn_codebuddy_upstream(
+                    site,
+                    vec![CodeBuddyGenerationReply::BusinessErrorWithChoices],
+                )
+                .await;
+                let state = codebuddy_test_state(&name);
+                let (provider_id, _) = install_codebuddy_provider(
+                    &state,
+                    &name,
+                    AppKind::Codex,
+                    site,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_codebuddy_share(
+                    &state,
+                    &share_id,
+                    AppKind::Codex,
+                    &provider_id,
+                    "owner@example.com",
+                )
+                .await;
+                let error = forward_codebuddy_surface(
+                    state,
+                    AppKind::Codex,
+                    provider_id,
+                    &share_id,
+                    streaming,
+                )
+                .await
+                .expect_err("business error must win over choices and [DONE]");
+                assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS, "{name}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_known_limit_code_on_http_401_never_refreshes_the_bound_account() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-http-401-limit-{}-{}-{streaming}",
+                        site.as_str(),
+                        app.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::HttpUnauthorizedWithLimitCode],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("known rate limit must not trigger auth recovery");
+                    assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_terminal_authorization_codes_on_http_401_never_refresh() {
+    run_codebuddy_async_test(async {
+        for code in [12_005, 11_212, 11_216, 12_153] {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                    for streaming in [false, true] {
+                        let name = format!(
+                            "codebuddy-http-401-terminal-{code}-{}-{}-{streaming}",
+                            site.as_str(),
+                            app.as_str()
+                        );
+                        let (address, fixture, server) = spawn_codebuddy_upstream(
+                            site,
+                            vec![CodeBuddyGenerationReply::HttpUnauthorizedWithTerminalCode(
+                                code,
+                            )],
+                        )
+                        .await;
+                        let state = codebuddy_test_state(&name);
+                        let (provider_id, _) = install_codebuddy_provider(
+                            &state,
+                            &name,
+                            app,
+                            site,
+                            &format!("http://{address}"),
+                        )
+                        .await;
+                        let share_id = format!("{name}-share");
+                        install_codebuddy_share(
+                            &state,
+                            &share_id,
+                            app,
+                            &provider_id,
+                            "owner@example.com",
+                        )
+                        .await;
+                        let error = forward_codebuddy_surface(
+                            state,
+                            app,
+                            provider_id,
+                            &share_id,
+                            streaming,
+                        )
+                        .await
+                        .expect_err("terminal authorization code must not refresh");
+                        assert_eq!(error.status, StatusCode::UNAUTHORIZED, "{name}");
+                        assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                        assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                        server.abort();
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_reject_invalid_choice_index_on_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-choice-index-{}-{app:?}-{streaming}",
+                        site.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::InvalidChoiceIndex],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("invalid choice index must fail before success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_reject_duplicate_choice_on_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-duplicate-choice-{}-{app:?}-{streaming}",
+                        site.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::DuplicateChoice],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("duplicate choice must fail before success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_reject_invalid_tool_index_on_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name =
+                        format!("codebuddy-tool-index-{}-{app:?}-{streaming}", site.as_str());
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::InvalidToolIndex],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("invalid tool index must fail before success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_reject_invalid_tool_calls_shape_on_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name =
+                        format!("codebuddy-tool-shape-{}-{app:?}-{streaming}", site.as_str());
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::InvalidToolCallsShape],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("invalid tool_calls shape must fail before success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_both_sites_reject_unhandled_legacy_function_call_on_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-legacy-call-{}-{app:?}-{streaming}",
+                        site.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::LegacyFunctionCall],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("unsupported legacy function call must not become success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_stream_rejects_business_after_finish_reason_before_done_on_both_sites() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            let name = format!("codebuddy-post-finish-stream-{}", site.as_str());
+            let (address, fixture, server) = spawn_codebuddy_upstream(
+                site,
+                vec![CodeBuddyGenerationReply::DataAfterFinishReason],
+            )
+            .await;
+            let state = codebuddy_test_state(&name);
+            let (provider_id, _) = install_codebuddy_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                site,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_codebuddy_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            let response = forward_codebuddy_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id,
+                &share_id,
+                true,
+            )
+            .await
+            .unwrap();
+            let body = tokio::time::timeout(
+                Duration::from_secs(1),
+                axum::body::to_bytes(response.into_body(), 1024 * 1024),
+            )
+            .await
+            .expect("CodeBuddy post-finish business must terminate with an error")
+            .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("response.failed"), "{name}: {body}");
+            assert!(!body.contains("response.completed"), "{name}: {body}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1);
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn codebuddy_invalid_usage_shape_fails_both_sites_and_all_surfaces() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for streaming in [false, true] {
+                    let name = format!(
+                        "codebuddy-invalid-usage-{}-{app:?}-{streaming}",
+                        site.as_str()
+                    );
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        site,
+                        vec![CodeBuddyGenerationReply::InvalidUsageShape],
+                    )
+                    .await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, _) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+
+                    let error =
+                        forward_codebuddy_surface(state, app, provider_id, &share_id, streaming)
+                            .await
+                            .expect_err("invalid usage must fail before success");
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_stream_never_refreshes_after_license_rejection_and_second_auth_is_terminal() {
     run_codebuddy_async_test(async {
         let (address, fixture, server) = spawn_codebuddy_upstream(
             CodeBuddySite::Intl,
-            vec![CodeBuddyGenerationReply::LateUnauthorized],
+            vec![CodeBuddyGenerationReply::LateLicenseRejected],
         )
         .await;
         let state = codebuddy_test_state("codebuddy-stream-postcommit-auth");
@@ -1588,66 +2418,160 @@ fn codebuddy_truncation_before_done_is_never_reported_as_success() {
 #[test]
 fn codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker() {
     run_codebuddy_async_test(async {
-        for reply in [
-            CodeBuddyGenerationReply::StallBeforeDone,
-            CodeBuddyGenerationReply::StallAfterDone,
-        ] {
-            let name = format!("codebuddy-cancel-{reply:?}");
-            let (address, fixture, server) =
-                spawn_codebuddy_upstream(CodeBuddySite::Intl, vec![reply]).await;
-            let state = codebuddy_test_state(&name);
-            let (provider_id, account_id) = install_codebuddy_provider(
-                &state,
-                &name,
-                AppKind::Codex,
-                CodeBuddySite::Intl,
-                &format!("http://{address}"),
-            )
-            .await;
-            let share_id = format!("{name}-share");
-            install_codebuddy_share(
-                &state,
-                &share_id,
-                AppKind::Codex,
-                &provider_id,
-                "owner@example.com",
-            )
-            .await;
-            let response = forward_codebuddy_surface(
-                state.clone(),
-                AppKind::Codex,
-                provider_id,
-                &share_id,
-                true,
-            )
-            .await
-            .unwrap();
-            let mut body = response.into_body().into_data_stream();
-            let first = tokio::time::timeout(Duration::from_secs(1), body.next())
-                .await
-                .expect("CodeBuddy must publish the first business frame")
-                .expect("CodeBuddy downstream body must remain open")
-                .unwrap();
-            assert!(String::from_utf8_lossy(&first).contains("cancel-"));
-            drop(body);
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for reply in [
+                    CodeBuddyGenerationReply::StallBeforeDone,
+                    CodeBuddyGenerationReply::StallAfterDone,
+                    CodeBuddyGenerationReply::StallAfterFinishReason,
+                ] {
+                    let name = format!(
+                        "codebuddy-cancel-{}-{}-{reply:?}",
+                        site.as_str(),
+                        app.as_str()
+                    );
+                    let (address, fixture, server) =
+                        spawn_codebuddy_upstream(site, vec![reply]).await;
+                    let state = codebuddy_test_state(&name);
+                    let (provider_id, account_id) = install_codebuddy_provider(
+                        &state,
+                        &name,
+                        app,
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_codebuddy_share(
+                        &state,
+                        &share_id,
+                        app,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let response =
+                        forward_codebuddy_surface(state.clone(), app, provider_id, &share_id, true)
+                            .await
+                            .unwrap();
+                    let mut body = response.into_body().into_data_stream();
+                    let first = tokio::time::timeout(Duration::from_secs(1), body.next())
+                        .await
+                        .expect("CodeBuddy must publish the first business frame")
+                        .expect("CodeBuddy downstream body must remain open")
+                        .unwrap();
+                    assert!(!first.is_empty(), "{name}");
+                    drop(body);
 
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !fixture.upstream_body_dropped.load(Ordering::SeqCst)
-                    || state.share_in_flight.has_in_flight(&share_id)
-                    || state
-                        .account_in_flight
-                        .snapshot()
-                        .current(ProviderType::CodeBuddyOAuth, &account_id)
-                        != 0
-                {
-                    tokio::task::yield_now().await;
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let released = fixture.upstream_body_dropped.load(Ordering::SeqCst)
+                                && !state.share_in_flight.has_in_flight(&share_id)
+                                && state
+                                    .account_in_flight
+                                    .snapshot()
+                                    .current(ProviderType::CodeBuddyOAuth, &account_id)
+                                    == 0;
+                            let cancelled =
+                                state.usage_snapshot().await.logs.last().is_some_and(|log| {
+                                    log.stream_status.as_deref() == Some("client_cancelled")
+                                        && log.outcome == UsageOutcome::Interrupted
+                                        && log.usage_state == UsageState::Interrupted
+                                });
+                            if released && cancelled {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect(
+                        "downstream cancellation must release CodeBuddy and record interruption",
+                    );
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
                 }
-            })
-            .await
-            .expect("downstream cancellation must release the CodeBuddy upstream body and leases");
-            assert_eq!(fixture.count(&fixture.generation_requests), 1);
-            assert_eq!(fixture.count(&fixture.refresh_requests), 0);
-            server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_final_terminal_chunk_commits_success_without_an_extra_downstream_poll() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex] {
+                let name = format!(
+                    "codebuddy-final-terminal-drop-{}-{}",
+                    site.as_str(),
+                    app.as_str()
+                );
+                let (address, fixture, server) =
+                    spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success]).await;
+                let state = codebuddy_test_state(&name);
+                let (provider_id, account_id) = install_codebuddy_provider(
+                    &state,
+                    &name,
+                    app,
+                    site,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_codebuddy_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let response =
+                    forward_codebuddy_surface(state.clone(), app, provider_id, &share_id, true)
+                        .await
+                        .unwrap();
+                let terminal = match app {
+                    AppKind::Claude => "message_stop",
+                    AppKind::Codex => "response.completed",
+                    AppKind::Gemini => unreachable!("Gemini finishReason precedes upstream EOF"),
+                };
+                let mut body = response.into_body().into_data_stream();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let chunk = body
+                            .next()
+                            .await
+                            .expect("CodeBuddy stream ended before terminal")
+                            .unwrap();
+                        if String::from_utf8_lossy(&chunk).contains(terminal) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("CodeBuddy terminal chunk must arrive");
+                drop(body);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let done = state.usage_snapshot().await.logs.last().is_some_and(|log| {
+                            log.stream_status.as_deref() == Some("completed")
+                                && log.outcome == UsageOutcome::Success
+                        });
+                        if done
+                            && !state.share_in_flight.has_in_flight(&share_id)
+                            && state
+                                .account_in_flight
+                                .snapshot()
+                                .current(ProviderType::CodeBuddyOAuth, &account_id)
+                                == 0
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{name}: a delivered final terminal was not recorded as success")
+                });
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                server.abort();
+            }
         }
     });
 }

@@ -8,6 +8,7 @@
 - Responses WebSocket 使用同一 Share URL 下的 `GET /v1/responses`。
 - 媒体入口包括图片生成/编辑和视频生成/状态查询；这些能力按账号 fail closed。
 - 模型目录通过同一 Share URL 下的 `GET /v1/models` 返回，并附带 Grok catalog 的来源、新鲜度和 capability manifest v2。
+- 三项私有真实验收的目录请求额外带可选 `expectedShareId/expectedProviderId`。Server 在读取目录前将它们与 Router 签名 Share 和实际选中的 Provider 核对；仅有 `providerId` 查询声明不能证明目录属于所选绑定。普通客户端无需这两个参数。
 - Models、Responses HTTP/WS、Chat 和媒体入口都要求 Router 签名验证且必须携带 Share 身份。Server 不接受本地推理 token，也不提供 Provider 专属公开路径。
 - 每个 `grok_oauth` Provider 必须绑定一个明确的 `grok_oauth` Account。
 - 同一个生成请求只允许使用该 Provider 的绑定账号；任何错误都不能触发账号轮换或通用 Provider failover。
@@ -52,14 +53,18 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 - OpenAI Chat Completions 先无损规范化为 Responses，请求上游固定使用 Grok CLI `/v1/responses`；非流式和 SSE 再恢复为 Chat contract。Grok 数据面不再向上游发送 `/v1/chat/completions`。
 - Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.6`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
 - 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。当前 reviewed identity 仍是 `grok-shell/0.2.111`，未发送 `x-grok-conv-group-id`；参考项目的 Build `1.0.40` 与 group header 在固定账号真实验收前不得直接替换本合同。
-- 账号 `extraHeaders` 不能覆盖 Authorization、CLI identity、conversation/cache identity、turn、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。
+- 账号 `extraHeaders` 不能覆盖 Authorization、`x-xai-token-auth`、`x-authenticateresponse`、整个 `x-grok-*` 代理身份命名空间、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。该约束不代表 Server 已发送或获准发送参考项目的 client-mode/group/session 等新增头。
 - Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。有精确 fresh catalog capability 时，HTTP、WebSocket 与 WS→HTTP fallback 的 effort 只接受该模型有序菜单中的 `none|minimal|low|medium|high|xhigh|max`；显式 `supports_reasoning_effort=false` 会删除 effort，但保留独立的 summary 控制。没有 fresh capability 时沿用既有保守静态判断，stale catalog 不能扩大权限。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
+- 最终 Grok 工具清理会将缺失、`null` 或空数组的 `tools` 与孤立的 `tool_choice` 一起省略；对象型强制选择必须匹配清理后保留的工具类型，函数选择还必须精确匹配已声明函数名，否则省略无效选择。普通 `auto|none|required`、合法函数和 hosted 工具选择保持原有行为。HTTP Responses、Chat 转换、WebSocket `response.create` 及其 HTTP fallback 使用同一请求准备规则；不凭空注入工具。
 - Claude Messages 的客户端 function tools 会转换为 xAI Responses 的扁平声明（顶层 `name` / `description` / `parameters`），Anthropic hosted web search 会转换为 xAI `web_search`，不会把 Chat Completions 专用的嵌套 `function` 对象发给 xAI。
 - 普通 Responses HTTP/WS body 的 `prompt_cache_key` 由 Server 强制绑定到隔离后的 conversation id，客户端值不能覆盖；compact 请求只保留会话 header，body 必须省略 `prompt_cache_key`。
 - 首次 401 允许对原账号强制 refresh 一次，再用新 Authorization 重放原请求；第二次 401 直接返回并只冷却原账号。
 - 429、403、5xx、网络错误或流内错误都不能触发跨 Provider/账号重放。
 - SSE 已向下游提交业务事件后不会透明重放完整请求。
 - first-event deadline 只由完整业务/终态事件满足；SSE comment、ping、空 data、生命周期事件和部分 JSON 字节不续命。content 与 reasoning delta 分开做有界重复输出保护，HTTP/SSE、WebSocket 和 WS→HTTP fallback 使用同一阈值合同，触发后终止当前请求且不切换账号或 Provider。
+- Responses SSE 只把单一 `event: ping`、仅含可忽略 comment/`data` 且无冲突业务类型或失败/终态语义的帧规范化为注释。非空 JSON 数据必须是对象；费用载荷可省略 `type`，显式 `type` 则必须是字符串 `ping`。数组、标量或显式非字符串 `type` 保留原帧交给主语义门禁，不能被当成计费 ping 丢弃。携带非空错误、失败状态或终态状态的 JSON 也必须原样保留，即使事件名写成 ping 也不能吞掉错误。带 `id`、`retry`、第二个 `event` 或未知字段的帧逐字节透传，不能因消除 ping 而丢失重连元数据；该规则只作用于 Grok OAuth 的 Responses SSE。旁路检查器按最早的 CR、LF、CRLF 或混合空行分帧，块末尾的 CR 等待下一块确认是否为 CRLF；超大帧直通结束后仍能恢复下一帧的正常检查。搜索/质量观察仍须满足主响应的成功终态，不因分帧变更扩权。
+- Grok OAuth Responses SSE 的流首 UTF-8 BOM 会在任意分片下完整匹配后移除，避免首个 `data:` 事件被解析成未知字段；不完整或不匹配的前缀、流中间的 BOM 保留并交给既有协议门禁。此项仅规范化入站 SSE，不改变出站身份、模型或其他 Provider 的传输。
+- Grok Build 参考实现会过滤私有 `response.doom_loop_check` SSE 控制事件。Server 仅在载荷 `type` 精确匹配、可选事件名一致，且无错误/终态语义或 `id`、`retry`、未知字段时把它规范化为无数据注释；歧义帧原样交给主语义门禁。此兼容规则不声称 direct-XAI OAuth 真实发送该事件，也不改变出站 wire。
 
 OAuth 凭据发生轮换时，Server 先原子持久化候选账号快照，再发布内存状态。若 durable write 失败，新 token 会保留在内存并由后台退避重试，但 Grok 新数据面请求和 WebSocket 会返回 `503`，`/ready` 同时进入 degraded，避免重启后继续使用未持久化的旋转凭据。
 
@@ -72,6 +77,8 @@ Grok Responses 的 hosted `web_search_call` 和 `custom_tool_call`/`x_search` �
 - `url_citation` annotation 转为 `citations_delta` 或非流式 citation content，保留 URL、标题和可用的文本位置。
 - `usage.server_tool_use.web_search_requests` 记录 hosted search 总数，`x_search_requests` 单独记录 X 搜索数。
 - Hosted search 已由上游完成，不把 Anthropic `stop_reason` 改成 `tool_use`；只有需要下游执行的普通 function call 才使用该终态。
+- 搜索能力证据和质量指标的 SSE 旁路观察遵守主 Responses transport 的声明事件/JSON `type` 一致性：冲突声明、伪 liveness 和未知 SSE 字段不产生证据。`response.done` 不是本 Server 的成功终态，`response.completed` 若携带失败状态也不能提升为成功；已见失败/完成终态后，迟到帧不会改写旁路观察。合法 `response.output_item.done` 的已完成 hosted search 先只作为候选；只有整条上游流到达 EOF、主 Responses 检查器确认成功终态且本地转换/容量检查通过，才持久化搜索能力证据。失败或中断流不会因早期工具完成事件获得能力证据；响应成功记账仍由主语义门禁判定。
+- Grok SSE 即使已看到 `response.completed`，仍继续读取上游到真正的 EOF。后续冲突帧或传输错误会使整条流失败；搜索能力证据和 SSE 质量指标都只在主语义成功结束、尾部转换与容量检查通过后提交，不把先到的完成事件当作最终成功。该等待仅针对 Grok Responses SSE，不改变其他 Provider 的终态读取策略。
 
 该转换只改变当前 Grok 响应的协议表示，不触发第二次搜索、不重放请求，也不进入 Provider/账号 failover。
 
@@ -104,10 +111,11 @@ Grok Responses WebSocket 使用固定 `wss://api.x.ai/v1/responses`，并复用 
 
 Grok Build 对多轮 function call 可能要求上一轮返回的 opaque `reasoning.encrypted_content`。Server 使用 Grok 专用、进程内、短期 cache 补齐无状态客户端省略的 proof；它不是通用会话历史，也不是账号调度器。
 
-- scope 哈希同时覆盖 App、Provider id/revision/runtime、Account id、auth/token generation、Share、签名用户命名空间、session、turn、model family、HTTP 或 WebSocket rail 以及 upstream plane；任一维度漂移均 miss 或在提交前 fail closed。
+- scope 哈希同时覆盖 App、Provider id/revision/runtime、Account id/incarnation、auth/token generation、规范化实际 Bearer 与 relogin 状态的域分离摘要、Share、签名用户命名空间、session、turn、model family、HTTP 或 WebSocket rail 以及 upstream plane；任一维度漂移均 miss 或在提交前 fail closed。同账号同代际换 Bearer 不能读取旧 proof，迟到的旧响应也不能写入当前身份的 replay 状态。摘要不保留明文 token，账号实例只在进程内有效。
 - 只关联最近的前置 reasoning 与其后的 function call；并行 call 可共享同一 proof。重复 call id、调用名/参数被编辑、乱序或无法证明的上下文不做部分注入。
+- 工具名以原始字符串参与 proof 指纹，不裁剪首尾空白；上游及客户端 `call_id` 必须非空、至多 256 字节且无首尾空白。否则不能捕获或复用该 proof。仅工具名与调用 ID 精确一致的历史可回填；这只收紧本地 replay 身份判断，不改发往 xAI 的原始调用字段。
 - cache 上限为 2,048 entries、每 proof 64 calls、单 reasoning item 1 MiB、单 entry 4 MiB、总计 64 MiB、TTL 30 分钟；流式解析总输入 8 MiB，并复用严格 Responses SSE/JSON 解码器处理 LF/CRLF 和任意分片。
-- HTTP JSON 只从 `status=completed` 响应捕获；SSE 和 WebSocket 只在唯一成功 `response.completed` 终态提交。EOF、failed/incomplete、重复终态、协议错误、超限、绑定漂移和 CAS 冲突均不产生新 proof。
+- HTTP JSON 只从 `status=completed` 响应捕获；SSE 和 WebSocket 只在唯一成功 `response.completed` 终态提交。流式捕获在该终态后若又收到任何 JSON（包括迟到的 output item 或错误），即废弃候选 proof；此前的 error、failed、incomplete、cancelled 也不能靠随后 completed 洗成成功。单个可选 `[DONE]` 只能在完成后出现，过早或重复均拒绝。缺成功终态的 EOF、协议错误、超限、绑定漂移和 CAS 冲突均不产生新 proof。此栅栏只保护旁路重放缓存，主响应成功仍由主语义门禁判定。
 - 只有本 attempt 确实注入 cache proof，且上游在业务输出提交前返回冻结的 `missing_reasoning`、`invalid_reasoning`、`reasoning_rejected`、`invalid_encrypted_content` 或精确 decrypt/decode 错误时，才 CAS 删除被拒 snapshot 并重试一次。重试保持原 Provider、Account、Share、session、rail 和 plane，并消耗共享 attempt/10 秒窗口。
 - 客户端自带 reasoning、普通 schema 400、401/403、429/capacity、5xx、传输故障以及已提交业务 delta 后的拒绝不进入 reasoning recovery。第二次明确拒绝直接终止，不再借 WS→HTTP fallback 形成第二次恢复。
 - 缺少合法 `x-grok-turn-idx`、Share 或签名用户时 replay 关闭；Server 不猜测 turn。该关闭不改变原有 direct Provider 测试和基础转发语义。
@@ -121,6 +129,8 @@ EVID-N1 已把 Grok reference delta 迁为 append-only schema v2。原 schema-v1
 ## 脱敏质量观测
 
 GR-N1 在 Grok Responses 的 HTTP JSON、SSE 和原生 WebSocket rail 上记录只读响应形状。指标 `cc_switch_grok_quality_observations_total` 只包含固定的 transport/outcome、terminal/tool/visible 布尔值和 `0`、`1_7`、`8_31`、`32_127`、`128_plus` 长度桶；outcome 限于 `empty`、`tool_only`、`short_text`、`text`、`text_and_tool`、`reasoning_only`、`anomalous_dump`。观察器不保存或输出正文、reasoning、token 比例、模型、Provider/Account/Share/用户身份或 prompt。
+
+可见输出包含 Responses 的 `output_text`/`text` 及 `refusal` 字符串；流式文本或拒答的非空 delta、done 与完成快照按优先级取证，不重复计数。空白文本 delta/done 只是占位，不会遮住完成快照中的实际文本。拒答仍使用既有长度桶和 outcome，不新增正文或账号标签，也不改变上游成功/失败判定。
 
 `anomalous_dump` 仅表示流中出现单个至少 1024 字符的可见 bulk fragment，供后续人工评估；它不是厂商错误信号。所有分类都在原响应旁路完成，SSE 字节保持不变，不 hold、不自动重试、不切换账号、不写 cooldown，也不改变成功/失败或 terminal 语义。只有未来真实 receipt 给出明确且可复现的厂商失败码后，才可另行评审同账号、pre-commit、共享预算内的一次恢复；本指标本身不得成为恢复条件。
 
@@ -142,7 +152,7 @@ Provider 管理页可对已经开启的单项能力发起真实媒体测试；�
 
 媒体请求复用文本/WS 的 CLI identity family；客户端显式提供的 `x-grok-conv-id` 在 Share/user 边界内做同样的命名空间隔离。媒体 POST 的 wire body 和逐层 gzip/deflate 解码结果都使用 32 MiB 硬上限，避免 Axum 默认 2 MiB 误拒合法图片，同时阻止压缩膨胀绕过内存边界。媒体上游 wire response 和逐层解压结果使用 64 MiB 硬上限，避免 base64 图片响应形成无界内存读取。视频状态 request id 只接受 1-128 字节 ASCII 字母、数字、`-` 和 `_`，禁止把路径、query 或 fragment 注入固定上游 URL。
 
-Grok 图片是 direct-XAI 实验能力，不代表 Build OAuth 官方保证。图片 multipart edit 最多接受 3 张图，每张都复用统一 image primitive 校验非空、大小、允许 MIME 和 magic bytes；声明 MIME 不匹配、未知签名、超数量以及未经验证的 `mask`/`quality`/`size`/`style` 均在出站前返回 4xx，不再静默丢弃。图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
+Grok 图片是 direct-XAI 实验能力，不代表 Build OAuth 官方保证。图片 multipart edit 最多接受 3 张图，每张都复用统一 image primitive 校验非空、大小、允许 MIME 和 magic bytes；声明 MIME 不匹配、未知签名、超数量以及未经验证的 `mask`/`quality`/`size`/`style` 均在出站前返回 4xx，不再静默丢弃。Multipart 使用标准 MIME 解析识别媒体类型与大小写不敏感的 `boundary` 参数；伪 multipart 类型不能携带有效 boundary 混入。分片只把完整分隔行识别为 boundary，图片内容中的同名普通字节和图片末尾换行原样保留；文本字段可以不带 `Content-Type`，缺少结束边界则失败关闭。LF-only 与 CRLF 头部都按最早出现的空行结束，避免把后续图片二进制中的 CRLFCRLF 当作头部分隔符。`Content-Disposition` 仅承认 `form-data`，字段名按引号与转义规则解析；`attachment`、引号内分号和重复 `name` 不能冒充真实图片字段。图片请求强制 `Accept-Encoding: identity`。成功响应拿到 headers 后，SSE 立即提交 `: connected` 并按完整事件边界转发，JSON 先提交合法空白、完整缓冲并校验一个 JSON 文档；两种模式空闲时都每 15 秒发送心跳，且逐块执行 64 MiB 上限。首个 comment/空白提交后 wire status 固定为 `200`，后续读失败、超限或 JSON 无效只能返回流内 error，不能透明换 Provider 或替换 HTTP 状态；Provider/Share 终态记账仍使用实际结果，客户端必须消费完整 Body。
 
 媒体请求进入与文本相同的 Usage/Router request-log 管道，但 `requestKind=image|video`、`operation` 和媒体元数据独立记录，`usageState=not_applicable`，不会伪造 token，也不会把无 token 标为 `missing` 或 `transform_error`。图片/视频记录可携带 task/status、视频 duration/resolution/aspect ratio 和有界错误信息；不保存 prompt、原始图片字节、Authorization、token 或上游私有 URL。Router 侧 Text/Image/Video 三个 Tab 读取同一 request-log 接口；Image Tab 仅按相同 canonical request id 关联 Router 已有的受控预览结果。
 
@@ -158,7 +168,7 @@ Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号
 - 没有可用缓存时返回静态 `grok-4.6` fallback。
 - 上游目录响应体上限为 1 MiB，超限按上游失败处理。
 - entry 支持纯字符串以及 `id`、`model`、`modelId`、`name`、`_meta.model`、`_meta.modelId`，按该优先级选取标识；`hidden=true` 或 `_meta.hidden=true` 不对外发布。
-- model ID 与 capability 在同一个 snapshot 中原子替换；scope 同时覆盖 App、Provider ID/revision/runtime fingerprint、Account、`authIdentityGeneration` 与 `tokenRefreshGeneration`，任一维度漂移都不能读取旧 capability。
+- model ID 与 capability 在同一个 snapshot 中原子替换；scope 同时覆盖 App、Provider ID/revision/runtime fingerprint、Account/incarnation、`authIdentityGeneration`、`tokenRefreshGeneration`，以及从实际规范化 Bearer 和 relogin 状态派生的域分离摘要。相同代次直接换 token 也不能读取旧目录或 reasoning capability；缓存键不保存明文。目录请求前、401 刷新前与接受结果前复核当前账号请求身份；同代次不同 Bearer 的并行目录互不驱逐，缓存总量上限 128 条，旧代次仍会被淘汰。这些复核不是跨存储原子事务。
 - capability parser 保留上游 reasoning menu 顺序并去重，过滤未知 effort；menu 内首个 `default=true` 优先，否则使用 top-level default，但 default 不属于过滤后菜单时丢弃。`false`/`0` 与字段缺失保持不同语义。
 - 成功空目录是权威结果并清空旧 model/capability；last-known-good 只用于展示，`stale=true` 时运行时 capability lookup 必须 miss。
 - 每个模型的 `capabilityManifestVersion=2` 展示 `supportsReasoningEffort`、`reasoningEfforts`、`reasoningDefault`、`contextWindow`、`maxOutputTokens` 和 `supportsBackendSearch`；这些元数据不会自动开启 hosted search、remote compaction，也不会改变本地 request-memory budget。
@@ -168,7 +178,7 @@ Share URL 下的 `GET /v1/models` 使用该 Share 的 Codex Surface 绑定账号
 
 Share models 和管理端 Provider 模型发现都只接受已提交 RuntimePlan 中 driver 为 `oauth.grok_responses` 的 `ManagedAccount` 引用，并要求 Provider revision、账号类型和 `authIdentityGeneration` 全部匹配。Provider 未绑定账号、仅配置 legacy API key、绑定缺失/类型错误、RuntimePlan 过期或账号身份代际变化时，只返回 `static_fallback`，不会刷新任意账号或访问 models 上游。
 
-GR-N3 的本地 fixture 已覆盖菜单顺序/去重、minimal/max、default membership、显式 false/zero、权威空目录、stale 不扩权、七个 scope 维度漂移、HTTP/WS 共用菜单，以及 Provider API manifest 与 `ServerState` 运行时读取闭环。它只建立 `fixture_verified`；搜索、Grok 4.7 entitlement 和 context/max 的真实接受性仍需固定账号 receipt。
+GR-N3 的本地 fixture 已覆盖菜单顺序/去重、minimal/max、default membership、显式 false/zero、权威空目录、stale 不扩权、精确 scope 漂移、HTTP/WS 共用菜单，以及 Provider API manifest 与 `ServerState` 运行时读取闭环。它只建立 `fixture_verified`；搜索、Grok 4.7 entitlement 和 context/max 的真实接受性仍需固定账号 receipt。
 
 不存在不带 Share 身份的公共模型列表；未签名或签名但无 Share 的 `/v1/models` 请求分别返回 `401` 或 `403`。
 
@@ -238,6 +248,26 @@ node scripts/smoke/grok-real-receipt.mjs
 ```
 
 三次运行都要求 `RUN_REAL=1`、控制面和 Share URL、固定 `GROK_OAUTH_TEST_ACCOUNT`、operation 对应的 Provider/Share/model、`CC_SWITCH_GROK_SIGNED_USER`、`CC_SWITCH_GROK_SESSION_ID`、`CC_SWITCH_GROK_TURN_INDEX`，以及仓库外权限 `0600` 的私有 receipt。validator 绑定当前 target commit、Provider revision/runtime、Account auth/token generation、Share revision、签名用户 namespace、精确 model/session/turn 和 fresh catalog；同时逐项核对 checks、body hashes、measurements、恢复决策、decoy 计数与 secret scan。fixture 只能得到 `contract_verified/live_pending`，三个 operation 不互相继承。
+
+三个 operation 在末次 Account/Provider/Share 复核后，还会经同一签名 Share 再读取一次模型目录。两次都必须是允许的权威来源、非 stale 且在接受时刻新鲜；当前完整 `data` 的摘要必须与 receipt 绑定的初次摘要一致。`upstream` 变为 `cache_fresh` 等合法来源变化不要求字面相同，但模型增删、撤下所选模型或失去目录权威会拒绝。分次读取不构成跨控制面/上游原子快照，也不证明真实 xAI entitlement。
+
+私有 validator 对每份目录的所有模型条目还要求非空、无首尾空白且唯一的字符串 ID，不只检查所选模型；其他模型的重复 ID 或缺 ID 同样拒绝。完整 `data` 在摘要前按模型 ID 的精确字符串全序排序，不使用可能将两个不同 Unicode ID 判为相等的语言环境排序；因此 receipt 绑定及末次复核都忽略纯行顺序变化，但模型能力字段变化仍改变摘要并拒绝。此规范化只改变私有证据比较，不改变生产目录顺序或实际 xAI wire。
+
+三个 operation 的私有 validator 都直接核对 Share 原始 `bindings`：Codex App 必须恰好有一条精确的 Grok Provider 绑定，Share 主字段必须与其对应的唯一主绑定一致，且 `enabled=true/status=active`。重复、冲突或停用的 Share 在模型目录请求前拒绝；不得把主字段合成为另一条 binding。控制面多次读取并不构成跨 API 原子快照。
+
+控制面 `GET /api/providers` 的真实投影同时给出顶层 `revision` 和 runtime 内的 `providerRevision`；三项 validator 要求两者都是非负安全整数且相等，并要求 Share `configRevision` 明确为非负安全整数、runtime `runtimeFingerprint` 为非空白字符串。缺字段、不一致、旧式伪造的顶层 `providerRevision` 或空白 fingerprint 均在目录请求前拒绝，不能用回退值补齐 receipt scope。此处只收紧私有证据，不能替代真实账号验收或提供跨 API 原子快照。
+
+三项 validator 还要求 OAuth Account 控制面投影中的 `hasApiKey` 与 `needsRelogin` 都明确为布尔 `false`。缺字段、`null` 或字符串 `"false"` 不能代替真实布尔值，均在 Provider 和模型目录请求前失败关闭；这不改变生产账号路由，也不证明 xAI 账号接受性。
+
+`inference`、`media`、`remote_compaction` 的目录证据都须在验收结束时仍满足两小时新鲜窗口与最多五分钟的未来时钟偏差。validator 在末次 Account/Provider/Share 绑定复核后重查同一目录时间戳；即使取得目录时尚未过期，只要复核期间过期也拒绝。此规则仅约束私有 receipt 验收，不修改生产 Grok 目录缓存 TTL；末次复核也不是跨 API 原子事务。
+
+三项 receipt 的 `recordedAt` 也须在最终接受时仍处于 24 小时窗口。validator 在内容校验时及末次绑定复核后，以同一接受时刻检查 receipt 和目录；复核期间任一证据过期即拒绝该 operation。此项不改变 receipt schema v1/revision 1，也不自动开启 remote compaction。
+
+私有 receipt 在控制面请求前由同一只读描述符限量读取。读取前后比较 dev/inode、链接数、大小、权限及纳秒级 mtime/ctime；普通同 inode 原位改写若改变这些元数据，会在发网前脱敏拒绝。元数据复原或精确并发写入下的原子快照不由此证明，离线 fixture 亦不构成真实 xAI 接受性。
+
+最终接受前还会重新解析配置的 receipt 路径，并将当前文件的 dev/inode、链接数、大小、权限及纳秒级 mtime/ctime 与读取后的指纹比较。控制面校验期间若换成另一文件，或原文件被等长原位改写并留下元数据变化，验收失败关闭。末次检查不是跨 API/文件系统原子事务，恶意元数据复原及检查后的变化仍需由受控私有文件位置和运行环境防护。
+
+末次复核还会经 `O_NOFOLLOW` 只读描述符重读至多 1 MiB 的完整 receipt 原始字节及 EOF，并与初始快照逐字节比较；读前、读后和配置路径的文件身份继续核对。inference、media、remote_compaction 三项对抗 fixture 在控制面请求期间等长改写文件、让末次元数据读取返回旧值时，旧流程会错误接受，现在均脱敏拒绝。元数据伪装仅验证指纹不能代替内容比较，不代表普通用户能恢复真实 `ctime`；末次检查后的竞态、跨 API 原子性和真实 xAI 接受性仍未获证明。
 
 GR-N4 还要求同一个固定 Account 分别留下 catalog 与 inference 对身份/header 的接受证据。只有明确的 version-rejected signal 或 current-commit fresh receipt 才能评审将默认 `0.2.111` 更新为参考项目的 Build `1.0.40`；`x-grok-conv-group-id` 也必须单独证明接受性和 Share/Account 隔离。静态 UUIDv5 向量只能验证派生算法，不能把状态提升为 live，也不能授权发送新 header。
 

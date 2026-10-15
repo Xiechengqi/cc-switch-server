@@ -985,6 +985,16 @@ fn auth_method(account: &Account) -> KiroAuthMethod {
     }
 }
 
+pub(crate) fn account_auth_kind(account: &Account) -> &'static str {
+    match auth_method(account) {
+        KiroAuthMethod::BuilderId => "builder_id",
+        KiroAuthMethod::Idc => "idc",
+        KiroAuthMethod::Social => "social",
+        KiroAuthMethod::ExternalIdp => "external_idp",
+        KiroAuthMethod::ApiKey => "api_key",
+    }
+}
+
 #[cfg(test)]
 fn test_oauth_token_url(account: &Account) -> Option<&str> {
     account
@@ -1432,5 +1442,24 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("credentialSource"))
             .is_none());
+    }
+
+    #[test]
+    fn public_kiro_auth_kind_matches_refresh_dispatch_aliases() {
+        for (raw, expected) in [
+            ("builder-id", "builder_id"),
+            ("iam_sso", "idc"),
+            ("github", "social"),
+            ("external-idp", "external_idp"),
+            ("API-KEY", "api_key"),
+        ] {
+            let account: Account = serde_json::from_value(json!({
+                "id": "kiro-auth-kind-test",
+                "providerType": "kiro_oauth",
+                "profile": {"authMethod": raw}
+            }))
+            .unwrap();
+            assert_eq!(account_auth_kind(&account), expected);
+        }
     }
 }

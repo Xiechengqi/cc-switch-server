@@ -120,8 +120,8 @@ pub struct ResponsesSseAggregator {
     response: Option<Value>,
     response_bytes: usize,
     output_items: BTreeMap<u64, Value>,
+    output_items_fallback: Vec<Value>,
     output_item_bytes: usize,
-    next_output_index: u64,
     stream_status: Option<&'static str>,
     last_error: Option<Value>,
     max_retained_bytes: usize,
@@ -557,8 +557,8 @@ impl ResponsesSseAggregator {
             response: None,
             response_bytes: 0,
             output_items: BTreeMap::new(),
+            output_items_fallback: Vec::new(),
             output_item_bytes: 0,
-            next_output_index: 0,
             stream_status: None,
             last_error: None,
             max_retained_bytes: max_retained_bytes.max(1),
@@ -618,15 +618,31 @@ impl ResponsesSseAggregator {
                 ),
             )
         })?;
-        if !self.output_items.is_empty() {
-            let output = self.output_items.into_values().collect::<Vec<_>>();
+        if !self.output_items.is_empty() || !self.output_items_fallback.is_empty() {
             let object = response.as_object_mut().ok_or_else(|| {
                 ResponsesSseAggregationError::new(
                     ResponsesSseAggregationErrorKind::ParseError,
                     ProxyError::bad_gateway("OpenAI Responses terminal payload is not an object"),
                 )
             })?;
-            object.insert("output".to_string(), Value::Array(output));
+            if let Some(output) = object
+                .get_mut("output")
+                .and_then(Value::as_array_mut)
+                .filter(|output| !output.is_empty())
+            {
+                super::response_semantics::hydrate_response_output_item_ids(output, |index| {
+                    u64::try_from(index)
+                        .ok()
+                        .and_then(|index| self.output_items.get(&index))
+                });
+            } else {
+                let output = self
+                    .output_items
+                    .into_values()
+                    .chain(self.output_items_fallback)
+                    .collect::<Vec<_>>();
+                object.insert("output".to_string(), Value::Array(output));
+            }
         }
         Ok(ResponsesSseAggregation {
             response,
@@ -640,6 +656,17 @@ impl ResponsesSseAggregator {
     ) -> Result<(), ResponsesSseAggregationError> {
         for event in events {
             if self.stream_status.is_some() {
+                if super::response_semantics::is_responses_terminal_event(
+                    event.event.as_deref(),
+                    &event.value,
+                ) {
+                    return Err(ResponsesSseAggregationError::new(
+                        ResponsesSseAggregationErrorKind::ParseError,
+                        ProxyError::bad_gateway(
+                            "Responses stream emitted another terminal event after a terminal response",
+                        ),
+                    ));
+                }
                 continue;
             }
             let event_type = event
@@ -681,18 +708,10 @@ impl ResponsesSseAggregator {
         let Some(item) = event.get("item").cloned() else {
             return Ok(());
         };
-        let index = event
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                let index = self.next_output_index;
-                self.next_output_index = self.next_output_index.saturating_add(1);
-                index
-            });
+        let index = event.get("output_index").and_then(Value::as_u64);
         let item_bytes = encoded_value_len(&item)?;
-        let replaced_bytes = self
-            .output_items
-            .get(&index)
+        let replaced_bytes = index
+            .and_then(|index| self.output_items.get(&index))
             .map(encoded_value_len)
             .transpose()?
             .unwrap_or(0);
@@ -706,7 +725,11 @@ impl ResponsesSseAggregator {
             self.max_retained_bytes,
         )?;
         self.output_item_bytes = next_output_bytes;
-        self.output_items.insert(index, item);
+        if let Some(index) = index {
+            self.output_items.insert(index, item);
+        } else {
+            self.output_items_fallback.push(item);
+        }
         Ok(())
     }
 
@@ -715,6 +738,9 @@ impl ResponsesSseAggregator {
         event: Value,
         stream_status: &'static str,
     ) -> Result<(), ResponsesSseAggregationError> {
+        if let Some(error) = self.last_error.as_ref() {
+            return Err(stream_terminal_error(error));
+        }
         let response = event.get("response").cloned().unwrap_or(event);
         if matches!(
             response.get("status").and_then(Value::as_str),
@@ -1360,6 +1386,35 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
     }
 
     #[test]
+    fn aggregator_preserves_nonempty_terminal_output_and_hydrates_missing_ids() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"tool-index-1\",\"type\":\"function_call\",\"call_id\":\"call-1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-hydrate\",\"status\":\"completed\",\"output\":[{\"id\":\"keep\",\"type\":\"message\"},{\"type\":\"function_call\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}]}}\n\n"
+        );
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator.push(stream.as_bytes()).unwrap();
+        let result = aggregator.finish().unwrap();
+        assert_eq!(result.response["output"][0]["id"], "keep");
+        assert_eq!(result.response["output"][1]["id"], "tool-index-1");
+        assert_eq!(result.response["output"][1]["arguments"], "{}");
+    }
+
+    #[test]
+    fn aggregator_keeps_indexless_done_after_indexed_done() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"indexed\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fallback\",\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator.push(stream.as_bytes()).unwrap();
+        let result = aggregator.finish().unwrap();
+        assert_eq!(result.response["output"].as_array().unwrap().len(), 2);
+        assert_eq!(result.response["output"][0]["id"], "indexed");
+        assert_eq!(result.response["output"][1]["id"], "fallback");
+    }
+
+    #[test]
     fn responses_aggregator_rejects_failure_and_retained_overflow() {
         let mut failed = ResponsesSseAggregator::new();
         failed
@@ -1375,6 +1430,22 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         );
         let error = oversized.push(event.as_bytes()).unwrap_err();
         assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn responses_aggregator_rejects_conflicting_terminal_after_completion() {
+        let completed =
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        for trailing in [
+            "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}",
+            "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}",
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}",
+            "{\"type\":\"error\",\"error\":{\"message\":\"late\"}}",
+        ] {
+            let mut aggregator = ResponsesSseAggregator::new();
+            let stream = format!("{completed}data: {trailing}\n\n");
+            assert!(aggregator.push(stream.as_bytes()).is_err(), "{trailing}");
+        }
     }
 
     #[test]
@@ -1434,6 +1505,38 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
         let message = error.into_proxy_error().to_string();
         assert!(message.contains("overloaded"), "{message}");
+    }
+
+    #[test]
+    fn responses_aggregator_rejects_success_after_error_frame() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n")
+            .unwrap();
+        let error = aggregator
+            .push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            ResponsesSseAggregationErrorKind::UpstreamFailure
+        );
+        assert!(error.into_proxy_error().to_string().contains("overloaded"));
+    }
+
+    #[test]
+    fn responses_aggregator_rejects_incomplete_after_error_frame() {
+        let mut aggregator = ResponsesSseAggregator::new();
+        aggregator
+            .push(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n")
+            .unwrap();
+        let error = aggregator
+            .push(b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"output\":[]}}\n\n")
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            ResponsesSseAggregationErrorKind::UpstreamFailure
+        );
+        assert!(error.into_proxy_error().to_string().contains("overloaded"));
     }
 
     #[test]

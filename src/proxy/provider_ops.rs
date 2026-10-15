@@ -42,6 +42,7 @@ pub(crate) struct PreparedProviderRequest {
     pub endpoint: String,
     pub headers: Vec<(String, String)>,
     pub session_id: Option<String>,
+    pub thread_mode: Option<super::claude_thread_alias::ClaudeThreadMode>,
 }
 
 impl std::fmt::Debug for ProviderExecution {
@@ -331,6 +332,7 @@ impl ProviderExecution {
             endpoint,
             headers,
             session_id: contract.session_id,
+            thread_mode: contract.thread_mode,
         })
     }
 
@@ -2889,6 +2891,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(signed_again, prepared.adapter_request.body);
+
+        let paired = execution
+            .prepare_claude_request(
+                bytes::Bytes::from_static(
+                    br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call/one","name":"Read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call/one","content":"ok"}]}]}"#,
+                ),
+                ProxyRoute::ClaudeMessages,
+                &client_headers,
+                &accounts,
+                None,
+            )
+            .unwrap();
+        let paired_body: Value = serde_json::from_slice(&paired.adapter_request.body).unwrap();
+        let call_id = paired_body["messages"][0]["content"][0]["id"]
+            .as_str()
+            .unwrap();
+        assert_ne!(call_id, "call/one");
+        assert_eq!(
+            paired_body["messages"][1]["content"][0]["tool_use_id"],
+            call_id
+        );
     }
 
     #[test]

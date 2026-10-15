@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -76,6 +76,67 @@ pub(super) fn input_to_kiro(client_name: &str, input: Value) -> Value {
         }
     }
     Value::Object(output)
+}
+
+/// A Claude Code alias and an already-wire-shaped key must not silently
+/// collapse onto the same Kiro property during request construction.
+pub(super) fn input_has_key_collision(client_name: &str, input: &Value) -> bool {
+    let Some(kiro_name) = builtin_name(client_name, ToolCompatibilityMode::ClaudeCode) else {
+        return false;
+    };
+    input
+        .as_object()
+        .is_some_and(|object| mapped_keys_collide(kiro_name, object))
+}
+
+pub(super) fn schema_has_key_collision(client_name: &str, schema: &Value) -> bool {
+    let Some(kiro_name) = builtin_name(client_name, ToolCompatibilityMode::ClaudeCode) else {
+        return false;
+    };
+    schema_has_key_collision_inner(kiro_name, schema)
+}
+
+fn schema_has_key_collision_inner(kiro_name: &str, schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        if mapped_keys_collide(kiro_name, properties)
+            || properties
+                .values()
+                .any(|property| schema_has_key_collision_inner(kiro_name, property))
+        {
+            return true;
+        }
+    }
+    if let Some(required) = object.get("required").and_then(Value::as_array) {
+        let mut seen = HashSet::new();
+        for key in required.iter().filter_map(Value::as_str) {
+            if !seen.insert(outbound_key(kiro_name, key).unwrap_or(key)) {
+                return true;
+            }
+        }
+    }
+    object
+        .get("items")
+        .is_some_and(|items| schema_has_key_collision_inner(kiro_name, items))
+        || ["oneOf", "anyOf", "allOf"].iter().any(|name| {
+            object
+                .get(*name)
+                .and_then(Value::as_array)
+                .is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .any(|variant| schema_has_key_collision_inner(kiro_name, variant))
+                })
+        })
+}
+
+fn mapped_keys_collide(kiro_name: &str, object: &Map<String, Value>) -> bool {
+    let mut seen = HashSet::new();
+    object
+        .keys()
+        .any(|key| !seen.insert(outbound_key(kiro_name, key).unwrap_or(key)))
 }
 
 pub(super) fn input_from_kiro(kiro_name: &str, input: Value) -> Value {
@@ -175,6 +236,13 @@ fn rewrite_schema_keys(mut schema: Value, map: impl Fn(&str) -> Option<&str> + C
     if let Some(items) = object.remove("items") {
         object.insert("items".to_string(), rewrite_schema_keys(items, map));
     }
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = object.get_mut(combinator).and_then(Value::as_array_mut) {
+            for variant in variants {
+                *variant = rewrite_schema_keys(std::mem::take(variant), map);
+            }
+        }
+    }
     schema
 }
 
@@ -213,6 +281,25 @@ mod tests {
         let mut map = HashMap::new();
         assert!(map_name("Read", ToolCompatibilityMode::Raw, &mut map).is_none());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn single_builtin_alias_remains_unambiguous() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"file_path":{"type":"string"}},
+            "required":["file_path"]
+        });
+        let input = json!({"file_path":"safe.txt","content":"hello"});
+        assert!(!schema_has_key_collision("Write", &schema));
+        assert!(!input_has_key_collision("Write", &input));
+        let mapped_schema = schema_to_kiro("Write", schema);
+        assert!(mapped_schema.pointer("/properties/path").is_some());
+        assert_eq!(mapped_schema["required"], json!(["path"]));
+        assert_eq!(
+            input_to_kiro("Write", input),
+            json!({"path":"safe.txt","text":"hello"})
+        );
     }
 
     #[test]

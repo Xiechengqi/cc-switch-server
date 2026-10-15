@@ -17,7 +17,17 @@ const contract = JSON.parse(
   ),
 );
 
-const HARNESS_REVISION = 1;
+const acceptance = contract.realAcceptanceExtensions?.find(
+  (extension) => extension.id === "AG-LIVE-V2-2026-10-08",
+);
+if (!acceptance || acceptance.receiptSchemaVersion !== 2 || acceptance.harnessRevision !== 2) {
+  throw new Error("Antigravity current receipt contract is unavailable");
+}
+const HARNESS_REVISION = acceptance.harnessRevision;
+const CATALOG_MAX_AGE_MS = acceptance.catalogMaxAgeMs;
+const RECEIPT_MAX_AGE_MS = acceptance.receiptMaxAgeMs;
+const CLOCK_SKEW_MS = acceptance.clockSkewMs;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const railSpecs = Object.freeze({
   antigravity_oauth: Object.freeze({
     providerType: "antigravity_oauth",
@@ -81,6 +91,10 @@ function canonical(value) {
     );
   }
   return value;
+}
+
+function sameCanonical(left, right) {
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 }
 
 function digest(domain, value) {
@@ -188,16 +202,119 @@ if (!/^(authorization|x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
 if (!path.isAbsolute(receiptFile)) {
   fail("ANTIGRAVITY_REAL_RECEIPT_FILE must be an absolute path");
 }
-const receiptPath = path.resolve(receiptFile);
-const receiptRelative = path.relative(repoRoot, receiptPath);
+const requestedReceiptPath = path.resolve(receiptFile);
+const receiptRelative = path.relative(repoRoot, requestedReceiptPath);
 if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("ANTIGRAVITY_REAL_RECEIPT_FILE must stay outside the repository");
 }
-if (!fs.existsSync(receiptPath) || !fs.statSync(receiptPath).isFile()) {
+if (!fs.existsSync(requestedReceiptPath) || !fs.statSync(requestedReceiptPath).isFile()) {
   fail("ANTIGRAVITY_REAL_RECEIPT_FILE is unavailable");
 }
-if (!fixtureMode && (fs.statSync(receiptPath).mode & 0o077) !== 0) {
+let receiptPath;
+try {
+  receiptPath = fs.realpathSync(requestedReceiptPath);
+} catch {
+  fail("ANTIGRAVITY_REAL_RECEIPT_FILE is unavailable");
+}
+const resolvedReceiptRelative = path.relative(repoRoot, receiptPath);
+if (!resolvedReceiptRelative.startsWith("..") && !path.isAbsolute(resolvedReceiptRelative)) {
+  fail("ANTIGRAVITY_REAL_RECEIPT_FILE must stay outside the repository");
+}
+const receiptStat = fs.statSync(receiptPath);
+if (!fixtureMode && (receiptStat.mode & 0o077) !== 0) {
   fail("ANTIGRAVITY_REAL_RECEIPT_FILE must not be group/world accessible");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o077) !== 0)
+    ) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("ANTIGRAVITY_REAL_RECEIPT_FILE path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("ANTIGRAVITY_REAL_RECEIPT_FILE changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -233,10 +350,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -284,8 +422,9 @@ async function validateAccount() {
     !Number.isSafeInteger(account.tokenRefreshGeneration) ||
     account.tokenRefreshGeneration < 0 ||
     account.hasAccessToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true
+    account.hasRefreshToken !== true ||
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false
   ) {
     fail("Antigravity Account is not a live OAuth identity generation");
   }
@@ -323,11 +462,23 @@ async function validateBindings(account) {
     ) {
       fail(`${app} Antigravity Provider is not fixed to the selected rail generation`);
     }
+    const providerRevision = view.runtime.providerRevision;
+    const runtimeFingerprint = view.runtime.runtimeFingerprint;
+    if (
+      !Number.isSafeInteger(providerRevision) ||
+      providerRevision < 0 ||
+      !Number.isSafeInteger(view.revision) ||
+      view.revision !== providerRevision ||
+      typeof runtimeFingerprint !== "string" ||
+      !runtimeFingerprint.trim()
+    ) {
+      fail(`${app} Antigravity Provider runtime scope is incomplete`);
+    }
     bindings.push({
       app,
       providerId,
-      providerRevision: view.providerRevision ?? view.provider?.revision ?? 0,
-      runtimeFingerprint: String(view.runtime.runtimeFingerprint || ""),
+      providerRevision,
+      runtimeFingerprint,
       authIdentityGeneration: authRef.authIdentityGeneration,
     });
   }
@@ -345,29 +496,55 @@ async function validateBindings(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Antigravity Share",
   );
-  const shareBindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  if (share.enabled !== true || share.status !== "active") {
+    fail("selected Antigravity Share is not active");
+  }
+  const shareBindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = shareBindings.filter((binding) => binding?.app === share.app);
+  if (
+    primaryBindings.length !== 1 ||
+    primaryBindings[0]?.providerId !== share.providerId ||
+    primaryBindings[0]?.providerType !== share.providerType
+  ) {
+    fail("Antigravity Share primary fields do not match its one App binding");
+  }
   for (const [app, providerId] of Object.entries(providerIds)) {
+    const appBindings = shareBindings.filter((binding) => binding?.app === app);
     if (
-      !shareBindings.some(
-        (binding) =>
-          binding?.app === app &&
-          binding?.providerId === providerId &&
-          binding?.providerType === spec.providerType,
-      )
+      appBindings.length !== 1 ||
+      appBindings[0]?.providerId !== providerId ||
+      appBindings[0]?.providerType !== spec.providerType
     ) {
-      fail(`Antigravity Share is not fixed to the ${app} Provider rail`);
+      fail(`Antigravity Share does not have one exact ${app} Provider rail binding`);
     }
   }
-  return { bindings, shareRevision: share.configRevision ?? 0 };
+  if (!Number.isSafeInteger(share.configRevision) || share.configRevision < 0) {
+    fail("Antigravity Share revision scope is incomplete");
+  }
+  return { bindings, shareRevision: share.configRevision };
+}
+
+function freshCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs >= now - CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + CLOCK_SKEW_MS;
+}
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + CLOCK_SKEW_MS;
 }
 
 async function validateCatalogs() {
   const snapshots = [];
   for (const [app, providerId] of Object.entries(providerIds)) {
-    const query = new URLSearchParams({ app, providerId });
+    const query = new URLSearchParams({
+      app,
+      providerId,
+      expectedShareId: shareId,
+      expectedProviderId: providerId,
+    });
     const catalog = await requestJson(
       shareUrl,
       `/v1/models?${query}`,
@@ -378,21 +555,37 @@ async function validateCatalogs() {
       !Array.isArray(catalog?.data) ||
       catalog.source !== "authenticated_fetch_available_models" ||
       catalog.stale !== false ||
-      !Number.isSafeInteger(catalog.fetchedAtMs) ||
-      catalog.fetchedAtMs <= 0
+      !freshCatalogTimestamp(catalog.fetchedAtMs)
     ) {
       fail(`${app} Antigravity model catalog is not fresh bound-account evidence`);
+    }
+    const modelIds = catalog.data.map((entry) => entry?.id);
+    if (
+      modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+      new Set(modelIds).size !== modelIds.length
+    ) {
+      fail(`${app} Antigravity model catalog has incomplete or duplicate model IDs`);
     }
     const matches = catalog.data.filter((entry) => entry?.id === models[app]);
     if (matches.length !== 1) {
       fail(`${app} Antigravity model catalog does not contain the exact selected model`);
     }
-    snapshots.push({ app, model: models[app], source: catalog.source, stale: catalog.stale });
+    snapshots.push({
+      app,
+      model: models[app],
+      source: catalog.source,
+      stale: catalog.stale,
+      fetchedAtMs: catalog.fetchedAtMs,
+      digest: digest(
+        acceptance.catalogDigestDomainPattern.replace("{app}", app),
+        [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+      ),
+    });
   }
   return snapshots;
 }
 
-function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bindingState) {
+function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bindingState, catalogs) {
   const allowed = new Set([
     "schemaVersion",
     "providerFamily",
@@ -404,6 +597,7 @@ function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bi
     "recordedAt",
     "scopeDigest",
     "models",
+    "catalogs",
     "requestTypeDecision",
     "checks",
     "bodyHashes",
@@ -423,7 +617,7 @@ function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bi
     fail("Antigravity receipt contained secret-like material");
   }
   if (
-    receipt.schemaVersion !== contract.realAcceptance.receiptSchemaVersion ||
+    receipt.schemaVersion !== acceptance.receiptSchemaVersion ||
     receipt.providerFamily !== "antigravity" ||
     receipt.rail !== rail ||
     receipt.targetCommit !== targetCommit ||
@@ -433,8 +627,9 @@ function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bi
   ) {
     fail("Antigravity receipt identity does not match the selected target scope");
   }
-  if (!Number.isFinite(Date.parse(receipt.recordedAt))) {
-    fail("Antigravity receipt recordedAt is invalid");
+  const recordedAt = Date.parse(receipt.recordedAt);
+  if (!freshReceiptTimestamp(recordedAt)) {
+    fail("Antigravity receipt recordedAt is outside the acceptance window");
   }
   const expectedVerification = fixtureMode ? "contract_verified" : "live_verified";
   const expectedLive = fixtureMode ? "live_pending" : "live_verified";
@@ -446,6 +641,9 @@ function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bi
   }
   if (JSON.stringify(receipt.models) !== JSON.stringify(models)) {
     fail("Antigravity receipt model scope changed");
+  }
+  if (!sameCanonical(receipt.catalogs, catalogs)) {
+    fail("Antigravity receipt catalog snapshots do not match the fresh bound models");
   }
   if (
     receipt.requestTypeDecision?.ordinary !== "agent" ||
@@ -510,14 +708,19 @@ function validateReceipt(receipt, expectedScopeDigest, targetCommit, account, bi
   ) {
     fail("Antigravity receipt did not prove isolation and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  if (receiptStat.nlink !== 1) {
+    fail("ANTIGRAVITY_REAL_RECEIPT_FILE must have one filesystem link");
+  }
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const bindingState = await validateBindings(account);
   const catalogs = await validateCatalogs();
-  const scopeDigest = digest("cc-switch-server:antigravity-real-scope:v1", {
+  const scopeDigest = digest(acceptance.scopeDigestDomain, {
     rail,
     accountId: account.id,
     authIdentityGeneration: account.authIdentityGeneration,
@@ -533,11 +736,49 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("ANTIGRAVITY_REAL_RECEIPT_FILE is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest, targetCommit, account, bindingState);
+  const recordedAt = validateReceipt(receipt, scopeDigest, targetCommit, account, bindingState, catalogs);
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBindings(finalAccount);
+  if (!sameCanonical(
+    {
+      accountId: finalAccount.id,
+      authIdentityGeneration: finalAccount.authIdentityGeneration,
+      tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
+      binding: finalBinding,
+    },
+    {
+      accountId: account.id,
+      authIdentityGeneration: account.authIdentityGeneration,
+      tokenRefreshGeneration: account.tokenRefreshGeneration,
+      binding: bindingState,
+    },
+  )) {
+    fail("Antigravity Account, Provider, or Share scope drifted during acceptance");
+  }
+  const finalCatalogs = await validateCatalogs();
+  for (let index = 0; index < catalogs.length; index += 1) {
+    if (
+      finalCatalogs[index]?.app !== catalogs[index].app ||
+      finalCatalogs[index].digest !== catalogs[index].digest
+    ) {
+      fail(`${catalogs[index].app} Antigravity model catalog changed during acceptance`);
+    }
+  }
+  const acceptanceNow = Date.now();
+  if (
+    [...catalogs, ...finalCatalogs]
+      .some((catalog) => !freshCatalogTimestamp(catalog.fetchedAtMs, acceptanceNow))
+  ) {
+    fail("Antigravity model catalogs expired during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("Antigravity receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(

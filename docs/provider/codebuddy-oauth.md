@@ -312,7 +312,7 @@ POST {endpoint}/v2/chat/completions
 ```
 
 - `reasoning_effort` 是**顶层字符串**（非 `reasoning:{effort}` 对象）。
-- 下游 canonical `reasoning.effort` 会归一为顶层 `reasoning_effort`；同时出现且值冲突、类型错误、或 effort 不在实时目录的 `supportedEfforts` 时，本地 400。仅在下游明确请求 reasoning 且未指定 effort 时采用目录 `defaultEffort`，不会无请求自动开启推理。
+- 下游 canonical `reasoning.effort` 会归一为顶层 `reasoning_effort`；同时出现且值冲突、类型错误、或 effort 不在实时目录的 `supportedEfforts` 时，本地 400。仅在下游明确请求 reasoning 且未指定 effort 时采用目录非空 `defaultEffort`，该字段缺失、`null` 或空白时回退到非空 `reasoning.effort`；不会无请求自动开启推理。显式非字符串 `defaultEffort` 不通过这条回退获得授权。
 - OpenAI named `tool_choice` 会先确认目标函数存在，再把 `tools` 缩减到该函数并映射为上游支持的 `"required"`；缺失/未知函数或畸形类型在发网前失败。
 - `tools: null`/`[]` 会与失去依附的 `tool_choice` 一起删除；`tool_choice: none` 同步删除 tools，`auto`/`required` 仅在非空 tools 存在时保留。named function 继续执行名字格式和声明存在性校验，不能借清理降级为 auto。
 - `stream_options.include_usage=true` 是末帧 usage 的来源；实现若需用量统计必须带上。
@@ -328,11 +328,25 @@ CB-N3 的差分结论是“共享 bridge 已覆盖”，没有增加 Provider �
 
 `tool_calls` 为标准增量（首帧 `id`+`name`，后续帧只递增 `arguments`）；**首帧的 `index` 是否存在随模型而变**，按 `index` 归并的实现须容忍首帧缺失。终帧 `finish_reason` ∈ `{tool_calls, stop, length}`，随后独立一帧携带 `usage`，最后 `data: [DONE]`。**U10 已关闭。**
 
+缺失工具 `index` 时的 ID 找回使用上游完整 ID 字符串，仅把全空白 ID 当作无 ID；不能先裁剪再查找。并行工具分片顺序变化时，`" call-b "` 必须命中同一个已聚合工具，不能因查找用了 `"call-b"` 而误落到数组位置对应的另一个工具。此项只修目标 Server 的本地身份保真，不推出厂商新的工具 ID 格式。
+
+显式 `delta.tool_calls` 在流式清洗与非流聚合两条路径都必须是数组或 `null`：`null`、空数组继续作为空占位清理，合法数组继续按工具 ID/index 聚合；字符串、对象、数字或布尔值不能因“空值清理”被吞掉，也不能原样转发后由 `finish_reason`/`[DONE]` 伪装成成功。这是本地响应形状门槛，不推断新的 WorkBuddy wire。
+
 SSE 解码接受 CRLF/LF/单 CR event boundary、多条 `data:`（按规范用换行拼接）、comment、`event:`、`id:` 与 `retry:` 心跳字段；仍要求唯一 `[DONE]` 后到达 EOF 才提交终态，`[DONE]` 后数据、重复 terminal、缺 terminal 或超限 event 全部失败。
+
+流式 decoder 与非流 Chat 聚合器在任何 `push` 错误后锁存失败，后续空块、其他数据和 `finish` 均不能把已拒绝的响应改判为成功；decoder 的 `finish` 错误同样不可由后续数据补救。首次错误保留原上游/本地协议或容量分类，之后只返回固定的本地协议错误。该规则是目标 Server 自己的 EOF 成功门槛，不从参考项目在首个 `[DONE]` 停止扫描的聚合行为推断新厂商 wire。
+
+目标解码器还按最早的完整空行识别混合 `LF+CRLF`、`CRLF+LF` 等事件边界，不能因为同批里较晚的标准边界把先到事件与 `[DONE]` 合并。逐字节分块和 Intl/CN × 三 Surface × 流/非流本地回环已覆盖；这只修本地 SSE 解析，不证明厂商真实发过混合行结束符，也不改变唯一 terminal+EOF 门槛。
+
+`finish_reason` 已出现但 `[DONE]` 尚未来到的窗口只允许独立 usage 尾帧或无语义心跳；新 content/reasoning/tool 等业务 choice 在解码与非流聚合入口均失败关闭，不能被后续 `[DONE]` 伪装为成功。Intl/CN 的流式回环验证此时只输出失败终态且不触发账号刷新。此限制不要求 `[DONE]` 前必须有 `finish_reason`，以保留既有 liveness 兼容样本；厂商真实终态接受性仍待两站 receipt。
+
+显式非零业务错误码优先于同帧 `choices`：即使错误 envelope 混入空 choices 或看似完整的 content/finish，decoder 与直接非流聚合器都不得把它当作普通 Chat chunk。已知 `14003` 仍归类限流，不因混合帧误记成功、转成普通 502 或触发账号刷新；`code=0` 正常业务帧保持原有处理。此项是本地错误优先级门槛，不推断厂商确实发送混合帧。
 
 CB-N5 已用 CodeBuddy loopback fixture 覆盖 `[DONE]` 前截断、重复/后置数据、`[DONE]` 后无 EOF，以及下游在 marker 前后取消。共享 stream guard 会关闭唯一上游 body 并释放 Account/Share 租约；专项差分为绿，因此没有复制 cli2api 的语言特定取消分支，也没有放宽“terminal + EOF”规则。
 
-revision 2 在 CodeBuddy decoder 内删除空 `content`、`reasoning_content`、`reasoning`、`refusal`、空 `tool_calls` 与 dummy `function_call`，重复 role 只保留第一次；若 chunk 随后不含 role、finish、usage、error、tool、reasoning 或 content 语义则整帧丢弃。finish、显式 usage（包括零）、真实 tool arguments 和合法首 role 不得丢失。该差分以 `cli2api@32aa108` 为只读交叉证据，严格 `[DONE]` + EOF 规则不变。
+revision 2 在 CodeBuddy decoder 内删除空 `content`、`reasoning_content`、`reasoning`、`refusal`、空 `tool_calls` 与 dummy `function_call`，重复 role 只保留第一次；若 chunk 随后不含 role、finish、usage、error、tool、reasoning 或 content 语义则整帧丢弃。文本字段只删除真正的空字符串或 null，单独成帧的空格必须保留，以免 `"left" + " " + "right"` 被拼成 `"leftright"`；显式非字符串文本按本地协议错误拒绝。finish、显式 usage（包括零）、真实 tool arguments 和合法首 role 不得丢失。该差分以 `cli2api@32aa108` 及已提交 `sse.go::dropEmptyString` 为只读交叉证据，严格 `[DONE]` + EOF 规则不变。
+
+旧式 `delta.function_call` 只有 `null` 或空占位可由上述清洗规则删除。非空调用在流式 decoder 与非流聚合器均固定 502 拒绝：当前三 Surface 的非流聚合只表达 `tool_calls`，不能让旧式调用在聚合时消失。此为本地失败关闭门槛，不表示两站实际发送该字段；正常 `tool_calls` 路径和 dummy 清洗不变。
 
 ### 5.7 usage 字段
 
@@ -349,6 +363,10 @@ prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_cache_write_tokens
 
 CB-N6 对缓存 usage 再做一层守恒归一化。read 固定按顶层 `cache_read_tokens` → `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` → vendor legacy 字段取第一个有效非负整数，write 同理先取顶层 `cache_write_tokens`，再取 nested creation/write，最后取 legacy。显式 `0` 是权威值，不允许被后面的非零 alias 覆盖；负数、小数和越界整数不进入 token 计量。Claude Messages 将 inclusive prompt 拆成 fresh/read/write；Codex Responses 保持 inclusive `input_tokens` 并在 details 写 read/write；Gemini 保持 inclusive prompt 和 cached count。三类 Surface 的 total 都按 inclusive input/output 守恒，不重复加入 cache token。
 
+流式和非流式入口现在对 `usage` 使用同一外层形状边界：显式非 `null` 值必须是对象，数字、字符串和数组在下游成功提交前按本地协议错误拒绝。`usage:null` 视为缺失并从规范化流帧移除；合法对象（包括显式零）与原有 cache 字段优先级不变。此项不推断新的上游计费字段或真实厂商接受性。
+
+独立 usage 尾帧可以省略 `choices`，也可以显式写 `choices:[]`：流式 decoder 早已接受前一种形状，非流 Chat 聚合现在与之保持一致，并保留 cache read/write 与 total。只有 `usage` 通过对象校验时才允许缺省 `choices`；显式非数组 `choices` 或既无 `choices` 也无 `usage` 的非流帧仍拒绝。该兼容形状来自已提交 `cli2api` WorkBuddy 聚合器的可选 `Choices` 字段与本仓库流/非流差分，不把参考的宽松首个 `[DONE]` 行为迁入唯一终态 + EOF 合同；Intl/CN 真实 receipt 仍待证。
+
 ### 5.8 Provider lifecycle facade
 
 CORE-N1 将精确 `codebuddy_oauth` Account binding、canonical request/model、站点绑定的 live catalog capability、payload preparation 和 Provider/Account generation fence 收敛到 `src/proxy/providers/codebuddy/`。共享 `forwarder.rs` 仍拥有 Share/Account lease、usage、terminal、统一 attempt budget，以及是否允许原账号在下游提交前执行一次 401 refresh/replay。此次拆分不改变 endpoint、header、payload bytes、错误记录分支、恢复次数或 terminal + EOF 合同，也不引入 Account、Provider、site、domain 或 rail fallback。
@@ -361,7 +379,7 @@ CORE-N2 只对精确的 `codebuddy_oauth` Provider 启用；普通 `claude`、`c
 
 核算范围包括 raw/decoded/canonical body、runtime/catalog、prepared payload、JSON wire、请求 ID、目标 headers、错误响应与解析工作集；流式路径还覆盖 transport chunk、rolling decoder buffer、event parse、canonical `Bytes` owner，以及 Claude/Codex/Gemini 下游 bridge retained state。非流路径的 content、reasoning、tool-call arguments 和最终 JSON `Value` 也在同一预算内；reservation 跟随最终 owner，到最后一个响应或 chunk owner drop 才释放。
 
-容量耗尽是 sticky 的：未提交响应返回稳定 `503`、`Retry-After: 1` 与 `cc_switch_request_memory_exhausted`；已提交 200 的 stream 只输出一个不含预算内部细节的 terminal。当前上游被取消，不 refresh/replay，不切 Account、Provider 或 site；usage 记录 `memory_capacity`，Provider outcome 归为 `CapacityShed` 而不是普通 `NetworkFailure`。分发边界对 `forward_codebuddy` future 做堆化，使默认 Tokio 测试线程栈无需额外 `RUST_MIN_STACK` 才能承载该状态机。
+容量耗尽是 sticky 的：未提交响应返回稳定 `503`、`Retry-After: 1` 与 `cc_switch_request_memory_exhausted`；已提交 200 的 stream 只输出一个不含预算内部细节的 terminal。当前上游被取消，不 refresh/replay，不切 Account、Provider 或 site；usage 记录 `memory_capacity`，Provider outcome 归为 `CapacityShed` 而不是普通 `NetworkFailure`。分发边界对 `forward_codebuddy` future 做堆化；非流完成上游聚合后的收尾再经独立 Tokio 任务切断 `forward_with_attempt` 到 usage durable commit 的深 poll 调用栈，正常路径仍等待收尾结果，调用方取消时由既有 abort guard 中止任务并释放 Account/Share guard。CodeBuddy Provider 三 Surface 自测和完整 library 在默认 2 MiB Rust 测试线程栈下通过；完整默认栈 API 合同另有 Claude/Kiro 用例栈溢出，不据此声称全仓默认栈已清零。此项只修本地执行栈，不改变 WorkBuddy wire 或双站验收状态。
 
 `CB-OBS-0015` 只把 `cli2api` 的 1/16 MiB body 读取上限、16 MiB 单条 SSE line ceiling 和 retained non-stream aggregation 当作差分信号；参考项目没有证明统一生命周期预算、payload/header 副本、下游 transform、容量分类或上述恢复语义。`CORE-N2-CODEBUDDY=fixture_verified` 绑定本仓库 `573dc47` 的独立实现和 66 个 CodeBuddy、26 个 request-memory、15 个 memory-exhaustion 专项测试。它不构成 Intl/CN 真实长流或内存压力 receipt，两站仍分别为 `null/live_pending`。
 
@@ -423,10 +441,11 @@ supportsToolCall, tags[], temperature, top_p, vendor
 
 能力字段比 Qoder 的目录更完整（含 reasoning effort 档位、多模态开关、上下文与输出上限、温度默认值），足以直接投影出 reviewed profile 的全部能力位，无需推测。同一响应还含 `agents`(16)、`enterpriseId`、`productFeatures`。
 
-- 目录按 App、Provider revision/runtime fingerprint、Account、identity generation、token generation、**site** 隔离，并 single-flight 获取。
+- 目录按 App、Provider revision/runtime fingerprint、Account、identity generation、token generation、**site**、进程内账号实例及实际请求身份摘要隔离，并 single-flight 获取。摘要覆盖凭据、profile、有效期与测试端点；不会将明文放入缓存键。同代次凭据/UID 改变或同 ID 账号重建不复用旧目录，完全相同作用域的 stale fallback 规则不变。返回目录和发起 generation 前再复核当前绑定及请求身份；分次复核不是跨存储原子事务。
 - **成功空目录是权威结果**，保持为空，不与 Provider 配置、静态 alias 或其他账号目录合并。
 - 只有 network / 408 / 429 / 5xx 才允许读取**完全相同作用域内**、24 小时硬上限内的 stale cache。
 - 认证错误、超限响应、坏 JSON、未知成功结构、身份 scope 漂移，以及"上游非空但全部模型均不在 reviewed allowlist"，一律 fail closed 并清理当前 scope。
+- `/v3/config` 若出现业务 `code`，必须可解析且为 0；无法解析的字符串、`null`、布尔或对象不能当作缺失后继续接受 `models`。模型 `id` 保留上游原样，只允许与 reviewed allowlist **精确相等**的启用项进入公开目录；首尾空白 ID 失败关闭，大小写不同的 ID 不会被强制转小写后冒充已审核模型。
 - **运行时不存在静态 entitlement fallback** —— 与 `kimi_code` 条款一致。`product.json` 内嵌目录只作为**字段补全的元数据源**（`mergeModelsById` 的 local 侧），不作为 entitlement 来源。这个区分是本 Provider 能通过该条款的原因。
 - `/v1/models` 只在当前 Share 选中的 CodeBuddy Provider 范围内，公开上游目录与 reviewed allowlist 的交集，不参与 Provider 或账号选择。
 - live catalog 出现启用但未 reviewed 的模型时只输出不含凭据/请求内容的结构化漂移告警（site、模型计数、固定 client version），不会自动放行新模型。
@@ -564,9 +583,13 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 | 11212 | `LicenseExpired`（授权过期） |
 | 11216 | `TrialExpired`（试用过期） |
 
+数据面的同账号恢复只针对没有已识别业务拒绝码的 HTTP 401（包括 APISIX HTML 401），且至多一次。HTTP 401 即使夹带已知 `14003` 限流码，也按限流终止当前请求；上表三项许可码即使映射为下游 401，也不得刷新或重放。`12153` 是需要重新登录的会话终态，在生成响应中出现时同样不触发刷新重放；HTTP 403 不因业务码映射为 401 而升级为可恢复。未识别数字码与无业务码的 HTTP 401 仅在**恢复资格判断**上仍按原 HTTP 状态回退；下游状态映射不变。Intl/CN × 三 Surface × 流/非流的本地回环覆盖已知终态，不能据此声称厂商实际会在生成响应中返回这些组合。
+
 限流/配额枚举（部分）：`14001 UsageLimitExceeded`、`14002 ConversationChatTooMany`、`14003 RateLimitError`、`14012–14018` 企业与用户配额系列、`10105 ConversationLimitExceeded`、`15001 WebSearchRateLimit`、`11115 ContextTooLong`、`6001–6008 CraftRate{TPS,TPM,TPH,TPD,RPS,RPM,RPH,RPD}Limit`。完整表见 `workbuddy-cliproxy/codebuddy-open-questions.md` §4.1。
 
 **业务码定位算法**：官方 CLI 会**递归下钻最多 6 层**（`code` → `data` → `error`，并对 `message` / `details` 尝试 JSON 解析后再钻），只认 `code >= 1000`。反代若要向下游透传上游错误，需保持这层嵌套可被还原。
+
+目标 Server 保留上述递归识别用于内部分类，但对外错误文本只显示本地已映射为认证、权限、限额或请求错误的业务码；未知数字码仍按上游错误处理，不回显其原值。HTTP 与 SSE 错误消息先经通用 Bearer/token/API key 等敏感字段脱敏、控制字符过滤和长度限制，才进入下游错误及失败记录。此为本地安全边界，不代表厂商只会返回已映射的错误码，也不能识别未带敏感字段线索的任意秘密。
 
 ---
 
@@ -637,9 +660,29 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
 
 真实验收需要**国内与国际各一份**脱敏 receipt，覆盖：登录、refresh 轮换、`/v3/config` 目录、三 Surface 的非流与流式、tools、首个 401、第二个 401、429、中途断流、未知模型拒绝，以及日志/控制面/持久化文件不泄露 token。
 
-LIVE-N1 的 `scripts/smoke/codebuddy-real-receipt.mjs` 一次只接受 `--site intl` 或 `--site cn`。对应 Account、Claude/Codex/Gemini 三个 Provider、Share、exact model 和 receipt path 必须使用该 site 的独立环境变量；三个 Provider 都必须是 `special.codebuddy_oauth` / `ready`，固定同一 Account 与当前 `authIdentityGeneration`，Share 显式固定三项绑定。validator 重新读取三份 `source=codebuddy_live_model_catalog`、`stale=false` 的 fresh catalog，并把 target commit/harness、Account 两代际、三个 Provider revision/runtime digest、Share revision/binding digest、exact model、三份 catalog snapshot 与六个 non-stream/stream body hash共同绑定进 scope digest。
+LIVE-N1 的 `scripts/smoke/codebuddy-real-receipt.mjs` 一次只接受 `--site intl` 或 `--site cn`。对应 Account、Claude/Codex/Gemini 三个 Provider、Share、exact model 和 receipt path 必须使用该 site 的独立环境变量；控制面只对通过生产 `CodeBuddyAccountProfile::parse` 验证的 Account 发布脱敏 `codebuddyCredentialScope.site`，validator 在开始和落盘前均要求该站点与 `--site` 精确相等，缺字段或漂移时失败关闭。投影不暴露 profile domain、UID、enterprise ID 或 token；脚本选择的站点及 receipt 自述不能代替真实 Account profile。三个 Provider 都必须是 `special.codebuddy_oauth` / `ready`，固定同一 Account 与当前 `authIdentityGeneration`，Share 显式固定三项绑定。validator 重新读取三份 `source=codebuddy_live_model_catalog`、`stale=false` 的 fresh catalog，并把 target commit/harness、Account 两代际、三个 Provider revision/runtime digest、Share revision/binding digest、exact model、三份 catalog snapshot 与六个 non-stream/stream body hash共同绑定进 scope digest。
+
+Share 控制面投影中的 `bindings` 已包含 `share.app` 的主绑定，主字段不是额外的第四条绑定。validator 直接要求 Claude/Codex/Gemini 各恰好一条完整匹配的绑定，并要求 `share.app/providerId/providerType` 与其对应条目一致；同 App 即使另有一条正确绑定，只要还存在重复或冲突条目便拒绝。此项防止歧义 Share 被写进真实验收证据，不改变生产 Share 路由或声称跨 API 原子快照。
+
+三个 Provider 都按 Server 真实 `ProviderView` 校验顶层 `revision` 与 runtime `providerRevision`：两者必须明确存在、是非负安全整数且相等，runtime `runtimeFingerprint` 必须是非空白字符串；Share `configRevision` 也必须明确为非负安全整数。缺失、不一致、仅有旧 mock 的虚构顶层 `providerRevision` 或空白 fingerprint，在三份目录请求前失败；不以 `0` 补齐 receipt 作用域。此检查只加固私有证据，不能替代 Intl/CN 各自的真实上游验收。
+
+Intl/CN 的 Account 投影还必须明确给出布尔 `hasApiKey=false` 与 `needsRelogin=false`。字段缺失、`null` 或字符串 `"false"` 不等同于布尔值，均在 Provider 和三份目录请求前拒绝；这不改变生产 OAuth 身份或站点绑定。
+
+Intl/CN 两站的 validator 还要求 Share 明确给出 `enabled=true` 和 `status=active`；缺字段、disabled 或 paused 都在目录请求前失败关闭。仅因字段缺失而没有返回 `false`/非 active 值，不能被推断为已启用。此检查仍只约束私有验收证据，不把控制面分次读取变成原子快照。
+
+三份目录请求各带 `app`、所选 `expectedShareId` 和该 App 的 `expectedProviderId`。Server 的签名 Router ingress 先按实际 Share/App 选择 Provider，再比对预期绑定；普通 `providerId` 查询不承担选择作用。此核对只证明验收目录的路由作用域，不证明厂商模型权益或目录与后续推理组成原子快照。
+
+Intl/CN 私有 receipt 在末次 Account、三 Provider 与 Share 绑定复核后，还会通过同一签名 Share/各 App Provider 栅栏重新读取 Claude、Codex、Gemini 三份目录。各目录必须继续是合法实时来源、非 stale；完整 `data` 的所有模型 ID 必须是非空字符串、无首尾空白且唯一，选定模型须恰好一次。完整 `data` 按 ID 确定性排序后计算摘要，末次摘要分别等于 receipt 所绑定的初次摘要；纯行重排不算漂移，能力字段等内容变化仍拒绝。初次与末次共六份目录时间戳在同一接受时刻复核新鲜性。撤下或添加模型、目录失效、来源漂移及超前时间均拒绝接受。这是私有证据门槛；分次读取不是跨控制面与厂商的原子快照，也不能代替双站真实账号验收。
 
 私有 receipt schema v2 必须完整提供 16 项 `pass`、规定的 measurements、固定恢复决策、decoy 零计数与 secret scan；真实文件位于仓库外且权限为 `0600`。缺输入时只输出 `blocked_inputs/live_pending`；`CC_SWITCH_CODEBUDDY_HARNESS_MODE=fixture` 即使所有 mock 检查通过也只接受 `contract_verified/live_pending`，不能写成 `live_verified`。真实模式只有完整私有 harness 已覆盖登录、refresh rotation、`12153`、权威空目录、billing、三 Surface、两段 401、唯一 terminal + EOF、generation/decoy/secret 检查时才接受 `live_verified`。任一站成功不得继承给另一站，receipt 也不自动开放 `deepseek-v4.1-flash`、企业或多模态能力。
+
+validator 在控制面请求前由只读描述符限量读取私有 receipt；读取前后都核对同一文件描述符的设备、inode、链接数、大小、权限以及纳秒级修改/状态变更时间。普通原位改写即使保持文件大小且发生在最后一次读取后、EOF 检查前，也会失败关闭，不再把读取期间变化的文件当成稳定证据。这是文件快照门槛，不证明并发原位改写与元数据复原情况下的原子视图，也不证明部署 commit 与本地 HEAD 一致。
+
+最终接受前还会重新解析配置的 receipt 路径，并把当前文件的设备、inode、链接数、大小、权限和纳秒级 mtime/ctime 与读取时的快照比较。若控制面校验期间路径被替换，或原文件被普通原位改写，即使原先读入的内容有效也拒绝该站。末次文件检查不是与控制面或后续文件操作绑定的原子事务，恶意元数据复原和检查后的变化仍需独立防护。
+
+末次检查还会通过 `O_NOFOLLOW` 只读描述符重新读取不超过 1 MiB 的完整 receipt 字节（含 EOF），与先前验收的原始字节逐字节比较，并在读前、读后及路径处复核文件身份/元数据。Intl/CN 的对抗 fixture 在控制面请求期间等长改写文件、对末次元数据读取返回原值时，旧流程会错误接受；现在两站均脱敏拒绝。fixture 的元数据伪装仅用于证明不能只依赖元数据，不代表普通用户能恢复真实 `ctime`；末次检查之后的并发变化和跨 API 原子性仍不由此保证，也不提升真实订阅验收状态。
+
+receipt 的 `recordedAt` 必须在最终接受时仍位于 24 小时有效期内（未来时钟偏差最多五分钟）。validator 在内容校验时和末次 Account/Provider/Share 绑定复核后各检查一次；若复核期间过期，则拒绝该站的 receipt。此规则只约束私有证据时效，不修改生产目录 TTL 或 CodeBuddy wire；末次控制面读取并非跨 API 原子事务。
 
 国际 site 的采集已完成（2026-08-31，个人账号），可支撑 `fixture_verified`；**升 live verified 仍需在本仓库内按上述清单重跑一遍并留存脱敏 receipt** —— 本次采集是在 workbuddy-cliproxy 侧做的探针式验证，不是本仓库的验收流水线产物。
 
@@ -754,3 +797,19 @@ requestId, credit, model, client, requestTime, inputTrunc, input, agentPurpose
 **不可借鉴**：杀进程 + 改文件 + 重启的桌面式切换（`process.rs`）、自动签到与多账号积分轮换（运营行为，且诱导账号滥用）、`apiKeyHelper` / `settings.json.env.CODEBUDDY_AUTH_TOKEN` 注入路径（本 Provider 自己就是上游端点，不需要改 CLI 配置）。
 
 **它帮不上的**：全部数据面结论（端点、强制流式、`11128` 首条 system、`reasoning_content` 非对称、dense delta、usage 字段、模型目录）——它一行都没有。
+
+### 流式终止原因的类型边界（2026-10-10）
+
+流式 decoder 与非流聚合器统一拒绝显式非字符串、非 `null` 的 `finish_reason`，防止数字、布尔值或对象绕开 finish 后业务帧栅栏并形成伪成功。`null` 与空白字符串沿用既有可丢弃兼容；合法非空字符串仍允许其后独立 usage 尾帧及唯一 `[DONE]`，成功只在 EOF 验证后提交。该局部收紧依据本仓库回归及 `cli2api` 已提交 WorkBuddy 聚合器的字符串解析，不宣称新的厂商协议或真实账号验收；Intl/CN receipt 与 CB-N4 仍待证。
+
+### Choice 形状与 index 的双路径校验（2026-10-10）
+
+流式 decoder 和非流聚合器共用单 choice 校验：一个 chunk 至多一个 `choices[]` 元素，该元素必须是对象，显式 `index` 必须可解析为 0。缺失 index、数值 0 和兼容字符串 `"0"` 保持可用；重复 index 0、非对象、非零或不可解析值在 `[DONE]` 前作为本地协议错误拒绝，不能被拼成一条回答或产生成功响应。空 choices 的独立 usage 尾帧与跨 chunk 的单 choice 续接保持。Intl/CN × Claude/Codex/Gemini × 流/非流的离线 HTTP 回环已覆盖；该规则不改变出站 WorkBuddy 请求，也不代表真实两站订阅验收。两份真实 receipt 与 CB-N4 仍待证。
+
+### 工具调用显式 index 的校验（2026-10-10）
+
+`tool_calls[].index` 缺失时继续用工具 ID 或分片位置归并，以兼容实测首帧可能没有 index；显式存在时必须可解析为 0～127 的非负整数，数字字符串如 `"0"` 仍兼容。`null`、非法字符串、负数或越界值不能降级为“缺省”，流式 decoder 在转发前和非流聚合器在合并前共用失败关闭校验。只读 `cli2api` WorkBuddy 聚合器按 index 汇集工具分片，提供差分信号而非本 Server 的严格成功规则；离线回环不证明两站会发送畸形分片。出站 wire、唯一 `[DONE]`+EOF 和两份真实 receipt 状态不变。
+
+### 拒答分片的非流保真（2026-10-13）
+
+CodeBuddy 流式清洗保留非空 `delta.refusal`；非流聚合现将多段拒答按原顺序拼接为 `choices[0].message.refusal`，并计入请求生命周期内存预算。只含拒答的回答不会因非流聚合而丢失可见内容；`finish_reason` 沿用上游值。固定 decoder→aggregator 反例在旧实现中得到空拒答，修复后保留完整文本。推荐 `cli2api` 的已提交清洗器也保留非空拒答，但其非流聚合未收集此字段；本项是目标 Server 的流/非流语义对齐，不推断两站厂商实际发送形状。出站请求、账号与站点绑定、唯一 `[DONE]`+EOF、receipt schema 和 Intl/CN 真实验收状态不变。

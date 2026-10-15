@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -32,6 +33,11 @@ use crate::domain::providers::model::ProviderType;
 const ACCOUNTS_FILE_NAME: &str = "accounts.json";
 const ENCRYPTED_V1_PREFIX: &str = "ccenc:v1:";
 const ENCRYPTED_V2_PREFIX: &str = "ccenc:v2:";
+static NEXT_ACCOUNT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_account_incarnation() -> u64 {
+    NEXT_ACCOUNT_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +46,41 @@ pub struct AccountStore {
     pub accounts: Vec<Account>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_codex_oauth_account_id: Option<String>,
+    // Stable across restarts for the SQLite-backed Kiro/Amazon Q local prompt
+    // estimate, but replaced when an account is deleted and recreated.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) kiro_prompt_cache_owner_ids: BTreeMap<String, String>,
+    // In-flight requests do not survive a process restart. This non-persistent
+    // generation distinguishes delete/recreate with the same ID and credentials.
+    #[serde(skip)]
+    pub(crate) account_incarnations: BTreeMap<String, u64>,
+}
+
+fn uses_kiro_prompt_cache_owner(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::KiroOAuth | ProviderType::AmazonQOAuth
+    )
+}
+
+fn new_kiro_prompt_cache_owner_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn legacy_kiro_prompt_cache_owner_id(account: &Account) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:kiro-prompt-cache-legacy-owner:v1\0");
+    for component in [account.provider_type.as_str(), account.id.as_str()] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    hex::encode(&digest.finalize()[..16])
+}
+
+fn valid_kiro_prompt_cache_owner_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -874,7 +915,28 @@ impl AccountStore {
             decrypt_account_store_value(&mut value, &root_key, &account_key)
                 .with_context(|| format!("decrypt accounts {}", path.display()))?;
         }
-        serde_json::from_value(value).with_context(|| format!("parse accounts {}", path.display()))
+        let mut store: Self = serde_json::from_value(value)
+            .with_context(|| format!("parse accounts {}", path.display()))?;
+        store.account_incarnations = store
+            .accounts
+            .iter()
+            .map(|account| (account.id.clone(), next_account_incarnation()))
+            .collect();
+        store.kiro_prompt_cache_owner_ids.retain(|id, owner| {
+            valid_kiro_prompt_cache_owner_id(owner)
+                && store.accounts.iter().any(|account| {
+                    account.id == *id && uses_kiro_prompt_cache_owner(account.provider_type)
+                })
+        });
+        for account in &store.accounts {
+            if uses_kiro_prompt_cache_owner(account.provider_type) {
+                store
+                    .kiro_prompt_cache_owner_ids
+                    .entry(account.id.clone())
+                    .or_insert_with(|| legacy_kiro_prompt_cache_owner_id(account));
+            }
+        }
+        Ok(store)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
@@ -936,7 +998,22 @@ impl AccountStore {
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
+            self.account_incarnations
+                .entry(account.id.clone())
+                .or_insert_with(next_account_incarnation);
             let previous = existing.clone();
+            if uses_kiro_prompt_cache_owner(account.provider_type) {
+                if account.provider_type == previous.provider_type {
+                    self.kiro_prompt_cache_owner_ids
+                        .entry(account.id.clone())
+                        .or_insert_with(|| legacy_kiro_prompt_cache_owner_id(&previous));
+                } else {
+                    self.kiro_prompt_cache_owner_ids
+                        .insert(account.id.clone(), new_kiro_prompt_cache_owner_id());
+                }
+            } else {
+                self.kiro_prompt_cache_owner_ids.remove(&account.id);
+            }
             use crate::domain::accounts::subscription_expiry::{
                 subscription_expiry_capability, supports_manual_expiry,
             };
@@ -971,6 +1048,12 @@ impl AccountStore {
             *existing = account.clone();
         } else {
             initialize_account_generations(&mut account);
+            self.account_incarnations
+                .insert(account.id.clone(), next_account_incarnation());
+            if uses_kiro_prompt_cache_owner(account.provider_type) {
+                self.kiro_prompt_cache_owner_ids
+                    .insert(account.id.clone(), new_kiro_prompt_cache_owner_id());
+            }
             self.accounts.push(account.clone());
         }
 
@@ -1192,10 +1275,24 @@ impl AccountStore {
         let before = self.accounts.len();
         self.accounts.retain(|item| item.id != account_id);
         let deleted = self.accounts.len() != before;
+        if deleted {
+            self.account_incarnations.remove(account_id);
+            self.kiro_prompt_cache_owner_ids.remove(account_id);
+        }
         if deleted && self.active_codex_oauth_account_id.as_deref() == Some(account_id) {
             self.active_codex_oauth_account_id = None;
         }
         deleted
+    }
+
+    pub(crate) fn account_incarnation(&self, account_id: &str) -> Option<u64> {
+        self.account_incarnations.get(account_id).copied()
+    }
+
+    pub(crate) fn kiro_prompt_cache_owner_id(&self, account_id: &str) -> Option<&str> {
+        self.kiro_prompt_cache_owner_ids
+            .get(account_id)
+            .map(String::as_str)
     }
 
     pub fn refresh_status(&mut self, account_id: &str, now_ms: i64) -> Option<Account> {
@@ -2885,6 +2982,116 @@ mod tests {
             rate_limited_until: None,
             last_refresh_error: None,
         }
+    }
+
+    #[test]
+    fn account_incarnation_changes_on_same_id_recreate_but_not_token_refresh() {
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::AntigravityOAuth);
+        input.id = Some("recreated-antigravity".to_string());
+        input.access_token = Some("same-token".to_string());
+        let initial = store.upsert(input.clone());
+        let first = store.account_incarnation(&initial.id).unwrap();
+        store.upsert(input.clone());
+        assert_eq!(store.account_incarnation(&initial.id), Some(first));
+        assert!(store.delete(&initial.id));
+        assert_eq!(store.account_incarnation(&initial.id), None);
+        let recreated = store.upsert(input);
+        assert_eq!(
+            recreated.auth_identity_generation,
+            initial.auth_identity_generation
+        );
+        assert_eq!(
+            recreated.token_refresh_generation,
+            initial.token_refresh_generation
+        );
+        assert_ne!(store.account_incarnation(&recreated.id), Some(first));
+        assert!(!serde_json::to_value(&store)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("accountIncarnations"));
+    }
+
+    #[test]
+    fn kiro_prompt_cache_owner_survives_restart_but_rotates_on_recreate() {
+        for provider_type in [ProviderType::KiroOAuth, ProviderType::AmazonQOAuth] {
+            let config_dir = account_store_test_dir(provider_type.as_str());
+            let mut store = AccountStore::default();
+            let mut input = fixture_input(provider_type);
+            input.id = Some(format!("{}-cache-owner", provider_type.as_str()));
+            input.access_token = Some("same-token".into());
+            let first = store.upsert(input.clone());
+            let owner = store
+                .kiro_prompt_cache_owner_id(&first.id)
+                .unwrap()
+                .to_string();
+            store.upsert(input.clone());
+            assert_eq!(
+                store.kiro_prompt_cache_owner_id(&first.id),
+                Some(owner.as_str())
+            );
+            store.save(&config_dir).unwrap();
+            let mut restarted = AccountStore::load_or_default(&config_dir).unwrap();
+            assert_eq!(
+                restarted.kiro_prompt_cache_owner_id(&first.id),
+                Some(owner.as_str())
+            );
+
+            assert!(restarted.delete(&first.id));
+            let recreated = restarted.upsert(input);
+            assert_eq!(
+                recreated.auth_identity_generation,
+                first.auth_identity_generation
+            );
+            assert_eq!(
+                recreated.token_refresh_generation,
+                first.token_refresh_generation
+            );
+            let next_owner = restarted
+                .kiro_prompt_cache_owner_id(&recreated.id)
+                .unwrap()
+                .to_string();
+            assert_ne!(next_owner, owner);
+            restarted.save(&config_dir).unwrap();
+            let reloaded = AccountStore::load_or_default(&config_dir).unwrap();
+            assert_eq!(
+                reloaded.kiro_prompt_cache_owner_id(&recreated.id),
+                Some(next_owner.as_str())
+            );
+            std::fs::remove_dir_all(config_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_kiro_account_without_owner_has_stable_migration_identity() {
+        let config_dir = account_store_test_dir("kiro-legacy-cache-owner");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let legacy = json!({"accounts":[{
+            "id":"legacy-kiro-account", "providerType":"kiro_oauth"
+        }]});
+        std::fs::write(
+            accounts_path(&config_dir),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let first = AccountStore::load_or_default(&config_dir).unwrap();
+        let owner = first
+            .kiro_prompt_cache_owner_id("legacy-kiro-account")
+            .unwrap()
+            .to_string();
+        let second = AccountStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(
+            second.kiro_prompt_cache_owner_id("legacy-kiro-account"),
+            Some(owner.as_str())
+        );
+        second.save(&config_dir).unwrap();
+        let persisted = AccountStore::load_or_default(&config_dir).unwrap();
+        assert_eq!(
+            persisted.kiro_prompt_cache_owner_id("legacy-kiro-account"),
+            Some(owner.as_str())
+        );
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     fn quota_account(

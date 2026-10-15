@@ -97,6 +97,26 @@ pub(crate) enum CanonicalRequestError {
     Request(ProxyError),
 }
 
+pub(crate) fn responses_previous_id(body: &Value) -> Result<Option<String>, ProxyError> {
+    let Some(previous) = body.get("previous_response_id") else {
+        return Ok(None);
+    };
+    if previous.is_null() {
+        return Ok(None);
+    }
+    let Some(previous) = previous.as_str() else {
+        return Err(ProxyError::bad_request(
+            "Qoder previous_response_id must be a string or null",
+        ));
+    };
+    if previous.is_empty() || previous.len() > 512 || previous.trim() != previous {
+        return Err(ProxyError::bad_request(
+            "Qoder previous_response_id must be a nonblank exact identifier of at most 512 bytes",
+        ));
+    }
+    Ok(Some(previous.to_string()))
+}
+
 pub(crate) fn prepare_canonical_request(
     request: &AdapterRequest,
     request_context: &mut UsageLogContext,
@@ -171,6 +191,7 @@ pub(crate) struct PreparedGeneration {
     pub(crate) model_key: String,
     pub(crate) model_source: String,
     pub(crate) payload: runtime::PreparedQoderPayload,
+    pub(crate) continuation_input: runtime::QoderContinuationInput,
     pub(crate) prepared_memory: Option<RequestMemoryReservation>,
 }
 
@@ -180,6 +201,13 @@ impl PreparedGeneration {
             .capacity()
             .saturating_add(self.model_source.capacity())
             .saturating_add(self.payload.retained_bytes())
+            .saturating_add(
+                self.continuation_input
+                    .tool_names
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
     }
 }
 
@@ -188,6 +216,7 @@ pub(crate) fn prepare_generation(
     canonical: &CanonicalRequest,
     now_ms: i64,
     request_memory: Option<&RequestMemoryBudget>,
+    continuation: Option<&runtime::QoderResponseContinuation>,
 ) -> Result<PreparedGeneration, ProxyError> {
     // Model/session derivation and payload construction normalize history and
     // tools before assembling the final COSY document. Reserve their working
@@ -227,14 +256,39 @@ pub(crate) fn prepare_generation(
                 "Qoder live catalog has no exact model_config for enabled model {model_key}"
             ),
         })?;
-    let conversation_session_id = runtime::derive_qoder_conversation_session_id(
-        &prepared_runtime.scope,
-        &canonical.share_id,
-        &canonical.user_namespace,
-        &canonical.downstream_session_id,
-        &model_key,
-    )
-    .map_err(ProxyError::bad_request)?;
+    let mut continuation_input =
+        runtime::qoder_continuation_input(&canonical.body).map_err(ProxyError::bad_request)?;
+    let conversation_session_id = if let Some(previous) = continuation {
+        if continuation_input.explicit_system
+            && continuation_input.system_fingerprint != previous.system_fingerprint
+        {
+            return Err(ProxyError::qoder_response_context_unavailable());
+        }
+        if continuation_input.explicit_tools
+            && continuation_input.tools_fingerprint != previous.tools_fingerprint
+        {
+            return Err(ProxyError::qoder_response_context_unavailable());
+        }
+        if !continuation_input.explicit_system {
+            continuation_input.system_fingerprint = previous.system_fingerprint;
+        }
+        if !continuation_input.explicit_tools {
+            continuation_input.tools_fingerprint = previous.tools_fingerprint;
+            continuation_input
+                .tool_names
+                .clone_from(&previous.tool_names);
+        }
+        previous.session_id.clone()
+    } else {
+        runtime::derive_qoder_conversation_session_id(
+            &prepared_runtime.scope,
+            &canonical.share_id,
+            &canonical.user_namespace,
+            &canonical.downstream_session_id,
+            &model_key,
+        )
+        .map_err(ProxyError::bad_request)?
+    };
     if let Some(memory) = prepared_memory.as_ref() {
         memory
             .resize(
@@ -245,7 +299,7 @@ pub(crate) fn prepare_generation(
             )
             .map_err(|error| error.into_proxy_error())?;
     }
-    let payload = runtime::build_qoder_payload(
+    let payload = runtime::build_qoder_payload_with_continuation(
         &canonical.body,
         exact_model_config,
         prepared_runtime.session.session.site,
@@ -253,6 +307,7 @@ pub(crate) fn prepare_generation(
         &conversation_session_id,
         &prepared_runtime.session.session.identity.user_type,
         now_ms,
+        continuation,
     )
     .map_err(ProxyError::bad_request)?;
     let model_source = exact_model_config
@@ -266,6 +321,7 @@ pub(crate) fn prepare_generation(
         model_key,
         model_source,
         payload,
+        continuation_input,
         prepared_memory,
     };
     if let Some(memory) = prepared.prepared_memory.as_ref() {
@@ -290,6 +346,8 @@ pub(crate) async fn runtime_is_current(
             &prepared_runtime.account_id,
             prepared_runtime.auth_identity_generation,
             prepared_runtime.token_refresh_generation,
+            prepared_runtime.account_incarnation,
+            &prepared_runtime.scope,
         )
         .await
 }
@@ -356,6 +414,8 @@ mod tests {
             rail,
             7,
             11,
+            13,
+            "fixture-request",
         )
         .unwrap();
         let identity = QoderIdentity {
@@ -397,6 +457,7 @@ mod tests {
             account_id: "qoder-account".to_string(),
             auth_identity_generation: 7,
             token_refresh_generation: 11,
+            account_incarnation: 13,
         }
     }
 
@@ -414,18 +475,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn responses_continuation_preflight_preserves_exact_ids_and_rejects_invalid_shapes() {
+        for body in [json!({}), json!({"previous_response_id": null})] {
+            assert_eq!(responses_previous_id(&body).unwrap(), None);
+        }
+        for value in [
+            json!(7),
+            json!(""),
+            json!(" resp_known"),
+            json!("resp_known "),
+            json!("x".repeat(513)),
+        ] {
+            let error = responses_previous_id(&json!({"previous_response_id": value})).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(!error.message.contains("resp_known"));
+        }
+        assert_eq!(
+            responses_previous_id(&json!({"previous_response_id": "resp_unknown"})).unwrap(),
+            Some("resp_unknown".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn live_catalog_selection_is_exact_and_site_scoped() {
         let global = runtime(QoderSite::Global).await;
-        let prepared = prepare_generation(&global, &canonical("glm-5.3"), 1_700_000_000_000, None)
-            .expect("Global alias is entitled");
+        let prepared = prepare_generation(
+            &global,
+            &canonical("glm-5.3"),
+            1_700_000_000_000,
+            None,
+            None,
+        )
+        .expect("Global alias is entitled");
         assert_eq!(prepared.model_key, "gmodel");
         assert_eq!(prepared.model_source, "system");
         assert_eq!(prepared.payload.model_key, "gmodel");
 
         let cn = runtime(QoderSite::Cn).await;
-        let missing = prepare_generation(&cn, &canonical("qwen3.7-max"), 1_700_000_000_000, None)
-            .unwrap_err();
+        let missing = prepare_generation(
+            &cn,
+            &canonical("qwen3.7-max"),
+            1_700_000_000_000,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(missing.status, StatusCode::FORBIDDEN);
         assert!(missing.message.contains("qmodel_latest"));
     }
@@ -438,13 +533,103 @@ mod tests {
             &canonical("glm-5.3"),
             1_700_000_000_000,
             None,
+            None,
         )
         .unwrap();
         let mut second_request = canonical("glm-5.3");
         second_request.share_id = "share-qoder-decoy".to_string();
-        let second =
-            prepare_generation(&prepared_runtime, &second_request, 1_700_000_000_000, None)
-                .unwrap();
+        let second = prepare_generation(
+            &prepared_runtime,
+            &second_request,
+            1_700_000_000_000,
+            None,
+            None,
+        )
+        .unwrap();
         assert_ne!(first.payload.session_id, second.payload.session_id);
+    }
+
+    #[tokio::test]
+    async fn responses_continuation_inherits_omitted_context_and_rejects_explicit_drift() {
+        let prepared_runtime = runtime(QoderSite::Global).await;
+        let mut first = canonical("glm-5.3");
+        first.body = json!({
+            "model": "glm-5.3",
+            "messages": [
+                {"role": "system", "content": "stable instructions"},
+                {"role": "user", "content": "look up one"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+        });
+        let first_prepared =
+            prepare_generation(&prepared_runtime, &first, 1_700_000_000_000, None, None).unwrap();
+        let previous = runtime::QoderResponseContinuation {
+            session_id: first_prepared.payload.session_id.clone(),
+            downstream_model: "glm-5.3".to_string(),
+            system_fingerprint: first_prepared.continuation_input.system_fingerprint,
+            tools_fingerprint: first_prepared.continuation_input.tools_fingerprint,
+            tool_names: first_prepared.continuation_input.tool_names.clone(),
+            pending_tool_calls: vec![json!({
+                "id": "call_lookup",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"key\":\"one\"}"}
+            })],
+        };
+        let mut next = canonical("glm-5.3");
+        next.body = json!({
+            "model": "glm-5.3",
+            "messages": [{"role": "tool", "tool_call_id": "call_lookup", "content": "result-one"}]
+        });
+        let continued = prepare_generation(
+            &prepared_runtime,
+            &next,
+            1_700_000_000_001,
+            None,
+            Some(&previous),
+        )
+        .unwrap();
+        assert_eq!(continued.payload.session_id, previous.session_id);
+        assert_eq!(continued.payload.body["messages"][0]["role"], "tool");
+        assert_eq!(continued.payload.body["messages"][0]["name"], "lookup");
+        assert_eq!(continued.payload.body["tools"], json!([]));
+        assert_eq!(
+            continued.continuation_input.system_fingerprint,
+            previous.system_fingerprint
+        );
+        assert_eq!(continued.continuation_input.tool_names, previous.tool_names);
+
+        let mut changed_system = next.clone();
+        changed_system.body["messages"] = json!([
+            {"role": "system", "content": "different instructions"},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "result-one"}
+        ]);
+        assert_eq!(
+            prepare_generation(
+                &prepared_runtime,
+                &changed_system,
+                1_700_000_000_001,
+                None,
+                Some(&previous),
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::CONFLICT
+        );
+        let mut changed_tools = next;
+        changed_tools.body["tools"] = json!([
+            {"type": "function", "function": {"name": "delete", "parameters": {"type": "object"}}}
+        ]);
+        assert_eq!(
+            prepare_generation(
+                &prepared_runtime,
+                &changed_tools,
+                1_700_000_000_001,
+                None,
+                Some(&previous),
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::CONFLICT
+        );
     }
 }

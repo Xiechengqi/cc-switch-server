@@ -64,18 +64,28 @@ impl EventStreamDecoder {
         if let Some(error) = self.failed.clone() {
             return Err(error);
         }
-        let size = self.buffer.len().saturating_add(bytes.len());
-        if size > self.max_buffer_length {
-            return self.fail(WireError::BufferOverflow {
-                size,
-                max: self.max_buffer_length,
-            });
+        let mut frames = self.drain()?;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let room = self.max_buffer_length.saturating_sub(self.buffer.len());
+            if room == 0 {
+                return self.fail(WireError::BufferOverflow {
+                    size: self.buffer.len().saturating_add(remaining.len()),
+                    max: self.max_buffer_length,
+                });
+            }
+            let take = remaining.len().min(room);
+            self.buffer.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            frames.extend(self.drain()?);
         }
-        self.buffer.extend_from_slice(bytes);
-        self.drain()
+        Ok(frames)
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<Frame>, WireError> {
+        if let Some(error) = self.failed.clone() {
+            return Err(error);
+        }
         let frames = self.drain()?;
         if self.buffer.is_empty() {
             Ok(frames)
@@ -123,5 +133,55 @@ impl EventStreamDecoder {
     fn fail<T>(&mut self, error: WireError) -> Result<T, WireError> {
         self.failed = Some(error.clone());
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::frame::crc32;
+    use super::*;
+
+    fn empty_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&16_u32.to_be_bytes());
+        frame.extend_from_slice(&0_u32.to_be_bytes());
+        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+        frame.extend_from_slice(&crc32(&frame).to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn multiple_valid_frames_in_one_chunk_do_not_exhaust_pending_buffer() {
+        let frame = empty_frame();
+        for prefix_len in [0, 8, frame.len() - 1] {
+            let mut decoder = EventStreamDecoder::strict();
+            decoder.max_buffer_length = frame.len() * 2;
+            decoder.max_frame_length = frame.len();
+            assert!(decoder.feed(&frame[..prefix_len]).unwrap().is_empty());
+
+            let mut chunk = frame[prefix_len..].to_vec();
+            chunk.extend_from_slice(&frame);
+            chunk.extend_from_slice(&frame);
+            assert_eq!(
+                decoder.feed(&chunk).unwrap().len(),
+                3,
+                "prefix={prefix_len}"
+            );
+            assert!(decoder.finish().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn finish_preserves_a_prior_buffer_limit_failure() {
+        let mut decoder = EventStreamDecoder::strict();
+        decoder.max_buffer_length = 4;
+        assert!(matches!(
+            decoder.feed(b"12345"),
+            Err(WireError::BufferOverflow { .. })
+        ));
+        assert!(matches!(
+            decoder.finish(),
+            Err(WireError::BufferOverflow { .. })
+        ));
     }
 }

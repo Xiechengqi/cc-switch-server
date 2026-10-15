@@ -298,7 +298,17 @@ pub(crate) async fn prepare_bound_request(
         .session_id
         .as_deref()
         .expect("Kiro request session identity is always resolved");
-    let cache_runtime_region = driver::KiroAccountData::from_account(&account)?.api_region;
+    let account_data = driver::KiroAccountData::from_account(&account)?;
+    let cache_request_identity = driver::prompt_cache_request_identity(&account, &account_data)?;
+    let cache_owner_id = accounts
+        .kiro_prompt_cache_owner_id(&account.id)
+        .ok_or_else(|| {
+            ProxyError::conflict(format!(
+                "{} prompt-cache account owner is unavailable",
+                product.label
+            ))
+        })?;
+    let cache_runtime_region = account_data.api_region;
     let cache_route = format!("{route:?}");
     let cache_namespace = super::super::kiro_prompt_cache::PromptCacheScope {
         app: stored.app.as_str(),
@@ -306,8 +316,10 @@ pub(crate) async fn prepare_bound_request(
         provider_revision: execution.plan.provider_revision,
         runtime_fingerprint: &execution.plan.runtime_fingerprint,
         account_id: &account.id,
+        account_owner_id: cache_owner_id,
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        request_identity: &cache_request_identity,
         share_id: request_context.share_id.as_deref().unwrap_or("direct"),
         signed_user: request_context.user_email.as_deref().unwrap_or("anonymous"),
         route: &cache_route,

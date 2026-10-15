@@ -6,6 +6,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+let failureReported = false;
+
+function reportFailure() {
+  if (!failureReported) {
+    failureReported = true;
+    console.error("[FAIL] CodeBuddy acceptance failed (details redacted)");
+  }
+  process.exitCode = 1;
+}
+
+process.on("uncaughtException", reportFailure);
+process.on("unhandledRejection", reportFailure);
+
 // This validator consumes one site-scoped private CodeBuddy receipt. The
 // destructive login/rotation/12153/empty-catalog/401 checks are performed by a
 // private harness; this file validates their receipt against the live Server
@@ -21,7 +34,10 @@ const contract = JSON.parse(
 );
 const HARNESS_REVISION = 2;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
-const CATALOG_MAX_AGE_MS = 2 * 60 * 60 * 1_000;
+// Match src/proxy/codebuddy_runtime.rs::CODEBUDDY_MODEL_CATALOG_TTL_MS.
+const CATALOG_MAX_AGE_MS = 8 * 60 * 1_000;
+const CATALOG_FUTURE_SKEW_MS = 60_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const siteSpecs = Object.freeze({
   intl: Object.freeze({
     accountEnv: "CODEBUDDY_INTL_TEST_ACCOUNT",
@@ -219,11 +235,106 @@ if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("CodeBuddy receipt file must stay outside the repository");
 }
 const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.nlink !== 1) {
+  fail("CodeBuddy receipt file must have one filesystem link");
+}
 if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
   fail("CodeBuddy receipt file size is invalid");
 }
 if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("CodeBuddy receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("CodeBuddy receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("CodeBuddy receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("CodeBuddy receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("CodeBuddy receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("CodeBuddy receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("CodeBuddy receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("CodeBuddy receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("CodeBuddy receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("CodeBuddy receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -259,10 +370,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -282,6 +414,18 @@ async function requestJson(base, requestPath, headers, label) {
 function exactOne(values, label) {
   if (values.length !== 1) fail(`${label} is not unique`);
   return values[0];
+}
+
+function freshCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs > now - CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + CATALOG_FUTURE_SKEW_MS;
+}
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + 5 * 60_000;
 }
 
 async function validateAccount() {
@@ -304,6 +448,9 @@ async function validateAccount() {
     ),
     "CodeBuddy Account selector",
   );
+  if (account.codebuddyCredentialScope?.site !== site) {
+    fail("CodeBuddy Account profile site does not match the selected site");
+  }
   if (
     !Number.isSafeInteger(account.authIdentityGeneration) ||
     account.authIdentityGeneration < 1 ||
@@ -311,8 +458,8 @@ async function validateAccount() {
     account.tokenRefreshGeneration < 1 ||
     account.hasAccessToken !== true ||
     account.hasRefreshToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true ||
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false ||
     account.hasProfile !== true ||
     account.hasRaw !== true
   ) {
@@ -337,9 +484,16 @@ function validateProvider(view, app, providerId, account) {
   ) {
     fail(`CodeBuddy ${app} Provider is not fixed to the selected Account generation`);
   }
-  const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-  const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
-  if (!Number.isSafeInteger(providerRevision) || providerRevision < 0 || !runtimeFingerprint) {
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
+  if (
+    !Number.isSafeInteger(providerRevision) ||
+    providerRevision < 0 ||
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim()
+  ) {
     fail(`CodeBuddy ${app} Provider runtime scope is incomplete`);
   }
   return { providerRevision, runtimeFingerprint };
@@ -379,26 +533,29 @@ async function validateBindings(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "CodeBuddy Share",
   );
-  if (share.enabled === false || (share.status && share.status !== "active")) {
+  if (share.enabled !== true || share.status !== "active") {
     fail("selected CodeBuddy Share is not active");
   }
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
+  if (
+    primaryBindings.length !== 1 ||
+    primaryBindings[0]?.providerId !== share.providerId ||
+    primaryBindings[0]?.providerType !== share.providerType
+  ) {
+    fail("CodeBuddy Share primary fields do not match its one App binding");
+  }
   for (const [app, providerId] of Object.entries(providerIds)) {
+    const appBindings = bindings.filter((binding) => binding?.app === app);
     if (
-      !bindings.some(
-        (binding) =>
-          binding?.app === app &&
-          binding?.providerId === providerId &&
-          binding?.providerType === "codebuddy_oauth",
-      )
+      appBindings.length !== 1 ||
+      appBindings[0]?.providerId !== providerId ||
+      appBindings[0]?.providerType !== "codebuddy_oauth"
     ) {
-      fail(`CodeBuddy Share is not fixed to the selected ${app} Provider`);
+      fail(`CodeBuddy Share does not have one exact ${app} Provider binding`);
     }
   }
-  const shareRevision = share.configRevision ?? 0;
+  const shareRevision = share.configRevision;
   if (!Number.isSafeInteger(shareRevision) || shareRevision < 0) {
     fail("CodeBuddy Share revision scope is incomplete");
   }
@@ -406,7 +563,12 @@ async function validateBindings(account) {
 }
 
 async function validateCatalog(app, providerId) {
-  const query = new URLSearchParams({ app, providerId });
+  const query = new URLSearchParams({
+    app,
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
@@ -418,11 +580,16 @@ async function validateCatalog(app, providerId) {
     !Array.isArray(catalog?.data) ||
     catalog.source !== "codebuddy_live_model_catalog" ||
     catalog.stale !== false ||
-    !Number.isSafeInteger(catalog.fetchedAtMs) ||
-    catalog.fetchedAtMs < now - CATALOG_MAX_AGE_MS ||
-    catalog.fetchedAtMs > now + 5 * 60_000
+    !freshCatalogTimestamp(catalog.fetchedAtMs, now)
   ) {
     fail(`CodeBuddy ${app} model catalog is not one fresh bound-account snapshot`);
+  }
+  const modelIds = catalog.data.map((entry) => entry?.id);
+  if (
+    modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+    new Set(modelIds).size !== modelIds.length
+  ) {
+    fail(`CodeBuddy ${app} model catalog has incomplete or duplicate model IDs`);
   }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail(`CodeBuddy ${app} model catalog did not preserve the exact selected model`);
@@ -431,7 +598,10 @@ async function validateCatalog(app, providerId) {
     source: catalog.source,
     fetchedAtMs: catalog.fetchedAtMs,
     stale: false,
-    digest: digest(`cc-switch-server:codebuddy-${app}-catalog:v2`, catalog.data),
+    digest: digest(
+      `cc-switch-server:codebuddy-${app}-catalog:v2`,
+      [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
   };
 }
 
@@ -573,12 +743,7 @@ function validateReceipt(receipt, context) {
     fail("CodeBuddy receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("CodeBuddy receipt timestamp is outside the acceptance window");
   }
   if (!sameCanonical(receipt.catalogs, context.catalogs)) {
@@ -653,9 +818,11 @@ function validateReceipt(receipt, context) {
   if (receipt.scopeDigest !== scopeDigest || !/^[a-f0-9]{64}$/.test(receipt.scopeDigest)) {
     fail("CodeBuddy receipt scope digest does not match the selected bindings and bodies");
   }
+  return recordedAt;
 }
 
 async function main() {
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBindings(account);
@@ -670,11 +837,40 @@ async function main() {
   const generations = expectedGenerations(account, binding);
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("CodeBuddy receipt file is not valid JSON");
   }
-  validateReceipt(receipt, { targetCommit, catalogs, generations });
+  const recordedAt = validateReceipt(receipt, { targetCommit, catalogs, generations });
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBindings(finalAccount);
+  if (!sameCanonical(expectedGenerations(finalAccount, finalBinding), generations)) {
+    fail("CodeBuddy Account, Provider, or Share scope drifted during acceptance");
+  }
+  const finalCatalogs = Object.fromEntries(
+    await Promise.all(
+      Object.entries(providerIds).map(async ([app, providerId]) => [
+        app,
+        await validateCatalog(app, providerId),
+      ]),
+    ),
+  );
+  for (const app of Object.keys(catalogs)) {
+    if (finalCatalogs[app].digest !== catalogs[app].digest) {
+      fail(`CodeBuddy ${app} model catalog changed during acceptance`);
+    }
+  }
+  const acceptanceNow = Date.now();
+  if (
+    [...Object.values(catalogs), ...Object.values(finalCatalogs)]
+      .some((catalog) => !freshCatalogTimestamp(catalog.fetchedAtMs, acceptanceNow))
+  ) {
+    fail("CodeBuddy model catalog expired during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("CodeBuddy receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(
@@ -682,7 +878,4 @@ async function main() {
   );
 }
 
-main().catch(() => {
-  console.error("[FAIL] CodeBuddy acceptance failed (details redacted)");
-  process.exitCode = 1;
-});
+main().catch(reportFailure);

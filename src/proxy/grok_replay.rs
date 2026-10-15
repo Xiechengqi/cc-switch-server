@@ -11,6 +11,7 @@ use super::request_memory::{
     retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
     RequestMemoryReservation,
 };
+use super::response_semantics::{self, SemanticObservation};
 use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
 
 const MAX_ENTRIES: usize = 2_048;
@@ -46,6 +47,8 @@ impl GrokReplayScope {
         account_id: &str,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
+        request_identity_fingerprint: [u8; 32],
         share_id: &str,
         user_namespace: &str,
         session_id: &str,
@@ -70,7 +73,7 @@ impl GrokReplayScope {
             return None;
         }
         let mut hasher = Sha256::new();
-        hasher.update(b"cc-switch-server:grok-reasoning-replay:v1\0");
+        hasher.update(b"cc-switch-server:grok-reasoning-replay:v2\0");
         for value in [
             app,
             provider_id,
@@ -90,6 +93,8 @@ impl GrokReplayScope {
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value.as_bytes());
         }
+        hasher.update(account_incarnation.to_be_bytes());
+        hasher.update(request_identity_fingerprint);
         Some(Self(hex::encode(hasher.finalize())))
     }
 }
@@ -402,7 +407,7 @@ pub(crate) fn apply(body: &[u8], proof: &GrokReplayProof) -> ApplyResult {
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
             continue;
         }
-        let Some(call_id) = bounded_text(item.get("call_id"), 256) else {
+        let Some(call_id) = bounded_call_id(item.get("call_id"), 256) else {
             return unchanged(body, true);
         };
         let Some(fingerprint) = call_fingerprint(item) else {
@@ -467,7 +472,7 @@ fn unchanged(body: &[u8], context_mismatch: bool) -> ApplyResult {
 }
 
 fn call_fingerprint(item: &Value) -> Option<String> {
-    let name = bounded_text(item.get("name"), 256)?;
+    let name = bounded_raw_text(item.get("name"), 256)?;
     let arguments = item.get("arguments").unwrap_or(&Value::Null);
     let canonical = canonical_value(arguments);
     let mut hasher = Sha256::new();
@@ -496,6 +501,16 @@ fn bounded_text(value: Option<&Value>, max: usize) -> Option<&str> {
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= max)
+}
+
+fn bounded_raw_text(value: Option<&Value>, max: usize) -> Option<&str> {
+    value?
+        .as_str()
+        .filter(|value| !value.trim().is_empty() && value.len() <= max)
+}
+
+fn bounded_call_id(value: Option<&Value>, max: usize) -> Option<&str> {
+    bounded_raw_text(value, max).filter(|value| value.trim() == *value)
 }
 
 fn sanitize_reasoning(item: &Value) -> Option<Value> {
@@ -534,7 +549,7 @@ fn capture_output(output: &[Value]) -> Option<GrokReplayProof> {
             Some("reasoning") => current = sanitize_reasoning(item),
             Some("function_call") => {
                 let reasoning = current.clone()?;
-                let call_id = bounded_text(item.get("call_id"), 256)?.to_string();
+                let call_id = bounded_call_id(item.get("call_id"), 256)?.to_string();
                 let fingerprint = call_fingerprint(item)?;
                 if calls
                     .insert(
@@ -601,6 +616,7 @@ pub(crate) struct GrokReplayStreamAccumulator {
     decoder: ResponsesTransportDecoder,
     output: Vec<Value>,
     terminal: Option<Value>,
+    done_seen: bool,
     bytes: usize,
     invalid: bool,
 }
@@ -611,6 +627,7 @@ impl Default for GrokReplayStreamAccumulator {
             decoder: ResponsesTransportDecoder::new(MAX_ITEM_BYTES, MAX_STREAM_BYTES),
             output: Vec::new(),
             terminal: None,
+            done_seen: false,
             bytes: 0,
             invalid: false,
         }
@@ -679,10 +696,54 @@ impl GrokReplayStreamAccumulator {
 
     fn observe(&mut self, items: Vec<ResponsesTransportItem>) {
         for item in items {
-            let ResponsesTransportItem::Json { value, .. } = item else {
-                continue;
+            let (declared_event, value) = match item {
+                ResponsesTransportItem::Liveness(_) => continue,
+                ResponsesTransportItem::Done => {
+                    if self.terminal.is_none() || self.done_seen {
+                        self.invalid = true;
+                        self.clear();
+                        return;
+                    }
+                    self.done_seen = true;
+                    continue;
+                }
+                ResponsesTransportItem::Json {
+                    declared_event,
+                    value,
+                } => (declared_event, value),
             };
-            match value.get("type").and_then(Value::as_str) {
+            // Replay proof is retained across requests, so its terminal
+            // boundary must be stricter than a best-effort output observer.
+            // A second JSON event after completion cannot add a trusted item.
+            if self.terminal.is_some() || self.done_seen {
+                self.invalid = true;
+                self.clear();
+                return;
+            }
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .or(declared_event.as_deref());
+            if matches!(
+                event_type,
+                Some(
+                    "response.failed"
+                        | "response.incomplete"
+                        | "response.cancelled"
+                        | "response.canceled"
+                        | "error"
+                )
+            ) || matches!(
+                response_semantics::classify_value(&value),
+                SemanticObservation::Failure(_)
+                    | SemanticObservation::IncompleteTerminal
+                    | SemanticObservation::ErrorFrame(_)
+            ) {
+                self.invalid = true;
+                self.clear();
+                return;
+            }
+            match event_type {
                 Some("response.output_item.done") => {
                     let Some(item) = value.get("item").filter(|item| item.is_object()) else {
                         self.invalid = true;
@@ -703,11 +764,6 @@ impl GrokReplayStreamAccumulator {
                         return;
                     }
                 }
-                Some("response.failed" | "response.incomplete") => {
-                    self.invalid = true;
-                    self.clear();
-                    return;
-                }
                 _ => {}
             }
         }
@@ -717,6 +773,7 @@ impl GrokReplayStreamAccumulator {
         self.decoder = ResponsesTransportDecoder::new(MAX_ITEM_BYTES, MAX_STREAM_BYTES);
         self.output = Vec::new();
         self.terminal = None;
+        self.done_seen = false;
         self.bytes = 0;
     }
 }
@@ -775,6 +832,50 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_whitespace_edits_to_call_name_and_id() {
+        for input in [
+            json!([{"type":"function_call","call_id":"call_1","name":" lookup ","arguments":"{\"x\":1}"}]),
+            json!([{"type":"function_call","call_id":" call_1 ","name":"lookup","arguments":"{\"x\":1}"}]),
+        ] {
+            let body = serde_json::to_vec(&json!({"input":input})).unwrap();
+            let result = apply(&body, &proof());
+            assert!(
+                !result.applied,
+                "edited identity must not reuse proof: {input}"
+            );
+            assert!(result.context_mismatch, "{input}");
+            assert_eq!(result.body.as_ref(), body);
+        }
+
+        let upstream_padded_id = json!({"status":"completed","output":[
+            {"type":"reasoning","encrypted_content":"opaque-reasoning-proof-1234567890"},
+            {"type":"function_call","call_id":" call_1 ","name":"lookup","arguments":"{\"x\":1}"}
+        ]});
+        assert!(capture_document(upstream_padded_id.to_string().as_bytes()).is_none());
+
+        let upstream_padded_name = json!({"status":"completed","output":[
+            {"type":"reasoning","encrypted_content":"opaque-reasoning-proof-1234567890"},
+            {"type":"function_call","call_id":"call_1","name":" lookup ","arguments":"{\"x\":1}"}
+        ]});
+        let padded_proof = capture_document(upstream_padded_name.to_string().as_bytes()).unwrap();
+        let edited = json!({"input":[
+            {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"x\":1}"}
+        ]});
+        let edited_body = edited.to_string();
+        let result = apply(edited_body.as_bytes(), &padded_proof);
+        assert!(!result.applied);
+        assert!(result.context_mismatch);
+        assert_eq!(result.body.as_ref(), edited_body.as_bytes());
+
+        let exact = json!({"input":[
+            {"type":"function_call","call_id":"call_1","name":" lookup ","arguments":"{\"x\":1}"}
+        ]});
+        let result = apply(exact.to_string().as_bytes(), &padded_proof);
+        assert!(result.applied);
+        assert!(!result.context_mismatch);
+    }
+
+    #[test]
     fn recovery_classifier_accepts_only_frozen_reasoning_rejections() {
         for body in [
             json!({"error":{"code":"missing_reasoning","message":"reasoning item is missing"}}),
@@ -827,6 +928,69 @@ mod tests {
             websocket.push(&serde_json::to_vec(&value).unwrap());
         }
         assert!(websocket.finish().is_some());
+    }
+
+    #[test]
+    fn stream_capture_rejects_events_after_completion() {
+        let prefix = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-reasoning-proof-1234567890\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        for trailing in [
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"late-proof-1234567890\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"late\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+        ] {
+            let mut accumulator = GrokReplayStreamAccumulator::default();
+            accumulator.push(prefix.as_bytes());
+            accumulator.push(trailing.as_bytes());
+            assert!(accumulator.finish().is_none(), "{trailing}");
+        }
+    }
+
+    #[test]
+    fn stream_capture_rejects_error_before_completion() {
+        let prefix = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-reasoning-proof-1234567890\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n"
+        );
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        for failing in [
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"early\"}}\n\n",
+            "event: error\ndata: {\"error\":{\"message\":\"early\"}}\n\n",
+            "data: {\"type\":\"response.cancelled\",\"response\":{\"status\":\"cancelled\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+        ] {
+            let mut accumulator = GrokReplayStreamAccumulator::default();
+            accumulator.push(prefix.as_bytes());
+            accumulator.push(failing.as_bytes());
+            accumulator.push(completed.as_bytes());
+            assert!(accumulator.finish().is_none(), "{failing}");
+        }
+    }
+
+    #[test]
+    fn stream_capture_requires_terminal_before_unique_done_sentinel() {
+        let completed = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-reasoning-proof-1234567890\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        let mut accepted = GrokReplayStreamAccumulator::default();
+        accepted.push(completed.as_bytes());
+        accepted.push(b"data: [DONE]\n\n");
+        assert!(accepted.finish().is_some());
+
+        let mut duplicate = GrokReplayStreamAccumulator::default();
+        duplicate.push(completed.as_bytes());
+        duplicate.push(b"data: [DONE]\n\ndata: [DONE]\n\n");
+        assert!(duplicate.finish().is_none());
+
+        let mut early = GrokReplayStreamAccumulator::default();
+        early.push(b"data: [DONE]\n\n");
+        early.push(completed.as_bytes());
+        assert!(early.finish().is_none());
     }
 
     #[test]
@@ -919,27 +1083,34 @@ mod tests {
             "http",
             "api.x.ai",
         ];
-        let derive =
-            |values: [&str; 10], provider_revision, auth_generation, token_generation, turn| {
-                GrokReplayScope::derive(
-                    values[0],
-                    values[1],
-                    provider_revision,
-                    values[2],
-                    values[3],
-                    auth_generation,
-                    token_generation,
-                    values[4],
-                    values[5],
-                    values[6],
-                    turn,
-                    values[7],
-                    values[8],
-                    values[9],
-                )
-                .unwrap()
-            };
-        let expected = derive(base, 7, 11, 13, 17);
+        let derive = |values: [&str; 10],
+                      provider_revision,
+                      auth_generation,
+                      token_generation,
+                      incarnation,
+                      fingerprint,
+                      turn| {
+            GrokReplayScope::derive(
+                values[0],
+                values[1],
+                provider_revision,
+                values[2],
+                values[3],
+                auth_generation,
+                token_generation,
+                incarnation,
+                fingerprint,
+                values[4],
+                values[5],
+                values[6],
+                turn,
+                values[7],
+                values[8],
+                values[9],
+            )
+            .unwrap()
+        };
+        let expected = derive(base, 7, 11, 13, 19, [1; 32], 17);
         for index in 0..base.len() {
             let mut changed = base;
             changed[index] = match index {
@@ -954,13 +1125,15 @@ mod tests {
                 8 => "websocket",
                 _ => "cli-chat-proxy.grok.com",
             };
-            assert_ne!(derive(changed, 7, 11, 13, 17), expected);
+            assert_ne!(derive(changed, 7, 11, 13, 19, [1; 32], 17), expected);
         }
         for changed in [
-            derive(base, 8, 11, 13, 17),
-            derive(base, 7, 12, 13, 17),
-            derive(base, 7, 11, 14, 17),
-            derive(base, 7, 11, 13, 18),
+            derive(base, 8, 11, 13, 19, [1; 32], 17),
+            derive(base, 7, 12, 13, 19, [1; 32], 17),
+            derive(base, 7, 11, 14, 19, [1; 32], 17),
+            derive(base, 7, 11, 13, 20, [1; 32], 17),
+            derive(base, 7, 11, 13, 19, [2; 32], 17),
+            derive(base, 7, 11, 13, 19, [1; 32], 18),
         ] {
             assert_ne!(changed, expected);
         }

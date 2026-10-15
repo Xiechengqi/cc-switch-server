@@ -29,7 +29,11 @@ pub(crate) fn normalize_anthropic_cache_control(body: &mut Value, inject_default
     if inject_defaults {
         inject_default_breakpoints(body);
     }
-    enforce_cache_control_limit(body, MAX_CACHE_BREAKPOINTS);
+    let reserved_for_thread = body.get("thread").is_some_and(|thread| !thread.is_null());
+    enforce_cache_control_limit(
+        body,
+        MAX_CACHE_BREAKPOINTS - usize::from(reserved_for_thread),
+    );
     normalize_cache_control_ttls(body);
 }
 
@@ -74,7 +78,12 @@ fn inject_default_breakpoints(body: &mut Value) {
         .is_some_and(|system| !system.is_empty());
     if !has_system && !paths.iter().any(|path| matches!(path, CachePath::Tool(_))) {
         if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-            if let Some(tool) = tools.last_mut().and_then(Value::as_object_mut) {
+            if let Some(tool) = tools
+                .iter_mut()
+                .rev()
+                .find(|tool| !tool_is_deferred(tool))
+                .and_then(Value::as_object_mut)
+            {
                 tool.insert("cache_control".to_string(), ephemeral_cache_control());
             }
         }
@@ -105,7 +114,7 @@ fn inject_default_breakpoints(body: &mut Value) {
                 .rev()
                 .find_map(|block| block.as_object_mut())
             {
-                if !block.contains_key("cache_control") {
+                if !block.get("cache_control").is_some_and(valid_cache_control) {
                     block.insert("cache_control".to_string(), ephemeral_cache_control());
                 }
                 return;
@@ -114,8 +123,20 @@ fn inject_default_breakpoints(body: &mut Value) {
     }
 }
 
+fn tool_is_deferred(tool: &Value) -> bool {
+    tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+        || tool
+            .pointer("/custom/defer_loading")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
 fn ephemeral_cache_control() -> Value {
     json!({"type": "ephemeral"})
+}
+
+fn valid_cache_control(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("ephemeral")
 }
 
 fn normalize_cache_control_ttls(body: &mut Value) {
@@ -204,14 +225,14 @@ fn collect_cache_paths(body: &Value) -> Vec<CachePath> {
     let mut paths = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for (index, tool) in tools.iter().enumerate() {
-            if tool.get("cache_control").is_some() {
+            if tool.get("cache_control").is_some_and(valid_cache_control) {
                 paths.push(CachePath::Tool(index));
             }
         }
     }
     if let Some(system) = body.get("system").and_then(Value::as_array) {
         for (index, block) in system.iter().enumerate() {
-            if block.get("cache_control").is_some() {
+            if block.get("cache_control").is_some_and(valid_cache_control) {
                 paths.push(CachePath::System(index));
             }
         }
@@ -220,7 +241,7 @@ fn collect_cache_paths(body: &Value) -> Vec<CachePath> {
         for (message_index, message) in messages.iter().enumerate() {
             if let Some(blocks) = message.get("content").and_then(Value::as_array) {
                 for (block_index, block) in blocks.iter().enumerate() {
-                    if block.get("cache_control").is_some() {
+                    if block.get("cache_control").is_some_and(valid_cache_control) {
                         paths.push(CachePath::Message(message_index, block_index));
                     }
                 }
@@ -308,6 +329,69 @@ mod tests {
     }
 
     #[test]
+    fn invalid_cache_controls_do_not_displace_real_breakpoints_or_ttls() {
+        let mut body = json!({
+            "system": [
+                {"type":"text","text":"ignored","cache_control":null},
+                {"type":"text","text":"long","cache_control":{"type":"ephemeral","ttl":"1h"}}
+            ],
+            "tools": [
+                {"name":"invalid","cache_control":{"type":"other"}},
+                {"name":"real","cache_control":{"type":"ephemeral","ttl":"1h"}}
+            ],
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"a","cache_control":{"type":"ephemeral"}},
+                {"type":"text","text":"b","cache_control":null},
+                {"type":"text","text":"c","cache_control":false},
+                {"type":"text","text":"d","cache_control":{"type":"ephemeral"}}
+            ]}]
+        });
+        normalize_anthropic_cache_control(&mut body, false);
+        assert_eq!(count(&body), 4);
+        assert_eq!(
+            body.pointer("/system/1/cache_control/ttl"),
+            Some(&json!("1h"))
+        );
+        assert_eq!(
+            body.pointer("/tools/1/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+        assert_eq!(
+            body.pointer("/messages/0/content/0/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+        assert_eq!(
+            body.pointer("/messages/0/content/3/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+    }
+
+    #[test]
+    fn invalid_cache_controls_do_not_block_default_injection() {
+        for (mut body, expected) in [
+            (
+                json!({"system":[{"type":"text","text":"sys","cache_control":null}],"messages":[{"role":"user","content":"ask"}]}),
+                "/system/0/cache_control/type",
+            ),
+            (
+                json!({"tools":[{"name":"lookup","cache_control":{"type":"other"}}],"messages":[{"role":"user","content":"ask"}]}),
+                "/tools/0/cache_control/type",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[{"type":"text","text":"ask","cache_control":null}]}]}),
+                "/messages/0/content/0/cache_control/type",
+            ),
+        ] {
+            normalize_anthropic_cache_control(&mut body, true);
+            assert_eq!(
+                body.pointer(expected),
+                Some(&json!("ephemeral")),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
     fn preserves_high_value_breakpoints_and_caps_at_four() {
         let mut body = json!({
             "tools": [
@@ -327,6 +411,26 @@ mod tests {
         assert_eq!(count(&body), 4);
         assert!(body.pointer("/tools/1/cache_control").is_some());
         assert!(body.pointer("/system/1/cache_control").is_some());
+        assert!(body
+            .pointer("/messages/1/content/0/cache_control")
+            .is_some());
+    }
+
+    #[test]
+    fn thread_continuation_reserves_one_of_four_cache_breakpoints() {
+        let mut body = json!({
+            "thread":{"type":"continue","previous_message_id":"msg_one"},
+            "tools":[{"name":"lookup","cache_control":{"type":"ephemeral"}}],
+            "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"old","cache_control":{"type":"ephemeral"}}]},
+                {"role":"user","content":[{"type":"text","text":"new","cache_control":{"type":"ephemeral"}}]}
+            ]
+        });
+        normalize_anthropic_cache_control(&mut body, false);
+        assert_eq!(count(&body), 3);
+        assert!(body.pointer("/tools/0/cache_control").is_some());
+        assert!(body.pointer("/system/0/cache_control").is_some());
         assert!(body
             .pointer("/messages/1/content/0/cache_control")
             .is_some());
@@ -361,6 +465,45 @@ mod tests {
         assert!(body.pointer("/system/0/cache_control").is_some());
         assert!(body
             .pointer("/messages/2/content/0/cache_control")
+            .is_some());
+    }
+
+    #[test]
+    fn default_tool_breakpoint_skips_trailing_deferred_tools() {
+        let mut body = json!({
+            "tools": [
+                {"name":"immediate","input_schema":{"type":"object"}},
+                {"name":"later","defer_loading":true,"input_schema":{"type":"object"}},
+                {"name":"custom_later","custom":{"defer_loading":true},"input_schema":{"type":"object"}}
+            ],
+            "messages": [{"role":"user","content":"find a tool"}]
+        });
+        normalize_anthropic_cache_control(&mut body, true);
+        assert_eq!(
+            body.pointer("/tools/0/cache_control/type"),
+            Some(&json!("ephemeral"))
+        );
+        assert!(body.pointer("/tools/1/cache_control").is_none());
+        assert!(body.pointer("/tools/2/cache_control").is_none());
+    }
+
+    #[test]
+    fn all_deferred_tools_get_no_default_tool_breakpoint() {
+        let mut body = json!({
+            "tools": [
+                {"name":"later","defer_loading":true},
+                {"name":"custom_later","custom":{"defer_loading":true}}
+            ],
+            "messages": [{"role":"user","content":"find a tool"}]
+        });
+        normalize_anthropic_cache_control(&mut body, true);
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+        assert!(body
+            .pointer("/messages/0/content/0/cache_control")
             .is_some());
     }
 

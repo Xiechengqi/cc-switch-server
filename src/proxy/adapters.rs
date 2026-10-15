@@ -1112,11 +1112,17 @@ fn transform_body_for_upstream(
     let Some(upstream_format) = upstream_format_for_route(stored, route, &body) else {
         return Ok(body);
     };
-    let input = serde_json::from_slice::<Value>(&body).map_err(|error| {
+    let mut input = serde_json::from_slice::<Value>(&body).map_err(|error| {
         ProxyError::bad_request(format!(
             "request body must be valid json for transform: {error}"
         ))
     })?;
+    if stored.provider_type == ProviderType::QoderCosy
+        && stored.app == AppKind::Codex
+        && route == Some(ProxyRoute::CodexResponses)
+    {
+        super::providers::qoder::responses_previous_id(&input)?;
+    }
     let antigravity = super::providers::antigravity::is_provider(stored.provider_type);
     if antigravity && stored.app != AppKind::Gemini {
         super::providers::antigravity::validate_source_tool_choice(&input)
@@ -1146,6 +1152,9 @@ fn transform_body_for_upstream(
             if input.get("messages").is_some() {
                 transforms::openai_chat_to_anthropic(&input)
             } else {
+                if stored.provider_type == ProviderType::ClaudeOAuth {
+                    super::claude_oauth::apply_responses_default_max_tokens(&mut input);
+                }
                 transforms::openai_responses_to_anthropic(&input)
             }
         }
@@ -1162,6 +1171,8 @@ fn transform_body_for_upstream(
         (AppKind::Codex, UpstreamFormat::OpenAiResponses) => {
             if input.get("input").is_some() {
                 Ok(input)
+            } else if stored.provider_type == ProviderType::CodexOAuth {
+                transforms::openai_chat_to_codex_oauth_responses(&input)
             } else {
                 transforms::openai_chat_to_responses(&input)
             }
@@ -1329,7 +1340,8 @@ fn transform_response_for_downstream(
             transforms::anthropic_response_to_gemini(&input)
         }
         (UpstreamFormat::GeminiNative, UpstreamFormat::OpenAiResponses) => {
-            transforms::gemini_response_to_anthropic(&input).and_then(|value| {
+            transforms::gemini_response_to_anthropic(&input).and_then(|mut value| {
+                transforms::add_gemini_reasoning_usage_details(&mut value, &input);
                 transforms::anthropic_response_to_openai_responses_with_tool_context(
                     &value,
                     responses_tool_context,
@@ -1337,8 +1349,10 @@ fn transform_response_for_downstream(
             })
         }
         (UpstreamFormat::GeminiNative, UpstreamFormat::OpenAiChat) => {
-            transforms::gemini_response_to_anthropic(&input)
-                .and_then(|value| transforms::anthropic_response_to_openai_chat(&value))
+            transforms::gemini_response_to_anthropic(&input).and_then(|mut value| {
+                transforms::add_gemini_reasoning_usage_details(&mut value, &input);
+                transforms::anthropic_response_to_openai_chat(&value)
+            })
         }
         (UpstreamFormat::OpenAiResponses, UpstreamFormat::GeminiNative) => {
             transforms::openai_responses_response_to_anthropic(&input)
@@ -2395,7 +2409,11 @@ fn apply_gemini_v1internal_contract(
             Value::String(if web_search { "web_search" } else { "agent" }.to_string()),
         );
     }
-    request.body = serde_json::to_vec(&Value::Object(envelope))
+    let mut envelope = Value::Object(envelope);
+    if antigravity_identity {
+        super::providers::antigravity::drop_final_gemini_thought_tail(&mut envelope);
+    }
+    request.body = serde_json::to_vec(&envelope)
         .map(Bytes::from)
         .map_err(|error| {
             ProxyError::bad_request(format!("Gemini v1internal request encode failed: {error}"))
@@ -5851,6 +5869,180 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_codex_responses_drops_trailing_signed_thought_only_turn() {
+        let reasoning =
+            crate::proxy::reasoning_bridge::responses_reasoning_item_from_anthropic_block(
+                "rs_tail",
+                &json!({"type":"thinking","thinking":"private tail","signature":"signed-tail"}),
+            )
+            .unwrap();
+        let stored = stored_provider(AppKind::Codex, ProviderType::AntigravityOAuth, json!({}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::AntigravityOAuth);
+        let mut request = adapter
+            .transform_request_for_route(
+                Bytes::from(
+                    json!({
+                        "model":"gemini-3.5-pro",
+                        "input":[{"role":"user","content":"hello"}, reasoning]
+                    })
+                    .to_string(),
+                ),
+                &stored,
+                ProxyRoute::CodexResponses,
+                None,
+            )
+            .unwrap();
+        let transformed: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(transformed["contents"][1]["role"], "model");
+        assert_eq!(transformed["contents"][1]["parts"][0]["thought"], true);
+        request.actual_model = Some("gemini-3.5-pro".to_string());
+        let accounts = AccountStore {
+            accounts: vec![serde_json::from_value(json!({
+                "id":"thought-tail-account",
+                "providerType":"antigravity_oauth",
+                "authIdentityGeneration":1,
+                "accessToken":"test-token",
+                "profile":{"projectId":"test-project"}
+            }))
+            .unwrap()],
+            ..Default::default()
+        };
+        let plan =
+            gemini_v1internal_runtime_plan(ProviderType::AntigravityOAuth, "thought-tail-account");
+        let mut endpoint = plan.endpoint.clone();
+        finalize_runtime_protocol_auth(
+            &plan,
+            &stored,
+            &accounts,
+            &mut request,
+            &mut endpoint,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            envelope["request"]["contents"],
+            json!([
+                {"role":"user","parts":[{"text":"hello"}]}
+            ])
+        );
+    }
+
+    #[test]
+    fn antigravity_raw_gemini_media_tool_result_gets_a_trailing_user_on_both_rails() {
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account_id = format!("{}-media-tool-result", provider_type.as_str());
+            let stored = stored_provider(AppKind::Gemini, provider_type, json!({}));
+            let adapter = adapter_for(AppKind::Gemini, provider_type);
+            let mut request = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        json!({"contents":[
+                            {"role":"model","parts":[{"functionCall":{"id":"call_1","name":"view_image","args":{}}}]},
+                            {"role":"model","parts":[{"functionResponse":{
+                                "id":"call_1","name":"view_image","response":{"result":""},
+                                "parts":[{"inlineData":{"mimeType":"image/png","data":"AAAA"}}]
+                            }}]}
+                        ]})
+                        .to_string(),
+                    ),
+                    &stored,
+                    ProxyRoute::Gemini,
+                    Some("models/gemini-3.5-flash:generateContent"),
+                )
+                .unwrap();
+            request.actual_model = Some("gemini-3.5-flash".to_string());
+            let accounts = AccountStore {
+                accounts: vec![serde_json::from_value(json!({
+                    "id":account_id,
+                    "providerType":provider_type.as_str(),
+                    "authIdentityGeneration":1,
+                    "accessToken":"test-token",
+                    "profile":{"projectId":"test-project"}
+                }))
+                .unwrap()],
+                ..Default::default()
+            };
+            let plan = gemini_v1internal_runtime_plan(provider_type, &account_id);
+            let mut endpoint = plan.endpoint.clone();
+            finalize_runtime_protocol_auth(
+                &plan,
+                &stored,
+                &accounts,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+            let contents = envelope
+                .pointer("/request/contents")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert_eq!(contents.len(), 3, "{provider_type:?}");
+            assert_eq!(contents[1]["role"], "model");
+            assert!(contents[1]
+                .pointer("/parts/0/functionResponse/parts/0/inlineData")
+                .is_some());
+            assert_eq!(contents[2], json!({"role":"user","parts":[{"text":""}]}));
+        }
+    }
+
+    #[test]
+    fn antigravity_nonstream_openai_usage_preserves_thought_breakdown_on_both_rails() {
+        let payload = Bytes::from(
+            json!({"response": {
+                "responseId": "gemini-usage",
+                "modelVersion": "gemini-3.5-flash",
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "ok"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 8,
+                    "candidatesTokenCount": 3,
+                    "thoughtsTokenCount": 2,
+                    "totalTokenCount": 13
+                }
+            }})
+            .to_string(),
+        );
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let stored = stored_provider(AppKind::Codex, provider_type, json!({}));
+            let adapter = adapter_for(AppKind::Codex, provider_type);
+            for (route, usage_path, detail_path) in [
+                (
+                    ProxyRoute::CodexChatCompletions,
+                    "/usage/completion_tokens",
+                    "/usage/completion_tokens_details/reasoning_tokens",
+                ),
+                (
+                    ProxyRoute::CodexResponses,
+                    "/usage/output_tokens",
+                    "/usage/output_tokens_details/reasoning_tokens",
+                ),
+            ] {
+                let response = adapter
+                    .transform_response(payload.clone(), &stored, route)
+                    .unwrap();
+                let response: Value = serde_json::from_slice(&response).unwrap();
+                assert_eq!(response.pointer(usage_path), Some(&json!(5)));
+                assert_eq!(response.pointer(detail_path), Some(&json!(2)));
+            }
+
+            let claude_stored = stored_provider(AppKind::Claude, provider_type, json!({}));
+            let claude_adapter = adapter_for(AppKind::Claude, provider_type);
+            let claude = claude_adapter
+                .transform_response(payload.clone(), &claude_stored, ProxyRoute::ClaudeMessages)
+                .unwrap();
+            let claude: Value = serde_json::from_slice(&claude).unwrap();
+            assert_eq!(claude["usage"]["output_tokens"], 5);
+            assert!(claude["usage"].get("output_tokens_details").is_none());
+        }
+    }
+
+    #[test]
     fn antigravity_unknown_tool_choice_fails_before_wire_finalization() {
         let stored = stored_provider(AppKind::Codex, ProviderType::AntigravityOAuth, json!({}));
         let adapter = adapter_for(AppKind::Codex, ProviderType::AntigravityOAuth);
@@ -5963,6 +6155,131 @@ mod tests {
             assert!(
                 error.message.contains("mode") || error.message.contains("allowedFunctionNames")
             );
+        }
+    }
+
+    #[test]
+    fn antigravity_final_wire_boundary_rejects_padded_tool_names() {
+        for mut request in [
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "tools": [{"functionDeclarations": [{"name": " lookup "}]}]
+            }),
+            json!({
+                "contents": [{"role": "model", "parts": [{"functionCall": {
+                    "id": "call_1", "name": " lookup ", "args": {}
+                }}]}],
+                "tools": [{"functionDeclarations": [{"name": "lookup"}]}]
+            }),
+        ] {
+            let error = sanitize_gemini_v1internal_request(&mut request, true)
+                .expect_err("padded tool names must be rejected before outbound Gemini wire");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn antigravity_both_rails_reject_competing_tool_field_spellings() {
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account_id = format!("{}-alias-conflict", provider_type.as_str());
+            let stored = stored_provider(AppKind::Gemini, provider_type, json!({}));
+            let adapter = adapter_for(AppKind::Gemini, provider_type);
+            let mut request = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        json!({"contents":[{"role":"model","parts":[{
+                            "functionCall":{"id":"call-a","name":"lookup","args":{}},
+                            "function_call":{"id":"call-b","name":"lookup","args":{}}
+                        }]}]})
+                        .to_string(),
+                    ),
+                    &stored,
+                    ProxyRoute::Gemini,
+                    Some("models/gemini-3.5-flash:generateContent"),
+                )
+                .unwrap();
+            request.actual_model = Some("gemini-3.5-flash".to_string());
+            let accounts = AccountStore {
+                accounts: vec![serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": provider_type.as_str(),
+                    "authIdentityGeneration": 1,
+                    "accessToken": "test-token",
+                    "profile": {"projectId": "test-project"},
+                    "quota": {"success": true, "extraUsage": {"loadCodeAssist": {
+                        "cloudaicompanionProject": {"id": "test-project"}
+                    }}}
+                }))
+                .unwrap()],
+                ..Default::default()
+            };
+            let plan = gemini_v1internal_runtime_plan(provider_type, &account_id);
+            let mut endpoint = plan.endpoint.clone();
+            let error = finalize_runtime_protocol_auth(
+                &plan,
+                &stored,
+                &accounts,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .expect_err("ambiguous tool identity must fail before upstream send");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("functionCall"));
+        }
+    }
+
+    #[test]
+    fn antigravity_both_rails_reject_competing_tool_configs_before_send() {
+        for provider_type in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account_id = format!("{}-config-alias-conflict", provider_type.as_str());
+            let stored = stored_provider(AppKind::Gemini, provider_type, json!({}));
+            let adapter = adapter_for(AppKind::Gemini, provider_type);
+            let mut request = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        json!({
+                            "contents": [{"role":"user","parts":[{"text":"ping"}]}],
+                            "tools": [{"functionDeclarations":[{"name":"lookup"}]}],
+                            "toolConfig": {"functionCallingConfig":{"mode":"AUTO"}},
+                            "tool_config": {"function_calling_config":{"mode":"ANY","allowed_function_names":["lookup"]}}
+                        })
+                        .to_string(),
+                    ),
+                    &stored,
+                    ProxyRoute::Gemini,
+                    Some("models/gemini-3.5-flash:generateContent"),
+                )
+                .unwrap();
+            request.actual_model = Some("gemini-3.5-flash".to_string());
+            let accounts = AccountStore {
+                accounts: vec![serde_json::from_value(json!({
+                    "id": account_id,
+                    "providerType": provider_type.as_str(),
+                    "authIdentityGeneration": 1,
+                    "accessToken": "test-token",
+                    "profile": {"projectId": "test-project"},
+                    "quota": {"success": true, "extraUsage": {"loadCodeAssist": {
+                        "cloudaicompanionProject": {"id": "test-project"}
+                    }}}
+                }))
+                .unwrap()],
+                ..Default::default()
+            };
+            let plan = gemini_v1internal_runtime_plan(provider_type, &account_id);
+            let mut endpoint = plan.endpoint.clone();
+            let error = finalize_runtime_protocol_auth(
+                &plan,
+                &stored,
+                &accounts,
+                &mut request,
+                &mut endpoint,
+                &mut Vec::new(),
+            )
+            .expect_err("ambiguous tool config must fail before upstream send");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("toolConfig"));
+            assert!(!error.message.contains("test-token"));
         }
     }
 
@@ -6407,6 +6724,31 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ping")
         );
+    }
+
+    #[test]
+    fn codex_app_claude_provider_rejects_hosted_tool_search_before_outbound() {
+        for provider_type in [ProviderType::Claude, ProviderType::ClaudeOAuth] {
+            let adapter = adapter_for(AppKind::Codex, provider_type);
+            let stored = stored_provider(AppKind::Codex, provider_type, json!({}));
+            let error = adapter
+                .transform_request_for_route(
+                    Bytes::from(
+                        json!({
+                            "model": "claude-sonnet-4-6",
+                            "input": "ping",
+                            "tools": [{"type": "tool_search", "execution": "server"}]
+                        })
+                        .to_string(),
+                    ),
+                    &stored,
+                    ProxyRoute::CodexResponses,
+                    None,
+                )
+                .err()
+                .expect("hosted tool search cannot be translated as a client function");
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
@@ -7389,6 +7731,43 @@ mod tests {
     }
 
     #[test]
+    fn claude_oauth_responses_omitted_output_limit_uses_model_default_only() {
+        let oauth = stored_provider(AppKind::Codex, ProviderType::ClaudeOAuth, json!({}));
+        let api_key = stored_provider(AppKind::Codex, ProviderType::Claude, json!({}));
+        for (body, expected) in [
+            (r#"{"model":"claude-opus-5-5","input":"hello"}"#, 128_000),
+            (
+                r#"{"model":"claude-opus-5-5","max_output_tokens":null,"input":"hello"}"#,
+                128_000,
+            ),
+            (r#"{"model":"claude-fable-5-1","input":"hello"}"#, 64_000),
+            (r#"{"model":"claude-opus-next","input":"hello"}"#, 8192),
+            (
+                r#"{"model":"claude-opus-5-5","max_output_tokens":4096,"input":"hello"}"#,
+                4096,
+            ),
+        ] {
+            let transformed = transform_body_for_upstream(
+                Bytes::copy_from_slice(body.as_bytes()),
+                &oauth,
+                Some(ProxyRoute::CodexResponses),
+            )
+            .unwrap();
+            let output: Value = serde_json::from_slice(&transformed).unwrap();
+            assert_eq!(output["max_tokens"], expected, "{body}");
+        }
+
+        let transformed = transform_body_for_upstream(
+            Bytes::from_static(br#"{"model":"claude-opus-5-5","input":"hello"}"#),
+            &api_key,
+            Some(ProxyRoute::CodexResponses),
+        )
+        .unwrap();
+        let output: Value = serde_json::from_slice(&transformed).unwrap();
+        assert_eq!(output["max_tokens"], 8192);
+    }
+
+    #[test]
     fn thinking_signature_rectifier_cleans_anthropic_request_when_explicitly_enabled() {
         let adapter = adapter_for(AppKind::Claude, ProviderType::Claude);
         let stored = stored_provider(
@@ -7849,6 +8228,32 @@ mod tests {
         );
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
         assert!(!request.stream_requested);
+    }
+
+    #[test]
+    fn codex_oauth_chat_long_tool_call_ids_are_bounded_and_paired() {
+        let long_id = "call_".to_string() + &"a".repeat(72);
+        let input = json!({
+            "model":"gpt-5.5",
+            "messages":[
+                {"role":"assistant","tool_calls":[{"id":long_id,"type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":long_id,"content":"done"}
+            ]
+        });
+        let stored = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}));
+        let adapter = adapter_for(AppKind::Codex, ProviderType::CodexOAuth);
+        let request = adapter
+            .transform_request_for_route(
+                Bytes::from(input.to_string()),
+                &stored,
+                ProxyRoute::CodexChatCompletions,
+                None,
+            )
+            .unwrap();
+        let outbound: Value = serde_json::from_slice(&request.body).unwrap();
+        let call_id = outbound["input"][0]["call_id"].as_str().unwrap();
+        assert!(call_id.len() <= 64, "{call_id}");
+        assert_eq!(outbound["input"][1]["call_id"], call_id);
     }
 
     #[test]

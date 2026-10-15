@@ -55,6 +55,196 @@ pub(crate) fn normalize_codex_tool_schemas(request: &mut Value) {
     }
 }
 
+pub(crate) fn normalize_codex_client_integer_tool_schemas(
+    request: &mut Value,
+    codex_client: bool,
+    codex_executor: bool,
+) -> bool {
+    if !codex_client || codex_executor {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        changed |= normalize_codex_client_integer_tools(tools, 0, None);
+    }
+    if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+                    changed |= normalize_codex_client_integer_tools(tools, 0, None);
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn normalize_codex_client_integer_tools(
+    tools: &mut [Value],
+    depth: usize,
+    namespace: Option<&str>,
+) -> bool {
+    if depth >= CODEX_SCHEMA_MAX_DEPTH {
+        return false;
+    }
+    let mut changed = false;
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            if namespace.is_some() {
+                continue;
+            }
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            let Some(name) = name else {
+                continue;
+            };
+            if let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                changed |= normalize_codex_client_integer_tools(children, depth + 1, Some(&name));
+            }
+            continue;
+        }
+        let mut declarations = false;
+        for key in ["function_declarations", "functionDeclarations"] {
+            if let Some(children) = tool.get_mut(key).and_then(Value::as_array_mut) {
+                changed |= normalize_codex_client_integer_tools(children, depth + 1, namespace);
+                declarations = true;
+            }
+        }
+        if declarations {
+            continue;
+        }
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| tool.pointer("/function/name").and_then(Value::as_str));
+        let Some(name) = name else {
+            continue;
+        };
+        let qualified_name = namespace.map(|namespace| format!("{namespace}__{name}"));
+        let Some(fields) = codex_integer_tool_fields(qualified_name.as_deref().unwrap_or(name))
+        else {
+            continue;
+        };
+        let parameter_pointer = [
+            "/parameters",
+            "/function/parameters",
+            "/input_schema",
+            "/parametersJsonSchema",
+        ]
+        .into_iter()
+        .find(|pointer| tool.pointer(pointer).is_some_and(Value::is_object));
+        let Some(parameters) = parameter_pointer.and_then(|pointer| tool.pointer_mut(pointer))
+        else {
+            continue;
+        };
+        if !codex_schema_within_limits(parameters) {
+            continue;
+        }
+        for field in fields {
+            // Paths are an explicit built-in allowlist relative to parameters.properties.
+            let pointer = format!("/properties/{}", field.replace('.', "/"));
+            let Some(property) = parameters
+                .pointer_mut(&pointer)
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            match property.get_mut("type") {
+                Some(Value::String(value)) if value == "number" => {
+                    *value = "integer".to_string();
+                    changed = true;
+                }
+                Some(Value::Array(types)) => {
+                    let mut replaced = false;
+                    for value in types.iter_mut() {
+                        if value.as_str() == Some("number") {
+                            *value = Value::String("integer".to_string());
+                            replaced = true;
+                        }
+                    }
+                    if replaced {
+                        changed = true;
+                        let mut seen = HashSet::new();
+                        types.retain(|value| {
+                            value
+                                .as_str()
+                                .map(|kind| seen.insert(kind.to_string()))
+                                .unwrap_or(true)
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
+fn codex_integer_tool_fields(name: &str) -> Option<&'static [&'static str]> {
+    let name = name.trim();
+    let name = name
+        .strip_prefix("functions__")
+        .or_else(|| name.strip_prefix("collab__"))
+        .unwrap_or(name);
+    match name {
+        "exec_command" => Some(&["yield_time_ms", "max_output_tokens", "timeout_ms"]),
+        "write_stdin" => Some(&["session_id", "yield_time_ms", "max_output_tokens"]),
+        "sleep" => Some(&["duration_ms"]),
+        "wait_agent" | "multi_agent_v1__wait_agent" | "collaboration__wait_agent" => {
+            Some(&["timeout_ms"])
+        }
+        "wait" => Some(&["yield_time_ms", "max_tokens"]),
+        "tool_search" => Some(&["limit"]),
+        "test_sync_tool" => Some(&[
+            "sleep_before_ms",
+            "sleep_after_ms",
+            "participants",
+            "timeout_ms",
+            "barrier.properties.participants",
+            "barrier.properties.timeout_ms",
+        ]),
+        "create_goal" => Some(&["token_budget"]),
+        "get_channels" | "collaboration__get_channels" => Some(&["limit"]),
+        "list_threads"
+        | "search_posts"
+        | "read_thread"
+        | "collaboration__list_threads"
+        | "collaboration__search_posts"
+        | "collaboration__read_thread" => Some(&["limit", "max_chars_per_post"]),
+        "read_post" | "collaboration__read_post" => Some(&["offset_chars", "limit_chars"]),
+        "memories__list" => Some(&["max_results"]),
+        "memories__read" => Some(&["line_offset", "max_lines"]),
+        "memories__search" => Some(&["context_lines", "max_results"]),
+        "history__list_windows" => Some(&["limit"]),
+        "history__list_items" => Some(&["limit", "max_chars_per_item"]),
+        "history__read_item" => Some(&["offset_chars", "limit_chars"]),
+        "history__search_contents" => Some(&["limit"]),
+        "notes__list_files_by_prefix" => Some(&["max_results"]),
+        "notes__read_file" => Some(&[
+            "start_line",
+            "stop_line",
+            "start_line.anyOf.0",
+            "stop_line.anyOf.0",
+        ]),
+        "notes__search_contents" => Some(&["max_matches_per_file", "max_files"]),
+        "image_gen__imagegen" => Some(&["num_last_images_to_include"]),
+        "web__run" => Some(&[
+            "search_query.items.properties.recency",
+            "image_query.items.properties.recency",
+            "open.items.properties.lineno",
+            "click.items.properties.id",
+            "screenshot.items.properties.pageno",
+            "weather.items.properties.duration",
+            "sports.items.properties.num_games",
+        ]),
+        _ => None,
+    }
+}
+
 fn normalize_codex_tool_schema(tool: &mut Value) {
     let Some(object) = tool.as_object_mut() else {
         return;
@@ -1735,5 +1925,140 @@ mod tests {
         let mut request = json!({"tools": [reserved.clone()]});
         normalize_codex_tool_schemas(&mut request);
         assert_eq!(request.pointer("/tools/0"), Some(&reserved));
+    }
+
+    #[test]
+    fn codex_client_integer_fields_are_scoped_to_client_executor_tool_and_field() {
+        let fixture = json!({
+            "tools": [
+                {"type":"function","name":"exec_command","parameters":{"type":"object","properties":{
+                    "yield_time_ms":{"type":"number"},"max_output_tokens":{"type":["number","null","integer"]},
+                    "ordinary":{"type":"number"},"nested":{"type":"object","properties":{"yield_time_ms":{"type":"number"}}}
+                }}},
+                {"type":"function","name":"functions__write_stdin","function":{"name":"functions__write_stdin","parameters":{"type":"object","properties":{"session_id":{"type":"number"}}}}},
+                {"type":"namespace","name":"functions","tools":[{"name":"wait","input_schema":{"type":"object","properties":{"yield_time_ms":{"type":"number"},"other":{"type":"number"}}}}]},
+                {"function_declarations":[{"name":"sleep","parametersJsonSchema":{"type":"object","properties":{"duration_ms":{"type":"number"}}}}]},
+                {"type":"function","name":"other_tool","parameters":{"type":"object","properties":{"yield_time_ms":{"type":"number"}}}}
+            ],
+            "input":[{"type":"additional_tools","tools":[{"type":"function","name":"write_stdin","parameters":{"type":"object","properties":{"session_id":{"type":"number"}}}}]}]
+        });
+        let mut request = fixture.clone();
+        normalize_codex_client_integer_tool_schemas(&mut request, true, false);
+        assert_eq!(
+            request.pointer("/tools/0/parameters/properties/yield_time_ms/type"),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            request.pointer("/tools/0/parameters/properties/max_output_tokens/type"),
+            Some(&json!(["integer", "null"]))
+        );
+        assert_eq!(
+            request.pointer("/tools/0/parameters/properties/ordinary/type"),
+            Some(&json!("number"))
+        );
+        assert_eq!(
+            request.pointer("/tools/0/parameters/properties/nested/properties/yield_time_ms/type"),
+            Some(&json!("number"))
+        );
+        assert_eq!(
+            request.pointer("/tools/1/function/parameters/properties/session_id/type"),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            request.pointer("/tools/2/tools/0/input_schema/properties/yield_time_ms/type"),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            request.pointer("/tools/2/tools/0/input_schema/properties/other/type"),
+            Some(&json!("number"))
+        );
+        assert_eq!(
+            request.pointer(
+                "/tools/3/function_declarations/0/parametersJsonSchema/properties/duration_ms/type"
+            ),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            request.pointer("/tools/4/parameters/properties/yield_time_ms/type"),
+            Some(&json!("number"))
+        );
+        assert_eq!(
+            request.pointer("/input/0/tools/0/parameters/properties/session_id/type"),
+            Some(&json!("integer"))
+        );
+
+        let once = request.clone();
+        normalize_codex_client_integer_tool_schemas(&mut request, true, false);
+        assert_eq!(request, once);
+        for (codex_client, codex_executor) in [(false, false), (true, true)] {
+            let mut decoy = fixture.clone();
+            normalize_codex_client_integer_tool_schemas(&mut decoy, codex_client, codex_executor);
+            assert_eq!(decoy, fixture);
+        }
+    }
+
+    #[test]
+    fn codex_client_integer_paths_cover_nested_builtin_tools_without_namespace_spoofing() {
+        let fixture = json!({
+            "tools": [
+                {"type":"function","name":"notes__read_file","parameters":{"type":"object","properties":{
+                    "start_line":{"anyOf":[{"type":"number"},{"type":"null"}]},
+                    "stop_line":{"type":"number"},
+                    "unrelated":{"anyOf":[{"type":"number"}]}
+                }}},
+                {"type":"function","name":"web__run","parameters":{"type":"object","properties":{
+                    "search_query":{"type":"array","items":{"type":"object","properties":{"recency":{"type":"number"},"weight":{"type":"number"}}}},
+                    "open":{"type":"array","items":{"type":"object","properties":{"lineno":{"type":["number","null"]}}}}
+                }}},
+                {"type":"namespace","name":"collaboration","tools":[{"name":"wait_agent","input_schema":{"type":"object","properties":{"timeout_ms":{"type":"number"}}}}]},
+                {"type":"namespace","name":"untrusted","tools":[{"name":"wait_agent","input_schema":{"type":"object","properties":{"timeout_ms":{"type":"number"}}}}]},
+                {"type":"function","name":"collaboration__get_channels","parameters":{"type":"object","properties":{"limit":{"type":"number"}}}}
+            ],
+            "input":[{"type":"additional_tools","tools":[{"name":"memories__search","input_schema":{"type":"object","properties":{"max_results":{"type":"number"},"query":{"type":"number"}}}}]}]
+        });
+        let mut request = fixture.clone();
+        assert!(normalize_codex_client_integer_tool_schemas(
+            &mut request,
+            true,
+            false
+        ));
+        for pointer in [
+            "/tools/0/parameters/properties/start_line/anyOf/0/type",
+            "/tools/0/parameters/properties/stop_line/type",
+            "/tools/1/parameters/properties/search_query/items/properties/recency/type",
+            "/tools/2/tools/0/input_schema/properties/timeout_ms/type",
+            "/tools/4/parameters/properties/limit/type",
+            "/input/0/tools/0/input_schema/properties/max_results/type",
+        ] {
+            assert_eq!(
+                request.pointer(pointer),
+                Some(&json!("integer")),
+                "{pointer}"
+            );
+        }
+        assert_eq!(
+            request.pointer("/tools/1/parameters/properties/open/items/properties/lineno/type"),
+            Some(&json!(["integer", "null"]))
+        );
+        for pointer in [
+            "/tools/0/parameters/properties/start_line/anyOf/1/type",
+            "/tools/0/parameters/properties/unrelated/anyOf/0/type",
+            "/tools/1/parameters/properties/search_query/items/properties/weight/type",
+            "/tools/3/tools/0/input_schema/properties/timeout_ms/type",
+            "/input/0/tools/0/input_schema/properties/query/type",
+        ] {
+            assert_eq!(
+                request.pointer(pointer),
+                fixture.pointer(pointer),
+                "{pointer}"
+            );
+        }
+        let once = request.clone();
+        assert!(!normalize_codex_client_integer_tool_schemas(
+            &mut request,
+            true,
+            false
+        ));
+        assert_eq!(request, once);
     }
 }

@@ -146,16 +146,296 @@ pub(crate) fn normalize_wire_request(request: &mut Value) -> Result<(), String> 
             .get_mut("request")
             .filter(|value| value.is_object())
             .ok_or_else(|| "Antigravity request envelope must contain an object".to_string())?;
-        return normalize_wire_request_inner(inner);
+        normalize_wire_request_inner(inner)?;
+        drop_final_gemini_thought_tail(request);
+        return Ok(());
     }
     normalize_wire_request_inner(request)
 }
 
 fn normalize_wire_request_inner(request: &mut Value) -> Result<(), String> {
+    validate_tool_field_aliases(request)?;
+    validate_tool_name_boundaries(request)?;
+    validate_tool_id_types(request)?;
     normalize_tool_call_ids(request)?;
     normalize_tool_names(request)?;
     stringify_ref_function_responses(request)?;
     preserve_function_response_adjacency(request);
+    validate_fixed_thinking_budget(request)?;
+    Ok(())
+}
+
+fn validate_tool_field_aliases(request: &Value) -> Result<(), String> {
+    let reject_pair = |object: &Map<String, Value>, primary: &str, alias: &str| {
+        if object.contains_key(primary) && object.contains_key(alias) {
+            Err(format!(
+                "Antigravity request cannot contain both {primary} and {alias}"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    if let Some(object) = request.as_object() {
+        reject_pair(object, "toolConfig", "tool_config")?;
+    }
+    for tool in request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(tool) = tool.as_object() {
+            reject_pair(tool, "functionDeclarations", "function_declarations")?;
+        }
+    }
+    for config in ["toolConfig", "tool_config"] {
+        let Some(config) = request.get(config).and_then(Value::as_object) else {
+            continue;
+        };
+        reject_pair(config, "functionCallingConfig", "function_calling_config")?;
+        for function_config in ["functionCallingConfig", "function_calling_config"] {
+            if let Some(function_config) = config.get(function_config).and_then(Value::as_object) {
+                reject_pair(
+                    function_config,
+                    "allowedFunctionNames",
+                    "allowed_function_names",
+                )?;
+            }
+        }
+    }
+    for content in request
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for part in content
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(part) = part.as_object() else {
+                continue;
+            };
+            for (primary, alias) in [
+                ("functionCall", "function_call"),
+                ("functionResponse", "function_response"),
+            ] {
+                if part.contains_key(primary) && part.contains_key(alias) {
+                    return Err(format!(
+                        "Antigravity tool part cannot contain both {primary} and {alias}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_id_types(request: &Value) -> Result<(), String> {
+    for content in request
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for part in content
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for (key, label) in [
+                ("functionCall", "functionCall"),
+                ("function_call", "functionCall"),
+                ("functionResponse", "functionResponse"),
+                ("function_response", "functionResponse"),
+            ] {
+                if part
+                    .get(key)
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("id"))
+                    .is_some_and(|id| !id.is_string())
+                {
+                    return Err(format!("Antigravity {label} id must be a string"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn drop_final_gemini_thought_tail(envelope: &mut Value) {
+    // Only the outer envelope model is authoritative after model mapping and
+    // web-search fallback. The raw transformed body's model can differ.
+    let gemini_target = envelope
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.to_ascii_lowercase().contains("gemini"));
+    if gemini_target {
+        if let Some(inner) = envelope.get_mut("request") {
+            drop_trailing_thought_only_model_turns(inner);
+            append_trailing_user_after_media_function_response(inner);
+        }
+    }
+}
+
+fn append_trailing_user_after_media_function_response(request: &mut Value) {
+    let Some(contents) = request.get_mut("contents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let needs_user = contents.last().is_some_and(|content| {
+        matches!(
+            content.get("role").and_then(Value::as_str),
+            Some("model" | "assistant")
+        ) && content
+            .get("parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("functionResponse")
+                        .or_else(|| part.get("function_response"))
+                        .and_then(|response| response.get("parts"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|nested| {
+                            nested.iter().any(|item| {
+                                ["inlineData", "inline_data", "fileData", "file_data"]
+                                    .iter()
+                                    .any(|key| item.get(*key).is_some())
+                            })
+                        })
+                })
+            })
+    });
+    if needs_user {
+        contents.push(json!({"role":"user","parts":[{"text":""}]}));
+    }
+}
+
+fn drop_trailing_thought_only_model_turns(request: &mut Value) {
+    let Some(contents) = request.get_mut("contents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    while contents.len() > 1
+        && contents.last().is_some_and(|content| {
+            matches!(
+                content.get("role").and_then(Value::as_str),
+                Some("model" | "assistant")
+            ) && content
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|part| {
+                            part.as_object().is_some_and(|part| {
+                                part.get("thought") == Some(&Value::Bool(true))
+                                    && part.iter().all(|(key, value)| match key.as_str() {
+                                        "thought" | "text" | "thoughtSignature" => true,
+                                        "thought_signature" => value.is_string(),
+                                        "extra_content" => value.as_object().is_some_and(|extra| {
+                                            extra.len() == 1
+                                                && extra
+                                                    .get("google")
+                                                    .and_then(Value::as_object)
+                                                    .is_some_and(|google| {
+                                                        google.len() == 1
+                                                            && google
+                                                                .get("thought_signature")
+                                                                .is_some_and(Value::is_string)
+                                                    })
+                                        }),
+                                        _ => false,
+                                    })
+                            })
+                        })
+                })
+        })
+    {
+        contents.pop();
+    }
+}
+
+fn validate_tool_name_boundaries(request: &Value) -> Result<(), String> {
+    let check = |name: &Value| -> Result<(), String> {
+        if name.as_str().is_some_and(|name| name.trim() != name) {
+            return Err(
+                "Antigravity function names must not have surrounding whitespace".to_string(),
+            );
+        }
+        Ok(())
+    };
+    for tool in request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for declaration in tool
+            .get("functionDeclarations")
+            .or_else(|| tool.get("function_declarations"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = declaration.get("name") {
+                check(name)?;
+            }
+        }
+    }
+    for content in request
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for part in content
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for key in [
+                "functionCall",
+                "function_call",
+                "functionResponse",
+                "function_response",
+            ] {
+                if let Some(name) = part.get(key).and_then(|value| value.get("name")) {
+                    check(name)?;
+                }
+            }
+        }
+    }
+    if let Some(allowed) = gemini_allowed_function_names(request) {
+        for name in allowed {
+            check(name)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixed_thinking_budget(request: &Value) -> Result<(), String> {
+    let Some(config) = request.get("generationConfig") else {
+        return Ok(());
+    };
+    let Some(thinking) = config.get("thinkingConfig") else {
+        return Ok(());
+    };
+    if thinking.get("thinkingLevel").is_some() {
+        return Ok(());
+    }
+    let Some(budget) = thinking.get("thinkingBudget").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let Some(max_output) = config.get("maxOutputTokens").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    if max_output <= budget {
+        return Err(
+            "Antigravity fixed thinkingBudget must be less than maxOutputTokens".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -936,6 +1216,211 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gemini_trailing_thought_only_turns_are_removed_without_touching_other_history() {
+        let user = json!({"role":"user","parts":[{"text":"hello"}]});
+        let thought = json!({"role":"model","parts":[{"text":"plan","thought":true,"thoughtSignature":"sig"}]});
+        let mixed_text =
+            json!({"role":"model","parts":[{"text":"plan","thought":true},{"text":"answer"}]});
+        let mixed_call = json!({"role":"model","parts":[{"text":"plan","thought":true},{"functionCall":{"name":"lookup","args":{}}}]});
+        let mixed_media = json!({"role":"model","parts":[{"text":"plan","thought":true,"inlineData":{"mimeType":"image/png","data":"AA=="}}]});
+        for preserved in [mixed_text, mixed_call, mixed_media] {
+            let mut request = json!({"model":"gemini-3.5-pro","project":"project","request":{"contents":[user, preserved]}});
+            let part_count = request["request"]["contents"][1]["parts"]
+                .as_array()
+                .unwrap()
+                .len();
+            normalize_wire_request(&mut request).unwrap();
+            assert_eq!(request["request"]["contents"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                request["request"]["contents"][1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                part_count
+            );
+        }
+
+        let mut request = json!({"model":"gemini-3.5-pro","project":"project","request":{"contents":[user, thought, thought]}});
+        normalize_wire_request(&mut request).unwrap();
+        assert_eq!(request["request"]["contents"], json!([user]));
+        normalize_wire_request(&mut request).unwrap();
+        assert_eq!(request["request"]["contents"], json!([user]));
+
+        let mut only_thought =
+            json!({"model":"gemini-3.5-pro","project":"project","request":{"contents":[thought]}});
+        normalize_wire_request(&mut only_thought).unwrap();
+        assert_eq!(only_thought["request"]["contents"], json!([thought]));
+
+        let mut claude = json!({"model":"claude-sonnet-4-6","project":"project","request":{"model":"gemini-3.5-pro","contents":[user, thought]}});
+        normalize_wire_request(&mut claude).unwrap();
+        assert_eq!(claude["request"]["contents"], json!([user, thought]));
+
+        let mut mapped_gemini = json!({"model":"gemini-3.5-pro","project":"project","request":{"model":"claude-sonnet-4-6","contents":[user, thought]}});
+        normalize_wire_request(&mut mapped_gemini).unwrap();
+        assert_eq!(mapped_gemini["request"]["contents"], json!([user]));
+
+        let mut raw_body = json!({"model":"gemini-3.5-pro","contents":[user, thought]});
+        normalize_wire_request(&mut raw_body).unwrap();
+        assert_eq!(raw_body["contents"], json!([user, thought]));
+    }
+
+    #[test]
+    fn gemini_trailing_assistant_thought_only_turn_is_removed() {
+        let user = json!({"role":"user","parts":[{"text":"hello"}]});
+        let thought = json!({"role":"assistant","parts":[{"text":"plan","thought":true,"thoughtSignature":"sig"}]});
+        let mut request = json!({
+            "model":"gemini-3.5-pro",
+            "project":"project",
+            "request":{"contents":[user, thought, thought]}
+        });
+        normalize_wire_request(&mut request).unwrap();
+        assert_eq!(request["request"]["contents"], json!([user]));
+
+        for preserved in [
+            json!({"role":"assistant","parts":[{"text":"plan","thought":true},{"text":"answer"}]}),
+            json!({"role":"assistant","parts":[{"functionCall":{"name":"lookup","args":{}}}]}),
+            json!({"role":"assistant","parts":[{"text":"plan","thought":true,"inlineData":{"mimeType":"image/png","data":"AA=="}}]}),
+        ] {
+            let mut request = json!({
+                "model":"gemini-3.5-pro",
+                "project":"project",
+                "request":{"contents":[user, preserved]}
+            });
+            normalize_wire_request(&mut request).unwrap();
+            let contents = request["request"]["contents"].as_array().unwrap();
+            assert_eq!(contents.len(), 2);
+            assert_eq!(contents[1]["role"], "assistant");
+            assert_eq!(
+                contents[1]["parts"].as_array().unwrap().len(),
+                preserved["parts"].as_array().unwrap().len()
+            );
+        }
+
+        let mut claude = json!({
+            "model":"claude-sonnet-4-6",
+            "project":"project",
+            "request":{"contents":[user, thought]}
+        });
+        normalize_wire_request(&mut claude).unwrap();
+        assert_eq!(claude["request"]["contents"], json!([user, thought]));
+    }
+
+    #[test]
+    fn gemini_trailing_thought_with_known_signature_aliases_is_removed() {
+        let user = json!({"role":"user","parts":[{"text":"hello"}]});
+        for thought in [
+            json!({"role":"model","parts":[{"text":"plan","thought":true,"thought_signature":"sig"}]}),
+            json!({"role":"model","parts":[{"text":"plan","thought":true,"extra_content":{"google":{"thought_signature":"sig"}}}]}),
+        ] {
+            let mut request = json!({
+                "model":"gemini-3.5-pro",
+                "project":"project",
+                "request":{"contents":[user, thought]}
+            });
+            normalize_wire_request(&mut request).unwrap();
+            assert_eq!(request["request"]["contents"], json!([user]));
+        }
+
+        let unknown = json!({"role":"model","parts":[{"text":"plan","thought":true,"extra_content":{"google":{"thought_signature":"sig","other":"keep"}}}]});
+        let mut request = json!({
+            "model":"gemini-3.5-pro",
+            "project":"project",
+            "request":{"contents":[user, unknown]}
+        });
+        normalize_wire_request(&mut request).unwrap();
+        assert_eq!(request["request"]["contents"], json!([user, unknown]));
+    }
+
+    #[test]
+    fn gemini_model_role_media_tool_result_needs_trailing_user_turn() {
+        let mut request = json!({
+            "model":"gemini-3.5-flash", "project":"project",
+            "request":{"contents":[
+                {"role":"model","parts":[{"functionCall":{"id":"call_1","name":"view_image","args":{}}}]},
+                {"role":"model","parts":[{"functionResponse":{
+                    "id":"call_1", "name":"view_image", "response":{"result":""},
+                    "parts":[{"inlineData":{"mimeType":"image/png","data":"AAAA"}}]
+                }}]}
+            ]}
+        });
+        normalize_wire_request(&mut request).unwrap();
+        let contents = request
+            .pointer("/request/contents")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(contents.last().unwrap()["role"], "user");
+        assert_eq!(contents.last().unwrap()["parts"], json!([{"text":""}]));
+        assert!(contents[1]
+            .pointer("/parts/0/functionResponse/parts/0/inlineData")
+            .is_some());
+        let once = request.clone();
+        normalize_wire_request(&mut request).unwrap();
+        assert_eq!(request, once);
+
+        for (nested, expect_user) in [
+            (
+                json!({"fileData":{"mimeType":"image/png","fileUri":"gs://bucket/a.png"}}),
+                true,
+            ),
+            (json!({"text":"ordinary result"}), false),
+        ] {
+            let mut request = json!({"model":"gemini-3.5-flash","project":"project","request":{
+                "contents":[{"role":"model","parts":[{"functionResponse":{
+                    "name":"view_image","response":{"result":""},"parts":[nested]
+                }}]}]
+            }});
+            normalize_wire_request(&mut request).unwrap();
+            assert_eq!(
+                request["request"]["contents"].as_array().unwrap().len() == 2,
+                expect_user
+            );
+        }
+
+        for role_or_model in ["user", "claude-sonnet-4-6"] {
+            let mut request = once.clone();
+            request["request"]["contents"].as_array_mut().unwrap().pop();
+            if role_or_model == "user" {
+                request["request"]["contents"][1]["role"] = json!("user");
+            } else {
+                request["model"] = json!(role_or_model);
+            }
+            normalize_wire_request(&mut request).unwrap();
+            assert_eq!(request["request"]["contents"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn fixed_thinking_budget_cannot_exceed_output_ceiling() {
+        for mut request in [
+            json!({"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingBudget":2048}}}),
+            json!({"project":"p","request":{"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingBudget":2048}}}}),
+        ] {
+            let error = normalize_wire_request(&mut request).unwrap_err();
+            assert!(error.contains("thinkingBudget"));
+        }
+        for mut request in [
+            json!({"generationConfig":{"maxOutputTokens":2049,"thinkingConfig":{"thinkingBudget":2048}}}),
+            json!({"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingBudget":-1}}}),
+            json!({"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingLevel":"high"}}}),
+            json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":2048}}}),
+        ] {
+            normalize_wire_request(&mut request).unwrap();
+        }
+        let mut explicit_model = json!({
+            "project":"p",
+            "model":"gemini-3.5-flash-medium",
+            "request":{"generationConfig":{"maxOutputTokens":2048,"thinkingConfig":{"thinkingBudget":1024}}}
+        });
+        normalize_wire_request(&mut explicit_model).unwrap();
+        assert_eq!(explicit_model["model"], "gemini-3.5-flash-medium");
+        assert_eq!(
+            explicit_model.pointer("/request/generationConfig/thinkingConfig/thinkingBudget"),
+            Some(&json!(1024))
+        );
+    }
+
+    #[test]
     fn responses_reasoning_summary_is_independent_from_reasoning_effort() {
         for (summary, expected) in [
             (None, true),
@@ -995,6 +1480,29 @@ mod tests {
             let mut input = base.clone();
             input["tool_choice"] = choice;
             validate_source_tool_choice(&input).unwrap();
+        }
+    }
+
+    #[test]
+    fn wire_rejects_ambiguous_tool_configuration_aliases() {
+        let declarations = json!([{"name":"lookup","parameters":{"type":"object"}}]);
+        for mut request in [
+            json!({"tools":[{"functionDeclarations":declarations,"function_declarations":[{"name":"delete_all"}]}]}),
+            json!({"tools":[{"functionDeclarations":declarations}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"tool_config":{"functionCallingConfig":{"mode":"ANY"}}}),
+            json!({"tools":[{"functionDeclarations":declarations}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"},"function_calling_config":{"mode":"ANY"}}}),
+            json!({"tools":[{"functionDeclarations":declarations}],"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["lookup"],"allowed_function_names":["delete_all"]}}}),
+        ] {
+            assert!(normalize_wire_request(&mut request).is_err(), "{request}");
+        }
+
+        for mut request in [
+            json!({"tools":[{"functionDeclarations":declarations}],"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["lookup"]}}}),
+            json!({"project":"p","request":{"tools":[{"function_declarations":declarations}],"tool_config":{"function_calling_config":{"mode":"ANY","allowed_function_names":["lookup"]}}}}),
+        ] {
+            normalize_wire_request(&mut request).unwrap();
+            let once = request.clone();
+            normalize_wire_request(&mut request).unwrap();
+            assert_eq!(request, once);
         }
     }
 
@@ -1114,5 +1622,113 @@ mod tests {
             decoy.pointer("/contents/1/parts/0/functionResponse/response/ok"),
             Some(&json!(true))
         );
+    }
+
+    #[test]
+    fn wire_normalization_rejects_padded_name_identity_drift() {
+        for mut request in [
+            json!({"tools": [{"functionDeclarations": [{"name": " lookup "}]}]}),
+            json!({"contents": [{"role": "model", "parts": [{"functionCall": {
+                "id": "call_1", "name": " lookup ", "args": {}
+            }}]}]}),
+            json!({"contents": [
+                {"role": "model", "parts": [{"functionCall": {
+                    "id": "call_1", "name": "lookup", "args": {}
+                }}]},
+                {"role": "user", "parts": [{"functionResponse": {
+                    "id": "call_1", "name": " lookup ", "response": {"ok": true}
+                }}]}
+            ]}),
+        ] {
+            assert!(
+                normalize_wire_request(&mut request).is_err(),
+                "boundary whitespace must not change a tool's wire identity: {request}"
+            );
+        }
+
+        let mut internal_space = json!({
+            "tools": [{"functionDeclarations": [{"name": "lookup file"}]}],
+            "contents": [{"role": "model", "parts": [{"functionCall": {
+                "id": "call_1", "name": "lookup file", "args": {}
+            }}]}]
+        });
+        normalize_wire_request(&mut internal_space).unwrap();
+        assert_eq!(
+            internal_space.pointer("/tools/0/functionDeclarations/0/name"),
+            Some(&json!("lookup_file"))
+        );
+        assert_eq!(
+            internal_space.pointer("/contents/0/parts/0/functionCall/name"),
+            Some(&json!("lookup_file"))
+        );
+    }
+
+    #[test]
+    fn explicit_non_string_tool_ids_cannot_be_replaced_or_repaired() {
+        for mut request in [
+            json!({"contents":[{"role":"model","parts":[{"functionCall":{
+                "id":42,"name":"lookup","args":{}
+            }}]}]}),
+            json!({"contents":[
+                {"role":"model","parts":[{"functionCall":{"id":"call-a","name":"lookup","args":{}}}]},
+                {"role":"user","parts":[{"functionResponse":{
+                    "id":42,"name":"lookup","response":{"ok":true}
+                }}]}
+            ]}),
+            json!({"contents":[{"role":"user","parts":[{"functionResponse":{
+                "id":null,"name":"lookup","response":{"ok":true}
+            }}]}]}),
+            json!({"project":"fixture-project","requestType":"agent","request":{
+                "contents":[{"role":"model","parts":[{"function_call":{
+                    "id":false,"name":"lookup","args":{}
+                }}]}]
+            }}),
+        ] {
+            let error = normalize_wire_request(&mut request).unwrap_err();
+            assert!(error.contains("id"), "{error}");
+        }
+
+        let mut missing_id = json!({"contents":[
+            {"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]},
+            {"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"ok":true}}}]}
+        ]});
+        normalize_wire_request(&mut missing_id).unwrap();
+        assert_eq!(
+            missing_id.pointer("/contents/0/parts/0/functionCall/id"),
+            missing_id.pointer("/contents/1/parts/0/functionResponse/id")
+        );
+    }
+
+    #[test]
+    fn tool_parts_cannot_carry_both_spellings_of_one_identity() {
+        for mut request in [
+            json!({"contents":[{"role":"model","parts":[{
+                "functionCall":{"id":"call-a","name":"lookup","args":{}},
+                "function_call":{"id":"call-b","name":"lookup","args":{}}
+            }]}]}),
+            json!({"contents":[
+                {"role":"model","parts":[{"functionCall":{"id":"call-a","name":"lookup","args":{}}}]},
+                {"role":"user","parts":[{
+                    "functionResponse":{"id":"call-a","name":"lookup","response":{"ok":true}},
+                    "function_response":{"id":"call-b","name":"lookup","response":{"ok":false}}
+                }]}
+            ]}),
+            json!({"contents":[{"role":"model","parts":[{
+                "functionCall":{"id":"call a","name":"lookup","args":{}},
+                "function_call":{"id":"call a","name":"lookup","args":{}}
+            }]}]}),
+        ] {
+            assert!(
+                normalize_wire_request(&mut request).is_err(),
+                "one tool identity must not have competing wire spellings: {request}"
+            );
+        }
+
+        for key in ["functionCall", "function_call"] {
+            let mut request = json!({"contents":[{"role":"model","parts":[{}]}]});
+            request["contents"][0]["parts"][0][key] =
+                json!({"id":"call-a","name":"lookup","args":{}});
+            normalize_wire_request(&mut request).unwrap();
+        }
     }
 }

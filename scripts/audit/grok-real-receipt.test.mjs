@@ -71,7 +71,7 @@ function fixture(operation) {
   const index = Object.keys(specs).indexOf(operation) + 1;
   const modelData = [{ id: spec.model, object: "model", owned_by: "xai" }];
   const catalog = {
-    source: "grok_upstream_fetch_available_models",
+    source: "upstream",
     fetchedAtMs: Date.now(),
     stale: false,
     digest: digest("cc-switch-server:grok-catalog:v1", modelData),
@@ -297,10 +297,29 @@ async function startMockServer(
   {
     providerGeneration = value.authIdentityGeneration,
     catalogStale = false,
+    catalogDrift = "",
     failProvidersWith = "",
+    drift = "",
+    shareFault = "",
+    scopeFault = "",
+    accountFault = "",
+    finalShareDelayMs = 0,
+    oversizedControl = "",
+    onFirstControl = null,
   } = {},
 ) {
   const seen = [];
+  let firstControlSeen = false;
+  let accountReads = 0;
+  let providerReads = 0;
+  let shareReads = 0;
+  let catalogReads = 0;
+  const accountBoolean = (field) => {
+    if (accountFault === `missing_${field}`) return undefined;
+    if (accountFault === `null_${field}`) return null;
+    if (accountFault === `string_${field}`) return "false";
+    return false;
+  };
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     seen.push({
@@ -308,7 +327,20 @@ async function startMockServer(
       search: url.search,
       authorization: request.headers.authorization || "",
     });
+    if (!firstControlSeen && url.pathname === "/api/accounts") {
+      firstControlSeen = true;
+      onFirstControl?.();
+    }
     if (request.method === "GET" && url.pathname === "/api/accounts") {
+      accountReads += 1;
+      if (oversizedControl === "declared") {
+        response.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": String(4 * 1024 * 1024 + 1),
+        });
+        response.write("{");
+        return;
+      }
       sendJson(response, 200, {
         ok: true,
         accounts: [
@@ -317,17 +349,23 @@ async function startMockServer(
             email: `${value.operation}@example.test`,
             providerType: "grok_oauth",
             authIdentityGeneration: value.authIdentityGeneration,
-            tokenRefreshGeneration: value.tokenRefreshGeneration,
+            tokenRefreshGeneration: value.tokenRefreshGeneration + (drift === "account" && accountReads > 1 ? 1 : 0),
             hasAccessToken: true,
             hasRefreshToken: true,
-            hasApiKey: false,
-            needsRelogin: false,
+            hasApiKey: accountBoolean("has_api_key"),
+            needsRelogin: accountBoolean("needs_relogin"),
           },
         ],
       });
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/providers") {
+      providerReads += 1;
+      if (oversizedControl === "chunked") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write("x".repeat(4 * 1024 * 1024 + 1));
+        return;
+      }
       if (failProvidersWith) {
         response.writeHead(500, { "content-type": "text/plain" });
         response.end(failProvidersWith);
@@ -340,9 +378,14 @@ async function startMockServer(
             app: "codex",
             providerType: "grok_oauth",
             providerTypeId: "grok_oauth",
-            providerRevision: value.providerRevision,
+            revision: ["missing_view_revision", "missing_both_revisions", "legacy_top_level_only"].includes(scopeFault)
+              ? undefined : value.providerRevision + (scopeFault === "mismatched_revisions" ? 1 : 0)
+                + (drift === "provider" && providerReads > 1 ? 1 : 0),
+            ...(scopeFault === "legacy_top_level_only" ? { providerRevision: value.providerRevision } : {}),
             provider: { id: value.providerId },
             runtime: {
+              providerRevision: ["missing_runtime_revision", "missing_both_revisions", "legacy_top_level_only"].includes(scopeFault)
+                ? undefined : value.providerRevision + (drift === "provider" && providerReads > 1 ? 1 : 0),
               driverId: "oauth.grok_responses",
               configurationState: "ready",
               runtimeFingerprint: value.runtimeFingerprint,
@@ -359,30 +402,57 @@ async function startMockServer(
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/shares") {
-      sendJson(response, 200, {
+      shareReads += 1;
+      const payload = {
         ok: true,
         shares: [
           {
             id: value.shareId,
             app: "codex",
-            providerId: value.providerId,
+            providerId: shareFault === "primary_conflict" ? "grok-other-provider" : value.providerId,
             providerType: "grok_oauth",
-            configRevision: value.shareRevision,
-            bindings: [],
+            enabled: shareFault !== "disabled",
+            status: shareFault === "paused" ? "paused" : "active",
+            configRevision: scopeFault === "missing_share_revision" ? undefined
+              : value.shareRevision + (drift === "share" && shareReads > 1 ? 1 : 0),
+            bindings: [
+              { app: "codex", providerId: value.providerId, providerType: "grok_oauth" },
+              ...(shareFault === "duplicate_conflict"
+                ? [{ app: "codex", providerId: "grok-other-provider", providerType: "grok_oauth" }]
+                : []),
+            ],
           },
         ],
-      });
+      };
+      if (finalShareDelayMs && shareReads > 1) {
+        setTimeout(() => sendJson(response, 200, payload), finalShareDelayMs);
+      } else {
+        sendJson(response, 200, payload);
+      }
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/models") {
+      catalogReads += 1;
       assert.equal(url.searchParams.get("app"), "codex");
       assert.equal(url.searchParams.get("providerId"), value.providerId);
+      const finalCatalog = catalogReads > 1;
       sendJson(response, 200, {
         object: "list",
-        data: value.modelData,
-        source: value.catalog.source,
-        fetchedAtMs: value.catalog.fetchedAtMs,
-        stale: catalogStale,
+        data: finalCatalog && catalogDrift === "model_removed" ? []
+          : finalCatalog && catalogDrift === "model_added"
+            ? [...value.modelData, { id: "grok-extra", object: "model", owned_by: "xai" }]
+            : finalCatalog && catalogDrift === "row_reordered"
+              ? [...value.modelData].reverse()
+              : finalCatalog && catalogDrift === "capability_changed"
+                ? value.modelData.map((entry, index) => index === 0
+                  ? { ...entry, capabilityManifestVersion: 2 } : entry)
+            : value.modelData,
+        source: finalCatalog && catalogDrift === "wrong_source" ? "static_registry"
+          : finalCatalog && catalogDrift === "allowed_source" ? "cache_fresh"
+            : value.catalog.source,
+        fetchedAtMs: finalCatalog && catalogDrift === "future"
+          ? Date.now() + 10 * 60_000 : value.catalog.fetchedAtMs,
+        stale: catalogStale || (finalCatalog && catalogDrift === "stale"),
       });
       return;
     }
@@ -438,6 +508,310 @@ test("Grok receipt harness validates all three operations independently", async 
           new RegExp(`Grok ${operation} private receipt accepted`),
         );
         assert.match(result.stdout, /verificationState=contract_verified, liveState=live_pending/);
+        for (const path of ["/api/accounts", "/api/providers", "/api/shares"]) {
+          assert.equal(mock.seen.filter((entry) => entry.path === path).length, 2);
+        }
+        const catalogRequest = mock.seen.find((entry) => entry.path === "/v1/models");
+        assert.ok(catalogRequest);
+        assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 2);
+        const catalogQuery = new URLSearchParams(catalogRequest.search);
+        assert.equal(catalogQuery.get("expectedShareId"), value.shareId);
+        assert.equal(catalogQuery.get("expectedProviderId"), value.providerId);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok operation receipts recheck current catalog content and authority", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const catalogDrift of ["model_removed", "model_added", "capability_changed", "stale", "wrong_source", "future"]) {
+      await t.test(`${operation}/${catalogDrift}`, async () => {
+        const value = fixture(operation);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-drift-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value, { catalogDrift });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+          assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 2);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+    await t.test(`${operation}/allowed_source`, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-source-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value, { catalogDrift: "allowed_source" });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /contract_verified.*live_pending/);
+        assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 2);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok operations reject ambiguous or malformed nonselected catalog IDs", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const kind of ["duplicate", "missing"]) {
+      await t.test(`${operation}/${kind}`, async () => {
+        const value = fixture(operation);
+        value.modelData.push({ id: "grok-extra", object: "model", owned_by: "xai" });
+        value.modelData.push(kind === "duplicate"
+          ? { id: "grok-extra", object: "model", owned_by: "xai" }
+          : { object: "model", owned_by: "xai" });
+        value.catalog.digest = digest("cc-switch-server:grok-catalog:v1", value.modelData);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-shape-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value);
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+          assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok operations allow a pure authoritative catalog row reorder", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      value.modelData.push({ id: "grok-z", object: "model", owned_by: "xai" });
+      value.catalog.digest = digest("cc-switch-server:grok-catalog:v1", value.modelData);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-order-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value, { catalogDrift: "row_reordered" });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+        assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 2);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok catalog digest ignores reorder of distinct canonically equivalent IDs", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      value.modelData = [
+        { id: "cafe\u0301", object: "model", owned_by: "xai" },
+        { id: "caf\u00e9", object: "model", owned_by: "xai" },
+        ...value.modelData,
+      ];
+      assert.notEqual(value.modelData[0].id, value.modelData[1].id);
+      assert.equal(value.modelData[0].id.localeCompare(value.modelData[1].id), 0);
+      value.catalog.digest = digest("cc-switch-server:grok-catalog:v1", value.modelData);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-unicode-order-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value, { catalogDrift: "row_reordered" });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+        assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 2);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok private receipts cannot be hard-linked from inside the repository", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      const insideDirectory = fs.mkdtempSync(path.join(repoRoot, ".grok-receipt-hardlink-"));
+      const outsideDirectory = fs.mkdtempSync(path.join(path.dirname(repoRoot), ".grok-receipt-outside-"));
+      const insideReceipt = path.join(insideDirectory, "receipt.json");
+      const outsideReceipt = path.join(outsideDirectory, "receipt.json");
+      writeReceipt(insideReceipt, value);
+      fs.linkSync(insideReceipt, outsideReceipt);
+      const mock = await startMockServer(value);
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, outsideReceipt));
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.deepEqual(mock.seen, []);
+      } finally {
+        await mock.close();
+        fs.rmSync(outsideDirectory, { recursive: true, force: true });
+        fs.rmSync(insideDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok receipt cannot be replaced during control-plane validation", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-receipt-swap-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      const replacementFile = path.join(directory, "replacement.json");
+      writeReceipt(receiptFile, value, { model: "not-the-selected-model" });
+      writeReceipt(replacementFile, value);
+      const originalInode = fs.statSync(receiptFile).ino;
+      const mock = await startMockServer(value, {
+        onFirstControl: () => fs.renameSync(replacementFile, receiptFile),
+      });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.ok(mock.seen.some((entry) => entry.path === "/api/accounts"));
+        assert.notEqual(fs.statSync(receiptFile).ino, originalInode);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok private receipt must remain the same file through final acceptance", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const change of ["replacement", "in_place"]) {
+      await t.test(`${operation}/${change}`, async () => {
+        const value = fixture(operation);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-receipt-final-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        const replacementFile = path.join(directory, "replacement.json");
+        writeReceipt(receiptFile, value);
+        if (change === "replacement") {
+          fs.writeFileSync(replacementFile, "not the accepted receipt\n", { mode: 0o600 });
+        }
+        const originalInode = fs.statSync(receiptFile).ino;
+        const mock = await startMockServer(value, {
+          onFirstControl: () => {
+            if (change === "replacement") {
+              fs.renameSync(replacementFile, receiptFile);
+            } else {
+              fs.writeFileSync(receiptFile, " ".repeat(fs.statSync(receiptFile).size), { flag: "r+" });
+              fs.utimesSync(receiptFile, new Date(0), new Date(0));
+            }
+          },
+        });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+          assert.ok(mock.seen.some((entry) => entry.path === "/api/accounts"));
+          if (change === "replacement") {
+            assert.notEqual(fs.statSync(receiptFile).ino, originalInode);
+          } else {
+            assert.equal(fs.statSync(receiptFile).ino, originalInode);
+          }
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok final acceptance rejects changed bytes despite unchanged reported metadata", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-receipt-bytes-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const preload = [
+        'import fs from "node:fs";',
+        `const target = process.env[${JSON.stringify(specs[operation].receiptEnv)}];`,
+        'const originalStat = fs.statSync;',
+        'const originalFstat = fs.fstatSync;',
+        'const originalFingerprint = originalStat(target, { bigint: true });',
+        'let bigintFstatCount = 0;',
+        'fs.statSync = (path, options) => {',
+        '  if (path === target && options?.bigint) return originalFingerprint;',
+        '  return originalStat(path, options);',
+        '};',
+        'fs.fstatSync = (fd, options) => {',
+        '  if (options?.bigint && ++bigintFstatCount > 2) return originalFingerprint;',
+        '  return originalFstat(fd, options);',
+        '};',
+      ].join("\n");
+      const mock = await startMockServer(value, {
+        onFirstControl: () => {
+          fs.writeFileSync(receiptFile, " ".repeat(fs.statSync(receiptFile).size), { flag: "r+" });
+        },
+      });
+      try {
+        const result = await runScript(operation, {
+          ...fullEnv(value, mock.url, receiptFile),
+          NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(preload)}`,
+        });
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+        assert.ok(mock.seen.some((entry) => entry.path === "/api/accounts"));
+        assert.match(fs.readFileSync(receiptFile, "utf8"), /^ +$/);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok receipt rejects an in-place rewrite during its snapshot", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-receipt-inplace-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const preload = [
+        'import fs from "node:fs";',
+        'const originalRead = fs.readSync;',
+        `const target = process.env[${JSON.stringify(specs[operation].receiptEnv)}];`,
+        'let changed = false;',
+        'fs.readSync = (fd, ...args) => {',
+        '  const count = originalRead(fd, ...args);',
+        '  if (!changed && count > 0 && fs.fstatSync(fd).ino === fs.statSync(target).ino) {',
+        '    changed = true;',
+        '    fs.writeFileSync(target, " ".repeat(fs.statSync(target).size), { flag: "r+" });',
+        '    fs.utimesSync(target, new Date(0), new Date(0));',
+        '  }',
+        '  return count;',
+        '};',
+      ].join("\n");
+      const mock = await startMockServer(value);
+      try {
+        const result = await runScript(operation, {
+          ...fullEnv(value, mock.url, receiptFile),
+          NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(preload)}`,
+        });
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.deepEqual(mock.seen, []);
+        assert.match(fs.readFileSync(receiptFile, "utf8"), /^ +$/);
       } finally {
         await mock.close();
         fs.rmSync(directory, { recursive: true, force: true });
@@ -484,6 +858,37 @@ test("Grok receipt harness rejects cross-operation and fixture promotion", async
   }
 });
 
+test("Grok OAuth Account requires explicit false credential and relogin booleans", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const accountFault of [
+      "missing_has_api_key",
+      "null_has_api_key",
+      "string_has_api_key",
+      "missing_needs_relogin",
+      "null_needs_relogin",
+      "string_needs_relogin",
+    ]) {
+      await t.test(`${operation}/${accountFault}`, async () => {
+        const value = fixture(operation);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-account-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value, { accountFault });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+          assert.equal(mock.seen.filter((entry) => entry.path === "/api/providers").length, 0);
+          assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
 test("Grok receipt harness fails closed on Account generation drift", async () => {
   const value = fixture("inference");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grok-generation-drift-"));
@@ -519,6 +924,51 @@ test("Grok receipt harness rejects a stale current catalog", async () => {
   }
 });
 
+test("Grok receipt rejects a catalog that expires before acceptance for every operation", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      value.catalog.fetchedAtMs = Date.now() - 2 * 60 * 60_000 + 1_000;
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-catalog-expiry-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value, { finalShareDelayMs: 1_500 });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(mock.seen.filter((entry) => entry.path === "/api/shares").length, 2);
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok operation receipts expiring during final binding validation are rejected", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    await t.test(operation, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-receipt-expiry-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value, {
+        recordedAt: new Date(Date.now() - 24 * 60 * 60_000 + 1_200).toISOString(),
+      });
+      const mock = await startMockServer(value, { finalShareDelayMs: 2_000 });
+      try {
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(mock.seen.filter((entry) => entry.path === "/api/shares").length, 2);
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("Grok receipt harness never prints secrets or raw failure bodies", async () => {
   const value = fixture("inference");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grok-redaction-"));
@@ -539,5 +989,161 @@ test("Grok receipt harness never prints secrets or raw failure bodies", async ()
   } finally {
     await mock.close();
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Grok receipt rejects binding drift for each operation", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const drift of ["account", "provider", "share"]) {
+      await t.test(`${operation}/${drift}`, async () => {
+        const value = fixture(operation);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-${operation}-${drift}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value, { drift });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok Share rejects ambiguous or inactive bindings before catalog access", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const shareFault of ["duplicate_conflict", "primary_conflict", "disabled", "paused"]) {
+      await t.test(`${operation}/${shareFault}`, async () => {
+        const value = fixture(operation);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-share-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value, { shareFault });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+          assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok operations reject incomplete or inconsistent Provider and Share scope before catalogs", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const scopeFault of [
+      "missing_runtime_revision",
+      "missing_view_revision",
+      "mismatched_revisions",
+      "missing_both_revisions",
+      "legacy_top_level_only",
+      "missing_share_revision",
+      "blank_runtime_fingerprint",
+    ]) {
+      await t.test(`${operation}/${scopeFault}`, async () => {
+        const value = fixture(operation);
+        if (scopeFault !== "legacy_top_level_only") value.providerRevision = 0;
+        if (scopeFault === "missing_share_revision") value.shareRevision = 0;
+        if (scopeFault === "blank_runtime_fingerprint") value.runtimeFingerprint = "   ";
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-scope-${operation}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value, { scopeFault });
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] Grok acceptance failed (details redacted)");
+          assert.equal(mock.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok receipt rejects old future and non-authoritative catalog evidence", async (t) => {
+  for (const operation of Object.keys(specs)) {
+    for (const invalid of ["old", "future", "wrong_source"]) {
+      await t.test(`${operation}/${invalid}`, async () => {
+        const value = fixture(operation);
+        if (invalid === "old") value.catalog.fetchedAtMs -= 3 * 60 * 60 * 1_000;
+        if (invalid === "future") value.catalog.fetchedAtMs += 10 * 60 * 1_000;
+        if (invalid === "wrong_source") value.catalog.source = "static_registry";
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-${operation}-${invalid}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        writeReceipt(receiptFile, value);
+        const mock = await startMockServer(value);
+        try {
+          const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+        } finally {
+          await mock.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("Grok receipt accepts current bound cache and 304 catalog sources only as fixture evidence", async (t) => {
+  for (const source of ["cache_fresh", "upstream_not_modified"]) {
+    await t.test(source, async () => {
+      const value = fixture("inference");
+      value.catalog.source = source;
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-${source}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value);
+      try {
+        const result = await runScript(value.operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /contract_verified.*live_pending/);
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Grok control-plane response bound rejects unfinished oversized bodies", async (t) => {
+  for (const [operation, oversizedControl, expectedPath] of [
+    ["inference", "declared", "/api/accounts"],
+    ["media", "chunked", "/api/providers"],
+  ]) {
+    await t.test(`${operation}/${oversizedControl}`, async () => {
+      const value = fixture(operation);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grok-oversized-${operation}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      writeReceipt(receiptFile, value);
+      const mock = await startMockServer(value, { oversizedControl });
+      try {
+        const startedAt = Date.now();
+        const result = await runScript(operation, fullEnv(value, mock.url, receiptFile));
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.deepEqual(
+          mock.seen.map((entry) => entry.path),
+          expectedPath === "/api/accounts"
+            ? ["/api/accounts"]
+            : ["/api/accounts", "/api/providers"],
+        );
+        assert.ok(Date.now() - startedAt < 3_000, "oversized response waited for timeout");
+      } finally {
+        await mock.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
   }
 });

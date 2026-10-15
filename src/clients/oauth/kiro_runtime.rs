@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::domain::accounts::store::Account;
@@ -39,8 +40,10 @@ struct ModelCacheKey {
     provider_revision: u64,
     runtime_fingerprint: String,
     account_id: String,
+    account_incarnation: u64,
     auth_identity_generation: u64,
     token_refresh_generation: u64,
+    request_identity_fingerprint: [u8; 32],
     profile_scope: String,
     runtime_region: String,
 }
@@ -51,6 +54,7 @@ pub struct KiroModelCatalogScope {
     provider_id: String,
     provider_revision: u64,
     runtime_fingerprint: String,
+    account_incarnation: u64,
 }
 
 impl KiroModelCatalogScope {
@@ -59,18 +63,26 @@ impl KiroModelCatalogScope {
         provider_id: &str,
         provider_revision: u64,
         runtime_fingerprint: &str,
+        account_incarnation: u64,
     ) -> Self {
         Self {
             app: app.trim().to_string(),
             provider_id: provider_id.trim().to_string(),
             provider_revision,
             runtime_fingerprint: runtime_fingerprint.trim().to_string(),
+            account_incarnation,
         }
     }
 
     #[cfg(test)]
     fn fixture() -> Self {
-        Self::derive("claude", "kiro-fixture-provider", 1, "kiro-fixture-runtime")
+        Self::derive(
+            "claude",
+            "kiro-fixture-provider",
+            1,
+            "kiro-fixture-runtime",
+            0,
+        )
     }
 }
 
@@ -81,6 +93,20 @@ struct RuntimeCache {
 }
 
 static CACHE: LazyLock<Mutex<RuntimeCache>> = LazyLock::new(|| Mutex::new(RuntimeCache::default()));
+
+pub(crate) fn request_identity_fingerprint(account: &Account, access_token: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:kiro-model-catalog-request-identity:v1\0");
+    let machine_id = account_string(account, &["/machineId", "/machine_id"])
+        .unwrap_or_else(|| account.id.clone());
+    let auth_kind = super::kiro::account_auth_kind(account);
+    let token_type = kiro_token_type(account).unwrap_or("");
+    for component in [access_token, machine_id.as_str(), auth_kind, token_type] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    digest.finalize().into()
+}
 
 #[cfg(not(test))]
 #[derive(Deserialize)]
@@ -323,8 +349,10 @@ pub async fn model_catalog_scoped(
         provider_revision: scope.provider_revision,
         runtime_fingerprint: scope.runtime_fingerprint.clone(),
         account_id: account.id.clone(),
+        account_incarnation: scope.account_incarnation,
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        request_identity_fingerprint: request_identity_fingerprint(account, access_token),
         profile_scope: identity
             .profile_arn
             .clone()
@@ -422,8 +450,13 @@ async fn cached_model_descriptor(
         provider_revision: scope.provider_revision,
         runtime_fingerprint: scope.runtime_fingerprint.clone(),
         account_id: account.id.clone(),
+        account_incarnation: scope.account_incarnation,
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        request_identity_fingerprint: request_identity_fingerprint(
+            account,
+            account.access_token.as_deref()?,
+        ),
         profile_scope: identity
             .profile_arn
             .unwrap_or_else(|| "profileless_api_key".to_string()),
@@ -1137,6 +1170,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_does_not_reuse_same_generation_after_credential_replacement() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let model = if headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer replacement-token")
+                    {
+                        "replacement-model"
+                    } else {
+                        "original-model"
+                    };
+                    axum::Json(json!({"models": [{"modelId": model}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-credential-replacement-{}", now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 0,
+            "accessToken": "original-token",
+            "profile": {"authMethod": "social", "apiRegion": "us-east-1"}
+        }))
+        .unwrap();
+        let endpoint = format!("http://{address}/models");
+        let http = reqwest::Client::new();
+        let first = model_catalog(&http, &account, Some(&endpoint)).await;
+        account.access_token = Some("replacement-token".to_string());
+        let replacement = model_catalog(&http, &account, Some(&endpoint)).await;
+
+        assert_eq!(first.model_ids().collect::<Vec<_>>(), ["original-model"]);
+        assert_eq!(
+            replacement.model_ids().collect::<Vec<_>>(),
+            ["replacement-model"]
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_does_not_reuse_same_token_after_account_recreation() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    let request = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    axum::Json(json!({"models": [{"modelId": format!("model-{request}")}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-recreated-account-{}", now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 0,
+            "accessToken": "unchanged-token",
+            "profile": {"authMethod": "social", "apiRegion": "us-east-1"}
+        }))
+        .unwrap();
+        let endpoint = format!("http://{address}/models");
+        let http = reqwest::Client::new();
+        let first_scope = KiroModelCatalogScope::derive(
+            "claude",
+            "kiro-fixture-provider",
+            1,
+            "kiro-fixture-runtime",
+            1,
+        );
+        let recreated_scope = KiroModelCatalogScope::derive(
+            "claude",
+            "kiro-fixture-provider",
+            1,
+            "kiro-fixture-runtime",
+            2,
+        );
+        let first = model_catalog_scoped(
+            &http,
+            &account,
+            &first_scope,
+            Some(&endpoint),
+            Duration::from_secs(2),
+        )
+        .await;
+        let recreated = model_catalog_scoped(
+            &http,
+            &account,
+            &recreated_scope,
+            Some(&endpoint),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(first.model_ids().collect::<Vec<_>>(), ["model-1"]);
+        assert_eq!(recreated.model_ids().collect::<Vec<_>>(), ["model-2"]);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_does_not_reuse_changed_machine_identity() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    let request = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    axum::Json(json!({"models": [{"modelId": format!("machine-model-{request}")}]}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut account: Account = serde_json::from_value(json!({
+            "id": format!("kiro-machine-change-{}", now_ms()),
+            "providerType": "kiro_oauth",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 0,
+            "accessToken": "unchanged-token",
+            "profile": {
+                "authMethod": "social",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+                "machineId": "machine-a"
+            }
+        }))
+        .unwrap();
+        let endpoint = format!("http://{address}/models");
+        let http = reqwest::Client::new();
+        let first = model_catalog(&http, &account, Some(&endpoint)).await;
+        account.profile.as_mut().unwrap()["machineId"] = json!("machine-b");
+        let second = model_catalog(&http, &account, Some(&endpoint)).await;
+
+        assert_eq!(first.model_ids().collect::<Vec<_>>(), ["machine-model-1"]);
+        assert_eq!(second.model_ids().collect::<Vec<_>>(), ["machine-model-2"]);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn model_catalog_cache_isolated_by_provider_runtime_scope() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1171,8 +1367,8 @@ mod tests {
         }))
         .unwrap();
         let endpoint = format!("http://{address}/models");
-        let scope_a = KiroModelCatalogScope::derive("claude", "provider-a", 1, "runtime-a");
-        let scope_b = KiroModelCatalogScope::derive("claude", "provider-b", 1, "runtime-b");
+        let scope_a = KiroModelCatalogScope::derive("claude", "provider-a", 1, "runtime-a", 0);
+        let scope_b = KiroModelCatalogScope::derive("claude", "provider-b", 1, "runtime-b", 0);
         let http = reqwest::Client::new();
 
         let first_a = model_catalog_scoped(
@@ -1239,7 +1435,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let scope = KiroModelCatalogScope::derive("codex", "provider", 9, "runtime");
+        let scope = KiroModelCatalogScope::derive("codex", "provider", 9, "runtime", 0);
         let http = reqwest::Client::new();
         let good = model_catalog_scoped(
             &http,
@@ -1260,8 +1456,13 @@ mod tests {
             provider_revision: scope.provider_revision,
             runtime_fingerprint: scope.runtime_fingerprint.clone(),
             account_id: account.id.clone(),
+            account_incarnation: scope.account_incarnation,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            request_identity_fingerprint: request_identity_fingerprint(
+                &account,
+                account.access_token.as_deref().unwrap(),
+            ),
             profile_scope: identity.profile_arn.unwrap(),
             runtime_region: identity.runtime_region,
         };
@@ -1647,8 +1848,13 @@ mod tests {
             provider_revision: scope.provider_revision,
             runtime_fingerprint: scope.runtime_fingerprint.clone(),
             account_id: account.id.clone(),
+            account_incarnation: scope.account_incarnation,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            request_identity_fingerprint: request_identity_fingerprint(
+                &account,
+                account.access_token.as_deref().unwrap(),
+            ),
             profile_scope: identity.profile_arn.unwrap(),
             runtime_region: identity.runtime_region,
         };

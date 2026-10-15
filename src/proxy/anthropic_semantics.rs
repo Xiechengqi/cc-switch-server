@@ -83,15 +83,20 @@ impl std::error::Error for AnthropicProtocolError {}
 pub(super) struct AnthropicSseInspector {
     pending: Vec<u8>,
     saw_message_start: bool,
+    saw_message_delta: bool,
+    stop_reason: Option<String>,
+    message_id: Option<String>,
     seen_block_indices: BTreeSet<u64>,
     open_blocks: BTreeMap<u64, AnthropicContentBlockState>,
     terminal: Option<AnthropicTerminal>,
+    failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnthropicContentBlockKind {
     Text,
     Thinking,
+    RedactedThinking,
     ToolUse,
     Unknown,
 }
@@ -139,6 +144,8 @@ impl AnthropicSseInspector {
         };
         self.pending
             .capacity()
+            .saturating_add(self.message_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.stop_reason.as_ref().map_or(0, String::capacity))
             .saturating_add(seen_blocks)
             .saturating_add(open_blocks)
             .saturating_add(terminal)
@@ -148,18 +155,26 @@ impl AnthropicSseInspector {
         &mut self,
         chunk: &[u8],
     ) -> Result<Vec<AnthropicObservation>, AnthropicProtocolError> {
+        if self.failed {
+            return Err(AnthropicProtocolError::new(
+                "Anthropic SSE inspector has failed",
+            ));
+        }
+        let result = self.push_inner(chunk);
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn push_inner(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<AnthropicObservation>, AnthropicProtocolError> {
         if self.terminal.is_some() && chunk.iter().any(|byte| !byte.is_ascii_whitespace()) {
             return Err(AnthropicProtocolError::new(
                 "Anthropic stream contained data after its terminal event",
             ));
         }
         self.pending.extend_from_slice(chunk);
-        if self.pending.len() > MAX_EVENT_BYTES && next_event_boundary(&self.pending).is_none() {
-            return Err(AnthropicProtocolError::new(
-                "Anthropic SSE event exceeded the 8 MiB limit",
-            ));
-        }
-
         let mut observations = Vec::new();
         while let Some((end, delimiter_len)) = next_event_boundary(&self.pending) {
             if end > MAX_EVENT_BYTES {
@@ -173,6 +188,11 @@ impl AnthropicSseInspector {
                 observations.push(observation);
             }
         }
+        if self.pending.len() > MAX_EVENT_BYTES {
+            return Err(AnthropicProtocolError::new(
+                "Anthropic SSE event exceeded the 8 MiB limit",
+            ));
+        }
         if self.terminal.is_some() && self.pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
             return Err(AnthropicProtocolError::new(
                 "Anthropic stream contained data after its terminal event",
@@ -182,6 +202,17 @@ impl AnthropicSseInspector {
     }
 
     pub(super) fn finish(&mut self) -> Result<(), AnthropicProtocolError> {
+        if self.failed {
+            return Err(AnthropicProtocolError::new(
+                "Anthropic SSE inspector has failed",
+            ));
+        }
+        let result = self.finish_inner();
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn finish_inner(&mut self) -> Result<(), AnthropicProtocolError> {
         if self.pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
             return Err(AnthropicProtocolError::new(
                 "Anthropic stream ended with an incomplete SSE event",
@@ -205,7 +236,19 @@ impl AnthropicSseInspector {
     }
 
     pub(super) fn terminal(&self) -> Option<&AnthropicTerminal> {
-        self.terminal.as_ref()
+        if self.failed {
+            None
+        } else {
+            self.terminal.as_ref()
+        }
+    }
+
+    pub(super) fn message_id(&self) -> Option<&str> {
+        if self.failed {
+            None
+        } else {
+            self.message_id.as_deref()
+        }
     }
 
     fn inspect_event(
@@ -217,8 +260,7 @@ impl AnthropicSseInspector {
         })?;
         let mut declared_event = None;
         let mut data = Vec::new();
-        for raw_line in text.split('\n') {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        for line in text.split(['\r', '\n']) {
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
@@ -240,10 +282,9 @@ impl AnthropicSseInspector {
             .as_deref()
             .is_some_and(|event| event != payload_type)
         {
-            return Err(AnthropicProtocolError::new(format!(
-                "Anthropic SSE event type mismatch: event={:?}, data.type={payload_type}",
-                declared_event.as_deref().unwrap_or_default()
-            )));
+            return Err(AnthropicProtocolError::new(
+                "Anthropic SSE event type does not match data.type",
+            ));
         }
         if self.terminal.is_some() {
             return Err(AnthropicProtocolError::new(
@@ -266,32 +307,56 @@ impl AnthropicSseInspector {
                 validate_message(value.get("message").ok_or_else(|| {
                     AnthropicProtocolError::new("Anthropic message_start is missing message")
                 })?)?;
+                self.message_id = value
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 self.saw_message_start = true;
                 Ok(Some(AnthropicObservation::Lifecycle))
             }
             "ping" => Ok(Some(AnthropicObservation::Lifecycle)),
             "content_block_start" => {
                 self.require_message_start(payload_type)?;
+                self.require_content_before_stop_reason()?;
                 self.inspect_content_block_start(&value)?;
                 Ok(Some(AnthropicObservation::Business))
             }
             "content_block_delta" => {
                 self.require_message_start(payload_type)?;
+                self.require_content_before_stop_reason()?;
                 self.inspect_content_block_delta(&value)?;
                 Ok(Some(AnthropicObservation::Business))
             }
             "content_block_stop" => {
                 self.require_message_start(payload_type)?;
+                self.require_content_before_stop_reason()?;
                 self.inspect_content_block_stop(&value)?;
                 Ok(Some(AnthropicObservation::Business))
             }
             "message_delta" => {
                 self.require_message_start(payload_type)?;
-                validate_message_delta(&value)?;
+                if let Some(reason) = validate_message_delta(&value)? {
+                    if self
+                        .stop_reason
+                        .as_deref()
+                        .is_some_and(|previous| previous != reason)
+                    {
+                        return Err(AnthropicProtocolError::new(
+                            "Anthropic message_delta changed stop_reason",
+                        ));
+                    }
+                    self.stop_reason = Some(reason.to_string());
+                }
+                self.saw_message_delta = true;
                 Ok(Some(AnthropicObservation::Business))
             }
             "message_stop" => {
                 self.require_message_start(payload_type)?;
+                if !self.saw_message_delta {
+                    return Err(AnthropicProtocolError::new(
+                        "Anthropic message_stop arrived before message_delta",
+                    ));
+                }
                 if !self.open_blocks.is_empty() {
                     return Err(AnthropicProtocolError::new(
                         "Anthropic message_stop arrived with open content blocks",
@@ -301,7 +366,7 @@ impl AnthropicSseInspector {
                 Ok(Some(AnthropicObservation::SuccessTerminal))
             }
             _ => {
-                self.require_message_start(payload_type)?;
+                self.require_message_start("unknown event")?;
                 Ok(Some(AnthropicObservation::Business))
             }
         }
@@ -320,7 +385,11 @@ impl AnthropicSseInspector {
         let block_type = required_string(block, "type", "Anthropic content block")?;
         let kind = match block_type {
             "text" => AnthropicContentBlockKind::Text,
-            "thinking" | "redacted_thinking" => AnthropicContentBlockKind::Thinking,
+            "thinking" => AnthropicContentBlockKind::Thinking,
+            "redacted_thinking" => {
+                validate_redacted_thinking_block(block)?;
+                AnthropicContentBlockKind::RedactedThinking
+            }
             "tool_use" | "server_tool_use" => {
                 required_string(block, "id", "Anthropic tool content block")?;
                 required_string(block, "name", "Anthropic tool content block")?;
@@ -358,12 +427,27 @@ impl AnthropicSseInspector {
         if block.kind == AnthropicContentBlockKind::Unknown {
             return Ok(());
         }
+        if block.kind == AnthropicContentBlockKind::RedactedThinking {
+            return Err(AnthropicProtocolError::new(
+                "Anthropic redacted thinking content block cannot have deltas",
+            ));
+        }
         let compatible = match delta_type {
-            "text_delta" | "citations_delta" => {
+            "text_delta" => {
                 matches!(block.kind, AnthropicContentBlockKind::Text)
+                    && delta.get("text").is_some_and(Value::is_string)
             }
-            "thinking_delta" | "signature_delta" => {
+            "citations_delta" => {
+                matches!(block.kind, AnthropicContentBlockKind::Text)
+                    && delta.get("citation").is_some_and(Value::is_object)
+            }
+            "thinking_delta" => {
                 matches!(block.kind, AnthropicContentBlockKind::Thinking)
+                    && delta.get("thinking").is_some_and(Value::is_string)
+            }
+            "signature_delta" => {
+                matches!(block.kind, AnthropicContentBlockKind::Thinking)
+                    && delta.get("signature").is_some_and(Value::is_string)
             }
             "input_json_delta" => {
                 if !matches!(block.kind, AnthropicContentBlockKind::ToolUse) {
@@ -385,6 +469,11 @@ impl AnthropicSseInspector {
             _ => false,
         };
         if !compatible {
+            let delta_type = match delta_type {
+                "text_delta" | "citations_delta" | "thinking_delta" | "signature_delta"
+                | "input_json_delta" => delta_type,
+                _ => "unknown delta",
+            };
             return Err(AnthropicProtocolError::new(format!(
                 "Anthropic {delta_type} is incompatible with content block index {index}"
             )));
@@ -423,6 +512,16 @@ impl AnthropicSseInspector {
             )))
         }
     }
+
+    fn require_content_before_stop_reason(&self) -> Result<(), AnthropicProtocolError> {
+        if self.stop_reason.is_some() {
+            Err(AnthropicProtocolError::new(
+                "Anthropic content block arrived after stop_reason",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn required_index(value: &Value, event_type: &str) -> Result<u64, AnthropicProtocolError> {
@@ -433,7 +532,14 @@ fn required_index(value: &Value, event_type: &str) -> Result<u64, AnthropicProto
     })
 }
 
-fn validate_message_delta(value: &Value) -> Result<(), AnthropicProtocolError> {
+fn validate_message_delta(value: &Value) -> Result<Option<&str>, AnthropicProtocolError> {
+    let delta = value
+        .get("delta")
+        .filter(|delta| delta.is_object())
+        .ok_or_else(|| {
+            AnthropicProtocolError::new("Anthropic message_delta is missing delta object")
+        })?;
+    let stop_reason = validate_stop_fields(delta, "Anthropic message_delta")?;
     let usage = value
         .get("usage")
         .filter(|usage| usage.is_object())
@@ -454,7 +560,7 @@ fn validate_message_delta(value: &Value) -> Result<(), AnthropicProtocolError> {
             )));
         }
     }
-    Ok(())
+    Ok(stop_reason)
 }
 
 pub(super) fn inspect_json_document(
@@ -487,6 +593,8 @@ fn validate_message(value: &Value) -> Result<(), AnthropicProtocolError> {
         ));
     }
     required_string(value, "id", "Anthropic message")?;
+    required_string(value, "model", "Anthropic message")?;
+    validate_stop_fields(value, "Anthropic message")?;
     if value.get("role").and_then(Value::as_str) != Some("assistant") {
         return Err(AnthropicProtocolError::new(
             "Anthropic message role must be assistant",
@@ -496,6 +604,11 @@ fn validate_message(value: &Value) -> Result<(), AnthropicProtocolError> {
         return Err(AnthropicProtocolError::new(
             "Anthropic message content must be an array",
         ));
+    }
+    if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            validate_message_content_block(block)?;
+        }
     }
     let usage = value
         .get("usage")
@@ -509,6 +622,61 @@ fn validate_message(value: &Value) -> Result<(), AnthropicProtocolError> {
         }
     }
     Ok(())
+}
+
+fn validate_message_content_block(block: &Value) -> Result<(), AnthropicProtocolError> {
+    let block_type = required_string(block, "type", "Anthropic message content block")?;
+    match block_type {
+        "text" if !block.get("text").is_some_and(Value::is_string) => Err(
+            AnthropicProtocolError::new("Anthropic text content block text must be a string"),
+        ),
+        "thinking" if !block.get("thinking").is_some_and(Value::is_string) => {
+            Err(AnthropicProtocolError::new(
+                "Anthropic thinking content block thinking must be a string",
+            ))
+        }
+        "tool_use" | "server_tool_use" => {
+            required_string(block, "id", "Anthropic tool content block")?;
+            required_string(block, "name", "Anthropic tool content block")?;
+            if !block.get("input").is_some_and(Value::is_object) {
+                return Err(AnthropicProtocolError::new(
+                    "Anthropic tool content block input must be an object",
+                ));
+            }
+            Ok(())
+        }
+        "redacted_thinking" => validate_redacted_thinking_block(block),
+        _ => Ok(()),
+    }
+}
+
+fn validate_redacted_thinking_block(block: &Value) -> Result<(), AnthropicProtocolError> {
+    required_string(block, "data", "Anthropic redacted thinking block")?;
+    Ok(())
+}
+
+fn validate_stop_fields<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<Option<&'a str>, AnthropicProtocolError> {
+    let stop_reason = match value.get("stop_reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(reason)) if !reason.trim().is_empty() => Some(reason.as_str()),
+        Some(_) => {
+            return Err(AnthropicProtocolError::new(format!(
+                "{context} has invalid stop_reason"
+            )))
+        }
+    };
+    if value
+        .get("stop_sequence")
+        .is_some_and(|sequence| !sequence.is_null() && !sequence.is_string())
+    {
+        return Err(AnthropicProtocolError::new(format!(
+            "{context} has invalid stop_sequence"
+        )));
+    }
+    Ok(stop_reason)
 }
 
 fn anthropic_error(value: &Value) -> AnthropicError {
@@ -547,36 +715,72 @@ fn sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     Some(value.strip_prefix(' ').unwrap_or(value))
 }
 
-fn next_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|end| (end, 2));
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|end| (end, 4));
-    let cr = bytes
-        .windows(2)
-        .position(|window| window == b"\r\r")
-        .map(|end| (end, 2));
-    [lf, crlf, cr]
-        .into_iter()
-        .flatten()
-        .min_by_key(|(end, _)| *end)
+pub(super) fn next_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < bytes.len() {
+        let first_len = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let next = index + first_len;
+        let second_len = match bytes.get(next) {
+            Some(b'\r') if bytes.get(next + 1) == Some(&b'\n') => 2,
+            Some(b'\r' | b'\n') => 1,
+            _ => {
+                index = next;
+                continue;
+            }
+        };
+        return Some((index, first_len + second_len));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    const START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+    const START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
 
     #[test]
     fn inspector_handles_every_chunk_boundary_and_crlf() {
         let stream = format!(
             "{}event: message_delta\r\ndata: {{\"type\":\"message_delta\",\r\ndata: \"delta\":{{}},\"usage\":{{\"output_tokens\":1}}}}\r\n\r\nevent: message_stop\r\ndata: {{\"type\":\"message_stop\"}}\r\n\r\n",
             START.replace('\n', "\r\n")
+        );
+        for split in 0..=stream.len() {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(&stream.as_bytes()[..split]).unwrap();
+            inspector.push(&stream.as_bytes()[split..]).unwrap();
+            inspector.finish().unwrap();
+            assert_eq!(inspector.terminal(), Some(&AnthropicTerminal::Success));
+        }
+    }
+
+    #[test]
+    fn inspector_accepts_cr_delimited_sse_fields_and_events() {
+        let stream = START.replace('\n', "\r")
+            + "event: message_delta\rdata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\r\r"
+            + "event: message_stop\rdata: {\"type\":\"message_stop\"}\r\r";
+        for split in 0..=stream.len() {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(&stream.as_bytes()[..split]).unwrap();
+            inspector.push(&stream.as_bytes()[split..]).unwrap();
+            inspector.finish().unwrap();
+            assert_eq!(inspector.terminal(), Some(&AnthropicTerminal::Success));
+        }
+    }
+
+    #[test]
+    fn inspector_accepts_mixed_sse_blank_line_endings() {
+        let start = START.strip_suffix("\n\n").unwrap();
+        let stream = format!(
+            "{start}\n\r\nevent: message_delta\rdata: {{\"type\":\"message_delta\",\"delta\":{{}},\"usage\":{{\"output_tokens\":0}}}}\r\r\nevent: message_stop\rdata: {{\"type\":\"message_stop\"}}\r\r\n"
         );
         for split in 0..=stream.len() {
             let mut inspector = AnthropicSseInspector::default();
@@ -627,9 +831,151 @@ mod tests {
     }
 
     #[test]
+    fn inspector_rejects_oversized_unfinished_event_after_complete_event_in_same_chunk() {
+        let mut inspector = AnthropicSseInspector::default();
+        let mut chunk = START.as_bytes().to_vec();
+        chunk.extend_from_slice(b"event: content_block_delta\ndata: ");
+        chunk.extend(std::iter::repeat_n(b'x', MAX_EVENT_BYTES));
+        let error = inspector.push(&chunk).unwrap_err();
+        assert!(error.to_string().contains("8 MiB"), "{error}");
+        assert!(inspector.terminal().is_none());
+    }
+
+    #[test]
+    fn inspector_limits_each_event_not_the_total_network_chunk() {
+        let mut comment = vec![b':'];
+        comment.extend(std::iter::repeat_n(b'x', MAX_EVENT_BYTES / 2));
+        comment.extend_from_slice(b"\n\n");
+        let mut chunk = comment.clone();
+        chunk.extend_from_slice(&comment);
+        chunk.extend_from_slice(START.as_bytes());
+        chunk.extend_from_slice(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n",
+        );
+        chunk.extend_from_slice(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(&chunk).unwrap();
+        inspector.finish().unwrap();
+        assert_eq!(inspector.terminal(), Some(&AnthropicTerminal::Success));
+    }
+
+    #[test]
+    fn inspector_rejects_message_stop_without_message_delta() {
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(START.as_bytes()).unwrap();
+        let error = inspector
+            .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("message_delta"), "{error}");
+        assert!(inspector.terminal().is_none());
+    }
+
+    #[test]
+    fn inspector_rejects_message_delta_without_delta_object() {
+        for delta in [None, Some(Value::Null), Some(json!("")), Some(json!([]))] {
+            let mut event = json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 1}
+            });
+            if let Some(delta) = delta {
+                event["delta"] = delta;
+            }
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(START.as_bytes()).unwrap();
+            let frame = format!("data: {event}\n\n");
+            assert!(inspector.push(frame.as_bytes()).is_err(), "{event}");
+            assert!(inspector.terminal().is_none());
+        }
+
+        let mut valid = AnthropicSseInspector::default();
+        valid.push(START.as_bytes()).unwrap();
+        valid
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":1}}\n\n")
+            .unwrap();
+        valid
+            .push(b"data: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
+        valid.finish().unwrap();
+    }
+
+    #[test]
+    fn inspector_rejects_invalid_stop_reason_and_content_after_stop_reason() {
+        for reason in [Value::Null, json!(false), json!(1), json!(" ")] {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(START.as_bytes()).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":1}})
+            );
+            let result = inspector.push(frame.as_bytes());
+            if reason.is_null() {
+                assert!(result.is_ok(), "null remains a non-terminal hint");
+            } else {
+                assert!(result.is_err(), "invalid stop_reason {reason} must fail");
+            }
+        }
+
+        let mut late = AnthropicSseInspector::default();
+        late.push(START.as_bytes()).unwrap();
+        late.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
+            .unwrap();
+        assert!(late
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"late\"}}\n\n")
+            .is_err());
+        assert!(late.terminal().is_none());
+        assert!(late.finish().is_err());
+
+        let mut changed = AnthropicSseInspector::default();
+        changed.push(START.as_bytes()).unwrap();
+        changed
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
+            .unwrap();
+        assert!(changed
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n")
+            .is_err());
+
+        let mut usage_only = AnthropicSseInspector::default();
+        usage_only.push(START.as_bytes()).unwrap();
+        usage_only
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
+            .unwrap();
+        usage_only
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"valid\"}}\n\n")
+            .unwrap();
+        usage_only
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap();
+        usage_only
+            .push(b"data: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
+        usage_only.finish().unwrap();
+    }
+
+    #[test]
+    fn json_message_rejects_invalid_stop_fields() {
+        let mut message = json!({
+            "id":"msg_1","type":"message","role":"assistant",
+            "model":"claude-sonnet-4-6","content":[],
+            "usage":{"input_tokens":1,"output_tokens":1},
+            "stop_reason":"end_turn","stop_sequence":null
+        });
+        assert!(inspect_json_document(message.to_string().as_bytes(), false).is_ok());
+        for invalid in [json!(false), json!(1), json!(" ")] {
+            message["stop_reason"] = invalid;
+            assert!(inspect_json_document(message.to_string().as_bytes(), false).is_err());
+        }
+        message["stop_reason"] = json!("end_turn");
+        message["stop_sequence"] = json!({"unexpected":"value"});
+        assert!(inspect_json_document(message.to_string().as_bytes(), false).is_err());
+    }
+
+    #[test]
     fn inspector_rejects_events_after_message_stop() {
         let mut inspector = AnthropicSseInspector::default();
         inspector.push(START.as_bytes()).unwrap();
+        inspector
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
+            .unwrap();
         inspector
             .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
             .unwrap();
@@ -639,9 +985,76 @@ mod tests {
 
         let mut same_chunk = AnthropicSseInspector::default();
         same_chunk.push(START.as_bytes()).unwrap();
+        same_chunk
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
+            .unwrap();
         assert!(same_chunk
             .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\ntrailing-data")
             .is_err());
+    }
+
+    #[test]
+    fn inspector_cannot_restore_success_after_a_push_error() {
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(START.as_bytes()).unwrap();
+        inspector
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
+            .unwrap();
+        inspector
+            .push(b"data: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
+        let first = inspector
+            .push(b"data: {\"type\":\"message_stop\"}\n\n")
+            .unwrap_err();
+        assert!(first.to_string().contains("terminal"));
+        assert!(inspector.terminal().is_none());
+        assert!(inspector.finish().is_err());
+
+        let mut malformed = AnthropicSseInspector::default();
+        malformed.push(START.as_bytes()).unwrap();
+        assert!(malformed
+            .push(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":0}}\n\n")
+            .is_err());
+        assert!(malformed
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+            .is_err());
+        assert!(malformed.finish().is_err());
+        assert!(malformed.terminal().is_none());
+    }
+
+    #[test]
+    fn inspector_cannot_repair_a_failed_finish_with_late_events() {
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(START.as_bytes()).unwrap();
+        assert!(inspector.finish().is_err());
+        assert!(inspector
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+            .is_err());
+        assert!(inspector.finish().is_err());
+        assert!(inspector.terminal().is_none());
+    }
+
+    #[test]
+    fn inspector_protocol_errors_do_not_echo_untrusted_event_names() {
+        const SECRET: &str = "Bearer claude-protocol-secret";
+        let mut mismatched = AnthropicSseInspector::default();
+        let frame = format!("event: {SECRET}\ndata: {{\"type\":\"message_start\"}}\n\n");
+        let error = mismatched.push(frame.as_bytes()).unwrap_err();
+        assert!(!error.to_string().contains(SECRET), "{error}");
+
+        let mut unknown = AnthropicSseInspector::default();
+        let frame = format!("data: {{\"type\":\"{SECRET}\"}}\n\n");
+        let error = unknown.push(frame.as_bytes()).unwrap_err();
+        assert!(!error.to_string().contains(SECRET), "{error}");
+
+        let mut delta = AnthropicSseInspector::default();
+        delta.push(START.as_bytes()).unwrap();
+        delta
+            .push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+            .unwrap();
+        let frame = format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"{SECRET}\"}}}}\n\n");
+        let error = delta.push(frame.as_bytes()).unwrap_err();
+        assert!(!error.to_string().contains(SECRET), "{error}");
     }
 
     #[test]
@@ -686,6 +1099,76 @@ mod tests {
     }
 
     #[test]
+    fn inspector_rejects_known_content_deltas_without_typed_payloads() {
+        for (block_type, delta) in [
+            ("text", json!({"type": "text_delta"})),
+            ("text", json!({"type": "text_delta", "text": 7})),
+            ("text", json!({"type": "citations_delta"})),
+            (
+                "text",
+                json!({"type": "citations_delta", "citation": "bad"}),
+            ),
+            ("thinking", json!({"type": "thinking_delta"})),
+            (
+                "thinking",
+                json!({"type": "thinking_delta", "thinking": null}),
+            ),
+            ("thinking", json!({"type": "signature_delta"})),
+            (
+                "thinking",
+                json!({"type": "signature_delta", "signature": []}),
+            ),
+        ] {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(START.as_bytes()).unwrap();
+            let start = format!(
+                "data: {}\n\n",
+                json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": block_type}})
+            );
+            inspector.push(start.as_bytes()).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"type": "content_block_delta", "index": 0, "delta": delta})
+            );
+            assert!(inspector.push(frame.as_bytes()).is_err(), "{delta}");
+        }
+    }
+
+    #[test]
+    fn inspector_accepts_typed_content_delta_payloads_including_empty_strings() {
+        for (block_type, delta) in [
+            ("text", json!({"type": "text_delta", "text": ""})),
+            ("text", json!({"type": "citations_delta", "citation": {}})),
+            (
+                "thinking",
+                json!({"type": "thinking_delta", "thinking": ""}),
+            ),
+            (
+                "thinking",
+                json!({"type": "signature_delta", "signature": ""}),
+            ),
+        ] {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(START.as_bytes()).unwrap();
+            for event in [
+                json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": block_type}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": delta}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {},
+                    "usage": {"output_tokens": 1}}),
+                json!({"type": "message_stop"}),
+            ] {
+                inspector
+                    .push(format!("data: {event}\n\n").as_bytes())
+                    .unwrap();
+            }
+            inspector.finish().unwrap();
+        }
+    }
+
+    #[test]
     fn inspector_rejects_incomplete_tool_json_and_accepts_future_events() {
         let mut invalid_tool = AnthropicSseInspector::default();
         invalid_tool.push(START.as_bytes()).unwrap();
@@ -703,6 +1186,9 @@ mod tests {
         future.push(START.as_bytes()).unwrap();
         future
             .push(b"event: message_metadata\ndata: {\"type\":\"message_metadata\",\"future\":true}\n\n")
+            .unwrap();
+        future
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
             .unwrap();
         future
             .push(b"data: {\"type\":\"message_stop\"}\n\n")
@@ -724,14 +1210,74 @@ mod tests {
             .push(b"data: {\"type\":\"content_block_stop\",\"index\":9}\n\n")
             .unwrap();
         inspector
+            .push(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":0}}\n\n")
+            .unwrap();
+        inspector
             .push(b"data: {\"type\":\"message_stop\"}\n\n")
             .unwrap();
         inspector.finish().unwrap();
     }
 
     #[test]
+    fn redacted_thinking_requires_opaque_data_and_cannot_accept_thinking_deltas() {
+        for block in [
+            json!({"type": "redacted_thinking"}),
+            json!({"type": "redacted_thinking", "data": null}),
+            json!({"type": "redacted_thinking", "data": 42}),
+            json!({"type": "redacted_thinking", "data": ""}),
+        ] {
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(START.as_bytes()).unwrap();
+            let event = json!({"type": "content_block_start", "index": 0, "content_block": block});
+            let error = inspector
+                .push(format!("data: {event}\n\n").as_bytes())
+                .unwrap_err();
+            assert!(!error.to_string().contains("42"), "{error}");
+        }
+
+        let valid_start = json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque-signature"}});
+        let mut invalid_delta = AnthropicSseInspector::default();
+        invalid_delta.push(START.as_bytes()).unwrap();
+        invalid_delta
+            .push(format!("data: {valid_start}\n\n").as_bytes())
+            .unwrap();
+        let delta = json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "not opaque"}});
+        assert!(invalid_delta
+            .push(format!("data: {delta}\n\n").as_bytes())
+            .is_err());
+
+        let mut valid = AnthropicSseInspector::default();
+        valid.push(START.as_bytes()).unwrap();
+        for event in [
+            valid_start,
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}),
+            json!({"type": "message_stop"}),
+        ] {
+            valid.push(format!("data: {event}\n\n").as_bytes()).unwrap();
+        }
+        valid.finish().unwrap();
+        assert_eq!(valid.terminal(), Some(&AnthropicTerminal::Success));
+    }
+
+    #[test]
+    fn json_redacted_thinking_requires_opaque_data() {
+        let mut message = json!({"id": "msg_1", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-6", "content": [{"type": "redacted_thinking"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}});
+        assert!(inspect_json_document(message.to_string().as_bytes(), false).is_err());
+        message["content"][0]["data"] = json!("opaque-signature");
+        assert_eq!(
+            inspect_json_document(message.to_string().as_bytes(), false).unwrap(),
+            AnthropicJsonObservation::Success
+        );
+    }
+
+    #[test]
     fn json_inspector_validates_messages_and_count_tokens() {
-        let message = br#"{"id":"msg_1","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":2}}"#;
+        let message = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":2}}"#;
         assert_eq!(
             inspect_json_document(message, false).unwrap(),
             AnthropicJsonObservation::Success
@@ -742,5 +1288,68 @@ mod tests {
         );
         assert!(inspect_json_document(br#"{}"#, false).is_err());
         assert!(inspect_json_document(br#"{}"#, true).is_err());
+    }
+
+    #[test]
+    fn claude_success_requires_a_non_empty_reported_model() {
+        for model in [None, Some(""), Some("   ")] {
+            let mut message = serde_json::json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [], "usage": {"input_tokens": 1, "output_tokens": 0}
+            });
+            if let Some(model) = model {
+                message["model"] = Value::String(model.to_string());
+            }
+            let body = serde_json::to_vec(&message).unwrap();
+            assert!(
+                inspect_json_document(&body, false).is_err(),
+                "model={model:?}"
+            );
+
+            let event = format!(
+                "event: message_start\ndata: {}\n\n",
+                serde_json::json!({"type": "message_start", "message": message})
+            );
+            let mut inspector = AnthropicSseInspector::default();
+            assert!(inspector.push(event.as_bytes()).is_err(), "model={model:?}");
+        }
+    }
+
+    #[test]
+    fn nonstream_known_content_blocks_require_typed_payloads() {
+        for block in [
+            json!(42),
+            json!({"type":"text","text":17}),
+            json!({"type":"text"}),
+            json!({"type":"thinking","thinking":{}}),
+            json!({"type":"thinking"}),
+            json!({"type":"tool_use","name":"lookup","input":{}}),
+            json!({"type":"tool_use","id":"tool_1","name":"lookup","input":[]}),
+            json!({"type":"server_tool_use","id":"tool_1","name":"search"}),
+        ] {
+            let message = json!({
+                "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6",
+                "content":[block],"stop_reason":"end_turn",
+                "usage":{"input_tokens":1,"output_tokens":1}
+            });
+            assert!(
+                inspect_json_document(message.to_string().as_bytes(), false).is_err(),
+                "known content block with malformed fields must not become success: {message}"
+            );
+        }
+
+        for block in [
+            json!({"type":"text","text":""}),
+            json!({"type":"thinking","thinking":""}),
+            json!({"type":"tool_use","id":"tool_1","name":"lookup","input":{}}),
+            json!({"type":"future_content","payload":{"version":1}}),
+        ] {
+            let message = json!({
+                "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6",
+                "content":[block],"stop_reason":"end_turn",
+                "usage":{"input_tokens":1,"output_tokens":1}
+            });
+            assert!(inspect_json_document(message.to_string().as_bytes(), false).is_ok());
+        }
     }
 }

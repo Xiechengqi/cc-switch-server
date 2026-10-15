@@ -36,9 +36,13 @@ pub fn is_declared_tool(declared: &[String], tool_name: &str) -> bool {
 pub fn resolve_mcp_tool_by_aliases(declared: &[String], aliases: &[&str]) -> Option<String> {
     for name in declared {
         let lower = normalize_tool_name(name);
+        let leaf = lower
+            .rsplit_once('.')
+            .filter(|(namespace, _)| !namespace.is_empty())
+            .map(|(_, leaf)| leaf);
         if aliases
             .iter()
-            .any(|alias| lower == *alias || lower.contains(alias))
+            .any(|alias| lower == *alias || leaf == Some(*alias))
         {
             return Some(name.clone());
         }
@@ -430,5 +434,25 @@ mod tests {
 
         assert!(resolve_shell_mcp_tool_name(&declared(&["weather"])).is_none());
         assert!(bridge_read_tool(&declared(&["weather"]), "main.rs", None, None).is_none());
+    }
+
+    #[test]
+    fn builtin_bridge_does_not_infer_tool_kind_from_name_substrings() {
+        let unrelated = declared(&["undelete", "breadboard", "research_notes", "unshell"]);
+        assert!(
+            bridge_builtin_tool(BuiltinBridgeKind::Delete, &unrelated, "old.rs", "", "").is_none()
+        );
+        assert!(bridge_read_tool(&unrelated, "main.rs", None, None).is_none());
+        assert!(bridge_grep_tool(&unrelated, "needle", ".", "", "", false, None).is_none());
+        assert!(resolve_shell_mcp_tool_name(&unrelated).is_none());
+
+        let namespaced = declared(&["functions.grep", "functions.undelete"]);
+        assert_eq!(
+            bridge_grep_tool(&namespaced, "needle", ".", "", "", false, None).map(|(name, _)| name),
+            Some("functions.grep".to_string())
+        );
+        assert!(
+            bridge_builtin_tool(BuiltinBridgeKind::Delete, &namespaced, "old.rs", "", "").is_none()
+        );
     }
 }

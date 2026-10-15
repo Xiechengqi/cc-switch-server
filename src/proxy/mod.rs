@@ -13,6 +13,7 @@ mod cache_injector;
 mod claude_client_detection;
 pub(crate) mod claude_oauth;
 mod claude_quota_headers;
+pub(crate) mod claude_thread_alias;
 pub(crate) mod codebuddy;
 pub(crate) mod codebuddy_runtime;
 mod codex_compaction;
@@ -173,8 +174,12 @@ impl ProxyError {
     const CURSOR_SESSION_LOST_PREFIX: &'static str = "[CURSOR_SESSION_LOST] ";
     const CURSOR_RESPONSE_STATE_LOST_PREFIX: &'static str = "[CURSOR_RESPONSE_STATE_LOST] ";
     const CURSOR_CONVERSATION_BUSY_PREFIX: &'static str = "[CURSOR_CONVERSATION_BUSY] ";
+    const CURSOR_SESSION_CAPACITY_EXHAUSTED_PREFIX: &'static str =
+        "[CURSOR_SESSION_CAPACITY_EXHAUSTED] ";
     const CURSOR_CONTINUATION_IN_PROGRESS_PREFIX: &'static str =
         "[CURSOR_CONTINUATION_IN_PROGRESS] ";
+    const CURSOR_CONTINUATION_CLAIM_CAPACITY_PREFIX: &'static str =
+        "[CURSOR_CONTINUATION_CLAIM_CAPACITY] ";
     const RETRY_AFTER_PREFIX: &'static str = "[CC_RETRY_AFTER_SECONDS=";
     const CAPACITY_SHED_PREFIX: &'static str = "[CC_UPSTREAM_CAPACITY_SHED] ";
     const CONCURRENCY_PREFIX: &'static str = "[CC_CONCURRENCY:";
@@ -252,6 +257,16 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn qoder_response_context_unavailable() -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: format!(
+                "{}Qoder previous response context is unavailable",
+                Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX
+            ),
+        }
+    }
+
     pub(super) fn is_protocol_incompatible(&self) -> bool {
         self.message_without_retry_metadata()
             .starts_with(Self::PROTOCOL_INCOMPATIBLE_PREFIX)
@@ -286,6 +301,17 @@ impl ProxyError {
         }
     }
 
+    pub(super) fn cursor_session_capacity_exhausted() -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{}1]{}Cursor live session capacity is exhausted; retry shortly",
+                Self::RETRY_AFTER_PREFIX,
+                Self::CURSOR_SESSION_CAPACITY_EXHAUSTED_PREFIX,
+            ),
+        }
+    }
+
     pub(super) fn cursor_continuation_in_progress(message: impl Into<String>) -> Self {
         const RETRY_AFTER_SECONDS: u64 = 5;
         Self {
@@ -295,6 +321,17 @@ impl ProxyError {
                 Self::RETRY_AFTER_PREFIX,
                 Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX,
                 message.into()
+            ),
+        }
+    }
+
+    pub(super) fn cursor_continuation_claim_capacity_exhausted() -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{}5]{}Cursor continuation claim capacity is exhausted; retry shortly",
+                Self::RETRY_AFTER_PREFIX,
+                Self::CURSOR_CONTINUATION_CLAIM_CAPACITY_PREFIX,
             ),
         }
     }
@@ -368,6 +405,7 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::CURSOR_RESPONSE_STATE_LOST_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_CONVERSATION_BUSY_PREFIX))
             .or_else(|| message.strip_prefix(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX))
+            .or_else(|| message.strip_prefix(Self::CURSOR_CONTINUATION_CLAIM_CAPACITY_PREFIX))
             .or_else(|| message.strip_prefix(Self::USER_IDENTITY_REQUIRED_PREFIX))
             .or_else(|| message.strip_prefix(Self::PROTOCOL_INCOMPATIBLE_PREFIX))
             .or_else(|| message.strip_prefix(Self::RESPONSE_CONTEXT_UNAVAILABLE_PREFIX))
@@ -476,8 +514,14 @@ impl ProxyError {
         if message.starts_with(Self::CURSOR_CONVERSATION_BUSY_PREFIX) {
             return "cursor_conversation_busy";
         }
+        if message.starts_with(Self::CURSOR_SESSION_CAPACITY_EXHAUSTED_PREFIX) {
+            return "cursor_session_capacity_exhausted";
+        }
         if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {
             return "cursor_continuation_in_progress";
+        }
+        if message.starts_with(Self::CURSOR_CONTINUATION_CLAIM_CAPACITY_PREFIX) {
+            return "cursor_continuation_claim_capacity_exhausted";
         }
         match self.status {
             axum::http::StatusCode::BAD_REQUEST => "cc_switch_invalid_request",
@@ -838,6 +882,12 @@ mod tests {
         assert_eq!(busy.error_code(), "cursor_conversation_busy");
         assert_eq!(busy.client_message(), "running");
 
+        let capacity = ProxyError::cursor_session_capacity_exhausted();
+        assert_eq!(capacity.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(capacity.error_code(), "cursor_session_capacity_exhausted");
+        assert_eq!(capacity.retry_after_seconds(), Some(1));
+        assert!(capacity.retryable());
+
         let continuation =
             ProxyError::cursor_continuation_in_progress("continuation is still running");
         assert_eq!(continuation.status, axum::http::StatusCode::CONFLICT);
@@ -848,6 +898,19 @@ mod tests {
             continuation.client_message(),
             "continuation is still running"
         );
+
+        let claim_capacity = ProxyError::cursor_continuation_claim_capacity_exhausted();
+        assert_eq!(
+            claim_capacity.status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            claim_capacity.error_code(),
+            "cursor_continuation_claim_capacity_exhausted"
+        );
+        assert_eq!(claim_capacity.retry_after_seconds(), Some(5));
+        assert!(claim_capacity.retryable());
+        assert!(!claim_capacity.client_message().contains("[CURSOR_"));
 
         let unsupported = ProxyError::bad_request(
             "unsupported parameter `background`: Cursor responses run synchronously",

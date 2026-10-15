@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use bytes::Bytes;
 use rand::RngCore;
 use serde_json::Value;
@@ -94,6 +96,7 @@ pub(crate) struct ClaudeForwardContract {
     pub headers: Vec<(&'static str, String)>,
     pub session_id: Option<String>,
     pub tool_name_map: BTreeMap<String, String>,
+    pub thread_mode: Option<super::claude_thread_alias::ClaudeThreadMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +213,7 @@ fn apply_forward_contract_inner(
     let mut body_shape = None;
     let mut internal_betas = Vec::new();
     let mut tool_name_map = BTreeMap::new();
+    let mut thread_mode = None;
     let mut client_class = ClaudeClientClass::ThirdPartyAnthropic;
     if !body.is_empty() {
         let mut value = serde_json::from_slice(body).map_err(|error| {
@@ -217,6 +221,7 @@ fn apply_forward_contract_inner(
                 "claude oauth request body must be valid json: {error}"
             ))
         })?;
+        thread_mode = super::claude_thread_alias::thread_mode_from_value(&value)?;
         let billing_header = claude_billing_header_text_for_prompt(
             first_user_text_for_billing(&value).unwrap_or_default(),
         );
@@ -239,6 +244,7 @@ fn apply_forward_contract_inner(
             )
         });
         tool_name_map = normalize_claude_oauth_tool_names(&mut value, tool_alias_seed.as_deref())?;
+        normalize_claude_oauth_tool_ids(&mut value);
         if tool_name_map
             .iter()
             .any(|(wire, original)| wire != &original.to_ascii_lowercase())
@@ -329,6 +335,7 @@ fn apply_forward_contract_inner(
         headers,
         session_id,
         tool_name_map,
+        thread_mode,
     })
 }
 
@@ -357,6 +364,7 @@ fn hoist_leading_text_system_messages(body: &mut Value) -> bool {
         }
         run_end += 1;
         let mut found_text = false;
+        let mut remaining_blocks = Vec::new();
         match message.get("content") {
             Some(Value::String(text)) if !text.is_empty() => {
                 hoisted.push(serde_json::json!({"type": "text", "text": text}));
@@ -372,12 +380,25 @@ fn hoist_leading_text_system_messages(body: &mut Value) -> bool {
                     {
                         hoisted.push(block.clone());
                         found_text = true;
+                    } else {
+                        remaining_blocks.push(block.clone());
                     }
                 }
             }
             _ => {}
         }
-        if !found_text {
+        if found_text
+            && (!remaining_blocks.is_empty()
+                || message.as_object().is_some_and(|object| {
+                    object
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "role" | "content"))
+                }))
+        {
+            let mut retained = message.clone();
+            retained["content"] = Value::Array(remaining_blocks);
+            retained_leading.push(retained);
+        } else if !found_text {
             retained_leading.push(message.clone());
         }
     }
@@ -499,10 +520,82 @@ fn normalize_claude_oauth_tool_names(
                     }
                     _ => {}
                 }
+                rewrite_claude_nested_tool_references(block, &request_names);
+                rewrite_claude_tool_change_name(block, &request_names);
             }
         }
     }
     Ok(aliases)
+}
+
+fn normalize_claude_oauth_tool_ids(body: &mut Value) {
+    fn id_field(block: &Value) -> Option<&'static str> {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => Some("id"),
+            Some("tool_result") => Some("tool_use_id"),
+            _ => None,
+        }
+    }
+
+    fn portable(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut used = HashSet::new();
+    for block in messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+    {
+        if let Some(id) = id_field(block)
+            .and_then(|field| block.get(field))
+            .and_then(Value::as_str)
+            .filter(|id| portable(id))
+        {
+            used.insert(id.to_string());
+        }
+    }
+
+    let mut aliases = HashMap::new();
+    for block in messages
+        .iter_mut()
+        .filter_map(|message| message.get_mut("content").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let Some(field) = id_field(block) else {
+            continue;
+        };
+        let Some(original) = block
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && !portable(id))
+        else {
+            continue;
+        };
+        let alias = aliases.entry(original.to_string()).or_insert_with(|| {
+            let mut hash = Sha256::new();
+            hash.update(b"cc-switch-claude-tool-id\0");
+            hash.update(original.as_bytes());
+            let base = format!("ctid_{}", URL_SAFE_NO_PAD.encode(hash.finalize()));
+            let mut candidate = base.clone();
+            let mut collision = 0_u32;
+            while used.contains(&candidate) {
+                collision = collision.saturating_add(1);
+                candidate = format!("{base}_{collision}");
+            }
+            used.insert(candidate.clone());
+            candidate
+        });
+        if let Some(object) = block.as_object_mut() {
+            object.insert(field.to_string(), Value::String(alias.clone()));
+        }
+    }
 }
 
 fn custom_tool_alias_enabled() -> bool {
@@ -515,6 +608,15 @@ fn claude_tool_name_is_legal(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn claude_tool_name_needs_prior_alias(name: &str) -> bool {
+    !claude_tool_name_is_legal(name)
+        || CLAUDE_CODE_TOOL_NAMES
+            .iter()
+            .copied()
+            .find(|canonical| canonical.eq_ignore_ascii_case(name))
+            .is_some_and(|canonical| canonical != name)
 }
 
 fn feature_enabled(name: &str, default: bool) -> bool {
@@ -564,6 +666,80 @@ fn rewrite_claude_tool_name_field(
     }
 }
 
+pub(crate) fn rewrite_claude_nested_tool_references(
+    block: &mut Value,
+    request_names: &BTreeMap<String, String>,
+) {
+    let references = match block.get("type").and_then(Value::as_str) {
+        Some("tool_result") => block.get_mut("content").and_then(Value::as_array_mut),
+        Some("tool_search_tool_result") => block
+            .pointer_mut("/content/tool_references")
+            .and_then(Value::as_array_mut),
+        _ => None,
+    };
+    if let Some(references) = references {
+        for reference in references {
+            if reference.get("type").and_then(Value::as_str) == Some("tool_reference") {
+                rewrite_claude_tool_name_field(reference, "tool_name", request_names);
+            }
+        }
+    }
+}
+
+fn claude_tool_change_name_container_path(block: &Value) -> Option<&'static str> {
+    let kind = block.get("type").and_then(Value::as_str)?;
+    let tool_type = block.pointer("/tool/type").and_then(Value::as_str)?;
+    match (kind, tool_type) {
+        ("tool_addition" | "tool_removal", "tool_reference") => Some("/tool"),
+        ("tool_addition", "tool_definition") => {
+            let definition = block.pointer("/tool/definition")?;
+            (!definition
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(claude_server_tool_type))
+            .then_some("/tool/definition")
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn claude_tool_change_alias_target(block: &Value) -> Option<&str> {
+    block
+        .pointer(claude_tool_change_name_container_path(block)?)?
+        .get("name")
+        .and_then(Value::as_str)
+}
+
+pub(crate) fn rewrite_claude_tool_change_name(
+    block: &mut Value,
+    request_names: &BTreeMap<String, String>,
+) {
+    let Some(path) = claude_tool_change_name_container_path(block) else {
+        return;
+    };
+    if let Some(container) = block.pointer_mut(path) {
+        rewrite_claude_tool_name_field(container, "name", request_names);
+    }
+}
+
+fn claude_server_tool_type(tool_type: &str) -> bool {
+    let tool_type = tool_type.trim().to_ascii_lowercase();
+    [
+        "advisor_",
+        "agent_toolset_",
+        "bash_",
+        "code_execution_",
+        "computer_",
+        "memory_",
+        "text_editor_",
+        "tool_search_tool_",
+        "web_fetch_",
+        "web_search_",
+    ]
+    .iter()
+    .any(|prefix| tool_type.starts_with(prefix))
+}
+
 pub(crate) fn restore_claude_tool_names_in_response_bytes(
     body: Bytes,
     aliases: &BTreeMap<String, String>,
@@ -609,6 +785,9 @@ fn restore_claude_tool_names_in_value(
         })
     {
         changed |= restore_claude_tool_name_field(object, "name", aliases);
+    }
+    if object.get("type").and_then(Value::as_str) == Some("tool_reference") {
+        changed |= restore_claude_tool_name_field(object, "tool_name", aliases);
     }
     for nested_key in ["function", "functionCall", "function_call"] {
         if let Some(nested) = object.get_mut(nested_key).and_then(Value::as_object_mut) {
@@ -765,15 +944,7 @@ impl ClaudeToolNameStreamPatcher {
 }
 
 fn claude_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
-        if buffer.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, 2));
-        }
-        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-    }
-    None
+    super::anthropic_semantics::next_event_boundary(buffer)
 }
 
 fn rewrite_claude_sse_event(event: &[u8], aliases: &BTreeMap<String, String>) -> Vec<u8> {
@@ -808,22 +979,22 @@ fn single_sse_data_payload_range(event: &[u8]) -> Option<(usize, usize)> {
     while cursor < event.len() {
         let line_end = event[cursor..]
             .iter()
-            .position(|byte| *byte == b'\n')
+            .position(|byte| matches!(*byte, b'\r' | b'\n'))
             .map(|offset| cursor + offset)
             .unwrap_or(event.len());
-        let content_end = line_end
-            .checked_sub(1)
-            .filter(|index| event.get(*index) == Some(&b'\r'))
-            .unwrap_or(line_end);
-        let line = &event[cursor..content_end];
+        let line = &event[cursor..line_end];
         if let Some(payload) = line.strip_prefix(b"data:") {
             if found.is_some() {
                 return None;
             }
             let leading_spaces = payload.iter().take_while(|byte| **byte == b' ').count();
-            found = Some((cursor + b"data:".len() + leading_spaces, content_end));
+            found = Some((cursor + b"data:".len() + leading_spaces, line_end));
         }
-        cursor = line_end.saturating_add(1);
+        cursor = if event.get(line_end..line_end + 2) == Some(b"\r\n") {
+            line_end + 2
+        } else {
+            line_end.saturating_add(1)
+        };
     }
     found
 }
@@ -1268,6 +1439,31 @@ fn ensure_claude_defaults(body: &mut Value) {
                 })
             });
     }
+}
+
+pub(crate) fn apply_responses_default_max_tokens(input: &mut Value) {
+    // Explicit limits, including unsupported values, retain the shared
+    // transform's existing handling. Only an omitted or null limit uses the
+    // Claude OAuth model catalog before reasoning budgets are calculated.
+    if ["max_output_tokens", "max_completion_tokens", "max_tokens"]
+        .iter()
+        .any(|key| input.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return;
+    }
+    let Some(capability) = input
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(claude_model_capability)
+    else {
+        return;
+    };
+    let default = if capability.id.contains("fable") {
+        capability.max_output_tokens.min(64_000)
+    } else {
+        capability.max_output_tokens
+    };
+    input["max_output_tokens"] = Value::from(default);
 }
 
 fn normalize_claude_sampling(body: &mut Value) {
@@ -2727,6 +2923,29 @@ mod tests {
     }
 
     #[test]
+    fn native_leading_mixed_system_preserves_effort_and_non_text_blocks() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "style"},
+                    {"type": "future_directive", "value": "keep"}
+                ], "output_config": {"effort": "low"}},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        assert!(hoist_leading_text_system_messages(&mut body));
+        assert_eq!(body["system"], json!([{"type": "text", "text": "style"}]));
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["output_config"]["effort"], "low");
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type": "future_directive", "value": "keep"}])
+        );
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
     fn native_user_first_system_hoist_is_a_value_identical_noop() {
         let mut body = json!({
             "system": [{"type": "text", "text": "existing"}],
@@ -2767,6 +2986,37 @@ mod tests {
         assert_eq!(value["system"][1]["text"], "style");
         assert_eq!(value["system"][1]["cache_control"]["ttl"], "1h");
         assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(sign_claude_oauth_messages_body(value.clone()), value);
+    }
+
+    #[test]
+    fn native_forward_contract_keeps_mixed_leading_effort_directive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-app", axum::http::HeaderValue::from_static("cli"));
+        headers.insert(
+            "user-agent",
+            axum::http::HeaderValue::from_static("claude-cli/2.1.258 (external, cli, linux-x64)"),
+        );
+        headers.insert(
+            "x-stainless-package-version",
+            axum::http::HeaderValue::from_static("0.112.1"),
+        );
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static(CLAUDE_CODE_BETA),
+        );
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","metadata":{"user_id":"user_a_account__session_abc"},"messages":[{"role":"system","content":[{"type":"text","text":"style"}],"output_config":{"effort":"low"}},{"role":"user","content":"hi"}]}"#,
+        );
+
+        apply_forward_contract(&mut url, &mut body, &headers, "account-123", false, None).unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["system"][0]["text"], "style");
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], json!([]));
+        assert_eq!(value["messages"][0]["output_config"]["effort"], "low");
+        assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(sign_claude_oauth_messages_body(value.clone()), value);
     }
 
@@ -2975,6 +3225,36 @@ mod tests {
             result["messages"][0]["content"].as_str().unwrap_or(""),
             "Be helpful."
         );
+    }
+
+    #[test]
+    fn third_party_caller_system_precedes_leading_user_run_and_single_terminal_user() {
+        for messages in [
+            json!([
+                {"role":"user","content":"first"},
+                {"role":"user","content":"second"},
+                {"role":"assistant","content":"answer"}
+            ]),
+            json!([{"role":"user","content":"only turn"}]),
+        ] {
+            let body = json!({"model":"claude-sonnet-4-6","system":"Caller instruction","messages":messages.clone()});
+            let result = normalize_claude_code_identity(body, "billing-test");
+            assert_eq!(
+                result
+                    .pointer("/messages/0/content")
+                    .and_then(Value::as_str),
+                Some("Caller instruction")
+            );
+            assert_eq!(
+                result["messages"].as_array().unwrap().len(),
+                messages.as_array().unwrap().len() + 1
+            );
+            assert_eq!(result["messages"][1], messages[0]);
+            assert_eq!(
+                result.pointer("/system/1/text").and_then(Value::as_str),
+                Some(CLAUDE_CODE_IDENTITY_TEXT)
+            );
+        }
     }
 
     #[test]
@@ -4353,6 +4633,73 @@ mod tests {
     }
 
     #[test]
+    fn claude_oauth_repairs_nonportable_history_tool_ids_as_one_pair() {
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from(
+            json!({
+                "model":"claude-sonnet-4-6","max_tokens":16,
+                "messages":[
+                    {"role":"assistant","content":[{"type":"tool_use","id":"call/one","name":"lookup","input":{}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"call/one","content":"ok"}]}
+                ]
+            })
+            .to_string(),
+        );
+        apply_forward_contract(
+            &mut url,
+            &mut body,
+            &HeaderMap::new(),
+            "account-1",
+            false,
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let call_id = value["messages"][0]["content"][0]["id"].as_str().unwrap();
+        let result_id = value["messages"][1]["content"][0]["tool_use_id"]
+            .as_str()
+            .unwrap();
+        assert_ne!(call_id, "call/one");
+        assert!(call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'));
+        assert_eq!(call_id, result_id);
+        assert_eq!(sign_claude_oauth_messages_body(value.clone()), value);
+    }
+
+    #[test]
+    fn claude_tool_id_aliases_preserve_legal_ids_and_avoid_collisions() {
+        let mut probe = json!({"messages":[{"content":[{"type":"tool_use","id":"call/one"}]}]});
+        normalize_claude_oauth_tool_ids(&mut probe);
+        let occupied = probe["messages"][0]["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut body = json!({"messages":[
+            {"content":[
+                {"type":"tool_use","id":occupied,"name":"lookup","input":{}},
+                {"type":"tool_use","id":"call/one","name":"lookup","input":{}}
+            ]},
+            {"content":[
+                {"type":"tool_result","tool_use_id":"call/one","content":"ok"},
+                {"type":"text","id":"leave/ordinary/id","text":"hello"}
+            ]}
+        ]});
+        normalize_claude_oauth_tool_ids(&mut body);
+        assert_eq!(body["messages"][0]["content"][0]["id"], occupied);
+        let repaired = body["messages"][0]["content"][1]["id"].as_str().unwrap();
+        assert_ne!(repaired, occupied);
+        assert!(repaired
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'));
+        assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], repaired);
+        assert_eq!(body["messages"][1]["content"][1]["id"], "leave/ordinary/id");
+        let once = body.clone();
+        normalize_claude_oauth_tool_ids(&mut body);
+        assert_eq!(body, once);
+    }
+
+    #[test]
     fn claude_oauth_tool_names_use_canonical_wire_case_and_restore_declared_case() {
         let mut request = json!({
             "tools": [
@@ -4466,6 +4813,166 @@ mod tests {
         assert_eq!(
             restored.pointer("/content/0/input/nested/name"),
             Some(&json!(custom_alias))
+        );
+    }
+
+    #[test]
+    fn invalid_custom_tool_alias_rewrites_only_declared_tool_changes() {
+        let mut request = json!({
+            "tools":[{"name":"mcp__bad/name","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":[
+                {"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__bad/name"}},
+                {"type":"tool_removal","tool":{"type":"tool_reference","name":"mcp__bad/name"}},
+                {"type":"tool_addition","tool":{"type":"tool_definition","definition":{"type":"custom","name":"mcp__bad/name"}}},
+                {"type":"tool_addition","tool":{"type":"tool_definition","definition":{"type":"web_search_20250305","name":"mcp__bad/name"}}},
+                {"type":"text","text":"mcp__bad/name"}
+            ]}]
+        });
+        normalize_claude_oauth_tool_names(&mut request, Some("account\0session")).unwrap();
+        let alias = request["tools"][0]["name"].as_str().unwrap();
+        assert!(alias.starts_with("cc_tool_"));
+        for pointer in [
+            "/messages/0/content/0/tool/name",
+            "/messages/0/content/1/tool/name",
+            "/messages/0/content/2/tool/definition/name",
+        ] {
+            assert_eq!(
+                request.pointer(pointer).and_then(Value::as_str),
+                Some(alias)
+            );
+        }
+        assert_eq!(
+            request
+                .pointer("/messages/0/content/3/tool/definition/name")
+                .and_then(Value::as_str),
+            Some("mcp__bad/name")
+        );
+        assert_eq!(
+            request
+                .pointer("/messages/0/content/4/text")
+                .and_then(Value::as_str),
+            Some("mcp__bad/name")
+        );
+    }
+
+    #[test]
+    fn forward_contract_keeps_nested_tool_references_on_the_declared_alias() {
+        let original = "mcp__weather:forecast";
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":64,
+                "tools":[{"name":original,"input_schema":{"type":"object"}}],
+                "messages":[
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"toolu_1","content":[
+                            {"type":"tool_reference","tool_name":original},
+                            {"type":"text","text":"business","tool_name":original}
+                        ]},
+                        {"type":"tool_reference","tool_name":"undeclared"}
+                    ]},
+                    {"role":"assistant","content":[{"type":"tool_search_tool_result",
+                        "content":{"tool_references":[
+                            {"type":"tool_reference","tool_name":original},
+                            {"type":"text","tool_name":original}
+                        ]}
+                    }]}
+                ]
+            }))
+            .unwrap(),
+        );
+        apply_forward_contract(
+            &mut url,
+            &mut body,
+            &HeaderMap::new(),
+            "account",
+            false,
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let alias = value["tools"][0]["name"].as_str().unwrap();
+        assert!(alias.starts_with("cc_tool_"));
+        assert_eq!(
+            value["messages"][0]["content"][0]["content"][0]["tool_name"],
+            alias
+        );
+        assert_eq!(
+            value["messages"][1]["content"][0]["content"]["tool_references"][0]["tool_name"],
+            alias
+        );
+        assert_eq!(
+            value["messages"][0]["content"][0]["content"][1]["tool_name"],
+            original
+        );
+        assert_eq!(
+            value["messages"][1]["content"][0]["content"]["tool_references"][1]["tool_name"],
+            original
+        );
+        assert_eq!(
+            value["messages"][0]["content"][1]["tool_name"],
+            "undeclared"
+        );
+    }
+
+    #[test]
+    fn response_restores_protocol_tool_references_but_not_tool_input() {
+        let original = "mcp__weather:forecast";
+        let alias = "cc_tool_alias";
+        let aliases = BTreeMap::from([(alias.to_string(), original.to_string())]);
+        let response = json!({"content":[
+            {"type":"tool_reference","tool_name":alias},
+            {"type":"tool_result","content":[{"type":"tool_reference","tool_name":alias}]},
+            {"type":"tool_search_tool_result","content":{"tool_references":[
+                {"type":"tool_reference","tool_name":alias}
+            ]}},
+            {"type":"tool_use","name":alias,"input":{"type":"tool_reference","tool_name":alias}}
+        ]});
+        let restored = restore_claude_tool_names_in_response_bytes(
+            Bytes::from(serde_json::to_vec(&response).unwrap()),
+            &aliases,
+        );
+        let value: Value = serde_json::from_slice(&restored).unwrap();
+        for pointer in [
+            "/content/0/tool_name",
+            "/content/1/content/0/tool_name",
+            "/content/2/content/tool_references/0/tool_name",
+        ] {
+            assert_eq!(value.pointer(pointer), Some(&json!(original)), "{pointer}");
+        }
+        assert_eq!(value["content"][3]["name"], original);
+        assert_eq!(value["content"][3]["input"]["tool_name"], alias);
+    }
+
+    #[test]
+    fn stream_restores_nested_tool_references_across_chunk_boundaries() {
+        let original = "mcp__weather:forecast";
+        let alias = "cc_tool_alias";
+        let aliases = BTreeMap::from([(alias.to_string(), original.to_string())]);
+        let event = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_search_tool_result","content":{"tool_references":[
+                    {"type":"tool_reference","tool_name":alias}
+                ]}
+            }})
+        );
+        let mut patcher = ClaudeToolNameStreamPatcher::new(aliases);
+        let mut output = Vec::new();
+        for chunk in event.as_bytes().chunks(7) {
+            output.extend_from_slice(&patcher.push(Bytes::copy_from_slice(chunk)));
+        }
+        output.extend_from_slice(&patcher.finish());
+        let data = std::str::from_utf8(&output).unwrap();
+        let payload = data
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let value: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            value.pointer("/content_block/content/tool_references/0/tool_name"),
+            Some(&json!(original))
         );
     }
 
@@ -4644,6 +5151,42 @@ mod tests {
         assert!(output.contains("event: content_block_start\r\n"));
         assert!(output.contains("data: {\"type\":\"message_stop\"}"));
         assert!(patcher.finish().is_empty());
+    }
+
+    #[test]
+    fn claude_tool_name_stream_patcher_restores_cr_delimited_sse_events() {
+        let mut patcher = ClaudeToolNameStreamPatcher::new(BTreeMap::from([(
+            "cc_tool_deadbeef".to_string(),
+            "mcp.server:read".to_string(),
+        )]));
+        let event = b"event: content_block_start\rdata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"cc_tool_deadbeef\"}}\r\r";
+        let mut output = Vec::new();
+        for chunk in event.chunks(5) {
+            output.extend_from_slice(&patcher.push(Bytes::copy_from_slice(chunk)));
+        }
+        output.extend_from_slice(&patcher.finish());
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("\"name\":\"mcp.server:read\""));
+        assert!(output.ends_with("\r\r"));
+    }
+
+    #[test]
+    fn claude_tool_name_stream_patcher_restores_mixed_blank_line_endings() {
+        let event = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"cc_tool_deadbeef\"}}\n\r\n";
+        for split in 0..=event.len() {
+            let mut patcher = ClaudeToolNameStreamPatcher::new(BTreeMap::from([(
+                "cc_tool_deadbeef".to_string(),
+                "mcp.server:read".to_string(),
+            )]));
+            let mut output = patcher
+                .push(Bytes::copy_from_slice(&event[..split]))
+                .to_vec();
+            output.extend_from_slice(&patcher.push(Bytes::copy_from_slice(&event[split..])));
+            output.extend_from_slice(&patcher.finish());
+            let output = std::str::from_utf8(&output).unwrap();
+            assert!(output.contains("\"name\":\"mcp.server:read\""));
+            assert!(output.ends_with("\n\r\n"));
+        }
     }
 
     #[test]

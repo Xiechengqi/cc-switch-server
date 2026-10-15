@@ -4024,11 +4024,33 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
                         .to_string(),
                     ),
                     "empty-stream" => ("text/event-stream", String::new()),
+                    "missing-model" => (
+                        "application/json",
+                        json!({
+                            "id": "msg-missing-model", "type": "message", "role": "assistant",
+                            "content": [], "usage": {"input_tokens": 1, "output_tokens": 0}
+                        })
+                        .to_string(),
+                    ),
+                    "missing-model-stream" => (
+                        "text/event-stream",
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-missing-model\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n".to_string(),
+                    ),
+                    "invalid-redacted-json" => (
+                        "application/json",
+                        json!({
+                            "id": "msg-invalid-redacted", "type": "message", "role": "assistant",
+                            "model": "invalid-redacted-json",
+                            "content": [{"type": "redacted_thinking"}],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })
+                        .to_string(),
+                    ),
                     "truncated-stream" => (
                         "text/event-stream",
                         concat!(
                             "event: message_start\n",
-                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-truncated\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-truncated\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"truncated-stream\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
                             "event: content_block_start\n",
                             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
                             "event: content_block_delta\n",
@@ -4042,6 +4064,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
                             "id": "msg-valid",
                             "type": "message",
                             "role": "assistant",
+                            "model": "valid",
                             "content": [],
                             "usage": {"input_tokens": 1, "output_tokens": 0}
                         })
@@ -4081,7 +4104,13 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
     .await;
     let app = app_router(state);
 
-    for model in ["invalid-json", "empty-stream"] {
+    for model in [
+        "invalid-json",
+        "empty-stream",
+        "missing-model",
+        "missing-model-stream",
+        "invalid-redacted-json",
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -4095,7 +4124,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
                         "model": model,
                         "max_tokens": 16,
                         "messages": [{"role": "user", "content": "ping"}],
-                        "stream": model == "empty-stream"
+                        "stream": model == "empty-stream" || model == "missing-model-stream"
                     }),
                 )
                 .await,
@@ -4190,7 +4219,7 @@ async fn claude_client_disconnect_cancels_upstream_without_provider_failure() {
                 let stream = async_stream::stream! {
                     let _drop_counter = StreamDropCounter(dropped);
                     yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cancel\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-cancel\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
                     ));
                     futures_util::future::pending::<()>().await;
                 };
@@ -4843,12 +4872,14 @@ async fn explicit_claude_provider_never_fails_over() {
         .await
         .unwrap();
     let closed_addr = closed_listener.local_addr().unwrap();
-    drop(closed_listener);
 
     let live_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let live_addr = live_listener.local_addr().unwrap();
+    // Keep both listeners bound while choosing ports so the live service
+    // cannot reuse the intended dead endpoint's address.
+    drop(closed_listener);
     let live_requests = Arc::new(AtomicUsize::new(0));
     let live_requests_for_route = Arc::clone(&live_requests);
     let live_upstream = Router::new().route(
@@ -4909,12 +4940,14 @@ async fn claude_share_never_fails_over() {
         .await
         .unwrap();
     let closed_addr = closed_listener.local_addr().unwrap();
-    drop(closed_listener);
 
     let live_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let live_addr = live_listener.local_addr().unwrap();
+    // Keep both listeners bound while choosing ports so the live service
+    // cannot reuse the intended dead endpoint's address.
+    drop(closed_listener);
     let live_requests = Arc::new(AtomicUsize::new(0));
     let live_requests_for_route = Arc::clone(&live_requests);
     let live_upstream = Router::new().route(

@@ -91,7 +91,11 @@ pub(crate) fn parse_event(frame: Frame) -> Result<Event, WireError> {
                 content: payload.content,
             })
         }
-        "reasoningContentEvent" => Ok(Event::Reasoning(parse_json(&frame.payload, &event_type)?)),
+        "reasoningContentEvent" => {
+            let payload = parse_json(&frame.payload, &event_type)?;
+            validate_reasoning_payload(&payload, &event_type)?;
+            Ok(Event::Reasoning(payload))
+        }
         "toolUseEvent" => {
             let payload: ToolUsePayload = parse_typed(&frame.payload, &event_type)?;
             if payload.tool_use_id.trim().is_empty() {
@@ -111,11 +115,27 @@ pub(crate) fn parse_event(frame: Frame) -> Result<Event, WireError> {
         | "metricsEvent"
         | "messageMetadataEvent"
         | "metadataEvent"
-        | "meteringEvent" => Ok(Event::Usage {
-            event_type: event_type.clone(),
-            payload: parse_json(&frame.payload, &event_type)?,
-        }),
-        "endEvent" => Ok(Event::End),
+        | "meteringEvent" => {
+            let payload = parse_json(&frame.payload, &event_type)?;
+            if matches!(
+                event_type.as_str(),
+                "messageMetadataEvent" | "metadataEvent"
+            ) {
+                validate_token_usage_payload(&payload, &event_type)?;
+            }
+            Ok(Event::Usage {
+                event_type,
+                payload,
+            })
+        }
+        "endEvent" => {
+            // The terminal marker may be payload-free, but nonempty bytes
+            // must not bypass the JSON validation applied to other events.
+            if !frame.payload.is_empty() {
+                parse_json(&frame.payload, &event_type)?;
+            }
+            Ok(Event::End)
+        }
         _ => Ok(Event::Unknown {
             event_type: event_type.clone(),
             payload: parse_json(&frame.payload, &event_type)?,
@@ -128,6 +148,83 @@ fn parse_json(payload: &[u8], event_type: &str) -> Result<Value, WireError> {
         event_type: event_type.to_string(),
         message: error.to_string(),
     })
+}
+
+fn validate_reasoning_payload(payload: &Value, event_type: &str) -> Result<(), WireError> {
+    let value = payload.get("reasoningContentEvent").unwrap_or(payload);
+    match value {
+        Value::String(_) | Value::Null => Ok(()),
+        Value::Object(fields) => {
+            for name in [
+                "text",
+                "content",
+                "reasoningContent",
+                "signature",
+                "redactedContent",
+                "redacted_content",
+            ] {
+                if fields
+                    .get(name)
+                    .is_some_and(|field| !field.is_string() && !field.is_null())
+                {
+                    return Err(WireError::InvalidEventPayload {
+                        event_type: event_type.to_string(),
+                        message: "reasoning field must be a string or null".to_string(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        _ => Err(WireError::InvalidEventPayload {
+            event_type: event_type.to_string(),
+            message: "reasoning payload must be an object or string".to_string(),
+        }),
+    }
+}
+
+fn validate_token_usage_payload(payload: &Value, event_type: &str) -> Result<(), WireError> {
+    let metadata = payload
+        .get("messageMetadataEvent")
+        .or_else(|| payload.get("metadataEvent"))
+        .unwrap_or(payload);
+    let Some(token_usage) = metadata.get("tokenUsage") else {
+        return Ok(());
+    };
+    if token_usage.is_null() {
+        return Ok(());
+    }
+    let invalid = || WireError::InvalidEventPayload {
+        event_type: event_type.to_string(),
+        message: "tokenUsage counters must be 32-bit integers".to_string(),
+    };
+    let fields = token_usage.as_object().ok_or_else(&invalid)?;
+    for key in [
+        "uncachedInputTokens",
+        "uncached_input_tokens",
+        "inputTokens",
+        "input_tokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
+        "cacheReadTokens",
+        "cacheWriteInputTokens",
+        "cache_write_input_tokens",
+        "cacheCreationInputTokens",
+        "cache_creation_input_tokens",
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+    ] {
+        if fields.get(key).is_some_and(|value| {
+            value
+                .as_i64()
+                .and_then(|count| i32::try_from(count).ok())
+                .is_none()
+        }) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn parse_typed<T: serde::de::DeserializeOwned>(

@@ -14,6 +14,7 @@ pub(in crate::proxy) enum DownstreamWait<T> {
 pub(in crate::proxy) async fn wait_with_downstream_cancellation<T>(
     downstream: &mut WebSocket,
     future: impl std::future::Future<Output = T>,
+    control_error: impl Fn(&Message) -> Option<String>,
 ) -> Result<DownstreamWait<T>, ProxyError> {
     tokio::pin!(future);
     loop {
@@ -35,6 +36,12 @@ pub(in crate::proxy) async fn wait_with_downstream_cancellation<T>(
                     }
                     Message::Pong(_) => {}
                     Message::Text(_) | Message::Binary(_) => {
+                        if let Some(error_body) = control_error(&message) {
+                            if downstream.send(Message::Text(error_body)).await.is_err() {
+                                return Ok(DownstreamWait::DownstreamClosed);
+                            }
+                            continue;
+                        }
                         return Err(ProxyError::bad_request(
                             "responses websocket received a request while HTTP fallback was in flight",
                         ));

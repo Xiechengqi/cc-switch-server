@@ -380,7 +380,10 @@ pub(crate) fn normalize_grok_responses_tool_compatibility(
     let mut changed = false;
     let mut loaded_tools = Vec::new();
 
-    if let Some(tools) = object.get_mut("tools") {
+    if object.get("tools").is_some_and(Value::is_null) {
+        object.remove("tools");
+        changed = true;
+    } else if let Some(tools) = object.get_mut("tools") {
         let source = tools
             .as_array()
             .ok_or_else(|| TransformError::new("Grok Responses tools must be an array"))?
@@ -998,6 +1001,7 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
 
 pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
+    validate_anthropic_tool_search_execution(input)?;
     let tool_context = responses_tool_context(input);
     let mut output = Map::new();
     copy_string(input, &mut output, "model");
@@ -1194,6 +1198,111 @@ pub fn openai_chat_to_responses(input: &Value) -> Result<Value, TransformError> 
     }
 
     Ok(Value::Object(output))
+}
+
+pub fn openai_chat_to_codex_oauth_responses(input: &Value) -> Result<Value, TransformError> {
+    let mut bounded = input.clone();
+    normalize_codex_oauth_chat_call_ids(&mut bounded);
+    openai_chat_to_responses(&bounded)
+}
+
+fn normalize_codex_oauth_chat_call_ids(input: &mut Value) {
+    let Some(messages) = input.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut used = HashSet::new();
+    for message in messages.iter() {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                for call in message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    reserve_short_codex_call_id(call.get("id"), &mut used);
+                }
+                reserve_short_codex_call_id(
+                    message.get("function_call").and_then(|call| call.get("id")),
+                    &mut used,
+                );
+            }
+            Some("tool" | "function") => {
+                reserve_short_codex_call_id(message.get("tool_call_id"), &mut used);
+            }
+            _ => {}
+        }
+    }
+
+    let mut mapped = BTreeMap::new();
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for call in calls {
+                        if let Some(id) = call.get_mut("id") {
+                            shorten_codex_chat_call_id(id, &mut mapped, &mut used);
+                        }
+                    }
+                }
+                if let Some(id) = message
+                    .get_mut("function_call")
+                    .and_then(|call| call.get_mut("id"))
+                {
+                    shorten_codex_chat_call_id(id, &mut mapped, &mut used);
+                }
+            }
+            Some("tool" | "function") => {
+                if let Some(id) = message.get_mut("tool_call_id") {
+                    shorten_codex_chat_call_id(id, &mut mapped, &mut used);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn reserve_short_codex_call_id(value: Option<&Value>, used: &mut HashSet<String>) {
+    if let Some(id) = value.and_then(Value::as_str).filter(|id| id.len() <= 64) {
+        used.insert(id.to_string());
+    }
+}
+
+fn shorten_codex_chat_call_id(
+    value: &mut Value,
+    mapped: &mut BTreeMap<String, String>,
+    used: &mut HashSet<String>,
+) {
+    let Some(raw) = value.as_str().filter(|id| id.len() > 64) else {
+        return;
+    };
+    let raw = raw.to_string();
+    let shortened = mapped.entry(raw.clone()).or_insert_with(|| {
+        let mut attempt = 0_u64;
+        loop {
+            let candidate = if attempt == 0 {
+                bounded_codex_call_id(&raw)
+            } else {
+                bounded_codex_call_id(&format!("{raw}_{attempt}"))
+            };
+            if used.insert(candidate.clone()) {
+                break candidate;
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    });
+    *value = Value::String(shortened.clone());
+}
+
+fn bounded_codex_call_id(raw: &str) -> String {
+    const MAX_LEN: usize = 64;
+    const HASH_BYTES: usize = 8;
+    let suffix = hex::encode(&Sha256::digest(raw.as_bytes())[..HASH_BYTES]);
+    let mut prefix_len = (MAX_LEN - 1 - suffix.len()).min(raw.len());
+    while !raw.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+    format!("{}_{}", &raw[..prefix_len], suffix)
 }
 
 pub fn openai_responses_to_chat(input: &Value) -> Result<Value, TransformError> {
@@ -2050,19 +2159,19 @@ pub(crate) fn anthropic_response_to_openai_responses_with_tool_context(
         }
     }
 
-    let incomplete_reason =
-        anthropic_responses_incomplete_reason(input.get("stop_reason").and_then(Value::as_str));
+    let incomplete_details =
+        anthropic_responses_incomplete_details(input.get("stop_reason").and_then(Value::as_str));
     let mut response = json!({
         "id": response_id,
         "object": "response",
-        "status": if incomplete_reason.is_some() {"incomplete"} else {"completed"},
+        "status": if incomplete_details.is_some() {"incomplete"} else {"completed"},
         "model": input.get("model").and_then(Value::as_str).unwrap_or_default(),
         "output": output,
         "output_text": output_text.join(""),
         "usage": openai_responses_usage_from_anthropic_usage(input.get("usage"))
     });
-    if let Some(reason) = incomplete_reason {
-        response["incomplete_details"] = json!({"reason": reason});
+    if let Some(details) = incomplete_details {
+        response["incomplete_details"] = details;
     }
     Ok(response)
 }
@@ -4024,6 +4133,37 @@ fn validate_response_tool_type_collisions(input: &Value) -> Result<(), Transform
         return Err(TransformError::new(format!(
             "Responses custom tool '{name}' conflicts with a function tool of the same name; rename one of the tools"
         )));
+    }
+    Ok(())
+}
+
+fn validate_anthropic_tool_search_execution(input: &Value) -> Result<(), TransformError> {
+    let is_hosted = |value: &Value| {
+        value.get("execution").is_some()
+            && value
+                .get("execution")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                != Some("client")
+    };
+    let hosted_declaration = response_tools_from_request(input).into_iter().any(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some("tool_search") && is_hosted(tool)
+    });
+    let hosted_history = input
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_search_call" | "tool_search_output")
+            ) && is_hosted(item)
+        });
+    if hosted_declaration || hosted_history {
+        return Err(TransformError::new(
+            "hosted tool_search cannot be executed by an Anthropic client tool bridge",
+        ));
     }
     Ok(())
 }
@@ -6814,10 +6954,15 @@ pub(super) fn anthropic_stop_reason_to_openai(reason: Option<&str>) -> &'static 
     }
 }
 
-fn anthropic_responses_incomplete_reason(reason: Option<&str>) -> Option<&'static str> {
+/// `None` means completed; `Some(null)` is Anthropic's paused server-tool turn.
+/// Responses has no corresponding incomplete reason for `pause_turn`.
+pub(super) fn anthropic_responses_incomplete_details(reason: Option<&str>) -> Option<Value> {
     match reason {
-        Some("refusal") => Some("content_filter"),
-        Some("max_tokens" | "model_context_window_exceeded") => Some("max_output_tokens"),
+        Some("refusal") => Some(json!({"reason": "content_filter"})),
+        Some("max_tokens" | "model_context_window_exceeded") => {
+            Some(json!({"reason": "max_output_tokens"}))
+        }
+        Some("pause_turn") => Some(Value::Null),
         _ => None,
     }
 }
@@ -6955,6 +7100,28 @@ pub(super) fn anthropic_usage_from_gemini_usage(usage: Option<&Value>) -> Value 
     Value::Object(output)
 }
 
+pub(crate) fn add_gemini_reasoning_usage_details(anthropic: &mut Value, gemini: &Value) {
+    let gemini_usage = gemini
+        .get("usageMetadata")
+        .or_else(|| gemini.get("usage_metadata"));
+    let Some(thought_tokens) = gemini_usage
+        .and_then(|usage| {
+            usage
+                .get("thoughtsTokenCount")
+                .or_else(|| usage.get("thoughts_token_count"))
+        })
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
+    if let Some(usage) = anthropic.get_mut("usage").and_then(Value::as_object_mut) {
+        usage.insert(
+            "output_tokens_details".to_string(),
+            json!({"reasoning_tokens": thought_tokens}),
+        );
+    }
+}
+
 fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
     let fresh_input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
     let output_tokens = usage_number(usage, &[&["output_tokens"]]).unwrap_or(0);
@@ -6972,6 +7139,9 @@ fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
     if let Some(cache_creation) = cache_creation {
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
+    }
+    if let Some(details) = usage.and_then(|usage| usage.get("output_tokens_details")) {
+        output["completion_tokens_details"] = details.clone();
     }
     if let Some(output) = output.as_object_mut() {
         copy_provider_metering(usage, output);
@@ -6996,6 +7166,9 @@ pub(super) fn openai_responses_usage_from_anthropic_usage(usage: Option<&Value>)
     if let Some(cache_creation) = cache_creation {
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["input_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
+    }
+    if let Some(details) = usage.and_then(|usage| usage.get("output_tokens_details")) {
+        output["output_tokens_details"] = details.clone();
     }
     if let Some(output) = output.as_object_mut() {
         copy_provider_metering(usage, output);
@@ -7103,11 +7276,13 @@ fn copy_provider_metering(source: Option<&Value>, target: &mut Map<String, Value
 fn openai_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
     let input_tokens =
         usage_number(usage, &[&["promptTokenCount"], &["prompt_token_count"]]).unwrap_or(0);
-    let output_tokens = usage_number(
+    let candidate_tokens = usage_number(
         usage,
         &[&["candidatesTokenCount"], &["candidates_token_count"]],
     )
     .unwrap_or(0);
+    let thought_tokens = usage_number(usage, &[&["thoughtsTokenCount"], &["thoughts_token_count"]]);
+    let output_tokens = candidate_tokens.saturating_add(thought_tokens.unwrap_or(0));
     let cache_read = usage_number(
         usage,
         &[
@@ -7115,12 +7290,16 @@ fn openai_usage_from_gemini_usage(usage: Option<&Value>) -> Value {
             &["cached_content_token_count"],
         ],
     );
-    json!({
+    let mut output = json!({
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": input_tokens.saturating_add(output_tokens),
         "prompt_tokens_details": {"cached_tokens": cache_read.unwrap_or(0)}
-    })
+    });
+    if let Some(thought_tokens) = thought_tokens {
+        output["completion_tokens_details"] = json!({"reasoning_tokens": thought_tokens});
+    }
+    output
 }
 
 fn gemini_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
@@ -8005,6 +8184,38 @@ mod tests {
         assert!(!serialized.contains("\"type\":\"tool_use\""));
         assert!(!serialized.contains("\"type\":\"tool_result\""));
         assert!(serialized.contains("do not lose me"));
+    }
+
+    #[test]
+    fn codex_oauth_chat_call_ids_preserve_pairing_and_avoid_short_id_collisions() {
+        let long_id = "工具调用".repeat(18);
+        let conflicting_short_id = bounded_codex_call_id(&long_id);
+        let input = json!({
+            "model":"gpt-5.5",
+            "messages":[
+                {"role":"assistant","tool_calls":[
+                    {"id":long_id,"type":"function","function":{"name":"lookup","arguments":"{}"}},
+                    {"id":conflicting_short_id,"type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":long_id,"content":"long result"},
+                {"role":"tool","tool_call_id":conflicting_short_id,"content":"short result"}
+            ]
+        });
+        let output = openai_chat_to_codex_oauth_responses(&input).unwrap();
+        let long_wire = output["input"][0]["call_id"].as_str().unwrap();
+        assert!(long_wire.len() <= 64);
+        assert_ne!(long_wire, conflicting_short_id);
+        assert_eq!(output["input"][1]["call_id"], conflicting_short_id);
+        assert_eq!(output["input"][2]["call_id"], long_wire);
+        assert_eq!(output["input"][3]["call_id"], conflicting_short_id);
+        assert_eq!(
+            openai_chat_to_codex_oauth_responses(&input).unwrap(),
+            output
+        );
+        assert_eq!(
+            openai_chat_to_responses(&input).unwrap()["input"][0]["call_id"],
+            long_id
+        );
     }
 
     #[test]
@@ -9138,6 +9349,39 @@ mod tests {
         assert_eq!(usage["input_tokens"], 8);
         assert_eq!(usage["cache_read_input_tokens"], 3);
         assert_eq!(usage["output_tokens"], 12);
+    }
+
+    #[test]
+    fn gemini_thought_tokens_count_as_openai_completion_tokens() {
+        for (candidates, thoughts, expected) in [(Some(5), 7, 12), (Some(0), 7, 7), (None, 7, 7)] {
+            let mut usage = json!({
+                "promptTokenCount": 11,
+                "cachedContentTokenCount": 3,
+                "thoughtsTokenCount": thoughts,
+                "totalTokenCount": 11 + expected
+            });
+            if let Some(candidates) = candidates {
+                usage["candidatesTokenCount"] = json!(candidates);
+            }
+            let converted = openai_usage_from_gemini_usage(Some(&usage));
+            assert_eq!(converted["prompt_tokens"], 11);
+            assert_eq!(converted["completion_tokens"], expected);
+            assert_eq!(converted["total_tokens"], 11 + expected);
+            assert_eq!(
+                converted["completion_tokens_details"]["reasoning_tokens"],
+                thoughts
+            );
+
+            let chat = gemini_stream_to_openai_chat(&json!({"usageMetadata": usage}));
+            assert_eq!(chat.len(), 1);
+            assert_eq!(
+                chat[0].payload,
+                StreamPayload::Json(json!({
+                    "choices": [],
+                    "usage": converted
+                }))
+            );
+        }
     }
 
     #[test]
@@ -10763,6 +11007,28 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_pause_turn_is_incomplete_without_token_limit_details() {
+        let input = json!({
+            "id": "msg_pause",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Searching"}],
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "pause_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 3}
+        });
+        let responses = anthropic_response_to_openai_responses(&input).unwrap();
+        assert_eq!(responses["status"], "incomplete");
+        assert!(responses["incomplete_details"].is_null());
+        assert_eq!(responses["output_text"], "Searching");
+        assert_eq!(responses["usage"]["input_tokens"], 7);
+        assert_eq!(responses["usage"]["output_tokens"], 3);
+
+        let chat = anthropic_response_to_openai_chat(&input).unwrap();
+        assert_eq!(chat["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
     fn anthropic_response_to_responses_merges_adjacent_text_with_scalar_citations() {
         let input = json!({
             "id": "msg_adjacent_citations",
@@ -11032,6 +11298,40 @@ mod tests {
         assert_eq!(
             output.pointer("/tool_choice/function/name"),
             Some(&json!("tool_search"))
+        );
+    }
+
+    #[test]
+    fn responses_to_anthropic_rejects_hosted_tool_search_before_translation() {
+        for request in [
+            json!({
+                "model": "claude-sonnet-4-6",
+                "input": "ping",
+                "tools": [{"type": "tool_search", "execution": "server"}]
+            }),
+            json!({
+                "model": "claude-sonnet-4-6",
+                "input": [{"type": "tool_search_call", "call_id": "call_1", "execution": "server", "arguments": {"query": "mail"}}],
+                "tools": [{"type": "tool_search", "execution": "client"}]
+            }),
+            json!({
+                "model": "claude-sonnet-4-6",
+                "input": [{"type": "tool_search_output", "call_id": "call_1", "execution": "server", "tools": []}],
+                "tools": [{"type": "tool_search", "execution": "client"}]
+            }),
+        ] {
+            let error = openai_responses_to_anthropic(&request).unwrap_err();
+            assert!(error.to_string().contains("hosted tool_search"), "{error}");
+        }
+
+        let client = json!({
+            "model": "claude-sonnet-4-6",
+            "input": "ping",
+            "tools": [{"type": "tool_search", "execution": "client"}]
+        });
+        assert_eq!(
+            openai_responses_to_anthropic(&client).unwrap()["tools"][0]["name"],
+            "tool_search"
         );
     }
 

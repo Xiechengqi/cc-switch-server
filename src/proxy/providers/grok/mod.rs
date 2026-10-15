@@ -7,6 +7,7 @@
 
 use bytes::Bytes;
 use serde_json::Value;
+use std::fmt;
 
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::runtime::RuntimeAuthRef;
@@ -24,6 +25,15 @@ use super::super::request_memory::{
 };
 use super::super::ProxyError;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReplayIdentityFingerprint([u8; 32]);
+
+impl fmt::Debug for ReplayIdentityFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReplayIdentityFingerprint(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReplayWriteContext {
     read: Option<(GrokReplayScope, GrokReplaySnapshot, CacheSnapshotOwnership)>,
@@ -38,6 +48,8 @@ pub(crate) struct ReplayWriteContext {
     account_id: String,
     auth_identity_generation: u64,
     token_refresh_generation: u64,
+    account_incarnation: u64,
+    request_identity_fingerprint: ReplayIdentityFingerprint,
     share_id: String,
     request_memory: Option<RequestMemoryBudget>,
 }
@@ -152,16 +164,14 @@ pub(crate) async fn prepare_transport_replay(
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .ok_or_else(|| ProxyError::bad_request("Grok reasoning replay plane is invalid"))?;
-    let (provider_type, account_id, auth_identity_generation) = execution
+    let (_, account_id, auth_identity_generation) = execution
         .managed_account_identity_target()
         .filter(|(provider_type, _, _)| *provider_type == ProviderType::GrokOAuth)
         .ok_or_else(|| ProxyError::bad_request("Grok Provider must bind one Account"))?;
-    let account = state
-        .find_account_for_provider(provider_type, account_id)
+    let (account_incarnation, token_refresh_generation, request_identity_fingerprint) = state
+        .grok_replay_identity_snapshot(account_id, auth_identity_generation)
         .await
-        .filter(|account| account.auth_identity_generation == auth_identity_generation)
         .ok_or_else(|| ProxyError::bad_request("Grok Account generation drifted"))?;
-    let token_refresh_generation = account.token_refresh_generation;
     let derive = |turn| {
         GrokReplayScope::derive(
             execution.plan.provider_key.app.as_str(),
@@ -171,6 +181,8 @@ pub(crate) async fn prepare_transport_replay(
             account_id,
             auth_identity_generation,
             token_refresh_generation,
+            account_incarnation,
+            request_identity_fingerprint,
             share_id,
             &user_namespace,
             session_id,
@@ -261,6 +273,8 @@ pub(crate) async fn prepare_transport_replay(
         account_id: account_id.to_string(),
         auth_identity_generation,
         token_refresh_generation,
+        account_incarnation,
+        request_identity_fingerprint: ReplayIdentityFingerprint(request_identity_fingerprint),
         share_id: share_id.to_string(),
         request_memory: request_memory.cloned(),
     }))
@@ -417,14 +431,16 @@ pub(crate) async fn binding_is_current(state: &ServerState, context: &ReplayWrit
     {
         return false;
     }
-    let Some(account) = state
-        .find_account_for_provider(ProviderType::GrokOAuth, &context.account_id)
+    let Some((account_incarnation, token_refresh_generation, request_identity_fingerprint)) = state
+        .grok_replay_identity_snapshot(&context.account_id, context.auth_identity_generation)
         .await
     else {
         return false;
     };
-    if account.auth_identity_generation != context.auth_identity_generation
-        || account.token_refresh_generation != context.token_refresh_generation
+    if account_incarnation != context.account_incarnation
+        || token_refresh_generation != context.token_refresh_generation
+        || ReplayIdentityFingerprint(request_identity_fingerprint)
+            != context.request_identity_fingerprint
     {
         return false;
     }

@@ -1353,9 +1353,34 @@ async fn proxy_models(
     let (provider_id, _share_guard) = validate_router_share_surface(&state, &headers, app)
         .await
         .map_err(|error| InferenceApiError::proxy(surface, request_id.clone(), error))?;
+    ensure_models_expected_binding(
+        query.expected_share_id.as_deref(),
+        query.expected_provider_id.as_deref(),
+        headers
+            .get("x-cc-switch-share-id")
+            .and_then(|value| value.to_str().ok()),
+        &provider_id,
+    )
+    .map_err(|error| InferenceApiError::proxy(surface, request_id.clone(), error))?;
     proxy_models_for_selection(&state, Some(app), Some(&provider_id))
         .await
         .map_err(|error| InferenceApiError::api(surface, request_id, error))
+}
+
+fn ensure_models_expected_binding(
+    expected_share_id: Option<&str>,
+    expected_provider_id: Option<&str>,
+    signed_share_id: Option<&str>,
+    selected_provider_id: &str,
+) -> Result<(), proxy::ProxyError> {
+    if expected_share_id.is_some_and(|expected| Some(expected) != signed_share_id)
+        || expected_provider_id.is_some_and(|expected| expected != selected_provider_id)
+    {
+        return Err(proxy::ProxyError::conflict(
+            "model catalog Share or Provider binding differs from the requested scope",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn validate_router_share_surface(
@@ -2045,6 +2070,19 @@ async fn append_cursor_api_key_models(
         let Some(catalog) = catalog else {
             continue;
         };
+        if !cursor_api_key_catalog_binding_is_current(
+            state,
+            provider,
+            &runtime_plan.runtime_fingerprint,
+        )
+        .await
+        {
+            tracing::debug!(
+                provider_id = %provider.provider.id,
+                "Cursor model discovery result belongs to an old Provider credential scope"
+            );
+            continue;
+        }
         used_catalog = Some(match used_catalog {
             Some(existing) => CursorCatalogUse {
                 stale: existing.stale || stale,
@@ -2080,6 +2118,41 @@ async fn append_cursor_api_key_models(
             .then_with(|| left.owned_by.cmp(&right.owned_by))
     });
     used_catalog
+}
+
+async fn cursor_api_key_catalog_binding_is_current(
+    state: &ServerState,
+    snapshot: &StoredProvider,
+    runtime_fingerprint: &str,
+) -> bool {
+    let providers = state.providers.read().await;
+    let current = providers.providers.iter().find(|provider| {
+        provider.app == snapshot.app && provider.provider.id == snapshot.provider.id
+    });
+    let Some(current) = current else {
+        return false;
+    };
+    if current.provider_type != ProviderType::CursorApiKey
+        || current.resource.revision != snapshot.resource.revision
+        || current.resource.credential_generation != snapshot.resource.credential_generation
+    {
+        return false;
+    }
+    providers
+        .runtime_plan(snapshot.app, &snapshot.provider.id)
+        .is_some_and(|runtime| {
+            runtime.driver_id.as_str() == "special.cursor"
+                && runtime.provider_revision == snapshot.resource.revision
+                && runtime.runtime_fingerprint == runtime_fingerprint
+                && runtime.configuration_state != RuntimeConfigurationState::NeedsAttention
+                && matches!(
+                    runtime.auth_ref,
+                    RuntimeAuthRef::StaticCredential {
+                        credential_generation,
+                        ..
+                    } if credential_generation == snapshot.resource.credential_generation
+                )
+        })
 }
 
 fn cursor_catalog_ids(
@@ -2135,6 +2208,31 @@ mod cursor_provider_api_key_tests {
     use super::*;
     use crate::domain::providers::model::{AuthBinding, ProviderMeta};
     use crate::domain::providers::store::ProviderResourceMetadata;
+
+    #[test]
+    fn model_catalog_scope_matches_signed_share_and_selected_provider() {
+        assert!(ensure_models_expected_binding(
+            Some("share-a"),
+            Some("provider-a"),
+            Some("share-a"),
+            "provider-a",
+        )
+        .is_ok());
+        for (share, provider) in [
+            (Some("share-b"), "provider-a"),
+            (Some("share-a"), "provider-b"),
+            (None, "provider-a"),
+        ] {
+            assert!(ensure_models_expected_binding(
+                Some("share-a"),
+                Some("provider-a"),
+                share,
+                provider,
+            )
+            .is_err());
+        }
+        assert!(ensure_models_expected_binding(None, None, Some("share-a"), "provider-a").is_ok());
+    }
 
     fn cursor_provider(settings_config: Value) -> StoredProvider {
         StoredProvider {
@@ -2205,6 +2303,10 @@ struct ModelsDispatchQuery {
     app: Option<AppKind>,
     #[serde(default, rename = "client_version")]
     client_version: Option<String>,
+    #[serde(default)]
+    expected_share_id: Option<String>,
+    #[serde(default)]
+    expected_provider_id: Option<String>,
 }
 
 async fn proxy_models_or_manifest(
@@ -2218,23 +2320,37 @@ async fn proxy_models_or_manifest(
         .as_deref()
         .is_some_and(|version| !version.trim().is_empty())
     {
-        return proxy::forward_codex_models_manifest(state, headers, query.client_version)
-            .await
-            .map_err(|error| {
-                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error)
-            });
+        return proxy::forward_codex_models_manifest(
+            state,
+            headers,
+            query.client_version,
+            query.expected_share_id,
+            query.expected_provider_id,
+        )
+        .await
+        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error));
     }
 
-    Ok(
-        proxy_models(State(state), headers, Query(ModelsQuery { app: query.app }))
-            .await?
-            .into_response(),
+    Ok(proxy_models(
+        State(state),
+        headers,
+        Query(ModelsQuery {
+            app: query.app,
+            expected_share_id: query.expected_share_id,
+            expected_provider_id: query.expected_provider_id,
+        }),
     )
+    .await?
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CodexModelsManifestQuery {
+    #[serde(rename = "client_version")]
     client_version: Option<String>,
+    expected_share_id: Option<String>,
+    expected_provider_id: Option<String>,
 }
 
 async fn proxy_codex_models_manifest(
@@ -2243,9 +2359,15 @@ async fn proxy_codex_models_manifest(
     Query(query): Query<CodexModelsManifestQuery>,
 ) -> Result<Response, InferenceApiError> {
     let request_id = inference_request_id(&headers);
-    proxy::forward_codex_models_manifest(state, headers, query.client_version)
-        .await
-        .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
+    proxy::forward_codex_models_manifest(
+        state,
+        headers,
+        query.client_version,
+        query.expected_share_id,
+        query.expected_provider_id,
+    )
+    .await
+    .map_err(|error| InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error))
 }
 
 async fn proxy_codex_alpha_search(
@@ -3012,6 +3134,52 @@ mod grok_catalog_provider_tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_receipt_scope_checks_signed_share_before_selection() {
+        let state = catalog_test_state("model-catalog-receipt-scope");
+        configure_test_router(&state).await;
+        configure_test_share_with_provider_type(
+            &state,
+            "share-catalog-scope",
+            AppKind::Claude,
+            ProviderType::ClaudeOAuth,
+        )
+        .await;
+        let app = app_router(state);
+        for (suffix, expected_status) in [
+            (
+                "expectedShareId=share-catalog-scope&expectedProviderId=share-catalog-scope-provider",
+                StatusCode::OK,
+            ),
+            (
+                "expectedShareId=other-share&expectedProviderId=share-catalog-scope-provider",
+                StatusCode::CONFLICT,
+            ),
+            (
+                "expectedShareId=share-catalog-scope&expectedProviderId=other-provider",
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    router_ingress_request(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(format!("/v1/models?app=claude&{suffix}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                        "catalog-receipt-scope",
+                        Some("share-catalog-scope"),
+                    )
+                    .await,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "{suffix}");
+        }
+    }
+
+    #[tokio::test]
     async fn gemini_cursor_api_key_models_use_only_the_exact_encrypted_provider_scope() {
         const PROVIDER_ID: &str = "gemini-cursor-api-key-catalog";
         const SHARE_ID: &str = "share-gemini-cursor-catalog";
@@ -3292,6 +3460,93 @@ mod grok_catalog_provider_tests {
             0
         );
         proxy_server.abort();
+    }
+
+    #[tokio::test]
+    async fn cursor_api_key_catalog_does_not_publish_after_provider_credential_rotation() {
+        const PROVIDER_ID: &str = "cursor-catalog-rotation";
+        let state = cursor_catalog_test_state("cursor-catalog-rotation");
+        let provider = || Provider {
+            id: PROVIDER_ID.to_string(),
+            name: "Cursor catalog rotation".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some(ProviderType::CursorApiKey.as_str().to_string()),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        };
+        state
+            .upsert_provider_command(
+                AppKind::Gemini,
+                provider(),
+                Some(ProfileId::parse("gemini.cursor_api_key").unwrap()),
+                None,
+                Some("cursor-catalog-rotation-initial".to_string()),
+                std::collections::BTreeMap::from([(
+                    "/settingsConfig/apiKey".to_string(),
+                    CredentialPatch::Replace {
+                        value: "cursor-old-api-key".to_string(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let old = state.providers_snapshot().await;
+        let stored = old
+            .providers
+            .iter()
+            .find(|stored| stored.app == AppKind::Gemini && stored.provider.id == PROVIDER_ID)
+            .unwrap();
+        let runtime = old.runtime_plan(AppKind::Gemini, PROVIDER_ID).unwrap();
+        let key_hash = hex::encode(sha2::Sha256::digest(b"cursor-old-api-key"));
+        let old_scope = crate::proxy::cursor::credential_cache::CursorModelCatalogScope::derive(
+            AppKind::Gemini.as_str(),
+            PROVIDER_ID,
+            stored.resource.revision,
+            stored.resource.credential_generation,
+            &runtime.runtime_fingerprint,
+            &key_hash,
+        );
+        state
+            .cursor_model_catalogs
+            .insert(
+                old_scope,
+                vec!["old-credential-model".to_string()],
+                crate::infra::time::now_ms() as i64,
+                60_000,
+            )
+            .await;
+        state
+            .upsert_provider_command(
+                AppKind::Gemini,
+                provider(),
+                Some(ProfileId::parse("gemini.cursor_api_key").unwrap()),
+                None,
+                Some("cursor-catalog-rotation-new".to_string()),
+                std::collections::BTreeMap::from([(
+                    "/settingsConfig/apiKey".to_string(),
+                    CredentialPatch::Replace {
+                        value: "cursor-new-api-key".to_string(),
+                    },
+                )]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = Vec::new();
+        let used = append_cursor_api_key_models(
+            &state,
+            &old,
+            Some(AppKind::Gemini),
+            Some(PROVIDER_ID),
+            &mut data,
+        )
+        .await;
+        assert!(used.is_none());
+        assert!(data.is_empty());
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use crate::proxy::request_memory::{
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
@@ -130,6 +130,17 @@ impl CursorSessionKey {
     pub fn conversation_id(&self) -> &str {
         &self.conversation_id
     }
+
+    /// Allocations held by both the registry key and the session's own key.
+    pub(crate) fn retained_key_bytes(&self) -> usize {
+        self.scope
+            .0
+            .capacity()
+            .saturating_add(self.conversation_id.capacity())
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(std::mem::size_of::<usize>())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -140,8 +151,7 @@ struct CursorScopedIndexKey {
 
 impl CursorScopedIndexKey {
     fn new(scope: &CursorSessionScope, raw_id: &str) -> Option<Self> {
-        let raw_id = raw_id.trim();
-        (!raw_id.is_empty()).then(|| Self {
+        (!raw_id.is_empty() && raw_id.trim() == raw_id).then(|| Self {
             scope: scope.clone(),
             raw_id: raw_id.to_string(),
         })
@@ -173,6 +183,18 @@ pub enum SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorSessionOpenConflict {
     pub state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorSessionReserveError {
+    ConversationBusy(CursorSessionOpenConflict),
+    CapacityExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorContinuationClaimError {
+    AlreadyClaimed,
+    CapacityExhausted,
 }
 
 /// Live state of a single AgentService run.
@@ -207,10 +229,14 @@ pub struct CursorSession {
     pub blob_store: HashMap<String, Bytes>,
     pub state: SessionState,
     pub last_activity: Instant,
+    pub(super) idle_expiry_task: Option<tokio::task::AbortHandle>,
     /// Reservation for request-owned state retained while this session is
     /// running or parked. A continuation reserves against its new request
     /// before releasing the previous request's reservation.
     pub(crate) request_memory: Option<RequestMemoryReservation>,
+    /// Conservative charge for secondary lookup keys and candidate copies
+    /// owned by the registry while this session remains live.
+    pub(crate) index_retained_bytes: usize,
 }
 
 impl CursorSession {
@@ -239,6 +265,28 @@ impl CursorSession {
         Ok(())
     }
 
+    fn reserve_index_binding(&mut self, raw_id: &str) -> Result<(), RequestMemoryError> {
+        // Charge a whole new hash slot and the first Vec allocation even if
+        // this ID later shares a bucket with another live session. Duplicate
+        // binds can overcharge, but must never make the estimate too small.
+        let candidate = std::mem::size_of::<CursorSessionIndexCandidate>()
+            .saturating_add(self.key.scope.0.capacity())
+            .saturating_add(self.key.conversation_id.capacity());
+        let bytes = std::mem::size_of::<CursorScopedIndexKey>()
+            .saturating_add(self.key.scope.0.capacity())
+            .saturating_add(raw_id.len())
+            .saturating_add(std::mem::size_of::<CursorSessionIndexBinding>())
+            .saturating_add(candidate.saturating_mul(4))
+            .saturating_add(std::mem::size_of::<usize>().saturating_mul(4));
+        let previous = self.index_retained_bytes;
+        self.index_retained_bytes = previous.saturating_add(bytes);
+        if let Err(error) = self.refresh_request_memory() {
+            self.index_retained_bytes = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(in crate::proxy) fn reserve_transient_memory(
         &self,
         component: RequestMemoryComponent,
@@ -251,6 +299,9 @@ impl CursorSession {
     }
 
     fn clear_retained_state(&mut self) {
+        if let Some(task) = self.idle_expiry_task.take() {
+            task.abort();
+        }
         self.stream = None;
         self.declared_tool_names.clear();
         self.declared_tools.clear();
@@ -262,6 +313,7 @@ impl CursorSession {
         self.cold_resume_completed_calls.clear();
         self.blob_store.clear();
         self.request_memory = None;
+        self.index_retained_bytes = 0;
     }
 }
 
@@ -293,10 +345,30 @@ struct Inner {
     max_sessions: usize,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
 struct CursorSessionIndexBinding {
+    candidates: Vec<CursorSessionIndexCandidate>,
+}
+
+struct CursorSessionIndexCandidate {
     key: CursorSessionKey,
     entry: Weak<Mutex<CursorSession>>,
+}
+
+impl CursorSessionIndexBinding {
+    fn bind(&mut self, key: &CursorSessionKey, entry: &Arc<Mutex<CursorSession>>) {
+        let weak = Arc::downgrade(entry);
+        if !self
+            .candidates
+            .iter()
+            .any(|candidate| Weak::ptr_eq(&candidate.entry, &weak))
+        {
+            self.candidates.push(CursorSessionIndexCandidate {
+                key: key.clone(),
+                entry: weak,
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -334,26 +406,29 @@ impl CursorSessionManager {
     /// Record the identifiers consumed while atomically taking ownership of a
     /// parked cold continuation. Claims contain only opaque response/call IDs,
     /// never prompts, tool arguments, results, or credentials.
-    pub async fn claim_continuation_ids(&self, scope: &CursorSessionScope, raw_ids: &[String]) {
+    pub async fn claim_continuation_ids(
+        &self,
+        scope: &CursorSessionScope,
+        raw_ids: &[String],
+    ) -> Result<(), CursorContinuationClaimError> {
         let now = Instant::now();
         let mut claims = self.inner.continuation_claims.write().await;
         claims.retain(|_, claimed_at| now.duration_since(*claimed_at) <= self.inner.idle_ttl);
-        for raw_id in raw_ids {
-            if let Some(key) = CursorScopedIndexKey::new(scope, raw_id) {
-                claims.insert(key, now);
-            }
+        let keys = raw_ids
+            .iter()
+            .filter_map(|raw_id| CursorScopedIndexKey::new(scope, raw_id))
+            .collect::<HashSet<_>>();
+        if keys.iter().any(|key| claims.contains_key(key)) {
+            return Err(CursorContinuationClaimError::AlreadyClaimed);
         }
         let max_claims = self.inner.max_sessions.saturating_mul(16).max(64);
-        if claims.len() > max_claims {
-            let mut oldest = claims
-                .iter()
-                .map(|(key, claimed_at)| (key.clone(), *claimed_at))
-                .collect::<Vec<_>>();
-            oldest.sort_unstable_by_key(|(_, claimed_at)| *claimed_at);
-            for (key, _) in oldest.into_iter().take(claims.len() - max_claims) {
-                claims.remove(&key);
-            }
+        if claims.len().saturating_add(keys.len()) > max_claims {
+            return Err(CursorContinuationClaimError::CapacityExhausted);
         }
+        for key in keys {
+            claims.insert(key, now);
+        }
+        Ok(())
     }
 
     /// Check whether an exact scope/id was already consumed by another cold
@@ -401,6 +476,9 @@ impl CursorSessionManager {
             return None;
         }
         session.state = SessionState::Running;
+        if let Some(task) = session.idle_expiry_task.take() {
+            task.abort();
+        }
         session.touch();
         drop(sessions);
         drop(session);
@@ -431,7 +509,7 @@ impl CursorSessionManager {
         declared_tools: Vec<McpToolDef>,
         semantic_items: Vec<serde_json::Value>,
         working_directory: String,
-    ) -> Result<Arc<Mutex<CursorSession>>, CursorSessionOpenConflict> {
+    ) -> Result<Arc<Mutex<CursorSession>>, CursorSessionReserveError> {
         self.evict_expired().await;
         let declared_tool_names = declared_tools.iter().map(|t| t.name.clone()).collect();
         let session = CursorSession {
@@ -451,11 +529,23 @@ impl CursorSessionManager {
             blob_store,
             state: SessionState::Running,
             last_activity: Instant::now(),
+            idle_expiry_task: None,
             request_memory: None,
+            index_retained_bytes: 0,
         };
         let entry = Arc::new(Mutex::new(session));
-        self.insert_new_entry(key, entry.clone()).await?;
+        self.insert_new_entry(key, entry.clone())
+            .await
+            .map_err(CursorSessionReserveError::ConversationBusy)?;
         self.enforce_max_sessions().await;
+        // Never let a full registry of active h2 streams turn the parked
+        // session ceiling into an unbounded soft limit. This entry has not
+        // escaped to a caller yet, so reject it without interrupting older
+        // running sessions or opening an upstream AgentService stream.
+        if self.size().await > self.inner.max_sessions {
+            self.release(entry, SessionState::Closed).await;
+            return Err(CursorSessionReserveError::CapacityExhausted);
+        }
         Ok(entry)
     }
 
@@ -503,6 +593,25 @@ impl CursorSessionManager {
             match final_state {
                 SessionState::AwaitingToolResult => {
                     session.state = SessionState::AwaitingToolResult;
+                    if let Some(task) = session.idle_expiry_task.take() {
+                        task.abort();
+                    }
+                    let inner = Arc::downgrade(&self.inner);
+                    let parked_entry = Arc::downgrade(&entry);
+                    let key = session.key.clone();
+                    let idle_ttl = self.inner.idle_ttl;
+                    let task = tokio::spawn(async move {
+                        tokio::time::sleep(idle_ttl.saturating_add(Duration::from_millis(1))).await;
+                        let (Some(inner), Some(entry)) = (inner.upgrade(), parked_entry.upgrade())
+                        else {
+                            return;
+                        };
+                        let manager = CursorSessionManager { inner };
+                        manager
+                            .evict_expired_candidate(&key, &entry, Instant::now())
+                            .await;
+                    });
+                    session.idle_expiry_task = Some(task.abort_handle());
                     return;
                 }
                 SessionState::Closed | SessionState::Running => {
@@ -529,29 +638,43 @@ impl CursorSessionManager {
         entry.lock().await.clear_retained_state();
     }
 
+    pub(crate) async fn try_bind_response_id(
+        &self,
+        key: &CursorSessionKey,
+        entry: &Arc<Mutex<CursorSession>>,
+        response_id: &str,
+    ) -> Result<(), RequestMemoryError> {
+        let Some(index_key) = CursorScopedIndexKey::new(key.scope(), response_id) else {
+            return Ok(());
+        };
+        entry.lock().await.reserve_index_binding(response_id)?;
+        let sessions = self.inner.sessions.read().await;
+        if !sessions
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return Ok(());
+        }
+        self.inner
+            .response_sessions
+            .write()
+            .await
+            .entry(index_key)
+            .or_default()
+            .bind(key, entry);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub async fn bind_response_id(
         &self,
         key: &CursorSessionKey,
         entry: &Arc<Mutex<CursorSession>>,
         response_id: &str,
     ) {
-        let Some(index_key) = CursorScopedIndexKey::new(key.scope(), response_id) else {
-            return;
-        };
-        let sessions = self.inner.sessions.read().await;
-        if !sessions
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
-        {
-            return;
-        }
-        self.inner.response_sessions.write().await.insert(
-            index_key,
-            CursorSessionIndexBinding {
-                key: key.clone(),
-                entry: Arc::downgrade(entry),
-            },
-        );
+        self.try_bind_response_id(key, entry, response_id)
+            .await
+            .unwrap();
     }
 
     pub async fn resolve_response_id(
@@ -564,29 +687,43 @@ impl CursorSessionManager {
             .await
     }
 
+    pub(crate) async fn try_bind_tool_call_id(
+        &self,
+        key: &CursorSessionKey,
+        entry: &Arc<Mutex<CursorSession>>,
+        tool_call_id: &str,
+    ) -> Result<(), RequestMemoryError> {
+        let Some(index_key) = CursorScopedIndexKey::new(key.scope(), tool_call_id) else {
+            return Ok(());
+        };
+        entry.lock().await.reserve_index_binding(tool_call_id)?;
+        let sessions = self.inner.sessions.read().await;
+        if !sessions
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return Ok(());
+        }
+        self.inner
+            .tool_call_sessions
+            .write()
+            .await
+            .entry(index_key)
+            .or_default()
+            .bind(key, entry);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub async fn bind_tool_call_id(
         &self,
         key: &CursorSessionKey,
         entry: &Arc<Mutex<CursorSession>>,
         tool_call_id: &str,
     ) {
-        let Some(index_key) = CursorScopedIndexKey::new(key.scope(), tool_call_id) else {
-            return;
-        };
-        let sessions = self.inner.sessions.read().await;
-        if !sessions
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
-        {
-            return;
-        }
-        self.inner.tool_call_sessions.write().await.insert(
-            index_key,
-            CursorSessionIndexBinding {
-                key: key.clone(),
-                entry: Arc::downgrade(entry),
-            },
-        );
+        self.try_bind_tool_call_id(key, entry, tool_call_id)
+            .await
+            .unwrap();
     }
 
     pub async fn resolve_tool_call_id(
@@ -604,30 +741,56 @@ impl CursorSessionManager {
         index: &RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
         index_key: &CursorScopedIndexKey,
     ) -> Option<CursorSessionReference> {
+        // Expired parked owners must not make a still-live ID ambiguous.
+        // The final candidate check also covers expiry racing this sweep.
+        self.evict_expired().await;
+        let now = Instant::now();
         // Keep the primary registry read-locked until the index binding is
         // validated so a same-key replacement cannot inherit stale indexes.
         let sessions = self.inner.sessions.read().await;
         let indexes = index.read().await;
         let binding = indexes.get(index_key)?;
-        let entry = binding.entry.upgrade()?;
-        sessions
-            .get(&binding.key)
-            .is_some_and(|current| Arc::ptr_eq(current, &entry))
-            .then(|| CursorSessionReference {
-                key: binding.key.clone(),
-                entry,
-            })
+        let mut live = binding.candidates.iter().filter_map(|candidate| {
+            let entry = candidate.entry.upgrade()?;
+            if entry.try_lock().is_ok_and(|session| {
+                session.state == SessionState::Closed
+                    || (session.state == SessionState::AwaitingToolResult
+                        && now.saturating_duration_since(session.last_activity)
+                            > self.inner.idle_ttl)
+            }) {
+                return None;
+            }
+            sessions
+                .get(&candidate.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                .then(|| CursorSessionReference {
+                    key: candidate.key.clone(),
+                    entry,
+                })
+        });
+        let unique = live.next()?;
+        live.next().is_none().then_some(unique)
     }
 
     async fn remove_indexes_for_session(&self, entry: &Arc<Mutex<CursorSession>>) {
         let weak = Arc::downgrade(entry);
         {
             let mut map = self.inner.response_sessions.write().await;
-            map.retain(|_, value| !Weak::ptr_eq(&value.entry, &weak));
+            map.retain(|_, value| {
+                value
+                    .candidates
+                    .retain(|candidate| !Weak::ptr_eq(&candidate.entry, &weak));
+                !value.candidates.is_empty()
+            });
         }
         {
             let mut map = self.inner.tool_call_sessions.write().await;
-            map.retain(|_, value| !Weak::ptr_eq(&value.entry, &weak));
+            map.retain(|_, value| {
+                value
+                    .candidates
+                    .retain(|candidate| !Weak::ptr_eq(&candidate.entry, &weak));
+                !value.candidates.is_empty()
+            });
         }
     }
 
@@ -679,6 +842,9 @@ impl CursorSessionManager {
             return false;
         }
         session.state = SessionState::Closed;
+        // A timer may be this very task. Drop its handle before clearing
+        // retained state so it cannot abort itself before index cleanup.
+        session.idle_expiry_task = None;
         session.clear_retained_state();
         drop(session);
         self.remove_indexes_for_session(entry).await;
@@ -770,7 +936,9 @@ mod tests {
             blob_store: HashMap::new(),
             state,
             last_activity: Instant::now(),
+            idle_expiry_task: None,
             request_memory: None,
+            index_retained_bytes: 0,
         }))
     }
 
@@ -824,6 +992,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parked_session_memory_counts_both_conversation_key_copies() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("conversation-key-memory");
+        let short_budget = RequestMemoryBudget::new(128 * 1024);
+        let long_budget = RequestMemoryBudget::new(128 * 1024);
+        let short = mgr
+            .reserve(
+                CursorSessionKey::new(scope.clone(), "short"),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        short
+            .lock()
+            .await
+            .attach_request_memory(&short_budget)
+            .unwrap();
+        let long = mgr
+            .reserve(
+                CursorSessionKey::new(scope, "x".repeat(4096)),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        long.lock()
+            .await
+            .attach_request_memory(&long_budget)
+            .unwrap();
+        assert!(
+            long_budget.snapshot().used_bytes >= short_budget.snapshot().used_bytes + 8_000,
+            "session and registry each retain a conversation key copy"
+        );
+        mgr.release(short, SessionState::Closed).await;
+        mgr.release(long, SessionState::Closed).await;
+    }
+
+    #[tokio::test]
+    async fn secondary_index_binding_charges_request_memory() {
+        let mgr = CursorSessionManager::default();
+        let key = session_key(&CursorSessionScope::fixture("index-memory"));
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let budget = RequestMemoryBudget::new(128 * 1024);
+        entry.lock().await.attach_request_memory(&budget).unwrap();
+        let before = budget.snapshot().used_bytes;
+        mgr.bind_response_id(&key, &entry, &"r".repeat(4096)).await;
+        assert!(budget.snapshot().used_bytes >= before + 4096);
+        let after_response = budget.snapshot().used_bytes;
+        mgr.bind_tool_call_id(&key, &entry, &"t".repeat(512)).await;
+        assert!(budget.snapshot().used_bytes >= after_response + 512);
+        mgr.release(entry, SessionState::Closed).await;
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn secondary_index_binding_rejects_before_registry_insert() {
+        for (label, response) in [("response", true), ("tool", false)] {
+            let mgr = CursorSessionManager::default();
+            let key = session_key(&CursorSessionScope::fixture(label));
+            let entry = mgr
+                .reserve(
+                    key.clone(),
+                    CursorProtocolRail::OAuthCli,
+                    HashMap::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                )
+                .await
+                .unwrap();
+            let base = session_retained_bytes(&*entry.lock().await);
+            let budget = RequestMemoryBudget::new(base + 512);
+            entry.lock().await.attach_request_memory(&budget).unwrap();
+            let id = "i".repeat(512);
+            if response {
+                assert!(mgr.try_bind_response_id(&key, &entry, &id).await.is_err());
+                assert!(mgr.resolve_response_id(key.scope(), &id).await.is_none());
+            } else {
+                assert!(mgr.try_bind_tool_call_id(&key, &entry, &id).await.is_err());
+                assert!(mgr.resolve_tool_call_id(key.scope(), &id).await.is_none());
+            }
+            assert_eq!(budget.snapshot().used_bytes, base);
+            mgr.release(entry, SessionState::Closed).await;
+            assert_eq!(budget.snapshot().used_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn expired_parked_session_releases_request_memory() {
         let mgr = CursorSessionManager::new(Duration::from_millis(1), 4);
         let key = session_key(&CursorSessionScope::fixture("memory-expiry"));
@@ -845,6 +1118,37 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(mgr.acquire(&key).await.is_none());
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().active_reservations, 0);
+    }
+
+    #[tokio::test]
+    async fn parked_session_expires_without_another_registry_request() {
+        let mgr = CursorSessionManager::new(Duration::from_millis(5), 4);
+        let key = session_key(&CursorSessionScope::fixture("idle-expiry"));
+        let budget = RequestMemoryBudget::new(64 * 1024);
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![serde_json::json!({"content":"parked".repeat(128)})],
+                String::new(),
+            )
+            .await
+            .unwrap();
+        entry.lock().await.attach_request_memory(&budget).unwrap();
+        mgr.release(entry, SessionState::AwaitingToolResult).await;
+        assert!(budget.snapshot().used_bytes > 0);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mgr.has(&key).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle parked session should expire without a new request");
         assert_eq!(budget.snapshot().used_bytes, 0);
         assert_eq!(budget.snapshot().active_reservations, 0);
     }
@@ -987,16 +1291,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_ids_in_one_scope_never_select_the_last_parked_session() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("duplicate-ids");
+        let key_a = CursorSessionKey::new(scope.clone(), "conversation-a");
+        let key_b = CursorSessionKey::new(scope.clone(), "conversation-b");
+        let entry_a = session_entry(key_a.clone(), SessionState::AwaitingToolResult);
+        let entry_b = session_entry(key_b.clone(), SessionState::AwaitingToolResult);
+        {
+            let mut sessions = mgr.inner.sessions.write().await;
+            sessions.insert(key_a.clone(), entry_a.clone());
+            sessions.insert(key_b.clone(), entry_b.clone());
+        }
+        mgr.bind_response_id(&key_a, &entry_a, "resp-collision")
+            .await;
+        mgr.bind_tool_call_id(&key_a, &entry_a, "call-collision")
+            .await;
+        mgr.bind_response_id(&key_a, &entry_a, "resp-collision")
+            .await;
+        assert_eq!(
+            mgr.resolve_response_id(&scope, "resp-collision")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(key_a.clone())
+        );
+        for (key, entry) in [(&key_a, &entry_a), (&key_b, &entry_b)] {
+            mgr.bind_response_id(key, entry, "resp-collision").await;
+            mgr.bind_tool_call_id(key, entry, "call-collision").await;
+        }
+        assert!(mgr
+            .resolve_response_id(&scope, "resp-collision")
+            .await
+            .is_none());
+        assert!(mgr
+            .resolve_tool_call_id(&scope, "call-collision")
+            .await
+            .is_none());
+
+        mgr.release(entry_b, SessionState::Closed).await;
+        assert_eq!(
+            mgr.resolve_response_id(&scope, "resp-collision")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(key_a.clone())
+        );
+        assert_eq!(
+            mgr.resolve_tool_call_id(&scope, "call-collision")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(key_a)
+        );
+    }
+
+    #[tokio::test]
+    async fn running_owner_keeps_a_colliding_parked_id_ambiguous() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("running-parked-collision");
+        let running_key = CursorSessionKey::new(scope.clone(), "conversation-running");
+        let parked_key = CursorSessionKey::new(scope.clone(), "conversation-parked");
+        let running = session_entry(running_key.clone(), SessionState::Running);
+        let parked = session_entry(parked_key.clone(), SessionState::AwaitingToolResult);
+        {
+            let mut sessions = mgr.inner.sessions.write().await;
+            sessions.insert(running_key.clone(), running.clone());
+            sessions.insert(parked_key.clone(), parked.clone());
+        }
+        for (key, entry) in [(&running_key, &running), (&parked_key, &parked)] {
+            mgr.bind_response_id(key, entry, "response-collision").await;
+            mgr.bind_tool_call_id(key, entry, "call-collision").await;
+        }
+
+        // A duplicate result may belong to the in-flight owner. Selecting the
+        // parked owner just because it is currently acquirable risks resuming
+        // another conversation's h2 stream.
+        assert!(mgr
+            .resolve_response_id(&scope, "response-collision")
+            .await
+            .is_none());
+        assert!(mgr
+            .resolve_tool_call_id(&scope, "call-collision")
+            .await
+            .is_none());
+        assert_eq!(parked.lock().await.state, SessionState::AwaitingToolResult);
+
+        mgr.release(running, SessionState::Closed).await;
+        assert_eq!(
+            mgr.resolve_response_id(&scope, "response-collision")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(parked_key.clone())
+        );
+        assert_eq!(
+            mgr.resolve_tool_call_id(&scope, "call-collision")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(parked_key)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_index_candidate_does_not_mask_a_live_parked_owner() {
+        let ttl = Duration::from_secs(300);
+        let mgr = CursorSessionManager::new(ttl, 10);
+        let scope = CursorSessionScope::fixture("expired-collision");
+        let stale_key = CursorSessionKey::new(scope.clone(), "conversation-stale");
+        let live_key = CursorSessionKey::new(scope.clone(), "conversation-live");
+        let stale = session_entry(stale_key.clone(), SessionState::AwaitingToolResult);
+        let live = session_entry(live_key.clone(), SessionState::AwaitingToolResult);
+        {
+            let mut sessions = mgr.inner.sessions.write().await;
+            sessions.insert(stale_key.clone(), stale.clone());
+            sessions.insert(live_key.clone(), live.clone());
+        }
+        for (key, entry) in [(&stale_key, &stale), (&live_key, &live)] {
+            mgr.bind_response_id(key, entry, "response-shared").await;
+            mgr.bind_tool_call_id(key, entry, "call-shared").await;
+        }
+        stale.lock().await.last_activity = Instant::now() - ttl - Duration::from_secs(1);
+
+        assert_eq!(
+            mgr.resolve_response_id(&scope, "response-shared")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(live_key.clone())
+        );
+        assert_eq!(
+            mgr.resolve_tool_call_id(&scope, "call-shared")
+                .await
+                .map(|reference| reference.key().clone()),
+            Some(live_key.clone())
+        );
+        assert!(!mgr.has(&stale_key).await);
+        assert_eq!(stale.lock().await.state, SessionState::Closed);
+        assert_eq!(live.lock().await.state, SessionState::AwaitingToolResult);
+    }
+
+    #[tokio::test]
+    async fn parked_response_and_tool_ids_remain_exact() {
+        let mgr = CursorSessionManager::default();
+        let scope = CursorSessionScope::fixture("exact-id-share");
+        let key = session_key(&scope);
+        let entry = session_entry(key.clone(), SessionState::AwaitingToolResult);
+        mgr.inner
+            .sessions
+            .write()
+            .await
+            .insert(key.clone(), entry.clone());
+        mgr.bind_response_id(&key, &entry, "resp-a").await;
+        mgr.bind_tool_call_id(&key, &entry, "call-a").await;
+        assert!(mgr.resolve_response_id(&scope, "resp-a").await.is_some());
+        assert!(mgr.resolve_tool_call_id(&scope, "call-a").await.is_some());
+        for padded in [" resp-a", "resp-a "] {
+            assert!(mgr.resolve_response_id(&scope, padded).await.is_none());
+        }
+        for padded in [" call-a", "call-a "] {
+            assert!(mgr.resolve_tool_call_id(&scope, padded).await.is_none());
+        }
+        mgr.claim_continuation_ids(&scope, &["call-a".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            !mgr.continuation_was_claimed(&scope, &[" call-a".to_string()])
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn consumed_continuation_claims_are_scope_isolated() {
         let mgr = CursorSessionManager::default();
         let scope_a = CursorSessionScope::fixture("claim-share-a");
         let scope_b = CursorSessionScope::fixture("claim-share-b");
         let ids = vec!["call_same".to_string(), "resp_same".to_string()];
 
-        mgr.claim_continuation_ids(&scope_a, &ids).await;
+        mgr.claim_continuation_ids(&scope_a, &ids).await.unwrap();
 
         assert!(mgr.continuation_was_claimed(&scope_a, &ids).await);
         assert!(!mgr.continuation_was_claimed(&scope_b, &ids).await);
+    }
+
+    #[tokio::test]
+    async fn consumed_continuation_claim_cannot_be_reused_by_a_later_batch() {
+        let mgr = CursorSessionManager::default();
+        let scope_a = CursorSessionScope::fixture("claim-reuse-a");
+        let scope_b = CursorSessionScope::fixture("claim-reuse-b");
+        let consumed = "call-consumed".to_string();
+        let fresh = "call-fresh".to_string();
+        mgr.claim_continuation_ids(&scope_a, std::slice::from_ref(&consumed))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.claim_continuation_ids(&scope_a, &[consumed.clone(), fresh.clone()])
+                .await,
+            Err(CursorContinuationClaimError::AlreadyClaimed)
+        );
+        assert!(
+            mgr.continuation_was_claimed(&scope_a, std::slice::from_ref(&consumed))
+                .await
+        );
+        assert!(!mgr.continuation_was_claimed(&scope_a, &[fresh]).await);
+        assert!(mgr
+            .claim_continuation_ids(&scope_b, &[consumed])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn unexpired_continuation_claims_survive_capacity_pressure() {
+        let mgr = CursorSessionManager::new(Duration::from_secs(300), 1);
+        let scope = CursorSessionScope::fixture("claim-capacity");
+        let original = "call_original".to_string();
+        mgr.claim_continuation_ids(&scope, std::slice::from_ref(&original))
+            .await
+            .unwrap();
+
+        // The minimum claim ceiling is 64. A later batch must not displace
+        // an unexpired replay fence merely because its own IDs fill the map.
+        let competing = (0..64)
+            .map(|index| format!("call_{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mgr.claim_continuation_ids(&scope, &competing).await,
+            Err(CursorContinuationClaimError::CapacityExhausted)
+        );
+
+        assert!(mgr.continuation_was_claimed(&scope, &[original]).await);
+        assert!(!mgr.continuation_was_claimed(&scope, &competing).await);
     }
 
     #[tokio::test]
@@ -1153,9 +1673,87 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(conflict.state, SessionState::Running);
+        assert_eq!(
+            conflict,
+            CursorSessionReserveError::ConversationBusy(CursorSessionOpenConflict {
+                state: SessionState::Running,
+            })
+        );
         let current = mgr.inner.sessions.read().await.get(&key).cloned().unwrap();
         assert!(Arc::ptr_eq(&current, &first));
+    }
+
+    #[tokio::test]
+    async fn running_sessions_do_not_overrun_global_session_capacity() {
+        let mgr = CursorSessionManager::new(Duration::from_secs(300), 1);
+        let first_key = session_key(&CursorSessionScope::fixture("capacity-first"));
+        let second_key = session_key(&CursorSessionScope::fixture("capacity-second"));
+        let first = mgr
+            .reserve(
+                first_key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .reserve(
+                second_key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await;
+        assert!(second.is_err());
+        assert!(matches!(
+            second,
+            Err(CursorSessionReserveError::CapacityExhausted)
+        ));
+        assert_eq!(mgr.size().await, 1);
+        assert!(mgr.has(&first_key).await);
+        assert!(!mgr.has(&second_key).await);
+        assert_eq!(first.lock().await.state, SessionState::Running);
+    }
+
+    #[tokio::test]
+    async fn parked_session_can_be_evicted_to_admit_new_running_session() {
+        let mgr = CursorSessionManager::new(Duration::from_secs(300), 1);
+        let first_key = session_key(&CursorSessionScope::fixture("capacity-parked"));
+        let second_key = session_key(&CursorSessionScope::fixture("capacity-new"));
+        let first = mgr
+            .reserve(
+                first_key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        mgr.release(first.clone(), SessionState::AwaitingToolResult)
+            .await;
+        let second = mgr
+            .reserve(
+                second_key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mgr.size().await, 1);
+        assert!(!mgr.has(&first_key).await);
+        assert!(mgr.has(&second_key).await);
+        assert_eq!(first.lock().await.state, SessionState::Closed);
+        assert_eq!(second.lock().await.state, SessionState::Running);
     }
 
     #[test]

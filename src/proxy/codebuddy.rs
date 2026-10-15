@@ -68,7 +68,7 @@ impl CodeBuddyUpstreamError {
 
     pub fn from_event(value: &Value) -> Option<Self> {
         let code = recursive_business_code(value, 0)?;
-        if code == 0 || value.get("choices").is_some() {
+        if code == 0 {
             return None;
         }
         let message = value
@@ -95,6 +95,9 @@ impl CodeBuddyUpstreamError {
 
     pub fn is_authentication_failure(&self) -> bool {
         self.status == 401
+            && self
+                .code
+                .is_none_or(|code| status_for_code(code) == axum::http::StatusCode::BAD_GATEWAY)
     }
 
     pub fn is_rate_limited(&self) -> bool {
@@ -102,9 +105,13 @@ impl CodeBuddyUpstreamError {
     }
 
     pub fn into_proxy_error(self) -> ProxyError {
+        let status = self.downstream_status();
         ProxyError {
-            status: self.downstream_status(),
-            message: match self.code {
+            status,
+            message: match self
+                .code
+                .filter(|code| status_for_code(*code) != axum::http::StatusCode::BAD_GATEWAY)
+            {
                 Some(code) => format!("CodeBuddy upstream error {code}: {}", self.message),
                 None => self.message,
             },
@@ -149,7 +156,9 @@ impl From<ProxyError> for CodeBuddySseDecodeError {
 pub struct CodeBuddySseDecoder {
     buffer: Vec<u8>,
     saw_done: bool,
+    saw_finish_reason: bool,
     complete: bool,
+    failed: bool,
     sent_role: bool,
     request_memory: Option<RequestMemoryBudget>,
     buffer_memory: Option<RequestMemoryReservation>,
@@ -180,10 +189,19 @@ impl CodeBuddySseDecoder {
     /// terminal because a later network chunk may still contain a duplicate
     /// terminal or business data.
     pub fn is_terminal(&self) -> bool {
-        self.complete
+        self.complete && !self.failed
     }
 
     pub fn push_classified(&mut self, chunk: Bytes) -> Result<Bytes, CodeBuddySseDecodeError> {
+        if self.failed {
+            return Err(ProxyError::bad_gateway("CodeBuddy SSE decoder has failed").into());
+        }
+        let result = self.push_classified_inner(chunk);
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn push_classified_inner(&mut self, chunk: Bytes) -> Result<Bytes, CodeBuddySseDecodeError> {
         if self.complete && !chunk.is_empty() {
             return Err(
                 ProxyError::bad_gateway("CodeBuddy SSE emitted bytes after completion").into(),
@@ -206,6 +224,15 @@ impl CodeBuddySseDecoder {
     }
 
     pub fn finish_classified(&mut self) -> Result<Bytes, CodeBuddySseDecodeError> {
+        if self.failed {
+            return Err(ProxyError::bad_gateway("CodeBuddy SSE decoder has failed").into());
+        }
+        let result = self.finish_classified_inner();
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn finish_classified_inner(&mut self) -> Result<Bytes, CodeBuddySseDecodeError> {
         if self.complete {
             return Err(
                 ProxyError::bad_gateway("CodeBuddy SSE was finalized more than once").into(),
@@ -329,8 +356,23 @@ impl CodeBuddySseDecoder {
         if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
             return Err(CodeBuddySseDecodeError::Upstream(error));
         }
-        if let Some(usage) = value.get_mut("usage") {
-            canonicalize_codebuddy_cache_usage(usage);
+        match value.get("usage") {
+            Some(Value::Null) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("usage");
+                }
+            }
+            Some(Value::Object(_)) => {
+                if let Some(usage) = value.get_mut("usage") {
+                    canonicalize_codebuddy_cache_usage(usage);
+                }
+            }
+            Some(_) => {
+                return Err(
+                    ProxyError::bad_gateway("CodeBuddy Chat SSE usage must be an object").into(),
+                )
+            }
+            None => {}
         }
         if !sanitize_codebuddy_stream_chunk(&mut value, &mut self.sent_role)? {
             return Ok(());
@@ -343,6 +385,20 @@ impl CodeBuddySseDecoder {
                 "CodeBuddy SSE chunk has neither choices nor usage",
             )
             .into());
+        }
+        if let Some(choices) = object.get("choices").and_then(Value::as_array) {
+            if self.saw_finish_reason && !choices.is_empty() {
+                return Err(ProxyError::bad_gateway(
+                    "CodeBuddy SSE emitted business data after finish_reason",
+                )
+                .into());
+            }
+            self.saw_finish_reason |= choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.trim().is_empty())
+            });
         }
         let canonical = serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_gateway(format!("encode CodeBuddy SSE chunk: {error}"))
@@ -438,14 +494,63 @@ fn sanitize_codebuddy_stream_chunk(
         let choices = choices
             .as_array_mut()
             .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy SSE choices must be an array"))?;
+        if choices.len() > 1 {
+            return Err(ProxyError::bad_gateway(
+                "CodeBuddy Chat SSE returned multiple choices for one response",
+            )
+            .into());
+        }
         for choice in choices.iter() {
-            if let Some(choice) = choice.as_object() {
-                if choice.get("delta").is_some_and(|delta| !delta.is_object()) {
+            validate_codebuddy_choice_index(choice)?;
+            if choice.get("delta").is_some_and(|delta| !delta.is_object()) {
+                return Err(
+                    ProxyError::bad_gateway("CodeBuddy Chat SSE delta must be an object").into(),
+                );
+            }
+            if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
+                if delta
+                    .get("function_call")
+                    .is_some_and(|call| !dummy_function_call(call))
+                {
                     return Err(ProxyError::bad_gateway(
-                        "CodeBuddy Chat SSE delta must be an object",
+                        "CodeBuddy Chat SSE legacy function_call is unsupported",
                     )
                     .into());
                 }
+                for field in ["content", "reasoning_content", "reasoning", "refusal"] {
+                    if delta
+                        .get(field)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                    {
+                        return Err(ProxyError::bad_gateway(format!(
+                            "CodeBuddy Chat SSE {field} must be a string or null"
+                        ))
+                        .into());
+                    }
+                }
+            }
+            match choice.pointer("/delta/tool_calls") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(calls)) => {
+                    for call in calls {
+                        validate_codebuddy_tool_call_index(call)?;
+                    }
+                }
+                Some(_) => {
+                    return Err(ProxyError::bad_gateway(
+                        "CodeBuddy Chat SSE tool_calls must be an array or null",
+                    )
+                    .into());
+                }
+            }
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null() && !reason.is_string())
+            {
+                return Err(ProxyError::bad_gateway(
+                    "CodeBuddy Chat SSE finish_reason must be a string or null",
+                )
+                .into());
             }
         }
         choices.retain_mut(|choice| {
@@ -458,7 +563,10 @@ fn sanitize_codebuddy_stream_chunk(
                 .is_some_and(|message| !semantic_empty(message));
             if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
                 for field in ["content", "reasoning_content", "reasoning", "refusal"] {
-                    if delta.get(field).is_some_and(semantic_empty) {
+                    if delta
+                        .get(field)
+                        .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
+                    {
                         delta.remove(field);
                     }
                 }
@@ -496,6 +604,39 @@ fn sanitize_codebuddy_stream_chunk(
     Ok(meaningful)
 }
 
+fn validate_codebuddy_choice_index(choice: &Value) -> Result<(), ProxyError> {
+    let choice = choice
+        .as_object()
+        .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy Chat SSE choice must be an object"))?;
+    if choice
+        .get("index")
+        .is_some_and(|index| integer_value(index) != Some(0))
+    {
+        return Err(ProxyError::bad_gateway(
+            "CodeBuddy Chat SSE returned an unsupported choice index",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_codebuddy_tool_call_index(call: &Value) -> Result<Option<usize>, ProxyError> {
+    let call = call
+        .as_object()
+        .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy Chat SSE tool call must be an object"))?;
+    let Some(index) = call.get("index") else {
+        return Ok(None);
+    };
+    let index = integer_value(index)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy Chat SSE tool call index is invalid"))?;
+    if index >= MAX_TOOL_CALLS {
+        return Err(ProxyError::bad_gateway(
+            "CodeBuddy Chat SSE tool call index exceeds the limit",
+        ));
+    }
+    Ok(Some(index))
+}
+
 fn semantic_empty(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -530,11 +671,13 @@ pub struct CodeBuddyChatSseAggregator {
     model: Option<String>,
     content: String,
     reasoning_content: String,
+    refusal: String,
     tool_calls: BTreeMap<usize, AggregatedToolCall>,
     fallback_tool_order: Vec<usize>,
     finish_reason: Option<Value>,
     usage: Option<Value>,
     terminal: bool,
+    failed: bool,
     request_memory: Option<RequestMemoryBudget>,
     retained_memory: Option<RequestMemoryReservation>,
 }
@@ -585,6 +728,7 @@ impl CodeBuddyChatSseAggregator {
             .saturating_add(self.model.as_ref().map_or(0, String::capacity))
             .saturating_add(self.content.capacity())
             .saturating_add(self.reasoning_content.capacity())
+            .saturating_add(self.refusal.capacity())
             .saturating_add(tool_calls)
             .saturating_add(
                 self.fallback_tool_order
@@ -596,6 +740,17 @@ impl CodeBuddyChatSseAggregator {
     }
 
     pub fn push(&mut self, chunk: Bytes) -> Result<(), ProxyError> {
+        if self.failed {
+            return Err(ProxyError::bad_gateway(
+                "CodeBuddy Chat SSE aggregator has failed",
+            ));
+        }
+        let result = self.push_inner(chunk);
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn push_inner(&mut self, chunk: Bytes) -> Result<(), ProxyError> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -621,6 +776,11 @@ impl CodeBuddyChatSseAggregator {
         fallback_model: &str,
         now_unix_seconds: i64,
     ) -> Result<CodeBuddyAggregatedResponse, ProxyError> {
+        if self.failed {
+            return Err(ProxyError::bad_gateway(
+                "CodeBuddy Chat SSE aggregator has failed",
+            ));
+        }
         self.drain(true)?;
         if !self.terminal {
             return Err(ProxyError::bad_gateway(
@@ -647,6 +807,9 @@ impl CodeBuddyChatSseAggregator {
                 "reasoning_content".to_string(),
                 Value::String(self.reasoning_content),
             );
+        }
+        if !self.refusal.is_empty() {
+            message.insert("refusal".to_string(), Value::String(self.refusal));
         }
         if !self.tool_calls.is_empty() {
             let mut calls = Vec::with_capacity(self.tool_calls.len());
@@ -764,6 +927,9 @@ impl CodeBuddyChatSseAggregator {
         let value = serde_json::from_str::<Value>(data).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid CodeBuddy Chat SSE chunk: {error}"))
         })?;
+        if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
+            return Err(error.into_proxy_error());
+        }
         let object = value
             .as_object()
             .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy Chat SSE chunk must be an object"))?;
@@ -790,21 +956,30 @@ impl CodeBuddyChatSseAggregator {
             canonicalize_codebuddy_cache_usage(&mut usage);
             self.usage = Some(usage);
         }
-        let choices = object
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProxyError::bad_gateway("CodeBuddy Chat SSE choices must be an array")
-            })?;
+        let choices = match object.get("choices") {
+            Some(Value::Array(choices)) => choices,
+            None if object.contains_key("usage") => return Ok(()),
+            _ => {
+                return Err(ProxyError::bad_gateway(
+                    "CodeBuddy Chat SSE choices must be an array",
+                ));
+            }
+        };
+        if choices.len() > 1 {
+            return Err(ProxyError::bad_gateway(
+                "CodeBuddy Chat SSE returned multiple choices for one response",
+            ));
+        }
+        if self.finish_reason.is_some() && !choices.is_empty() {
+            return Err(ProxyError::bad_gateway(
+                "CodeBuddy Chat SSE emitted business data after finish_reason",
+            ));
+        }
         for choice in choices {
+            validate_codebuddy_choice_index(choice)?;
             let choice = choice.as_object().ok_or_else(|| {
                 ProxyError::bad_gateway("CodeBuddy Chat SSE choice must be an object")
             })?;
-            if choice.get("index").and_then(integer_value).unwrap_or(0) != 0 {
-                return Err(ProxyError::bad_gateway(
-                    "CodeBuddy Chat SSE returned an unsupported choice index",
-                ));
-            }
             if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
                 let reason = reason
                     .as_str()
@@ -822,6 +997,14 @@ impl CodeBuddyChatSseAggregator {
             let delta = delta.as_object().ok_or_else(|| {
                 ProxyError::bad_gateway("CodeBuddy Chat SSE delta must be an object")
             })?;
+            if delta
+                .get("function_call")
+                .is_some_and(|call| !dummy_function_call(call))
+            {
+                return Err(ProxyError::bad_gateway(
+                    "CodeBuddy Chat SSE legacy function_call is unsupported",
+                ));
+            }
             append_delta_text(&mut self.content, delta.get("content"), "content")?;
             append_delta_text(
                 &mut self.reasoning_content,
@@ -830,23 +1013,20 @@ impl CodeBuddyChatSseAggregator {
                     .or_else(|| delta.get("reasoning")),
                 "reasoning_content",
             )?;
+            append_delta_text(&mut self.refusal, delta.get("refusal"), "refusal")?;
             if let Some(calls) = delta.get("tool_calls") {
                 let calls = calls.as_array().ok_or_else(|| {
                     ProxyError::bad_gateway("CodeBuddy Chat SSE tool_calls must be an array")
                 })?;
                 for (position, call) in calls.iter().enumerate() {
+                    let explicit = validate_codebuddy_tool_call_index(call)?;
                     let call = call.as_object().ok_or_else(|| {
                         ProxyError::bad_gateway("CodeBuddy Chat SSE tool call must be an object")
                     })?;
-                    let explicit = call
-                        .get("index")
-                        .and_then(integer_value)
-                        .and_then(|value| usize::try_from(value).ok());
                     let id = call
                         .get("id")
                         .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty());
+                        .filter(|value| !value.trim().is_empty());
                     let index = explicit
                         .or_else(|| {
                             id.and_then(|id| {
@@ -1141,13 +1321,28 @@ fn recursive_business_code(value: &Value, depth: usize) -> Option<i64> {
 }
 
 fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    let cr = buffer.windows(2).position(|window| window == b"\r\r");
-    [(lf, 2), (crlf, 4), (cr, 2)]
-        .into_iter()
-        .filter_map(|(position, delimiter)| position.map(|position| (position, delimiter)))
-        .min_by_key(|(position, _)| *position)
+    let mut index = 0;
+    while index < buffer.len() {
+        let first = match buffer[index] {
+            b'\r' if buffer.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let next = index + first;
+        let second = match buffer.get(next) {
+            Some(b'\r') if buffer.get(next + 1) == Some(&b'\n') => 2,
+            Some(b'\r' | b'\n') => 1,
+            _ => {
+                index = next;
+                continue;
+            }
+        };
+        return Some((index, first + second));
+    }
+    None
 }
 
 fn integer_value(value: &Value) -> Option<i64> {
@@ -1158,7 +1353,13 @@ fn integer_value(value: &Value) -> Option<i64> {
 }
 
 fn sanitize_error_message(value: &str) -> String {
-    value.trim().chars().take(MAX_ERROR_MESSAGE_BYTES).collect()
+    crate::logging::redact_sensitive_text(value.trim())
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_ERROR_MESSAGE_BYTES)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1214,6 +1415,30 @@ mod tests {
     }
 
     #[test]
+    fn decoder_separates_mixed_sse_blank_lines_before_done() {
+        let business =
+            json!({"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]});
+        let stream = format!("data: {business}\n\r\ndata: [DONE]\r\n\n");
+        for split in 0..=stream.len() {
+            let mut decoder = CodeBuddySseDecoder::default();
+            let first = decoder
+                .push_classified(Bytes::copy_from_slice(&stream.as_bytes()[..split]))
+                .unwrap();
+            let second = decoder
+                .push_classified(Bytes::copy_from_slice(&stream.as_bytes()[split..]))
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&[first.as_ref(), second.as_ref()].concat())
+                    .contains("hello")
+            );
+            assert_eq!(
+                decoder.finish_classified().unwrap(),
+                Bytes::from_static(b"data: [DONE]\n\n")
+            );
+        }
+    }
+
+    #[test]
     fn decoder_accepts_standard_multiline_data_single_cr_and_liveness_fields() {
         let mut decoder = CodeBuddySseDecoder::default();
         let output = decoder
@@ -1251,6 +1476,108 @@ mod tests {
         };
         assert_eq!(error.code, Some(14_003));
         assert!(error.is_rate_limited());
+    }
+
+    #[test]
+    fn recognized_business_rejection_does_not_become_auth_recovery_from_http_401() {
+        for (code, expected_status) in [
+            (14_003, axum::http::StatusCode::TOO_MANY_REQUESTS),
+            (11_102, axum::http::StatusCode::FORBIDDEN),
+            (11_128, axum::http::StatusCode::BAD_REQUEST),
+            (12_005, axum::http::StatusCode::UNAUTHORIZED),
+            (11_212, axum::http::StatusCode::UNAUTHORIZED),
+            (11_216, axum::http::StatusCode::UNAUTHORIZED),
+            (12_153, axum::http::StatusCode::UNAUTHORIZED),
+        ] {
+            let body = json!({"code": code, "msg": "rejected"}).to_string();
+            let error = CodeBuddyUpstreamError::from_status_body(401, body.as_bytes());
+            assert_eq!(error.downstream_status(), expected_status);
+            assert!(!error.is_authentication_failure(), "code {code}");
+        }
+
+        for code in [None, Some(123_456)] {
+            let body = code.map_or_else(
+                || json!({"msg": "expired"}).to_string(),
+                |code| json!({"code": code, "msg": "expired"}).to_string(),
+            );
+            let error = CodeBuddyUpstreamError::from_status_body(401, body.as_bytes());
+            assert!(error.is_authentication_failure(), "code {code:?}");
+        }
+
+        let body = json!({"code": 12_005, "msg": "expired"}).to_string();
+        let error = CodeBuddyUpstreamError::from_status_body(403, body.as_bytes());
+        assert!(!error.is_authentication_failure());
+
+        for code in [12_005, 11_212, 11_216, 12_153] {
+            let error = CodeBuddyUpstreamError::from_event(&json!({
+                "code": code,
+                "message": "authorization unavailable"
+            }))
+            .unwrap();
+            assert_eq!(
+                error.downstream_status(),
+                axum::http::StatusCode::UNAUTHORIZED
+            );
+            assert!(!error.is_authentication_failure(), "stream code {code}");
+        }
+    }
+
+    #[test]
+    fn upstream_errors_redact_reflected_secrets_and_unknown_numeric_codes() {
+        let error = CodeBuddyUpstreamError::from_status_body(
+            502,
+            br#"{"code":123456,"msg":"Authorization: Bearer http-secret"}"#,
+        );
+        assert_eq!(error.code, Some(123456));
+        let downstream = error.into_proxy_error();
+        assert!(!downstream.message.contains("http-secret"));
+        assert!(!downstream.message.contains("123456"));
+
+        let error = CodeBuddyUpstreamError::from_status_body(
+            403,
+            br#"{"code":11102,"message":"refresh_token=refresh-secret"}"#,
+        );
+        let downstream = error.into_proxy_error();
+        assert_eq!(downstream.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(!downstream.message.contains("refresh-secret"));
+        assert!(downstream.message.contains("11102"));
+
+        let stream = CodeBuddyUpstreamError::from_event(&json!({
+            "code": 14003,
+            "msg": "api_key=stream-secret",
+        }))
+        .unwrap();
+        assert!(stream.is_rate_limited());
+        assert!(!stream.into_proxy_error().message.contains("stream-secret"));
+
+        let unknown_stream = CodeBuddyUpstreamError::from_event(&json!({
+            "code": 123456,
+            "msg": "denied",
+        }))
+        .unwrap()
+        .into_proxy_error();
+        assert_eq!(unknown_stream.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(unknown_stream.message, "denied");
+    }
+
+    #[test]
+    fn decoder_rejects_business_error_even_with_choices_and_done() {
+        for choices in [
+            json!([]),
+            json!([{"index":0,"delta":{"content":"misleading"},"finish_reason":"stop"}]),
+        ] {
+            let error = json!({"code": 14003, "msg": "too many requests", "choices": choices});
+            let mut decoder = CodeBuddySseDecoder::default();
+            let classified = decoder.push_classified(chunk(error.clone())).unwrap_err();
+            let CodeBuddySseDecodeError::Upstream(classified) = classified else {
+                panic!("mixed error envelope must remain an upstream error")
+            };
+            assert_eq!(classified.code, Some(14_003));
+            assert!(classified.is_rate_limited());
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(chunk(error)).is_err());
+        }
     }
 
     #[test]
@@ -1298,6 +1625,409 @@ mod tests {
         assert!(malformed
             .push_classified(chunk(json!({"choices":[{"index":0,"delta":""}]})))
             .is_err());
+    }
+
+    #[test]
+    fn decoder_preserves_whitespace_only_text_fragments() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        for delta in [
+            json!({"content":"left"}),
+            json!({"content":" "}),
+            json!({"content":"right"}),
+            json!({"reasoning_content":"think"}),
+            json!({"reasoning_content":" "}),
+            json!({"reasoning_content":"more"}),
+        ] {
+            let canonical = decoder
+                .push_classified(chunk(json!({"choices":[{"index":0,"delta":delta}]})))
+                .unwrap();
+            assert!(
+                !canonical.is_empty(),
+                "whitespace fragment must be forwarded"
+            );
+            aggregator.push(canonical).unwrap();
+        }
+        aggregator
+            .push(
+                decoder
+                    .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+                    .unwrap(),
+            )
+            .unwrap();
+        aggregator
+            .push(decoder.finish_classified().unwrap())
+            .unwrap();
+        let response = aggregator.finish("model", 1).unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "left right");
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            "think more"
+        );
+    }
+
+    #[test]
+    fn usage_only_tail_without_choices_survives_decoder_and_aggregator() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        for frame in [
+            chunk(
+                json!({"choices":[{"index":0,"delta":{"content":"ready"},"finish_reason":"stop"}]}),
+            ),
+            chunk(
+                json!({"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"cache_read_tokens":3,"cache_write_tokens":2}}),
+            ),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ] {
+            aggregator
+                .push(decoder.push_classified(frame).unwrap())
+                .unwrap();
+        }
+        aggregator
+            .push(decoder.finish_classified().unwrap())
+            .unwrap();
+        let response = aggregator.finish("model", 1).unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "ready");
+        assert_eq!(response["usage"]["cache_read_tokens"], 3);
+        assert_eq!(response["usage"]["cache_write_tokens"], 2);
+    }
+
+    #[test]
+    fn missing_choices_requires_a_valid_usage_object() {
+        for value in [
+            json!({"id":"empty"}),
+            json!({"usage":null}),
+            json!({"usage":"invalid"}),
+            json!({"choices":null,"usage":{"prompt_tokens":1}}),
+        ] {
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(chunk(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_explicit_non_string_text_deltas() {
+        for field in ["content", "reasoning_content", "reasoning", "refusal"] {
+            let mut decoder = CodeBuddySseDecoder::default();
+            let bad = json!({"choices":[{"index":0,"delta":{(field):42}}]});
+            assert!(decoder.push_classified(chunk(bad)).is_err(), "{field}");
+            assert!(decoder.finish_classified().is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn refusal_deltas_survive_non_stream_aggregation() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        for value in [
+            json!({"choices":[{"index":0,"delta":{"refusal":"I cannot "},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"refusal":"help with that."},"finish_reason":"content_filter"}]}),
+        ] {
+            let normalized = decoder.push_classified(chunk(value)).unwrap();
+            aggregator.push(normalized).unwrap();
+        }
+        decoder
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        aggregator
+            .push(decoder.finish_classified().unwrap())
+            .unwrap();
+        let response = aggregator.finish("default-model", 1).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["refusal"],
+            "I cannot help with that."
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn decoder_rejects_business_after_finish_reason_but_accepts_usage_tail() {
+        let finish = chunk(json!({"choices":[{
+            "index":0,"delta":{"content":"done"},"finish_reason":"stop"
+        }]}));
+        let late = chunk(json!({"choices":[{
+            "index":0,"delta":{"content":"unexpected"},"finish_reason":null
+        }]}));
+        let mut decoder = CodeBuddySseDecoder::default();
+        decoder.push_classified(finish.clone()).unwrap();
+        assert!(decoder.push_classified(late.clone()).is_err());
+
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        aggregator.push(finish).unwrap();
+        assert!(aggregator.push(late).is_err());
+
+        let mut after_usage = CodeBuddySseDecoder::default();
+        after_usage
+            .push_classified(chunk(json!({"choices":[{
+                "index":0,"delta":{},"finish_reason":"stop"
+            }]})))
+            .unwrap();
+        after_usage
+            .push_classified(chunk(json!({"choices":[],"usage":{"prompt_tokens":0}})))
+            .unwrap();
+        assert!(after_usage
+            .push_classified(chunk(json!({"choices":[{
+                "index":0,"delta":{"content":"late"},"finish_reason":null
+            }]})))
+            .is_err());
+
+        let mut valid = CodeBuddySseDecoder::default();
+        valid
+            .push_classified(chunk(json!({"choices":[{
+                "index":0,"delta":{},"finish_reason":"stop"
+            }]})))
+            .unwrap();
+        valid
+            .push_classified(chunk(json!({"choices":[],"usage":{"prompt_tokens":0}})))
+            .unwrap();
+        valid
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        assert!(valid.finish_classified().is_ok());
+    }
+
+    #[test]
+    fn decoder_rejects_non_string_finish_reason_before_stream_success() {
+        for reason in [json!(false), json!(1), json!({"unexpected": "stop"})] {
+            let frame = chunk(json!({"choices": [{
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": reason,
+            }]}));
+            let mut decoder = CodeBuddySseDecoder::default();
+            assert!(decoder.push_classified(frame.clone()).is_err());
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(frame).is_err());
+        }
+
+        for reason in [Value::Null, json!(""), json!("  ")] {
+            let mut decoder = CodeBuddySseDecoder::default();
+            let frame = chunk(json!({"choices": [{
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": reason,
+            }]}));
+            assert!(decoder.push_classified(frame).is_ok());
+            assert!(decoder
+                .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+                .is_ok());
+            assert!(decoder.finish_classified().is_ok());
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_non_object_usage_before_stream_success() {
+        for usage in [json!(-1), json!("bad"), json!([1, 2])] {
+            let mut decoder = CodeBuddySseDecoder::default();
+            let event = chunk(json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": usage,
+            }));
+            assert!(decoder.push_classified(event).is_err());
+            assert!(!decoder.is_terminal());
+        }
+
+        let mut decoder = CodeBuddySseDecoder::default();
+        let canonical = decoder
+            .push_classified(chunk(json!({
+                "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": null,
+            })))
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&canonical).contains("\"usage\":null"));
+        decoder
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        assert!(decoder.finish_classified().is_ok());
+    }
+
+    #[test]
+    fn choices_require_objects_and_supported_indices_on_both_paths() {
+        for choice in [
+            json!(null),
+            json!("unexpected"),
+            json!({"index": 1, "delta": {"content": "wrong choice"}}),
+            json!({"index": "invalid", "delta": {"content": "wrong choice"}}),
+            json!({"index": false, "delta": {"content": "wrong choice"}}),
+        ] {
+            let frame = chunk(json!({"choices": [choice]}));
+            let mut decoder = CodeBuddySseDecoder::default();
+            assert!(decoder.push_classified(frame.clone()).is_err());
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(frame).is_err());
+        }
+
+        for index in [None, Some(json!(0)), Some(json!("0"))] {
+            let mut choice = json!({"delta": {"content": "valid"}, "finish_reason": "stop"});
+            if let Some(index) = index {
+                choice["index"] = index;
+            }
+            let frame = chunk(json!({"choices": [choice]}));
+            let mut decoder = CodeBuddySseDecoder::default();
+            assert!(decoder.push_classified(frame.clone()).is_ok());
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(frame).is_ok());
+        }
+    }
+
+    #[test]
+    fn duplicate_choice_zero_in_one_chunk_is_rejected_on_both_paths() {
+        let frame = chunk(json!({"choices": [
+            {"index": 0, "delta": {"content": "left"}, "finish_reason": null},
+            {"index": 0, "delta": {"content": "right"}, "finish_reason": "stop"}
+        ]}));
+        let mut decoder = CodeBuddySseDecoder::default();
+        let error = decoder
+            .push_classified(frame.clone())
+            .expect_err("two choice-zero branches cannot be forwarded as one response");
+        assert_eq!(
+            error.into_proxy_error().status,
+            axum::http::StatusCode::BAD_GATEWAY
+        );
+        assert!(!decoder.is_terminal());
+
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        let error = aggregator
+            .push(frame)
+            .expect_err("two choice-zero branches cannot be concatenated");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(aggregator.finish("model", 1).is_err());
+    }
+
+    #[test]
+    fn explicit_invalid_tool_indices_fail_on_both_paths() {
+        for index in [Value::Null, json!("invalid"), json!(-1), json!(128)] {
+            let frame = chunk(json!({"choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": index,
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]}));
+            let mut decoder = CodeBuddySseDecoder::default();
+            assert!(decoder.push_classified(frame.clone()).is_err(), "{index}");
+            assert!(decoder
+                .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+                .is_err());
+            assert!(decoder.finish_classified().is_err());
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(frame).is_err(), "{index}");
+            assert!(aggregator
+                .push(Bytes::from_static(b"data: [DONE]\n\n"))
+                .is_err());
+            assert!(aggregator.finish("model", 1).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_non_array_tool_calls_fail_before_stream_forwarding() {
+        for calls in [json!(""), json!({"id":"call-1"}), json!(42), json!(false)] {
+            let frame = chunk(json!({"choices":[{
+                "index":0,
+                "delta":{"tool_calls":calls},
+                "finish_reason":"tool_calls"
+            }]}));
+            let mut decoder = CodeBuddySseDecoder::default();
+            let error = decoder
+                .push_classified(frame.clone())
+                .expect_err("invalid tool_calls shape cannot be forwarded");
+            assert_eq!(
+                error.into_proxy_error().status,
+                axum::http::StatusCode::BAD_GATEWAY
+            );
+            assert!(!decoder.is_terminal());
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            assert!(aggregator.push(frame).is_err());
+        }
+
+        let mut decoder = CodeBuddySseDecoder::default();
+        assert!(decoder
+            .push_classified(chunk(json!({"choices":[{
+                "index":0,"delta":{"tool_calls":null},"finish_reason":null
+            }]})))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn non_dummy_legacy_function_call_cannot_disappear_from_response() {
+        let frame = chunk(json!({"choices":[{
+            "index":0,
+            "delta":{"function_call":{"name":"lookup","arguments":"{}"}},
+            "finish_reason":"function_call"
+        }]}));
+        let mut decoder = CodeBuddySseDecoder::default();
+        assert!(decoder.push_classified(frame.clone()).is_err());
+
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        assert!(aggregator.push(frame).is_err());
+    }
+
+    #[test]
+    fn missing_and_numeric_string_tool_indices_remain_compatible() {
+        for index in [None, Some(json!(0)), Some(json!("0"))] {
+            let mut call = json!({
+                "id": "call-1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            });
+            if let Some(index) = index {
+                call["index"] = index;
+            }
+            let frame = chunk(json!({"choices": [{
+                "index": 0, "delta": {"tool_calls": [call]},
+                "finish_reason": "tool_calls"
+            }]}));
+            let done = Bytes::from_static(b"data: [DONE]\n\n");
+            let mut decoder = CodeBuddySseDecoder::default();
+            decoder.push_classified(frame.clone()).unwrap();
+            decoder.push_classified(done.clone()).unwrap();
+            decoder.finish_classified().unwrap();
+
+            let mut aggregator = CodeBuddyChatSseAggregator::default();
+            aggregator.push(frame).unwrap();
+            aggregator.push(done).unwrap();
+            let response = aggregator.finish("model", 1).unwrap();
+            assert_eq!(
+                response["choices"][0]["message"]["tool_calls"][0]["id"],
+                "call-1"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_tool_index_matches_the_opaque_id_after_parallel_order_changes() {
+        let first = chunk(json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-a","type":"function","function":{"name":"alpha","arguments":"{"}},
+            {"index":1,"id":" call-b ","type":"function","function":{"name":"beta","arguments":"{"}}
+        ]},"finish_reason":null}]}));
+        let second = chunk(json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"id":" call-b ","function":{"arguments":"}"}}
+        ]},"finish_reason":null}]}));
+        let third = chunk(json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"}"}}
+        ]},"finish_reason":"tool_calls"}]}));
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        aggregator.push(first).unwrap();
+        aggregator.push(second).unwrap();
+        aggregator.push(third).unwrap();
+        aggregator
+            .push(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        let response = aggregator.finish("model", 1).unwrap();
+        let calls = response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls[0]["id"], "call-a");
+        assert_eq!(calls[1]["id"], " call-b ");
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
     }
 
     #[test]
@@ -1503,5 +2233,43 @@ mod tests {
         assert!(error.is_request_memory_exhausted());
         assert_eq!(error.error_code(), "cc_switch_request_memory_exhausted");
         assert!(budget.is_exhausted());
+    }
+
+    #[test]
+    fn decoder_rejected_data_after_done_cannot_be_finished_as_success() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        decoder
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        assert!(decoder
+            .push_classified(Bytes::from_static(b"data: {}\n\n"))
+            .is_err());
+        assert!(decoder.push_classified(Bytes::new()).is_err());
+        assert!(decoder.finish_classified().is_err());
+        assert!(!decoder.is_terminal());
+    }
+
+    #[test]
+    fn decoder_failed_finish_cannot_be_repaired_by_later_data() {
+        let mut decoder = CodeBuddySseDecoder::default();
+        assert!(decoder.finish_classified().is_err());
+        assert!(decoder
+            .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+            .is_err());
+        assert!(decoder.finish_classified().is_err());
+        assert!(!decoder.is_terminal());
+    }
+
+    #[test]
+    fn aggregator_rejected_data_after_done_cannot_be_finished_as_success() {
+        let mut aggregator = CodeBuddyChatSseAggregator::default();
+        aggregator
+            .push(Bytes::from_static(b"data: [DONE]\n\n"))
+            .unwrap();
+        assert!(aggregator
+            .push(Bytes::from_static(b"data: {}\n\n"))
+            .is_err());
+        assert!(aggregator.push(Bytes::new()).is_err());
+        assert!(aggregator.finish("auto", 1).is_err());
     }
 }

@@ -67,6 +67,13 @@ function digest(domain, value) {
     .digest("hex");
 }
 
+function catalogDigest(app, data) {
+  return digest(
+    `cc-switch-server:codebuddy-${app}-catalog:v2`,
+    [...data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+  );
+}
+
 function fixture(site) {
   const model = site === "intl" ? "default-model" : "default";
   const accountId = `codebuddy-${site}-fixture-account`;
@@ -97,7 +104,7 @@ function fixture(site) {
         source: "codebuddy_live_model_catalog",
         fetchedAtMs,
         stale: false,
-        digest: digest(`cc-switch-server:codebuddy-${app}-catalog:v2`, modelData),
+        digest: catalogDigest(app, modelData),
       },
     ]),
   );
@@ -300,14 +307,20 @@ function sendJson(response, status, value) {
   response.end(JSON.stringify(value));
 }
 
-function providerView(value, app, { bindingMismatch = false } = {}) {
+function providerView(value, app, { bindingMismatch = false, scopeFault = "" } = {}) {
+  const fault = scopeFault.startsWith(`${app}_`) ? scopeFault.slice(app.length + 1) : "";
+  const revision = value.providers[app].providerRevision;
   return {
     app,
-    providerRevision: value.providers[app].providerRevision,
+    revision: ["missing_view_revision", "legacy_top_level_only"].includes(fault)
+      ? undefined : revision + (fault === "mismatched_revisions" ? 1 : 0),
+    ...(fault === "legacy_top_level_only" ? { providerRevision: revision } : {}),
     providerType: "codebuddy_oauth",
     providerTypeId: "codebuddy_oauth",
     provider: { id: value.providerIds[app] },
     runtime: {
+      providerRevision: ["missing_runtime_revision", "legacy_top_level_only"].includes(fault)
+        ? undefined : revision,
       driverId: "special.codebuddy_oauth",
       runtimeFingerprint: value.providers[app].runtimeFingerprint,
       configurationState: "ready",
@@ -321,8 +334,22 @@ function providerView(value, app, { bindingMismatch = false } = {}) {
   };
 }
 
-async function startMockServer(value, { bindingMismatch = false, leakSecret = false } = {}) {
+async function startMockServer(value, { bindingMismatch = false, duplicateShareApp = "", primaryMismatch = false, shareFault = "", scopeFault = "", accountFault = null, leakSecret = false, drift = "", oversizedControl = "", onFirstControl = null, accountSite = value.site, omitAccountScope = false, finalShareDelayMs = 0, finalCatalogFault = null } = {}) {
   const seen = [];
+  let firstControlSeen = false;
+  let accountReads = 0;
+  let providerReads = 0;
+  let shareReads = 0;
+  const catalogReads = { claude: 0, codex: 0, gemini: 0 };
+  const accountFlags = { hasApiKey: false, needsRelogin: false };
+  if (accountFault) {
+    if (accountFault.variant === "missing") {
+      delete accountFlags[accountFault.field];
+    } else {
+      accountFlags[accountFault.field] =
+        accountFault.variant === "null" ? null : "false";
+    }
+  }
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     seen.push({
@@ -331,7 +358,20 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
       search: url.search,
       authorization: request.headers.authorization || "",
     });
+    if (!firstControlSeen && url.pathname === "/api/accounts") {
+      firstControlSeen = true;
+      onFirstControl?.();
+    }
     if (request.method === "GET" && url.pathname === "/api/accounts") {
+      accountReads += 1;
+      if (oversizedControl === "declared") {
+        response.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": String(4 * 1024 * 1024 + 1),
+        });
+        response.write("{");
+        return;
+      }
       sendJson(response, 200, {
         ok: true,
         accounts: [
@@ -339,13 +379,19 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
             id: value.accountId,
             providerType: "codebuddy_oauth",
             authIdentityGeneration: value.authIdentityGeneration,
-            tokenRefreshGeneration: value.tokenRefreshGeneration,
+            tokenRefreshGeneration: value.tokenRefreshGeneration + (drift === "account" && accountReads > 1 ? 1 : 0),
             hasAccessToken: true,
             hasRefreshToken: true,
-            hasApiKey: false,
+            ...accountFlags,
             hasProfile: true,
             hasRaw: true,
-            needsRelogin: false,
+            ...(!omitAccountScope && {
+              codebuddyCredentialScope: {
+                site: drift === "site" && accountReads > 1
+                  ? (value.site === "intl" ? "cn" : "intl")
+                  : accountSite,
+              },
+            }),
           },
           {
             id: "codebuddy-decoy-account",
@@ -359,29 +405,45 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/providers") {
+      providerReads += 1;
+      if (oversizedControl === "chunked") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write("x".repeat(4 * 1024 * 1024 + 1));
+        return;
+      }
+      const providers = ["claude", "codex", "gemini"].map((app) =>
+        providerView(value, app, { bindingMismatch, scopeFault }),
+      );
+      if (drift === "provider" && providerReads > 1) {
+        providers[0].revision += 1;
+        providers[0].runtime.providerRevision += 1;
+      }
       sendJson(response, 200, {
         ok: true,
-        providers: [
-          providerView(value, "claude", { bindingMismatch }),
-          providerView(value, "codex", { bindingMismatch }),
-          providerView(value, "gemini", { bindingMismatch }),
-        ],
+        providers,
       });
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/shares") {
-      sendJson(response, 200, {
+      shareReads += 1;
+      const payload = {
         ok: true,
         shares: [
           {
             id: value.shareId,
-            enabled: true,
-            status: "active",
-            configRevision: value.shareRevision,
+            enabled: shareFault === "disabled" ? false : shareFault === "missing_enabled" ? undefined : true,
+            status: shareFault === "paused" ? "paused" : shareFault === "missing_status" ? undefined : "active",
+            configRevision: scopeFault === "missing_share_revision" ? undefined
+              : value.shareRevision + (drift === "share" && shareReads > 1 ? 1 : 0),
             app: "claude",
-            providerId: value.providerIds.claude,
+            providerId: primaryMismatch ? "conflicting-primary-provider" : value.providerIds.claude,
             providerType: "codebuddy_oauth",
             bindings: [
+              {
+                app: "claude",
+                providerId: value.providerIds.claude,
+                providerType: "codebuddy_oauth",
+              },
               {
                 app: "codex",
                 providerId: value.providerIds.codex,
@@ -392,10 +454,20 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
                 providerId: value.providerIds.gemini,
                 providerType: "codebuddy_oauth",
               },
+              ...(duplicateShareApp ? [{
+                app: duplicateShareApp,
+                providerId: "conflicting-codebuddy-provider",
+                providerType: "codebuddy_oauth",
+              }] : []),
             ],
           },
         ],
-      });
+      };
+      if (shareReads > 1 && finalShareDelayMs > 0) {
+        setTimeout(() => sendJson(response, 200, payload), finalShareDelayMs);
+      } else {
+        sendJson(response, 200, payload);
+      }
       return;
     }
     if (request.method === "GET" && url.pathname === "/v1/models") {
@@ -405,12 +477,26 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
         sendJson(response, 404, { error: "unknown binding" });
         return;
       }
+      catalogReads[app] += 1;
+      const modelData = value.modelDataByApp?.[app] ?? value.modelData;
+      const fault = finalCatalogFault?.app === app && catalogReads[app] > 1
+        ? finalCatalogFault.kind : "";
+      let responseData = fault === "remove" ? [] : modelData;
+      if (fault === "add") {
+        responseData = [...modelData, { id: "unexpected-model", object: "model" }];
+      }
+      if (fault === "reorder") responseData = [...modelData].reverse();
+      if (fault === "capability") {
+        responseData = modelData.map((entry) => entry.id === value.model
+          ? { ...entry, capabilities: { ...entry.capabilities, tools: false } }
+          : entry);
+      }
       sendJson(response, 200, {
         object: "list",
-        data: value.modelData,
-        source: "codebuddy_live_model_catalog",
-        stale: false,
-        fetchedAtMs: value.fetchedAtMs,
+        data: responseData,
+        source: fault === "source" ? "untrusted_catalog" : "codebuddy_live_model_catalog",
+        stale: fault === "stale",
+        fetchedAtMs: fault === "future" ? Date.now() + 2 * 60_000 : value.fetchedAtMs,
       });
       return;
     }
@@ -430,9 +516,21 @@ async function startMockServer(value, { bindingMismatch = false, leakSecret = fa
 
 async function withHarness(site, options, callback) {
   const value = fixture(site);
+  options?.mutateFixture?.(value);
+  if (options?.catalogOffsetMs !== undefined) {
+    value.fetchedAtMs = Date.now() + options.catalogOffsetMs;
+    for (const snapshot of Object.values(value.catalogs)) {
+      snapshot.fetchedAtMs = value.fetchedAtMs;
+    }
+  }
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), `codebuddy-${site}-receipt-`));
   const receiptFile = path.join(directory, "receipt.json");
-  const server = await startMockServer(value, options?.server || {});
+  const server = await startMockServer(value, {
+    ...(options?.server || {}),
+    ...(options?.server?.onFirstControl && {
+      onFirstControl: () => options.server.onFirstControl(receiptFile),
+    }),
+  });
   try {
     fs.writeFileSync(
       receiptFile,
@@ -471,18 +569,30 @@ test("CodeBuddy receipt gate reports blocked inputs without network access", asy
   assert.ok(output.missingInputs.includes("SERVER_URL"));
 });
 
-test("CodeBuddy Intl and CN fixture receipts stay contract-only", async () => {
+test("CodeBuddy Intl and CN fixture receipts stay contract-only", async (t) => {
   for (const site of ["intl", "cn"]) {
-    await withHarness(site, {}, async ({ result, server }) => {
+    await t.test(site, async () => withHarness(site, {}, async ({ result, server }) => {
       assert.equal(result.code, 0, result.stderr);
       assert.match(result.stdout, /verificationState=contract_verified/);
       assert.match(result.stdout, /liveState=live_pending/);
       assert.doesNotMatch(result.stdout, /live_verified/);
-      assert.equal(server.seen.length, 6);
-      assert.equal(
-        server.seen.filter((entry) => entry.path === "/v1/models").length,
-        3,
-      );
+      assert.equal(server.seen.length, 12);
+      for (const controlPath of ["/api/accounts", "/api/providers", "/api/shares"]) {
+        assert.equal(server.seen.filter((entry) => entry.path === controlPath).length, 2);
+      }
+      const catalogRequests = server.seen.filter((entry) => entry.path === "/v1/models");
+      assert.equal(catalogRequests.length, 6);
+      const selected = fixture(site);
+      for (const app of ["claude", "codex", "gemini"]) {
+        const scoped = catalogRequests.filter(
+          (entry) => new URLSearchParams(entry.search).get("app") === app,
+        );
+        assert.equal(scoped.length, 2, `${site}/${app} catalog count`);
+        const query = new URLSearchParams(scoped[0].search);
+        assert.equal(query.get("providerId"), selected.providerIds[app]);
+        assert.equal(query.get("expectedShareId"), selected.shareId);
+        assert.equal(query.get("expectedProviderId"), selected.providerIds[app]);
+      }
       assert.ok(
         server.seen
           .filter((entry) => entry.path.startsWith("/api/"))
@@ -493,6 +603,286 @@ test("CodeBuddy Intl and CN fixture receipts stay contract-only", async () => {
           .filter((entry) => entry.path === "/v1/models")
           .every((entry) => entry.authorization === `Bearer ${routerSecret}`),
       );
+    }));
+  }
+});
+
+test("CodeBuddy sites reject final catalog changes before private receipt acceptance", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      for (const kind of ["remove", "add", "capability", "stale", "source", "future"]) {
+        await t.test(`${site}/${app}/${kind}`, async () => {
+          await withHarness(site, {
+            server: { finalCatalogFault: { app, kind } },
+          }, async ({ result, server, receiptFile }) => {
+            assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+            assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+            assert.ok(fs.existsSync(receiptFile));
+            assert.equal(server.seen.filter((entry) => entry.path === "/api/shares").length, 2);
+          });
+        });
+      }
+    }
+  }
+});
+
+test("CodeBuddy sites reject invalid IDs in each full App catalog", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      for (const kind of ["missing", "blank", "duplicate", "nonstring"]) {
+        await t.test(`${site}/${app}/${kind}`, async () => withHarness(site, {
+          mutateFixture(value) {
+            const modelData = [
+              ...value.modelData,
+              { id: "codebuddy-other", object: "model", owned_by: "codebuddy" },
+              kind === "missing" ? { object: "model", owned_by: "codebuddy" }
+                : { id: kind === "blank" ? " " : kind === "duplicate" ? "codebuddy-other" : 42, object: "model", owned_by: "codebuddy" },
+            ];
+            value.modelDataByApp = { [app]: modelData };
+            value.catalogs[app].digest = digest(`cc-switch-server:codebuddy-${app}-catalog:v2`, modelData);
+          },
+        }, async ({ result }) => {
+          assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+          assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        }));
+      }
+    }
+  }
+});
+
+test("CodeBuddy sites accept catalog row reordering without content drift", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      await t.test(`${site}/${app}`, async () => withHarness(site, {
+        mutateFixture(value) {
+          const modelData = [
+            ...value.modelData,
+            { id: "codebuddy-other", object: "model", owned_by: "codebuddy" },
+          ];
+          value.modelDataByApp = { [app]: modelData };
+          value.catalogs[app].digest = catalogDigest(app, modelData);
+        },
+        server: { finalCatalogFault: { app, kind: "reorder" } },
+      }, async ({ result }) => {
+        assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+        assert.match(result.stdout, /contract_verified.*live_pending/);
+      }));
+    }
+  }
+});
+
+test("CodeBuddy private receipts cannot be hard-linked from inside the repository", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      const value = fixture(site);
+      const insideDirectory = fs.mkdtempSync(path.join(repoRoot, ".codebuddy-receipt-hardlink-"));
+      const outsideDirectory = fs.mkdtempSync(path.join(path.dirname(repoRoot), ".codebuddy-receipt-outside-"));
+      const insideReceipt = path.join(insideDirectory, "receipt.json");
+      const outsideReceipt = path.join(outsideDirectory, "receipt.json");
+      fs.writeFileSync(insideReceipt, `${JSON.stringify(receipt(value), null, 2)}\n`, { mode: 0o600 });
+      fs.linkSync(insideReceipt, outsideReceipt);
+      const server = await startMockServer(value);
+      try {
+        const result = await runScript(value, {
+          SERVER_URL: server.origin,
+          CC_SWITCH_SERVER_TOKEN: serverSecret,
+          CC_SWITCH_SHARE_URL: server.origin,
+          ROUTER_API_TOKEN: routerSecret,
+          [specs[site].receiptEnv]: outsideReceipt,
+        });
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        assert.deepEqual(server.seen, []);
+      } finally {
+        await server.close();
+        fs.rmSync(outsideDirectory, { recursive: true, force: true });
+        fs.rmSync(insideDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("CodeBuddy private receipt cannot be replaced during control-plane validation", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      const value = fixture(site);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `codebuddy-receipt-swap-${site}-`));
+      const receiptFile = path.join(directory, "receipt.json");
+      const replacementFile = path.join(directory, "replacement.json");
+      fs.writeFileSync(receiptFile, `${JSON.stringify(receipt(value, { model: "not-the-selected-model" }), null, 2)}\n`, { mode: 0o600 });
+      fs.writeFileSync(replacementFile, `${JSON.stringify(receipt(value), null, 2)}\n`, { mode: 0o600 });
+      const originalInode = fs.statSync(receiptFile).ino;
+      const server = await startMockServer(value, {
+        onFirstControl: () => fs.renameSync(replacementFile, receiptFile),
+      });
+      try {
+        const result = await runScript(value, {
+          SERVER_URL: server.origin,
+          CC_SWITCH_SERVER_TOKEN: serverSecret,
+          CC_SWITCH_SHARE_URL: server.origin,
+          ROUTER_API_TOKEN: routerSecret,
+          [specs[site].receiptEnv]: receiptFile,
+        });
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        assert.ok(server.seen.some((entry) => entry.path === "/api/accounts"));
+        assert.notEqual(fs.statSync(receiptFile).ino, originalInode);
+      } finally {
+        await server.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("CodeBuddy private receipt rejects an in-place rewrite during its snapshot", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      const receiptEnv = specs[site].receiptEnv;
+      const preload = [
+        'import fs from "node:fs";',
+        'const originalRead = fs.readSync;',
+        `const target = process.env[${JSON.stringify(receiptEnv)}];`,
+        'let changed = false;',
+        'fs.readSync = (fd, ...args) => {',
+        '  const count = originalRead(fd, ...args);',
+        '  if (!changed && count > 0 && fs.fstatSync(fd).ino === fs.statSync(target).ino) {',
+        '    changed = true;',
+        '    fs.writeFileSync(target, " ".repeat(fs.statSync(target).size), { flag: "r+" });',
+        '    fs.utimesSync(target, new Date(0), new Date(0));',
+        '  }',
+        '  return count;',
+        '};',
+      ].join("\n");
+      await withHarness(site, {
+        env: { NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(preload)}` },
+      }, async ({ result, server, receiptFile }) => {
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        assert.deepEqual(server.seen, []);
+        assert.match(fs.readFileSync(receiptFile, "utf8"), /^ +$/);
+      });
+    });
+  }
+});
+
+test("CodeBuddy private receipt must remain the same file through final acceptance", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const change of ["replacement", "in_place"]) {
+      await t.test(`${site}/${change}`, async () => {
+        const value = fixture(site);
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), `codebuddy-receipt-final-${site}-`));
+        const receiptFile = path.join(directory, "receipt.json");
+        const replacementFile = path.join(directory, "replacement.json");
+        fs.writeFileSync(receiptFile, `${JSON.stringify(receipt(value), null, 2)}\n`, { mode: 0o600 });
+        if (change === "replacement") {
+          fs.writeFileSync(replacementFile, "not the accepted receipt\n", { mode: 0o600 });
+        }
+        const originalInode = fs.statSync(receiptFile).ino;
+        const server = await startMockServer(value, {
+          onFirstControl: () => {
+            if (change === "replacement") {
+              fs.renameSync(replacementFile, receiptFile);
+            } else {
+              fs.writeFileSync(receiptFile, " ".repeat(fs.statSync(receiptFile).size), { flag: "r+" });
+              fs.utimesSync(receiptFile, new Date(0), new Date(0));
+            }
+          },
+        });
+        try {
+          const result = await runScript(value, {
+            SERVER_URL: server.origin,
+            CC_SWITCH_SERVER_TOKEN: serverSecret,
+            CC_SWITCH_SHARE_URL: server.origin,
+            ROUTER_API_TOKEN: routerSecret,
+            [specs[site].receiptEnv]: receiptFile,
+          });
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+          assert.ok(server.seen.some((entry) => entry.path === "/api/accounts"));
+          if (change === "replacement") {
+            assert.notEqual(fs.statSync(receiptFile).ino, originalInode);
+          } else {
+            assert.equal(fs.statSync(receiptFile).ino, originalInode);
+          }
+        } finally {
+          await server.close();
+          fs.rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("CodeBuddy final acceptance checks bytes even when file metadata appears unchanged", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      const receiptEnv = specs[site].receiptEnv;
+      const preload = [
+        'import fs from "node:fs";',
+        `const target = process.env[${JSON.stringify(receiptEnv)}];`,
+        'const originalStat = fs.statSync;',
+        'const originalFstat = fs.fstatSync;',
+        'const originalFingerprint = originalStat(target, { bigint: true });',
+        'let bigintFstatCount = 0;',
+        'fs.statSync = (path, options) => {',
+        '  if (path === target && options?.bigint) return originalFingerprint;',
+        '  return originalStat(path, options);',
+        '};',
+        'fs.fstatSync = (fd, options) => {',
+        '  if (options?.bigint && ++bigintFstatCount > 2) return originalFingerprint;',
+        '  return originalFstat(fd, options);',
+        '};',
+      ].join("\n");
+      await withHarness(site, {
+        env: { NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(preload)}` },
+        server: {
+          onFirstControl: (target) => {
+            fs.writeFileSync(target, " ".repeat(fs.statSync(target).size), { flag: "r+" });
+          },
+        },
+      }, async ({ result, server, receiptFile }) => {
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        assert.ok(server.seen.some((entry) => entry.path === "/api/accounts"));
+        assert.match(fs.readFileSync(receiptFile, "utf8"), /^ +$/);
+      });
+    });
+  }
+});
+
+test("CodeBuddy receipt gate requires a catalog within the production fresh TTL", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(`${site}/cached-seven-minutes`, async () => {
+      await withHarness(site, { catalogOffsetMs: -7 * 60_000 }, async ({ result }) => {
+        assert.equal(result.code, 0, result.stderr);
+      });
+    });
+    for (const [label, catalogOffsetMs] of [
+      ["expired-nine-minutes", -9 * 60_000],
+      ["future-two-minutes", 2 * 60_000],
+    ]) {
+      await t.test(`${site}/${label}`, async () => {
+        await withHarness(site, { catalogOffsetMs }, async ({ result }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+        });
+      });
+    }
+  }
+});
+
+test("CodeBuddy Intl and CN reject receipts that expire during final binding validation", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      await withHarness(site, {
+        receipt: { recordedAt: new Date(Date.now() - 24 * 60 * 60 * 1_000 + 1_200).toISOString() },
+        server: { finalShareDelayMs: 2_000 },
+      }, async ({ result, server }) => {
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.equal(server.seen.filter((entry) => entry.path === "/api/shares").length, 2);
+      });
     });
   }
 });
@@ -536,6 +926,81 @@ test("CodeBuddy Provider binding mismatch fails before receipt acceptance", asyn
   );
 });
 
+test("CodeBuddy Intl and CN reject ambiguous Share bindings for every App", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const app of ["claude", "codex", "gemini"]) {
+      await t.test(`${site}/${app}`, async () => {
+        await withHarness(site, { server: { duplicateShareApp: app } }, async ({ result, server }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+          assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        });
+      });
+    }
+  }
+});
+
+test("CodeBuddy Intl and CN reject Share primary fields that disagree with bindings", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    await t.test(site, async () => {
+      await withHarness(site, { server: { primaryMismatch: true } }, async ({ result, server }) => {
+        assert.equal(result.code, 1, result.stdout);
+        assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+        assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+      });
+    });
+  }
+});
+
+test("CodeBuddy Intl and CN require explicitly active Shares before catalog access", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const shareFault of ["missing_enabled", "missing_status", "disabled", "paused"]) {
+      await t.test(`${site}/${shareFault}`, async () => {
+        await withHarness(site, { server: { shareFault } }, async ({ result, server }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+          assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        });
+      });
+    }
+  }
+});
+
+test("CodeBuddy sites reject incomplete or inconsistent three-Surface revision scope before catalogs", async (t) => {
+  const providerFaults = [
+    "missing_view_revision",
+    "missing_runtime_revision",
+    "mismatched_revisions",
+    "legacy_top_level_only",
+    "blank_runtime_fingerprint",
+  ];
+  for (const site of ["intl", "cn"]) {
+    for (const scopeFault of [
+      ...["claude", "codex", "gemini"].flatMap((app) => providerFaults.map((fault) => `${app}_${fault}`)),
+      "missing_share_revision",
+    ]) {
+      await t.test(`${site}/${scopeFault}`, async () => {
+        await withHarness(site, {
+          server: { scopeFault },
+          mutateFixture: (value) => {
+            for (const provider of Object.values(value.providers)) provider.providerRevision = 0;
+            if (scopeFault === "missing_share_revision") value.shareRevision = 0;
+            for (const app of ["claude", "codex", "gemini"]) {
+              if (scopeFault === `${app}_blank_runtime_fingerprint`) {
+                value.providers[app].runtimeFingerprint = "   ";
+              }
+            }
+          },
+        }, async ({ result, server }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+          assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        });
+      });
+    }
+  }
+});
+
 test("CodeBuddy validator redacts secret-bearing control-plane failures", async () => {
   await withHarness(
     "cn",
@@ -547,4 +1012,70 @@ test("CodeBuddy validator redacts secret-bearing control-plane failures", async 
       assert.doesNotMatch(result.stdout, new RegExp(serverSecret));
     },
   );
+});
+
+test("CodeBuddy receipt gate rejects identity and binding drift before acceptance", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const drift of ["account", "provider", "share", "site"]) {
+      await t.test(`${site}/${drift}`, async () => {
+        await withHarness(site, { server: { drift } }, async ({ result }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+        });
+      });
+    }
+  }
+});
+
+test("CodeBuddy receipt rejects wrong or absent Account profile site before catalog requests", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const [label, serverOptions] of [
+      ["wrong_site", { accountSite: site === "intl" ? "cn" : "intl" }],
+      ["missing_scope", { omitAccountScope: true }],
+    ]) {
+      await t.test(`${site}/${label}`, async () => {
+        await withHarness(site, { server: serverOptions }, async ({ result, server }) => {
+          assert.equal(result.code, 1, result.stdout);
+          assert.match(result.stderr, /details redacted/);
+          assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+        });
+      });
+    }
+  }
+});
+
+test("CodeBuddy Intl and CN require explicit false Account booleans", async (t) => {
+  for (const site of ["intl", "cn"]) {
+    for (const field of ["hasApiKey", "needsRelogin"]) {
+      for (const variant of ["missing", "null", "string"]) {
+        await t.test(`${site}/${field}/${variant}`, async () => {
+          await withHarness(site, {
+            server: { accountFault: { field, variant } },
+          }, async ({ result, server }) => {
+            assert.equal(result.code, 1, result.stdout);
+            assert.equal(result.stderr.trim(), "[FAIL] CodeBuddy acceptance failed (details redacted)");
+            assert.equal(server.seen.filter((entry) => entry.path === "/api/providers").length, 0);
+            assert.equal(server.seen.filter((entry) => entry.path === "/v1/models").length, 0);
+          });
+        });
+      }
+    }
+  }
+});
+
+test("CodeBuddy control-plane response bound rejects unfinished oversized bodies on both sites", async (t) => {
+  for (const [site, oversizedControl, expectedPaths] of [
+    ["intl", "declared", ["/api/accounts"]],
+    ["cn", "chunked", ["/api/accounts", "/api/providers"]],
+  ]) {
+    await t.test(`${site}/${oversizedControl}`, async () => {
+      const startedAt = Date.now();
+      await withHarness(site, { server: { oversizedControl } }, async ({ result, server }) => {
+        assert.equal(result.code, 1, result.stdout);
+        assert.match(result.stderr, /details redacted/);
+        assert.deepEqual(server.seen.map((entry) => entry.path), expectedPaths);
+      });
+      assert.ok(Date.now() - startedAt < 3_000, "oversized response waited for timeout");
+    });
+  }
 });

@@ -322,12 +322,16 @@ RUN_REAL=1 node scripts/smoke/antigravity-real.mjs --rail antigravity_oauth
 RUN_REAL=1 node scripts/smoke/antigravity-real.mjs --rail agy_oauth
 ~~~
 
-脚本在读取 receipt 前先核对 Account、Claude/Gemini 两个 Provider、Share binding、fresh catalog、目标 commit 和 generation scope。receipt 必须覆盖普通文本、function tools、历史工具轮次、Google Search、mixed tools 的 `requestType`，以及两 Surface 的 stream/non-stream/tool/usage/terminal、401/429、reasoning/session、decoy 与 secret scan。当前合同要求普通请求为 `agent`、搜索请求为 `web_search`；若真实结果与其冲突，脚本失败并保持 `live_pending`，不能人工改 receipt 绕过。compaction 在独立真实证据和专属 executor 完成前必须记录 `runtime_disabled`。
+脚本先在任何控制面请求前限量读取仓库外私有 receipt 快照，再核对 Account、Claude/Gemini 两个 Provider、Share binding、fresh catalog、目标 commit 和 generation scope；接受结束前还重读 receipt 完整字节并复核路径。Share 控制面投影的 `bindings` 已包含主 App 条目，所选两个 App 各须恰好一条精确绑定，主字段须与对应条目一致，Share 必须 enabled 且 active；重复、冲突或停用时在目录发网前失败。receipt 必须覆盖普通文本、function tools、历史工具轮次、Google Search、mixed tools 的 `requestType`，以及两 Surface 的 stream/non-stream/tool/usage/terminal、401/429、reasoning/session、decoy 与 secret scan。当前合同要求普通请求为 `agent`、搜索请求为 `web_search`；若真实结果与其冲突，脚本失败并保持 `live_pending`，不能人工改 receipt 绕过。compaction 在独立真实证据和专属 executor 完成前必须记录 `runtime_disabled`。
+
+两个 Provider 的控制面真实投影都同时含顶层 `revision` 与 runtime `providerRevision`；两值必须明确为非负安全整数且一致，runtime fingerprint 必须是非空白字符串，Share `configRevision` 也必须明确为非负安全整数。仅有旧 mock 使用的顶层 `providerRevision`、真实字段缺失或两值冲突时，脚本在双目录发网前拒绝；不能以虚构字段或 `0` 填补 receipt 作用域。
+
+双 rail 的私有验收在末次 Account、Claude/Gemini Provider 与 Share 绑定复核后，还会通过同一签名 Share/对应 Provider 栅栏重读两份模型目录。初次和末次目录都必须保持权威来源、非 stale，完整 `data` 中所有模型 ID 为非空字符串、无首尾空白且唯一，选定模型恰好出现一次。完整 `data` 按 ID 确定性排序后计算摘要，末次摘要分别等于 receipt 绑定的初次摘要；纯行重排不算漂移，能力字段等内容变化仍拒绝。初次与末次共四份目录时间戳在同一接受时刻复核新鲜性。模型撤下或添加、目录失效、来源漂移或超前时间均拒绝接受。分次读取不是跨控制面与上游的原子快照，本地 fixture 不证明真实 Google 账号权益。
 
 1. 分别为 `special.antigravity` 与 `special.agy` Provider 显式绑定一个对应类型 Account；另建未绑定账号。调用 `POST /api/providers/:id/fetch-models`，抓包确认 `loadCodeAssist` 与 `fetchAvailableModels` 只使用各自绑定账号的 Bearer、project 和 Antigravity identity，未绑定账号请求数为零，Agy 不借 Antigravity 的 credential 或 cache。
 2. `fetchAvailableModels.models` 同时返回 Gemini、Claude、GPT、未知安全 model id、0% remaining、reset time、thinking/image、thinking budget、max token、MIME 与 `deprecatedModelIds`。响应应逐模型保留明确字段并标记 family；未知字段不得自动扩大能力，非法 model id 应丢弃。
-3. 成功空 `models` 是权威空目录。网络、408、429、5xx 只能返回同 Provider type、Account id 与 `authIdentityGeneration` 的旧目录，且 `source=same_identity_cached_fetch_available_models`、`stale=true`；Agy、其他账号和旧代际缓存均不得命中。
-4. 模拟首次 401 后原账号 refresh/replay 成功，再模拟第二次 401、403、坏 JSON、缺 `models`、Provider revision/runtime/binding 变化和 Account generation 变化；以上终态必须失败关闭，不得合并静态目录或切换账号。成功 fresh 目录应写入当前代际的 model-catalog、Gemini/Claude/GPT family 与 capacity capability evidence；stale 结果不得刷新证据时间。
+3. 成功空 `models` 是权威空目录。网络、408、429、5xx 只能返回精确匹配 Provider type、Account id/incarnation、`authIdentityGeneration`、`tokenRefreshGeneration`、project id 与 source URL 的旧目录，且 `source=same_identity_cached_fetch_available_models`、`stale=true`；Agy、其他账号、删除后复用同 ID 的账号、旧 token/项目或旧代际缓存均不得命中。并发 A/B 请求倒序返回时，旧响应不得覆盖新目录或新代际的 capability evidence。
+4. 模拟首次 401 后原账号 refresh/replay 成功，再模拟第二次 401、403、坏 JSON、缺 `models`、Provider revision/runtime/binding 变化、Account generation 变化，以及代际不变但 Bearer 凭据更换后旧目录遇到 5xx；这些终态必须失败关闭，不得合并静态目录、复用旧凭据的 stale 目录或切换账号。成功 fresh 目录应写入当前代际和请求凭据的 model-catalog、Gemini/Claude/GPT family 与 capacity capability evidence；stale 结果不得刷新证据时间。
 5. 用目录中的低成本 Gemini 与 Claude 模型分别完成 non-stream、stream、mixed Google Search + function tool、thought signature、图片输入、429 retry-delay、畸形 stream 与 terminal reason 验收。receipt 只保存 rail、model、目标 commit/harness revision、generation/binding digest、请求形状标签、终态/usage 判定和脱敏 body hash，不保存账号原值、project、prompt、token 或 raw body。没有独立可复现的 weekly quota endpoint 时必须记录 `unavailable`，不得从 5h/reset time 猜测周额度；完成真实账号验收前保持 `live_pending`。
 
 Grok OAuth 单账号专项补充：

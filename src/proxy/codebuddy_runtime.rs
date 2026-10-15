@@ -68,12 +68,15 @@ impl CodeBuddyRuntimeScope {
         domain: &str,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
+        request_identity_fingerprint: &str,
     ) -> Result<Self, String> {
         let required = [
             app.trim(),
             provider_id.trim(),
             runtime_fingerprint.trim(),
             account_id.trim(),
+            request_identity_fingerprint.trim(),
         ];
         if required.iter().any(|value| value.is_empty()) {
             return Err("CodeBuddy runtime scope contains an empty identity component".to_string());
@@ -85,7 +88,7 @@ impl CodeBuddyRuntimeScope {
             )
         })?;
         let mut digest = Sha256::new();
-        digest.update(b"cc-switch-server:codebuddy-runtime:v2\0");
+        digest.update(b"cc-switch-server:codebuddy-runtime:v3\0");
         for value in [
             required[0],
             required[1],
@@ -96,12 +99,14 @@ impl CodeBuddyRuntimeScope {
             &domain,
             &auth_identity_generation.to_string(),
             &token_refresh_generation.to_string(),
+            &account_incarnation.to_string(),
+            required[4],
         ] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }
         Ok(Self(format!(
-            "codebuddy-runtime-v2:{:x}",
+            "codebuddy-runtime-v3:{:x}",
             digest.finalize()
         )))
     }
@@ -216,6 +221,7 @@ pub struct PreparedCodeBuddyRuntime {
     pub account_id: String,
     pub auth_identity_generation: u64,
     pub token_refresh_generation: u64,
+    pub account_incarnation: u64,
 }
 
 impl PreparedCodeBuddyRuntime {
@@ -345,7 +351,9 @@ pub fn parse_codebuddy_model_catalog(
     value: &Value,
     site: CodeBuddySite,
 ) -> Result<FetchedCodeBuddyModelCatalog, String> {
-    if let Some(code) = json_i64(value.get("code")) {
+    if let Some(raw_code) = value.get("code") {
+        let code = json_i64(Some(raw_code))
+            .ok_or_else(|| "CodeBuddy model catalog has an invalid business code".to_string())?;
         if code != 0 {
             return Err(format!(
                 "CodeBuddy model catalog returned business code {code}"
@@ -373,13 +381,16 @@ pub fn parse_codebuddy_model_catalog(
         let object = entry
             .as_object()
             .ok_or_else(|| format!("CodeBuddy model catalog entry {index} must be an object"))?;
-        let id = object
+        let raw_id = object
             .get("id")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| format!("CodeBuddy model catalog entry {index} is missing id"))?
-            .to_ascii_lowercase();
+            .ok_or_else(|| format!("CodeBuddy model catalog entry {index} is missing id"))?;
+        if raw_id.is_empty() || raw_id.trim() != raw_id {
+            return Err(format!(
+                "CodeBuddy model catalog entry {index} has an invalid id"
+            ));
+        }
+        let id = raw_id.to_string();
         if id.len() > MAX_MODEL_ID_BYTES {
             return Err("CodeBuddy model id exceeds the size limit".to_string());
         }
@@ -469,18 +480,24 @@ fn codebuddy_model_capability(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let default_reasoning_effort = object
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| {
-            reasoning
-                .get("defaultEffort")
-                .or_else(|| reasoning.get("effort"))
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= 32)
-        .map(str::to_string);
+    let default_reasoning_effort =
+        object
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|reasoning| {
+                let default = reasoning.get("defaultEffort");
+                if default.is_some_and(|value| !value.is_null() && !value.is_string()) {
+                    return None;
+                }
+                default
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.len() <= 32)
+                    .or_else(|| reasoning.get("effort").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.len() <= 32)
+                    .map(str::to_string)
+            });
     Ok(CodeBuddyModelCapability {
         id: id.to_string(),
         display_name: object
@@ -983,6 +1000,8 @@ mod tests {
             domain,
             7,
             token_generation,
+            11,
+            "request-a",
         )
         .unwrap()
     }
@@ -1040,6 +1059,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn catalog_empty_default_effort_falls_back_to_legacy_effort_for_requested_reasoning() {
+        for default_effort in [Value::Null, json!("  ")] {
+            let catalog = parse_codebuddy_model_catalog(
+                &json!({"data":{"models":[{
+                    "id":"default-model",
+                    "supportsReasoning":true,
+                    "reasoning":{
+                        "defaultEffort":default_effort,
+                        "effort":"high",
+                        "supportedEfforts":["low","high"]
+                    }
+                }]}}),
+                CodeBuddySite::Intl,
+            )
+            .unwrap();
+            let capability = &catalog.capabilities["default-model"];
+            assert_eq!(capability.default_reasoning_effort.as_deref(), Some("high"));
+            let payload = build_codebuddy_payload(
+                &json!({"messages":[{"role":"user","content":"hello"}],"reasoning":{}}),
+                "default-model",
+                capability,
+            )
+            .unwrap();
+            assert_eq!(payload["reasoning_effort"], "high");
+            let unrequested = build_codebuddy_payload(
+                &json!({"messages":[{"role":"user","content":"hello"}]}),
+                "default-model",
+                capability,
+            )
+            .unwrap();
+            assert!(unrequested.get("reasoning_effort").is_none());
+        }
+
+        for (default_effort, expected) in [(json!("low"), Some("low")), (json!(42), None)] {
+            let catalog = parse_codebuddy_model_catalog(
+                &json!({"data":{"models":[{
+                    "id":"default-model",
+                    "supportsReasoning":true,
+                    "reasoning":{"defaultEffort":default_effort,"effort":"high"}
+                }]}}),
+                CodeBuddySite::Intl,
+            )
+            .unwrap();
+            assert_eq!(
+                catalog.capabilities["default-model"]
+                    .default_reasoning_effort
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_does_not_promote_noncanonical_vendor_ids_to_reviewed_models() {
+        for id in ["FAST-MODEL", " fast-model", "fast-model "] {
+            let parsed = parse_codebuddy_model_catalog(
+                &json!({"data": {"models": [
+                    {"id": "default-model", "enable": true},
+                    {"id": id, "enable": true}
+                ]}}),
+                CodeBuddySite::Intl,
+            );
+            match id {
+                "FAST-MODEL" => assert_eq!(parsed.unwrap().enabled_models, ["default-model"]),
+                _ => assert!(parsed.is_err(), "noncanonical id {id:?} was accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_unparseable_business_codes_even_with_reviewed_models() {
+        for code in [json!("ERROR"), json!(null), json!(false), json!({})] {
+            assert!(parse_codebuddy_model_catalog(
+                &json!({"code": code, "data": {"models": [{"id": "default-model"}]}}),
+                CodeBuddySite::Intl,
+            )
+            .is_err());
+        }
+        assert!(parse_codebuddy_model_catalog(
+            &json!({"code": "0", "data": {"models": [{"id": "default-model"}]}}),
+            CodeBuddySite::Intl,
+        )
+        .is_ok());
+    }
+
     #[tokio::test]
     async fn cache_fences_site_and_both_generations_and_bounds_stale() {
         let cache = CodeBuddyRuntimeCache::default();
@@ -1077,6 +1182,56 @@ mod tests {
             .stale_catalog(&current, 1_000 + MAX_STALE_CATALOG_AGE_MS + 1)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_fences_same_generation_credential_and_account_recreation() {
+        let cache = CodeBuddyRuntimeCache::default();
+        let original = scope(CodeBuddySite::Intl, "www.codebuddy.ai", 4);
+        let changed_credential = CodeBuddyRuntimeScope::derive(
+            "claude",
+            "provider-a",
+            2,
+            "runtime-a",
+            "account-a",
+            CodeBuddySite::Intl,
+            "www.codebuddy.ai",
+            7,
+            4,
+            11,
+            "request-b",
+        )
+        .unwrap();
+        let recreated = CodeBuddyRuntimeScope::derive(
+            "claude",
+            "provider-a",
+            2,
+            "runtime-a",
+            "account-a",
+            CodeBuddySite::Intl,
+            "www.codebuddy.ai",
+            7,
+            4,
+            12,
+            "request-a",
+        )
+        .unwrap();
+        cache
+            .insert_catalog(
+                original.clone(),
+                FetchedCodeBuddyModelCatalog {
+                    enabled_models: vec!["default-model".to_string()],
+                    raw_configs: BTreeMap::new(),
+                    capabilities: BTreeMap::new(),
+                },
+                1_000,
+            )
+            .await;
+        for changed in [&changed_credential, &recreated] {
+            assert_ne!(changed, &original);
+            assert!(cache.catalog(changed, 1_001).await.is_none());
+            assert!(cache.stale_catalog(changed, 1_001).await.is_none());
+        }
     }
 
     #[test]

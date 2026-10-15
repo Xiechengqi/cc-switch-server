@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::model::{AppKind, ProviderType};
 use crate::domain::providers::runtime::RuntimeAuthRef;
 use crate::domain::usage::store::UsageLogContext;
@@ -27,7 +28,8 @@ use super::super::{bounded_upstream_rate_limit_until, ProxyError};
 mod wire;
 
 pub(crate) use wire::{
-    apply_responses_reasoning_summary, normalize_wire_request, validate_source_tool_choice,
+    apply_responses_reasoning_summary, drop_final_gemini_thought_tail, normalize_wire_request,
+    validate_source_tool_choice,
 };
 
 pub(crate) fn is_provider(provider_type: ProviderType) -> bool {
@@ -83,6 +85,7 @@ pub(crate) fn session_rollover_source(
 pub(crate) async fn record_limit_evidence(
     state: &ServerState,
     execution: &ProviderExecution,
+    accounts_for_request: &AccountStore,
     limit: &AntigravityRetryInfo,
 ) {
     use crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::{
@@ -94,6 +97,15 @@ pub(crate) async fn record_limit_evidence(
     else {
         return;
     };
+    let Some(snapshot) = accounts_for_request
+        .find_for_provider(provider_type, Some(account_id))
+        .filter(|account| account.auth_identity_generation == auth_identity_generation)
+    else {
+        return;
+    };
+    let Some(account_incarnation) = accounts_for_request.account_incarnation(account_id) else {
+        return;
+    };
     let observation_state = match limit.kind {
         antigravity_retry::AntigravityLimitKind::RateLimit => Unknown,
         antigravity_retry::AntigravityLimitKind::ModelCapacity => Unsupported,
@@ -103,7 +115,8 @@ pub(crate) async fn record_limit_evidence(
         now_ms.saturating_add(i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX));
     if let Err(error) = state
         .record_antigravity_capability_observation_if_current(
-            account_id,
+            snapshot,
+            account_incarnation,
             crate::domain::accounts::capability_evidence::MODEL_CAPACITY_DIMENSION,
             crate::state::CurrentAccountCapabilityObservation {
                 provider_type,

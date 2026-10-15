@@ -18,6 +18,13 @@ const contract = JSON.parse(
 );
 const HARNESS_REVISION = 1;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + 5 * 60_000;
+}
 let failureReported = false;
 
 function reportFailure() {
@@ -241,11 +248,106 @@ if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("Codex receipt file must stay outside the repository");
 }
 const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.nlink !== 1) {
+  fail("Codex receipt file must have one filesystem link");
+}
 if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
   fail("Codex receipt file size is invalid");
 }
 if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("Codex receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("Codex receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Codex receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("Codex receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("Codex receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("Codex receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("Codex receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Codex receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("Codex receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("Codex receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -282,10 +384,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -334,8 +457,8 @@ async function validateAccount() {
     account.tokenRefreshGeneration < 0 ||
     account.hasAccessToken !== true ||
     account.hasRefreshToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false
   ) {
     fail("Codex Account is not a live OAuth identity generation");
   }
@@ -385,27 +508,36 @@ async function validateBinding(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Codex Share",
   );
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
-  if (
-    !bindings.some(
-      (binding) =>
-        binding?.app === "codex" &&
-        binding?.providerId === providerId &&
-        binding?.providerType === "codex_oauth",
-    )
-  ) {
-    fail("Codex Share is not fixed to the selected Provider");
+  if (share.enabled !== true || share.status !== "active") {
+    fail("selected Codex Share is not active");
   }
-  const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-  const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
-  const shareRevision = share.configRevision ?? 0;
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
+  if (
+    primaryBindings.length !== 1 ||
+    primaryBindings[0]?.providerId !== share.providerId ||
+    primaryBindings[0]?.providerType !== share.providerType
+  ) {
+    fail("Codex Share primary fields do not match its one App binding");
+  }
+  const codexBindings = bindings.filter((binding) => binding?.app === "codex");
+  if (
+    codexBindings.length !== 1 ||
+    codexBindings[0]?.providerId !== providerId ||
+    codexBindings[0]?.providerType !== "codex_oauth"
+  ) {
+    fail("Codex Share does not have one exact selected Provider binding");
+  }
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
+  const shareRevision = share.configRevision;
   if (
     !Number.isSafeInteger(providerRevision) ||
     providerRevision < 0 ||
-    !runtimeFingerprint ||
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim() ||
     !Number.isSafeInteger(shareRevision) ||
     shareRevision < 0
   ) {
@@ -415,8 +547,13 @@ async function validateBinding(account) {
 }
 
 async function validateWebsocketModel() {
-  if (spec.kind !== "websocket" && spec.kind !== "model") return;
-  const query = new URLSearchParams({ app: "codex", providerId });
+  if (spec.kind !== "websocket" && spec.kind !== "model") return null;
+  const query = new URLSearchParams({
+    app: "codex",
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
@@ -426,9 +563,50 @@ async function validateWebsocketModel() {
   if (!Array.isArray(catalog?.data)) {
     fail("Codex model catalog violated the public contract");
   }
+  const catalogIds = catalog.data.map((entry) => entry?.id);
+  if (
+    catalogIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+    new Set(catalogIds).size !== catalogIds.length
+  ) {
+    fail("Codex model catalog has incomplete or duplicate model IDs");
+  }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail("Codex model catalog did not preserve the exact selected model");
   }
+  const manifest = await requestJson(
+    shareUrl,
+    `/v1/models?${new URLSearchParams({
+      client_version: "0.144.1",
+      expectedShareId: shareId,
+      expectedProviderId: providerId,
+    })}`,
+    shareHeaders(),
+    "Codex bound Account manifest",
+  );
+  if (!Array.isArray(manifest?.models)) {
+    fail("Codex bound Account manifest violated the public contract");
+  }
+  const manifestSlugs = manifest.models.map((entry) => entry?.slug);
+  if (
+    manifestSlugs.some((slug) => typeof slug !== "string" || !slug || slug.trim() !== slug) ||
+    new Set(manifestSlugs).size !== manifestSlugs.length
+  ) {
+    fail("Codex bound Account manifest has incomplete or duplicate model slugs");
+  }
+  if (manifest.models.filter((entry) => entry?.slug === model).length !== 1) {
+    fail("Codex bound Account manifest did not authorize the exact selected model");
+  }
+  return {
+    catalogDigest: digest(
+      "cc-switch-server:codex-bound-catalog:v1",
+      [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
+    manifestDigest: digest(
+      "cc-switch-server:codex-bound-manifest:v1",
+      [...manifest.models].sort((left, right) =>
+        left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0),
+    ),
+  };
 }
 
 function expectedDecisions() {
@@ -569,12 +747,7 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
     fail("Codex receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("Codex receipt timestamp is outside the acceptance window");
   }
   const checkKeys = Object.keys(receipt.checks || {}).sort();
@@ -629,13 +802,15 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
   ) {
     fail("Codex receipt did not prove isolation and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBinding(account);
-  await validateWebsocketModel();
+  const modelSnapshot = await validateWebsocketModel();
   const scopeDigest = digest("cc-switch-server:codex-real-scope:v1", {
     operation,
     targetCommit,
@@ -652,11 +827,36 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("Codex receipt file is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest, targetCommit, account, binding);
+  const recordedAt = validateReceipt(receipt, scopeDigest, targetCommit, account, binding);
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBinding(finalAccount);
+  if (!sameCanonical(
+    {
+      accountId: finalAccount.id,
+      authIdentityGeneration: finalAccount.authIdentityGeneration,
+      tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
+      binding: finalBinding,
+    },
+    {
+      accountId: account.id,
+      authIdentityGeneration: account.authIdentityGeneration,
+      tokenRefreshGeneration: account.tokenRefreshGeneration,
+      binding,
+    },
+  )) {
+    fail("Codex Account, Provider, or Share scope drifted during acceptance");
+  }
+  if (modelSnapshot && !sameCanonical(await validateWebsocketModel(), modelSnapshot)) {
+    fail("Codex bound model catalog or Account manifest changed during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt)) {
+    fail("Codex receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(

@@ -10,6 +10,7 @@ use rand::RngCore;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use super::response_semantics::{self, SemanticObservation};
 use super::{ProxyError, ProxyRoute};
 use crate::domain::grok_cli::{
     grok_cli_user_agent, grok_cli_version, GROK_CLI_BASE_URL, GROK_CLI_CLIENT_IDENTIFIER,
@@ -54,6 +55,8 @@ pub(super) struct GrokQualityObserver {
     visible_fragments: u8,
     saw_text_delta: bool,
     saw_text_done: bool,
+    saw_refusal_delta: bool,
+    saw_refusal_done: bool,
     reported: bool,
 }
 
@@ -70,6 +73,8 @@ impl GrokQualityObserver {
             visible_fragments: 0,
             saw_text_delta: false,
             saw_text_done: false,
+            saw_refusal_delta: false,
+            saw_refusal_done: false,
             reported: false,
         }
     }
@@ -83,6 +88,9 @@ impl GrokQualityObserver {
     }
 
     pub(super) fn observe_value(&mut self, value: &Value) {
+        if self.terminal != GrokQualityTerminal::None {
+            return;
+        }
         let event_type = value.get("type").and_then(Value::as_str);
         if event_type.is_some_and(|kind| kind.starts_with("response."))
             || value.get("output").is_some()
@@ -92,24 +100,64 @@ impl GrokQualityObserver {
             self.saw_response_shape = true;
         }
 
+        if grok_response_is_completed(value) {
+            self.terminal = GrokQualityTerminal::Completed;
+        } else if matches!(
+            response_semantics::classify_value(value),
+            SemanticObservation::Failure(_)
+                | SemanticObservation::ErrorFrame(_)
+                | SemanticObservation::IncompleteTerminal
+        ) || event_type == Some("response.completed")
+        {
+            self.terminal = GrokQualityTerminal::Other;
+        }
+
         match event_type {
             Some("response.output_text.delta") => {
-                self.saw_text_delta = true;
-                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                if let Some(text) = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    self.saw_text_delta = true;
                     self.note_visible_text(text);
                 }
             }
             Some("response.output_text.done") => {
-                if !self.saw_text_delta {
-                    if let Some(text) = value
-                        .get("text")
-                        .or_else(|| value.get("delta"))
-                        .and_then(Value::as_str)
-                    {
+                if let Some(text) = value
+                    .get("text")
+                    .or_else(|| value.get("delta"))
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    if !self.saw_text_delta {
                         self.note_visible_text(text);
                     }
+                    self.saw_text_done = true;
                 }
-                self.saw_text_done = true;
+            }
+            Some("response.refusal.delta") => {
+                if let Some(text) = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    self.saw_refusal_delta = true;
+                    self.note_visible_text(text);
+                }
+            }
+            Some("response.refusal.done") => {
+                if let Some(text) = value
+                    .get("refusal")
+                    .or_else(|| value.get("delta"))
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    if !self.saw_refusal_delta {
+                        self.note_visible_text(text);
+                    }
+                    self.saw_refusal_done = true;
+                }
             }
             Some(kind)
                 if kind.starts_with("response.reasoning")
@@ -122,25 +170,13 @@ impl GrokQualityObserver {
                     self.observe_output_item(item, !self.saw_text_delta && !self.saw_text_done);
                 }
             }
-            Some("response.completed" | "response.done") => {
-                self.terminal = GrokQualityTerminal::Completed;
-                self.observe_response_snapshot(value.get("response").unwrap_or(value));
-            }
-            Some("response.failed" | "response.incomplete") => {
-                self.terminal = GrokQualityTerminal::Other;
+            Some(
+                "response.completed" | "response.done" | "response.failed" | "response.incomplete",
+            ) => {
                 self.observe_response_snapshot(value.get("response").unwrap_or(value));
             }
             _ => {
                 let response = value.get("response").unwrap_or(value);
-                match response.get("status").and_then(Value::as_str) {
-                    Some("completed" | "succeeded" | "done") => {
-                        self.terminal = GrokQualityTerminal::Completed;
-                    }
-                    Some("failed" | "incomplete" | "cancelled") => {
-                        self.terminal = GrokQualityTerminal::Other;
-                    }
-                    _ => {}
-                }
                 self.observe_response_snapshot(response);
             }
         }
@@ -210,7 +246,11 @@ impl GrokQualityObserver {
     }
 
     fn observe_response_snapshot(&mut self, response: &Value) {
-        let allow_text = !self.saw_text_delta && !self.saw_text_done && self.visible_chars == 0;
+        let allow_text = !self.saw_text_delta
+            && !self.saw_text_done
+            && !self.saw_refusal_delta
+            && !self.saw_refusal_done
+            && self.visible_chars == 0;
         if let Some(output) = response.get("output").and_then(Value::as_array) {
             for item in output {
                 self.observe_output_item(item, allow_text);
@@ -234,7 +274,11 @@ impl GrokQualityObserver {
         if let Some(content) = item.get("content").and_then(Value::as_array) {
             for part in content {
                 let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
-                if matches!(part_type, "output_text" | "text") {
+                if part_type == "refusal" {
+                    if let Some(text) = part.get("refusal").and_then(Value::as_str) {
+                        self.note_visible_text(text);
+                    }
+                } else if matches!(part_type, "output_text" | "text") {
                     if let Some(text) = part
                         .get("text")
                         .or_else(|| part.get("content"))
@@ -291,6 +335,8 @@ pub(super) fn grok_quality_observation(body: &[u8]) -> Option<GrokQualityObserva
 #[derive(Debug)]
 pub(super) struct GrokResponsesSseInspector {
     normalize_ping: bool,
+    leading_bom_checked: bool,
+    leading_bom_prefix: Vec<u8>,
     buffer: Vec<u8>,
     passthrough_oversized_frame: bool,
     passthrough_tail: Vec<u8>,
@@ -309,6 +355,8 @@ impl GrokResponsesSseInspector {
     pub(super) fn new(normalize_ping: bool) -> Self {
         Self {
             normalize_ping,
+            leading_bom_checked: false,
+            leading_bom_prefix: Vec::new(),
             buffer: Vec::new(),
             passthrough_oversized_frame: false,
             passthrough_tail: Vec::new(),
@@ -325,8 +373,9 @@ impl GrokResponsesSseInspector {
             ),
             |bytes, key| bytes.saturating_add(key.capacity()),
         );
-        self.buffer
+        self.leading_bom_prefix
             .capacity()
+            .saturating_add(self.buffer.capacity())
             .saturating_add(self.passthrough_tail.capacity())
             .saturating_add(search_keys)
     }
@@ -334,9 +383,34 @@ impl GrokResponsesSseInspector {
     pub(super) fn push(&mut self, chunk: Bytes) -> Bytes {
         let mut output = Vec::with_capacity(chunk.len());
         let mut remaining = chunk.as_ref();
+        if !self.leading_bom_checked {
+            const BOM: &[u8; 3] = b"\xef\xbb\xbf";
+            while self.leading_bom_prefix.len() < BOM.len() && !remaining.is_empty() {
+                self.leading_bom_prefix.push(remaining[0]);
+                remaining = &remaining[1..];
+                if !BOM.starts_with(&self.leading_bom_prefix) {
+                    break;
+                }
+            }
+            if self.leading_bom_prefix.as_slice() == BOM {
+                self.leading_bom_prefix.clear();
+                self.leading_bom_checked = true;
+            } else if !BOM.starts_with(&self.leading_bom_prefix) {
+                self.leading_bom_checked = true;
+            } else {
+                return Bytes::new();
+            }
+        }
+        let prefix = std::mem::take(&mut self.leading_bom_prefix);
+        self.push_segment(&prefix, &mut output);
+        self.push_segment(remaining, &mut output);
+        Bytes::from(output)
+    }
+
+    fn push_segment(&mut self, mut remaining: &[u8], output: &mut Vec<u8>) {
         while !remaining.is_empty() {
             if self.passthrough_oversized_frame {
-                let consumed = self.forward_oversized_frame(remaining, &mut output);
+                let consumed = self.forward_oversized_frame(remaining, output);
                 remaining = &remaining[consumed..];
                 continue;
             }
@@ -348,7 +422,7 @@ impl GrokResponsesSseInspector {
             let take = remaining.len().min(room);
             self.buffer.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
-            self.drain_complete_frames(&mut output);
+            self.drain_complete_frames(output);
 
             if self.buffer.len() > GROK_SSE_INSPECTION_MAX_FRAME_BYTES
                 || sse_frame_line_count(&self.buffer) > GROK_SSE_INSPECTION_MAX_FRAME_LINES
@@ -360,10 +434,13 @@ impl GrokResponsesSseInspector {
                 self.passthrough_oversized_frame = true;
             }
         }
-        Bytes::from(output)
     }
 
     pub(super) fn finish(&mut self) -> Bytes {
+        if !self.leading_bom_checked {
+            self.buffer.append(&mut self.leading_bom_prefix);
+            self.leading_bom_checked = true;
+        }
         if self.passthrough_oversized_frame || self.buffer.is_empty() {
             return Bytes::new();
         }
@@ -373,10 +450,6 @@ impl GrokResponsesSseInspector {
 
     pub(super) fn take_search_observation(&mut self) -> bool {
         std::mem::take(&mut self.search_observation_pending)
-    }
-
-    pub(super) fn take_quality_observation(&mut self) -> Option<GrokQualityObservation> {
-        self.quality_observer.take_completed_observation()
     }
 
     pub(super) fn finish_quality_observation(&mut self) -> Option<GrokQualityObservation> {
@@ -403,8 +476,13 @@ impl GrokResponsesSseInspector {
         {
             return frame.to_vec();
         }
-        if self.normalize_ping && grok_sse_event_is_ping(event) {
+        if grok_sse_event_is_private_control(event)
+            || (self.normalize_ping && grok_sse_event_is_ping(event))
+        {
             return b": ping\n\n".to_vec();
+        }
+        if self.quality_observer.terminal != GrokQualityTerminal::None {
+            return frame.to_vec();
         }
         if let Some(value) = grok_sse_json_payload(event) {
             let previous_count = self.completed_searches.len();
@@ -420,9 +498,22 @@ impl GrokResponsesSseInspector {
     fn forward_oversized_frame(&mut self, input: &[u8], output: &mut Vec<u8>) -> usize {
         let mut recent = std::mem::take(&mut self.passthrough_tail);
         for (index, byte) in input.iter().copied().enumerate() {
+            // A trailing CR might be the second CR of a CR-only boundary, or
+            // the start of CRLF split across chunks. Decide before consuming
+            // the first byte of the next frame.
+            if byte != b'\n'
+                && next_sse_frame_boundary_with_trailing_cr(&recent)
+                    .is_some_and(|(start, len)| start + len == recent.len())
+            {
+                self.passthrough_oversized_frame = false;
+                self.passthrough_tail.clear();
+                return index;
+            }
             output.push(byte);
             recent.push(byte);
-            if recent.ends_with(b"\n\n") || recent.ends_with(b"\r\n\r\n") {
+            if next_sse_frame_boundary(&recent)
+                .is_some_and(|(start, len)| start + len == recent.len())
+            {
                 self.passthrough_oversized_frame = false;
                 self.passthrough_tail.clear();
                 return index + 1;
@@ -449,22 +540,54 @@ pub(super) fn grok_response_has_completed_search(body: &[u8]) -> bool {
 }
 
 fn next_sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if crlf <= lf => Some((crlf, 4)),
-        (Some(lf), _) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
+    next_sse_frame_boundary_inner(buffer, false)
+}
+
+fn next_sse_frame_boundary_with_trailing_cr(buffer: &[u8]) -> Option<(usize, usize)> {
+    next_sse_frame_boundary_inner(buffer, true)
+}
+
+fn next_sse_frame_boundary_inner(buffer: &[u8], allow_trailing_cr: bool) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < buffer.len() {
+        let first = match buffer[index] {
+            b'\r' if buffer.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let next = index + first;
+        let second = match buffer.get(next) {
+            Some(b'\r') if buffer.get(next + 1) == Some(&b'\n') => 2,
+            Some(b'\r') if next + 1 == buffer.len() && !allow_trailing_cr => return None,
+            Some(b'\r' | b'\n') => 1,
+            _ => {
+                index = next;
+                continue;
+            }
+        };
+        return Some((index, first + second));
     }
+    None
 }
 
 fn sse_frame_line_count(frame: &[u8]) -> usize {
-    frame
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        .saturating_add(1)
+    let mut count: usize = 1;
+    let mut index = 0;
+    while index < frame.len() {
+        match frame[index] {
+            b'\r' => {
+                count = count.saturating_add(1);
+                index += usize::from(frame.get(index + 1) == Some(&b'\n'));
+            }
+            b'\n' => count = count.saturating_add(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    count
 }
 
 fn trailing_sse_boundary_prefix(frame: &[u8]) -> Vec<u8> {
@@ -475,16 +598,22 @@ fn grok_sse_event_is_ping(event: &[u8]) -> bool {
     let Ok(event) = std::str::from_utf8(event) else {
         return false;
     };
-    let mut event_names = Vec::new();
+    let mut saw_ping_event = false;
     let mut data = Vec::new();
-    for line in event.lines().map(|line| line.trim_end_matches('\r')) {
+    for line in event.split(['\r', '\n']).filter(|line| !line.is_empty()) {
         if let Some(value) = line.strip_prefix("event:") {
-            event_names.push(value.trim());
+            if saw_ping_event || value.trim() != "ping" {
+                return false;
+            }
+            saw_ping_event = true;
         } else if let Some(value) = line.strip_prefix("data:") {
             data.push(value.trim_start());
+        } else if !line.starts_with(':') {
+            // Rewriting a stateful or unknown field would discard SSE metadata.
+            return false;
         }
     }
-    if event_names.is_empty() || event_names.iter().any(|name| *name != "ping") {
+    if !saw_ping_event {
         return false;
     }
     let payload = data.join("\n");
@@ -494,24 +623,108 @@ fn grok_sse_event_is_ping(event: &[u8]) -> bool {
     serde_json::from_str::<Value>(&payload)
         .ok()
         .is_some_and(|value| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .is_none_or(|event_type| event_type == "ping")
+            let Some(object) = value.as_object() else {
+                return false;
+            };
+            // A vendor billing ping can omit `type`, but an error or terminal
+            // payload must remain visible to the downstream semantic guard.
+            if matches!(
+                response_semantics::classify_value(&value),
+                SemanticObservation::ErrorFrame(_)
+                    | SemanticObservation::Failure(_)
+                    | SemanticObservation::IncompleteTerminal
+                    | SemanticObservation::SuccessTerminal
+            ) {
+                return false;
+            }
+            match object.get("type") {
+                None => true,
+                Some(Value::String(event_type)) => event_type == "ping",
+                _ => false,
+            }
+        })
+}
+
+fn grok_sse_event_is_private_control(event: &[u8]) -> bool {
+    let Ok(event) = std::str::from_utf8(event) else {
+        return false;
+    };
+    let mut declared_event = None;
+    let mut data = Vec::new();
+    for line in event.split(['\r', '\n']).filter(|line| !line.is_empty()) {
+        if let Some(value) = line.strip_prefix("event:") {
+            if declared_event.replace(value.trim()).is_some() {
+                return false;
+            }
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start());
+        } else if !line.starts_with(':') {
+            // Keep reconnect metadata and unknown fields byte-for-byte.
+            return false;
+        }
+    }
+    if declared_event.is_some_and(|kind| kind != "response.doom_loop_check") || data.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<Value>(&data.join("\n"))
+        .ok()
+        .is_some_and(|value| {
+            value.get("type").and_then(Value::as_str) == Some("response.doom_loop_check")
+                && !matches!(
+                    response_semantics::classify_value(&value),
+                    SemanticObservation::ErrorFrame(_)
+                        | SemanticObservation::Failure(_)
+                        | SemanticObservation::IncompleteTerminal
+                        | SemanticObservation::SuccessTerminal
+                )
         })
 }
 
 fn grok_sse_json_payload(event: &[u8]) -> Option<Value> {
     let event = std::str::from_utf8(event).ok()?;
-    let data = event
-        .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>();
-    if data.is_empty() {
-        return serde_json::from_str(event.trim()).ok();
+    let mut data = Vec::new();
+    let mut declared_events = Vec::new();
+    for line in event.split(['\r', '\n']).filter(|line| !line.is_empty()) {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, raw_value) = line.split_once(':').unwrap_or((line, ""));
+        let value = raw_value.strip_prefix(' ').unwrap_or(raw_value);
+        match field {
+            "data" => data.push(value),
+            "event" => {
+                if !value.trim().is_empty() {
+                    declared_events.push(value.trim());
+                }
+            }
+            "id" | "retry" => {}
+            _ => {
+                if data.is_empty() && declared_events.is_empty() {
+                    return serde_json::from_str(event.trim())
+                        .ok()
+                        .filter(Value::is_object);
+                }
+                return None;
+            }
+        }
     }
-    serde_json::from_str(&data.join("\n")).ok()
+    if data.is_empty() {
+        return serde_json::from_str(event.trim())
+            .ok()
+            .filter(Value::is_object);
+    }
+    let value: Value = serde_json::from_str(&data.join("\n")).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let payload_type = value.get("type").and_then(Value::as_str).map(str::trim);
+    if declared_events.iter().any(|declared| {
+        matches!(*declared, "ping" | "keepalive")
+            || payload_type.is_some_and(|payload| payload != *declared)
+    }) {
+        return None;
+    }
+    Some(value)
 }
 
 fn observe_completed_searches(value: &Value, completed: &mut BTreeSet<String>) {
@@ -525,7 +738,7 @@ fn observe_completed_searches(value: &Value, completed: &mut BTreeSet<String>) {
                 );
             }
         }
-        Some("response.completed") | Some("response.done") => {
+        Some("response.completed") if grok_response_is_completed(value) => {
             observe_response_search_output(value.get("response").unwrap_or(value), completed);
         }
         _ if grok_response_is_completed(value) => {
@@ -536,14 +749,19 @@ fn observe_completed_searches(value: &Value, completed: &mut BTreeSet<String>) {
 }
 
 fn grok_response_is_completed(value: &Value) -> bool {
-    matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("response.completed" | "response.done")
-    ) || value
+    if !matches!(
+        response_semantics::classify_value(value),
+        SemanticObservation::SuccessTerminal
+    ) {
+        return false;
+    }
+    value
+        .get("response")
+        .filter(|response| response.is_object())
+        .unwrap_or(value)
         .get("status")
-        .or_else(|| value.pointer("/response/status"))
         .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "completed" | "succeeded" | "done"))
+        .is_none_or(|status| status == "completed")
 }
 
 fn observe_response_search_output(response: &Value, completed: &mut BTreeSet<String>) {
@@ -1264,10 +1482,8 @@ pub(super) fn image_edit_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes,
 }
 
 fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, ProxyError> {
-    let boundary = content_type
-        .split(';')
-        .find_map(|part| part.trim().strip_prefix("boundary="))
-        .map(|value| value.trim_matches('"').to_string())
+    let boundary = multer::parse_boundary(content_type)
+        .ok()
         .filter(|value| {
             !value.is_empty()
                 && value.len() <= 70
@@ -1278,7 +1494,7 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
         .ok_or_else(|| ProxyError::bad_request("multipart image edit is missing boundary"))?;
     let mut fields = Map::new();
     let mut image_urls = Vec::new();
-    for part in split_multipart_parts(body, &boundary) {
+    for part in split_multipart_parts(body, &boundary)? {
         let Some((headers, data)) = split_part_headers(part) else {
             return Err(ProxyError::bad_request(
                 "multipart image edit contains a malformed part",
@@ -1292,20 +1508,19 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
         let Some(name) = multipart_disposition_param(disposition, "name") else {
             continue;
         };
-        let content_type = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.as_str())
-            .ok_or_else(|| {
-                ProxyError::bad_request("multipart image part is missing Content-Type")
-            })?;
         if name == "image" || name == "images" || name == "image[]" {
+            let content_type = headers
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str())
+                .ok_or_else(|| {
+                    ProxyError::bad_request("multipart image part is missing Content-Type")
+                })?;
             if image_urls.len() >= 3 {
                 return Err(ProxyError::bad_request(
                     "multipart image edit accepts at most 3 images",
                 ));
             }
-            let data = trim_part_data(data);
             let detected_mime = super::remote_image::validate_image_bytes(
                 data,
                 Some(content_type),
@@ -1322,9 +1537,7 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
                 "Grok direct-XAI image edit does not support {name}"
             )));
         } else {
-            let text = String::from_utf8_lossy(trim_part_data(data))
-                .trim()
-                .to_string();
+            let text = String::from_utf8_lossy(data).trim().to_string();
             fields.insert(name, Value::String(text));
         }
     }
@@ -1348,33 +1561,74 @@ fn multipart_image_edit_body(content_type: &str, body: &[u8]) -> Result<Bytes, P
         })
 }
 
-fn split_multipart_parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+fn split_multipart_parts<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<&'a [u8]>, ProxyError> {
     let marker = format!("--{boundary}").into_bytes();
     let mut parts = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(start_rel) = find_bytes(&body[cursor..], &marker) {
-        let start = cursor + start_rel + marker.len();
-        if body.get(start..start + 2) == Some(b"--") {
-            break;
-        }
-        let content_start = if body.get(start..start + 2) == Some(b"\r\n") {
-            start + 2
-        } else if body.get(start..start + 1) == Some(b"\n") {
-            start + 1
-        } else {
-            start
-        };
-        let Some(end_rel) = find_bytes(&body[content_start..], &marker) else {
-            break;
-        };
-        let mut content_end = content_start + end_rel;
-        while content_end > content_start && matches!(body[content_end - 1], b'\r' | b'\n') {
-            content_end -= 1;
-        }
-        parts.push(&body[content_start..content_end]);
-        cursor = content_start + end_rel;
+    let Some((_, _, mut content_start, closing)) = next_multipart_delimiter(body, &marker, 0)
+    else {
+        return Err(ProxyError::bad_request(
+            "multipart image edit is missing its opening boundary",
+        ));
+    };
+    if closing {
+        return Ok(parts);
     }
-    parts
+    loop {
+        let Some((delimiter_start, prefix_len, next, closing)) =
+            next_multipart_delimiter(body, &marker, content_start)
+        else {
+            return Err(ProxyError::bad_request(
+                "multipart image edit is missing its closing boundary",
+            ));
+        };
+        let content_end = delimiter_start
+            .saturating_sub(prefix_len)
+            .max(content_start);
+        parts.push(&body[content_start..content_end]);
+        if closing {
+            break;
+        }
+        content_start = next;
+    }
+    Ok(parts)
+}
+
+/// A boundary is a complete delimiter line, never a bare byte substring in
+/// image data. The separator CRLF belongs to the framing, not the part body.
+fn next_multipart_delimiter(
+    body: &[u8],
+    marker: &[u8],
+    from: usize,
+) -> Option<(usize, usize, usize, bool)> {
+    let mut cursor = from;
+    while let Some(relative) = find_bytes(&body[cursor..], marker) {
+        let start = cursor + relative;
+        cursor = start + 1;
+        let prefix_len = if start == 0 {
+            0
+        } else if start >= 2 && body.get(start - 2..start) == Some(b"\r\n") {
+            2
+        } else if body.get(start - 1..start) == Some(b"\n") {
+            1
+        } else {
+            continue;
+        };
+        let after_marker = start + marker.len();
+        if body.get(after_marker..after_marker + 2) == Some(b"--") {
+            let after_close = after_marker + 2;
+            if after_close == body.len()
+                || body.get(after_close..after_close + 2) == Some(b"\r\n")
+                || body.get(after_close..after_close + 1) == Some(b"\n")
+            {
+                return Some((start, prefix_len, after_close, true));
+            }
+        } else if body.get(after_marker..after_marker + 2) == Some(b"\r\n") {
+            return Some((start, prefix_len, after_marker + 2, false));
+        } else if body.get(after_marker..after_marker + 1) == Some(b"\n") {
+            return Some((start, prefix_len, after_marker + 1, false));
+        }
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1387,15 +1641,20 @@ type MultipartHeaders = Vec<(String, String)>;
 type MultipartPart<'a> = (MultipartHeaders, &'a [u8]);
 
 fn split_part_headers(part: &[u8]) -> Option<MultipartPart<'_>> {
-    let split = part
+    let crlf = part
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            part.windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|index| (index, 2))
-        })?;
+        .map(|index| (index, 4));
+    let lf = part
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    // The first separator ends the headers. A later CRLFCRLF can be part of
+    // an image body when the multipart producer used LF-only header lines.
+    let split = [crlf, lf]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(index, _)| *index)?;
     let header_text = String::from_utf8_lossy(&part[..split.0]);
     let headers = header_text
         .lines()
@@ -1406,18 +1665,73 @@ fn split_part_headers(part: &[u8]) -> Option<MultipartPart<'_>> {
 }
 
 fn multipart_disposition_param(disposition: &str, name: &str) -> Option<String> {
-    disposition.split(';').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key.trim() == name).then(|| value.trim().trim_matches('"').to_string())
-    })
-}
-
-fn trim_part_data(data: &[u8]) -> &[u8] {
-    let mut end = data.len();
-    while end > 0 && matches!(data[end - 1], b'\r' | b'\n') {
-        end -= 1;
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in disposition.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                segments.push(&disposition[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
     }
-    &data[..end]
+    if quoted || escaped {
+        return None;
+    }
+    segments.push(&disposition[start..]);
+    if !segments.first()?.trim().eq_ignore_ascii_case("form-data") {
+        return None;
+    }
+
+    let mut found = None;
+    for segment in segments.into_iter().skip(1) {
+        let (key, raw_value) = segment.trim().split_once('=')?;
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let raw_value = raw_value.trim();
+        let value = if let Some(inner) = raw_value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            let mut decoded = String::new();
+            let mut characters = inner.chars();
+            while let Some(character) = characters.next() {
+                match character {
+                    '\\' => decoded.push(characters.next()?),
+                    '"' => return None,
+                    _ => decoded.push(character),
+                }
+            }
+            decoded
+        } else {
+            if raw_value.is_empty()
+                || raw_value.chars().any(|character| {
+                    character.is_ascii_whitespace() || matches!(character, '"' | '\\' | ';')
+                })
+            {
+                return None;
+            }
+            raw_value.to_string()
+        };
+        if value.chars().any(char::is_control) {
+            return None;
+        }
+        if key.eq_ignore_ascii_case(name) && found.replace(value).is_some() {
+            return None;
+        }
+    }
+    found
 }
 
 pub(super) fn video_task_id_from_request(path: &str, body: &[u8]) -> Option<String> {
@@ -1768,6 +2082,8 @@ fn sanitize_tools(object: &mut Map<String, Value>) -> Result<(), ProxyError> {
     let tool_choice = object.get("tool_choice").cloned();
     let should_drop_choice = {
         let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
+            object.remove("tools");
+            object.remove("tool_choice");
             return Ok(());
         };
         tools.retain(|tool| {
@@ -2082,10 +2398,28 @@ fn should_drop_tool_choice(choice: &Value, tools: &[Value]) -> bool {
     else {
         return true;
     };
-    !tools.iter().any(|tool| {
-        tool.get("type")
+    let choice_name = if choice_type == "function" {
+        let Some(name) = choice
+            .get("name")
+            .or_else(|| choice.pointer("/function/name"))
             .and_then(Value::as_str)
-            .is_some_and(|tool_type| tool_type == choice_type)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return true;
+        };
+        Some(name)
+    } else {
+        None
+    };
+    !tools.iter().any(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some(choice_type)
+            && choice_name.is_none_or(|name| {
+                tool.get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|tool_name| tool_name.trim() == name)
+            })
     })
 }
 
@@ -2515,6 +2849,7 @@ mod tests {
             );
             assert_eq!(header("x-xai-token-auth"), Some(GROK_CLI_TOKEN_AUTH));
             assert_eq!(header("x-grok-turn-idx"), None);
+            assert_eq!(header("x-grok-conv-group-id"), None);
         }
     }
 
@@ -2767,6 +3102,91 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_never_survives_without_a_nonempty_tool_inventory() {
+        for (name, request) in [
+            (
+                "missing",
+                json!({"model":"grok-4.5","input":"hello","tool_choice":"auto"}),
+            ),
+            (
+                "null",
+                json!({"model":"grok-4.5","input":"hello","tools":null,"tool_choice":"none"}),
+            ),
+            (
+                "empty",
+                json!({"model":"grok-4.5","input":"hello","tools":[],"tool_choice":"required"}),
+            ),
+        ] {
+            let mut body = json_body(request.clone());
+            patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+            let output: Value = serde_json::from_slice(&body).unwrap();
+            assert!(output.get("tools").is_none(), "{name}: {output}");
+            assert!(output.get("tool_choice").is_none(), "{name}: {output}");
+
+            let websocket = ws_request_body(request, Some("session-1")).unwrap();
+            let output = &websocket["response"];
+            assert!(output.get("tools").is_none(), "ws/{name}: {output}");
+            assert!(output.get("tool_choice").is_none(), "ws/{name}: {output}");
+        }
+        let mut valid = json_body(json!({"model":"grok-4.5","input":"hello",
+            "tools":[{"type":"web_search"}],"tool_choice":"auto"}));
+        patch_grok_request_body(&mut valid, ProxyRoute::CodexResponses).unwrap();
+        let valid: Value = serde_json::from_slice(&valid).unwrap();
+        assert_eq!(valid["tool_choice"], "auto");
+        assert_eq!(valid["tools"][0]["type"], "web_search");
+
+        let mut malformed = json_body(json!({"model":"grok-4.5","input":"hello",
+            "tools":"not-an-array","tool_choice":"auto"}));
+        assert_eq!(
+            patch_grok_request_body(&mut malformed, ProxyRoute::CodexResponses)
+                .unwrap_err()
+                .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn forced_function_choice_must_name_a_retained_tool_on_http_and_websocket() {
+        for (name, choice, keep) in [
+            ("declared", json!({"type":"function","name":"lookup"}), true),
+            (
+                "missing",
+                json!({"type":"function","name":"missing"}),
+                false,
+            ),
+            (
+                "nested missing",
+                json!({"type":"function","function":{"name":"missing"}}),
+                false,
+            ),
+            ("hosted", json!({"type":"web_search"}), true),
+        ] {
+            let request = json!({
+                "model":"grok-4.5",
+                "input":"hello",
+                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}, {"type":"web_search"}],
+                "tool_choice":choice,
+            });
+            let mut body = json_body(request.clone());
+            patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+            let http: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                http.get("tool_choice").is_some(),
+                keep,
+                "http/{name}: {http}"
+            );
+
+            let websocket = ws_request_body(request, Some("session-1")).unwrap();
+            let response = &websocket["response"];
+            assert_eq!(
+                response.get("tool_choice").is_some(),
+                keep,
+                "ws/{name}: {response}"
+            );
+        }
+    }
+
+    #[test]
     fn ws_message_body_sanitizes_existing_response_create() {
         let value = ws_message_body(
             json!({
@@ -2947,6 +3367,161 @@ mod tests {
     }
 
     #[test]
+    fn multipart_image_edit_preserves_binary_boundary_text_and_trailing_newlines() {
+        let boundary = "grok-image-test-boundary";
+        let image = b"\x89PNG\r\n\x1a\nimage--grok-image-test-boundary-inside\r\n\r\n";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+
+        let converted = image_edit_body(&headers, Bytes::from(body)).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        let encoded = value["image"]["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("data:image/png;base64,")
+            .unwrap();
+        assert_eq!(STANDARD.decode(encoded).unwrap(), image);
+    }
+
+    #[test]
+    fn multipart_image_edit_uses_earliest_header_separator_before_binary_data() {
+        let boundary = "grok-lf-header-boundary";
+        let image = b"\x89PNG\r\n\x1a\nfixture\r\n\r\nmore-image-data";
+        let mut body = format!(
+            "--{boundary}\nContent-Disposition: form-data; name=\"image\"\nContent-Type: image/png\n\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\n--{boundary}--\n").as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+
+        let converted = image_edit_body(&headers, Bytes::from(body)).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        let encoded = value["image"]["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("data:image/png;base64,")
+            .unwrap();
+        assert_eq!(STANDARD.decode(encoded).unwrap(), image);
+    }
+
+    #[test]
+    fn multipart_image_edit_accepts_text_fields_without_content_type() {
+        let boundary = "grok-image-test-boundary";
+        let image = b"\x89PNG\r\n\x1a\nfixture";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\npaint a tree\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+
+        let closing = format!("\r\n--{boundary}--\r\n");
+        let incomplete = body[..body.len() - closing.len()].to_vec();
+        let converted = image_edit_body(&headers, Bytes::from(body)).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(value["prompt"], "paint a tree");
+        assert!(value["image"]["url"].as_str().is_some());
+        assert_eq!(
+            image_edit_body(&headers, Bytes::from(incomplete))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn multipart_image_edit_parses_case_insensitive_mime_boundary() {
+        let boundary = "grok-mime-boundary";
+        let image = b"\x89PNG\r\n\x1a\nfixture";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("Multipart/Form-Data; Boundary=\"{boundary}\""))
+                .unwrap(),
+        );
+        let converted = image_edit_body(&headers, Bytes::from(body.clone())).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        let encoded = value["image"]["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("data:image/png;base64,")
+            .unwrap();
+        assert_eq!(STANDARD.decode(encoded).unwrap(), image);
+
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("multipart/form-dataevil; boundary={boundary}"))
+                .unwrap(),
+        );
+        assert_eq!(
+            image_edit_body(&headers, Bytes::from(body))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn multipart_image_edit_uses_exact_form_data_field_names() {
+        let boundary = "grok-disposition-boundary";
+        let image = b"\x89PNG\r\n\x1a\nfixture";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+        for disposition in [
+            "attachment; name=\"image\"",
+            "form-data; name=\"image;ignored\"",
+            "form-data; name=\"image\"; name=\"mask\"",
+        ] {
+            let mut body = format!(
+                "--{boundary}\r\nContent-Disposition: {disposition}\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .into_bytes();
+            body.extend_from_slice(image);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let error = image_edit_body(&headers, Bytes::from(body)).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{disposition}");
+        }
+
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"im\\age\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let converted = image_edit_body(&headers, Bytes::from(body)).unwrap();
+        let value: Value = serde_json::from_slice(&converted).unwrap();
+        assert!(value["image"]["url"].as_str().is_some());
+    }
+
+    #[test]
     fn json_image_edit_rejects_fields_that_direct_xai_does_not_verify() {
         for field in ["quality", "size", "style", "mask"] {
             let mut value = json!({"model": "grok-imagine", "prompt": "edit"});
@@ -3076,6 +3651,7 @@ mod tests {
             b"event: ping\n\n".as_slice(),
             b"event: ping\ndata:\n\n".as_slice(),
             b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n".as_slice(),
+            b"event: ping\ndata: {\"cost\":\"0\"}\n\n".as_slice(),
         ] {
             let mut inspector = GrokResponsesSseInspector::default();
             assert_eq!(inspector.push(Bytes::copy_from_slice(input)), ": ping\n\n");
@@ -3087,9 +3663,107 @@ mod tests {
                 .as_slice(),
             b"event: response.output_text.delta\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
             b"event: ping\ndata: not-json\n\n".as_slice(),
+            b"event: ping\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":\"ping\",\"error\":{\"message\":\"upstream failed\"}}\n\n".as_slice(),
+            b"event: ping\ndata: {\"status\":\"failed\"}\n\n".as_slice(),
+            b"event: ping\ndata: {\"status\":\"completed\"}\n\n".as_slice(),
+            b"event: ping\ndata: [\"upstream-error\"]\n\n".as_slice(),
+            b"event: ping\ndata: \"upstream-error\"\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":null,\"cost\":\"0\"}\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":7,\"cost\":\"0\"}\n\n".as_slice(),
         ] {
             let mut inspector = GrokResponsesSseInspector::default();
             assert_eq!(inspector.push(Bytes::copy_from_slice(input)), input);
+        }
+    }
+
+    #[test]
+    fn responses_sse_leading_bom_is_removed_across_chunk_boundaries() {
+        let body =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        let mut input = b"\xef\xbb\xbf".to_vec();
+        input.extend_from_slice(body);
+        for split in 0..=input.len() {
+            let mut inspector = GrokResponsesSseInspector::default();
+            let mut output = inspector
+                .push(Bytes::copy_from_slice(&input[..split]))
+                .to_vec();
+            output.extend_from_slice(&inspector.push(Bytes::copy_from_slice(&input[split..])));
+            output.extend_from_slice(&inspector.finish());
+            assert_eq!(output, body, "split={split}");
+            let mut semantics = response_semantics::ResponsesSseInspector::default();
+            semantics.push(&output).unwrap();
+            semantics.finish().unwrap();
+            assert!(matches!(
+                semantics.terminal(),
+                Some(response_semantics::SemanticTerminal::Success)
+            ));
+        }
+        for input in [
+            b"data: {\"type\":\"response.created\"}\n\n\xef\xbb\xbfdata: {}\n\n".as_slice(),
+            b"\xef\xbb".as_slice(),
+            b"\xefxdata: {}\n\n".as_slice(),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            let mut output = inspector.push(Bytes::copy_from_slice(input)).to_vec();
+            output.extend_from_slice(&inspector.finish());
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
+    fn responses_sse_private_control_is_hidden_without_masking_errors_or_metadata() {
+        let control = b"event: response.doom_loop_check\r\ndata: {\"type\":\"response.doom_loop_check\",\"detected\":true}\r\n\r\n";
+        let bare = b"data: {\"type\":\"response.doom_loop_check\",\"detected\":false}\n\n";
+        for normalize_ping in [true, false] {
+            for input in [control.as_slice(), bare.as_slice()] {
+                for split in 0..=input.len() {
+                    let mut inspector = GrokResponsesSseInspector::new(normalize_ping);
+                    let mut output = inspector
+                        .push(Bytes::copy_from_slice(&input[..split]))
+                        .to_vec();
+                    output.extend_from_slice(
+                        &inspector.push(Bytes::copy_from_slice(&input[split..])),
+                    );
+                    output.extend_from_slice(&inspector.finish());
+                    assert_eq!(output, b": ping\n\n", "split={split}");
+                }
+            }
+        }
+
+        for input in [
+            b"event: response.doom_loop_check\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n".as_slice(),
+            b"event: response.doom_loop_check\ndata: {\"type\":\"response.doom_loop_check\",\"error\":{\"message\":\"failed\"}}\n\n".as_slice(),
+            b"event: response.doom_loop_check\nid: cursor-1\ndata: {\"type\":\"response.doom_loop_check\"}\n\n".as_slice(),
+            b"event: response.doom_loop_check\nretry: 1000\ndata: {\"type\":\"response.doom_loop_check\"}\n\n".as_slice(),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(inspector.push(Bytes::copy_from_slice(input)), input);
+        }
+    }
+
+    #[test]
+    fn responses_sse_ping_filter_preserves_stateful_or_ambiguous_frames() {
+        for input in [
+            b"event: ping\nid: cursor-17\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"event: ping\nretry: 5000\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"event: ping\nevent: ping\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"event: ping\nunknown: value\ndata: {\"type\":\"ping\"}\n\n".as_slice(),
+            b"event: ping\ndata: [\"upstream-error\"]\n\n".as_slice(),
+            b"event: ping\ndata: {\"type\":null,\"cost\":\"0\"}\n\n".as_slice(),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(inspector.push(Bytes::copy_from_slice(input)), input);
+            assert!(inspector.finish().is_empty());
+            for split in 0..=input.len() {
+                let mut fragmented = GrokResponsesSseInspector::default();
+                let mut output = fragmented
+                    .push(Bytes::copy_from_slice(&input[..split]))
+                    .to_vec();
+                output.extend_from_slice(&fragmented.push(Bytes::copy_from_slice(&input[split..])));
+                output.extend_from_slice(&fragmented.finish());
+                assert_eq!(output, input);
+            }
         }
     }
 
@@ -3117,6 +3791,33 @@ mod tests {
     }
 
     #[test]
+    fn responses_sse_inspector_handles_mixed_and_cr_only_boundaries() {
+        for input in [
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\r\n".as_slice(),
+            b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\n".as_slice(),
+            b"event: ping\rdata: {\"type\":\"ping\"}\r\r".as_slice(),
+        ] {
+            for split in 0..=input.len() {
+                let mut inspector = GrokResponsesSseInspector::default();
+                let mut output = inspector
+                    .push(Bytes::copy_from_slice(&input[..split]))
+                    .to_vec();
+                output.extend_from_slice(&inspector.push(Bytes::copy_from_slice(&input[split..])));
+                output.extend_from_slice(&inspector.finish());
+                assert_eq!(output, b": ping\n\n", "split={split}, input={input:?}");
+            }
+        }
+
+        let search = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"search-mixed\",\"status\":\"completed\"}}\n\r\n";
+        let mut inspector = GrokResponsesSseInspector::default();
+        assert_eq!(
+            inspector.push(Bytes::copy_from_slice(search)),
+            search.as_slice()
+        );
+        assert!(inspector.take_search_observation());
+    }
+
+    #[test]
     fn responses_sse_ping_filter_passthrough_is_bounded() {
         let payload = "x".repeat(GROK_SSE_INSPECTION_MAX_FRAME_BYTES + 32);
         let oversized = format!("event: ping\ndata: {payload}\n\n");
@@ -3126,6 +3827,24 @@ mod tests {
         let second = inspector.push(Bytes::from_static(next.as_bytes()));
         assert_eq!(first, oversized.as_bytes());
         assert_eq!(second, ": ping\n\n");
+    }
+
+    #[test]
+    fn responses_sse_oversized_frame_recovers_after_mixed_or_cr_boundary() {
+        let payload = "x".repeat(GROK_SSE_INSPECTION_MAX_FRAME_BYTES + 32);
+        for delimiter in ["\n\r\n", "\r\n\n", "\r\r"] {
+            let oversized = format!("event: ping\ndata: {payload}{delimiter}");
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(
+                inspector.push(Bytes::from(oversized.clone())),
+                oversized.as_bytes()
+            );
+            assert_eq!(
+                inspector.push(Bytes::from_static(b"event: ping\n\n")),
+                ": ping\n\n"
+            );
+            assert!(inspector.finish().is_empty());
+        }
     }
 
     #[test]
@@ -3145,6 +3864,65 @@ mod tests {
         );
         assert!(!inspector.take_search_observation());
         assert_eq!(inspector.completed_search_count(), 1);
+    }
+
+    #[test]
+    fn conflicting_sse_event_cannot_create_grok_search_or_quality_evidence() {
+        let payload = r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"web_search_call","id":"search_1","status":"completed"}]}}"#;
+        for frame in [
+            format!("event: response.failed\ndata: {payload}\n\n"),
+            format!("event: ping\ndata: {payload}\n\n"),
+            format!("event: response.failed\nevent: response.completed\ndata: {payload}\n\n"),
+            format!("unknown: ignored-by-old-observer\ndata: {payload}\n\n"),
+        ] {
+            let mut inspector = GrokResponsesSseInspector::default();
+            assert_eq!(inspector.push(Bytes::from(frame.clone())), frame);
+            assert!(!inspector.take_search_observation());
+            assert!(inspector
+                .quality_observer
+                .take_completed_observation()
+                .is_none());
+            assert_eq!(inspector.completed_search_count(), 0);
+        }
+    }
+
+    #[test]
+    fn nonterminal_or_failed_grok_response_cannot_create_completed_evidence() {
+        let output = r#"[{"type":"web_search_call","id":"search_1","status":"completed"}]"#;
+        for payload in [
+            format!(
+                r#"{{"type":"response.done","response":{{"status":"completed","output":{output}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"response.completed","response":{{"status":"failed","output":{output}}}}}"#
+            ),
+        ] {
+            assert!(!grok_response_has_completed_search(payload.as_bytes()));
+            assert!(grok_quality_observation(payload.as_bytes()).is_none());
+            let mut inspector = GrokResponsesSseInspector::default();
+            inspector.push(Bytes::from(format!("data: {payload}\n\n")));
+            assert!(!inspector.take_search_observation());
+            assert!(inspector
+                .quality_observer
+                .take_completed_observation()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn grok_failed_terminal_cannot_be_replaced_by_later_completed_evidence() {
+        let failed =
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n";
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\"}]}}\n\n";
+        let mut inspector = GrokResponsesSseInspector::default();
+        inspector.push(Bytes::from_static(failed.as_bytes()));
+        inspector.push(Bytes::from_static(completed.as_bytes()));
+        assert!(!inspector.take_search_observation());
+        assert!(inspector
+            .quality_observer
+            .take_completed_observation()
+            .is_none());
+        assert_eq!(inspector.completed_search_count(), 0);
     }
 
     #[test]
@@ -3261,6 +4039,87 @@ mod tests {
     }
 
     #[test]
+    fn quality_observer_counts_refusal_as_visible_output() {
+        let completed = json!({
+            "status":"completed",
+            "output":[{"type":"message","content":[{"type":"refusal","refusal":"I cannot help with that."}]}]
+        });
+        let observation =
+            grok_quality_observation(&serde_json::to_vec(&completed).unwrap()).unwrap();
+        assert_eq!(observation.outcome, "text");
+        assert!(observation.has_visible_text);
+
+        let mut streaming = GrokQualityObserver::new(true);
+        streaming.observe_value(&json!({"type":"response.refusal.delta","delta":"I cannot"}));
+        streaming.observe_value(&json!({"type":"response.refusal.done","refusal":"I cannot help"}));
+        streaming.observe_value(&json!({"type":"response.completed","response":completed}));
+        let observation = streaming.take_completed_observation().unwrap();
+        assert_eq!(observation.outcome, "text");
+        assert!(observation.has_visible_text);
+        assert_eq!(observation.visible_length_bucket, "8_31");
+
+        let mut delta_only = GrokQualityObserver::new(true);
+        delta_only.observe_value(&json!({"type":"response.refusal.delta","delta":"Nope"}));
+        delta_only.observe_value(
+            &json!({"type":"response.refusal.done","refusal":"Nope, a longer refusal"}),
+        );
+        delta_only.observe_value(&json!({"type":"response.completed","response":completed}));
+        let observation = delta_only.take_completed_observation().unwrap();
+        assert_eq!(observation.outcome, "short_text");
+        assert_eq!(observation.visible_length_bucket, "1_7");
+
+        let mut done_only = GrokQualityObserver::new(true);
+        done_only.observe_value(&json!({"type":"response.refusal.done","refusal":"No thanks"}));
+        done_only.observe_value(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        );
+        assert_eq!(
+            done_only.take_completed_observation().unwrap().outcome,
+            "text"
+        );
+
+        let mut empty_placeholders = GrokQualityObserver::new(true);
+        empty_placeholders.observe_value(&json!({"type":"response.refusal.delta","delta":""}));
+        empty_placeholders.observe_value(&json!({"type":"response.refusal.done","refusal":""}));
+        empty_placeholders
+            .observe_value(&json!({"type":"response.completed","response":completed}));
+        assert_eq!(
+            empty_placeholders
+                .take_completed_observation()
+                .unwrap()
+                .outcome,
+            "text"
+        );
+    }
+
+    #[test]
+    fn quality_observer_empty_text_placeholders_do_not_hide_completed_text() {
+        let completed = json!({
+            "type":"response.completed",
+            "response":{
+                "status":"completed",
+                "output":[{"type":"message","content":[{"type":"output_text","text":"actual answer"}]}]
+            }
+        });
+        let mut observer = GrokQualityObserver::new(true);
+        observer.observe_value(&json!({"type":"response.output_text.delta","delta":""}));
+        observer.observe_value(&json!({"type":"response.output_text.done","text":" "}));
+        observer.observe_value(&completed);
+        let observation = observer.take_completed_observation().unwrap();
+        assert_eq!(observation.outcome, "text");
+        assert_eq!(observation.visible_length_bucket, "8_31");
+
+        let mut done_only = GrokQualityObserver::new(true);
+        done_only.observe_value(&json!({"type":"response.output_text.delta","delta":" "}));
+        done_only
+            .observe_value(&json!({"type":"response.output_text.done","text":"actual answer"}));
+        done_only.observe_value(&completed);
+        let observation = done_only.take_completed_observation().unwrap();
+        assert_eq!(observation.outcome, "text");
+        assert_eq!(observation.visible_length_bucket, "8_31");
+    }
+
+    #[test]
     fn quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump() {
         let visible = "x".repeat(GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS);
         let input = format!(
@@ -3278,7 +4137,7 @@ mod tests {
             .extend_from_slice(&inspector.push(Bytes::copy_from_slice(&input.as_bytes()[split..])));
         output.extend_from_slice(&inspector.finish());
         assert_eq!(output, input.as_bytes());
-        let observation = inspector.take_quality_observation().unwrap();
+        let observation = inspector.finish_quality_observation().unwrap();
         assert_eq!(observation.outcome, "anomalous_dump");
         assert!(observation.has_terminal);
         assert!(observation.has_visible_text);

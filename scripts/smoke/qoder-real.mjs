@@ -191,6 +191,21 @@ if (!/^(authorization|x-api-key|x-goog-api-key)$/i.test(routerTokenHeader)) {
   fail("ROUTER_API_TOKEN_HEADER is unsupported");
 }
 
+function assertReceiptDirectory() {
+  const directory = path.dirname(receiptFile);
+  let realDirectory;
+  try {
+    realDirectory = fs.realpathSync(directory);
+  } catch {
+    fail("QODER_REAL_RECEIPT_FILE parent directory does not exist");
+  }
+  const relative = path.relative(repoRoot, realDirectory);
+  if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
+    fail("QODER_REAL_RECEIPT_FILE parent must stay outside the repository");
+  }
+  return directory;
+}
+
 const secrets = [serverToken, routerToken].filter(usable);
 function redact(text) {
   let output = String(text || "");
@@ -259,17 +274,29 @@ async function request(base, requestPath, init = {}, { admin = false } = {}) {
 }
 
 async function readLimited(response, label, limit = 8 * 1024 * 1024) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > limit) {
+    await response.body?.cancel();
+    fail(`${label} exceeded the response-size bound`);
+  }
   if (!response.body) return "";
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let text = "";
   let bytes = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    bytes += value.byteLength;
-    if (bytes > limit) fail(`${label} exceeded the response-size bound`);
-    text += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        await reader.cancel();
+        fail(`${label} exceeded the response-size bound`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
   }
   text += decoder.decode();
   scanSensitive(text, label);
@@ -308,6 +335,13 @@ function resolveAccount(accounts) {
   );
   if (matches.length !== 1) fail(`${spec.accountEnv} did not select exactly one Qoder Account`);
   const account = matches[0];
+  if (
+    account.qoderCredentialScope?.site !== spec.site ||
+    account.qoderCredentialScope?.credentialRail !==
+      (rail === "global_pat" ? "pat_job_token" : rail)
+  ) {
+    fail("selected Qoder Account profile does not match the selected site and rail");
+  }
   if (!account.id?.startsWith(`qoder-${spec.site}-`)) {
     fail(`selected Qoder Account does not belong to the ${spec.site} site`);
   }
@@ -317,15 +351,19 @@ function resolveAccount(accounts) {
   if (!Number.isSafeInteger(account.tokenRefreshGeneration) || account.tokenRefreshGeneration < 0) {
     fail("selected Qoder Account is missing tokenRefreshGeneration");
   }
-  if (account.needsRelogin === true) fail("selected Qoder Account requires relogin");
+  if (account.needsRelogin !== false) fail("selected Qoder Account requires relogin");
   if (rail === "global_pat") {
-    if (account.hasApiKey !== true || account.hasAccessToken || account.hasRefreshToken) {
+    if (
+      account.hasApiKey !== true ||
+      account.hasAccessToken !== false ||
+      account.hasRefreshToken !== false
+    ) {
       fail("Global PAT rail must persist only its PAT credential");
     }
   } else if (
     account.hasAccessToken !== true ||
     account.hasRefreshToken !== true ||
-    account.hasApiKey
+    account.hasApiKey !== false
   ) {
     fail("Qoder OAuth rail must persist access and refresh tokens without a PAT");
   }
@@ -378,12 +416,15 @@ async function validateBindings(account) {
     ) {
       fail(`${app} Qoder Provider is not fixed to the selected Account generation`);
     }
-    const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-    const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
+    const providerRevision = view.runtime.providerRevision;
+    const runtimeFingerprint = view.runtime.runtimeFingerprint;
     if (
       !Number.isSafeInteger(providerRevision) ||
       providerRevision < 0 ||
-      !runtimeFingerprint
+      !Number.isSafeInteger(view.revision) ||
+      view.revision !== providerRevision ||
+      typeof runtimeFingerprint !== "string" ||
+      !runtimeFingerprint.trim()
     ) {
       fail(`${app} Qoder Provider runtime scope is incomplete`);
     }
@@ -423,30 +464,29 @@ async function validateShareBinding() {
   const matches = response.shares.filter((share) => share?.id === shareId);
   if (matches.length !== 1) fail(`${spec.shareEnv} did not select exactly one Share`);
   const share = matches[0];
-  if (share.enabled === false || (share.status && share.status !== "active")) {
+  if (share.enabled !== true || share.status !== "active") {
     fail("selected Qoder Share is not active");
   }
-  const bindings = [
-    {
-      app: share.app,
-      providerId: share.providerId,
-      providerType: share.providerType,
-    },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
+  if (
+    primaryBindings.length !== 1 ||
+    primaryBindings[0].providerId !== share.providerId ||
+    primaryBindings[0].providerType !== share.providerType
+  ) {
+    fail("Qoder Share primary binding is ambiguous");
+  }
   for (const [app, providerId] of Object.entries(providerIds)) {
+    const selectedBindings = bindings.filter((binding) => binding?.app === app);
     if (
-      !bindings.some(
-        (binding) =>
-          binding?.app === app &&
-          binding?.providerId === providerId &&
-          binding?.providerType === "qoder_cosy",
-      )
+      selectedBindings.length !== 1 ||
+      selectedBindings[0].providerId !== providerId ||
+      selectedBindings[0].providerType !== "qoder_cosy"
     ) {
       fail(`Qoder Share is not fixed to the selected ${app} Provider`);
     }
   }
-  const shareRevision = share.configRevision ?? 0;
+  const shareRevision = share.configRevision;
   if (!Number.isSafeInteger(shareRevision) || shareRevision < 0) {
     fail("Qoder Share revision scope is incomplete");
   }
@@ -463,10 +503,23 @@ async function validateShareBinding() {
   };
 }
 
-async function validateCatalogs() {
+function freshCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return (
+    Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs >= now - CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + 5 * 60_000
+  );
+}
+
+async function validateCatalogs(requiredModel = requestedModel) {
   const catalogs = [];
   for (const [app, providerId] of Object.entries(providerIds)) {
-    const query = new URLSearchParams({ app, providerId });
+    const query = new URLSearchParams({
+      app,
+      providerId,
+      expectedShareId: shareId,
+      expectedProviderId: providerId,
+    });
     const catalog = await requireJson(
       shareUrl,
       `/v1/models?${query}`,
@@ -477,31 +530,35 @@ async function validateCatalogs() {
       !Array.isArray(catalog?.data) ||
       catalog.source !== "qoder_live_model_catalog" ||
       catalog.stale !== false ||
-      !Number.isSafeInteger(catalog.fetchedAtMs) ||
-      catalog.fetchedAtMs < Date.now() - CATALOG_MAX_AGE_MS ||
-      catalog.fetchedAtMs > Date.now() + 5 * 60_000
+      !freshCatalogTimestamp(catalog.fetchedAtMs)
     ) {
       fail(`${app} Qoder model catalog is not a fresh bound-account catalog`);
     }
-    const models = new Set(
-      catalog.data
-        .map((entry) => String(entry?.id || "").trim())
-        .filter(Boolean),
-    );
+    const modelIds = catalog.data.map((entry) => entry?.id);
+    if (
+      modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+      new Set(modelIds).size !== modelIds.length
+    ) {
+      fail(`${app} Qoder model catalog has incomplete or duplicate model IDs`);
+    }
+    const models = new Set(modelIds);
     if (models.size === 0) fail(`${app} Qoder model catalog is empty`);
     catalogs.push({
       app,
       source: catalog.source,
       stale: false,
       fetchedAtMs: catalog.fetchedAtMs,
-      digest: digest(`cc-switch-server:qoder-${app}-catalog:v1`, catalog.data),
+      digest: digest(
+        `cc-switch-server:qoder-${app}-catalog:v1`,
+        [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+      ),
       models,
     });
   }
   const commonModels = [...catalogs[0].models].filter((model) =>
     catalogs.slice(1).every((catalog) => catalog.models.has(model)),
   );
-  const model = requestedModel || commonModels.sort()[0];
+  const model = requiredModel || commonModels.sort()[0];
   if (!model || !catalogs.every((catalog) => catalog.models.has(model))) {
     fail("Qoder Provider catalogs have no common selected model");
   }
@@ -600,6 +657,23 @@ async function collectSse(requestPath, body, label, extraHeaders = {}) {
     }
     scanSensitive(JSON.stringify(frames), label);
     if (frames.length === 0) fail(`${label} ended without SSE data`);
+    const doneIndex = frames.findIndex((frame) => frame.done);
+    if (
+      doneIndex >= 0 &&
+      (doneIndex !== frames.length - 1 || frames.filter((frame) => frame.done).length !== 1)
+    ) {
+      fail(`${label} emitted a premature DONE marker`);
+    }
+    if (
+      frames.some(
+        (frame) =>
+          frame.event === "error" ||
+          ["error", "response.failed", "response.incomplete"].includes(frame.payload?.type) ||
+          frame.payload?.error != null,
+      )
+    ) {
+      fail(`${label} stream reported an error`);
+    }
     return frames;
   } finally {
     stop();
@@ -619,6 +693,23 @@ const toolSchema = {
   required: ["key"],
 };
 const smokeText = "Call lookup with key qoder-acceptance. Do not answer in prose.";
+
+function validToolArguments(value) {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return false;
+    }
+  }
+  return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) &&
+    Object.keys(parsed).length === 1 && parsed.key === "qoder-acceptance";
+}
+
+function requireToolArguments(value, label) {
+  if (!validToolArguments(value)) fail(`${label} tool arguments did not round-trip`);
+}
 
 async function validateClaude(model) {
   const base = {
@@ -643,9 +734,14 @@ async function validateClaude(model) {
   if (nonstream?.type !== "message" || nonstream.role !== "assistant") {
     fail("Qoder Claude non-stream response is not an assistant message");
   }
-  if (!nonstream.content?.some((block) => block?.type === "tool_use" && block.name === toolName)) {
+  const nonstreamTool = nonstream.content?.find(
+    (block) => block?.type === "tool_use" && block.name === toolName,
+  );
+  if (!nonstreamTool) {
     fail("Qoder Claude non-stream response is missing the lookup tool call");
   }
+  if (!usable(nonstreamTool.id)) fail("Qoder Claude non-stream tool id is missing");
+  requireToolArguments(nonstreamTool.input, "Qoder Claude non-stream");
   requireUsage(nonstream.usage, "Qoder Claude non-stream response");
   const frames = await collectSse(
     "/v1/messages",
@@ -655,16 +751,36 @@ async function validateClaude(model) {
   );
   const terminals = frames.filter((frame) => frame.payload?.type === "message_stop");
   if (terminals.length !== 1) fail("Qoder Claude stream must emit one message_stop");
-  if (
-    !frames.some(
-      (frame) =>
-        frame.payload?.type === "content_block_start" &&
-        frame.payload?.content_block?.type === "tool_use" &&
-        frame.payload?.content_block?.name === toolName,
-    )
-  ) {
+  const toolBlocks = new Map();
+  for (const frame of frames) {
+    const payload = frame.payload;
+    if (payload?.type === "content_block_start" && payload.content_block?.type === "tool_use") {
+      toolBlocks.set(payload.index, {
+        id: payload.content_block.id,
+        name: payload.content_block.name,
+        input: payload.content_block.input,
+        fragments: [],
+        stopped: false,
+      });
+    } else if (payload?.type === "content_block_delta" && toolBlocks.has(payload.index)) {
+      if (payload.delta?.type === "input_json_delta" && typeof payload.delta.partial_json === "string") {
+        toolBlocks.get(payload.index).fragments.push(payload.delta.partial_json);
+      }
+    } else if (payload?.type === "content_block_stop" && toolBlocks.has(payload.index)) {
+      toolBlocks.get(payload.index).stopped = true;
+    }
+  }
+  const streamTool = [...toolBlocks.values()].find((block) => block.name === toolName);
+  if (!streamTool) {
     fail("Qoder Claude stream is missing the lookup tool lifecycle");
   }
+  if (!usable(streamTool.id) || !streamTool.stopped) {
+    fail("Qoder Claude stream tool lifecycle is incomplete");
+  }
+  requireToolArguments(
+    streamTool.fragments.length > 0 ? streamTool.fragments.join("") : streamTool.input,
+    "Qoder Claude stream",
+  );
   return {
     terminalCount: terminals.length,
     eof: true,
@@ -702,9 +818,14 @@ async function validateCodex(model) {
   if (nonstream?.object !== "response" || nonstream.status !== "completed") {
     fail("Qoder Codex non-stream response is not completed");
   }
-  if (!nonstream.output?.some((item) => item?.type === "function_call" && item.name === toolName)) {
+  const nonstreamTool = nonstream.output?.find(
+    (item) => item?.type === "function_call" && item.name === toolName,
+  );
+  if (!nonstreamTool) {
     fail("Qoder Codex non-stream response is missing the lookup tool call");
   }
+  if (!usable(nonstreamTool.call_id)) fail("Qoder Codex non-stream tool id is missing");
+  requireToolArguments(nonstreamTool.arguments, "Qoder Codex non-stream");
   requireUsage(nonstream.usage, "Qoder Codex non-stream response");
   const frames = await collectSse(
     "/v1/responses",
@@ -713,16 +834,21 @@ async function validateCodex(model) {
   );
   const terminals = frames.filter((frame) => frame.payload?.type === "response.completed");
   if (terminals.length !== 1) fail("Qoder Codex stream must emit one response.completed");
-  if (
-    !frames.some(
-      (frame) => frame.payload?.item?.type === "function_call" && frame.payload?.item?.name === toolName,
-    ) &&
-    !terminals[0]?.payload?.response?.output?.some(
-      (item) => item?.type === "function_call" && item.name === toolName,
-    )
-  ) {
+  const finalItems = terminals[0]?.payload?.response?.output;
+  const completedItems = frames
+    .filter((frame) => frame.payload?.type === "response.output_item.done")
+    .map((frame) => frame.payload.item);
+  const toolItems = Array.isArray(finalItems) && finalItems.length > 0
+    ? finalItems
+    : completedItems;
+  const streamTool = toolItems.find(
+    (item) => item?.type === "function_call" && item.name === toolName,
+  );
+  if (!streamTool) {
     fail("Qoder Codex stream is missing the lookup tool lifecycle");
   }
+  if (!usable(streamTool.call_id)) fail("Qoder Codex stream tool id is missing");
+  requireToolArguments(streamTool.arguments, "Qoder Codex stream");
   return {
     terminalCount: terminals.length,
     eof: true,
@@ -762,13 +888,13 @@ async function validateGemini(model) {
   if (!Array.isArray(nonstream?.candidates) || nonstream.candidates.length === 0) {
     fail("Qoder Gemini non-stream response has no candidate");
   }
-  if (
-    !nonstream.candidates.some((candidate) =>
-      candidate?.content?.parts?.some((part) => part?.functionCall?.name === toolName),
-    )
-  ) {
+  const nonstreamTool = nonstream.candidates
+    .flatMap((candidate) => candidate?.content?.parts || [])
+    .find((part) => part?.functionCall?.name === toolName)?.functionCall;
+  if (!nonstreamTool) {
     fail("Qoder Gemini non-stream response is missing the lookup tool call");
   }
+  requireToolArguments(nonstreamTool.args, "Qoder Gemini non-stream");
   requireUsage(nonstream.usageMetadata, "Qoder Gemini non-stream response");
   const frames = await collectSse(
     `/v1beta/models/${modelPath}:streamGenerateContent?alt=sse`,
@@ -779,15 +905,14 @@ async function validateGemini(model) {
     frame.payload?.candidates?.some((candidate) => usable(candidate?.finishReason)),
   );
   if (terminals.length !== 1) fail("Qoder Gemini stream must emit one finishReason terminal");
-  if (
-    !frames.some((frame) =>
-      frame.payload?.candidates?.some((candidate) =>
-        candidate?.content?.parts?.some((part) => part?.functionCall?.name === toolName),
-      ),
-    )
-  ) {
+  const streamTool = frames
+    .flatMap((frame) => frame.payload?.candidates || [])
+    .flatMap((candidate) => candidate?.content?.parts || [])
+    .find((part) => part?.functionCall?.name === toolName)?.functionCall;
+  if (!streamTool) {
     fail("Qoder Gemini stream is missing the lookup tool lifecycle");
   }
+  requireToolArguments(streamTool.args, "Qoder Gemini stream");
   return {
     terminalCount: terminals.length,
     eof: true,
@@ -825,22 +950,168 @@ function assertReceiptSafe(receipt) {
   }
 }
 
-function writeReceipt(receipt) {
+function assertFreshCatalogs(snapshots, now = Date.now()) {
+  if (
+    Object.values(snapshots).some(
+      (snapshot) => !freshCatalogTimestamp(snapshot.fetchedAtMs, now),
+    )
+  ) {
+    fail("Qoder model catalogs expired during acceptance");
+  }
+}
+
+function writeReceipt(receipt, verifyBeforePublish) {
   assertReceiptSafe(receipt);
-  const directory = path.dirname(receiptFile);
-  if (!fs.existsSync(directory)) fail("QODER_REAL_RECEIPT_FILE parent directory does not exist");
-  if (fs.existsSync(receiptFile)) fail("QODER_REAL_RECEIPT_FILE already exists");
-  const temporary = `${receiptFile}.tmp-${process.pid}`;
-  fs.writeFileSync(temporary, `${JSON.stringify(receipt, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-    flag: "wx",
-  });
-  fs.renameSync(temporary, receiptFile);
-  fs.chmodSync(receiptFile, 0o600);
+  const directory = assertReceiptDirectory();
+  const contents = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+  const flags = fs.constants.O_RDONLY |
+    (fs.constants.O_DIRECTORY ?? 0) |
+    (fs.constants.O_NOFOLLOW ?? 0);
+  const directoryDescriptor = fs.openSync(fs.realpathSync(directory), flags);
+  const anchoredDirectory = `/proc/self/fd/${directoryDescriptor}`;
+  function assertReceiptContents(descriptor, fingerprint, linkCount, requireMode = true) {
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      !before.isFile() ||
+      before.nlink !== linkCount ||
+      before.size !== BigInt(contents.length) ||
+      (requireMode && (before.mode & 0o777n) !== 0o600n) ||
+      (fingerprint && (
+        before.dev !== fingerprint.dev ||
+        before.ino !== fingerprint.ino ||
+        before.mode !== fingerprint.mode ||
+        before.mtimeNs !== fingerprint.mtimeNs ||
+        before.ctimeNs !== fingerprint.ctimeNs
+      ))
+    ) {
+      fail("Qoder receipt changed during publication");
+    }
+    const actual = Buffer.alloc(contents.length);
+    let offset = 0;
+    while (offset < actual.length) {
+      const read = fs.readSync(descriptor, actual, offset, actual.length - offset, offset);
+      if (read === 0) fail("Qoder receipt changed during publication");
+      offset += read;
+    }
+    if (
+      fs.readSync(descriptor, Buffer.alloc(1), 0, 1, actual.length) !== 0 ||
+      !actual.equals(contents)
+    ) {
+      fail("Qoder receipt changed during publication");
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.nlink !== before.nlink ||
+      after.size !== before.size ||
+      after.mode !== before.mode ||
+      after.mtimeNs !== before.mtimeNs ||
+      after.ctimeNs !== before.ctimeNs
+    ) {
+      fail("Qoder receipt changed during publication");
+    }
+  }
+  function assertReceiptPath(file, fingerprint, linkCount) {
+    const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      assertReceiptContents(descriptor, fingerprint, linkCount);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
+  function assertPinnedDirectory() {
+    assertReceiptDirectory();
+    const current = fs.statSync(directory);
+    const pinned = fs.fstatSync(directoryDescriptor);
+    if (!pinned.isDirectory() || current.dev !== pinned.dev || current.ino !== pinned.ino) {
+      fail("QODER_REAL_RECEIPT_FILE parent changed during publication");
+    }
+    let anchoredReal;
+    try {
+      anchoredReal = fs.realpathSync(anchoredDirectory);
+    } catch {
+      fail("QODER_REAL_RECEIPT_FILE requires descriptor-anchored publication");
+    }
+    const relative = path.relative(repoRoot, anchoredReal);
+    if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
+      fail("QODER_REAL_RECEIPT_FILE parent must stay outside the repository");
+    }
+  }
+  const target = path.join(anchoredDirectory, path.basename(receiptFile));
+  const temporary = `${target}.tmp-${process.pid}`;
+  let created = false;
+  let published = false;
+  let receiptDescriptor;
+  function unlinkTemporaryIfOwned() {
+    let current;
+    try {
+      current = fs.lstatSync(temporary, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    const owned = fs.fstatSync(receiptDescriptor, { bigint: true });
+    if (current.dev === owned.dev && current.ino === owned.ino) {
+      fs.unlinkSync(temporary);
+    }
+  }
+  function unlinkPublishedIfOwned() {
+    let current;
+    try {
+      current = fs.lstatSync(target, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    const owned = fs.fstatSync(receiptDescriptor, { bigint: true });
+    if (current.dev === owned.dev && current.ino === owned.ino) {
+      fs.unlinkSync(target);
+    }
+  }
+  try {
+    assertPinnedDirectory();
+    if (fs.existsSync(target)) fail("QODER_REAL_RECEIPT_FILE already exists");
+    receiptDescriptor = fs.openSync(
+      temporary,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL |
+        (fs.constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    created = true;
+    fs.writeFileSync(receiptDescriptor, contents);
+    assertReceiptContents(receiptDescriptor, null, 1n, false);
+    fs.fchmodSync(receiptDescriptor, 0o600);
+    const fingerprint = fs.fstatSync(receiptDescriptor, { bigint: true });
+    assertPinnedDirectory();
+    assertReceiptPath(temporary, fingerprint, 1n);
+    verifyBeforePublish();
+    // Linking is exclusive: a receipt created after the check must not be overwritten.
+    fs.linkSync(temporary, target);
+    published = true;
+    assertPinnedDirectory();
+    assertReceiptPath(target, fs.fstatSync(receiptDescriptor, { bigint: true }), 2n);
+  } catch (error) {
+    if (published) unlinkPublishedIfOwned();
+    throw error;
+  } finally {
+    try {
+      if (created) unlinkTemporaryIfOwned();
+    } finally {
+      try {
+        if (receiptDescriptor !== undefined) fs.closeSync(receiptDescriptor);
+      } finally {
+        fs.closeSync(directoryDescriptor);
+      }
+    }
+  }
 }
 
 async function main() {
+  assertReceiptDirectory();
+  if (process.platform !== "linux" || !fs.existsSync("/proc/self/fd")) {
+    fail("QODER_REAL_RECEIPT_FILE requires Linux descriptor-anchored publication");
+  }
   const targetCommit = gitCommit();
   const initialAccount = await accountSnapshot();
   const providerBindings = await validateBindings(initialAccount);
@@ -867,10 +1138,37 @@ async function main() {
   if (
     finalAccount.id !== initialAccount.id ||
     finalAccount.authIdentityGeneration !== initialAccount.authIdentityGeneration ||
-    finalAccount.tokenRefreshGeneration < initialAccount.tokenRefreshGeneration
+    finalAccount.tokenRefreshGeneration !== initialAccount.tokenRefreshGeneration
   ) {
     fail("Qoder Account identity or credential generation drifted during acceptance");
   }
+  const finalProviderBindings = await validateBindings(finalAccount);
+  if (
+    finalProviderBindings.digest !== providerBindings.digest ||
+    JSON.stringify(finalProviderBindings.surfaceBindings) !==
+      JSON.stringify(providerBindings.surfaceBindings)
+  ) {
+    fail("Qoder Provider bindings drifted during acceptance");
+  }
+  const finalShareBinding = await validateShareBinding();
+  if (
+    finalShareBinding.shareRevision !== shareBinding.shareRevision ||
+    finalShareBinding.shareIdentityDigest !== shareBinding.shareIdentityDigest ||
+    finalShareBinding.shareBindingDigest !== shareBinding.shareBindingDigest
+  ) {
+    fail("Qoder Share binding drifted during acceptance");
+  }
+  const finalCatalog = await validateCatalogs(catalog.model);
+  for (const app of Object.keys(catalog.snapshots)) {
+    if (finalCatalog.snapshots[app].digest !== catalog.snapshots[app].digest) {
+      fail(`${app} Qoder model catalog changed during acceptance`);
+    }
+  }
+  const assertBoundCatalogsFresh = () => {
+    const now = Date.now();
+    assertFreshCatalogs(catalog.snapshots, now);
+    assertFreshCatalogs(finalCatalog.snapshots, now);
+  };
 
   // This harness observes the happy-path data plane. Login/import, credential
   // rotation, authoritative-empty discovery, and controlled 401 scenarios are
@@ -971,7 +1269,8 @@ async function main() {
     timestamp: new Date().toISOString(),
     tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
   };
-  writeReceipt(receipt);
+  assertBoundCatalogsFresh();
+  writeReceipt(receipt, assertBoundCatalogsFresh);
   console.log(
     `[PASS] Qoder ${rail} acceptance receipt written (verificationState=${verificationState}, liveState=${liveState})`,
   );

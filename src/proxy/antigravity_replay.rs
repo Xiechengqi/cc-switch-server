@@ -476,7 +476,7 @@ fn request_contents(document: &Value) -> Option<&[Value]> {
 }
 
 fn history_hash(contents: &[Value]) -> String {
-    let canonical = Value::Array(contents.iter().map(canonical_history_value).collect());
+    let canonical = Value::Array(contents.iter().map(canonical_history_content).collect());
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(b"cc-switch-server:antigravity-history:v1\0");
@@ -484,17 +484,42 @@ fn history_hash(contents: &[Value]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn canonical_history_content(content: &Value) -> Value {
+    let mut content = canonical_history_value(content);
+    if let Some(object) = content.as_object_mut() {
+        object.remove("cache_control");
+        if let Some(parts) = object.get_mut("parts").and_then(Value::as_array_mut) {
+            for part in parts {
+                let Some(part) = part.as_object_mut() else {
+                    continue;
+                };
+                // Ignore replay metadata only at Gemini part positions. Tool
+                // arguments and results may contain identical business keys.
+                part.remove("thoughtSignature");
+                part.remove("thought_signature");
+                part.remove("cache_control");
+                if let Some(extra) = part.get_mut("extra_content").and_then(Value::as_object_mut) {
+                    if let Some(google) = extra.get_mut("google").and_then(Value::as_object_mut) {
+                        google.remove("thought_signature");
+                        if google.is_empty() {
+                            extra.remove("google");
+                        }
+                    }
+                    if extra.is_empty() {
+                        part.remove("extra_content");
+                    }
+                }
+            }
+        }
+    }
+    content
+}
+
 fn canonical_history_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut sorted = BTreeMap::new();
             for (key, child) in object {
-                if matches!(
-                    key.as_str(),
-                    "thoughtSignature" | "thought_signature" | "cache_control"
-                ) {
-                    continue;
-                }
                 sorted.insert(key.clone(), canonical_history_value(child));
             }
             Value::Object(Map::from_iter(sorted))
@@ -505,12 +530,16 @@ fn canonical_history_value(value: &Value) -> Value {
 }
 
 fn native_signature(part: &Value) -> Option<&str> {
-    part.get("thoughtSignature")
-        .or_else(|| part.get("thought_signature"))
-        .or_else(|| part.pointer("/extra_content/google/thought_signature"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|signature| signature.len() >= 16 && signature.len() <= MAX_SIGNATURE_BYTES)
+    [
+        part.get("thoughtSignature"),
+        part.get("thought_signature"),
+        part.pointer("/extra_content/google/thought_signature"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|signature| signature.len() >= 16 && signature.len() <= MAX_SIGNATURE_BYTES)
 }
 
 fn part_target(part: &Value) -> Option<(String, String)> {
@@ -709,23 +738,39 @@ fn patch_model_content(content: &Value, items: &[ReplayItem]) -> Option<Value> {
             } => {
                 let mut seen = 0usize;
                 let mut matched = None;
-                for (index, part) in parts.iter().enumerate() {
-                    let Some(call) = part.get("functionCall") else {
-                        continue;
-                    };
-                    let call_id = call.get("id").and_then(Value::as_str).map(str::trim);
-                    if id.as_deref().is_some_and(|id| call_id == Some(id)) {
-                        matched = Some(index);
-                        break;
-                    }
-                    if call.get("name").and_then(Value::as_str) == Some(name)
-                        && canonical_history_value(call.get("args").unwrap_or(&json!({}))) == *args
-                    {
-                        if seen == *occurrence {
-                            matched = Some(index);
-                            break;
+                if let Some(id) = id.as_deref() {
+                    for (index, part) in parts.iter().enumerate() {
+                        let Some(call) = part.get("functionCall") else {
+                            continue;
+                        };
+                        if call.get("id").and_then(Value::as_str) != Some(id) {
+                            continue;
                         }
-                        seen = seen.saturating_add(1);
+                        if matched.is_some()
+                            || call.get("name").and_then(Value::as_str) != Some(name)
+                            || canonical_history_value(call.get("args").unwrap_or(&json!({})))
+                                != *args
+                        {
+                            return None;
+                        }
+                        matched = Some(index);
+                    }
+                }
+                if matched.is_none() {
+                    for (index, part) in parts.iter().enumerate() {
+                        let Some(call) = part.get("functionCall") else {
+                            continue;
+                        };
+                        if call.get("name").and_then(Value::as_str) == Some(name)
+                            && canonical_history_value(call.get("args").unwrap_or(&json!({})))
+                                == *args
+                        {
+                            if seen == *occurrence {
+                                matched = Some(index);
+                                break;
+                            }
+                            seen = seen.saturating_add(1);
+                        }
                     }
                 }
                 let index = matched?;
@@ -824,11 +869,15 @@ fn response_matches_calls(content: &Value, items: &[ReplayItem]) -> bool {
             .enumerate()
             .filter(|(index, _)| !used.contains(index))
             .filter(|(_, item)| match item {
-                ReplayItem::FunctionCall { id, name, .. } => response_id
-                    .filter(|id| !id.is_empty())
-                    .zip(id.as_deref())
-                    .map(|(left, right)| left == right)
-                    .unwrap_or_else(|| response_name == Some(name.as_str())),
+                ReplayItem::FunctionCall { id, name, .. } => {
+                    if response_name.is_some_and(|value| !value.is_empty() && value != name) {
+                        return false;
+                    }
+                    match response_id.filter(|value| !value.is_empty()) {
+                        Some(response_id) => id.as_deref() == Some(response_id),
+                        None => response_name == Some(name.as_str()),
+                    }
+                }
                 _ => false,
             })
             .map(|(index, _)| index)
@@ -998,22 +1047,51 @@ impl AntigravityReplayStreamAccumulator {
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
-        if self.overflow || chunk.is_empty() {
+        if self.terminal || self.overflow || chunk.is_empty() {
             return;
         }
-        if self.buffer.len().saturating_add(chunk.len()) > MAX_STREAM_BUFFER_BYTES {
-            self.overflow = true;
-            self.buffer = Vec::new();
-            self.content = Value::Null;
-            self.terminal = false;
-            return;
+        let mut remaining = chunk;
+        while !remaining.is_empty() && !self.terminal && !self.overflow {
+            let room = MAX_STREAM_BUFFER_BYTES.saturating_sub(self.buffer.len());
+            if room == 0 {
+                self.fail_overflow();
+                break;
+            }
+            let appended = remaining.len().min(room);
+            self.buffer.extend_from_slice(&remaining[..appended]);
+            remaining = &remaining[appended..];
+            self.drain_complete_events();
+            if !remaining.is_empty() && self.buffer.len() == MAX_STREAM_BUFFER_BYTES {
+                self.fail_overflow();
+            }
         }
-        self.buffer.extend_from_slice(chunk);
-        while let Some((end, delimiter)) = next_sse_event(&self.buffer) {
-            let event = self.buffer.drain(..end).collect::<Vec<_>>();
-            self.buffer.drain(..delimiter);
+    }
+
+    fn drain_complete_events(&mut self) {
+        let mut consumed = 0;
+        while let Some((end, delimiter)) = next_sse_event(&self.buffer[consumed..]) {
+            let event = self.buffer[consumed..consumed + end].to_vec();
+            consumed += end + delimiter;
             self.observe_event(&event);
+            if self.terminal {
+                self.buffer = Vec::new();
+                return;
+            }
         }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
+            if self.buffer.capacity() > MAX_STREAM_BUFFER_BYTES / 2 && self.buffer.len() < 64 * 1024
+            {
+                self.buffer.shrink_to_fit();
+            }
+        }
+    }
+
+    fn fail_overflow(&mut self) {
+        self.overflow = true;
+        self.buffer = Vec::new();
+        self.content = Value::Null;
+        self.terminal = false;
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -1036,9 +1114,11 @@ impl AntigravityReplayStreamAccumulator {
     }
 
     fn observe_event(&mut self, event: &[u8]) {
+        if self.terminal {
+            return;
+        }
         let mut data = Vec::new();
-        for line in event.split(|byte| *byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+        for line in event.split(|byte| matches!(byte, b'\r' | b'\n')) {
             if let Some(payload) = line.strip_prefix(b"data:") {
                 if !data.is_empty() {
                     data.push(b'\n');
@@ -1077,16 +1157,28 @@ impl AntigravityReplayStreamAccumulator {
 }
 
 fn next_sse_event(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|index| (index, 2))
-        })
+    let mut index = 0;
+    while index < buffer.len() {
+        let first = match buffer[index] {
+            b'\r' if buffer.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let next = index + first;
+        let second = match buffer.get(next) {
+            Some(b'\r') if buffer.get(next + 1) == Some(&b'\n') => 2,
+            Some(b'\r' | b'\n') => 1,
+            _ => {
+                index = next;
+                continue;
+            }
+        };
+        return Some((index, first + second));
+    }
+    None
 }
 
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
@@ -1113,11 +1205,22 @@ fn merge_stream_content(target: &mut Value, source: &Value) {
         return;
     };
     for part in source_parts {
+        // A signature closes a non-empty segment; only an unsigned prefix may
+        // absorb a later signed fragment without changing signature ownership.
         let merge_text = part.get("functionCall").is_none()
             && part.get("text").and_then(Value::as_str).is_some()
             && target_parts.last().is_some_and(|last| {
                 last.get("functionCall").is_none()
-                    && last.get("text").and_then(Value::as_str).is_some()
+                    && last
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            native_signature(last).is_none_or(|signature| {
+                                text.is_empty()
+                                    && native_signature(part)
+                                        .is_none_or(|next_signature| next_signature == signature)
+                            })
+                        })
                     && last.get("thought").and_then(Value::as_bool)
                         == part.get("thought").and_then(Value::as_bool)
             });
@@ -1215,6 +1318,27 @@ mod tests {
         accumulator.push(&vec![b'x'; MAX_STREAM_BUFFER_BYTES + 1]);
         assert_eq!(accumulator.retained_bytes(), 0);
         assert!(!accumulator.is_complete());
+    }
+
+    #[test]
+    fn stream_accumulator_bounds_incomplete_events_not_combined_network_chunks() {
+        let base = request(json!([{"role":"user","parts":[{"text":"hi"}]}]));
+        let heartbeat = format!(":{}\n\n", "x".repeat(MAX_STREAM_BUFFER_BYTES / 2));
+        let terminal = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_A}\"}}]}},\"finishReason\":\"STOP\"}}]}}}}\n\n"
+        );
+        let wire = format!("{heartbeat}{heartbeat}{terminal}");
+        assert!(wire.len() > MAX_STREAM_BUFFER_BYTES);
+        let mut accumulator = AntigravityReplayStreamAccumulator::default();
+        accumulator.push(wire.as_bytes());
+        assert!(accumulator.is_complete());
+        let chain = accumulator.finish(&base, None).unwrap();
+        let signatures = chain.turns[0]
+            .items
+            .iter()
+            .filter_map(ReplayItem::signature)
+            .collect::<Vec<_>>();
+        assert_eq!(signatures, vec![SIG_A]);
     }
 
     #[test]
@@ -1477,6 +1601,114 @@ mod tests {
     }
 
     #[test]
+    fn captures_signature_alias_after_null_primary_in_both_response_paths() {
+        let base = request(json!([{"role":"user","parts":[{"text":"lookup"}]}]));
+        let content = json!({"role":"model","parts":[{
+            "functionCall":{"id":"call-1","name":"lookup","args":{}},
+            "thoughtSignature":null,
+            "thought_signature":SIG_A
+        }]});
+        let non_stream = capture_response(&base, &response(content.clone()), None);
+        assert_eq!(
+            non_stream
+                .as_ref()
+                .and_then(|chain| chain.turns[0].items[0].signature()),
+            Some(SIG_A)
+        );
+
+        let mut stream = AntigravityReplayStreamAccumulator::default();
+        stream.push(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "response":{"candidates":[{"content":content,"finishReason":"STOP"}]}
+                })
+            )
+            .as_bytes(),
+        );
+        let streamed = stream.finish(&base, None);
+        assert_eq!(
+            streamed
+                .as_ref()
+                .and_then(|chain| chain.turns[0].items[0].signature()),
+            Some(SIG_A)
+        );
+    }
+
+    #[test]
+    fn replay_does_not_overwrite_native_alias_hidden_by_null_primary() {
+        let base = request(json!([{"role":"user","parts":[{"text":"lookup"}]}]));
+        let output = response(json!({"role":"model","parts":[{
+            "functionCall":{"id":"call-1","name":"lookup","args":{}},
+            "thoughtSignature":SIG_A
+        }]}));
+        let chain = capture_response(&base, &output, None).unwrap();
+        let continuation = request(json!([
+            {"role":"user","parts":[{"text":"lookup"}]},
+            {"role":"model","parts":[{
+                "functionCall":{"id":"call-1","name":"lookup","args":{}},
+                "thoughtSignature":null,
+                "extra_content":{"google":{"thought_signature":SIG_B}}
+            }]},
+            {"role":"user","parts":[{"functionResponse":{
+                "id":"call-1","name":"lookup","response":{"ok":true}
+            }}]}
+        ]));
+        let replayed = apply_replay(&continuation, &chain);
+        assert!(!replayed.applied);
+        assert_eq!(replayed.body.as_ref(), continuation.as_ref());
+    }
+
+    #[test]
+    fn opaque_caqs_replay_requires_exact_multi_image_context() {
+        // The double-encoded form is an opaque vendor signature, not something
+        // this server decodes or synthesizes for a different conversation.
+        const DOUBLE_ENCODED_CAQS: &str =
+            "Q0FRU3d5QUtFQWdSR0FJNEFVSUlkR2hwbmttY1NmbDJ6eFQrdG5ZS09HWFZXQm9N";
+        let base = request(json!([{"role":"user","parts":[
+            {"text":"compare"},
+            {"inlineData":{"mimeType":"image/png","data":"AA=="}},
+            {"inlineData":{"mimeType":"image/jpeg","data":"/9j/"}}
+        ]}]));
+        let output = response(json!({"role":"model","parts":[
+            {"functionCall":{"id":"image-call","name":"inspect","args":{}},
+             "thoughtSignature": DOUBLE_ENCODED_CAQS}
+        ]}));
+        let chain = capture_response(&base, &output, None).unwrap();
+        let continuation = request(json!([
+            {"role":"user","parts":[
+                {"text":"compare"},
+                {"inlineData":{"mimeType":"image/png","data":"AA=="}},
+                {"inlineData":{"mimeType":"image/jpeg","data":"/9j/"}}
+            ]},
+            {"role":"user","parts":[{"functionResponse":{
+                "id":"image-call","name":"inspect","response":{"ok":true}
+            }}]}
+        ]));
+        let replayed = apply_replay(&continuation, &chain);
+        assert!(replayed.applied);
+        let value: Value = serde_json::from_slice(&replayed.body).unwrap();
+        assert_eq!(
+            value.pointer("/request/contents/1/parts/0/thoughtSignature"),
+            Some(&json!(DOUBLE_ENCODED_CAQS))
+        );
+
+        let swapped = request(json!([
+            {"role":"user","parts":[
+                {"text":"compare"},
+                {"inlineData":{"mimeType":"image/jpeg","data":"/9j/"}},
+                {"inlineData":{"mimeType":"image/png","data":"AA=="}}
+            ]},
+            {"role":"user","parts":[{"functionResponse":{
+                "id":"image-call","name":"inspect","response":{"ok":true}
+            }}]}
+        ]));
+        let rejected = apply_replay(&swapped, &chain);
+        assert!(!rejected.applied);
+        assert!(rejected.context_mismatch);
+    }
+
+    #[test]
     fn patches_existing_unsigned_call_and_rejects_edited_history() {
         let base = request(json!([{"role":"user","parts":[{"text":"original"}]}]));
         let output = response(json!({
@@ -1505,6 +1737,66 @@ mod tests {
         let rejected = apply_replay(&edited, &chain);
         assert!(!rejected.applied);
         assert!(rejected.context_mismatch);
+    }
+
+    #[test]
+    fn reused_call_id_with_changed_semantics_never_receives_cached_signature() {
+        let base = request(json!([{"role":"user","parts":[{"text":"run"}]}]));
+        let output = response(json!({
+            "role":"model","parts":[{
+                "functionCall":{"id":"reused-id","name":"run_command","args":{"command":"old"}},
+                "thoughtSignature":SIG_A
+            }]
+        }));
+        let chain = capture_response(&base, &output, None).unwrap();
+        for (name, args) in [
+            ("run_command", json!({"command":"new"})),
+            ("other_command", json!({"command":"old"})),
+        ] {
+            let continuation = request(json!([
+                {"role":"user","parts":[{"text":"run"}]},
+                {"role":"model","parts":[
+                    {"functionCall":{"id":"reused-id","name":name,"args":args}},
+                    {"functionCall":{"id":"other-id","name":"run_command","args":{"command":"old"}}}
+                ]},
+                {"role":"user","parts":[
+                    {"functionResponse":{"id":"reused-id","name":name,"response":{"result":"one"}}},
+                    {"functionResponse":{"id":"other-id","name":"run_command","response":{"result":"two"}}}
+                ]}
+            ]));
+            let replayed = apply_replay(&continuation, &chain);
+            assert!(
+                !replayed.applied,
+                "changed call {name} must not reuse the signature"
+            );
+            assert_eq!(replayed.body, continuation);
+        }
+    }
+
+    #[test]
+    fn reused_response_id_with_changed_name_never_replays_cached_call() {
+        let base = request(json!([{"role":"user","parts":[{"text":"run"}]}]));
+        let output = response(json!({
+            "role":"model","parts":[{
+                "functionCall":{"id":"reused-id","name":"read_file","args":{"path":"a"}},
+                "thoughtSignature":SIG_A
+            }]
+        }));
+        let chain = capture_response(&base, &output, None).unwrap();
+        for (id, name) in [("reused-id", "write_file"), ("other-id", "read_file")] {
+            let continuation = request(json!([
+                {"role":"user","parts":[{"text":"run"}]},
+                {"role":"user","parts":[{"functionResponse":{
+                    "id":id,"name":name,"response":{"ok":true}
+                }}]}
+            ]));
+            let replayed = apply_replay(&continuation, &chain);
+            assert!(
+                !replayed.applied,
+                "changed result {id}/{name} must not replay"
+            );
+            assert_eq!(replayed.body, continuation);
+        }
     }
 
     #[test]
@@ -1619,6 +1911,201 @@ mod tests {
         }
         assert!(accumulator.is_complete());
         assert!(accumulator.finish(&base, None).is_some());
+    }
+
+    #[test]
+    fn stream_replay_preserves_signed_text_segment_boundaries() {
+        let base = request(json!([{"role":"user","parts":[{"text":"start"}]}]));
+        for (second, expected_second_signature) in [
+            (json!({"text":"unsigned"}), None),
+            (
+                json!({"text":"second","thoughtSignature":SIG_B}),
+                Some(SIG_B),
+            ),
+        ] {
+            let mut accumulator = AntigravityReplayStreamAccumulator::default();
+            for event in [
+                json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"signed","thoughtSignature":SIG_A}]}}]}}),
+                json!({"response":{"candidates":[{"content":{"role":"model","parts":[second.clone()]},"finishReason":"STOP"}]}}),
+            ] {
+                accumulator.push(format!("data: {event}\n\n").as_bytes());
+            }
+            let chain = accumulator.finish(&base, None).unwrap();
+            let continuation = request(json!([
+                {"role":"user","parts":[{"text":"start"}]},
+                {"role":"model","parts":[{"text":"signed"}, {"text":second["text"]}]},
+                {"role":"user","parts":[{"text":"next"}]}
+            ]));
+            let replayed = apply_replay(&continuation, &chain);
+            assert!(replayed.applied, "second={second}");
+            let body: Value = serde_json::from_slice(&replayed.body).unwrap();
+            assert_eq!(
+                body.pointer("/request/contents/1/parts/0/thoughtSignature"),
+                Some(&json!(SIG_A))
+            );
+            assert_eq!(
+                body.pointer("/request/contents/1/parts/1/thoughtSignature")
+                    .cloned(),
+                expected_second_signature.map(|signature| json!(signature))
+            );
+        }
+    }
+
+    #[test]
+    fn stream_replay_merges_unsigned_text_prefix_with_final_signature() {
+        let base = request(json!([{"role":"user","parts":[{"text":"start"}]}]));
+        let mut accumulator = AntigravityReplayStreamAccumulator::default();
+        for event in [
+            json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"pre"}]}}]}}),
+            json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"fix","thoughtSignature":SIG_A}]},"finishReason":"STOP"}]}}),
+        ] {
+            accumulator.push(format!("data: {event}\n\n").as_bytes());
+        }
+        let chain = accumulator.finish(&base, None).unwrap();
+        let continuation = request(json!([
+            {"role":"user","parts":[{"text":"start"}]},
+            {"role":"model","parts":[{"text":"prefix"}]},
+            {"role":"user","parts":[{"text":"next"}]}
+        ]));
+        let replayed = apply_replay(&continuation, &chain);
+        assert!(replayed.applied);
+        let body: Value = serde_json::from_slice(&replayed.body).unwrap();
+        assert_eq!(
+            body.pointer("/request/contents/1/parts/0/thoughtSignature"),
+            Some(&json!(SIG_A))
+        );
+    }
+
+    #[test]
+    fn stream_replay_does_not_capture_signed_business_after_terminal() {
+        let base = request(json!([{"role":"user","parts":[{"text":"hi"}]}]));
+        let before = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"first\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_A}\"}}]}}}}]}}}}\n\n"
+        );
+        let terminal = "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}]}}\n\n";
+        let after = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"late\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_B}\"}}]}}}}]}}}}\n\n"
+        );
+        let stream = format!("{before}{terminal}{after}");
+        for split in [0, before.len(), before.len() + terminal.len(), stream.len()] {
+            let mut accumulator = AntigravityReplayStreamAccumulator::default();
+            accumulator.push(&stream.as_bytes()[..split]);
+            accumulator.push(&stream.as_bytes()[split..]);
+            let chain = accumulator.finish(&base, None).unwrap();
+            let signatures = chain.turns[0]
+                .items
+                .iter()
+                .filter_map(ReplayItem::signature)
+                .collect::<Vec<_>>();
+            assert_eq!(signatures, vec![SIG_A], "split={split}");
+        }
+    }
+
+    #[test]
+    fn replay_history_keeps_nested_business_fields_in_context_fingerprint() {
+        let history = json!([
+            {"role":"user","parts":[{"text":"run"}]},
+            {"role":"model","parts":[{"functionCall":{"id":"call-a","name":"lookup","args":{}}}]},
+            {"role":"user","parts":[{"functionResponse":{
+                "id":"call-a","name":"lookup",
+                "response":{"result":{"thoughtSignature":"business-one","cache_control":"value-one"}}
+            }}]}
+        ]);
+        let seed = request(history.clone());
+        let chain = capture_response(
+            &seed,
+            &response(json!({"role":"model","parts":[{"text":"answer","thoughtSignature":SIG_A}]})),
+            None,
+        )
+        .unwrap();
+        let mut continuation_history = history.as_array().unwrap().clone();
+        continuation_history.push(json!({"role":"model","parts":[{"text":"answer"}]}));
+        let matching = request(Value::Array(continuation_history.clone()));
+        assert!(apply_replay(&matching, &chain).applied);
+
+        continuation_history[1]["parts"][0]["thoughtSignature"] = json!(SIG_B);
+        continuation_history[1]["parts"][0]["cache_control"] = json!({"type":"ephemeral"});
+        continuation_history[1]["parts"][0]["extra_content"]["google"]["thought_signature"] =
+            json!(SIG_B);
+        let metadata_only = request(Value::Array(continuation_history.clone()));
+        assert!(apply_replay(&metadata_only, &chain).applied);
+
+        for (field, value) in [
+            ("thoughtSignature", "business-two"),
+            ("cache_control", "value-two"),
+        ] {
+            let mut changed = continuation_history.clone();
+            changed[2]["parts"][0]["functionResponse"]["response"]["result"][field] = json!(value);
+            let result = apply_replay(&request(Value::Array(changed)), &chain);
+            assert!(!result.applied, "nested business field {field} changed");
+            assert!(
+                result.context_mismatch,
+                "nested business field {field} changed"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_function_call_args_keep_signature_named_business_fields() {
+        let seed = request(json!([{"role":"user","parts":[{"text":"run"}]}]));
+        let chain = capture_response(
+            &seed,
+            &response(json!({"role":"model","parts":[{
+                "functionCall":{"name":"lookup","args":{"thought_signature":"business-one"}},
+                "thoughtSignature":SIG_A
+            }]})),
+            None,
+        )
+        .unwrap();
+        let continuation = |argument: &str| {
+            request(json!([
+                {"role":"user","parts":[{"text":"run"}]},
+                {"role":"model","parts":[{
+                    "functionCall":{"name":"lookup","args":{"thought_signature":argument}}
+                }]}
+            ]))
+        };
+        assert!(apply_replay(&continuation("business-one"), &chain).applied);
+        assert!(!apply_replay(&continuation("business-two"), &chain).applied);
+    }
+
+    #[test]
+    fn mixed_sse_event_delimiters_preserve_signed_content_before_terminal() {
+        let base = request(json!([{"role":"user","parts":[{"text":"hi"}]}]));
+        let mut accumulator = AntigravityReplayStreamAccumulator::default();
+        let wire = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_A}\"}}]}}}}]}}}}\n\ndata: {{\"response\":{{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}}}\r\n\r\n"
+        );
+        accumulator.push(wire.as_bytes());
+        assert!(accumulator.is_complete());
+        assert!(accumulator.finish(&base, None).is_some());
+    }
+
+    #[test]
+    fn cr_and_mixed_sse_empty_lines_preserve_signed_replay() {
+        let base = request(json!([{"role":"user","parts":[{"text":"hi"}]}]));
+        let wire = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_A}\"}}]}}}}]}}}}\r\rdata: {{\"response\":{{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}}}\n\r\n"
+        );
+        for split in 0..=wire.len() {
+            let mut accumulator = AntigravityReplayStreamAccumulator::default();
+            accumulator.push(&wire.as_bytes()[..split]);
+            accumulator.push(&wire.as_bytes()[split..]);
+            assert!(accumulator.is_complete(), "split={split}");
+            assert!(accumulator.finish(&base, None).is_some(), "split={split}");
+        }
+    }
+
+    #[test]
+    fn disconnected_nonterminal_signed_stream_does_not_seed_replay() {
+        let base = request(json!([{"role":"user","parts":[{"text":"hi"}]}]));
+        let mut accumulator = AntigravityReplayStreamAccumulator::default();
+        let wire = format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\"args\":{{}}}},\"thoughtSignature\":\"{SIG_A}\"}}]}}}}]}}}}\n\n"
+        );
+        accumulator.push(wire.as_bytes());
+        assert!(!accumulator.is_complete());
+        assert!(accumulator.finish(&base, None).is_none());
     }
 
     #[test]

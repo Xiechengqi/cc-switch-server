@@ -2606,7 +2606,29 @@ impl GeminiOpenAiState {
         }
     }
 
-    fn relay(&mut self, anthropic: Vec<StreamFrame>) -> Vec<StreamFrame> {
+    fn relay(&mut self, mut anthropic: Vec<StreamFrame>) -> Vec<StreamFrame> {
+        let thought_tokens = self
+            .source
+            .usage
+            .get("thoughtsTokenCount")
+            .or_else(|| self.source.usage.get("thoughts_token_count"))
+            .and_then(Value::as_u64);
+        if let Some(thought_tokens) = thought_tokens {
+            for frame in &mut anthropic {
+                if frame.event != Some("message_delta") {
+                    continue;
+                }
+                let transforms::StreamPayload::Json(value) = &mut frame.payload else {
+                    continue;
+                };
+                if let Some(usage) = value.get_mut("usage").and_then(Value::as_object_mut) {
+                    usage.insert(
+                        "output_tokens_details".to_string(),
+                        json!({"reasoning_tokens": thought_tokens}),
+                    );
+                }
+            }
+        }
         match &mut self.target {
             GeminiOpenAiTarget::Responses(responses) => {
                 relay_json_frames(anthropic, |event| responses.transform(event))
@@ -6134,12 +6156,9 @@ impl AnthropicResponsesState {
             self.completed = true;
             return frames;
         }
-        let incomplete_reason = match self.stop_reason.as_deref() {
-            Some("refusal") => Some("content_filter"),
-            Some("max_tokens" | "model_context_window_exceeded") => Some("max_output_tokens"),
-            _ => None,
-        };
-        let incomplete = incomplete_reason.is_some();
+        let incomplete_details =
+            transforms::anthropic_responses_incomplete_details(self.stop_reason.as_deref());
+        let incomplete = incomplete_details.is_some();
         let status = if incomplete {
             "incomplete"
         } else {
@@ -6148,8 +6167,8 @@ impl AnthropicResponsesState {
         let mut response = self.response_snapshot(status);
         response["output"] = output;
         response["usage"] = usage;
-        if let Some(reason) = incomplete_reason {
-            response["incomplete_details"] = json!({"reason": reason});
+        if let Some(details) = incomplete_details {
+            response["incomplete_details"] = details;
         }
         frames.push(StreamFrame::json(json!({
             "type": if incomplete {"response.incomplete"} else {"response.completed"},
@@ -7066,6 +7085,10 @@ mod tests {
             .unwrap();
         assert_eq!(terminal["response"]["usage"]["input_tokens"], 8);
         assert_eq!(terminal["response"]["usage"]["output_tokens"], 5);
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            2
+        );
         assert_eq!(done_frame_count(&responses), 1);
 
         let chat = gemini_openai_fixture(GeminiOpenAiState::chat(
@@ -7127,6 +7150,10 @@ mod tests {
             .unwrap();
         assert_eq!(usage["usage"]["prompt_tokens"], 8);
         assert_eq!(usage["usage"]["completion_tokens"], 5);
+        assert_eq!(
+            usage["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
         assert_eq!(done_frame_count(&chat), 1);
     }
 
@@ -9456,6 +9483,56 @@ mod tests {
             incomplete.payload_json()["response"]["incomplete_details"]["reason"],
             "content_filter"
         );
+    }
+
+    #[test]
+    fn anthropic_pause_turn_stream_is_incomplete_once_without_token_limit_details() {
+        let mut state = AnthropicResponsesState::default();
+        state.transform(&json!({
+            "type": "message_start",
+            "message": {"id": "msg_pause", "model": "claude-sonnet-4-6", "usage": {"input_tokens": 7}}
+        }));
+        state.transform(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "Searching"}
+        }));
+        state.transform(&json!({"type": "content_block_stop", "index": 0}));
+        state.transform(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "pause_turn"},
+            "usage": {"output_tokens": 3}
+        }));
+        let frames = state.transform(&json!({"type": "message_stop"}));
+        let terminals = frames
+            .iter()
+            .filter_map(|frame| match &frame.payload {
+                transforms::StreamPayload::Json(payload)
+                    if matches!(
+                        payload["type"].as_str(),
+                        Some("response.incomplete" | "response.completed")
+                    ) =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        let terminal = terminals[0];
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert!(terminal["response"]["incomplete_details"].is_null());
+        assert_eq!(terminal["response"]["usage"]["input_tokens"], 7);
+        assert_eq!(terminal["response"]["usage"]["output_tokens"], 3);
+        assert!(!state
+            .transform(&json!({"type": "message_stop"}))
+            .iter()
+            .any(|frame| matches!(
+                &frame.payload,
+                transforms::StreamPayload::Json(payload)
+                    if matches!(payload["type"].as_str(), Some("response.incomplete" | "response.completed"))
+            )));
     }
 
     #[test]

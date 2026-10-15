@@ -991,5 +991,23 @@
       {"rail": "agy_oauth", "status": "live_pending", "receipt": null}
     ],
     "compaction": {"status": "live_pending", "runtimeEnabled": false, "receipt": null}
-  }
+  },
+  "realAcceptanceExtensions": [
+    {
+      "id": "AG-LIVE-V2-2026-10-08",
+      "receiptSchemaVersion": 2,
+      "harnessRevision": 2,
+      "scopeDigestDomain": "cc-switch-server:antigravity-real-scope:v2",
+      "catalogDigestDomainPattern": "cc-switch-server:antigravity-{app}-catalog:v2",
+      "catalogMaxAgeMs": 7200000,
+      "receiptMaxAgeMs": 86400000,
+      "clockSkewMs": 300000,
+      "catalogSnapshotFields": ["app", "model", "source", "stale", "fetchedAtMs", "digest"],
+      "rails": [
+        {"rail": "antigravity_oauth", "status": "live_pending", "receipt": null},
+        {"rail": "agy_oauth", "status": "live_pending", "receipt": null}
+      ],
+      "compactionAutoEnable": false
+    }
+  ]
 }

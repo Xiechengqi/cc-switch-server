@@ -20,6 +20,7 @@ const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 2_000;
 const MAX_ITEMS: usize = 200;
 const MAX_RESPONSE_ID_LEN: usize = 512;
+const MAX_CONVERSATION_ID_LEN: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CursorResponseScope(String);
@@ -205,7 +206,11 @@ impl CursorCompletedResponseStore {
         let Some(key) = cache_key(&scope, response_id) else {
             return false;
         };
-        if conversation_id.trim().is_empty() || items.is_empty() || items.len() > MAX_ITEMS {
+        if conversation_id.trim().is_empty()
+            || conversation_id.len() > MAX_CONVERSATION_ID_LEN
+            || items.is_empty()
+            || items.len() > MAX_ITEMS
+        {
             return false;
         }
         if local_task_state.origin_turn_digest.len() > 128 {
@@ -213,8 +218,12 @@ impl CursorCompletedResponseStore {
         }
         let Some(bytes) = encoded_size(&items).and_then(|bytes| {
             bytes
-                .checked_add(local_task_state.origin_turn_digest.len())
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CursorLocalTaskState>()))
+                .checked_add(key.response_id.len())
+                .and_then(|bytes| bytes.checked_add(key.scope.0.len()))
+                .and_then(|bytes| bytes.checked_add(conversation_id.len()))
+                .and_then(|bytes| bytes.checked_add(local_task_state.origin_turn_digest.len()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Key>()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Entry>()))
         }) else {
             return false;
         };
@@ -263,8 +272,10 @@ impl CursorCompletedResponseStore {
 }
 
 fn cache_key(scope: &CursorResponseScope, response_id: &str) -> Option<Key> {
-    let response_id = response_id.trim();
-    if response_id.is_empty() || response_id.len() > MAX_RESPONSE_ID_LEN {
+    if response_id.is_empty()
+        || response_id.len() > MAX_RESPONSE_ID_LEN
+        || response_id.trim() != response_id
+    {
         return None;
     }
     Some(Key {
@@ -342,6 +353,55 @@ mod tests {
     }
 
     #[test]
+    fn completed_response_ids_do_not_collapse_padding() {
+        let store = CursorCompletedResponseStore::default();
+        let scope = scope("generation-a");
+        let items = vec![json!({"type":"function_call","call_id":"call-a"})];
+        assert!(store.insert(
+            scope.clone(),
+            "resp-a",
+            "conversation-a",
+            items.clone(),
+            CursorLocalTaskState::default(),
+            1_000,
+        ));
+        for padded in [" resp-a", "resp-a ", "\tresp-a", "resp-a\n"] {
+            assert!(store.get(&scope, padded, 1_001).is_none());
+            assert!(!store.insert(
+                scope.clone(),
+                padded,
+                "conversation-b",
+                items.clone(),
+                CursorLocalTaskState::default(),
+                1_001,
+            ));
+        }
+        assert_eq!(
+            store.get(&scope, "resp-a", 1_002).unwrap().conversation_id,
+            "conversation-a"
+        );
+    }
+
+    #[test]
+    fn completed_response_budget_includes_key_and_conversation_identity() {
+        let store = CursorCompletedResponseStore::default();
+        let response_id = "r".repeat(MAX_RESPONSE_ID_LEN);
+        let conversation_id = "c".repeat(MAX_CONVERSATION_ID_LEN);
+        let items = vec![json!({"type":"message","content":"hi"})];
+        let item_bytes = encoded_size(&items).unwrap();
+        assert!(store.insert(
+            scope("generation-a"),
+            &response_id,
+            &conversation_id,
+            items,
+            CursorLocalTaskState::default(),
+            1_000,
+        ));
+        let inner = store.inner.lock().unwrap();
+        assert!(inner.total_bytes >= item_bytes + response_id.len() + conversation_id.len());
+    }
+
+    #[test]
     fn rejects_oversized_item_sets_and_invalid_identifiers() {
         let store = CursorCompletedResponseStore::default();
         assert!(!store.insert(
@@ -364,6 +424,14 @@ mod tests {
             scope("generation-a"),
             "resp-empty-conversation",
             " ",
+            vec![json!({"type":"message"})],
+            CursorLocalTaskState::default(),
+            1_000,
+        ));
+        assert!(!store.insert(
+            scope("generation-a"),
+            "resp-oversized-conversation",
+            &"c".repeat(MAX_RESPONSE_ID_LEN + 1),
             vec![json!({"type":"message"})],
             CursorLocalTaskState::default(),
             1_000,

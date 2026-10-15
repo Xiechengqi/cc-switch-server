@@ -10,6 +10,11 @@ use crate::domain::qoder::{QoderCosySession, QoderCredentialRail, QoderSite};
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
 const MAX_MODEL_KEY_BYTES: usize = 256;
+const MAX_RESPONSE_ALIASES: usize = 1024;
+const MAX_RESPONSE_ALIAS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_ALIAS_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_ALIAS_ID_BYTES: usize = 512;
+const RESPONSE_ALIAS_TTL_MS: i64 = 2 * 60 * 60 * 1000;
 const SESSION_EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
 pub const QODER_MODEL_CATALOG_TTL_MS: i64 = 60 * 60 * 1000;
 
@@ -60,18 +65,21 @@ impl QoderRuntimeScope {
         credential_rail: QoderCredentialRail,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
+        request_identity_fingerprint: &str,
     ) -> Result<Self, String> {
         let values = [
             app.trim(),
             provider_id.trim(),
             runtime_fingerprint.trim(),
             account_id.trim(),
+            request_identity_fingerprint.trim(),
         ];
         if values.iter().any(|value| value.is_empty()) {
             return Err("Qoder runtime scope contains an empty identity component".to_string());
         }
         Ok(Self(scoped_digest(
-            b"cc-switch-server:qoder-runtime:v1\0",
+            b"cc-switch-server:qoder-runtime:v2\0",
             [
                 values[0],
                 values[1],
@@ -82,8 +90,10 @@ impl QoderRuntimeScope {
                 credential_rail.as_str(),
                 &auth_identity_generation.to_string(),
                 &token_refresh_generation.to_string(),
+                &account_incarnation.to_string(),
+                values[4],
             ],
-            "qoder-runtime-v1",
+            "qoder-runtime-v2",
         )))
     }
 
@@ -183,6 +193,7 @@ pub struct PreparedQoderRuntime {
     pub account_id: String,
     pub auth_identity_generation: u64,
     pub token_refresh_generation: u64,
+    pub account_incarnation: u64,
 }
 
 impl PreparedQoderRuntime {
@@ -212,6 +223,10 @@ impl QoderModelCatalog {
             let Some(capability) = self.capabilities.get(model_key) else {
                 continue;
             };
+            if resolve_qoder_model_key(site, model_key).ok().as_deref() != Some(model_key.as_str())
+            {
+                continue;
+            }
             let public_ids = aliases
                 .iter()
                 .filter_map(|(alias, route)| (*route == model_key).then_some(*alias))
@@ -299,12 +314,130 @@ pub struct FetchedQoderModelCatalog {
     pub capabilities: BTreeMap<String, QoderModelCapability>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QoderResponseContinuation {
+    pub(crate) session_id: String,
+    pub(crate) downstream_model: String,
+    pub(crate) system_fingerprint: [u8; 32],
+    pub(crate) tools_fingerprint: [u8; 32],
+    pub(crate) tool_names: Vec<String>,
+    pub(crate) pending_tool_calls: Vec<Value>,
+}
+
+impl QoderResponseContinuation {
+    fn retained_bytes(&self) -> usize {
+        self.session_id
+            .capacity()
+            .saturating_add(self.downstream_model.capacity())
+            .saturating_add(self.system_fingerprint.len())
+            .saturating_add(self.tools_fingerprint.len())
+            .saturating_add(
+                self.tool_names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(self.tool_names.iter().map(String::capacity).sum::<usize>())
+            .saturating_add(
+                self.pending_tool_calls
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.pending_tool_calls
+                    .iter()
+                    .map(super::request_memory::retained_json_bytes)
+                    .sum::<usize>(),
+            )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QoderContinuationInput {
+    pub(crate) system_fingerprint: [u8; 32],
+    pub(crate) tools_fingerprint: [u8; 32],
+    pub(crate) tool_names: Vec<String>,
+    pub(crate) explicit_system: bool,
+    pub(crate) explicit_tools: bool,
+}
+
+pub(crate) fn qoder_continuation_input(body: &Value) -> Result<QoderContinuationInput, String> {
+    let request = body
+        .as_object()
+        .ok_or_else(|| "Qoder canonical Chat request must be an object".to_string())?;
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Qoder canonical Chat request must contain messages".to_string())?;
+    let mut system_parts = Vec::new();
+    for message in messages {
+        let message = message
+            .as_object()
+            .ok_or_else(|| "Qoder Chat message must be an object".to_string())?;
+        if matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        ) {
+            let text = chat_content_text(message.get("content"))?;
+            if !text.trim().is_empty() {
+                system_parts.push(text);
+            }
+        }
+    }
+    let system = system_parts.join("\n\n");
+    let tools = normalized_tools(request)?;
+    let mut tool_names = tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tool_names.sort();
+    tool_names.dedup();
+    let tools_json = serde_json::to_vec(&tools)
+        .map_err(|error| format!("encode Qoder tools fingerprint: {error}"))?;
+    Ok(QoderContinuationInput {
+        system_fingerprint: scoped_fingerprint(
+            b"cc-switch-server:qoder-system:v1\0",
+            system.as_bytes(),
+        ),
+        tools_fingerprint: scoped_fingerprint(b"cc-switch-server:qoder-tools:v1\0", &tools_json),
+        tool_names,
+        explicit_system: !system.is_empty(),
+        explicit_tools: request.contains_key("tools"),
+    })
+}
+
+fn scoped_fingerprint(domain: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+    hasher.finalize().into()
+}
+
+#[derive(Debug, Clone)]
+struct QoderResponseAlias {
+    scope: QoderRuntimeScope,
+    continuation: QoderResponseContinuation,
+    inserted_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+impl QoderResponseAlias {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.scope.0.capacity())
+            .saturating_add(self.continuation.retained_bytes())
+            .saturating_add(128)
+    }
+}
+
 #[derive(Default)]
 pub struct QoderRuntimeCache {
     sessions: RwLock<HashMap<QoderRuntimeScope, QoderCachedSession>>,
     session_flights: Mutex<HashMap<QoderRuntimeScope, Arc<Mutex<()>>>>,
     catalogs: RwLock<HashMap<QoderRuntimeScope, QoderModelCatalog>>,
     catalog_flights: Mutex<HashMap<QoderRuntimeScope, Arc<Mutex<()>>>>,
+    response_aliases: RwLock<HashMap<String, QoderResponseAlias>>,
 }
 
 impl std::fmt::Debug for QoderRuntimeCache {
@@ -400,11 +533,130 @@ impl QoderRuntimeCache {
     pub async fn invalidate_scope(&self, scope: &QoderRuntimeScope) {
         self.invalidate_session(scope).await;
         self.invalidate_catalog(scope).await;
+        self.response_aliases
+            .write()
+            .await
+            .retain(|_, alias| &alias.scope != scope);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn response_continuation(
+        &self,
+        scope: &QoderRuntimeScope,
+        share_id: &str,
+        user_namespace: &str,
+        model_key: &str,
+        response_id: &str,
+        now_ms: i64,
+    ) -> Option<QoderResponseContinuation> {
+        let key = response_alias_key(scope, share_id, user_namespace, model_key, response_id)?;
+        let mut aliases = self.response_aliases.write().await;
+        aliases.retain(|_, alias| alias.expires_at_ms > now_ms);
+        aliases.get(&key).map(|alias| alias.continuation.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_response_continuation(
+        &self,
+        scope: &QoderRuntimeScope,
+        share_id: &str,
+        user_namespace: &str,
+        model_key: &str,
+        response_id: &str,
+        now_ms: i64,
+    ) -> Option<QoderResponseContinuation> {
+        let key = response_alias_key(scope, share_id, user_namespace, model_key, response_id)?;
+        let mut aliases = self.response_aliases.write().await;
+        aliases.retain(|_, alias| alias.expires_at_ms > now_ms);
+        aliases.remove(&key).map(|alias| alias.continuation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn insert_response_alias(
+        &self,
+        scope: QoderRuntimeScope,
+        share_id: &str,
+        user_namespace: &str,
+        model_key: &str,
+        response_id: &str,
+        continuation: QoderResponseContinuation,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let key = response_alias_key(&scope, share_id, user_namespace, model_key, response_id)
+            .ok_or_else(|| "Qoder response alias identity is invalid".to_string())?;
+        if continuation.session_id.trim().is_empty()
+            || continuation.session_id.len() > 128
+            || continuation.downstream_model.is_empty()
+            || continuation.downstream_model.len() > 256
+            || continuation.tool_names.len() > 128
+            || continuation.pending_tool_calls.len() > 128
+            || continuation
+                .tool_names
+                .iter()
+                .any(|name| name.is_empty() || name.trim() != name || name.len() > 256)
+        {
+            return Err("Qoder response continuation exceeds identity limits".to_string());
+        }
+        let alias = QoderResponseAlias {
+            scope,
+            continuation,
+            inserted_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(RESPONSE_ALIAS_TTL_MS),
+        };
+        if alias.retained_bytes() > MAX_RESPONSE_ALIAS_ENTRY_BYTES {
+            return Err("Qoder response continuation exceeds entry limit".to_string());
+        }
+        let mut aliases = self.response_aliases.write().await;
+        aliases.retain(|_, value| value.expires_at_ms > now_ms);
+        if aliases.contains_key(&key) {
+            return Err("Qoder response identifier is already bound".to_string());
+        }
+        let mut retained_bytes = aliases
+            .values()
+            .map(QoderResponseAlias::retained_bytes)
+            .sum::<usize>();
+        while aliases.len() >= MAX_RESPONSE_ALIASES
+            || retained_bytes.saturating_add(alias.retained_bytes()) > MAX_RESPONSE_ALIAS_BYTES
+        {
+            let Some(oldest_key) = aliases
+                .iter()
+                .min_by_key(|(key, value)| (value.inserted_at_ms, *key))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = aliases.remove(&oldest_key) {
+                retained_bytes = retained_bytes.saturating_sub(removed.retained_bytes());
+            }
+        }
+        aliases.insert(key, alias);
+        Ok(())
     }
 
     pub async fn catalog_lock(&self, scope: &QoderRuntimeScope) -> OwnedMutexGuard<()> {
         flight_lock(&self.catalog_flights, scope).await
     }
+}
+
+fn response_alias_key(
+    scope: &QoderRuntimeScope,
+    share_id: &str,
+    user_namespace: &str,
+    model_key: &str,
+    response_id: &str,
+) -> Option<String> {
+    let values = [share_id, user_namespace, model_key, response_id];
+    if values.iter().any(|value| value.is_empty())
+        || response_id.len() > MAX_RESPONSE_ALIAS_ID_BYTES
+        || response_id.trim() != response_id
+    {
+        return None;
+    }
+    Some(scoped_digest(
+        b"cc-switch-server:qoder-response-alias:v1\0",
+        [scope.key(), values[0], values[1], values[2], values[3]],
+        "qoder-response",
+    ))
 }
 
 async fn flight_lock(
@@ -443,12 +695,16 @@ pub fn parse_qoder_model_catalog(
         let object = entry
             .as_object()
             .ok_or_else(|| format!("Qoder model catalog entry {index} must be an object"))?;
-        let key = object
+        let raw_key = object
             .get("key")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
             .ok_or_else(|| format!("Qoder model catalog entry {index} is missing a key"))?;
+        let key = raw_key.trim();
+        if key.is_empty() || key != raw_key {
+            return Err(format!(
+                "Qoder model catalog entry {index} has an invalid key"
+            ));
+        }
         if key.len() > MAX_MODEL_KEY_BYTES {
             return Err("Qoder model key exceeds the size limit".to_string());
         }
@@ -486,16 +742,16 @@ pub fn resolve_qoder_model_key(site: QoderSite, requested: &str) -> Result<Strin
         .trim()
         .strip_prefix("qoder/")
         .unwrap_or(requested.trim())
-        .trim()
-        .to_ascii_lowercase();
+        .trim();
     if requested.is_empty() {
         return Err("Qoder request model is empty".to_string());
     }
+    let alias_lookup = requested.to_ascii_lowercase();
     let aliases = qoder_model_aliases(site);
     Ok(aliases
         .iter()
-        .find_map(|(alias, key)| (*alias == requested).then_some(*key))
-        .unwrap_or(requested.as_str())
+        .find_map(|(alias, key)| (*alias == alias_lookup.as_str()).then_some(*key))
+        .unwrap_or(requested)
         .to_string())
 }
 
@@ -587,6 +843,29 @@ pub fn build_qoder_payload(
     user_type: &str,
     now_ms: i64,
 ) -> Result<PreparedQoderPayload, String> {
+    build_qoder_payload_with_continuation(
+        canonical_chat_request,
+        exact_model_config,
+        site,
+        model_key,
+        session_id,
+        user_type,
+        now_ms,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_qoder_payload_with_continuation(
+    canonical_chat_request: &Value,
+    exact_model_config: &Value,
+    site: QoderSite,
+    model_key: &str,
+    session_id: &str,
+    user_type: &str,
+    now_ms: i64,
+    continuation: Option<&QoderResponseContinuation>,
+) -> Result<PreparedQoderPayload, String> {
     let request = canonical_chat_request
         .as_object()
         .ok_or_else(|| "Qoder canonical Chat request must be an object".to_string())?;
@@ -611,7 +890,11 @@ pub fn build_qoder_payload(
     }
 
     let tools = normalized_tools(request)?;
-    let normalized_history = normalize_tool_history(request.get("messages"), &tools)?;
+    let normalized_history = if continuation.is_some() {
+        normalize_tool_history_with_continuation(request.get("messages"), &tools, continuation)?
+    } else {
+        normalize_tool_history(request.get("messages"), &tools)?
+    };
     let normalized_history = Value::Array(normalized_history);
     let (system, mut messages, last_user_text) =
         normalize_chat_messages(Some(&normalized_history))?;
@@ -716,21 +999,58 @@ pub fn build_qoder_payload(
 }
 
 fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<Value>, String> {
+    normalize_tool_history_with_continuation(value, tools, None)
+}
+
+fn normalize_tool_history_with_continuation(
+    value: Option<&Value>,
+    tools: &[Value],
+    continuation: Option<&QoderResponseContinuation>,
+) -> Result<Vec<Value>, String> {
     let messages = value
         .and_then(Value::as_array)
         .ok_or_else(|| "Qoder canonical Chat request must contain messages".to_string())?;
-    let defined_names = tools
+    let mut defined_names = tools
         .iter()
         .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .collect::<HashSet<_>>();
+    if let Some(continuation) = continuation {
+        defined_names.extend(continuation.tool_names.iter().map(String::as_str));
+    }
     let mut used_ids = HashSet::new();
     let mut batch_source_ids = HashMap::<String, Vec<String>>::new();
     let mut current_batch = Vec::<String>::new();
     let mut consumed = HashSet::<String>::new();
     let mut pending_results = Vec::<(usize, Value)>::new();
     let mut output = Vec::with_capacity(messages.len());
+    let mut pending_names = HashMap::<String, String>::new();
+    let mut matched_pending = HashSet::<String>::new();
+    if let Some(continuation) = continuation {
+        for call in &continuation.pending_tool_calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| "Qoder continuation tool call has no exact ID".to_string())?;
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| "Qoder continuation tool call has no name".to_string())?;
+            if !defined_names.contains(name)
+                || pending_names
+                    .insert(id.to_string(), name.to_string())
+                    .is_some()
+            {
+                return Err("Qoder continuation tool call identity is ambiguous".to_string());
+            }
+            used_ids.insert(id.to_string());
+            current_batch.push(id.to_string());
+            batch_source_ids.insert(id.to_string(), vec![id.to_string()]);
+        }
+    }
 
     fn flush_results(output: &mut Vec<Value>, pending: &mut Vec<(usize, Value)>) {
         pending.sort_by_key(|(order, _)| *order);
@@ -776,7 +1096,7 @@ fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<
                     let source_id = call
                         .get("id")
                         .and_then(Value::as_str)
-                        .map(str::trim)
+                        .filter(|id| !id.trim().is_empty())
                         .unwrap_or_default();
                     let mut id = source_id.to_string();
                     if id.is_empty() || used_ids.contains(&id) {
@@ -832,7 +1152,7 @@ fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<
             let requested = object
                 .get("tool_call_id")
                 .and_then(Value::as_str)
-                .map(str::trim)
+                .filter(|id| !id.trim().is_empty())
                 .unwrap_or_default();
             let normalized_id = if requested.is_empty() {
                 let mut available = current_batch.iter().filter(|id| !consumed.contains(*id));
@@ -858,6 +1178,9 @@ fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<
                     .unwrap_or_default()
             };
             if normalized_id.is_empty() || consumed.contains(normalized_id) {
+                if continuation.is_some() {
+                    return Err("Qoder continuation tool result has no matching call".to_string());
+                }
                 crate::metrics::record_qoder_compatibility("orphan_tool_result_dropped");
                 continue;
             }
@@ -866,7 +1189,22 @@ fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<
                 continue;
             };
             consumed.insert(normalized_id.to_string());
+            if pending_names.contains_key(normalized_id) {
+                matched_pending.insert(normalized_id.to_string());
+            }
             let mut normalized = object.clone();
+            if let Some(name) = pending_names.get(normalized_id) {
+                if normalized
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|declared| declared != name)
+                {
+                    return Err(
+                        "Qoder continuation tool result name conflicts with its call".to_string(),
+                    );
+                }
+                normalized.insert("name".to_string(), Value::String(name.clone()));
+            }
             normalized.insert(
                 "tool_call_id".to_string(),
                 Value::String(normalized_id.to_string()),
@@ -881,6 +1219,9 @@ fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<
         output.push(message.clone());
     }
     flush_results(&mut output, &mut pending_results);
+    if continuation.is_some() && pending_names.keys().any(|id| !matched_pending.contains(id)) {
+        return Err("Qoder continuation is missing a pending tool result".to_string());
+    }
     Ok(output)
 }
 
@@ -924,8 +1265,7 @@ fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>,
                 let call_id = object
                     .get("tool_call_id")
                     .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                    .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| "Qoder tool message is missing tool_call_id".to_string())?;
                 let mut message =
                     qoder_message("tool", empty_placeholder(&text), None, Some(call_id));
@@ -1062,8 +1402,7 @@ fn normalized_tool_calls(value: Option<&Value>) -> Result<Vec<Value>, String> {
         let id = object
             .get("id")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| "Qoder tool call is missing id".to_string())?;
         let function = object
             .get("function")
@@ -1097,18 +1436,27 @@ fn normalized_tools(request: &Map<String, Value>) -> Result<Vec<Value>, String> 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if request.get("tool_choice").and_then(Value::as_str) == Some("none") {
+    let choice = match request.get("tool_choice") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(mode)) => Some((mode.as_str(), None)),
+        Some(Value::Object(object)) => {
+            let mode = object
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Qoder tool_choice requires a type".to_string())?;
+            let name = object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str);
+            Some((mode, name))
+        }
+        Some(_) => return Err("Qoder tool_choice must be a string or object".to_string()),
+    };
+    if choice.is_some_and(|(mode, _)| mode == "none") {
         return Ok(Vec::new());
     }
-    let selected_name = request
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("function"))
-        .and_then(Value::as_object)
-        .and_then(|function| function.get("name"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
     for tool in &tools {
         let function = tool
             .get("function")
@@ -1123,19 +1471,25 @@ fn normalized_tools(request: &Map<String, Value>) -> Result<Vec<Value>, String> 
             return Err("Qoder tool function is missing name".to_string());
         }
     }
-    if let Some(selected_name) = selected_name {
-        let selected = tools
-            .iter()
-            .filter(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some(selected_name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !selected.is_empty() {
-            tools = selected;
+    match choice {
+        None | Some(("auto", _)) => Ok(tools),
+        Some(("required", _)) if !tools.is_empty() => Ok(tools),
+        Some(("required", _)) => Err("Qoder required tool_choice has no tools".to_string()),
+        Some(("function", name)) => {
+            let name = name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "Qoder function tool_choice requires a name".to_string())?;
+            tools.retain(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some(name)
+            });
+            if tools.is_empty() {
+                return Err("Qoder tool_choice references an undeclared tool".to_string());
+            }
+            Ok(tools)
         }
+        Some(_) => Err("Qoder tool_choice type is unsupported".to_string()),
     }
-    Ok(tools)
 }
 
 fn qoder_max_tokens(request: &Map<String, Value>, config: &Map<String, Value>) -> u64 {
@@ -1361,8 +1715,198 @@ mod tests {
             rail,
             7,
             token_generation,
+            11,
+            "request-a",
         )
         .unwrap()
+    }
+
+    fn continuation(session_id: &str) -> QoderResponseContinuation {
+        QoderResponseContinuation {
+            session_id: session_id.to_string(),
+            downstream_model: "auto".to_string(),
+            system_fingerprint: [7; 32],
+            tools_fingerprint: [8; 32],
+            tool_names: vec!["lookup".to_string()],
+            pending_tool_calls: vec![json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            })],
+        }
+    }
+
+    #[tokio::test]
+    async fn response_alias_is_exact_scoped_bounded_and_expiring() {
+        let cache = QoderRuntimeCache::default();
+        let bound = scope(4, QoderSite::Global, QoderCredentialRail::GlobalOauth);
+        let first = continuation("session-a");
+        cache
+            .insert_response_alias(
+                bound.clone(),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+                first.clone(),
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cache
+                .response_continuation(&bound, "share-a", "user-a", "auto", "resp_a", 1_001)
+                .await,
+            Some(first.clone())
+        );
+        for (scope, share, user, model, id) in [
+            (bound.clone(), "share-b", "user-a", "auto", "resp_a"),
+            (bound.clone(), "share-a", "user-b", "auto", "resp_a"),
+            (bound.clone(), "share-a", "user-a", "other", "resp_a"),
+            (bound.clone(), "share-a", "user-a", "auto", " resp_a"),
+            (bound.clone(), "share-a", "user-a", "auto", "resp_a "),
+            (
+                scope(5, QoderSite::Global, QoderCredentialRail::GlobalOauth),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+            ),
+            (
+                scope(4, QoderSite::Cn, QoderCredentialRail::CnOauth),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+            ),
+            (
+                scope(4, QoderSite::Global, QoderCredentialRail::PatJobToken),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+            ),
+        ] {
+            assert!(cache
+                .response_continuation(&scope, share, user, model, id, 1_001)
+                .await
+                .is_none());
+        }
+        assert!(cache
+            .insert_response_alias(
+                bound.clone(),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+                continuation("session-b"),
+                1_002,
+            )
+            .await
+            .is_err());
+        assert!(cache
+            .response_continuation(
+                &bound,
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_a",
+                1_000 + RESPONSE_ALIAS_TTL_MS,
+            )
+            .await
+            .is_none());
+
+        let mut oversized = continuation("session-a");
+        oversized.pending_tool_calls = vec![json!({"arguments": "x".repeat(65 * 1024)})];
+        assert!(cache
+            .insert_response_alias(
+                bound,
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_large",
+                oversized,
+                2_000,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn response_alias_evicts_oldest_and_invalidates_bound_scope() {
+        let cache = QoderRuntimeCache::default();
+        let bound = scope(4, QoderSite::Global, QoderCredentialRail::GlobalOauth);
+        for index in 0..=MAX_RESPONSE_ALIASES {
+            cache
+                .insert_response_alias(
+                    bound.clone(),
+                    "share-a",
+                    "user-a",
+                    "auto",
+                    &format!("resp_{index}"),
+                    continuation("session-a"),
+                    index as i64,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(cache
+            .response_continuation(&bound, "share-a", "user-a", "auto", "resp_0", 1_025)
+            .await
+            .is_none());
+        assert!(cache
+            .response_continuation(&bound, "share-a", "user-a", "auto", "resp_1", 1_025)
+            .await
+            .is_some());
+        cache.invalidate_scope(&bound).await;
+        assert!(cache
+            .response_continuation(&bound, "share-a", "user-a", "auto", "resp_1", 1_025)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn response_alias_claim_allows_only_one_concurrent_continuation() {
+        let cache = QoderRuntimeCache::default();
+        let bound = scope(4, QoderSite::Global, QoderCredentialRail::GlobalOauth);
+        cache
+            .insert_response_alias(
+                bound.clone(),
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_once",
+                continuation("session-a"),
+                1_000,
+            )
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            cache.claim_response_continuation(
+                &bound,
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_once",
+                1_001
+            ),
+            cache.claim_response_continuation(
+                &bound,
+                "share-a",
+                "user-a",
+                "auto",
+                "resp_once",
+                1_001
+            )
+        );
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+        assert!(cache
+            .response_continuation(&bound, "share-a", "user-a", "auto", "resp_once", 1_001)
+            .await
+            .is_none());
     }
 
     fn session() -> QoderCosySession {
@@ -1411,6 +1955,68 @@ mod tests {
         assert!(cache.session(&rotated, 2_000).await.is_none());
         assert!(cache.session(&pat, 2_000).await.is_none());
         assert!(cache.session(&cn, 2_000).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_fences_same_generation_credential_and_account_recreation() {
+        let cache = QoderRuntimeCache::default();
+        let original = scope(4, QoderSite::Global, QoderCredentialRail::GlobalOauth);
+        let changed_credential = QoderRuntimeScope::derive(
+            "claude",
+            "provider-a",
+            3,
+            "runtime-a",
+            "account-a",
+            QoderSite::Global,
+            QoderCredentialRail::GlobalOauth,
+            7,
+            4,
+            11,
+            "request-b",
+        )
+        .unwrap();
+        let recreated = QoderRuntimeScope::derive(
+            "claude",
+            "provider-a",
+            3,
+            "runtime-a",
+            "account-a",
+            QoderSite::Global,
+            QoderCredentialRail::GlobalOauth,
+            7,
+            4,
+            12,
+            "request-a",
+        )
+        .unwrap();
+        cache
+            .insert_session(
+                original.clone(),
+                QoderCachedSession::new(
+                    session(),
+                    "https://api1.qoder.sh".to_string(),
+                    None,
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .await;
+        cache
+            .insert_catalog(
+                original.clone(),
+                FetchedQoderModelCatalog {
+                    enabled_models: vec!["auto".to_string()],
+                    raw_configs: BTreeMap::new(),
+                    capabilities: BTreeMap::new(),
+                },
+                1_000,
+            )
+            .await;
+        for changed in [&changed_credential, &recreated] {
+            assert_ne!(changed, &original);
+            assert!(cache.session(changed, 2_000).await.is_none());
+            assert!(cache.catalog(changed, 2_000).await.is_none());
+        }
     }
 
     #[tokio::test]
@@ -1493,6 +2099,28 @@ mod tests {
             resolve_qoder_model_key(QoderSite::Global, "future-route").unwrap(),
             "future-route"
         );
+        assert_eq!(
+            resolve_qoder_model_key(QoderSite::Global, "Future-Route").unwrap(),
+            "Future-Route"
+        );
+    }
+
+    #[test]
+    fn catalog_key_must_match_the_exact_model_config_key() {
+        for key in [" leading", "trailing ", "\tindented"] {
+            assert!(parse_qoder_model_catalog(
+                &json!({"chat": [{"key": key, "enable": true}]}),
+                QoderSite::Global,
+            )
+            .is_err());
+        }
+        let fetched = parse_qoder_model_catalog(
+            &json!({"chat": [{"key": "Future-Route", "enable": true}]}),
+            QoderSite::Global,
+        )
+        .unwrap();
+        assert_eq!(fetched.enabled_models, ["Future-Route"]);
+        assert!(fetched.raw_configs.contains_key("Future-Route"));
     }
 
     #[test]
@@ -1547,6 +2175,74 @@ mod tests {
             1_000_000
         );
         assert_eq!(prepared.body["stream"], true);
+    }
+
+    #[test]
+    fn forced_tool_choice_cannot_expose_other_tools_when_name_is_missing() {
+        let request = json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"run"}],
+            "tools":[
+                {"type":"function","function":{"name":"read","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"write","parameters":{"type":"object"}}}
+            ],
+            "tool_choice":{"type":"function","function":{"name":"missing"}}
+        });
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            assert!(
+                build_qoder_payload(
+                    &request,
+                    &json!({"key":"auto","enable":true}),
+                    site,
+                    "auto",
+                    "session-a",
+                    "personal_standard",
+                    1_700_000_000_000,
+                )
+                .unwrap_err()
+                .contains("undeclared"),
+                "site={site:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qoder_tool_choice_keeps_forced_and_automatic_modes_distinct() {
+        let declared = json!([
+            {"type":"function","function":{"name":"read"}},
+            {"type":"function","function":{"name":"write"}}
+        ]);
+        let cases = [
+            (json!("auto"), vec!["read", "write"]),
+            (json!("required"), vec!["read", "write"]),
+            (json!("none"), vec![]),
+            (
+                json!({"type":"function","function":{"name":"read"}}),
+                vec!["read"],
+            ),
+            (json!({"type":"function","name":"write"}), vec!["write"]),
+        ];
+        for (choice, expected) in cases {
+            let request = json!({"tools":declared,"tool_choice":choice});
+            let tools = normalized_tools(request.as_object().unwrap()).unwrap();
+            let names = tools
+                .iter()
+                .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected);
+        }
+        for choice in [
+            json!({"type":"function","function":{"name":" "}}),
+            json!({"type":"function","function":{"name":42}}),
+            json!({"type":"function"}),
+            json!({"type":"unknown"}),
+            json!(42),
+        ] {
+            let request = json!({"tools":declared,"tool_choice":choice});
+            assert!(normalized_tools(request.as_object().unwrap()).is_err());
+        }
+        let no_tools = json!({"tool_choice":"required"});
+        assert!(normalized_tools(no_tools.as_object().unwrap()).is_err());
     }
 
     #[test]
@@ -1708,6 +2404,58 @@ mod tests {
         assert_eq!(cn.max_input_tokens, 200_000);
         assert_eq!(global.max_input_tokens, 1_000_000);
         assert!(cn.runtime_selectable && global.runtime_selectable);
+    }
+
+    #[test]
+    fn public_catalog_never_advertises_a_raw_key_shadowed_by_an_alias() {
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            for &(alias, route) in qoder_model_aliases(site) {
+                if alias == route {
+                    continue;
+                }
+                let fetched = parse_qoder_model_catalog(
+                    &json!({"chat": [{"key": alias, "enable": true}]}),
+                    site,
+                )
+                .unwrap();
+                let catalog = QoderModelCatalog {
+                    enabled_models: fetched.enabled_models,
+                    raw_configs: fetched.raw_configs,
+                    capabilities: fetched.capabilities,
+                    fetched_at_ms: 1,
+                    expires_at_ms: 2,
+                };
+                assert!(
+                    catalog
+                        .public_models(site)
+                        .iter()
+                        .all(|model| model.id != alias),
+                    "{site:?}/{alias} resolves to {route}, which is not enabled"
+                );
+            }
+        }
+
+        let fetched = parse_qoder_model_catalog(
+            &json!({"chat": [
+                {"key": "claude-opus-4-6", "enable": true},
+                {"key": "ultimate", "enable": true}
+            ]}),
+            QoderSite::Global,
+        )
+        .unwrap();
+        let catalog = QoderModelCatalog {
+            enabled_models: fetched.enabled_models,
+            raw_configs: fetched.raw_configs,
+            capabilities: fetched.capabilities,
+            fetched_at_ms: 1,
+            expires_at_ms: 2,
+        };
+        let public = catalog.public_models(QoderSite::Global);
+        let advertised = public
+            .iter()
+            .find(|model| model.id == "claude-opus-4-6")
+            .unwrap();
+        assert_eq!(advertised.route.model_key, "ultimate");
     }
 
     #[test]

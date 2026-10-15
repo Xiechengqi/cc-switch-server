@@ -1005,6 +1005,7 @@ pub struct ServerStateInner {
     pub(crate) sessions: RwLock<Vec<Session>>,
     pub(crate) oauth_logins: RwLock<OAuthLoginStore>,
     pub(crate) copilot_upstream_auth: RwLock<BTreeMap<String, CachedCopilotUpstreamAuth>>,
+    antigravity_catalog_publications: AsyncMutex<BTreeMap<(String, String, u64), u64>>,
     copilot_token_exchange_generation: std::sync::atomic::AtomicU64,
     pub(crate) copilot_model_catalogs:
         crate::clients::oauth::copilot_models::CopilotModelCatalogCache,
@@ -1062,6 +1063,7 @@ pub struct ServerStateInner {
     share_model_cooldowns: Mutex<ShareModelCooldownTracker>,
     claude_quota_events: Mutex<ClaudeQuotaEventTracker>,
     previous_response_cache: Mutex<PreviousResponseCache>,
+    claude_thread_aliases: Mutex<crate::proxy::claude_thread_alias::ClaudeThreadAliasCache>,
     pub control_nonces: Arc<ControlNonceCache>,
     router_ingress_replays: Mutex<crate::clients::router::ingress::IngressReplayCache>,
     router_registration_flight: AsyncMutex<Option<Arc<RouterRegistrationFlight>>>,
@@ -1242,6 +1244,49 @@ fn qoder_client_runtime_error(
     }
 }
 
+fn qoder_request_identity_fingerprint(account: &Account) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:qoder-request-identity:v1\0");
+    let profile = account
+        .profile
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let machine_token =
+        crate::domain::qoder::machine_token_from_raw(account.raw.as_ref()).unwrap_or_default();
+    // Endpoint overrides are test-only, but must still fence the in-process cache.
+    let endpoint_overrides = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testQoderEndpoints"))
+        .map(Value::to_string)
+        .unwrap_or_default();
+    for component in [
+        account.access_token.as_deref().unwrap_or_default(),
+        account.refresh_token.as_deref().unwrap_or_default(),
+        account.api_key.as_deref().unwrap_or_default(),
+        profile.as_str(),
+        machine_token.as_str(),
+        endpoint_overrides.as_str(),
+        if account.needs_relogin {
+            "relogin"
+        } else {
+            "active"
+        },
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    match account.expires_at {
+        Some(expires_at) => {
+            digest.update([1]);
+            digest.update(expires_at.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    hex::encode(digest.finalize())
+}
+
 fn codebuddy_client_runtime_error(
     error: crate::clients::oauth::codebuddy::CodeBuddyClientError,
 ) -> CodeBuddyRuntimeError {
@@ -1251,6 +1296,44 @@ fn codebuddy_client_runtime_error(
         retryable: error.is_transient(),
         message: error.message,
     }
+}
+
+fn codebuddy_request_identity_fingerprint(account: &Account) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:codebuddy-request-identity:v1\0");
+    let profile = account
+        .profile
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let endpoint_override = account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("testCodeBuddyBaseUrl"))
+        .map(Value::to_string)
+        .unwrap_or_default();
+    for component in [
+        account.access_token.as_deref().unwrap_or_default(),
+        account.refresh_token.as_deref().unwrap_or_default(),
+        profile.as_str(),
+        endpoint_override.as_str(),
+        if account.needs_relogin {
+            "relogin"
+        } else {
+            "active"
+        },
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    match account.expires_at {
+        Some(expires_at) => {
+            digest.update([1]);
+            digest.update(expires_at.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    hex::encode(digest.finalize())
 }
 
 fn trae_client_runtime_error(
@@ -5935,6 +6018,38 @@ impl ServerStateInner {
         result
     }
 
+    pub(crate) fn claude_thread_alias_lookup(
+        &self,
+        scope: &crate::proxy::claude_thread_alias::ClaudeThreadAliasScope,
+        message_id: &str,
+    ) -> crate::proxy::claude_thread_alias::ClaudeThreadAliasLookup {
+        self.claude_thread_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lookup(
+                scope,
+                message_id,
+                crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+            )
+    }
+
+    pub(crate) fn cache_claude_thread_aliases(
+        &self,
+        scope: crate::proxy::claude_thread_alias::ClaudeThreadAliasScope,
+        message_id: &str,
+        aliases: BTreeMap<String, String>,
+    ) -> bool {
+        self.claude_thread_aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .save(
+                scope,
+                message_id,
+                aliases,
+                crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+            )
+    }
+
     #[cfg(test)]
     pub(crate) fn previous_response_context(
         &self,
@@ -6326,19 +6441,39 @@ impl ServerStateInner {
 
     pub(crate) async fn record_antigravity_model_catalog_observations_for_generation(
         &self,
-        provider_type: ProviderType,
-        account_id: &str,
-        auth_identity_generation: u64,
+        snapshot: &Account,
+        account_incarnation: u64,
         catalog: &crate::clients::oauth::antigravity_models::AntigravityModelCatalog,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let provider_type = snapshot.provider_type;
         if !matches!(
             provider_type,
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
         ) {
             anyhow::bail!("model catalog observations require Antigravity or Agy");
         }
+        let account_id = snapshot.id.as_str();
+        let auth_identity_generation = snapshot.auth_identity_generation;
+        let token_refresh_generation = snapshot.token_refresh_generation;
+        let request_identity_fingerprint =
+            crate::clients::oauth::antigravity_models::request_identity_fingerprint(snapshot)
+                .ok_or_else(|| anyhow::anyhow!("bound Antigravity request identity disappeared"))?;
+        let project_id = gemini_v1internal_project_id(snapshot)
+            .ok_or_else(|| anyhow::anyhow!("bound Antigravity project disappeared"))?;
         if catalog.stale {
-            return Ok(());
+            let accounts = self.accounts.read().await;
+            let current = accounts.find_for_provider(provider_type, Some(account_id));
+            return Ok(
+                accounts.account_incarnation(account_id) == Some(account_incarnation)
+                    && current.is_some_and(|current| {
+                        current.auth_identity_generation == auth_identity_generation
+                            && current.token_refresh_generation == token_refresh_generation
+                            && crate::clients::oauth::antigravity_models::request_identity_fingerprint(current)
+                                == Some(request_identity_fingerprint)
+                            && gemini_v1internal_project_id(current).as_deref()
+                                == Some(project_id.as_str())
+                    }),
+            );
         }
         let observed_at_ms = catalog.fetched_at_ms;
         let expires_at_ms = observed_at_ms.saturating_add(
@@ -6424,20 +6559,58 @@ impl ServerStateInner {
             }
         }
         let account_id = account_id.to_string();
-        self.try_mutate_accounts_immediate(move |accounts| {
+        let publication_key = (
+            provider_type.as_str().to_string(),
+            account_id.clone(),
+            account_incarnation,
+        );
+        let mut publications = self.antigravity_catalog_publications.lock().await;
+        if publications
+            .get(&publication_key)
+            .is_some_and(|revision| *revision > catalog.request_revision)
+        {
+            return Ok(false);
+        }
+        let applied = self.try_mutate_accounts_immediate(move |accounts| {
+            if accounts.account_incarnation(&account_id) != Some(account_incarnation) {
+                return Err("bound Antigravity account incarnation changed");
+            }
             let account = accounts
                 .accounts
                 .iter_mut()
                 .find(|account| account.id == account_id && account.provider_type == provider_type)
                 .ok_or("bound Antigravity account disappeared")?;
-            if account.auth_identity_generation != auth_identity_generation {
-                return Err("bound Antigravity account identity changed");
+            if account.auth_identity_generation != auth_identity_generation
+                || account.token_refresh_generation != token_refresh_generation
+                || crate::clients::oauth::antigravity_models::request_identity_fingerprint(account)
+                    != Some(request_identity_fingerprint)
+                || gemini_v1internal_project_id(account).as_deref() != Some(project_id.as_str())
+            {
+                return Err("bound Antigravity account scope changed");
             }
+            account.capability_observations.retain(|_, observation| {
+                observation.capability
+                    != crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY
+                    || !observation.dimension.starts_with(
+                        crate::domain::accounts::capability_evidence::ANTIGRAVITY_MODEL_SEARCH_DIMENSION_PREFIX,
+                    )
+            });
             record_observation_drafts(account, observations);
             Ok(())
         })
         .await?
-        .map_err(anyhow::Error::msg)
+        .map_err(anyhow::Error::msg);
+        if applied.is_ok() {
+            let active_incarnations = self.accounts.read().await.account_incarnations.clone();
+            publications.retain(|(stored_provider, stored_account, stored_incarnation), _| {
+                active_incarnations.get(stored_account) == Some(stored_incarnation)
+                    && (stored_provider != &publication_key.0
+                        || stored_account != &publication_key.1
+                        || *stored_incarnation == publication_key.2)
+            });
+            publications.insert(publication_key, catalog.request_revision);
+        }
+        applied.map(|()| true)
     }
 
     pub(crate) async fn refresh_codex_quota_for_account(
@@ -6846,6 +7019,7 @@ impl ServerStateInner {
             sessions: RwLock::new(Vec::new()),
             oauth_logins: RwLock::new(OAuthLoginStore::default()),
             copilot_upstream_auth: RwLock::new(BTreeMap::new()),
+            antigravity_catalog_publications: AsyncMutex::new(BTreeMap::new()),
             copilot_token_exchange_generation: std::sync::atomic::AtomicU64::new(1),
             copilot_model_catalogs:
                 crate::clients::oauth::copilot_models::CopilotModelCatalogCache::default(),
@@ -6908,6 +7082,7 @@ impl ServerStateInner {
             share_model_cooldowns: Mutex::new(ShareModelCooldownTracker::default()),
             claude_quota_events: Mutex::new(ClaudeQuotaEventTracker::default()),
             previous_response_cache: Mutex::new(PreviousResponseCache::default()),
+            claude_thread_aliases: Mutex::new(Default::default()),
             control_nonces: Arc::new(ControlNonceCache::default()),
             router_ingress_replays: Mutex::new(
                 crate::clients::router::ingress::IngressReplayCache::default(),
@@ -8240,10 +8415,10 @@ impl ServerStateInner {
             tracing::warn!(account_id, error = ?error, "Kiro model discovery token refresh failed");
             return unavailable_model_catalog("kiro_token_refresh_failed");
         }
-        let Some(mut account) = self
-            .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+        let Some((mut account, account_incarnation)) = self
+            .find_account_for_provider_with_incarnation(ProviderType::KiroOAuth, account_id)
             .await
-            .filter(|account| {
+            .filter(|(account, _)| {
                 account.auth_identity_generation == expected_auth_identity_generation
             })
         else {
@@ -8254,6 +8429,7 @@ impl ServerStateInner {
             provider_id,
             provider_revision,
             runtime_fingerprint,
+            account_incarnation,
         );
         let http = self.http_client().await;
         let mut catalog =
@@ -8287,11 +8463,12 @@ impl ServerStateInner {
             {
                 return unavailable_model_catalog("kiro_runtime_changed_after_refresh");
             }
-            let Some(refreshed) = self
-                .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+            let Some((refreshed, _)) = self
+                .find_account_for_provider_with_incarnation(ProviderType::KiroOAuth, account_id)
                 .await
-                .filter(|current| {
-                    current.auth_identity_generation == expected_auth_identity_generation
+                .filter(|(current, current_incarnation)| {
+                    *current_incarnation == account_incarnation
+                        && current.auth_identity_generation == expected_auth_identity_generation
                 })
             else {
                 return unavailable_model_catalog("kiro_bound_account_changed_after_refresh");
@@ -8301,21 +8478,42 @@ impl ServerStateInner {
                 model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
         }
         let current = self
-            .find_account_for_provider(ProviderType::KiroOAuth, account_id)
+            .find_account_for_provider_with_incarnation(ProviderType::KiroOAuth, account_id)
             .await;
-        if current.as_ref().is_none_or(|current| {
-            current.auth_identity_generation != expected_auth_identity_generation
-                || current.token_refresh_generation != account.token_refresh_generation
-        }) || !self
-            .kiro_catalog_runtime_matches(
-                app,
-                provider_id,
-                provider_revision,
-                runtime_fingerprint,
-                account_id,
-                expected_auth_identity_generation,
-            )
-            .await
+        let request_identity = account.access_token.as_deref().map(|token| {
+            crate::clients::oauth::kiro_runtime::request_identity_fingerprint(&account, token)
+        });
+        let runtime_identity =
+            crate::domain::providers::kiro::operational_runtime_identity_from_account(&account)
+                .ok();
+        if current
+            .as_ref()
+            .is_none_or(|(current, current_incarnation)| {
+                *current_incarnation != account_incarnation
+                    || current.auth_identity_generation != expected_auth_identity_generation
+                    || current.token_refresh_generation != account.token_refresh_generation
+                    || current.access_token.as_deref().map(|token| {
+                        crate::clients::oauth::kiro_runtime::request_identity_fingerprint(
+                            current, token,
+                        )
+                    }) != request_identity
+                    || crate::domain::providers::kiro::operational_runtime_identity_from_account(
+                        current,
+                    )
+                    .ok()
+                    .as_ref()
+                        != runtime_identity.as_ref()
+            })
+            || !self
+                .kiro_catalog_runtime_matches(
+                    app,
+                    provider_id,
+                    provider_revision,
+                    runtime_fingerprint,
+                    account_id,
+                    expected_auth_identity_generation,
+                )
+                .await
         {
             return unavailable_model_catalog("kiro_identity_changed_during_discovery");
         }
@@ -12033,19 +12231,71 @@ impl ServerStateInner {
             .cloned()
     }
 
+    pub(crate) async fn find_account_for_provider_with_incarnation(
+        &self,
+        provider_type: ProviderType,
+        account_id: &str,
+    ) -> Option<(Account, u64)> {
+        let accounts = self.accounts.read().await;
+        let account = accounts
+            .find_for_provider(provider_type, Some(account_id))
+            .cloned()?;
+        Some((account, accounts.account_incarnation(account_id)?))
+    }
+
+    pub(crate) async fn find_antigravity_account_with_incarnation(
+        &self,
+        provider_type: ProviderType,
+        account_id: &str,
+    ) -> Option<(Account, u64)> {
+        self.find_account_for_provider_with_incarnation(provider_type, account_id)
+            .await
+    }
+
+    pub(crate) async fn grok_replay_identity_snapshot(
+        &self,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Option<(u64, u64, [u8; 32])> {
+        let accounts = self.accounts.read().await;
+        let account = accounts.find_for_provider(ProviderType::GrokOAuth, Some(account_id))?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return None;
+        }
+        Some((
+            accounts.account_incarnation(account_id)?,
+            account.token_refresh_generation,
+            crate::clients::oauth::grok_models::request_identity_fingerprint(account)?,
+        ))
+    }
+
     pub(crate) async fn fresh_grok_reasoning_capability(
         &self,
         scope: GrokReasoningCapabilityScope<'_>,
         model: &str,
     ) -> Option<(Option<bool>, Vec<String>)> {
+        let accounts = self.accounts.read().await;
+        let account =
+            accounts.find_for_provider(ProviderType::GrokOAuth, Some(scope.account_id))?;
+        if account.auth_identity_generation != scope.auth_identity_generation
+            || account.token_refresh_generation != scope.token_refresh_generation
+        {
+            return None;
+        }
+        let account_incarnation = accounts.account_incarnation(scope.account_id)?;
+        let request_identity_fingerprint =
+            crate::clients::oauth::grok_models::request_identity_fingerprint(account)?;
+        drop(accounts);
         let scope = crate::clients::oauth::grok_models::GrokModelCatalogScope {
             app: scope.app.as_str().to_string(),
             provider_id: scope.provider_id.to_string(),
             provider_revision: scope.provider_revision,
             runtime_fingerprint: scope.runtime_fingerprint.to_string(),
             account_id: scope.account_id.to_string(),
+            account_incarnation,
             auth_identity_generation: scope.auth_identity_generation,
             token_refresh_generation: scope.token_refresh_generation,
+            request_identity_fingerprint,
         };
         crate::clients::oauth::grok_models::fresh_grok_model_capability(&scope, model)
             .await
@@ -15034,7 +15284,8 @@ impl ServerStateInner {
 
     pub(crate) async fn record_antigravity_capability_observation_if_current(
         &self,
-        account_id: &str,
+        snapshot: &Account,
+        account_incarnation: u64,
         dimension: &'static str,
         observation: CurrentAccountCapabilityObservation,
     ) -> anyhow::Result<bool> {
@@ -15042,16 +15293,35 @@ impl ServerStateInner {
         if !matches!(
             provider_type,
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
-        ) {
+        ) || snapshot.provider_type != provider_type
+            || snapshot.auth_identity_generation != observation.auth_identity_generation
+        {
             return Ok(false);
         }
+        let Some(request_identity_fingerprint) =
+            crate::clients::oauth::antigravity_models::request_identity_fingerprint(snapshot)
+        else {
+            return Ok(false);
+        };
+        let Some(project_id) = gemini_v1internal_project_id(snapshot) else {
+            return Ok(false);
+        };
         let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-        let account_id = account_id.to_string();
+        let account_id = snapshot.id.clone();
+        let token_refresh_generation = snapshot.token_refresh_generation;
         self.mutate_accounts_immediate(move |accounts| {
             let current = accounts.find_for_provider(provider_type, Some(&account_id));
-            if current.is_none_or(|account| {
-                account.auth_identity_generation != observation.auth_identity_generation
-            }) {
+            if accounts.account_incarnation(&account_id) != Some(account_incarnation)
+                || current.is_none_or(|account| {
+                    account.auth_identity_generation != observation.auth_identity_generation
+                        || account.token_refresh_generation != token_refresh_generation
+                        || crate::clients::oauth::antigravity_models::request_identity_fingerprint(
+                            account,
+                        ) != Some(request_identity_fingerprint)
+                        || gemini_v1internal_project_id(account).as_deref()
+                            != Some(project_id.as_str())
+                })
+            {
                 return false;
             }
             accounts.record_account_capability_observations(
@@ -16628,8 +16898,8 @@ impl ServerStateInner {
             return Err(QoderRuntimeError::IdentityChanged);
         }
 
-        let mut account = self
-            .find_account_for_provider(ProviderType::QoderCosy, account_id)
+        let (mut account, account_incarnation) = self
+            .find_account_for_provider_with_incarnation(ProviderType::QoderCosy, account_id)
             .await
             .ok_or(QoderRuntimeError::NotFound)?;
         if account.auth_identity_generation != expected_auth_identity_generation {
@@ -16646,11 +16916,13 @@ impl ServerStateInner {
             .await
             .map_err(QoderRuntimeError::Refresh)?;
             account = self
-                .find_account_for_provider(ProviderType::QoderCosy, account_id)
+                .find_account_for_provider_with_incarnation(ProviderType::QoderCosy, account_id)
                 .await
-                .filter(|current| {
-                    current.auth_identity_generation == expected_auth_identity_generation
+                .filter(|(current, incarnation)| {
+                    *incarnation == account_incarnation
+                        && current.auth_identity_generation == expected_auth_identity_generation
                 })
+                .map(|(current, _)| current)
                 .ok_or(QoderRuntimeError::IdentityChanged)?;
             profile = QoderAccountProfile::parse(account.profile.as_ref())
                 .map_err(QoderRuntimeError::InvalidAccount)?;
@@ -16663,6 +16935,8 @@ impl ServerStateInner {
             });
         }
 
+        let request_identity_fingerprint = qoder_request_identity_fingerprint(&account);
+
         let scope = QoderRuntimeScope::derive(
             app.as_str(),
             provider_id,
@@ -16673,6 +16947,8 @@ impl ServerStateInner {
             profile.credential_rail,
             account.auth_identity_generation,
             account.token_refresh_generation,
+            account_incarnation,
+            &request_identity_fingerprint,
         )
         .map_err(QoderRuntimeError::InvalidAccount)?;
         let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
@@ -16779,6 +17055,8 @@ impl ServerStateInner {
                         provider_revision,
                         runtime_fingerprint,
                         &account,
+                        account_incarnation,
+                        &request_identity_fingerprint,
                     )
                     .await
                 {
@@ -16806,6 +17084,8 @@ impl ServerStateInner {
                         provider_revision,
                         runtime_fingerprint,
                         &account,
+                        account_incarnation,
+                        &request_identity_fingerprint,
                     )
                     .await
                 {
@@ -16843,6 +17123,8 @@ impl ServerStateInner {
                         provider_revision,
                         runtime_fingerprint,
                         &account,
+                        account_incarnation,
+                        &request_identity_fingerprint,
                     )
                     .await
                 {
@@ -16854,6 +17136,21 @@ impl ServerStateInner {
             }
         };
 
+        if !self
+            .qoder_runtime_snapshot_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &account,
+                account_incarnation,
+                &request_identity_fingerprint,
+            )
+            .await
+        {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+
         Ok(PreparedQoderRuntime {
             scope,
             session,
@@ -16862,7 +17159,151 @@ impl ServerStateInner {
             account_id: account.id,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            account_incarnation,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn qoder_runtime_scope_for_continuation(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<
+        (
+            crate::proxy::qoder_runtime::QoderRuntimeScope,
+            crate::domain::qoder::QoderSite,
+        ),
+        QoderRuntimeError,
+    > {
+        use crate::domain::qoder::QoderAccountProfile;
+        use crate::proxy::qoder_runtime::QoderRuntimeScope;
+
+        if self.credential_persistence_degraded() {
+            return Err(QoderRuntimeError::CredentialPersistenceDegraded);
+        }
+        if !self
+            .qoder_runtime_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await
+        {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+        let (account, incarnation) = self
+            .find_account_for_provider_with_incarnation(ProviderType::QoderCosy, account_id)
+            .await
+            .ok_or(QoderRuntimeError::NotFound)?;
+        if account.auth_identity_generation != expected_auth_identity_generation {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+        let profile = QoderAccountProfile::parse(account.profile.as_ref())
+            .map_err(QoderRuntimeError::InvalidAccount)?;
+        let request_identity_fingerprint = qoder_request_identity_fingerprint(&account);
+        let scope = QoderRuntimeScope::derive(
+            app.as_str(),
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            profile.site,
+            profile.credential_rail,
+            account.auth_identity_generation,
+            account.token_refresh_generation,
+            incarnation,
+            &request_identity_fingerprint,
+        )
+        .map_err(QoderRuntimeError::InvalidAccount)?;
+        if !self
+            .qoder_runtime_snapshot_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                &account,
+                incarnation,
+                &request_identity_fingerprint,
+            )
+            .await
+        {
+            return Err(QoderRuntimeError::IdentityChanged);
+        }
+        Ok((scope, profile.site))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn cached_qoder_runtime_for_continuation(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+    ) -> Result<Option<crate::proxy::qoder_runtime::PreparedQoderRuntime>, QoderRuntimeError> {
+        use crate::proxy::qoder_runtime::PreparedQoderRuntime;
+
+        let (scope, _) = self
+            .qoder_runtime_scope_for_continuation(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                expected_auth_identity_generation,
+            )
+            .await?;
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let Some(session) = self.qoder_runtime.session(&scope, now_ms).await else {
+            return Ok(None);
+        };
+        let Some(catalog) = self.qoder_runtime.catalog(&scope, now_ms).await else {
+            return Ok(None);
+        };
+        let Some((account, account_incarnation)) = self
+            .find_account_for_provider_with_incarnation(ProviderType::QoderCosy, account_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        if !self
+            .qoder_runtime_generation_matches(
+                app,
+                provider_id,
+                provider_revision,
+                runtime_fingerprint,
+                account_id,
+                account.auth_identity_generation,
+                account.token_refresh_generation,
+                account_incarnation,
+                &scope,
+            )
+            .await
+        {
+            return Ok(None);
+        }
+        Ok(Some(PreparedQoderRuntime {
+            scope,
+            session,
+            catalog,
+            credential_rail: crate::domain::qoder::QoderAccountProfile::parse(
+                account.profile.as_ref(),
+            )
+            .map_err(QoderRuntimeError::InvalidAccount)?
+            .credential_rail,
+            account_id: account.id,
+            auth_identity_generation: account.auth_identity_generation,
+            token_refresh_generation: account.token_refresh_generation,
+            account_incarnation,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16903,6 +17344,7 @@ impl ServerStateInner {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn qoder_runtime_snapshot_matches(
         &self,
         app: AppKind,
@@ -16910,6 +17352,8 @@ impl ServerStateInner {
         provider_revision: u64,
         runtime_fingerprint: &str,
         expected: &Account,
+        expected_incarnation: u64,
+        expected_request_identity_fingerprint: &str,
     ) -> bool {
         if !self
             .qoder_runtime_matches(
@@ -16924,11 +17368,14 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::QoderCosy, &expected.id)
+        self.find_account_for_provider_with_incarnation(ProviderType::QoderCosy, &expected.id)
             .await
-            .is_some_and(|current| {
-                current.auth_identity_generation == expected.auth_identity_generation
+            .is_some_and(|(current, incarnation)| {
+                incarnation == expected_incarnation
+                    && current.auth_identity_generation == expected.auth_identity_generation
                     && current.token_refresh_generation == expected.token_refresh_generation
+                    && qoder_request_identity_fingerprint(&current)
+                        == expected_request_identity_fingerprint
             })
     }
 
@@ -16949,6 +17396,8 @@ impl ServerStateInner {
         account_id: &str,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
+        scope: &crate::proxy::qoder_runtime::QoderRuntimeScope,
     ) -> bool {
         if !self
             .qoder_runtime_matches(
@@ -16963,11 +17412,32 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::QoderCosy, account_id)
+        self.find_account_for_provider_with_incarnation(ProviderType::QoderCosy, account_id)
             .await
-            .is_some_and(|account| {
+            .is_some_and(|(account, incarnation)| {
                 account.auth_identity_generation == auth_identity_generation
                     && account.token_refresh_generation == token_refresh_generation
+                    && incarnation == account_incarnation
+                    && crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref())
+                        .ok()
+                        .and_then(|profile| {
+                            crate::proxy::qoder_runtime::QoderRuntimeScope::derive(
+                                app.as_str(),
+                                provider_id,
+                                provider_revision,
+                                runtime_fingerprint,
+                                account_id,
+                                profile.site,
+                                profile.credential_rail,
+                                auth_identity_generation,
+                                token_refresh_generation,
+                                incarnation,
+                                &qoder_request_identity_fingerprint(&account),
+                            )
+                            .ok()
+                        })
+                        .as_ref()
+                        == Some(scope)
             })
     }
 
@@ -17012,8 +17482,8 @@ impl ServerStateInner {
         )
         .await
         .map_err(CodeBuddyRuntimeError::Refresh)?;
-        let account = self
-            .find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+        let (account, account_incarnation) = self
+            .find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, account_id)
             .await
             .ok_or(CodeBuddyRuntimeError::NotFound)?;
         if account.auth_identity_generation != expected_auth_identity_generation {
@@ -17041,6 +17511,7 @@ impl ServerStateInner {
             .to_string();
         let base_url = crate::clients::oauth::codebuddy::runtime_base_url(&account)
             .map_err(codebuddy_client_runtime_error)?;
+        let request_identity_fingerprint = codebuddy_request_identity_fingerprint(&account);
         let scope = CodeBuddyRuntimeScope::derive(
             app.as_str(),
             provider_id,
@@ -17051,6 +17522,8 @@ impl ServerStateInner {
             &profile.domain,
             account.auth_identity_generation,
             account.token_refresh_generation,
+            account_incarnation,
+            &request_identity_fingerprint,
         )
         .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
 
@@ -17070,6 +17543,8 @@ impl ServerStateInner {
                         provider_revision,
                         runtime_fingerprint,
                         &account,
+                        account_incarnation,
+                        &request_identity_fingerprint,
                     )
                     .await
                 {
@@ -17097,6 +17572,8 @@ impl ServerStateInner {
                                 provider_revision,
                                 runtime_fingerprint,
                                 &account,
+                                account_incarnation,
+                                &request_identity_fingerprint,
                             )
                             .await
                         {
@@ -17136,6 +17613,8 @@ impl ServerStateInner {
                 provider_revision,
                 runtime_fingerprint,
                 &account,
+                account_incarnation,
+                &request_identity_fingerprint,
             )
             .await
         {
@@ -17150,6 +17629,7 @@ impl ServerStateInner {
             account_id: account.id,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            account_incarnation,
         })
     }
 
@@ -17191,6 +17671,7 @@ impl ServerStateInner {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn codebuddy_runtime_snapshot_matches(
         &self,
         app: AppKind,
@@ -17198,6 +17679,8 @@ impl ServerStateInner {
         provider_revision: u64,
         runtime_fingerprint: &str,
         expected: &Account,
+        expected_incarnation: u64,
+        expected_request_identity_fingerprint: &str,
     ) -> bool {
         if !self
             .codebuddy_runtime_matches(
@@ -17212,11 +17695,14 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::CodeBuddyOAuth, &expected.id)
+        self.find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, &expected.id)
             .await
-            .is_some_and(|current| {
-                current.auth_identity_generation == expected.auth_identity_generation
+            .is_some_and(|(current, incarnation)| {
+                incarnation == expected_incarnation
+                    && current.auth_identity_generation == expected.auth_identity_generation
                     && current.token_refresh_generation == expected.token_refresh_generation
+                    && codebuddy_request_identity_fingerprint(&current)
+                        == expected_request_identity_fingerprint
             })
     }
 
@@ -17237,6 +17723,8 @@ impl ServerStateInner {
         account_id: &str,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
+        scope: &crate::proxy::codebuddy_runtime::CodeBuddyRuntimeScope,
     ) -> bool {
         if !self
             .codebuddy_runtime_matches(
@@ -17251,11 +17739,34 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+        self.find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, account_id)
             .await
-            .is_some_and(|account| {
+            .is_some_and(|(account, incarnation)| {
                 account.auth_identity_generation == auth_identity_generation
                     && account.token_refresh_generation == token_refresh_generation
+                    && incarnation == account_incarnation
+                    && crate::domain::codebuddy::CodeBuddyAccountProfile::parse(
+                        account.profile.as_ref(),
+                    )
+                    .ok()
+                    .and_then(|profile| {
+                        crate::proxy::codebuddy_runtime::CodeBuddyRuntimeScope::derive(
+                            app.as_str(),
+                            provider_id,
+                            provider_revision,
+                            runtime_fingerprint,
+                            account_id,
+                            profile.site,
+                            &profile.domain,
+                            auth_identity_generation,
+                            token_refresh_generation,
+                            incarnation,
+                            &codebuddy_request_identity_fingerprint(&account),
+                        )
+                        .ok()
+                    })
+                    .as_ref()
+                        == Some(scope)
             })
     }
 
@@ -22529,6 +23040,65 @@ mod tests {
         account.refresh_token = None;
         account.api_key = None;
         assert!(!account_quota_refresh_candidate(&accounts, &account));
+    }
+
+    #[test]
+    fn qoder_cache_request_identity_changes_without_generation_bumps() {
+        let mut account: Account = serde_json::from_value(json!({
+            "id": "qoder-same-generation",
+            "providerType": "qoder_cosy",
+            "accessToken": "oauth-a",
+            "refreshToken": "refresh-a",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 0,
+            "profile": {"site": "global", "credentialRail": "global_oauth", "uid": "user-a", "machineId": "0123456789abcdef0123456789abcdef0123"},
+            "raw": {"qoderSecrets": {"machineToken": "machine-a"}}
+        }))
+        .unwrap();
+        let initial = qoder_request_identity_fingerprint(&account);
+        account.access_token = Some("oauth-b".to_string());
+        assert_ne!(qoder_request_identity_fingerprint(&account), initial);
+        account.access_token = Some("oauth-a".to_string());
+        account.raw = Some(json!({"qoderSecrets": {"machineToken": "machine-b"}}));
+        assert_ne!(qoder_request_identity_fingerprint(&account), initial);
+        account.raw = Some(json!({"qoderSecrets": {"machineToken": "machine-a"}}));
+        account.profile.as_mut().unwrap()["machineId"] =
+            json!("abcdef0123456789abcdef0123456789abcd");
+        assert_ne!(qoder_request_identity_fingerprint(&account), initial);
+        account.profile.as_mut().unwrap()["machineId"] =
+            json!("0123456789abcdef0123456789abcdef0123");
+        account.needs_relogin = true;
+        assert_ne!(qoder_request_identity_fingerprint(&account), initial);
+        account.needs_relogin = false;
+        account.expires_at = Some(0);
+        assert_ne!(qoder_request_identity_fingerprint(&account), initial);
+    }
+
+    #[test]
+    fn codebuddy_cache_request_identity_changes_without_generation_bumps() {
+        let mut account: Account = serde_json::from_value(json!({
+            "id": "codebuddy-same-generation",
+            "providerType": "codebuddy_oauth",
+            "accessToken": "access-a",
+            "refreshToken": "refresh-a",
+            "authIdentityGeneration": 1,
+            "tokenRefreshGeneration": 0,
+            "profile": {"site": "intl", "domain": "www.codebuddy.ai", "uid": "user-a", "clientVersion": "2.142.0", "productPlatform": "CLI"},
+            "raw": {"testCodeBuddyBaseUrl": "https://first.example"}
+        }))
+        .unwrap();
+        let initial = codebuddy_request_identity_fingerprint(&account);
+        account.access_token = Some("access-b".to_string());
+        assert_ne!(codebuddy_request_identity_fingerprint(&account), initial);
+        account.access_token = Some("access-a".to_string());
+        account.profile.as_mut().unwrap()["uid"] = json!("user-b");
+        assert_ne!(codebuddy_request_identity_fingerprint(&account), initial);
+        account.profile.as_mut().unwrap()["uid"] = json!("user-a");
+        account.raw.as_mut().unwrap()["testCodeBuddyBaseUrl"] = json!("https://second.example");
+        assert_ne!(codebuddy_request_identity_fingerprint(&account), initial);
+        account.raw.as_mut().unwrap()["testCodeBuddyBaseUrl"] = json!("https://first.example");
+        account.expires_at = Some(0);
+        assert_ne!(codebuddy_request_identity_fingerprint(&account), initial);
     }
 
     #[test]
@@ -31455,6 +32025,168 @@ mod tests {
         );
         assert_eq!(observation.source, "upstream_success");
         assert!(observation.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn antigravity_late_limit_evidence_cannot_cross_same_generation_bearer() {
+        let state = test_state();
+        let account = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": "antigravity-limit-evidence-fence",
+                        "providerType": "antigravity_oauth",
+                        "accessToken": "old-bearer",
+                        "raw": {"projectId": "same-project"}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let account_incarnation = state
+            .accounts
+            .read()
+            .await
+            .account_incarnation(&account.id)
+            .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let current = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == account.id)
+                    .unwrap();
+                current.access_token = Some("new-bearer".to_string());
+            })
+            .await
+            .unwrap();
+
+        assert!(!state
+            .record_antigravity_capability_observation_if_current(
+                &account,
+                account_incarnation,
+                MODEL_CAPACITY_DIMENSION,
+                CurrentAccountCapabilityObservation {
+                    provider_type: account.provider_type,
+                    auth_identity_generation: account.auth_identity_generation,
+                    state: AccountCapabilityObservationState::Unsupported,
+                    source: "google_rpc_error",
+                    reason: Some("model_capacity"),
+                    expires_at_ms: Some(i64::MAX),
+                },
+            )
+            .await
+            .unwrap());
+        let current = state.find_account_by_id(&account.id).await.unwrap();
+        assert!(!current.capability_observations.contains_key(
+            &crate::domain::accounts::capability_evidence::observation_key(
+                crate::domain::accounts::capability_evidence::ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                MODEL_CAPACITY_DIMENSION,
+            )
+        ));
+
+        let observation = || CurrentAccountCapabilityObservation {
+            provider_type: account.provider_type,
+            auth_identity_generation: account.auth_identity_generation,
+            state: AccountCapabilityObservationState::Unsupported,
+            source: "google_rpc_error",
+            reason: Some("model_capacity"),
+            expires_at_ms: Some(i64::MAX),
+        };
+        assert!(state
+            .record_antigravity_capability_observation_if_current(
+                &current,
+                account_incarnation,
+                MODEL_CAPACITY_DIMENSION,
+                observation(),
+            )
+            .await
+            .unwrap());
+
+        let account_id = account.id.clone();
+        let recreated = state
+            .mutate_accounts_immediate(move |accounts| {
+                assert!(accounts.delete(&account_id));
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id": account_id,
+                        "providerType": "antigravity_oauth",
+                        "accessToken": "new-bearer",
+                        "raw": {"projectId": "same-project"}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        let recreated_incarnation = state
+            .accounts
+            .read()
+            .await
+            .account_incarnation(&recreated.id)
+            .unwrap();
+        assert_ne!(recreated_incarnation, account_incarnation);
+        assert_eq!(
+            recreated.auth_identity_generation,
+            current.auth_identity_generation
+        );
+        assert_eq!(
+            recreated.token_refresh_generation,
+            current.token_refresh_generation
+        );
+        assert!(!state
+            .record_antigravity_capability_observation_if_current(
+                &current,
+                account_incarnation,
+                MODEL_CAPACITY_DIMENSION,
+                observation(),
+            )
+            .await
+            .unwrap());
+
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let current = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == recreated.id)
+                    .unwrap();
+                current.token_refresh_generation += 1;
+            })
+            .await
+            .unwrap();
+        assert!(!state
+            .record_antigravity_capability_observation_if_current(
+                &recreated,
+                recreated_incarnation,
+                MODEL_CAPACITY_DIMENSION,
+                observation(),
+            )
+            .await
+            .unwrap());
+
+        let rotated = state.find_account_by_id(&recreated.id).await.unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let current = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == recreated.id)
+                    .unwrap();
+                current.raw = Some(json!({"projectId": "new-project"}));
+            })
+            .await
+            .unwrap();
+        assert!(!state
+            .record_antigravity_capability_observation_if_current(
+                &rotated,
+                recreated_incarnation,
+                MODEL_CAPACITY_DIMENSION,
+                observation(),
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

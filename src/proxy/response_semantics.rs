@@ -123,6 +123,36 @@ fn valid_reported_response_model(value: &Value) -> Option<String> {
     Some(model.to_string())
 }
 
+/// Fill only missing terminal output IDs from the matching completed item.
+/// A non-empty terminal output remains authoritative for every other field.
+pub(super) fn hydrate_response_output_item_ids<'a>(
+    output: &mut [Value],
+    mut indexed_item: impl FnMut(usize) -> Option<&'a Value>,
+) -> bool {
+    let mut changed = false;
+    for (index, item) in output.iter_mut().enumerate() {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        let missing_id = item_object
+            .get("id")
+            .is_none_or(|id| id.is_null() || id.as_str().is_some_and(|id| id.trim().is_empty()));
+        if !missing_id {
+            continue;
+        }
+        let Some(id) = indexed_item(index)
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        item_object.insert("id".to_string(), Value::String(id.to_string()));
+        changed = true;
+    }
+    changed
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ResponsesRepeatTracker {
     content: RepeatLane,
@@ -366,7 +396,25 @@ pub(super) fn classify_json_document(
             "Responses body must be a JSON object",
         ));
     }
+    reject_conflicting_completed_status(&value)?;
     Ok(classify_value(&value))
+}
+
+fn reject_conflicting_completed_status(value: &Value) -> Result<(), SemanticProtocolError> {
+    let response = value
+        .get("response")
+        .filter(|response| response.is_object())
+        .unwrap_or(value);
+    if value.get("type").and_then(Value::as_str) == Some("response.completed")
+        && response
+            .get("status")
+            .is_some_and(|status| status.as_str() != Some("completed"))
+    {
+        return Err(SemanticProtocolError::new(
+            "Responses completed event has a non-completed response status",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn classify_value(value: &Value) -> SemanticObservation {
@@ -394,6 +442,16 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
     {
         return SemanticObservation::IncompleteTerminal;
     }
+    if event_type == "response.completed" && status == Some("incomplete") {
+        return SemanticObservation::IncompleteTerminal;
+    }
+    if event_type == "response.completed"
+        && response
+            .get("status")
+            .is_some_and(|value| value.as_str() != Some("completed"))
+    {
+        return SemanticObservation::Business;
+    }
     if event_type == "response.completed" || (event_type.is_empty() && status == Some("completed"))
     {
         return SemanticObservation::SuccessTerminal;
@@ -409,6 +467,26 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         return SemanticObservation::Lifecycle;
     }
     SemanticObservation::Business
+}
+
+pub(super) fn is_responses_terminal_event(declared_event: Option<&str>, value: &Value) -> bool {
+    matches!(
+        declared_event,
+        Some(
+            "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.cancelled"
+                | "response.canceled"
+                | "error"
+        )
+    ) || matches!(
+        classify_value(value),
+        SemanticObservation::SuccessTerminal
+            | SemanticObservation::IncompleteTerminal
+            | SemanticObservation::Failure(_)
+            | SemanticObservation::ErrorFrame(_)
+    )
 }
 
 /// Returns whether a Responses `*.added` event is only an empty startup shell.
@@ -431,11 +509,25 @@ fn is_empty_startup_output_item(item: &Value) -> bool {
         return false;
     };
     match item.get("type").and_then(Value::as_str) {
-        Some("message") => item
-            .get("content")
-            .is_none_or(is_empty_startup_content_list),
+        Some("message") => {
+            has_only_startup_item_fields(item, &["id", "type", "status", "role", "content"])
+                && item
+                    .get("content")
+                    .is_none_or(is_empty_startup_content_list)
+        }
         Some("reasoning") => {
-            item.get("encrypted_content")
+            has_only_startup_item_fields(
+                item,
+                &[
+                    "id",
+                    "type",
+                    "status",
+                    "summary",
+                    "content",
+                    "encrypted_content",
+                ],
+            ) && item
+                .get("encrypted_content")
                 .is_none_or(|value| matches!(value, Value::Null) || value.as_str() == Some(""))
                 && item
                     .get("summary")
@@ -444,14 +536,34 @@ fn is_empty_startup_output_item(item: &Value) -> bool {
                     .get("content")
                     .is_none_or(is_empty_startup_content_list)
         }
-        Some("function_call") => item
-            .get("arguments")
-            .is_none_or(|arguments| arguments.as_str() == Some("")),
-        Some("custom_tool_call") => item
-            .get("input")
-            .is_none_or(|input| input.as_str() == Some("")),
+        Some("function_call") => {
+            has_only_startup_item_fields(
+                item,
+                &["id", "type", "status", "call_id", "name", "arguments"],
+            ) && item
+                .get("arguments")
+                .is_none_or(|arguments| arguments.as_str() == Some(""))
+        }
+        Some("custom_tool_call") => {
+            has_only_startup_item_fields(
+                item,
+                &["id", "type", "status", "call_id", "name", "input"],
+            ) && item
+                .get("input")
+                .is_none_or(|input| input.as_str() == Some(""))
+        }
         _ => false,
     }
+}
+
+fn has_only_startup_item_fields(item: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    item.iter().all(|(field, value)| {
+        allowed.contains(&field.as_str())
+            && (!matches!(
+                field.as_str(),
+                "id" | "status" | "role" | "call_id" | "name"
+            ) || value.is_string())
+    })
 }
 
 fn is_empty_startup_content_list(content: &Value) -> bool {
@@ -468,8 +580,18 @@ fn is_empty_startup_part(part: &Value) -> bool {
     match part.get("type").and_then(Value::as_str) {
         Some("output_text" | "summary_text" | "text" | "reasoning_text") => {
             part.get("text").and_then(Value::as_str) == Some("")
+                && part.iter().all(|(field, value)| match field.as_str() {
+                    "type" | "text" => true,
+                    "annotations" | "logprobs" => value.as_array().is_some_and(Vec::is_empty),
+                    _ => false,
+                })
         }
-        Some("refusal") => part.get("refusal").and_then(Value::as_str) == Some(""),
+        Some("refusal") => {
+            part.get("refusal").and_then(Value::as_str) == Some("")
+                && part
+                    .keys()
+                    .all(|field| matches!(field.as_str(), "type" | "refusal"))
+        }
         _ => false,
     }
 }
@@ -591,6 +713,7 @@ fn normalize_failure_token(value: &str) -> String {
 #[derive(Debug)]
 pub(super) struct ResponsesSseInspector {
     transport: ResponsesTransportDecoder,
+    rejected: bool,
     saw_business: bool,
     terminal: Option<SemanticTerminal>,
     pending_error: Option<SemanticFailure>,
@@ -636,6 +759,7 @@ impl Default for ResponsesSseInspector {
                 MAX_SEMANTIC_PENDING_BYTES,
                 MAX_SEMANTIC_EVENT_BYTES,
             ),
+            rejected: false,
             saw_business: false,
             terminal: None,
             pending_error: None,
@@ -687,12 +811,17 @@ impl ResponsesSseInspector {
         &mut self,
         chunk: &[u8],
     ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
+        if self.rejected {
+            return Err(Self::rejected_error());
+        }
         self.started = true;
-        let items = self
+        let result = self
             .transport
             .push(chunk)
-            .map_err(SemanticProtocolError::from_transport)?;
-        self.process_transport_items(items)
+            .map_err(SemanticProtocolError::from_transport)
+            .and_then(|items| self.process_transport_items(items));
+        self.rejected = result.is_err();
+        result
     }
 
     fn push_with_limits(
@@ -717,7 +846,18 @@ impl ResponsesSseInspector {
     pub(super) fn finish_normalized(
         &mut self,
     ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
+        if self.rejected {
+            return Err(Self::rejected_error());
+        }
         self.started = true;
+        let result = self.finish_normalized_inner();
+        self.rejected = result.is_err();
+        result
+    }
+
+    fn finish_normalized_inner(
+        &mut self,
+    ) -> Result<ResponsesInspectionBatch, SemanticProtocolError> {
         let items = self
             .transport
             .finish()
@@ -748,7 +888,15 @@ impl ResponsesSseInspector {
     }
 
     pub(super) fn terminal(&self) -> Option<&SemanticTerminal> {
-        self.terminal.as_ref()
+        if self.rejected {
+            None
+        } else {
+            self.terminal.as_ref()
+        }
+    }
+
+    fn rejected_error() -> SemanticProtocolError {
+        SemanticProtocolError::new("Responses inspector was already rejected")
     }
 
     pub(super) fn retained_transport_bytes(&self) -> usize {
@@ -793,8 +941,14 @@ impl ResponsesSseInspector {
                     value,
                 } => {
                     if self.terminal.is_some() {
+                        if is_responses_terminal_event(declared_event.as_deref(), &value) {
+                            return Err(SemanticProtocolError::new(
+                                "Responses stream emitted another terminal event after a terminal response",
+                            ));
+                        }
                         continue;
                     }
+                    reject_conflicting_completed_status(&value)?;
                     self.reported_model.observe_event_value(&value);
                     if responses_event_is_filtered(
                         self.event_visibility,
@@ -809,6 +963,17 @@ impl ResponsesSseInspector {
                     }
                     self.observe_repeat(&value)?;
                     let observation = classify_value(&value);
+                    if matches!(
+                        observation,
+                        SemanticObservation::SuccessTerminal
+                            | SemanticObservation::IncompleteTerminal
+                    ) && self.pending_error.is_some()
+                    {
+                        if let Some(failure) = self.promote_pending_error() {
+                            observations.push(SemanticObservation::Failure(failure));
+                        }
+                        continue;
+                    }
                     self.record(&observation);
                     normalized.extend_from_slice(&encode_canonical_json_sse(
                         declared_event.as_deref(),
@@ -826,6 +991,11 @@ impl ResponsesSseInspector {
     }
 
     fn observe_done(&mut self) -> Result<Option<SemanticFailure>, SemanticProtocolError> {
+        if self.done_seen {
+            return Err(SemanticProtocolError::new(
+                "Responses stream emitted duplicate [DONE] sentinel",
+            ));
+        }
         self.done_seen = true;
         if self.terminal.is_none() {
             if let Some(failure) = self.promote_pending_error() {
@@ -1025,12 +1195,46 @@ mod tests {
     }
 
     #[test]
+    fn completed_event_cannot_override_an_explicit_non_completed_status() {
+        for status in [
+            json!("incomplete"),
+            json!("in_progress"),
+            json!("queued"),
+            json!(null),
+            json!(42),
+        ] {
+            let event = json!({
+                "type": "response.completed",
+                "response": {"status": status, "incomplete_details": {"reason": "max_output_tokens"}}
+            });
+            assert_ne!(classify_value(&event), SemanticObservation::SuccessTerminal);
+            let body = serde_json::to_vec(&event).unwrap();
+            assert!(classify_json_document(&body).is_err(), "status={status}");
+            let mut inspector = ResponsesSseInspector::default();
+            let frame = format!("event: response.completed\ndata: {event}\n\n");
+            assert!(
+                inspector.push_normalized(frame.as_bytes()).is_err(),
+                "status={status}"
+            );
+        }
+        for response in [json!({}), json!({"status": "completed"})] {
+            let event = json!({"type": "response.completed", "response": response});
+            assert_eq!(classify_value(&event), SemanticObservation::SuccessTerminal);
+            assert!(classify_json_document(event.to_string().as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
     fn codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier() {
         let lifecycle = [
             json!({
                 "type": "response.output_item.added",
                 "output_index": 0,
                 "item": {"id": "msg_1", "type": "message", "role": "assistant", "content": []}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "msg_status", "type": "message", "status": "in_progress", "role": "assistant", "content": []}
             }),
             json!({
                 "type": "response.output_item.added",
@@ -1048,6 +1252,10 @@ mod tests {
             json!({
                 "type": "response.output_item.added",
                 "item": {"id": "fc_1", "type": "function_call", "name": "lookup", "arguments": ""}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"id": "fc_call", "type": "function_call", "call_id": "call_1", "name": "lookup", "status": "in_progress", "arguments": ""}
             }),
             json!({
                 "type": "response.output_item.added",
@@ -1126,6 +1334,86 @@ mod tests {
                 "event must commit fail closed: {event}"
             );
             assert!(observation.commits_downstream());
+        }
+    }
+
+    #[test]
+    fn codex_empty_text_announcement_with_annotations_or_logprobs_commits() {
+        let substantive_parts = [
+            json!({"type": "output_text", "text": "", "annotations": [{"type": "url_citation", "url": "https://example.com"}]}),
+            json!({"type": "output_text", "text": "", "logprobs": [{"token": "x", "logprob": -0.1}]}),
+            json!({"type": "output_text", "text": "", "future_content": "opaque"}),
+        ];
+        for part in substantive_parts {
+            for event in [
+                json!({"type": "response.content_part.added", "part": part}),
+                json!({"type": "response.output_item.added", "item": {
+                    "type": "message", "role": "assistant", "content": [part]
+                }}),
+            ] {
+                assert_eq!(
+                    classify_value(&event),
+                    SemanticObservation::Business,
+                    "content-bearing startup event must commit: {event}"
+                );
+                assert_eq!(
+                    classify_json_document(event.to_string().as_bytes()).unwrap(),
+                    SemanticObservation::Business
+                );
+                let mut inspector = ResponsesSseInspector::default();
+                let frame = format!("data: {event}\n\n");
+                assert_eq!(
+                    inspector.push(frame.as_bytes()).unwrap(),
+                    vec![SemanticObservation::Business]
+                );
+                assert!(inspector.saw_business());
+            }
+        }
+
+        for part in [
+            json!({"type": "output_text", "text": "", "annotations": [], "logprobs": []}),
+            json!({"type": "summary_text", "text": ""}),
+        ] {
+            for event in [
+                json!({"type": "response.content_part.added", "part": part}),
+                json!({"type": "response.output_item.added", "item": {
+                    "type": "message", "role": "assistant", "content": [part]
+                }}),
+            ] {
+                assert_eq!(classify_value(&event), SemanticObservation::Lifecycle);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_empty_output_item_with_unknown_business_field_commits() {
+        let items = [
+            json!({"type": "message", "role": "assistant", "content": [], "future_content": "visible"}),
+            json!({"type": "reasoning", "summary": [], "future_content": {"token": "visible"}}),
+            json!({"type": "function_call", "name": "lookup", "arguments": "", "future_content": "visible"}),
+            json!({"type": "custom_tool_call", "name": "exec", "input": "", "future_content": "visible"}),
+            json!({"type": "message", "content": [], "role": {"future_content": "visible"}}),
+        ];
+        for item in items {
+            let event = json!({"type": "response.output_item.added", "item": item});
+            assert_eq!(
+                classify_value(&event),
+                SemanticObservation::Business,
+                "{event}"
+            );
+            assert_eq!(
+                classify_json_document(event.to_string().as_bytes()).unwrap(),
+                SemanticObservation::Business,
+                "{event}"
+            );
+            let mut inspector = ResponsesSseInspector::default();
+            let frame = format!("data: {event}\n\n");
+            assert_eq!(
+                inspector.push(frame.as_bytes()).unwrap(),
+                vec![SemanticObservation::Business],
+                "{event}"
+            );
+            assert!(inspector.saw_business(), "{event}");
         }
     }
 
@@ -1410,6 +1698,49 @@ mod tests {
     }
 
     #[test]
+    fn sse_inspector_rejects_success_after_error_frame() {
+        let mut inspector = ResponsesSseInspector::default();
+        inspector
+            .push(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n")
+            .unwrap();
+        let observations = inspector
+            .push(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+            .unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [SemanticObservation::Failure(SemanticFailure { code, .. })]
+                if code == "server_is_overloaded"
+        ));
+        assert!(matches!(
+            inspector.terminal(),
+            Some(SemanticTerminal::Failure(_))
+        ));
+        inspector.finish().unwrap();
+    }
+
+    #[test]
+    fn sse_inspector_rejects_incomplete_after_error_frame() {
+        let mut inspector = ResponsesSseInspector::default();
+        inspector
+            .push(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}\n\n")
+            .unwrap();
+        let observations = inspector
+            .push(b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n")
+            .unwrap();
+        assert!(matches!(
+            observations.as_slice(),
+            [SemanticObservation::Failure(SemanticFailure { code, .. })]
+                if code == "server_is_overloaded"
+        ));
+        assert!(matches!(
+            inspector.terminal(),
+            Some(SemanticTerminal::Failure(SemanticFailure { code, .. }))
+                if code == "server_is_overloaded"
+        ));
+        inspector.finish().unwrap();
+    }
+
+    #[test]
     fn sse_inspector_requires_a_semantic_terminal() {
         let mut inspector = ResponsesSseInspector::default();
         let error = inspector
@@ -1433,6 +1764,89 @@ mod tests {
             .unwrap();
         assert_eq!(observations, vec![SemanticObservation::SuccessTerminal]);
         inspector.finish().unwrap();
+    }
+
+    #[test]
+    fn responses_done_marker_is_unique_after_completion() {
+        for (completed, done) in [
+            (
+                b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                    .as_slice(),
+                b"data: [DONE]\n\n".as_slice(),
+            ),
+            (
+                b"{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n"
+                    .as_slice(),
+                b"[DONE]\n".as_slice(),
+            ),
+        ] {
+            let mut inspector = ResponsesSseInspector::default();
+            inspector.push_normalized(completed).unwrap();
+            let first = inspector.push_normalized(done).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&first.normalized).matches("[DONE]").count(),
+                1
+            );
+            let error = inspector.push_normalized(done).unwrap_err();
+            assert!(error.to_string().contains("duplicate [DONE]"));
+
+            let mut same_chunk = ResponsesSseInspector::default();
+            let mut wire = completed.to_vec();
+            wire.extend_from_slice(done);
+            wire.extend_from_slice(done);
+            let error = same_chunk.push_normalized(&wire).unwrap_err();
+            assert!(error.to_string().contains("duplicate [DONE]"));
+        }
+    }
+
+    #[test]
+    fn responses_inspector_rejects_conflicting_terminal_after_completion() {
+        let completed =
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        for trailing in [
+            "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}",
+            "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}",
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}",
+            "{\"type\":\"error\",\"error\":{\"message\":\"late\"}}",
+        ] {
+            let mut inspector = ResponsesSseInspector::default();
+            let stream = format!("{completed}data: {trailing}\n\n");
+            assert!(
+                inspector.push_normalized(stream.as_bytes()).is_err(),
+                "{trailing}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_inspector_cannot_finish_after_a_rejected_push() {
+        let completed =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        for trailing in [
+            b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n"
+                .as_slice(),
+            b"data: not-json\n\n".as_slice(),
+        ] {
+            let mut inspector = ResponsesSseInspector::default();
+            inspector.push(completed).unwrap();
+            inspector.push(trailing).unwrap_err();
+            assert!(inspector.terminal().is_none());
+            assert!(inspector.finish().is_err());
+            assert!(inspector.push(completed).is_err());
+        }
+    }
+
+    #[test]
+    fn responses_inspector_cannot_accept_a_terminal_after_rejected_finish() {
+        let mut inspector = ResponsesSseInspector::default();
+        inspector
+            .push(b"data: {\"type\":\"response.created\"}\n\n")
+            .unwrap();
+        assert!(inspector.finish().is_err());
+        assert!(inspector
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+            .is_err());
+        assert!(inspector.terminal().is_none());
     }
 
     #[test]
@@ -1494,9 +1908,9 @@ mod tests {
     }
 
     #[test]
-    fn line_delimited_json_ignores_events_after_terminal() {
+    fn line_delimited_json_rejects_failure_after_terminal() {
         let mut inspector = ResponsesSseInspector::default();
-        let observations = inspector
+        let error = inspector
             .push(
                 concat!(
                     "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n",
@@ -1504,10 +1918,8 @@ mod tests {
                 )
                 .as_bytes(),
             )
-            .unwrap();
-        assert_eq!(observations, vec![SemanticObservation::SuccessTerminal]);
-        assert_eq!(inspector.terminal(), Some(&SemanticTerminal::Success));
-        inspector.finish().unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("another terminal event"));
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub(super) fn prepare_anthropic_images_with_memory(
     body: &mut Value,
     request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<(), ProxyError> {
+    validate_image_placement(body)?;
     let mut hashes = Vec::new();
     visit_image_blocks(body, &mut |block| {
         let data = image_data(block).ok_or_else(|| {
@@ -86,6 +87,76 @@ pub(super) fn prepare_anthropic_images_with_memory(
         source.insert("data".to_string(), json!(prepared.data));
         Ok(())
     })
+}
+
+/// Only user content arrays can become Kiro user images. The converter also
+/// lifts images one level inside a user tool_result; all other image blocks
+/// would be validated here and then silently disappear from the wire body.
+fn validate_image_placement(body: &Value) -> Result<(), ProxyError> {
+    let unsupported =
+        || ProxyError::bad_request("Kiro image input has an unsupported content location");
+    if body.get("system").is_some_and(contains_image_block) {
+        return Err(unsupported());
+    }
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            if contains_image_block(content) {
+                return Err(unsupported());
+            }
+            continue;
+        }
+        match content {
+            Value::Array(blocks) => {
+                for block in blocks {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("image") => {}
+                        Some("tool_result") => {
+                            if let Some(nested) = block.get("content") {
+                                match nested {
+                                    Value::Array(parts) => {
+                                        if parts.iter().any(|part| {
+                                            part.get("type").and_then(Value::as_str)
+                                                != Some("image")
+                                                && contains_image_block(part)
+                                        }) {
+                                            return Err(unsupported());
+                                        }
+                                    }
+                                    _ if contains_image_block(nested) => return Err(unsupported()),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ if contains_image_block(block) => return Err(unsupported()),
+                        _ => {}
+                    }
+                }
+            }
+            _ if contains_image_block(content) => return Err(unsupported()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn contains_image_block(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_image_block),
+        Value::Object(_) => match value.get("type").and_then(Value::as_str) {
+            Some("image") => true,
+            Some("tool_result") => value.get("content").is_some_and(contains_image_block),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn prepare_image(

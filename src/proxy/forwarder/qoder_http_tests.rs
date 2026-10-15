@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{get, post};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::domain::providers::model::{AppKind, AuthBinding, Provider, ProviderMeta, ProviderType};
@@ -59,12 +60,22 @@ impl QoderFixtureRail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QoderGenerationReply {
     Success,
+    ToolCall,
+    TerminalThenUnauthorized,
+    UsageThenReadFailure,
     LargeAggregate,
     LargeToolStream,
     HttpUnauthorized,
     OversizedHttpUnauthorized,
     EmbeddedUnauthorized,
     FirstBusinessThenUnauthorized,
+    MalformedWrapper,
+    InvalidToolIndex,
+    ConflictingToolAlias,
+    DuplicateChoice,
+    HeartbeatOnly,
+    InvalidSemanticText,
+    InvalidUsageTotal,
     Entitlement112,
     AgentLimit115,
 }
@@ -289,6 +300,81 @@ fn success_stream() -> Response {
         .unwrap()
 }
 
+fn tool_call_stream() -> Response {
+    let call = json!({
+        "id": "chat-qoder-fixture",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": MODEL_KEY,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_lookup",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"key\":\"one\"}"}
+            }]},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let body = qoder_wrapper(json!("OK"), call);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn terminal_then_unauthorized_stream() -> Response {
+    let chunks = vec![
+        Ok::<_, std::convert::Infallible>(qoder_wrapper(
+            json!("OK"),
+            inner_success_chunk(Some("ready"), false),
+        )),
+        Ok(qoder_wrapper(json!("OK"), inner_success_chunk(None, true))),
+        Ok(qoder_wrapper(
+            json!("UNAUTHORIZED"),
+            json!({"message": "late error after terminal"}),
+        )),
+    ];
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap()
+}
+
+fn usage_then_read_failure_stream() -> Response {
+    let mut usage = inner_success_chunk(None, false);
+    usage["usage"] = json!({
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3
+    });
+    let chunks = vec![
+        Ok(qoder_wrapper(
+            json!("OK"),
+            inner_success_chunk(Some("ready"), false),
+        )),
+        Ok(qoder_wrapper(json!("OK"), usage)),
+        Err(std::io::Error::other("fixture upstream read failure")),
+    ];
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(
+            futures_util::stream::iter(chunks)
+                .enumerate()
+                .then(|(index, chunk)| async move {
+                    if index == 2 {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    chunk
+                }),
+        ))
+        .unwrap()
+}
+
 fn large_aggregate_stream() -> Response {
     let content = "a".repeat(4 * 1024);
     let mut chunks = (0..96)
@@ -399,6 +485,9 @@ async fn qoder_generation(
         .unwrap_or(QoderGenerationReply::Success);
     match reply {
         QoderGenerationReply::Success => success_stream(),
+        QoderGenerationReply::ToolCall => tool_call_stream(),
+        QoderGenerationReply::TerminalThenUnauthorized => terminal_then_unauthorized_stream(),
+        QoderGenerationReply::UsageThenReadFailure => usage_then_read_failure_stream(),
         QoderGenerationReply::LargeAggregate => large_aggregate_stream(),
         QoderGenerationReply::LargeToolStream => large_tool_stream(),
         QoderGenerationReply::HttpUnauthorized => Response::builder()
@@ -417,6 +506,76 @@ async fn qoder_generation(
             embedded_error("UNAUTHORIZED", json!({"message": "embedded expired"}))
         }
         QoderGenerationReply::FirstBusinessThenUnauthorized => business_then_unauthorized(),
+        QoderGenerationReply::MalformedWrapper => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: null\n\ndata: [DONE]\n\n"))
+            .unwrap(),
+        QoderGenerationReply::InvalidToolIndex => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(qoder_wrapper(
+                json!("OK"),
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":null,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},"finish_reason":"tool_calls"}]}),
+            )))
+            .unwrap(),
+        QoderGenerationReply::ConflictingToolAlias => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(qoder_wrapper(
+                json!("OK"),
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call-a","call_id":"call-b","function":{"name":"lookup","arguments":"{}"}}
+                ]},"finish_reason":"tool_calls"}]}),
+            )))
+            .unwrap(),
+        QoderGenerationReply::DuplicateChoice => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(qoder_wrapper(
+                json!("OK"),
+                json!({"choices": [
+                    {"index": 0, "delta": {"content": "left"}, "finish_reason": null},
+                    {"index": 0, "delta": {"content": "right"}, "finish_reason": "stop"}
+                ]}),
+            )))
+            .unwrap(),
+        QoderGenerationReply::HeartbeatOnly => {
+            let mut body = qoder_wrapper(
+                json!("OK"),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":null}]}),
+            )
+            .to_vec();
+            body.extend_from_slice(b"data: [DONE]\n\n");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        QoderGenerationReply::InvalidSemanticText => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(qoder_wrapper(
+                json!("OK"),
+                json!({"choices":[{"index":0,"delta":{"reasoning_content":42},"finish_reason":"stop"}]}),
+            )))
+            .unwrap(),
+        QoderGenerationReply::InvalidUsageTotal => {
+            let mut chunk = inner_success_chunk(Some("ready"), true);
+            chunk["usage"] = json!({
+                "prompt_tokens": 4,
+                "completion_tokens": 3,
+                "total_tokens": 2
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(qoder_wrapper(json!("OK"), chunk)))
+                .unwrap()
+        }
         QoderGenerationReply::Entitlement112 => {
             embedded_error("FORBIDDEN", json!({"code": 112, "message": "not entitled"}))
         }
@@ -739,6 +898,22 @@ async fn collect(response: Response) -> Vec<u8> {
         .to_vec()
 }
 
+fn qoder_responses_id(body: &str, stream_requested: bool) -> String {
+    if stream_requested {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "response.completed")
+            .and_then(|event| event["response"]["id"].as_str().map(str::to_string))
+            .unwrap()
+    } else {
+        serde_json::from_str::<Value>(body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+}
+
 fn run_qoder_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -940,6 +1115,890 @@ fn qoder_http_fixture_covers_all_credential_rails_and_client_surfaces() {
                 }
             }
         }
+    });
+}
+
+#[test]
+fn qoder_unknown_responses_continuation_never_reaches_generation() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for stream_requested in [false, true] {
+                let name = format!(
+                    "qoder-unknown-continuation-{}-{stream_requested}",
+                    rail.label()
+                );
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) = install_qoder_provider(
+                    &state,
+                    &name,
+                    AppKind::Codex,
+                    rail,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(
+                    &state,
+                    &share_id,
+                    AppKind::Codex,
+                    &provider_id,
+                    "owner@example.com",
+                )
+                .await;
+                let body = Bytes::from(
+                    json!({
+                        "model": MODEL_KEY,
+                        "input": "follow up",
+                        "previous_response_id": "resp_unknown",
+                        "stream": stream_requested
+                    })
+                    .to_string(),
+                );
+                let error = super::forward_for_test_surface(
+                    state,
+                    ProxyRoute::CodexResponses,
+                    provider_id,
+                    None,
+                    qoder_headers(&share_id, "owner@example.com", "continuation-session"),
+                    body,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::CONFLICT, "{name}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 0, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_responses_ids_are_unique_across_requests_and_stream_modes() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for stream_requested in [false, true] {
+                let name = format!("qoder-response-id-{}-{stream_requested}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) = install_qoder_provider(
+                    &state,
+                    &name,
+                    AppKind::Codex,
+                    rail,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(
+                    &state,
+                    &share_id,
+                    AppKind::Codex,
+                    &provider_id,
+                    "owner@example.com",
+                )
+                .await;
+                let mut response_ids = Vec::new();
+                for _ in 0..2 {
+                    let response = forward_qoder_surface(
+                        state.clone(),
+                        AppKind::Codex,
+                        provider_id.clone(),
+                        &share_id,
+                        "owner@example.com",
+                        "response-id-session",
+                        stream_requested,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = String::from_utf8(collect(response).await).unwrap();
+                    let id = qoder_responses_id(&body, stream_requested);
+                    assert!(id.starts_with("resp_"), "{name}: {id}");
+                    assert!(!id.contains("chat-qoder-fixture"), "{name}: {id}");
+                    response_ids.push(id);
+                }
+                assert_ne!(response_ids[0], response_ids[1], "{name}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 2, "{name}");
+                let generations = fixture.generation_observations();
+                assert_ne!(
+                    generations[0].decoded_body.as_ref().unwrap()["session_id"],
+                    generations[1].decoded_body.as_ref().unwrap()["session_id"],
+                    "independent Responses calls cannot append to the same COSY session"
+                );
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_responses_previous_id_reuses_only_the_bound_cosy_session() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for first_stream in [false, true] {
+                for second_stream in [false, true] {
+                    let name = format!(
+                        "qoder-responses-continuation-{}-{first_stream}-{second_stream}",
+                        rail.label()
+                    );
+                    let (address, fixture, server) =
+                        spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                    let state = qoder_test_state(&name);
+                    let (provider_id, _) = install_qoder_provider(
+                        &state,
+                        &name,
+                        AppKind::Codex,
+                        rail,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_qoder_share(
+                        &state,
+                        &share_id,
+                        AppKind::Codex,
+                        &provider_id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let first = forward_qoder_surface(
+                        state.clone(),
+                        AppKind::Codex,
+                        provider_id.clone(),
+                        &share_id,
+                        "owner@example.com",
+                        "same-downstream-session",
+                        first_stream,
+                    )
+                    .await
+                    .unwrap();
+                    let first_body = String::from_utf8(collect(first).await).unwrap();
+                    let first_id = qoder_responses_id(&first_body, first_stream);
+                    let second = super::forward_for_test_surface(
+                        state.clone(),
+                        ProxyRoute::CodexResponses,
+                        provider_id.clone(),
+                        None,
+                        qoder_headers(&share_id, "owner@example.com", "same-downstream-session"),
+                        Bytes::from(
+                            json!({
+                                "model": MODEL_KEY,
+                                "input": "follow up",
+                                "previous_response_id": first_id,
+                                "stream": second_stream
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(second.status(), StatusCode::OK, "{name}");
+                    let second_body = String::from_utf8(collect(second).await).unwrap();
+                    let second_id = qoder_responses_id(&second_body, second_stream);
+                    assert_ne!(first_id, second_id, "{name}");
+                    let generations = fixture.generation_observations();
+                    assert_eq!(generations.len(), 2, "{name}");
+                    let first_wire = generations[0].decoded_body.as_ref().unwrap();
+                    let second_wire = generations[1].decoded_body.as_ref().unwrap();
+                    assert_eq!(
+                        first_wire["session_id"], second_wire["session_id"],
+                        "{name}"
+                    );
+                    assert_eq!(
+                        second_wire["messages"].as_array().unwrap().len(),
+                        1,
+                        "{name}"
+                    );
+                    assert_eq!(second_wire["messages"][0]["role"], "user", "{name}");
+                    assert_eq!(
+                        second_wire["chat_context"]["text"]["text"], "follow up",
+                        "{name}"
+                    );
+                    let replay = super::forward_for_test_surface(
+                        state,
+                        ProxyRoute::CodexResponses,
+                        provider_id,
+                        None,
+                        qoder_headers(&share_id, "owner@example.com", "same-downstream-session"),
+                        Bytes::from(
+                            json!({
+                                "model": MODEL_KEY,
+                                "input": "duplicate follow up",
+                                "previous_response_id": first_id,
+                                "stream": false
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(replay.status, StatusCode::CONFLICT, "{name}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 2, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_responses_concurrent_followups_claim_one_alias_once() {
+    run_qoder_async_test(async {
+        let (address, fixture, server) = spawn_qoder_upstream(
+            QoderFixtureRail::GlobalOauth,
+            vec![QoderGenerationReply::Success],
+        )
+        .await;
+        let state = qoder_test_state("qoder-concurrent-followups");
+        let (provider_id, _) = install_qoder_provider(
+            &state,
+            "qoder-concurrent-followups",
+            AppKind::Codex,
+            QoderFixtureRail::GlobalOauth,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = "qoder-concurrent-followups-share";
+        install_qoder_share(
+            &state,
+            share_id,
+            AppKind::Codex,
+            &provider_id,
+            "owner@example.com",
+        )
+        .await;
+        let first = forward_qoder_surface(
+            state.clone(),
+            AppKind::Codex,
+            provider_id.clone(),
+            share_id,
+            "owner@example.com",
+            "concurrent-session",
+            false,
+        )
+        .await
+        .unwrap();
+        let first_body = String::from_utf8(collect(first).await).unwrap();
+        let response_id = qoder_responses_id(&first_body, false);
+        let followup = |text: &'static str| {
+            super::forward_for_test_surface(
+                state.clone(),
+                ProxyRoute::CodexResponses,
+                provider_id.clone(),
+                None,
+                qoder_headers(share_id, "owner@example.com", "concurrent-session"),
+                Bytes::from(
+                    json!({
+                        "model": MODEL_KEY,
+                        "input": text,
+                        "previous_response_id": response_id,
+                        "stream": false
+                    })
+                    .to_string(),
+                ),
+            )
+        };
+        let (left, right) = tokio::join!(followup("left"), followup("right"));
+        let successes = usize::from(left.is_ok()) + usize::from(right.is_ok());
+        assert_eq!(successes, 1);
+        let failure = if let Err(error) = left {
+            error
+        } else {
+            right.unwrap_err()
+        };
+        assert_eq!(failure.status, StatusCode::CONFLICT);
+        assert_eq!(fixture.count(&fixture.generation_requests), 2);
+        server.abort();
+    });
+}
+
+#[test]
+fn qoder_responses_continuation_pairs_prior_tool_call_with_new_result() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for first_stream in [false, true] {
+                let name = format!("qoder-tool-continuation-{}-{first_stream}", rail.label());
+                let (address, fixture, server) = spawn_qoder_upstream(
+                    rail,
+                    vec![
+                        QoderGenerationReply::ToolCall,
+                        QoderGenerationReply::Success,
+                    ],
+                )
+                .await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) = install_qoder_provider(
+                    &state,
+                    &name,
+                    AppKind::Codex,
+                    rail,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(
+                    &state,
+                    &share_id,
+                    AppKind::Codex,
+                    &provider_id,
+                    "owner@example.com",
+                )
+                .await;
+                let first = super::forward_for_test_surface(
+                    state.clone(),
+                    ProxyRoute::CodexResponses,
+                    provider_id.clone(),
+                    None,
+                    qoder_headers(&share_id, "owner@example.com", "tool-session"),
+                    Bytes::from(
+                        json!({
+                            "model": MODEL_KEY,
+                            "input": "look up one",
+                            "tools": [{
+                                "type": "function",
+                                "name": "lookup",
+                                "parameters": {"type": "object", "properties": {"key": {"type": "string"}}}
+                            }],
+                            "stream": first_stream
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(first.status(), StatusCode::OK, "{name}");
+                let first_body = String::from_utf8(collect(first).await).unwrap();
+                let first_id = qoder_responses_id(&first_body, first_stream);
+                let second = super::forward_for_test_surface(
+                    state,
+                    ProxyRoute::CodexResponses,
+                    provider_id,
+                    None,
+                    qoder_headers(&share_id, "owner@example.com", "tool-session"),
+                    Bytes::from(
+                        json!({
+                            "model": MODEL_KEY,
+                            "input": [{
+                                "type": "function_call_output",
+                                "call_id": "call_lookup",
+                                "output": "result-one"
+                            }],
+                            "previous_response_id": first_id,
+                            "stream": false
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(second.status(), StatusCode::OK, "{name}");
+                let second_body: Value = serde_json::from_slice(&collect(second).await).unwrap();
+                assert_eq!(second_body["status"], "completed", "{name}");
+                let generations = fixture.generation_observations();
+                assert_eq!(generations.len(), 2, "{name}");
+                let first_wire = generations[0].decoded_body.as_ref().unwrap();
+                let second_wire = generations[1].decoded_body.as_ref().unwrap();
+                assert_eq!(
+                    first_wire["session_id"], second_wire["session_id"],
+                    "{name}"
+                );
+                assert_eq!(
+                    second_wire["messages"].as_array().unwrap().len(),
+                    1,
+                    "{name}"
+                );
+                assert_eq!(second_wire["messages"][0]["role"], "tool", "{name}");
+                assert_eq!(
+                    second_wire["messages"][0]["tool_call_id"], "call_lookup",
+                    "{name}"
+                );
+                assert_eq!(second_wire["messages"][0]["name"], "lookup", "{name}");
+                assert_eq!(second_wire["tools"], json!([]), "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_cancelled_responses_stream_does_not_publish_continuation() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            let name = format!("qoder-cancelled-continuation-{}", rail.label());
+            let (address, fixture, server) =
+                spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+            let state = qoder_test_state(&name);
+            let (provider_id, _) = install_qoder_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                rail,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_qoder_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            let response = forward_qoder_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id.clone(),
+                &share_id,
+                "owner@example.com",
+                "cancelled-session",
+                true,
+            )
+            .await
+            .unwrap();
+            let mut stream = response.into_body().into_data_stream();
+            let first = stream.next().await.unwrap().unwrap();
+            let first = std::str::from_utf8(&first).unwrap();
+            let response_id = first
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["type"] == "response.created")
+                .and_then(|event| event["response"]["id"].as_str().map(str::to_string))
+                .unwrap();
+            drop(stream);
+            let error = super::forward_for_test_surface(
+                state,
+                ProxyRoute::CodexResponses,
+                provider_id,
+                None,
+                qoder_headers(&share_id, "owner@example.com", "cancelled-session"),
+                Bytes::from(
+                    json!({
+                        "model": MODEL_KEY,
+                        "input": "follow up",
+                        "previous_response_id": response_id,
+                        "stream": false
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT, "{name}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn qoder_final_terminal_chunk_commits_and_allows_immediate_continuation() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex] {
+                let name = format!(
+                    "qoder-final-terminal-drop-{}-{}",
+                    rail.label(),
+                    app.as_str()
+                );
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let state = qoder_test_state(&name);
+                let (provider_id, account_id) =
+                    install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
+                        .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let response = forward_qoder_surface(
+                    state.clone(),
+                    app,
+                    provider_id.clone(),
+                    &share_id,
+                    "owner@example.com",
+                    "final-terminal-session",
+                    true,
+                )
+                .await
+                .unwrap();
+                let terminal = match app {
+                    AppKind::Claude => "message_stop",
+                    AppKind::Codex => "response.completed",
+                    AppKind::Gemini => unreachable!("Gemini finishReason may precede EOF"),
+                };
+                let mut body = response.into_body().into_data_stream();
+                let terminal_chunk = tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let chunk = body
+                            .next()
+                            .await
+                            .expect("Qoder stream ended before terminal")
+                            .unwrap();
+                        if String::from_utf8_lossy(&chunk).contains(terminal) {
+                            break chunk;
+                        }
+                    }
+                })
+                .await
+                .expect("Qoder terminal chunk must arrive");
+                drop(body);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let done = state.usage_snapshot().await.logs.last().is_some_and(|log| {
+                            log.stream_status.as_deref() == Some("completed")
+                                && log.outcome == UsageOutcome::Success
+                        });
+                        if done
+                            && !state.share_in_flight.has_in_flight(&share_id)
+                            && state
+                                .account_in_flight
+                                .snapshot()
+                                .current(ProviderType::QoderCosy, &account_id)
+                                == 0
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{name}: a delivered final terminal was not recorded as success")
+                });
+                if app == AppKind::Codex {
+                    let terminal_text = std::str::from_utf8(&terminal_chunk).unwrap();
+                    let response_id = qoder_responses_id(terminal_text, true);
+                    let second = super::forward_for_test_surface(
+                        state,
+                        ProxyRoute::CodexResponses,
+                        provider_id,
+                        None,
+                        qoder_headers(&share_id, "owner@example.com", "final-terminal-session"),
+                        Bytes::from(
+                            json!({
+                                "model": MODEL_KEY,
+                                "input": "follow up",
+                                "previous_response_id": response_id,
+                                "stream": false
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(second.status(), StatusCode::OK, "{name}");
+                    let second_body: Value =
+                        serde_json::from_slice(&collect(second).await).unwrap();
+                    assert_eq!(second_body["status"], "completed", "{name}");
+                }
+                assert_eq!(
+                    fixture.count(&fixture.generation_requests),
+                    if app == AppKind::Codex { 2 } else { 1 },
+                    "{name}"
+                );
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_late_error_after_terminal_never_exposes_success_before_failure() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex] {
+                let name = format!("qoder-late-error-{}-{}", rail.label(), app.as_str());
+                let (address, fixture, server) = spawn_qoder_upstream(
+                    rail,
+                    vec![QoderGenerationReply::TerminalThenUnauthorized],
+                )
+                .await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
+                        .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let response = forward_qoder_surface(
+                    state.clone(),
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "late-error-session",
+                    true,
+                )
+                .await
+                .unwrap();
+                let body = String::from_utf8(collect(response).await).unwrap();
+                assert!(body.contains("ready"), "{name}: {body}");
+                assert!(!body.contains("response.completed"), "{name}: {body}");
+                if app == AppKind::Claude {
+                    let error_at = body.find("event: error").expect("Claude error event");
+                    assert!(
+                        !body[..error_at].contains("event: message_delta"),
+                        "{name}: {body}"
+                    );
+                    assert!(
+                        body.find("event: message_stop")
+                            .is_some_and(|stop_at| stop_at > error_at),
+                        "{name}: {body}"
+                    );
+                }
+                let usage = state.usage_snapshot().await;
+                let log = usage.logs.last().expect("Qoder usage log");
+                assert_eq!(
+                    log.stream_status.as_deref(),
+                    Some("upstream_error"),
+                    "{name}"
+                );
+                assert_eq!(log.input_tokens, Some(2), "{name}");
+                assert_eq!(log.output_tokens, Some(1), "{name}");
+                assert_eq!(log.total_tokens, Some(3), "{name}");
+                assert_ne!(log.outcome, UsageOutcome::Success, "{name}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_stream_read_failure_preserves_observed_usage_without_success() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-read-failure-{}-{}", rail.label(), app.as_str());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::UsageThenReadFailure])
+                        .await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
+                        .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let response = forward_qoder_surface(
+                    state.clone(),
+                    app,
+                    provider_id.clone(),
+                    &share_id,
+                    "owner@example.com",
+                    "read-failure-session",
+                    true,
+                )
+                .await
+                .unwrap();
+                let body = String::from_utf8(collect(response).await).unwrap();
+                assert!(body.contains("ready"), "{name}: {body}");
+                assert!(!body.contains("response.completed"), "{name}: {body}");
+                let usage = state.usage_snapshot().await;
+                let log = usage.logs.last().expect("Qoder usage log");
+                assert_eq!(
+                    log.stream_status.as_deref(),
+                    Some("upstream_error"),
+                    "{name}"
+                );
+                assert_eq!(log.input_tokens, Some(2), "{name}");
+                assert_eq!(log.output_tokens, Some(1), "{name}");
+                assert_eq!(log.total_tokens, Some(3), "{name}");
+                assert_ne!(log.outcome, UsageOutcome::Success, "{name}");
+                if app == AppKind::Codex {
+                    let response_id = body
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .find(|event| event["type"] == "response.created")
+                        .and_then(|event| event["response"]["id"].as_str().map(str::to_string))
+                        .expect("Qoder response.created ID");
+                    let followup = super::forward_for_test_surface(
+                        state.clone(),
+                        ProxyRoute::CodexResponses,
+                        provider_id,
+                        None,
+                        qoder_headers(&share_id, "owner@example.com", "read-failure-session"),
+                        Bytes::from(
+                            json!({
+                                "model": MODEL_KEY,
+                                "input": "follow up",
+                                "previous_response_id": response_id,
+                                "stream": false
+                            })
+                            .to_string(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(followup.status, StatusCode::CONFLICT, "{name}");
+                }
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_responses_alias_rejects_share_user_model_and_account_drift_before_network() {
+    run_qoder_async_test(async {
+        let (address, fixture, server) = spawn_qoder_upstream(
+            QoderFixtureRail::GlobalOauth,
+            vec![QoderGenerationReply::Success],
+        )
+        .await;
+        let state = qoder_test_state("qoder-response-scope-drift");
+        let (provider_id, account_id) = install_qoder_provider(
+            &state,
+            "qoder-response-scope-drift",
+            AppKind::Codex,
+            QoderFixtureRail::GlobalOauth,
+            &format!("http://{address}"),
+        )
+        .await;
+        let share_id = "qoder-response-scope-drift-share";
+        let other_share = "qoder-response-scope-drift-other";
+        for share in [share_id, other_share] {
+            install_qoder_share(
+                &state,
+                share,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+        }
+        let first = forward_qoder_surface(
+            state.clone(),
+            AppKind::Codex,
+            provider_id.clone(),
+            share_id,
+            "owner@example.com",
+            "scope-session",
+            false,
+        )
+        .await
+        .unwrap();
+        let first_body = String::from_utf8(collect(first).await).unwrap();
+        let response_id = qoder_responses_id(&first_body, false);
+        let first_share_id = share_id.to_string();
+        state
+            .mutate_shares_immediate(move |shares| {
+                let share = shares
+                    .shares
+                    .iter_mut()
+                    .find(|share| share.id == first_share_id)
+                    .unwrap();
+                share.user_grants.insert(
+                    "other@example.com".to_string(),
+                    serde_json::from_value(json!({
+                        "email": "other@example.com",
+                        "role": "user",
+                        "active": true
+                    }))
+                    .unwrap(),
+                );
+            })
+            .await
+            .unwrap();
+        for (share, user, model) in [
+            (other_share, "owner@example.com", MODEL_KEY),
+            (share_id, "other@example.com", MODEL_KEY),
+            (share_id, "owner@example.com", "different-model"),
+        ] {
+            let result = super::forward_for_test_surface(
+                state.clone(),
+                ProxyRoute::CodexResponses,
+                provider_id.clone(),
+                None,
+                qoder_headers(share, user, "scope-session"),
+                Bytes::from(
+                    json!({
+                        "model": model,
+                        "input": "follow up",
+                        "previous_response_id": response_id,
+                        "stream": false
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+            let error = result.err().unwrap_or_else(|| {
+                panic!("{share}/{user}/{model} unexpectedly accepted a foreign response ID")
+            });
+            assert_eq!(error.status, StatusCode::CONFLICT, "{share}/{user}/{model}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        }
+        let mut accounts = state.accounts_snapshot().await;
+        accounts
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .unwrap()
+            .token_refresh_generation += 1;
+        state.replace_account_store_for_test(accounts).await;
+        let error = super::forward_for_test_surface(
+            state,
+            ProxyRoute::CodexResponses,
+            provider_id,
+            None,
+            qoder_headers(share_id, "owner@example.com", "scope-session"),
+            Bytes::from(
+                json!({
+                    "model": MODEL_KEY,
+                    "input": "follow up",
+                    "previous_response_id": response_id,
+                    "stream": false
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+        assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+        server.abort();
     });
 }
 
@@ -1415,6 +2474,351 @@ fn qoder_stream_replays_auth_before_commit_but_never_after_business_output() {
 }
 
 #[test]
+fn qoder_malformed_sse_wrapper_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-malformed-wrapper-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::MalformedWrapper]).await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let error = forward_qoder_surface(
+                    state,
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "malformed-wrapper-session",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_undeclared_forced_tool_fails_before_generation_on_all_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-undeclared-choice-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let (route, gemini_path, body) = surface_request(app, false);
+                let mut request: Value = serde_json::from_slice(&body).unwrap();
+                match app {
+                    AppKind::Claude => {
+                        request["tools"] =
+                            json!([{"name":"read","input_schema":{"type":"object"}}]);
+                        request["tool_choice"] = json!({"type":"tool","name":"missing"});
+                    }
+                    AppKind::Codex => {
+                        request["tools"] = json!([{"type":"function","name":"read","parameters":{"type":"object"}}]);
+                        request["tool_choice"] = json!({"type":"function","name":"missing"});
+                    }
+                    AppKind::Gemini => {
+                        request["tools"] = json!([{"functionDeclarations":[{"name":"read","parameters":{"type":"object"}}]}]);
+                        request["toolConfig"] = json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["missing"]}});
+                    }
+                }
+                let error = super::forward_for_test_surface(
+                    state,
+                    route,
+                    provider_id,
+                    gemini_path,
+                    qoder_headers(&share_id, "owner@example.com", "forced-choice-session"),
+                    Bytes::from(request.to_string()),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_REQUEST, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 0, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_invalid_tool_index_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-invalid-tool-index-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::InvalidToolIndex]).await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let error = forward_qoder_surface(
+                    state,
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "invalid-tool-index-session",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_conflicting_tool_alias_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-conflicting-tool-alias-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::ConflictingToolAlias])
+                        .await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let error = forward_qoder_surface(
+                    state,
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "conflicting-tool-alias-session",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_duplicate_choice_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-duplicate-choice-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::DuplicateChoice]).await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let error = forward_qoder_surface(
+                    state,
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "duplicate-choice-session",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_invalid_semantic_text_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for stream in [false, true] {
+                    let name = format!(
+                        "qoder-invalid-semantic-text-{}-{app:?}-{stream}",
+                        rail.label()
+                    );
+                    let (address, fixture, server) =
+                        spawn_qoder_upstream(rail, vec![QoderGenerationReply::InvalidSemanticText])
+                            .await;
+                    let state = qoder_test_state(&name);
+                    let origin = format!("http://{address}");
+                    let (provider_id, _) =
+                        install_qoder_provider(&state, &name, app, rail, &origin).await;
+                    let share_id = format!("{name}-share");
+                    install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                        .await;
+
+                    let error = forward_qoder_surface(
+                        state,
+                        app,
+                        provider_id,
+                        &share_id,
+                        "owner@example.com",
+                        "invalid-semantic-text-session",
+                        stream,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_heartbeat_only_success_status_fails_before_commit_on_every_bound_surface() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for stream in [false, true] {
+                    let name = format!("qoder-empty-stream-{}-{app:?}-{stream}", rail.label());
+                    let (address, fixture, server) =
+                        spawn_qoder_upstream(rail, vec![QoderGenerationReply::HeartbeatOnly]).await;
+                    let state = qoder_test_state(&name);
+                    let origin = format!("http://{address}");
+                    let (provider_id, _) =
+                        install_qoder_provider(&state, &name, app, rail, &origin).await;
+                    let share_id = format!("{name}-share");
+                    install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                        .await;
+
+                    let error = forward_qoder_surface(
+                        state,
+                        app,
+                        provider_id,
+                        &share_id,
+                        "owner@example.com",
+                        "heartbeat-only-session",
+                        stream,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_invalid_usage_total_fails_all_bound_rails_and_surfaces() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-invalid-usage-total-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::InvalidUsageTotal]).await;
+                let state = qoder_test_state(&name);
+                let origin = format!("http://{address}");
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &origin).await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+
+                let error = forward_qoder_surface(
+                    state,
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "invalid-usage-total-session",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
+                assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
 fn qoder_112_does_not_refresh_and_115_cools_only_the_bound_account() {
     run_qoder_async_test(async {
         for (reply, expected_status) in [
@@ -1485,7 +2889,7 @@ fn qoder_112_does_not_refresh_and_115_cools_only_the_bound_account() {
 }
 
 #[test]
-fn qoder_conversation_scope_isolates_share_user_session_and_account_generation() {
+fn qoder_responses_root_conversations_are_independent_and_generation_fenced() {
     run_qoder_async_test(async {
         let (address, fixture, server) = spawn_qoder_upstream(
             QoderFixtureRail::GlobalOauth,
@@ -1565,7 +2969,7 @@ fn qoder_conversation_scope_isolates_share_user_session_and_account_generation()
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(before[0], before[1]);
+        assert_ne!(before[0], before[1]);
         assert_ne!(before[0], before[2]);
         assert_ne!(before[0], before[3]);
         assert_ne!(before[0], before[4]);
@@ -1596,6 +3000,97 @@ fn qoder_conversation_scope_isolates_share_user_session_and_account_generation()
             after.last().unwrap().decoded_body.as_ref().unwrap()["session_id"]
         );
         server.abort();
+    });
+}
+
+#[test]
+fn qoder_catalog_cache_refetches_after_same_generation_request_identity_change() {
+    run_qoder_async_test(async {
+        for changed in ["credential", "machine"] {
+            let (address, fixture, server) = spawn_qoder_upstream(
+                QoderFixtureRail::GlobalOauth,
+                vec![QoderGenerationReply::Success],
+            )
+            .await;
+            let state = qoder_test_state(&format!("qoder-cache-{changed}"));
+            let origin = format!("http://{address}");
+            let (provider_id, account_id) = install_qoder_provider(
+                &state,
+                &format!("qoder-cache-{changed}"),
+                AppKind::Codex,
+                QoderFixtureRail::GlobalOauth,
+                &origin,
+            )
+            .await;
+            let share_id = format!("qoder-cache-{changed}-share");
+            install_qoder_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            let first = forward_qoder_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id.clone(),
+                &share_id,
+                "owner@example.com",
+                "same-session",
+                false,
+            )
+            .await
+            .unwrap();
+            let _ = collect(first).await;
+            assert_eq!(fixture.count(&fixture.model_requests), 1);
+            let original_account = state.find_account_by_id(&account_id).await.unwrap();
+
+            state
+                .mutate_accounts_immediate(|accounts| {
+                    let account = accounts
+                        .accounts
+                        .iter_mut()
+                        .find(|account| account.id == account_id)
+                        .unwrap();
+                    match changed {
+                        "credential" => {
+                            account.access_token = Some("same-generation-new-token".to_string())
+                        }
+                        "machine" => {
+                            account.profile.as_mut().unwrap()["machineId"] =
+                                json!("abcdef0123456789abcdef0123456789abcd")
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .unwrap();
+            let second = forward_qoder_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id.clone(),
+                &share_id,
+                "owner@example.com",
+                "same-session",
+                false,
+            )
+            .await
+            .unwrap();
+            let _ = collect(second).await;
+            assert_eq!(fixture.count(&fixture.model_requests), 2, "{changed}");
+            assert_eq!(fixture.count(&fixture.generation_requests), 2, "{changed}");
+            let account = state.find_account_by_id(&account_id).await.unwrap();
+            assert_eq!(
+                account.auth_identity_generation, original_account.auth_identity_generation,
+                "{changed}"
+            );
+            assert_eq!(
+                account.token_refresh_generation, original_account.token_refresh_generation,
+                "{changed}"
+            );
+            server.abort();
+        }
     });
 }
 

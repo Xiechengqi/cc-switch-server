@@ -64,7 +64,10 @@ use super::credential_cache::{CursorApiKeyCredentialScope, CursorModelCatalogSco
 use super::event_emitter::{
     AgentEvent, AgentSseWriter, CapturedToolCall, ComposerMarkerFilter, MarkerEvent,
 };
-use super::h2_client::{cursor_transport_diagnostic, CursorH2Stream, CursorH2Timeouts};
+use super::h2_client::{
+    cursor_resource_exhausted_is_size, cursor_transport_diagnostic, CursorH2Stream,
+    CursorH2Timeouts,
+};
 use super::identity::{
     cursor_account_for_api_key, cursor_account_from_managed_account, cursor_agentservice_headers,
     CursorAccountData,
@@ -702,6 +705,7 @@ async fn drive_semantic_attempts(
             deadline,
             drive_non_stream(
                 state,
+                stored,
                 session_entry.clone(),
                 &session_key,
                 response_format,
@@ -1003,6 +1007,12 @@ fn cursor_stream_provider_outcome(status_code: u16, stream_status: &str) -> Prov
         "memory_capacity" => ProviderOutcome::CapacityShed {
             status_code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
         },
+        "failed" if status_code == StatusCode::TOO_MANY_REQUESTS.as_u16() => {
+            ProviderOutcome::RateLimited { status_code }
+        }
+        "failed" if status_code == StatusCode::BAD_REQUEST.as_u16() => {
+            ProviderOutcome::from_status(status_code)
+        }
         "failed" => ProviderOutcome::NetworkFailure,
         _ => ProviderOutcome::from_status(status_code),
     }
@@ -1296,6 +1306,37 @@ pub async fn forward_agentservice(
     .await?;
     let session_entry = opened.entry;
     session_key = opened.key;
+    let final_response_scope = if response_scope.is_some() && !compact {
+        if let Err(error) =
+            ensure_cursor_session_scope_current(&session_open_context, &session_key).await
+        {
+            state
+                .cursor_sessions
+                .release(session_entry, SessionState::Closed)
+                .await;
+            return Err(error);
+        }
+        match cursor_completed_response_scope(
+            &state,
+            &stored,
+            &runtime_fingerprint,
+            &request_context,
+            &plan.working_directory,
+        )
+        .await
+        {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                state
+                    .cursor_sessions
+                    .release(session_entry, SessionState::Closed)
+                    .await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let session_memory_result = {
         let mut session = session_entry.lock().await;
         if resolved_session.parked.is_some() {
@@ -1312,14 +1353,10 @@ pub async fn forward_agentservice(
             .await;
         return Err(error.into_proxy_error());
     }
-    let response_state = (!compact)
-        .then(|| {
-            response_scope.map(|scope| CursorResponseStateContext {
-                scope,
-                local_task_state: local_task_state.clone(),
-            })
-        })
-        .flatten();
+    let response_state = final_response_scope.map(|scope| CursorResponseStateContext {
+        scope,
+        local_task_state: local_task_state.clone(),
+    });
 
     let model = usage_model_metadata(&adapter_request);
     let semantic_tool_choice = semantic_tool_constraint_for_plan(&plan);
@@ -1656,10 +1693,17 @@ async fn stream_response(
             .sync_buffered_events(&start_events)
             .map_err(|error| error.into_proxy_error())?;
     }
-    state
+    if let Err(error) = state
         .cursor_sessions
-        .bind_response_id(&session_key, &session_entry, writer.message_id())
-        .await;
+        .try_bind_response_id(&session_key, &session_entry, writer.message_id())
+        .await
+    {
+        state
+            .cursor_sessions
+            .release(session_entry, SessionState::Closed)
+            .await;
+        return Err(error.into_proxy_error());
+    }
     let request_id = log_usage(
         &state,
         &stored,
@@ -1725,11 +1769,11 @@ async fn stream_response(
                 .and_then(super::super::downstream_keepalive::DownstreamKeepalive::deadline)
             {
                 tokio::select! {
-                    frame = next_session_frame(&session_entry) => Some(frame),
+                    frame = next_session_frame(&state, &stored, &session_entry) => Some(frame),
                     _ = tokio::time::sleep_until(deadline) => None,
                 }
             } else {
-                Some(next_session_frame(&session_entry).await)
+                Some(next_session_frame(&state, &stored, &session_entry).await)
             };
             let Some(frame_result) = frame_result else {
                 let now = tokio::time::Instant::now();
@@ -2407,8 +2451,10 @@ async fn stream_semantic_response(
     response
 }
 
+#[allow(clippy::too_many_arguments)] // The pinned Provider is needed for in-band rate-limit accounting.
 async fn drive_non_stream(
     state: &ServerState,
+    stored: &StoredProvider,
     session_entry: Arc<tokio::sync::Mutex<CursorSession>>,
     session_key: &CursorSessionKey,
     response_format: super::protocol::CursorResponseFormat,
@@ -2434,10 +2480,17 @@ async fn drive_non_stream(
     let mut writer = AgentSseWriter::new(response_model, response_format, input_tokens)
         .with_custom_tool_names(custom_tool_names.clone())
         .with_response_tool_namespaces(response_tool_namespaces);
-    state
+    if let Err(error) = state
         .cursor_sessions
-        .bind_response_id(session_key, &session_entry, writer.message_id())
-        .await;
+        .try_bind_response_id(session_key, &session_entry, writer.message_id())
+        .await
+    {
+        state
+            .cursor_sessions
+            .release(session_entry, SessionState::Closed)
+            .await;
+        return Err(error.into_proxy_error());
+    }
     let mut buffered_events = writer.start_events();
     let mut filter = ComposerMarkerFilter::default();
     let mut exec_dedup = ExecDedup::default();
@@ -2455,7 +2508,7 @@ async fn drive_non_stream(
     )?;
     let mut observation = SemanticAttemptObservation::default();
     loop {
-        let Some(frame) = next_session_frame(&session_entry)
+        let Some(frame) = next_session_frame(state, stored, &session_entry)
             .await
             .inspect_err(|_error| {
                 record_cursor_agentservice_failure(
@@ -2733,6 +2786,13 @@ enum CursorDeltaOutcome {
     TurnEnded(Vec<String>),
 }
 
+fn cursor_marker_only_tool_error() -> ProxyError {
+    ProxyError {
+        status: StatusCode::NOT_IMPLEMENTED,
+        message: "Cursor AgentService emitted a marker-only tool call without Exec/MCP metadata; session resume requires an AgentService MCP event".to_string(),
+    }
+}
+
 fn cursor_delta_events(
     delta: InteractionDelta,
     writer: &mut AgentSseWriter,
@@ -2744,15 +2804,7 @@ fn cursor_delta_events(
             for event in filter.push(&text) {
                 match event {
                     MarkerEvent::Text(text) => out.extend(writer.event(&AgentEvent::Text(text))),
-                    MarkerEvent::ToolCall(tool_call) => {
-                        return Err(ProxyError {
-                            status: StatusCode::NOT_IMPLEMENTED,
-                            message: format!(
-                                "Cursor AgentService emitted marker-only tool call `{}` without Exec/MCP metadata; session resume requires an AgentService MCP event",
-                                tool_call.name
-                            ),
-                        });
-                    }
+                    MarkerEvent::ToolCall(_) => return Err(cursor_marker_only_tool_error()),
                 }
             }
             Ok(CursorDeltaOutcome::Events(out))
@@ -2774,15 +2826,7 @@ fn cursor_delta_events(
             for event in filter.flush() {
                 match event {
                     MarkerEvent::Text(text) => out.extend(writer.event(&AgentEvent::Text(text))),
-                    MarkerEvent::ToolCall(tool_call) => {
-                        return Err(ProxyError {
-                            status: StatusCode::NOT_IMPLEMENTED,
-                            message: format!(
-                                "Cursor AgentService emitted marker-only tool call `{}` without Exec/MCP metadata; session resume requires an AgentService MCP event",
-                                tool_call.name
-                            ),
-                        });
-                    }
+                    MarkerEvent::ToolCall(_) => return Err(cursor_marker_only_tool_error()),
                 }
             }
             Ok(CursorDeltaOutcome::TurnEnded(out))
@@ -2816,15 +2860,7 @@ fn flush_cursor_marker_filter(
     for event in filter.flush() {
         match event {
             MarkerEvent::Text(text) => out.extend(writer.event(&AgentEvent::Text(text))),
-            MarkerEvent::ToolCall(tool_call) => {
-                return Err(ProxyError {
-                    status: StatusCode::NOT_IMPLEMENTED,
-                    message: format!(
-                        "Cursor AgentService emitted marker-only tool call `{}` without Exec/MCP metadata; session resume requires an AgentService MCP event",
-                        tool_call.name
-                    ),
-                });
-            }
+            MarkerEvent::ToolCall(_) => return Err(cursor_marker_only_tool_error()),
         }
     }
     Ok(out)
@@ -3323,6 +3359,7 @@ async fn acquire_or_open_session(
     parked: Option<&CursorSessionReference>,
     attempt_context: &mut CursorAttemptContext,
 ) -> Result<OpenedCursorSession, ProxyError> {
+    ensure_cursor_session_scope_current(context, session_key).await?;
     if let Some(parked) = parked {
         let entry = context
             .state
@@ -3335,6 +3372,14 @@ async fn acquire_or_open_session(
                     session_key.conversation_id()
                 ))
             })?;
+        if let Err(error) = ensure_cursor_session_scope_current(context, session_key).await {
+            context
+                .state
+                .cursor_sessions
+                .release(entry, SessionState::Closed)
+                .await;
+            return Err(error);
+        }
         if let Some(request_memory) = context.request_memory {
             let transfer = {
                 let mut session = entry.lock().await;
@@ -3373,14 +3418,25 @@ async fn acquire_or_open_session(
             context.timeouts.request,
         )
         .await?;
+        ensure_cursor_session_scope_current(context, &active_session_key).await?;
         let access_token = credential.access_token().to_string();
         match open_agent_stream(context, &credential, &active_session_key).await {
             Ok(entry) => {
+                if let Err(error) =
+                    ensure_cursor_session_scope_current(context, &active_session_key).await
+                {
+                    context
+                        .state
+                        .cursor_sessions
+                        .release(entry, SessionState::Closed)
+                        .await;
+                    return Err(error);
+                }
                 return Ok(OpenedCursorSession {
                     entry,
                     access_token: Some(access_token),
                     key: active_session_key,
-                })
+                });
             }
             Err(error) => {
                 let action = cursor_agentservice_auth_action(
@@ -3422,6 +3478,25 @@ async fn acquire_or_open_session(
     }
 }
 
+async fn ensure_cursor_session_scope_current(
+    context: &CursorSessionOpenContext<'_>,
+    session_key: &CursorSessionKey,
+) -> Result<(), ProxyError> {
+    let current = cursor_session_scope(
+        context.state,
+        context.stored,
+        context.runtime_fingerprint,
+        context.request_context,
+    )
+    .await?;
+    if &current != session_key.scope() {
+        return Err(ProxyError::conflict(
+            "Cursor account request identity changed; start a new request",
+        ));
+    }
+    Ok(())
+}
+
 async fn acquire_ready_session(
     context: &CursorSessionOpenContext<'_>,
     session_key: &CursorSessionKey,
@@ -3445,6 +3520,15 @@ async fn acquire_ready_session(
             CursorAgentServiceAuthAction::UseResponse => {
                 ensure_cursor_success_status(context.state, context.stored, &opened.entry, status)
                     .await?;
+                if let Err(error) = ensure_cursor_session_scope_current(context, &opened.key).await
+                {
+                    context
+                        .state
+                        .cursor_sessions
+                        .release(opened.entry, SessionState::Closed)
+                        .await;
+                    return Err(error);
+                }
                 return Ok(opened);
             }
             CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
@@ -3640,6 +3724,65 @@ fn cursor_error_message_from_body(body: &[u8]) -> Option<String> {
     Some(cursor_transport_diagnostic(&detail))
 }
 
+fn cursor_agentservice_json_error(payload: &[u8]) -> Option<ProxyError> {
+    if payload.len() > MAX_CURSOR_ERROR_BODY_BYTES
+        || payload
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            != Some(b'{')
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let error = value.get("error")?;
+    if !error.is_object() && !error.is_string() {
+        return None;
+    }
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let detail = cursor_error_field(
+        &value,
+        &[
+            "/error/details/0/debug/details/title",
+            "/error/details/0/debug/details/detail",
+            "/error/message",
+        ],
+    )
+    .unwrap_or_default();
+    match code.as_str() {
+        "resource_exhausted" | "resource exhausted" => {
+            if cursor_resource_exhausted_is_size(&detail) {
+                Some(ProxyError::bad_request(
+                    "Cursor AgentService request is too large",
+                ))
+            } else {
+                let now = crate::infra::time::now_ms() as i64;
+                let until = cursor_rate_limit_until(&HeaderMap::new(), payload, now);
+                let retry_after_seconds = u64::try_from(until.saturating_sub(now))
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(999)
+                    / 1_000;
+                Some(ProxyError::rate_limited(
+                    "Cursor AgentService resource exhausted",
+                    retry_after_seconds,
+                ))
+            }
+        }
+        "rate_limited" | "rate_limit_exceeded" | "quota_exceeded" => Some(
+            ProxyError::rate_limited("Cursor AgentService usage limit exceeded", 60),
+        ),
+        _ => Some(ProxyError::bad_gateway(
+            "Cursor AgentService returned an upstream error",
+        )),
+    }
+}
+
 fn cursor_error_field(value: &Value, pointers: &[&str]) -> Option<String> {
     pointers.iter().find_map(|pointer| {
         let value = value.pointer(pointer)?;
@@ -3750,14 +3893,41 @@ fn number_at(value: &Value, pointer: &str) -> Option<i64> {
 }
 
 async fn next_session_frame(
+    state: &ServerState,
+    stored: &StoredProvider,
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
 ) -> Result<Option<ConnectFrame>, ProxyError> {
-    let mut session = session_entry.lock().await;
-    let stream = session
-        .stream
-        .as_mut()
-        .ok_or_else(|| ProxyError::conflict("Cursor AgentService session has no live h2 stream"))?;
-    stream.next_frame().await
+    let (result, headers, body) = {
+        let mut session = session_entry.lock().await;
+        let stream = session.stream.as_mut().ok_or_else(|| {
+            ProxyError::conflict("Cursor AgentService session has no live h2 stream")
+        })?;
+        let result = stream.next_frame().await;
+        let headers = stream.trailers().cloned().unwrap_or_default();
+        match result {
+            Ok(Some(frame)) => match cursor_agentservice_json_error(&frame.payload) {
+                Some(error) => (Err(error), headers, Some(frame.payload)),
+                None => (Ok(Some(frame)), headers, None),
+            },
+            Ok(None) => (Ok(None), headers, None),
+            Err(error) => (Err(error), headers, None),
+        }
+    };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.status == StatusCode::TOO_MANY_REQUESTS)
+    {
+        maybe_mark_cursor_rate_limited(
+            state,
+            stored,
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            body.as_deref().unwrap_or_default(),
+        )
+        .await;
+    }
+    result
 }
 
 async fn close_failed_cursor_stream_session(
@@ -3877,11 +4047,6 @@ async fn surface_mcp_tool_call(
     )
     .increment(1);
 
-    let client_call_id = if tool_call_id.trim().is_empty() {
-        random_call_id()
-    } else {
-        tool_call_id.to_string()
-    };
     let custom = custom_tool_names
         .iter()
         .any(|name| tool_names_equal(name, &resolved.name));
@@ -3889,8 +4054,9 @@ async fn surface_mcp_tool_call(
         .iter()
         .find(|wire| tool_names_equal(&wire.internal_name, &resolved.name));
     let arguments_json = serde_json::to_string(&resolved.args).unwrap_or_else(|_| "{}".to_string());
-    {
+    let client_call_id = {
         let mut session = session_entry.lock().await;
+        let client_call_id = client_tool_call_id(tool_call_id, &session.pending_tool_calls);
         session.pending_tool_calls.insert(
             client_call_id.clone(),
             PendingToolCall {
@@ -3930,17 +4096,40 @@ async fn surface_mcp_tool_call(
         session
             .refresh_request_memory()
             .map_err(|error| error.into_proxy_error())?;
-    }
+        client_call_id
+    };
     state
         .cursor_sessions
-        .bind_tool_call_id(&session_key, session_entry, &client_call_id)
-        .await;
+        .try_bind_tool_call_id(&session_key, session_entry, &client_call_id)
+        .await
+        .map_err(|error| error.into_proxy_error())?;
 
     Ok(ExecHandling::ToolCall(CapturedToolCall {
         id: client_call_id,
         name: resolved.name,
         arguments_json,
     }))
+}
+
+const MAX_CLIENT_TOOL_CALL_ID_LEN: usize = 512;
+
+fn client_tool_call_id(
+    upstream_id: &str,
+    pending: &std::collections::HashMap<String, PendingToolCall>,
+) -> String {
+    if !upstream_id.is_empty()
+        && upstream_id.len() <= MAX_CLIENT_TOOL_CALL_ID_LEN
+        && upstream_id.trim() == upstream_id
+        && !pending.contains_key(upstream_id)
+    {
+        return upstream_id.to_string();
+    }
+    loop {
+        let generated = random_call_id();
+        if !pending.contains_key(&generated) {
+            return generated;
+        }
+    }
 }
 
 async fn resolve_session_key(
@@ -4174,10 +4363,6 @@ async fn close_unusable_continuation_session(
         if let Some(entry) = state.cursor_sessions.acquire_resolved(&reference).await {
             let mut reservation_guard =
                 CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
-            state
-                .cursor_sessions
-                .claim_continuation_ids(scope, &continuation_ids)
-                .await;
             let snapshot = {
                 let mut session = entry.lock().await;
                 if let Some(request_memory) = request_memory {
@@ -4198,6 +4383,30 @@ async fn close_unusable_continuation_session(
                 )
             };
             let (semantic_items, local_task_state, memory) = snapshot;
+            // Do not mark IDs as consumed until the fallible snapshot and its
+            // memory reservations have succeeded. A failed snapshot closes
+            // the parked entry through the guard, but must not poison retries.
+            if let Err(error) = state
+                .cursor_sessions
+                .claim_continuation_ids(scope, &continuation_ids)
+                .await
+            {
+                state
+                    .cursor_sessions
+                    .release(entry, SessionState::Closed)
+                    .await;
+                reservation_guard.disarm();
+                return Err(match error {
+                    super::session::CursorContinuationClaimError::AlreadyClaimed => {
+                        ProxyError::cursor_continuation_in_progress(
+                            "Cursor continuation was already resumed by another request",
+                        )
+                    }
+                    super::session::CursorContinuationClaimError::CapacityExhausted => {
+                        ProxyError::cursor_continuation_claim_capacity_exhausted()
+                    }
+                });
+            }
             state
                 .cursor_sessions
                 .release(entry, SessionState::Closed)
@@ -4361,17 +4570,24 @@ async fn open_agent_stream(
             plan.working_directory.clone(),
         )
         .await
-        .map_err(|conflict| {
-            let state = match conflict.state {
-                SessionState::Running => "running",
-                SessionState::AwaitingToolResult => "awaiting_tool_result",
-                SessionState::Closed => "closed",
-            };
-            metrics::counter!("cursor_session_conflict_total", "state" => state).increment(1);
-            ProxyError::cursor_conversation_busy(format!(
-                "Cursor conversation is busy in state {:?}",
-                conflict.state
-            ))
+        .map_err(|error| match error {
+            super::session::CursorSessionReserveError::ConversationBusy(conflict) => {
+                let state = match conflict.state {
+                    SessionState::Running => "running",
+                    SessionState::AwaitingToolResult => "awaiting_tool_result",
+                    SessionState::Closed => "closed",
+                };
+                metrics::counter!("cursor_session_conflict_total", "state" => state).increment(1);
+                ProxyError::cursor_conversation_busy(format!(
+                    "Cursor conversation is busy in state {:?}",
+                    conflict.state
+                ))
+            }
+            super::session::CursorSessionReserveError::CapacityExhausted => {
+                metrics::counter!("cursor_session_conflict_total", "state" => "capacity")
+                    .increment(1);
+                ProxyError::cursor_session_capacity_exhausted()
+            }
         })?;
     let mut reservation_guard =
         CursorSessionReservationGuard::new(state.cursor_sessions.clone(), entry.clone());
@@ -4456,10 +4672,7 @@ async fn cursor_session_scope(
             let account = authoritative_managed_account(stored, &accounts).ok_or_else(|| {
                 ProxyError::conflict("Cursor OAuth account identity changed; rebind the Provider")
             })?;
-            format!(
-                "oauth:{}:{}:{}",
-                account.id, account.auth_identity_generation, account.token_refresh_generation
-            )
+            cursor_oauth_scope_principal(&accounts, account)?
         }
         ProviderType::CursorApiKey => {
             let api_key = cursor_api_key(stored)?;
@@ -4470,8 +4683,10 @@ async fn cursor_session_scope(
                 .map(|identity| identity.account_id.clone())
                 .unwrap_or_else(|| cursor_api_key_hash(&api_key));
             format!(
-                "apikey:{}:{}",
-                principal, stored.resource.credential_generation
+                "apikey:{}:{}:{}",
+                principal,
+                stored.resource.credential_generation,
+                cursor_api_key_hash(&api_key)
             )
         }
         _ => {
@@ -4604,7 +4819,7 @@ async fn cursor_completed_response_scope(
             let account = authoritative_managed_account(stored, &accounts).ok_or_else(|| {
                 ProxyError::conflict("Cursor OAuth account identity changed; rebind the Provider")
             })?;
-            format!("oauth:{}:{}", account.id, account.auth_identity_generation)
+            cursor_oauth_scope_principal(&accounts, account)?
         }
         ProviderType::CursorApiKey => {
             let api_key = cursor_api_key(stored)?;
@@ -4632,6 +4847,44 @@ async fn cursor_completed_response_scope(
         user_email: request_context.user_email.as_deref(),
         workspace_id,
     }))
+}
+
+fn cursor_oauth_scope_principal(
+    accounts: &crate::domain::accounts::store::AccountStore,
+    account: &crate::domain::accounts::store::Account,
+) -> Result<String, ProxyError> {
+    let incarnation = accounts.account_incarnation(&account.id).ok_or_else(|| {
+        ProxyError::conflict("Cursor OAuth account instance changed; rebind the Provider")
+    })?;
+    let access_token = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| ProxyError::bad_request("Cursor OAuth access token is required"))?;
+    let normalized_token =
+        crate::domain::accounts::cursor_import::normalize_cursor_access_token(access_token);
+    let account_data = cursor_account_from_managed_account(account);
+    let material = serde_json::to_vec(&(
+        normalized_token,
+        &account_data,
+        &account.token_type,
+        &account.extra_headers,
+        account.expires_at,
+        account.needs_relogin,
+    ))
+    .map_err(|_| ProxyError::bad_gateway("Cursor OAuth request identity is invalid"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-server:cursor-oauth-state-identity:v1\0");
+    digest.update(material);
+    Ok(format!(
+        "oauth:{}:{}:{}:{}:{:x}",
+        account.id,
+        incarnation,
+        account.auth_identity_generation,
+        account.token_refresh_generation,
+        digest.finalize(),
+    ))
 }
 
 fn random_uuid_like() -> String {
@@ -4772,6 +5025,7 @@ fn cursor_stream_drop_classification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::cursor::agent_proto::McpToolDef;
     use futures_util::StreamExt;
 
     fn cursor_endpoint_provider(
@@ -4815,6 +5069,277 @@ mod tests {
             )),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cursor_oauth_session_scope_separates_same_generation_credentials_and_machine() {
+        let state = cursor_stream_test_state("oauth-session-identity");
+        let account_id = "cursor-oauth-session-identity-account";
+        let input: crate::domain::accounts::store::UpsertAccountInput =
+            serde_json::from_value(json!({
+                "id": account_id,
+                "providerType": "cursor_oauth",
+                "accessToken": "cursor-access-a",
+                "refreshToken": "cursor-refresh-a",
+                "profile": {"machineId": "cursor-machine-a"}
+            }))
+            .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(input.clone());
+            })
+            .await
+            .unwrap();
+        let mut stored = cursor_endpoint_provider(ProviderType::CursorOAuth, json!({}));
+        stored.provider.meta = Some(crate::domain::providers::model::ProviderMeta {
+            provider_type: Some(ProviderType::CursorOAuth.as_str().to_string()),
+            auth_binding: Some(crate::domain::providers::model::AuthBinding {
+                source: Some("account_store".to_string()),
+                auth_provider: Some(ProviderType::CursorOAuth.as_str().to_string()),
+                account_id: Some(account_id.to_string()),
+                auth_identity_generation: Some(1),
+            }),
+            ..Default::default()
+        });
+        let context = UsageLogContext {
+            share_id: Some("cursor-session-share".into()),
+            user_email: Some("owner@example.com".into()),
+            ..UsageLogContext::default()
+        };
+        let original = cursor_session_scope(&state, &stored, "runtime", &context)
+            .await
+            .unwrap();
+        let original_response =
+            cursor_completed_response_scope(&state, &stored, "runtime", &context, "workspace")
+                .await
+                .unwrap();
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap()
+                    .access_token = Some("cursor-access-b".into());
+            })
+            .await
+            .unwrap();
+        let changed_token = cursor_session_scope(&state, &stored, "runtime", &context)
+            .await
+            .unwrap();
+        assert_ne!(changed_token, original);
+        assert_ne!(
+            cursor_completed_response_scope(&state, &stored, "runtime", &context, "workspace")
+                .await
+                .unwrap(),
+            original_response,
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == account_id)
+                    .unwrap();
+                account.access_token = Some("cursor-access-a".into());
+                account.profile = Some(json!({"machineId": "cursor-machine-b"}));
+            })
+            .await
+            .unwrap();
+        let changed_machine = cursor_session_scope(&state, &stored, "runtime", &context)
+            .await
+            .unwrap();
+        assert_ne!(changed_machine, original);
+        assert_ne!(
+            cursor_completed_response_scope(&state, &stored, "runtime", &context, "workspace")
+                .await
+                .unwrap(),
+            original_response,
+        );
+        state
+            .mutate_accounts_immediate(|accounts| {
+                assert!(accounts.delete(account_id));
+                accounts.upsert(input.clone());
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            cursor_session_scope(&state, &stored, "runtime", &context)
+                .await
+                .unwrap(),
+            original,
+        );
+        assert_ne!(
+            cursor_completed_response_scope(&state, &stored, "runtime", &context, "workspace")
+                .await
+                .unwrap(),
+            original_response,
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_api_key_session_scope_separates_same_generation_keys() {
+        let state = cursor_stream_test_state("apikey-session-identity");
+        let mut stored = cursor_endpoint_provider(ProviderType::CursorApiKey, json!({}));
+        stored.provider.settings_config = json!({"apiKey": "cursor-key-a"});
+        stored.resource.cursor_verified_identity =
+            Some(crate::domain::providers::store::CursorVerifiedIdentity {
+                schema_version: 2,
+                account_id: "cursor-verified-account".into(),
+                principal_source: "user_id".into(),
+                verified_at_ms: 1_000,
+                email: None,
+                display_name: None,
+                credential_name: None,
+                subscription_level: None,
+            });
+        let context = UsageLogContext::default();
+        let original = cursor_session_scope(&state, &stored, "runtime", &context)
+            .await
+            .unwrap();
+        stored.provider.settings_config = json!({"apiKey": "cursor-key-b"});
+        let rotated = cursor_session_scope(&state, &stored, "runtime", &context)
+            .await
+            .unwrap();
+        assert_ne!(rotated, original);
+    }
+
+    #[test]
+    fn cursor_client_tool_ids_remain_exact_and_unique_for_parked_continuation() {
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            "call-a".to_string(),
+            PendingToolCall {
+                exec_msg_id: 1,
+                exec_id: "exec-a".to_string(),
+                tool_name: "read".to_string(),
+                custom: false,
+            },
+        );
+        assert_eq!(client_tool_call_id("call-b", &pending), "call-b");
+        assert_eq!(
+            client_tool_call_id(&"c".repeat(MAX_CLIENT_TOOL_CALL_ID_LEN), &pending).len(),
+            MAX_CLIENT_TOOL_CALL_ID_LEN
+        );
+        for upstream_id in [
+            "",
+            " call-b",
+            "call-b ",
+            "call-a",
+            &"c".repeat(MAX_CLIENT_TOOL_CALL_ID_LEN + 1),
+        ] {
+            let client_id = client_tool_call_id(upstream_id, &pending);
+            assert!(client_id.starts_with("call_"));
+            assert!(client_id.len() <= MAX_CLIENT_TOOL_CALL_ID_LEN);
+            assert_eq!(client_id.trim(), client_id);
+            assert!(!pending.contains_key(&client_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn non_responses_previous_id_can_become_a_session_conversation_key() {
+        let state = cursor_stream_test_state("client-conversation-key");
+        let scope = CursorSessionScope::fixture("client-conversation-key");
+        let client_id = "client-id-".to_string() + &"x".repeat(4096);
+        let body = json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "previous_response_id": client_id,
+        });
+        let plan = try_build_plan(InboundProtocol::OpenAiChat, &body).unwrap();
+        let resolved = resolve_session_key(
+            &state,
+            &plan,
+            &scope,
+            CursorProtocolRail::OAuthCli,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.key.conversation_id(), client_id);
+    }
+
+    #[tokio::test]
+    async fn cursor_surface_tool_calls_do_not_overwrite_duplicate_upstream_ids() {
+        let state = cursor_stream_test_state("duplicate-upstream-tool-ids");
+        let key = CursorSessionKey::new(
+            CursorSessionScope::fixture("duplicate-upstream-tool-ids"),
+            "conversation-a",
+        );
+        let entry = state
+            .cursor_sessions
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                std::collections::HashMap::new(),
+                vec![McpToolDef::new(
+                    "read".to_string(),
+                    String::new(),
+                    json!({"type":"object","additionalProperties":true}),
+                    "client".to_string(),
+                    "read".to_string(),
+                )],
+                Vec::new(),
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        let first = surface_mcp_tool_call(
+            &state,
+            &entry,
+            1,
+            "exec-a",
+            "read",
+            "call-a",
+            json!({"path":"a"}),
+        )
+        .await
+        .unwrap();
+        let second = surface_mcp_tool_call(
+            &state,
+            &entry,
+            2,
+            "exec-b",
+            "read",
+            "call-a",
+            json!({"path":"b"}),
+        )
+        .await
+        .unwrap();
+        let padded = surface_mcp_tool_call(
+            &state,
+            &entry,
+            3,
+            "exec-c",
+            "read",
+            " call-c ",
+            json!({"path":"c"}),
+        )
+        .await
+        .unwrap();
+        let ids = [first, second, padded]
+            .into_iter()
+            .map(|result| match result {
+                ExecHandling::ToolCall(call) => call.id,
+                _ => panic!("declared tool call must be surfaced"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], "call-a");
+        assert_ne!(ids[1], ids[0]);
+        assert_ne!(ids[2], ids[0]);
+        assert_ne!(ids[2], ids[1]);
+        let session = entry.lock().await;
+        assert_eq!(session.pending_tool_calls.len(), 3);
+        for (id, exec_id) in ids.iter().zip(["exec-a", "exec-b", "exec-c"]) {
+            assert_eq!(session.pending_tool_calls[id].exec_id, exec_id);
+        }
+        drop(session);
+        state
+            .cursor_sessions
+            .release(entry, SessionState::Closed)
+            .await;
     }
 
     #[test]
@@ -5015,6 +5540,122 @@ mod tests {
         assert_eq!(retry_one.scope(), retry_two.scope());
         assert_ne!(initial.conversation_id(), retry_one.conversation_id());
         assert_ne!(retry_one.conversation_id(), retry_two.conversation_id());
+    }
+
+    #[tokio::test]
+    async fn failed_cold_resume_snapshot_does_not_claim_unconsumed_ids() {
+        let state = cursor_stream_test_state("cold-resume-snapshot-budget");
+        let scope = CursorSessionScope::fixture("cold-resume-snapshot-budget");
+        let key = CursorSessionKey::new(scope.clone(), "parked-conversation");
+        let entry = state
+            .cursor_sessions
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![json!({"type":"message","role":"user","content":"hello"})],
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .cursor_sessions
+            .bind_tool_call_id(&key, &entry, "call-1")
+            .await;
+        state
+            .cursor_sessions
+            .release(entry, SessionState::AwaitingToolResult)
+            .await;
+
+        let budget = RequestMemoryBudget::new(1);
+        let result = close_unusable_continuation_session(
+            &state,
+            &scope,
+            &[super::super::request_builder::ToolResultBlock {
+                tool_call_id: "call-1".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+            }],
+            None,
+            Some(&budget),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !state
+                .cursor_sessions
+                .continuation_was_claimed(&scope, &["call-1".to_string()])
+                .await,
+            "a failed snapshot must not consume a continuation ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_resume_rejects_reused_claim_from_another_parked_session() {
+        let state = cursor_stream_test_state("cold-resume-reused-claim");
+        let scope = CursorSessionScope::fixture("cold-resume-reused-claim");
+        let consumed = "call-consumed".to_string();
+        let fresh = "call-fresh".to_string();
+        state
+            .cursor_sessions
+            .claim_continuation_ids(&scope, std::slice::from_ref(&consumed))
+            .await
+            .unwrap();
+
+        let key = CursorSessionKey::new(scope.clone(), "later-parked-conversation");
+        let entry = state
+            .cursor_sessions
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![json!({"type":"message","role":"user","content":"hello"})],
+                "/workspace".to_string(),
+            )
+            .await
+            .unwrap();
+        for id in [&consumed, &fresh] {
+            state
+                .cursor_sessions
+                .bind_tool_call_id(&key, &entry, id)
+                .await;
+        }
+        state
+            .cursor_sessions
+            .release(entry, SessionState::AwaitingToolResult)
+            .await;
+
+        let error = close_unusable_continuation_session(
+            &state,
+            &scope,
+            &[
+                super::super::request_builder::ToolResultBlock {
+                    tool_call_id: consumed.clone(),
+                    content: "done".to_string(),
+                    is_error: false,
+                },
+                super::super::request_builder::ToolResultBlock {
+                    tool_call_id: fresh.clone(),
+                    content: "done".to_string(),
+                    is_error: false,
+                },
+            ],
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("reused continuation claim must be rejected");
+        assert_eq!(error.error_code(), "cursor_continuation_in_progress");
+        assert!(!state.cursor_sessions.has(&key).await);
+        assert!(
+            !state
+                .cursor_sessions
+                .continuation_was_claimed(&scope, &[fresh])
+                .await
+        );
     }
 
     #[tokio::test]
@@ -5384,6 +6025,35 @@ mod tests {
     }
 
     #[test]
+    fn marker_only_tool_rejection_does_not_echo_upstream_name() {
+        for format in [
+            super::super::protocol::CursorResponseFormat::AnthropicMessages,
+            super::super::protocol::CursorResponseFormat::OpenAiResponses,
+            super::super::protocol::CursorResponseFormat::OpenAiChatCompletions,
+            super::super::protocol::CursorResponseFormat::GeminiGenerateContent,
+        ] {
+            let mut writer = AgentSseWriter::new("cursor-model".to_string(), format, 0);
+            let mut filter = ComposerMarkerFilter::default();
+            let error = cursor_delta_events(
+                InteractionDelta::Text(
+                    "<|tool_calls_begin|><|tool_call_begin|>private-marker-name<|tool_sep|>{}<|tool_call_end|><|tool_calls_end|>".to_string(),
+                ),
+                &mut writer,
+                &mut filter,
+            )
+            .err()
+            .expect("marker-only tool calls must be rejected");
+            assert_eq!(error.status, StatusCode::NOT_IMPLEMENTED, "{format:?}");
+            assert!(!error.message.contains("private-marker-name"), "{format:?}");
+            let wire = cursor_stream_error_events(&mut writer, &error).concat();
+            assert!(!wire.contains("private-marker-name"), "{format:?}");
+            if format == super::super::protocol::CursorResponseFormat::OpenAiResponses {
+                assert!(wire.contains("event: response.failed"));
+            }
+        }
+    }
+
+    #[test]
     fn cursor_business_output_classifier_is_independent_of_deferred_wire_events() {
         assert!(!cursor_events_are_business_output(
             true, false, false, false
@@ -5652,7 +6322,9 @@ mod tests {
             blob_store: HashMap::new(),
             state: SessionState::Running,
             last_activity: Instant::now(),
+            idle_expiry_task: None,
             request_memory: None,
+            index_retained_bytes: 0,
         }));
         let response = stream_response(
             state.clone(),
@@ -6445,6 +7117,46 @@ mod tests {
             cursor_stream_provider_outcome(error.status.as_u16(), stream_status),
             ProviderOutcome::CapacityShed { status_code: 503 }
         );
+    }
+
+    #[test]
+    fn cursor_in_band_rate_limit_is_not_a_network_failure() {
+        assert_eq!(
+            cursor_stream_provider_outcome(429, "failed"),
+            ProviderOutcome::RateLimited { status_code: 429 }
+        );
+        assert_eq!(
+            cursor_stream_provider_outcome(400, "failed"),
+            ProviderOutcome::Success { status_code: 400 }
+        );
+    }
+
+    #[test]
+    fn cursor_agentservice_json_error_classifies_quota_without_leaking_detail() {
+        let quota = br#"{"error":{"code":"resource_exhausted","message":"quota exhausted; authorization=secret","retry_after_ms":2500}}"#;
+        let frames = super::super::agent_proto::ConnectFrameParser::new()
+            .feed(&wrap_connect_frame(quota))
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        let error = cursor_agentservice_json_error(&frames[0].payload).unwrap();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!error.message.contains("secret"));
+        assert_eq!(cursor_rate_limit_until_from_body(quota, 1_000), Some(3_500));
+
+        let too_large = cursor_agentservice_json_error(
+            br#"{"error":{"code":"resource_exhausted","message":"request too large"}}"#,
+        )
+        .unwrap();
+        assert_eq!(too_large.status, StatusCode::BAD_REQUEST);
+
+        let unknown = cursor_agentservice_json_error(
+            br#"{"error":{"code":"future_error","message":"authorization=secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(unknown.status, StatusCode::BAD_GATEWAY);
+        assert!(!unknown.message.contains("secret"));
+        assert!(cursor_agentservice_json_error(br#"{"message":"ordinary"}"#).is_none());
+        assert!(cursor_agentservice_json_error(&vec![b' '; 8 * 1024 + 1]).is_none());
     }
 }
 

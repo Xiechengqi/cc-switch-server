@@ -324,6 +324,10 @@ const immutableReferenceReviewExtensionDigests = new Map([
     "QODER-SKILL-GATE-2026-09-28",
     "144bec34e50584c740930da7c8b0304611f8b8bfe74ab780451f49ed84180e13",
   ],
+  [
+    "QODER-CURRENT-HEAD-READ-ONLY-2026-10-14",
+    "70f258c18d63485194c1797e64566762d9bed020e6d4ceefbdbdc4b58ab453ba",
+  ],
 ]);
 const referenceReviewExtensions = new Map();
 for (const review of contract.referenceReviewExtensions ?? []) {
@@ -335,7 +339,11 @@ for (const review of contract.referenceReviewExtensions ?? []) {
     review.sourceId === "tokenrouter" &&
       sourceById.has(review.sourceId) &&
       review.repository === "TokenRouter" &&
-      Number.isFinite(Date.parse(review.reviewedAt)) &&
+      Number.isFinite(Date.parse(review.reviewedAt)),
+    `${review.id} has invalid reference review identity`,
+  );
+  if (review.id === "QODER-SKILL-GATE-2026-09-28") {
+    assert(
       review.status === "unreviewed_skill_gate" &&
       review.headCommit === "6d676f1d100e11f2f068949f5779e960c862079c" &&
       review.headTree === "4b830127433aa21c8534891526b3617bf90d2b80" &&
@@ -353,14 +361,56 @@ for (const review of contract.referenceReviewExtensions ?? []) {
       review.lastTrustedCommit === "7faf9469bc6957716923b5b4a98665c0fb9715e0" &&
       JSON.stringify(review.preservedLiveGates) ===
         JSON.stringify(["global_oauth", "global_pat", "cn_oauth"]),
-    `${review.id} changed the unavailable-skill review boundary`,
-  );
-  assert(
-    sourceSnapshotById.has(review.lastTrustedSnapshotId) &&
-      sourceSnapshotById.get(review.lastTrustedSnapshotId).headCommit ===
-        review.lastTrustedCommit,
-    `${review.id} changed the last trusted Qoder snapshot`,
-  );
+      `${review.id} changed the unavailable-skill review boundary`,
+    );
+    assert(
+      sourceSnapshotById.has(review.lastTrustedSnapshotId) &&
+        sourceSnapshotById.get(review.lastTrustedSnapshotId).headCommit ===
+          review.lastTrustedCommit,
+      `${review.id} changed the last trusted Qoder snapshot`,
+    );
+  } else if (review.id === "QODER-CURRENT-HEAD-READ-ONLY-2026-10-14") {
+    assert(
+      review.status === "reviewed_with_target_followups" &&
+        review.fromCommit === "7faf9469bc6957716923b5b4a98665c0fb9715e0" &&
+        review.fromTree === "b205061c4f0d9b53fbffb0242f34796e10b18251" &&
+        review.intermediateCommit === "6d676f1d100e11f2f068949f5779e960c862079c" &&
+        review.intermediateTree === "4b830127433aa21c8534891526b3617bf90d2b80" &&
+        review.headCommit === "c25dbf0cfa5a806460ed0fbc5c43a55797148537" &&
+        review.headTree === "8d3a7b4014e0f0c97d8f36895afac562f3c2a18e" &&
+        review.worktreeClean === false &&
+        review.worktreeChangesExcluded === true &&
+        JSON.stringify(review.excludedWorktreeEntries) ===
+          JSON.stringify([" D AGENTS.md"]) &&
+        review.readMode === "read_only_committed_git_objects" &&
+        review.businessFilesRead === true &&
+        review.businessAnalysisPerformed === true &&
+        review.reviewedPlanSections === "18.302-18.320" &&
+        review.productionCodeChangedInThisReview === true &&
+        JSON.stringify(review.preservedLiveGates) ===
+          JSON.stringify(["global_oauth", "global_pat", "cn_oauth"]),
+      `${review.id} changed the current-HEAD read-only review boundary`,
+    );
+    assert(
+      referenceReviewExtensions.get("QODER-SKILL-GATE-2026-09-28")?.headCommit ===
+        review.intermediateCommit &&
+        sourceById.get(review.sourceId)?.commit === review.fromCommit,
+      `${review.id} does not extend the frozen Qoder source history`,
+    );
+    if (checkSources) {
+      const sourceRoot = sourceRootById.get(review.sourceId);
+      for (const [commit, tree] of [
+        [review.fromCommit, review.fromTree],
+        [review.intermediateCommit, review.intermediateTree],
+        [review.headCommit, review.headTree],
+      ]) {
+        assert(
+          gitTree(sourceRoot, commit) === tree,
+          `${review.id} source tree drifted at ${commit}`,
+        );
+      }
+    }
+  }
   assert(
     immutableReferenceReviewExtensionDigests.get(review.id) === objectDigest(review),
     `${review.id} changed after it was recorded`,
@@ -369,7 +419,8 @@ for (const review of contract.referenceReviewExtensions ?? []) {
 }
 assert(
   referenceReviewExtensions.size === immutableReferenceReviewExtensionDigests.size &&
-    referenceReviewExtensions.has("QODER-SKILL-GATE-2026-09-28"),
+    referenceReviewExtensions.has("QODER-SKILL-GATE-2026-09-28") &&
+    referenceReviewExtensions.has("QODER-CURRENT-HEAD-READ-ONLY-2026-10-14"),
   "Qoder reference review extension history is incomplete",
 );
 
@@ -898,5 +949,5 @@ for (const [rail, site] of [
 }
 
 console.log(
-  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${referenceReviewExtensions.size} gated reference review, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
+  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${referenceReviewExtensions.size} reference reviews, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
 );

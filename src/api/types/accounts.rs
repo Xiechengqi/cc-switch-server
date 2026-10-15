@@ -88,11 +88,37 @@ pub(in crate::api) struct AccountPublicView {
     pub(in crate::api) has_extra_headers: bool,
     pub(in crate::api) has_profile: bool,
     pub(in crate::api) has_raw: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) kiro_credential_scope: Option<KiroCredentialScopeView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) qoder_credential_scope: Option<QoderCredentialScopeView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) codebuddy_credential_scope: Option<CodeBuddyCredentialScopeView>,
     pub(in crate::api) has_refresh_error: bool,
     pub(in crate::api) refresh_consecutive_failures: u32,
     pub(in crate::api) needs_relogin: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(in crate::api) capability_evidence: Vec<AccountCapabilityProjection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct KiroCredentialScopeView {
+    auth_kind: &'static str,
+    runtime_region: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct QoderCredentialScopeView {
+    site: &'static str,
+    credential_rail: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct CodeBuddyCredentialScopeView {
+    site: &'static str,
 }
 
 impl From<&Account> for AccountPublicView {
@@ -127,6 +153,40 @@ impl From<&Account> for AccountPublicView {
             has_extra_headers: !account.extra_headers.is_empty(),
             has_profile: account.profile.is_some(),
             has_raw: account.raw.is_some(),
+            kiro_credential_scope: (account.provider_type == ProviderType::KiroOAuth)
+                .then(|| {
+                    let identity =
+                        crate::domain::providers::kiro::operational_runtime_identity_from_account(
+                            account,
+                        )
+                        .ok()?;
+                    Some(KiroCredentialScopeView {
+                        auth_kind: crate::clients::oauth::kiro::account_auth_kind(account),
+                        runtime_region: identity.runtime_region,
+                    })
+                })
+                .flatten(),
+            qoder_credential_scope: (account.provider_type == ProviderType::QoderCosy)
+                .then(|| {
+                    crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref())
+                        .ok()
+                        .map(|profile| QoderCredentialScopeView {
+                            site: profile.site.as_str(),
+                            credential_rail: profile.credential_rail.as_str(),
+                        })
+                })
+                .flatten(),
+            codebuddy_credential_scope: (account.provider_type == ProviderType::CodeBuddyOAuth)
+                .then(|| {
+                    crate::domain::codebuddy::CodeBuddyAccountProfile::parse(
+                        account.profile.as_ref(),
+                    )
+                    .ok()
+                    .map(|profile| CodeBuddyCredentialScopeView {
+                        site: profile.site.as_str(),
+                    })
+                })
+                .flatten(),
             has_refresh_error: account
                 .last_refresh_error
                 .as_deref()
@@ -1053,6 +1113,122 @@ mod tests {
         assert!(serialized.contains("visible"));
         assert!(serialized.contains("tokenLimit"));
         assert!(serialized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn kiro_public_scope_exposes_effective_kind_and_region_without_profile_arn() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "kiro-scope",
+            "providerType": "kiro_oauth",
+            "accessToken": "access-secret",
+            "refreshToken": "refresh-secret",
+            "profile": {
+                "authMethod": "idc",
+                "profileArn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ORGPROFILE",
+                "profileProvenance": "discovered"
+            }
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+        assert_eq!(value["kiroCredentialScope"]["authKind"], "idc");
+        assert_eq!(
+            value["kiroCredentialScope"]["runtimeRegion"],
+            "eu-central-1"
+        );
+        assert!(!value.to_string().contains("123456789012"));
+        assert!(!value.to_string().contains("access-secret"));
+        assert!(!value.to_string().contains("refresh-secret"));
+
+        let invalid: Account = serde_json::from_value(json!({
+            "id": "kiro-invalid-scope",
+            "providerType": "kiro_oauth",
+            "profile": {"authMethod": "idc", "profileArn": "invalid"}
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&invalid)).unwrap();
+        assert!(value.get("kiroCredentialScope").is_none());
+    }
+
+    #[test]
+    fn qoder_public_scope_exposes_validated_site_and_rail_without_identity_or_secrets() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "qoder-global-account",
+            "providerType": "qoder_cosy",
+            "apiKey": "pt-secret-value",
+            "profile": {
+                "site": "global",
+                "credentialRail": "pat_job_token",
+                "refreshMode": "cosy",
+                "uid": "private-qoder-uid",
+                "machineId": "0123456789abcdef0123456789abcdef0123"
+            }
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+        assert_eq!(value["qoderCredentialScope"]["site"], "global");
+        assert_eq!(
+            value["qoderCredentialScope"]["credentialRail"],
+            "pat_job_token"
+        );
+        assert!(!value.to_string().contains("private-qoder-uid"));
+        assert!(!value
+            .to_string()
+            .contains("0123456789abcdef0123456789abcdef0123"));
+        assert!(!value.to_string().contains("pt-secret-value"));
+
+        let invalid: Account = serde_json::from_value(json!({
+            "id": "qoder-invalid-account",
+            "providerType": "qoder_cosy",
+            "profile": {
+                "site": "cn",
+                "credentialRail": "pat_job_token",
+                "refreshMode": "qodercn20",
+                "uid": "private-qoder-uid",
+                "machineId": "0123456789abcdef0123456789abcdef0123"
+            }
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&invalid)).unwrap();
+        assert!(value.get("qoderCredentialScope").is_none());
+    }
+
+    #[test]
+    fn codebuddy_public_scope_exposes_validated_site_without_domain_uid_or_tokens() {
+        let account: Account = serde_json::from_value(json!({
+            "id": "codebuddy-intl-account",
+            "providerType": "codebuddy_oauth",
+            "accessToken": "private-access-token",
+            "refreshToken": "private-refresh-token",
+            "profile": {
+                "site": "intl",
+                "domain": "www.codebuddy.ai",
+                "uid": "private-codebuddy-uid"
+            }
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+        assert_eq!(value["codebuddyCredentialScope"]["site"], "intl");
+        for secret in [
+            "www.codebuddy.ai",
+            "private-codebuddy-uid",
+            "private-access-token",
+            "private-refresh-token",
+        ] {
+            assert!(!value.to_string().contains(secret));
+        }
+
+        let invalid: Account = serde_json::from_value(json!({
+            "id": "codebuddy-invalid-account",
+            "providerType": "codebuddy_oauth",
+            "profile": {
+                "site": "intl",
+                "domain": "copilot.tencent.com",
+                "uid": "private-codebuddy-uid"
+            }
+        }))
+        .unwrap();
+        let value = serde_json::to_value(AccountPublicView::from(&invalid)).unwrap();
+        assert!(value.get("codebuddyCredentialScope").is_none());
     }
 
     #[test]

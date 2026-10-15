@@ -98,6 +98,100 @@ mod tests {
     }
 
     #[test]
+    fn end_event_rejects_malformed_nonempty_payload() {
+        let bytes = frame("endEvent", b"{invalid-json");
+        let mut decoder = EventStreamDecoder::strict();
+        let terminal = decoder.feed(&bytes).unwrap().remove(0);
+        assert!(matches!(
+            parse_event(terminal),
+            Err(WireError::InvalidEventPayload { ref event_type, .. }) if event_type == "endEvent"
+        ));
+
+        let bytes = frame("endEvent", br#"{}"#);
+        let terminal = decoder.feed(&bytes).unwrap().remove(0);
+        assert_eq!(parse_event(terminal).unwrap(), Event::End);
+
+        let bytes = frame("endEvent", b"");
+        let terminal = decoder.feed(&bytes).unwrap().remove(0);
+        assert_eq!(parse_event(terminal).unwrap(), Event::End);
+    }
+
+    #[test]
+    fn reasoning_event_rejects_explicit_non_string_content_without_dropping_it() {
+        for payload in [
+            br#"{"reasoningContentEvent":{"redactedContent":{"secret":"opaque"}}}"#.as_slice(),
+            br#"{"reasoningContentEvent":{"text":42}}"#.as_slice(),
+            br#"{"reasoningContentEvent":{"signature":["sig"]}}"#.as_slice(),
+            br#"{"reasoningContentEvent":true}"#.as_slice(),
+        ] {
+            let bytes = frame("reasoningContentEvent", payload);
+            let mut decoder = EventStreamDecoder::strict();
+            let event = decoder.feed(&bytes).unwrap().remove(0);
+            assert!(matches!(
+                parse_event(event),
+                Err(WireError::InvalidEventPayload { ref event_type, .. })
+                    if event_type == "reasoningContentEvent"
+            ));
+        }
+        for payload in [
+            br#"{"reasoningContentEvent":{"text":"thought","signature":"sig","redactedContent":"opaque"}}"#.as_slice(),
+            br#"{"reasoningContentEvent":{"text":null,"signature":null,"redactedContent":null}}"#.as_slice(),
+            br#"{"reasoningContentEvent":"legacy thought"}"#.as_slice(),
+        ] {
+            let bytes = frame("reasoningContentEvent", payload);
+            let mut decoder = EventStreamDecoder::strict();
+            let event = decoder.feed(&bytes).unwrap().remove(0);
+            assert!(matches!(parse_event(event), Ok(Event::Reasoning(_))));
+        }
+    }
+
+    #[test]
+    fn metadata_token_usage_rejects_non_integer_or_malformed_authoritative_counters() {
+        for (event_type, payload) in [
+            (
+                "metadataEvent",
+                br#"{"tokenUsage":{"outputTokens":2.75}}"#.as_slice(),
+            ),
+            (
+                "metadataEvent",
+                br#"{"tokenUsage":{"outputTokens":2.0}}"#.as_slice(),
+            ),
+            (
+                "messageMetadataEvent",
+                br#"{"messageMetadataEvent":{"tokenUsage":{"uncachedInputTokens":"12"}}}"#
+                    .as_slice(),
+            ),
+            (
+                "metadataEvent",
+                br#"{"tokenUsage":{"cacheReadInputTokens":2147483648}}"#.as_slice(),
+            ),
+            (
+                "metadataEvent",
+                br#"{"tokenUsage":{"cacheWriteInputTokens":null}}"#.as_slice(),
+            ),
+            ("metadataEvent", br#"{"tokenUsage":[1,2]}"#.as_slice()),
+        ] {
+            let bytes = frame(event_type, payload);
+            let event = EventStreamDecoder::strict().feed(&bytes).unwrap().remove(0);
+            assert!(matches!(
+                parse_event(event),
+                Err(WireError::InvalidEventPayload { event_type: ref actual, .. })
+                    if actual == event_type
+            ));
+        }
+        for payload in [
+            br#"{"tokenUsage":{"outputTokens":2,"uncachedInputTokens":-1}}"#.as_slice(),
+            br#"{"metadataEvent":{"tokenUsage":{"output_tokens":2,"inputTokens":10}}}"#.as_slice(),
+            br#"{"tokenUsage":null}"#.as_slice(),
+            br#"{"stopReason":"end_turn"}"#.as_slice(),
+        ] {
+            let bytes = frame("metadataEvent", payload);
+            let event = EventStreamDecoder::strict().feed(&bytes).unwrap().remove(0);
+            assert!(matches!(parse_event(event), Ok(Event::Usage { .. })));
+        }
+    }
+
+    #[test]
     fn unknown_message_type_is_rejected_without_echoing_its_value() {
         let bytes = frame_with_message_type(
             "assistantResponseEvent",

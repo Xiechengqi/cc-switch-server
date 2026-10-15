@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-28T00:00:00Z",
+  "updatedAt": "2026-10-14T00:00:00Z",
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",
@@ -100,6 +100,35 @@
       "productionCodeChanged": false,
       "lastTrustedSnapshotId": "tokenrouter-2026-09-19",
       "lastTrustedCommit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+      "preservedLiveGates": [
+        "global_oauth",
+        "global_pat",
+        "cn_oauth"
+      ]
+    },
+    {
+      "id": "QODER-CURRENT-HEAD-READ-ONLY-2026-10-14",
+      "sourceId": "tokenrouter",
+      "repository": "TokenRouter",
+      "reviewedAt": "2026-10-14T00:00:00Z",
+      "status": "reviewed_with_target_followups",
+      "fromCommit": "7faf9469bc6957716923b5b4a98665c0fb9715e0",
+      "fromTree": "b205061c4f0d9b53fbffb0242f34796e10b18251",
+      "intermediateCommit": "6d676f1d100e11f2f068949f5779e960c862079c",
+      "intermediateTree": "4b830127433aa21c8534891526b3617bf90d2b80",
+      "headCommit": "c25dbf0cfa5a806460ed0fbc5c43a55797148537",
+      "headTree": "8d3a7b4014e0f0c97d8f36895afac562f3c2a18e",
+      "worktreeClean": false,
+      "worktreeChangesExcluded": true,
+      "excludedWorktreeEntries": [
+        " D AGENTS.md"
+      ],
+      "readMode": "read_only_committed_git_objects",
+      "businessFilesRead": true,
+      "businessAnalysisPerformed": true,
+      "reviewedPlanSections": "18.302-18.320",
+      "conclusion": "Qoder-reachable migration and current-HEAD paths classified; partial-usage and nested-error followups covered in target; no further single-account COSY outbound wire delta found",
+      "productionCodeChangedInThisReview": true,
       "preservedLiveGates": [
         "global_oauth",
         "global_pat",

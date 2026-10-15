@@ -18,6 +18,9 @@ const contract = JSON.parse(
 );
 const HARNESS_REVISION = 2;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const API_KEY_CATALOG_MAX_AGE_MS = 5 * 60 * 1_000;
+const CATALOG_CLOCK_SKEW_MS = 60_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 let failureReported = false;
 
 function reportFailure() {
@@ -225,11 +228,106 @@ if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("Cursor receipt file must stay outside the repository");
 }
 const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.nlink !== 1) {
+  fail("Cursor receipt file must have one filesystem link");
+}
 if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
   fail("Cursor receipt file size is invalid");
 }
 if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("Cursor receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("Cursor receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Cursor receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("Cursor receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("Cursor receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("Cursor receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("Cursor receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Cursor receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("Cursor receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("Cursor receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -265,10 +363,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (hasSecretLike(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -318,8 +437,8 @@ async function validateAccount() {
     account.tokenRefreshGeneration < 0 ||
     account.hasAccessToken !== true ||
     account.hasRefreshToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false
   ) {
     fail("Cursor Account is not a live refreshable OAuth identity generation");
   }
@@ -392,28 +511,31 @@ async function validateBinding(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Cursor Share",
   );
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const selectedBindings = bindings.filter((binding) => binding?.app === app);
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
   if (
-    !bindings.some(
-      (binding) =>
-        binding?.app === app &&
-        binding?.providerId === providerId &&
-        binding?.providerType === spec.providerType,
-    )
+    share.enabled !== true ||
+    share.status !== "active" ||
+    selectedBindings.length !== 1 ||
+    selectedBindings[0].providerId !== providerId ||
+    selectedBindings[0].providerType !== spec.providerType ||
+    primaryBindings.length !== 1 ||
+    primaryBindings[0].providerId !== share.providerId ||
+    primaryBindings[0].providerType !== share.providerType
   ) {
     fail("Cursor Share is not fixed to the selected Provider rail");
   }
-  const providerRevision =
-    view.runtime?.providerRevision ?? view.revision ?? view.providerRevision ?? 0;
-  const runtimeFingerprint = String(view.runtime?.runtimeFingerprint || "");
-  const shareRevision = share.configRevision ?? 0;
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
+  const shareRevision = share.configRevision;
   if (
     !Number.isSafeInteger(providerRevision) ||
     providerRevision < 0 ||
-    !runtimeFingerprint ||
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim() ||
     !Number.isSafeInteger(shareRevision) ||
     shareRevision < 0
   ) {
@@ -427,8 +549,27 @@ async function validateBinding(account) {
   };
 }
 
+function freshApiKeyCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return (
+    Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs >= now - API_KEY_CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + CATALOG_CLOCK_SKEW_MS
+  );
+}
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + 5 * 60_000;
+}
+
 async function validateCatalog() {
-  const query = new URLSearchParams({ app, providerId });
+  const query = new URLSearchParams({
+    app,
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
@@ -438,9 +579,35 @@ async function validateCatalog() {
   if (!Array.isArray(catalog?.data)) {
     fail("Cursor model catalog violated the public contract");
   }
+  if (rail === "api_key") {
+    const modelIds = catalog.data.map((entry) => entry?.id);
+    if (
+      modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+      new Set(modelIds).size !== modelIds.length
+    ) {
+      fail("Cursor API-key catalog has incomplete or duplicate model IDs");
+    }
+  }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail("Cursor model catalog did not preserve the exact fresh *-fast id");
   }
+  if (rail === "api_key") {
+    if (
+      catalog.source !== "cursor_public_api" ||
+      catalog.stale !== false ||
+      !freshApiKeyCatalogTimestamp(catalog.fetchedAtMs)
+    ) {
+      fail("Cursor API-key catalog is not fresh bound-credential evidence");
+    }
+  }
+  return rail === "api_key" ? {
+    fetchedAtMs: catalog.fetchedAtMs,
+    digest: digest(
+      "cc-switch-server:cursor-api-key-catalog:v1",
+      [...catalog.data].sort((left, right) =>
+        left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
+  } : null;
 }
 
 function expectedDecisions() {
@@ -514,12 +681,7 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
     fail("Cursor receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("Cursor receipt timestamp is outside the acceptance window");
   }
   const checkKeys = Object.keys(receipt.checks || {}).sort();
@@ -604,13 +766,15 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding) {
   ) {
     fail("Cursor receipt did not prove fixed binding and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBinding(account);
-  await validateCatalog();
+  const catalogSnapshot = await validateCatalog();
   const scopeDigest = digest("cc-switch-server:cursor-real-scope:v2", {
     rail,
     targetCommit,
@@ -629,11 +793,36 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("Cursor receipt file is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest, targetCommit, account, binding);
+  const recordedAt = validateReceipt(receipt, scopeDigest, targetCommit, account, binding);
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBinding(finalAccount);
+  if (!sameCanonical(
+    { accountId: finalAccount?.id ?? null, binding: finalBinding },
+    { accountId: account?.id ?? null, binding },
+  )) {
+    fail("Cursor Account, Provider, Share, or credential scope drifted during acceptance");
+  }
+  // The API-key catalog is credential-bound and can change while the receipt and
+  // final binding are checked. OAuth's static alias list is not entitlement evidence.
+  const finalCatalogSnapshot = rail === "api_key" ? await validateCatalog() : null;
+  const acceptanceNow = Date.now();
+  if (rail === "api_key" && (
+    !freshApiKeyCatalogTimestamp(catalogSnapshot.fetchedAtMs, acceptanceNow) ||
+    !freshApiKeyCatalogTimestamp(finalCatalogSnapshot.fetchedAtMs, acceptanceNow)
+  )) {
+    fail("Cursor API-key catalog expired during acceptance");
+  }
+  if (rail === "api_key" && catalogSnapshot.digest !== finalCatalogSnapshot.digest) {
+    fail("Cursor API-key catalog changed during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("Cursor receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(

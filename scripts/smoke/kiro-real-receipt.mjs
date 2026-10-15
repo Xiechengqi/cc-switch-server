@@ -5,6 +5,19 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+let failureReported = false;
+
+function reportFailure() {
+  if (!failureReported) {
+    failureReported = true;
+    console.error("[FAIL] Kiro acceptance failed (details redacted)");
+  }
+  process.exitCode = 1;
+}
+
+process.on("uncaughtException", reportFailure);
+process.on("unhandledRejection", reportFailure);
+
 // This validator consumes one auth-kind/region-scoped private Kiro receipt.
 // Fixture mode validates only the gate itself and can never promote live state.
 
@@ -17,6 +30,9 @@ const contract = JSON.parse(
 );
 const HARNESS_REVISION = 1;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const CATALOG_MAX_AGE_MS = 5 * 60 * 1_000;
+const CATALOG_CLOCK_SKEW_MS = 60_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const authKinds = new Set(["builder_id", "idc", "social", "api_key"]);
 const regions = new Set(["us-east-1", "eu-central-1"]);
 
@@ -222,11 +238,106 @@ if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("Kiro receipt file must stay outside the repository");
 }
 const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.nlink !== 1) {
+  fail("Kiro receipt file must have one filesystem link");
+}
 if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
   fail("Kiro receipt file size is invalid");
 }
 if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("Kiro receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("Kiro receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Kiro receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("Kiro receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("Kiro receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("Kiro receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("Kiro receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Kiro receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("Kiro receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("Kiro receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -262,10 +373,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -309,6 +441,8 @@ async function validateAccount() {
   );
   const apiKey = authKind === "api_key";
   if (
+    account.kiroCredentialScope?.authKind !== authKind ||
+    account.kiroCredentialScope?.runtimeRegion !== region ||
     !Number.isSafeInteger(account.authIdentityGeneration) ||
     account.authIdentityGeneration < 1 ||
     !Number.isSafeInteger(account.tokenRefreshGeneration) ||
@@ -316,7 +450,7 @@ async function validateAccount() {
     account.hasAccessToken !== true ||
     account.hasApiKey !== apiKey ||
     account.hasRefreshToken !== !apiKey ||
-    account.needsRelogin === true ||
+    account.needsRelogin !== false ||
     account.hasProfile !== true ||
     account.hasRaw !== true ||
     (apiKey && String(account.tokenType || "").toUpperCase() !== "API_KEY")
@@ -342,12 +476,15 @@ function validateProvider(view, app, providerId, account) {
   ) {
     fail(`Kiro ${app} Provider is not fixed to the selected Account generation`);
   }
-  const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-  const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
   if (
     !Number.isSafeInteger(providerRevision) ||
     providerRevision < 0 ||
-    !runtimeFingerprint
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim()
   ) {
     fail(`Kiro ${app} Provider runtime scope is incomplete`);
   }
@@ -394,34 +531,58 @@ async function validateBinding(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Kiro Share",
   );
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
+  if (
+    share.enabled !== true ||
+    share.status !== "active" ||
+    primaryBindings.length !== 1 ||
+    primaryBindings[0].providerId !== share.providerId ||
+    primaryBindings[0].providerType !== share.providerType
+  ) {
+    fail("Kiro Share primary binding is ambiguous or inactive");
+  }
   for (const [app, providerId] of [
     ["claude", claudeProviderId],
     ["codex", codexProviderId],
   ]) {
+    const selectedBindings = bindings.filter((binding) => binding?.app === app);
     if (
-      !bindings.some(
-        (binding) =>
-          binding?.app === app &&
-          binding?.providerId === providerId &&
-          binding?.providerType === "kiro_oauth",
-      )
+      selectedBindings.length !== 1 ||
+      selectedBindings[0].providerId !== providerId ||
+      selectedBindings[0].providerType !== "kiro_oauth"
     ) {
       fail(`Kiro Share is not fixed to the selected ${app} Provider`);
     }
   }
-  const shareRevision = share.configRevision ?? 0;
+  const shareRevision = share.configRevision;
   if (!Number.isSafeInteger(shareRevision) || shareRevision < 0) {
     fail("Kiro Share revision scope is incomplete");
   }
   return { claude, codex, shareRevision };
 }
 
+function freshCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return (
+    Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs >= now - CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + CATALOG_CLOCK_SKEW_MS
+  );
+}
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + CATALOG_CLOCK_SKEW_MS;
+}
+
 async function validateModel(app, providerId) {
-  const query = new URLSearchParams({ app, providerId });
+  const query = new URLSearchParams({
+    app,
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
@@ -431,15 +592,20 @@ async function validateModel(app, providerId) {
   if (!Array.isArray(catalog?.data)) {
     fail(`Kiro ${app} model catalog violated the public contract`);
   }
+  const modelIds = catalog.data.map((entry) => entry?.id);
+  if (
+    modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+    new Set(modelIds).size !== modelIds.length
+  ) {
+    fail(`Kiro ${app} model catalog has incomplete or duplicate model IDs`);
+  }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail(`Kiro ${app} model catalog did not preserve the exact selected model`);
   }
   if (
-    typeof catalog.source !== "string" ||
-    !/^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(catalog.source) ||
+    !["kiro_list_available_models", "kiro_account_cache"].includes(catalog.source) ||
     catalog.stale !== false ||
-    !Number.isSafeInteger(catalog.fetchedAtMs) ||
-    catalog.fetchedAtMs <= 0
+    !freshCatalogTimestamp(catalog.fetchedAtMs)
   ) {
     fail(`Kiro ${app} model catalog is not one fresh authoritative snapshot`);
   }
@@ -447,7 +613,10 @@ async function validateModel(app, providerId) {
     source: catalog.source,
     fetchedAtMs: catalog.fetchedAtMs,
     stale: false,
-    digest: digest(`cc-switch-server:kiro-${app}-catalog:v1`, catalog.data),
+    digest: digest(
+      `cc-switch-server:kiro-${app}-catalog:v1`,
+      [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+    ),
   };
 }
 
@@ -591,12 +760,7 @@ function validateReceipt(receipt, context) {
     fail("Kiro receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("Kiro receipt timestamp is outside the acceptance window");
   }
   if (!sameCanonical(receipt.catalogs, context.catalogs)) {
@@ -656,9 +820,11 @@ function validateReceipt(receipt, context) {
   ) {
     fail("Kiro receipt did not prove isolation and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBinding(account);
@@ -689,11 +855,11 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("Kiro receipt file is not valid JSON");
   }
-  validateReceipt(receipt, {
+  const recordedAt = validateReceipt(receipt, {
     targetCommit,
     userNamespaceDigest,
     sessionDigest,
@@ -701,6 +867,41 @@ async function main() {
     catalogs,
     generations,
   });
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBinding(finalAccount);
+  const finalGenerations = expectedGenerations(finalAccount, finalBinding, userNamespaceDigest);
+  if (
+    finalAccount.id !== account.id ||
+    !sameCanonical(finalGenerations, generations)
+  ) {
+    fail("Kiro Account, Provider, or Share scope drifted during acceptance");
+  }
+  // Each receipt binds two independent App catalogs. Re-read both through the
+  // signed Share after binding validation; accepted cache provenance may vary,
+  // but neither receipt-bound model set may change.
+  const finalCatalogs = {
+    claude: await validateModel("claude", claudeProviderId),
+    codex: await validateModel("codex", codexProviderId),
+  };
+  if (
+    finalCatalogs.claude.digest !== catalogs.claude.digest ||
+    finalCatalogs.codex.digest !== catalogs.codex.digest
+  ) {
+    fail("Kiro model catalogs changed during acceptance");
+  }
+  const acceptanceNow = Date.now();
+  if (
+    !freshCatalogTimestamp(catalogs.claude.fetchedAtMs, acceptanceNow) ||
+    !freshCatalogTimestamp(catalogs.codex.fetchedAtMs, acceptanceNow) ||
+    !freshCatalogTimestamp(finalCatalogs.claude.fetchedAtMs, acceptanceNow) ||
+    !freshCatalogTimestamp(finalCatalogs.codex.fetchedAtMs, acceptanceNow)
+  ) {
+    fail("Kiro model catalogs expired during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("Kiro receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(
@@ -708,7 +909,4 @@ async function main() {
   );
 }
 
-main().catch(() => {
-  console.error("[FAIL] Kiro acceptance failed (details redacted)");
-  process.exitCode = 1;
-});
+main().catch(reportFailure);

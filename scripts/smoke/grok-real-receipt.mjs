@@ -5,6 +5,19 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+let failureReported = false;
+
+function reportFailure() {
+  if (!failureReported) {
+    failureReported = true;
+    console.error("[FAIL] Grok acceptance failed (details redacted)");
+  }
+  process.exitCode = 1;
+}
+
+process.on("uncaughtException", reportFailure);
+process.on("unhandledRejection", reportFailure);
+
 // Grok normal-path probing and acceptance are intentionally separate. This
 // validator consumes one operation-scoped private receipt; fixture mode proves
 // only that the validator fails closed and can never promote live state.
@@ -18,6 +31,9 @@ const contract = JSON.parse(
 );
 const HARNESS_REVISION = 1;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const CATALOG_MAX_AGE_MS = 2 * 60 * 60 * 1_000;
+const CATALOG_CLOCK_SKEW_MS = 5 * 60_000;
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 const operationSpecs = Object.freeze({
   inference: Object.freeze({
@@ -82,6 +98,12 @@ function digest(domain, value) {
 
 function sameCanonical(left, right) {
   return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
+// Model IDs are exact strings. Collation can equate distinct Unicode spellings
+// (for example NFC and NFD), so use a total order for catalog rows.
+function compareExactIds(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function gitCommit() {
@@ -215,11 +237,106 @@ if (!receiptRelative.startsWith("..") && !path.isAbsolute(receiptRelative)) {
   fail("Grok receipt file must stay outside the repository");
 }
 const receiptStat = fs.statSync(receiptPath);
+if (receiptStat.nlink !== 1) {
+  fail("Grok receipt file must have one filesystem link");
+}
 if (receiptStat.size <= 0 || receiptStat.size > 1024 * 1024) {
   fail("Grok receipt file size is invalid");
 }
 if (!fixtureMode && (receiptStat.mode & 0o777) !== 0o600) {
   fail("Grok receipt file must have mode 0600");
+}
+
+function readReceiptSnapshot() {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (
+      !stat.isFile() ||
+      stat.dev !== receiptStat.dev ||
+      stat.ino !== receiptStat.ino ||
+      stat.nlink !== 1 ||
+      stat.size <= 0 ||
+      stat.size > 1024 * 1024 ||
+      (!fixtureMode && (stat.mode & 0o777) !== 0o600)
+    ) {
+      fail("Grok receipt file changed before its snapshot");
+    }
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Grok receipt file changed during its snapshot");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0) {
+      fail("Grok receipt file changed during its snapshot");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      afterRead.dev !== beforeRead.dev ||
+      afterRead.ino !== beforeRead.ino ||
+      afterRead.nlink !== beforeRead.nlink ||
+      afterRead.size !== beforeRead.size ||
+      afterRead.mode !== beforeRead.mode ||
+      afterRead.mtimeNs !== beforeRead.mtimeNs ||
+      afterRead.ctimeNs !== beforeRead.ctimeNs
+    ) {
+      fail("Grok receipt file changed during its snapshot");
+    }
+    return { contents: bytes.toString("utf8"), bytes, fingerprint: afterRead };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameReceiptFingerprint(current, fingerprint) {
+  return current.isFile() &&
+    current.dev === fingerprint.dev &&
+    current.ino === fingerprint.ino &&
+    current.nlink === fingerprint.nlink &&
+    current.size === fingerprint.size &&
+    current.mode === fingerprint.mode &&
+    current.mtimeNs === fingerprint.mtimeNs &&
+    current.ctimeNs === fingerprint.ctimeNs;
+}
+
+function assertReceiptStillCurrent(fingerprint, expectedBytes) {
+  const currentPath = fs.realpathSync(requestedReceiptPath);
+  if (currentPath !== receiptPath) {
+    fail("Grok receipt path changed during acceptance");
+  }
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const descriptor = fs.openSync(receiptPath, flags);
+  try {
+    const beforeRead = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameReceiptFingerprint(beforeRead, fingerprint)) {
+      fail("Grok receipt file changed during acceptance");
+    }
+    const bytes = Buffer.alloc(expectedBytes.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) fail("Grok receipt file changed during acceptance");
+      offset += read;
+    }
+    if (fs.readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 || !bytes.equals(expectedBytes)) {
+      fail("Grok receipt file changed during acceptance");
+    }
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.statSync(requestedReceiptPath, { bigint: true });
+    if (
+      !sameReceiptFingerprint(afterRead, fingerprint) ||
+      !sameReceiptFingerprint(current, fingerprint) ||
+      fs.realpathSync(requestedReceiptPath) !== receiptPath
+    ) {
+      fail("Grok receipt file changed during acceptance");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 const secrets = [serverToken, routerToken].filter(usable);
@@ -255,10 +372,31 @@ async function requestJson(base, requestPath, headers, label) {
       headers,
       signal: controller.signal,
     });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > 4 * 1024 * 1024) {
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_CONTROL_RESPONSE_BYTES) {
+      controller.abort();
       fail(`${label} exceeded the response-size bound`);
     }
+    const chunks = [];
+    let totalBytes = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_CONTROL_RESPONSE_BYTES) {
+            controller.abort();
+            fail(`${label} exceeded the response-size bound`);
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bytes = Buffer.concat(chunks, totalBytes);
     const text = new TextDecoder().decode(bytes);
     if (containsSecret(text)) fail(`${label} contained secret-like material`);
     if (!response.ok) fail(`${label} returned HTTP ${response.status}`);
@@ -307,8 +445,8 @@ async function validateAccount() {
     account.tokenRefreshGeneration < 0 ||
     account.hasAccessToken !== true ||
     account.hasRefreshToken !== true ||
-    account.hasApiKey === true ||
-    account.needsRelogin === true
+    account.hasApiKey !== false ||
+    account.needsRelogin !== false
   ) {
     fail("Grok Account is not one live refreshable OAuth identity generation");
   }
@@ -358,27 +496,31 @@ async function validateBinding(account) {
     shareList.shares.filter((candidate) => candidate?.id === shareId),
     "Grok Share",
   );
-  const bindings = [
-    { app: share.app, providerId: share.providerId, providerType: share.providerType },
-    ...(Array.isArray(share.bindings) ? share.bindings : []),
-  ];
+  const bindings = Array.isArray(share.bindings) ? share.bindings : [];
+  const selectedBindings = bindings.filter((binding) => binding?.app === "codex");
+  const primaryBindings = bindings.filter((binding) => binding?.app === share.app);
   if (
-    !bindings.some(
-      (binding) =>
-        binding?.app === "codex" &&
-        binding?.providerId === providerId &&
-        binding?.providerType === "grok_oauth",
-    )
+    share.enabled !== true ||
+    share.status !== "active" ||
+    selectedBindings.length !== 1 ||
+    selectedBindings[0].providerId !== providerId ||
+    selectedBindings[0].providerType !== "grok_oauth" ||
+    primaryBindings.length !== 1 ||
+    primaryBindings[0].providerId !== share.providerId ||
+    primaryBindings[0].providerType !== share.providerType
   ) {
     fail("Grok Share is not fixed to the selected Provider");
   }
-  const providerRevision = view.providerRevision ?? view.provider?.revision ?? 0;
-  const runtimeFingerprint = String(view.runtime.runtimeFingerprint || "");
-  const shareRevision = share.configRevision ?? 0;
+  const providerRevision = view.runtime.providerRevision;
+  const runtimeFingerprint = view.runtime.runtimeFingerprint;
+  const shareRevision = share.configRevision;
   if (
     !Number.isSafeInteger(providerRevision) ||
     providerRevision < 0 ||
-    !runtimeFingerprint ||
+    !Number.isSafeInteger(view.revision) ||
+    view.revision !== providerRevision ||
+    typeof runtimeFingerprint !== "string" ||
+    !runtimeFingerprint.trim() ||
     !Number.isSafeInteger(shareRevision) ||
     shareRevision < 0
   ) {
@@ -387,8 +529,27 @@ async function validateBinding(account) {
   return { providerRevision, runtimeFingerprint, shareRevision };
 }
 
+function freshCatalogTimestamp(fetchedAtMs, now = Date.now()) {
+  return (
+    Number.isSafeInteger(fetchedAtMs) &&
+    fetchedAtMs >= now - CATALOG_MAX_AGE_MS &&
+    fetchedAtMs <= now + CATALOG_CLOCK_SKEW_MS
+  );
+}
+
+function freshReceiptTimestamp(recordedAtMs, now = Date.now()) {
+  return Number.isFinite(recordedAtMs) &&
+    recordedAtMs >= now - RECEIPT_MAX_AGE_MS &&
+    recordedAtMs <= now + CATALOG_CLOCK_SKEW_MS;
+}
+
 async function validateModel() {
-  const query = new URLSearchParams({ app: "codex", providerId });
+  const query = new URLSearchParams({
+    app: "codex",
+    providerId,
+    expectedShareId: shareId,
+    expectedProviderId: providerId,
+  });
   const catalog = await requestJson(
     shareUrl,
     `/v1/models?${query}`,
@@ -398,15 +559,20 @@ async function validateModel() {
   if (!Array.isArray(catalog?.data)) {
     fail("Grok model catalog violated the public contract");
   }
+  const modelIds = catalog.data.map((entry) => entry?.id);
+  if (
+    modelIds.some((id) => typeof id !== "string" || !id || id.trim() !== id) ||
+    new Set(modelIds).size !== modelIds.length
+  ) {
+    fail("Grok model catalog contains ambiguous or malformed IDs");
+  }
   if (catalog.data.filter((entry) => entry?.id === model).length !== 1) {
     fail("Grok model catalog did not preserve the exact selected model");
   }
   if (
-    typeof catalog.source !== "string" ||
-    !/^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(catalog.source) ||
+    !["upstream", "upstream_not_modified", "cache_fresh"].includes(catalog.source) ||
     catalog.stale !== false ||
-    !Number.isSafeInteger(catalog.fetchedAtMs) ||
-    catalog.fetchedAtMs <= 0
+    !freshCatalogTimestamp(catalog.fetchedAtMs)
   ) {
     fail("Grok model catalog is not one fresh authoritative snapshot");
   }
@@ -414,7 +580,10 @@ async function validateModel() {
     source: catalog.source,
     fetchedAtMs: catalog.fetchedAtMs,
     stale: false,
-    digest: digest("cc-switch-server:grok-catalog:v1", catalog.data),
+    digest: digest(
+      "cc-switch-server:grok-catalog:v1",
+      [...catalog.data].sort((left, right) => compareExactIds(left.id, right.id)),
+    ),
   };
 }
 
@@ -523,12 +692,7 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding, c
     fail("Grok receipt evidence state is not valid for this harness mode");
   }
   const recordedAt = Date.parse(receipt.recordedAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(recordedAt) ||
-    recordedAt < now - RECEIPT_MAX_AGE_MS ||
-    recordedAt > now + 5 * 60_000
-  ) {
+  if (!freshReceiptTimestamp(recordedAt)) {
     fail("Grok receipt timestamp is outside the acceptance window");
   }
   if (!sameCanonical(receipt.catalog, catalog)) {
@@ -613,9 +777,11 @@ function validateReceipt(receipt, scopeDigest, targetCommit, account, binding, c
   ) {
     fail("Grok receipt did not prove isolation and secret safety");
   }
+  return recordedAt;
 }
 
 async function main() {
+  const { contents: receiptSnapshot, bytes: receiptBytes, fingerprint: receiptFingerprint } = readReceiptSnapshot();
   const targetCommit = gitCommit();
   const account = await validateAccount();
   const binding = await validateBinding(account);
@@ -645,11 +811,46 @@ async function main() {
   });
   let receipt;
   try {
-    receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    receipt = JSON.parse(receiptSnapshot);
   } catch {
     fail("Grok receipt file is not valid JSON");
   }
-  validateReceipt(receipt, scopeDigest, targetCommit, account, binding, catalog);
+  const recordedAt = validateReceipt(receipt, scopeDigest, targetCommit, account, binding, catalog);
+  const finalAccount = await validateAccount();
+  const finalBinding = await validateBinding(finalAccount);
+  if (!sameCanonical(
+    {
+      accountId: finalAccount.id,
+      authIdentityGeneration: finalAccount.authIdentityGeneration,
+      tokenRefreshGeneration: finalAccount.tokenRefreshGeneration,
+      binding: finalBinding,
+    },
+    {
+      accountId: account.id,
+      authIdentityGeneration: account.authIdentityGeneration,
+      tokenRefreshGeneration: account.tokenRefreshGeneration,
+      binding,
+    },
+  )) {
+    fail("Grok Account, Provider, or Share scope drifted during acceptance");
+  }
+  // Re-read the signed-Share catalog after binding validation. A valid source
+  // may change (upstream to fresh cache), but the receipt-bound model set may not.
+  const finalCatalog = await validateModel();
+  if (finalCatalog.digest !== catalog.digest) {
+    fail("Grok model catalog changed during acceptance");
+  }
+  const acceptanceNow = Date.now();
+  if (
+    !freshCatalogTimestamp(catalog.fetchedAtMs, acceptanceNow) ||
+    !freshCatalogTimestamp(finalCatalog.fetchedAtMs, acceptanceNow)
+  ) {
+    fail("Grok model catalog expired during acceptance");
+  }
+  if (!freshReceiptTimestamp(recordedAt, acceptanceNow)) {
+    fail("Grok receipt expired during acceptance");
+  }
+  assertReceiptStillCurrent(receiptFingerprint, receiptBytes);
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(
@@ -657,7 +858,4 @@ async function main() {
   );
 }
 
-main().catch(() => {
-  console.error("[FAIL] Grok acceptance failed (details redacted)");
-  process.exitCode = 1;
-});
+main().catch(reportFailure);
