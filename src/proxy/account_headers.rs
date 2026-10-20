@@ -47,6 +47,11 @@ pub(super) fn apply_account_header_overrides(
 
 pub(super) fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
     let normalized = name.to_ascii_lowercase();
+    if provider_type == ProviderType::CodexOAuth
+        && normalized == "x-openai-internal-codex-responses-lite"
+    {
+        return true;
+    }
     if provider_type == ProviderType::ClaudeOAuth
         && (matches!(
             normalized.as_str(),
@@ -180,9 +185,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_account_headers_cannot_override_routing_hint() {
-        assert!(account_header_override_blocked(
+    fn codex_account_headers_cannot_override_lite_or_routing_hint() {
+        for name in [
             "X-Codex-Routing-Hint",
+            "X-OpenAI-Internal-Codex-Responses-Lite",
+        ] {
+            assert!(account_header_override_blocked(
+                name,
+                ProviderType::CodexOAuth
+            ));
+        }
+        assert!(!account_header_override_blocked(
+            "x-provider-feature",
             ProviderType::CodexOAuth
         ));
     }

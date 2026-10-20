@@ -121,7 +121,7 @@ OpenAI OAuth 的消耗策略保存在 Share，而不是账号池或全局调度�
 
 最终 HTTP sanitizer 只删除顶层精确 `type=response.create`，不会触碰 input/content/tool 中的嵌套 `type`。工具 schema walker 会递归删除 schema 内的 `type:null`，覆盖 `properties`、`items`、`$defs`/`definitions`、dependent schemas 和组合器，并同样处理 Responses Lite 的 `input[].type=additional_tools`；function 根 schema 缺 type 时补为 object。`collaboration.*` 保留工具在任何 sanitizer 前即跳过，保证声明原样透传。
 
-Codex OAuth 的最终工具数组为空或缺失时，出站 body 删除 `parallel_tool_calls`，不把无工具请求伪装成需要并行工具控制的请求。此规则在普通 Responses、Compact、Responses Lite、原生 WebSocket 和 WS→HTTP fallback 的准备路径生效；工具清洗（包括可选的图片工具剔除）之后再判断。有非空工具数组时保留已有设置，Lite 仍按其既有规则关闭并行工具调用。
+Codex OAuth 的非 Lite 请求在最终顶层 `tools` 为空或缺失时删除 `parallel_tool_calls`；有非空顶层工具时保留客户端设置。Responses Lite 是独立例外：只要最终模型能力门控保留 Lite 信号，无论顶层工具是否存在、是否只有 `input[].additional_tools`，或图片工具清洗后是否为空，都显式发送 `parallel_tool_calls=false`，并设置 `reasoning.context=all_turns`。此规则在普通 Responses、Compact、原生 WebSocket 和 WS→HTTP fallback 的最终准备路径生效；Account extra header 不能覆盖代理管理的 Lite header。明确不支持 Lite 的最终模型保持非 Lite 清理规则，代理不注入 Lite body 约束，也不转发 Lite header/WS marker。
 
 Responses Lite 请求信号在模型 policy 完成后，以最终映射模型的 manifest `use_responses_lite` 能力门控。明确不支持时同时删除 HTTP header 和 WS metadata marker，且不执行 Lite body mutation；明确支持时保留；未知模型保持兼容透传。内置快照中 `gpt-6-astra`、Sol/Terra/Luna 和 `codex-auto-review` 支持 Lite，5.5/5.4/5.4-mini/5.3 Codex Spark/5.2 不支持；实时 manifest 的明确值逐字段优先，且绑定 Account identity generation，内置项不代表当前账号 entitlement。
 

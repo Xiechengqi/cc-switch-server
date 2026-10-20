@@ -714,6 +714,13 @@ impl ProviderExecution {
         if explicit_compact {
             request.body =
                 super::forwarder::normalize_codex_oauth_compact_body_bytes(&request.body)?;
+            if responses_lite {
+                request.body = super::forwarder::normalize_codex_responses_lite_body_bytes(
+                    &request.body,
+                    true,
+                    true,
+                )?;
+            }
             request.stream_requested = false;
             request.upstream_stream_requested = true;
         } else {
@@ -769,6 +776,10 @@ impl ProviderExecution {
             &mut body_value,
             final_model.as_deref(),
             false,
+            responses_lite,
+        );
+        super::forwarder::normalize_codex_parallel_tool_calls_for_tools(
+            &mut body_value,
             responses_lite,
         );
         request.body = serde_json::to_vec(&body_value)
@@ -1742,6 +1753,82 @@ mod tests {
             body.pointer("/input/1/type"),
             Some(&json!("compaction_trigger"))
         );
+    }
+
+    #[test]
+    fn codex_final_contract_pairs_lite_with_parallel_false_for_responses_and_compact() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::ManagedAccount {
+                account_id: "codex-account".to_string(),
+                expected_provider_type: ProviderType::CodexOAuth,
+                auth_identity_generation: 1,
+            },
+            UpstreamProtocol::OpenAiResponses,
+            json!({}),
+            1,
+        );
+        execution.stored.provider_type = ProviderType::CodexOAuth;
+        execution.stored.provider_type_id = ProviderType::CodexOAuth.as_str().to_string();
+        Arc::make_mut(&mut execution.plan).driver_id =
+            crate::domain::providers::registry::DriverId::parse("oauth.openai_codex").unwrap();
+
+        for route in [
+            ProxyRoute::CodexResponses,
+            ProxyRoute::CodexResponsesCompact,
+        ] {
+            for lite in [false, true] {
+                let body = json!({
+                    "type": "response.create",
+                    "model": "gpt-5.6-sol",
+                    "input": "hi",
+                    "tools": [],
+                    "parallel_tool_calls": true
+                });
+                let mut request = AdapterRequest {
+                    body: bytes::Bytes::from(body.to_string()),
+                    upstream_endpoint: None,
+                    upstream_headers: vec![],
+                    model: Some("gpt-5.6-sol".to_string()),
+                    requested_model: Some("gpt-5.6-sol".to_string()),
+                    actual_model: Some("gpt-5.6-sol".to_string()),
+                    actual_model_source: Some("request".to_string()),
+                    gemini_action: None,
+                    stream_requested: false,
+                    upstream_stream_requested: false,
+                    downstream_include_usage: false,
+                    custom_tool_names: Default::default(),
+                    responses_tool_context: Default::default(),
+                    claude_tool_name_map: Default::default(),
+                };
+                let intent = super::super::codex_request_policy::extract_intent(&body);
+                execution
+                    .apply_openai_codex_final_request_contract(
+                        route,
+                        &mut request,
+                        None,
+                        lite,
+                        &intent,
+                    )
+                    .unwrap();
+                let prepared: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    prepared.get("parallel_tool_calls").and_then(Value::as_bool),
+                    lite.then_some(false),
+                    "route={route:?} body={prepared}"
+                );
+                assert_eq!(
+                    prepared.pointer("/reasoning/context"),
+                    lite.then_some(&json!("all_turns")),
+                    "route={route:?} body={prepared}"
+                );
+                if route == ProxyRoute::CodexResponsesCompact {
+                    assert_eq!(
+                        prepared.pointer("/input/1/type"),
+                        Some(&json!("compaction_trigger"))
+                    );
+                }
+            }
+        }
     }
 
     #[test]

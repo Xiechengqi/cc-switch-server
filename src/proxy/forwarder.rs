@@ -15477,6 +15477,7 @@ async fn prepare_codex_http_fallback_target(
             false,
             responses_lite,
         );
+        normalize_codex_parallel_tool_calls_for_tools(&mut body_value, responses_lite);
         adapter_request.body =
             serde_json::to_vec(&body_value)
                 .map(Bytes::from)
@@ -15995,7 +15996,7 @@ async fn prepare_codex_responses_websocket_request(
         true,
         responses_lite,
     );
-    normalize_codex_parallel_tool_calls_for_tools(target);
+    normalize_codex_parallel_tool_calls_for_tools(target, responses_lite);
     if let Some(scope) = metadata_scope {
         let decision = super::codex_metadata::scrub_body_value(&mut frame, scope);
         crate::metrics::record_codex_metadata_decision(decision.as_str());
@@ -26219,7 +26220,6 @@ fn normalize_codex_responses_lite_body(
     strip_hosted_image_tools: bool,
     remove_ws_metadata: bool,
 ) {
-    body["parallel_tool_calls"] = Value::Bool(false);
     if !body.get("reasoning").is_some_and(Value::is_object) {
         body["reasoning"] = Value::Object(serde_json::Map::new());
     }
@@ -26227,7 +26227,7 @@ fn normalize_codex_responses_lite_body(
     if strip_hosted_image_tools {
         strip_codex_image_generation_tools(body);
     }
-    normalize_codex_parallel_tool_calls_for_tools(body);
+    normalize_codex_parallel_tool_calls_for_tools(body, true);
     if remove_ws_metadata {
         if let Some(metadata) = body
             .get_mut("client_metadata")
@@ -26282,7 +26282,7 @@ pub(super) fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<B
         &mut value,
         super::codex_compaction::CompactionSignalMode::AddIfMissing,
     )?;
-    normalize_codex_parallel_tool_calls_for_tools(&mut value);
+    normalize_codex_parallel_tool_calls_for_tools(&mut value, false);
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -26368,7 +26368,7 @@ fn normalize_codex_oauth_responses_body(
     }
 
     strip_codex_oauth_unsupported_responses_fields(&mut body);
-    normalize_codex_parallel_tool_calls_for_tools(&mut body);
+    normalize_codex_parallel_tool_calls_for_tools(&mut body, false);
 
     body
 }
@@ -26389,7 +26389,14 @@ fn normalize_codex_oauth_include(body: &mut Value) {
     body["include"] = Value::Array(include);
 }
 
-fn normalize_codex_parallel_tool_calls_for_tools(body: &mut Value) {
+pub(super) fn normalize_codex_parallel_tool_calls_for_tools(
+    body: &mut Value,
+    responses_lite: bool,
+) {
+    if responses_lite {
+        body["parallel_tool_calls"] = Value::Bool(false);
+        return;
+    }
     let has_tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -44532,6 +44539,18 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
 
         assert!(headers.contains(&("x-enterprise-sso".to_string(), "tenant-a".to_string())));
 
+        headers.push((CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string()));
+        accounts.accounts[0].extra_headers.insert(
+            "X-OpenAI-Internal-Codex-Responses-Lite".to_string(),
+            "false".to_string(),
+        );
+        let error = apply_account_header_overrides(&mut headers, &stored, &accounts).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(headers.contains(&(CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string())));
+        accounts.accounts[0]
+            .extra_headers
+            .remove("X-OpenAI-Internal-Codex-Responses-Lite");
+
         accounts.accounts[0]
             .extra_headers
             .insert("authorization".to_string(), "Bearer attacker".to_string());
@@ -44903,7 +44922,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[test]
-    fn codex_oauth_prepared_requests_drop_parallel_flag_without_tools() {
+    fn codex_oauth_prepared_requests_keep_lite_parallel_false_without_tools() {
         let request = Bytes::from_static(
             br#"{"model":"gpt-5","input":"hi","tools":[],"parallel_tool_calls":true}"#,
         );
@@ -44915,9 +44934,48 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         .unwrap();
         let compact = normalize_codex_oauth_compact_body_bytes(&request).unwrap();
         let lite = normalize_codex_responses_lite_body_bytes(&ordinary, true, true).unwrap();
-        for prepared in [ordinary, compact, lite] {
+        for prepared in [ordinary, compact] {
             let prepared: Value = serde_json::from_slice(&prepared).unwrap();
             assert!(prepared.get("parallel_tool_calls").is_none(), "{prepared}");
+        }
+        let lite: Value = serde_json::from_slice(&lite).unwrap();
+        assert_eq!(lite.get("parallel_tool_calls"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn codex_responses_lite_parallel_false_survives_tool_cleanup() {
+        for (body, expected_tools) in [
+            (json!({"model":"gpt-5.6-sol","input":"hi"}), json!([])),
+            (
+                json!({"model":"gpt-5.6-sol","input":"hi","parallel_tool_calls":true}),
+                json!([]),
+            ),
+            (
+                json!({"model":"gpt-5.6-sol","input":"hi","parallel_tool_calls":false,"tools":[]}),
+                json!([]),
+            ),
+            (
+                json!({"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":[{"type":"custom","name":"exec","description":"run shell"}]}],"parallel_tool_calls":true}),
+                json!([]),
+            ),
+            (
+                json!({"model":"gpt-5.6-sol","input":"hi","tools":[{"type":"image_generation"}],"parallel_tool_calls":true}),
+                json!([]),
+            ),
+        ] {
+            let ordinary =
+                normalize_codex_oauth_responses_body(body, None, CodexImageToolStripPolicy::Never);
+            let mut lite = ordinary.clone();
+            normalize_codex_responses_lite_body(&mut lite, true, true);
+            assert_eq!(lite["parallel_tool_calls"], false, "{lite}");
+            assert_eq!(lite["tools"], expected_tools, "{lite}");
+            assert_eq!(
+                lite.pointer("/reasoning/context"),
+                Some(&json!("all_turns"))
+            );
+            if ordinary["tools"] == json!([]) {
+                assert!(ordinary.get("parallel_tool_calls").is_none(), "{ordinary}");
+            }
         }
     }
 
@@ -44953,12 +45011,12 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     }
 
     #[tokio::test]
-    async fn codex_websocket_preparation_drops_parallel_flag_without_tools() {
+    async fn codex_websocket_preparation_pairs_lite_parallel_false_without_tools() {
         let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
         for lite in [false, true] {
             let mut request = json!({
                 "type":"response.create",
-                "response":{"model":"gpt-5","input":"hi","parallel_tool_calls":true}
+                "response":{"model":"gpt-5.6-sol","input":"hi","parallel_tool_calls":true}
             });
             if lite {
                 request["response"]["client_metadata"] =
@@ -44979,7 +45037,13 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
                 panic!("expected text frame");
             };
             let prepared: Value = serde_json::from_str(&prepared).unwrap();
-            assert!(prepared["response"].get("parallel_tool_calls").is_none());
+            assert_eq!(
+                prepared["response"]
+                    .get("parallel_tool_calls")
+                    .and_then(Value::as_bool),
+                lite.then_some(false),
+                "{prepared}"
+            );
         }
     }
 
@@ -45713,6 +45777,149 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         let fallback: Value = serde_json::from_slice(&fallback.body).unwrap();
         assert_eq!(fallback["input"][0]["arguments"], "{}");
         assert_eq!(fallback["input"][1]["arguments"], "{bad");
+    }
+
+    #[tokio::test]
+    async fn codex_http_fallback_pairs_lite_header_with_parallel_false() {
+        let (state, execution) =
+            codex_bridge_test_context("lite-parallel-fallback", "http://127.0.0.1:9".to_string())
+                .await;
+        for (model, expect_lite) in [("gpt-5.6-sol", true), ("gpt-5.4", false)] {
+            let body = json!({
+                "model": model,
+                "input": "hi",
+                "tools": [],
+                "parallel_tool_calls": true,
+                "client_metadata": {(CODEX_RESPONSES_LITE_WS_METADATA): "true"}
+            });
+            let intent = crate::proxy::codex_request_policy::extract_intent(&body);
+            let target = prepare_codex_http_fallback_target(
+                &state,
+                &execution,
+                &body,
+                Some("lite-parallel-session"),
+                None,
+                &intent,
+            )
+            .await
+            .unwrap();
+            let prepared: Value = serde_json::from_slice(&target.body).unwrap();
+            assert_eq!(
+                target
+                    .headers
+                    .iter()
+                    .find(|(name, _)| { name.eq_ignore_ascii_case(CODEX_RESPONSES_LITE_HEADER) })
+                    .map(|(_, value)| value.as_str()),
+                expect_lite.then_some("true"),
+                "model={model}"
+            );
+            assert_eq!(
+                prepared.get("parallel_tool_calls").and_then(Value::as_bool),
+                expect_lite.then_some(false),
+                "model={model} body={prepared}"
+            );
+            assert_eq!(
+                prepared
+                    .pointer("/reasoning/context")
+                    .and_then(Value::as_str),
+                expect_lite.then_some("all_turns")
+            );
+            assert!(prepared
+                .pointer(&format!(
+                    "/client_metadata/{CODEX_RESPONSES_LITE_WS_METADATA}"
+                ))
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_http_upstream_pairs_lite_header_and_body_across_routes() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&observations);
+        let upstream = axum::Router::new().fallback(move |headers: HeaderMap, body: Bytes| {
+            let observed = std::sync::Arc::clone(&observed);
+            async move {
+                observed.lock().unwrap().push((
+                    headers
+                        .get(CODEX_RESPONSES_LITE_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                ));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_lite_pair\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    ))
+                    .unwrap()
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let (state, execution) = codex_bridge_test_context(
+            "lite-paired-http-upstream",
+            format!("http://{address}/v1/responses"),
+        )
+        .await;
+
+        for route in [
+            ProxyRoute::CodexResponses,
+            ProxyRoute::CodexResponsesCompact,
+        ] {
+            for (model, expect_lite) in [("gpt-5.6-sol", true), ("gpt-5.4", false)] {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers.insert(
+                    CODEX_RESPONSES_LITE_HEADER,
+                    HeaderValue::from_static("true"),
+                );
+                let response = forward_for_test_surface(
+                    state.clone(),
+                    route,
+                    execution.stored.provider.id.clone(),
+                    None,
+                    headers,
+                    Bytes::from(
+                        json!({
+                            "model":model,
+                            "input":"hi",
+                            "stream":false,
+                            "tools":[],
+                            "parallel_tool_calls":true
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = collect_response_body(response).await;
+
+                let observations = observations.lock().unwrap();
+                let (lite_header, body) = observations.last().unwrap();
+                assert_eq!(lite_header.as_deref(), expect_lite.then_some("true"));
+                assert_eq!(
+                    body.get("parallel_tool_calls").and_then(Value::as_bool),
+                    expect_lite.then_some(false),
+                    "route={route:?} model={model} body={body}"
+                );
+                assert_eq!(
+                    body.pointer("/reasoning/context").and_then(Value::as_str),
+                    expect_lite.then_some("all_turns")
+                );
+                if route == ProxyRoute::CodexResponsesCompact {
+                    assert_eq!(
+                        body.pointer("/input/1/type"),
+                        Some(&json!("compaction_trigger"))
+                    );
+                }
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
