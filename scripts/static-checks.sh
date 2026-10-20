@@ -9,7 +9,9 @@ fi
 echo "== rustfmt check =="
 mapfile -t rust_files < <(rg --files -g '*.rs' src)
 if [[ "${#rust_files[@]}" -gt 0 ]]; then
-  rustfmt --edition 2021 --check "${rust_files[@]}"
+  # Every source file is listed explicitly; avoid recursively formatting each
+  # module again from its parent, which makes this check quadratic in practice.
+  rustfmt --edition 2021 --config skip_children=true --check "${rust_files[@]}"
 fi
 
 echo "== clippy =="

@@ -97,6 +97,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: cc-switch-server-linux-*
 
       - name: Prepare release files
         run: |

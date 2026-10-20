@@ -14,7 +14,7 @@ permissions:
 jobs:
   validate:
     name: Validate release contracts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CC_SWITCH_ROUTER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
       CC_SWITCH_ROUTER_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
@@ -54,6 +54,13 @@ jobs:
           toolchain: 1.94.1
           components: clippy,rustfmt
 
+      - name: Cache Rust validation dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation
+          cache-targets: true
+          cache-bin: false
+
       - name: Run static contract checks
         run: scripts/static-checks.sh
 
@@ -63,10 +70,49 @@ jobs:
           cargo test amazon_q --lib
           cargo test web_session --lib
 
+  # The committed web-dist can lag web-src. Generate release assets once and
+  # pass exactly those bytes to both architecture builds.
+  web:
+    name: Build embedded web assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web-src/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci --prefix web-src --ignore-scripts --no-audit --no-fund
+
+      - name: Build embedded web assets
+        run: npm --prefix web-src run build
+
+      - name: Check generated web assets
+        run: |
+          test -s web-dist/index.html
+          node scripts/audit/audit-web-dist-size.mjs
+
+      - name: Upload embedded web assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-web-dist
+          path: web-dist/
+          if-no-files-found: error
+
   build:
     name: Build ${{ matrix.arch }}
-    needs: validate
-    runs-on: ubuntu-latest
+    # Keep validation parallel with release compilation. The caller's reusable
+    # workflow job still fails unless validate, web, and both builds pass.
+    needs: web
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -96,18 +142,17 @@ jobs:
             exit 1
           fi
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Download embedded web assets
+        uses: actions/download-artifact@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: web-src/package-lock.json
+          name: embedded-web-dist
+          path: ${{ runner.temp }}/embedded-web-dist
 
-      - name: Install web dependencies
-        run: npm ci --prefix web-src --ignore-scripts --no-audit --no-fund
-
-      - name: Build embedded web assets
-        run: SKIP_NPM_INSTALL=1 scripts/sync/build-web.sh
+      - name: Install embedded web assets
+        run: |
+          test -s "${RUNNER_TEMP}/embedded-web-dist/index.html"
+          rsync -a --delete "${RUNNER_TEMP}/embedded-web-dist/" web-dist/
+          node scripts/audit/audit-web-dist-size.mjs
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -126,8 +171,26 @@ jobs:
         with:
           platforms: arm64
 
+      - name: Cache cargo-zigbuild
+        id: cargo-zigbuild-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-0.23.0-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild
+        if: steps.cargo-zigbuild-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Verify cargo-zigbuild version
+        run: test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
+
+      - name: Cache Rust release dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+          cache-targets: true
+          cache-bin: false
 
       - name: Export build metadata
         run: |

@@ -76,6 +76,8 @@ for _ in $(seq 1 20); do
     exit 1
   fi
   if curl -fsS "http://127.0.0.1:${PORT}/version" >/dev/null 2>&1; then
+    curl -fsS "http://127.0.0.1:${PORT}/" >"${CONFIG_DIR}/served-index.html"
+    cmp web-dist/index.html "${CONFIG_DIR}/served-index.html"
     sleep 2
     kill -0 "$PID"
     exit 0
