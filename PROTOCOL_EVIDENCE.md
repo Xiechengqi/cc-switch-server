@@ -19,6 +19,16 @@ node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-ui-provider-matrix.mjs --check
 ```
 
+## 2026-10-20 Codex OAuth 带序号 keepalive 的 Responses SSE 兼容边界
+
+远程 Router 的只读故障调查显示，目标 Share 在 2026-10-19 UTC 有 1,293 次 502、925 次 200；其中 1,283 次 502 在 30–35 秒结束。目标 Server 上传的失败审计同属 `response_finalize / cc_switch_forward_failed`，留存的错误响应为 `Responses SSE liveness event contained a non-liveness payload`。Router 到目标 Server 的隧道连接失败会走 503，而这里的 502 是目标 Server 在业务帧提交前的协议拒绝。生产原始上游心跳帧没有留存，不能据此断定每次失败的确切字段；约 31 秒的聚集时间也不是本地默认 120 秒首事件超时的证据。部署版本 `6545191` 与本地修复前的该解析器一致。
+
+只读核对干净的 `CLIProxyAPI@ae3ee3be303fb07fb8173279923413005bf32177`：`internal/runtime/executor/codex_executor_grokbuild_keepalive_test.go::TestCodexExecutorExecuteStream_GrokBuildConvertsKeepaliveToSSEComment` 明确使用 `event: keepalive` 和 `{"type":"keepalive","sequence_number":3}`，并将其转换为下游 SSE comment。次选 `codex2api@5ee6c29273773a2398531d061d23f199ca8c25f7` 的 `proxy/executor.go::ReadSSEStreamWithEvent` 对 SSE data 不做该字段形状拒绝，但其宽松读取不是本 Server 的成功/失败合同。官方 [OpenAI Docs Responses streaming 指南](https://developers.openai.com/api/docs/guides/streaming-responses) 说明公开 SSE 用法，不定义私有 OAuth keepalive 字段，也不能证明生产每一帧与参考 fixture 相同。
+
+目标 `ResponsesTransportDecoder` 原仅将单键 `type=ping|keepalive` JSON 认作 liveness；上述已声明 `event: keepalive` 的固定反例在旧实现按同一错误文案失败。现仅把 `type=keepalive`、可选非负 `u64` 整数 `sequence_number` 纳入心跳白名单，`ping` 仍只允许单键对象；再次对候选原始 JSON 作严格反序列化，避免未知/重复顶层键及 `null`、浮点、字符串、负数或越界序号被误识别为心跳。SSE `event`/`type` 冲突、业务/错误字段伪装仍失败关闭；无声明事件的非法候选不静默滤除。固定低基数指标记录被接受的带序号心跳和本次 `non-liveness payload` 拒绝分支，不记录序号、原始帧或请求正文。普通 HTTP 流、强制 SSE 的非流聚合、Dedicated Images 和 WS→HTTP fallback 共用该入站修复；出站 wire、首事件/idle 时钟、终态门禁、usage、单账号/Share 绑定与同账号 401 预算均不改变。
+
+离线回归只能证明参考形状被正确处理，真实 OAuth 接受性与目标 Share 的 502 指纹消退仍须在目标 Server 发布后独立观察；本次不修改远程 Router，也不把公开文档或参考样例误报为生产原始帧证据。
+
 ## 2026-10-14 Qoder 非流输出与嵌套错误分类
 
 只读对照 `TokenRouter@7faf9469bc695` 的旧 `service/qoder_gateway_service.go` 与 `TokenRouter@6d676f1d100e11f2f068949f5779e960c862079c` 的 `upstream/qoder/{execute,stream_conversion}.go`：Chat、Messages、Responses 非流路径都先收集 SSE 事件，再构造客户端 JSON、记录用量并提交会话；对应构造函数的文本、工具、停止原因和 usage 映射保持，Responses 桥主要改为注入时间/随机源。较新的 `c25dbf0c` 对这些非流构造函数主要补充注释，未形成应照搬的新 COSY wire。参考会在 `IsDone` 提前停止读取；目标仍要求唯一终态和真实上游 EOF。

@@ -41174,6 +41174,8 @@ mod tests {
             body: concat!(
                 ": upstream keepalive\n\n",
                 "data: ping\n\n",
+                "event: keepalive\n",
+                "data: {\"type\":\"keepalive\",\"sequence_number\":3}\n\n",
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-non-stream\"}}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-non-stream\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n",
@@ -41353,6 +41355,8 @@ mod tests {
                 ": upstream keepalive\r\n\r\n",
                 "id: 7\r\nretry: 1000\r\n\r\n",
                 "data: ping\r\n\r\n",
+                "event: keepalive\r\n",
+                "data: {\"type\":\"keepalive\",\"sequence_number\":3}\r\n\r\n",
                 "event: response.created\r\n",
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-normalized\"}}\r\n\r\n",
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\r\n\r\n",
@@ -41405,6 +41409,7 @@ mod tests {
         assert!(!body.contains("id: 7"));
         assert!(!body.contains("retry: 1000"));
         assert!(!body.contains("data: ping"));
+        assert!(!body.contains("sequence_number"));
         assert!(body.contains("event: response.created\n"));
         assert!(body.contains("event: response.output_text.delta\n"));
         assert!(body.contains("event: response.completed\n"));
@@ -41492,7 +41497,9 @@ mod tests {
             vec![
                 (
                     Duration::ZERO,
-                    Bytes::from_static(b": upstream keepalive\n\n"),
+                    Bytes::from_static(
+                        b"event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":3}\n\n",
+                    ),
                 ),
                 (
                     Duration::from_millis(120),
@@ -41531,6 +41538,104 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
         assert!(error.message.contains("first byte timeout"));
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_rejects_disguised_sequenced_keepalive_before_commit() {
+        let upstream = spawn_test_overflow_upstream(vec![TestOverflowReply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            body: concat!(
+                "event: keepalive\n",
+                "data: {\"type\":\"keepalive\",\"sequence_number\":3,\"response\":{\"status\":\"completed\"}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+            )
+            .to_string(),
+        }])
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-disguised-sequenced-keepalive",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let error = forward_with_attempt(
+            state,
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("non-liveness payload"));
+        assert_eq!(upstream.requests.lock().unwrap().len(), 1);
+        upstream.server.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_stream_rejects_disguised_sequenced_keepalive_after_commit() {
+        let upstream = spawn_test_streaming_codex_images_upstream(
+            vec![
+                (
+                    Duration::ZERO,
+                    Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"committed\"}\n\n",
+                    ),
+                ),
+                (
+                    Duration::from_millis(10),
+                    Bytes::from_static(
+                        b"event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":-1}\n\n",
+                    ),
+                ),
+            ],
+            false,
+        )
+        .await;
+        let (state, execution) = codex_bridge_test_context(
+            "responses-post-commit-disguised-keepalive",
+            format!("http://{}", upstream.address),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = forward_with_attempt(
+            state.clone(),
+            ProxyRoute::CodexResponses,
+            None,
+            headers,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
+            ForwardAttemptContext {
+                execution: Some(execution),
+                ..ForwardAttemptContext::default()
+            },
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("committed"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("upstream_stream_protocol_error"));
+        assert!(!body.contains("data: [DONE]"));
+
+        let usage = state.usage_snapshot().await;
+        let log = usage.logs.last().expect("streaming usage log");
+        assert_eq!(log.stream_status.as_deref(), Some("protocol_error"));
         upstream.server.abort();
     }
 
@@ -46395,6 +46500,7 @@ data: {"type":"response.completed","response":{"created_at":1800000000,"output":
     #[test]
     fn codex_images_parser_handles_sse_split_at_every_byte_boundary() {
         let payload = concat!(
+            "event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":3}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"iVBORw0KGgo=\",\"output_format\":\"png\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"created_at\":1800000000,\"output\":[]}}\n\n"
         );
@@ -48777,7 +48883,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     fn codex_http_fallback_sse_decoder_handles_fragmented_crlf_and_ignores_metadata() {
         let mut decoder = CodexHttpFallbackSseDecoder::default();
         assert!(decoder
-            .push(b"event: response.created\r\ndata: {\"type\":\"response.cre")
+            .push(b"event: keepalive\r\ndata: {\"type\":\"keepalive\",\"sequence_number\":3}\r\n\r\nevent: response.created\r\ndata: {\"type\":\"response.cre")
             .unwrap()
             .is_empty());
         let items = decoder
@@ -51137,7 +51243,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 ),
                 (
                     Duration::from_millis(60),
-                    Bytes::from_static(b": keepalive\n\n"),
+                    Bytes::from_static(
+                        b"event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":3}\n\n",
+                    ),
                 ),
                 (
                     Duration::from_millis(70),

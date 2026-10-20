@@ -1,6 +1,7 @@
 use std::fmt;
 
 use bytes::Bytes;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use super::sse_transport::{SseDecodeError, SseEvent, SseEventDecoder};
@@ -15,6 +16,7 @@ pub(crate) enum ResponsesLivenessKind {
     TextPing,
     EventPing,
     JsonPing,
+    SequencedKeepalive,
 }
 
 impl ResponsesLivenessKind {
@@ -25,6 +27,7 @@ impl ResponsesLivenessKind {
             Self::TextPing => "text_ping",
             Self::EventPing => "event_ping",
             Self::JsonPing => "json_ping",
+            Self::SequencedKeepalive => "sequenced_keepalive",
         }
     }
 }
@@ -262,11 +265,10 @@ impl ResponsesTransportDecoder {
                             "Responses JSON payload must be an object",
                         ));
                     }
+                    let liveness = json_liveness(&value, &self.json[..consumed]);
                     self.json.drain(..consumed);
-                    if json_liveness(&value) {
-                        items.push(ResponsesTransportItem::Liveness(
-                            ResponsesLivenessKind::JsonPing,
-                        ));
+                    if let Some(kind) = liveness {
+                        items.push(ResponsesTransportItem::Liveness(kind));
                     } else {
                         items.push(ResponsesTransportItem::Json {
                             declared_event: None,
@@ -401,16 +403,19 @@ fn classify_sse_event(event: SseEvent) -> Result<ResponsesTransportItem, Respons
             ));
         }
     }
-    if json_liveness(&value) {
+    if let Some(kind) = json_liveness(&value, payload) {
         return Ok(ResponsesTransportItem::Liveness(
-            if declared_event.is_some() {
+            if kind == ResponsesLivenessKind::SequencedKeepalive {
+                kind
+            } else if declared_event.is_some() {
                 ResponsesLivenessKind::EventPing
             } else {
-                ResponsesLivenessKind::JsonPing
+                kind
             },
         ));
     }
     if declared_liveness.is_some() {
+        crate::metrics::record_responses_sse_transport("decoder", "liveness_shape_rejected");
         return Err(ResponsesTransportError::new(
             "Responses SSE liveness event contained a non-liveness payload",
         ));
@@ -467,14 +472,35 @@ fn done_token_prefix_len(value: &[u8]) -> Option<usize> {
         .then_some(DONE.len())
 }
 
-fn json_liveness(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.len() == 1
-            && object
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(liveness_token)
-    })
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonLivenessPayload {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default, deserialize_with = "deserialize_optional_sequence_number")]
+    sequence_number: Option<u64>,
+}
+
+fn deserialize_optional_sequence_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(Some)
+}
+
+fn json_liveness(value: &Value, payload: &[u8]) -> Option<ResponsesLivenessKind> {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|event_type| liveness_token(event_type))?;
+    // Deserialize only liveness candidates a second time so duplicate keys
+    // cannot be hidden by serde_json::Value's last-value-wins map.
+    let candidate = serde_json::from_slice::<JsonLivenessPayload>(payload).ok()?;
+    match (candidate.event_type.as_str(), candidate.sequence_number) {
+        ("ping" | "keepalive", None) => Some(ResponsesLivenessKind::JsonPing),
+        ("keepalive", Some(_)) => Some(ResponsesLivenessKind::SequencedKeepalive),
+        _ => None,
+    }
 }
 
 fn liveness_token(value: &str) -> bool {
@@ -557,6 +583,81 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn sequenced_keepalive_is_liveness_across_sse_and_json_chunk_boundaries() {
+        let items = decode_all_splits(
+            concat!(
+                "event: response.created\r\n",
+                "data: {\"type\":\"response.created\"}\r\n\r\n",
+                "event: keepalive\r\n",
+                "data: {\"type\":\"keepalive\",\"sequence_number\":3}\r\n\r\n",
+                "data: {\"type\":\"keepalive\",\"sequence_number\":0}\r\n\r\n",
+                "event: response.completed\r\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert!(matches!(items[0], ResponsesTransportItem::Json { .. }));
+        assert_eq!(
+            items[1..3],
+            [
+                ResponsesTransportItem::Liveness(ResponsesLivenessKind::SequencedKeepalive),
+                ResponsesTransportItem::Liveness(ResponsesLivenessKind::SequencedKeepalive),
+            ]
+        );
+        assert!(matches!(items[3], ResponsesTransportItem::Json { .. }));
+
+        let json_items = decode_all_splits(
+            b"{\"type\":\"keepalive\",\"sequence_number\":18446744073709551615}\n{\"type\":\"response.completed\"}\n",
+        );
+        assert_eq!(
+            json_items[0],
+            ResponsesTransportItem::Liveness(ResponsesLivenessKind::SequencedKeepalive)
+        );
+        assert!(matches!(json_items[1], ResponsesTransportItem::Json { .. }));
+    }
+
+    #[test]
+    fn declared_keepalive_rejects_invalid_sequence_and_disguised_business() {
+        for data in [
+            r#"{"type":"keepalive","sequence_number":-1}"#,
+            r#"{"type":"keepalive","sequence_number":1.0}"#,
+            r#"{"type":"keepalive","sequence_number":"3"}"#,
+            r#"{"type":"keepalive","sequence_number":null}"#,
+            r#"{"type":"keepalive","sequence_number":true}"#,
+            r#"{"type":"keepalive","sequence_number":18446744073709551616}"#,
+            r#"{"type":"keepalive","sequence_number":3,"response":{"status":"completed"}}"#,
+            r#"{"type":"keepalive","sequence_number":3,"error":{"message":"failed"}}"#,
+            r#"{"type":"keepalive","sequence_number":3,"unexpected":0}"#,
+            r#"{"type":"response.failed","type":"keepalive","sequence_number":3}"#,
+            r#"{"type":"keepalive","sequence_number":1,"sequence_number":3}"#,
+            r#"{"type":"ping","sequence_number":3}"#,
+        ] {
+            let input = format!("event: keepalive\ndata: {data}\n\n");
+            let mut decoder = ResponsesTransportDecoder::default();
+            assert!(
+                decoder.push(input.as_bytes()).is_err(),
+                "invalid liveness was accepted: {data}"
+            );
+        }
+    }
+
+    #[test]
+    fn unlabelled_invalid_keepalive_is_not_silently_filtered() {
+        for data in [
+            r#"{"type":"keepalive","sequence_number":-1}"#,
+            r#"{"type":"keepalive","sequence_number":3,"response":{"status":"completed"}}"#,
+            r#"{"type":"response.failed","type":"keepalive","sequence_number":3}"#,
+        ] {
+            let input = format!("data: {data}\n\n");
+            let items = decode_all_splits(input.as_bytes());
+            assert!(matches!(
+                items.as_slice(),
+                [ResponsesTransportItem::Json { .. }]
+            ));
+        }
     }
 
     #[test]
