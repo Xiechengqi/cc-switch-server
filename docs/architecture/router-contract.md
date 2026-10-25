@@ -2,7 +2,7 @@
 
 > 状态：**权威文档（Server 侧）**。线格式、字段定义与 Router 内部行为以 `cc-switch-router/PROTOCOL.md` 为准；本文只描述 Server 实现了什么、在哪里实现、以及 Server 侧的判定规则。
 >
-> 最后核对：2026-08-24。
+> 最后核对：2026-10-25。
 
 ## 1. 实现位置
 
@@ -72,16 +72,17 @@ Server 侧校验（`src/clients/router/ingress.rs`）：
 
 Router 通过**未签名**头 `x-cc-switch-ingress-body-limit` 声明其上限；Server 的生效值为 `min(本地 requestBodyLimits, Router 声明)`。本地值存于 `server.json` 的 `requestBodyLimits`。
 
-## 7. Share 契约 v4
+## 7. Share 契约 v7
 
-v4 延续 v2 的统一 Share 访问边界：
+Server 当前写出 Share Contract v7（`src/domain/sharing/router_contract.rs` 的 `SHARE_CONTRACT_VERSION`），与 Router 的写出版本一致；Router 为滚动升级仍可读取 v2..v7，Share Market 发布要求至少 v5。各版本在 v2 的统一 Share 访问边界上逐步追加：
 
-- `freeAccess`（默认 `false`，即私有）
-- `userGrants`
-- `tokenLimit`
-- `parallelLimit`
+- v2：`freeAccess`（默认 `false`，即私有）、`userGrants`、`tokenLimit`、`parallelLimit`。
+- v4：不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
+- v5：Grok 媒体权限 `grokMediaPolicy`（图片生成、图片编辑、视频生成三个独立开关，缺失即全部关闭）。
+- v6：scoped quota metadata。
+- v7：quota 中独立的 `unobservedTiers`（套餐已确认但尚无真实数值观测的容量池，只用于展示），以及仅 Codex OAuth 使用的 `bankedReset` 摘要。二者都不参与调度、限流、可用性或容量评分。
 
-并新增不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
+Router 的 quota 解析拒绝未知字段，因此契约扩展必须先升级 Router，再升级写出新字段的 Server。Share 控制面线格式及严格性规则以 `cc-switch-router/PROTOCOL.md` §§7、12 为准。
 
 以下 v1 字段**已退役，且对 camelCase 与 snake_case 两种写法都 fail-closed**（`src/domain/sharing/retired_fields.rs`）：
 `acl`、`forSale`/`for_sale`、`officialPricePercent`、`forSaleOfficialPricePercentByApp`、`sharedWithEmails`、`marketAccessMode`、`accessByApp`、`appSettings`。

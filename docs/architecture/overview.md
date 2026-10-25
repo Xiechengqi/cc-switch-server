@@ -2,7 +2,7 @@
 
 > 状态：**权威文档**。本文件是 cc-switch-server 架构叙述的唯一真值来源，Router 侧对应文档为 `cc-switch-router/ARCHITECTURE.md`，系统文档站对应 `tokenswitch-docsify`。三者出现冲突时，涉及 Server 内部结构的以本文为准，涉及 Router 内部结构与协议线格式的以 Router 仓库 `PROTOCOL.md` 为准。
 >
-> 最后核对：2026-08-20。
+> 最后核对：2026-10-25（Server `312d127`，Router `3a489ab`）。
 
 ## 1. 系统角色
 
@@ -12,16 +12,20 @@ Token 路由交易系统由**三个角色**构成，运行时只有**两个进�
 | --- | --- | --- | --- |
 | Client | `cc-switch-server` | 本仓库 | 持有 Provider 账号与凭据，执行反代转发，向 Router 注册并维护隧道，管理 Share 与用量 |
 | Router | `cc-switch-router` | `/data/projects/cc-switch-router` | 公网入口、签名校验、IngressContext 注入、SSH 反向隧道终结、区域调度 |
-| Client / Share Market | `cc-switch-router`（内置） | 同上 | Client Market（主机供给与租约）与 Share Market（拼车位租赁与撮合） |
+| Client / Share Market | `cc-switch-router`（内置） | 同上 | Share Market（拼车位挂牌、租用与授权下发）、Client Market（主机供给、开通与租约），以及两者共用的准入与资金 |
 
 > Router 同时承担 Router 与 Client/Share Market 两个角色，二者在同一进程内实现，不是独立服务。
 
-已下线、**不得**再写入任何文档的组件：
+以下组件已下线，**不得**被描述为当前运行时组成：
 
-- 独立 Token Market 服务（`cc-switch-market`）。Router 上 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 一律返回 `410 Gone`。
-- 独立 `cc-switch-share-market` 仓库，其能力已并入 Router 内置 Share Market。
+- 旧 Token Market 集成。Router 上 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 一律返回 `410 Gone`。
 - 任何 Tauri 桌面端或外部 Provider 仓库。Server 的 Provider 产品范围由本仓库 requirements/Registry 决定，证据边界见 [`PROTOCOL_EVIDENCE.md`](../../PROTOCOL_EVIDENCE.md)。
-- 账本抽成（10%+5%）与 Gate.io 提现。现行结算为 USD 赊账账户（按 买家×供应商 聚合）+ 线下付款声明 + 供应商确认 + 12h 健康时长试用。
+
+### 1.1 资金边界
+
+Server 不参与计费：不保存价格、余额、账单或结算，只统计 Token、状态与延迟。Share Market 与 Client Market 的付费发布、报价和购买均使用 Router 的平台余额；Router 的 `disabled` / `shadow` / `enabled` 财务模式只控制新的官方渠道充值，不切换到旧的 Provider 资金轨道。`shadow` 只允许 Owner 测试充值；开放或重新开放普通用户充值须通过当前渠道及账本验收门槛。关闭充值或退回影子测试不影响既有余额的消费、转账、已发起订单的核对或成熟收益的结算，也不会恢复旧资金写入口。
+
+Provider 的净收益完成七天沉淀后由 Router 自动计入其平台余额，可用于消费或按 Router 的规则流转；外部提现、提现地址和手动「收益转入余额」均已退役。对 Server 而言，Share Market 的租用、恢复和欠费暂停体现为 Router 经 pending Share edit 下发的 `managedGrant` `upsert`（授予/恢复）与 `revoke`（回收/暂停）；Server 落库为 `manager=routerShareMarket` 的授权并据此执行访问与限额。Client Market 欠费由 Router 侧暂停该 Client 的隧道，不需要 Server 配合。当前资金契约以 `cc-switch-router/docs/market-platform-wallet-implementation.md` 开头的现行说明和 `cc-switch-router/docs/market-earnings-automatic-credit.md` 为准，不能把前者保留的旧提现规划当作当前实现。
 
 ## 2. 两条链路
 
@@ -51,7 +55,7 @@ Code Agent CLI
 - 由 `src/proxy/` 提供，入口路由集中在 `src/api/mod.rs` 的 `inference_router()`。
 - 请求身份来自 Router 注入的 IngressContext，Server 侧不接受未经 Router 签名的推理调用。
 
-推理入口路径（以 `inference_router()` 定义为准）：`/v1/messages`、`/v1/messages/count_tokens`、`/v1/chat/completions`、`/v1/responses`、`/v1/responses/compact`、`/v1/responses/input_tokens`、`/v1/models`、`/v1/images/generations`、`/v1/images/edits`、`/alpha/search`，以及 `/claude/*`、`/codex/*`、`/backend-api/codex/*`、无前缀与双 `/v1/v1` 等兼容别名。
+推理入口路径（以 `inference_router()` 定义为准）：`/v1/messages`、`/v1/messages/count_tokens`、`/v1/chat/completions`、`/v1/responses`、`/v1/responses/compact`、`/v1/responses/input_tokens`、`/v1/models`、`/v1/images/generations`、`/v1/images/edits`、`/v1/images/files/:token`、`/v1/videos/generations`、`/v1/videos/:request_id`、`/v1/alpha/search`、Gemini 的 `/v1beta/*`、`/gemini/v1beta/*`、`/gemini/v1/*`，以及 `/claude/*`、`/codex/*`、`/backend-api/codex/*`、无前缀与双 `/v1/v1` 等兼容别名。
 
 ## 3. 代码分层
 
@@ -60,15 +64,17 @@ Code Agent CLI
 | 模块 | `.rs` 数 | 职责 |
 | --- | --- | --- |
 | `api/` | 46 | HTTP 路由、控制面、Web UI 资产、终端会话、请求/响应类型 |
-| `proxy/` | 64 | 推理转发热路径：协议适配、流式改写、重试与降级、用量计量 |
-| `domain/` | 54 | 业务模型与不变量：providers / accounts / sharing / usage / router / settings |
-| `clients/` | 31 | 出站客户端：OAuth 设备流与刷新、Router 客户端、隧道、DeepSeek PoW |
-| `infra/` | 7 | 基础设施：存储、凭据加解密、HTTP 客户端、备份、时间、公网 IP |
+| `proxy/` | 111 | 推理转发热路径：协议适配、流式改写、重试与降级、用量计量 |
+| `domain/` | 61 | 业务模型与不变量：providers / accounts / sharing / usage / router / settings |
+| `clients/` | 38 | 出站客户端：OAuth 设备流与刷新、Router 客户端、隧道、DeepSeek PoW |
+| `repository/` | 5 | providers / accounts / shares / usage 的 SQLite 事务型权威库与 JSON→SQLite 迁移边界 |
+| `state/` | 2 | 从 `state.rs` 拆出的后台调度器与 in-flight 准入跟踪 |
+| `infra/` | 8 | 基础设施：存储、凭据加解密、HTTP 客户端、备份、时间、公网 IP、网络身份 |
 | `logging/` | 4 | 日志初始化、审计、捕获缓冲 |
 | `self_update/` | 4 | 版本探测、升级、重启 |
-| 顶层 `.rs` | 12 | `state.rs`、`admin.rs`、`setup.rs`、`cli.rs`、`metrics.rs` 等 |
+| 顶层 `.rs` | 14 | `state.rs`、`admin.rs`、`setup.rs`、`cli.rs`、`metrics.rs`、`client_tunnel_provision.rs`、`provider_identity.rs` 等 |
 
-顶层文件（共约 35.1k 行）中 `state.rs` 单文件约 29.5k 行，是全仓最大的单点；其余依次为 `client_tunnel_provision.rs`（约 1.4k）、`admin.rs`（约 1.0k）、`setup.rs`（约 0.8k）。
+顶层文件（共约 40.3k 行）中 `state.rs` 单文件约 33.8k 行，仍是全仓最大的单点；其余依次为 `client_tunnel_provision.rs`（约 1.4k）、`admin.rs`（约 1.3k）、`metrics.rs`（约 1.0k）、`setup.rs`（约 0.8k）。
 
 ### 3.1 api/
 
@@ -78,7 +84,7 @@ Code Agent CLI
 
 ### 3.2 proxy/
 
-平铺文件按供应商与关注点划分，主要有 `forwarder.rs`（转发主循环）、`adapters.rs`/`transforms.rs`/`stream_transforms.rs`（协议改写）、`streaming.rs`、`retry_policy.rs`、`request_governance.rs`、`usage.rs`，以及供应商专属的 `claude_oauth.rs` `codex_models.rs` `codex_request_policy.rs` `copilot_model_map.rs` `copilot_optimizer.rs` `grok.rs` `kimi.rs`/`kimi_runtime.rs` `kiro.rs` `qoder.rs`/`qoder_runtime.rs` `deepseek.rs` 等；子目录 `cursor/`（Agent 协议桥接）、`kiro/`、`forwarder/`、`codex_instructions/`。
+平铺文件按供应商与关注点划分，主要有 `forwarder.rs`（转发主循环）、`adapters.rs`/`transforms.rs`/`stream_transforms.rs`（协议改写）、`streaming.rs`、`retry_policy.rs`、`request_governance.rs`、`usage.rs`，以及供应商专属的 `claude_oauth.rs` `codex_models.rs` `codex_request_policy.rs` `copilot_model_map.rs` `copilot_optimizer.rs` `grok.rs` `kimi.rs`/`kimi_runtime.rs` `kiro.rs` `qoder.rs`/`qoder_runtime.rs` `deepseek.rs` 等；子目录 `cursor/`（Agent 协议桥接）、`kiro/`、`deepseek/`、`providers/`、`execution/`、`forwarder/`、`codex_instructions/`。
 
 Cursor 的 live h2 session 与 completed Responses context 是两个独立状态域。`session.rs` 仅保存可续传的 h2 writer/tool-call 映射，并对相同 Running conversation 返回冲突；`response_state.rs` 仅保存有界、规范化、无凭据的 input/output items，用于 `previous_response_id` 新开 run。该短期 continuation context 也适用于 `store=false`，但只存在于进程内且不形成可查询的 Responses 资源。二者都按 Provider、rail、runtime、credential identity、Share/user 等维度 fencing，不能互相降级或跨 scope 查找。
 
@@ -97,7 +103,7 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
 
 ### 3.4 clients/
 
-- `oauth/`：Claude / Codex / Copilot / Cursor / Grok / Kimi / Kiro / Qoder 的设备流、JWKS、刷新与配额查询（19 个文件）。
+- `oauth/`：Claude / Codex / Gemini / Antigravity / Copilot / Cursor / Grok / Kimi / Kiro / Amazon Q / Qoder / CodeBuddy / Trae 的设备流、JWKS、刷新、模型目录与配额查询（26 个文件）。
 - `router/`：`client.rs`、`tunnel.rs`、`ingress.rs`、`control_store.rs`、`email_auth.rs`。
 - `deepseek/`：含 `pow.rs`。
 - 顶层：`coding_plan_quota.rs`、`ollama_cloud.rs`。

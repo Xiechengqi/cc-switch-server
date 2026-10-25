@@ -2,7 +2,7 @@
 
 > 本文件是 cc-switch-server 全部文档的**唯一索引**。新增文档必须在此登记并标注状态，否则 `scripts/static-checks.sh` 的文档检查会失败。
 >
-> 最后核对：2026-09-02。
+> 最后核对：2026-10-25。
 
 ## 状态标记
 
@@ -17,8 +17,8 @@
 
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
-| [overview.md](architecture/overview.md) | 权威 | 三角色拓扑、两条链路、8 个模块的分层与强约束。**架构叙述的真值来源** |
-| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧实现的 Router 协议：控制面、探针、IngressContext、Share 契约 v2 |
+| [overview.md](architecture/overview.md) | 权威 | 三角色拓扑、资金边界、两条链路、模块分层与强约束。**架构叙述的真值来源** |
+| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧实现的 Router 协议：控制面、探针、IngressContext、Share 契约 v7 |
 | [storage.md](architecture/storage.md) | 权威 | 数据目录、文件清单、凭据加密、用量存储、备份、写入锁序 |
 | [usage-accounting.md](architecture/usage-accounting.md) | 权威 | Usage token 计量口径 |
 
@@ -114,7 +114,8 @@
 | 主题 | 位置 |
 | --- | --- |
 | Router 内部架构与术语表 | `cc-switch-router/ARCHITECTURE.md`（§0 术语表为词汇标准） |
-| Router ↔ Server 协议线格式 | `cc-switch-router/PROTOCOL.md`（11 节） |
+| Router ↔ Server 协议线格式 | `cc-switch-router/PROTOCOL.md`（12 节） |
+| Market 资金模型（平台钱包、充值与 Provider 收益自动到账） | `cc-switch-router/docs/market-platform-wallet-implementation.md`、`cc-switch-router/docs/market-earnings-automatic-credit.md` |
 | Router UI 测试计划 | `cc-switch-router/UI_TEST_PLAN.md` |
 | 系统级文档站 | `tokenswitch-docsify` → https://docs.tokenswitch.org |
 | Provider 产品范围与身份 | `assets/contract/server-provider-requirements.json` 与 `assets/contract/provider-registry.json` |
@@ -155,10 +156,9 @@
 
 ## 已下线主题
 
-以下内容**不得**再出现在任何权威文档中，只允许在 `docs/history/` 中作为历史记录：
+以下历史设计**不得**在权威文档中被描述为当前可用功能；权威文档可说明其退役边界，完整过程仅在 `docs/history/` 中作为历史记录：
 
-- 独立 Token Market 服务（`cc-switch-market`）；Router 上 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 返回 `410 Gone`
-- 独立 `cc-switch-share-market` 仓库（能力已并入 Router 内建 Share Market）
+- 旧 Token Market 集成：Market host、`market-http` tunnel、Market proxy 与 Share 出售字段；Router 上 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 统一返回 `410 Gone`
 - Tauri 桌面端作为 Router 客户端
-- 账本抽成（10% + 5%）与 Gate.io 提现；现行结算为 USD 赊账账户 + 线下付款声明 + 供应商确认 + 12h 健康时长试用
+- Server 内的价格、余额、账单或结算逻辑。资金只存在于 Router：Share Market / Client Market 的计费、平台钱包、充值与 Provider 收益自动到账见外部真值来源；Server 只执行 Router 下发的 `routerShareMarket` 授权并统计 Token
 - Share Contract v1 字段：`acl`、`forSale`/`for_sale`、`officialPricePercent`、`forSaleOfficialPricePercentByApp`、`sharedWithEmails`、`marketAccessMode`、`accessByApp`、`appSettings`

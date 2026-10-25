@@ -47,8 +47,7 @@ scripts/smoke/router-share-smoke.sh
 RUN_REAL=1 STREAM_PROBE=1 scripts/smoke/code-agent-regression.sh
 ```
 
-The standalone `cc-switch-market` repository is not part of this acceptance
-path. Migration 21 physically retires the old Router live/archive tables after
+Migration 21 physically retires the old Router live/archive tables after
 checksum verification; only non-identifying aggregate receipts and eligible
 canonical Share usage remain. No old Market writer or runtime dependency is
 accepted.
