@@ -52,7 +52,7 @@ HTTP 和 SSE 共用同一份 Grok request contract：
 
 - OpenAI Chat Completions 先无损规范化为 Responses，请求上游固定使用 Grok CLI `/v1/responses`；非流式和 SSE 再恢复为 Chat contract。Grok 数据面不再向上游发送 `/v1/chat/completions`。
 - Provider 的 single-model policy 先决定候选上游模型，默认 `grok-4.6`；随后由 Grok contract 对候选别名做最终规范化，例如 `grok-composer` 变为 `grok-composer-2.5-fast`。
-- 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。当前 reviewed identity 仍是 `grok-shell/0.2.111`，未发送 `x-grok-conv-group-id`；参考项目的 Build `1.0.40` 与 group header 在固定账号真实验收前不得直接替换本合同。
+- 出站使用 `Authorization: Bearer`、`x-xai-token-auth`、`x-grok-client-identifier`、`x-grok-client-version`、`x-authenticateresponse`、Grok CLI User-Agent 和稳定的 `x-grok-conv-id`。根据 2026-10-25 用户报告的上游明确版本拒绝（最低要求 `1.0.13`），默认 version/User-Agent 更新为 `1.0.13` / `grok-shell/1.0.13 (linux; x86_64)`。`x-grok-conv-group-id` 仍未启用，必须单独完成固定账号接受性验收。
 - 账号 `extraHeaders` 不能覆盖 Authorization、`x-xai-token-auth`、`x-authenticateresponse`、整个 `x-grok-*` 代理身份命名空间、accept/content-type 或 hop-by-hop header；发现冲突配置时请求 fail closed，而不是静默采用账号值。该约束不代表 Server 已发送或获准发送参考项目的 client-mode/group/session 等新增头。
 - Responses body 会清理不受支持的字段，并校验 reasoning、tool 和 `encrypted_content` 形状。有精确 fresh catalog capability 时，HTTP、WebSocket 与 WS→HTTP fallback 的 effort 只接受该模型有序菜单中的 `none|minimal|low|medium|high|xhigh|max`；显式 `supports_reasoning_effort=false` 会删除 effort，但保留独立的 summary 控制。没有 fresh capability 时沿用既有保守静态判断，stale catalog 不能扩大权限。Codex Responses Lite 的 `additional_tools` 接受可选的规范 `role=developer`，随后把工具提升到 xAI 顶层 tools；完全相同的声明会去重，同名不同定义、其他 role、未知字段或无法无损映射的工具仍在本地 `422` fail closed。
 - 最终 Grok 工具清理会将缺失、`null` 或空数组的 `tools` 与孤立的 `tool_choice` 一起省略；对象型强制选择必须匹配清理后保留的工具类型，函数选择还必须精确匹配已声明函数名，否则省略无效选择。普通 `auto|none|required`、合法函数和 hosted 工具选择保持原有行为。HTTP Responses、Chat 转换、WebSocket `response.create` 及其 HTTP fallback 使用同一请求准备规则；不凭空注入工具。
@@ -202,10 +202,12 @@ GR-N3 的本地 fixture 已覆盖菜单顺序/去重、minimal/max、default mem
 | 变量 | 作用 |
 | --- | --- |
 | `CC_SWITCH_SERVER_XAI_CLIENT_ID` | 覆盖 xAI public client id；通常留空 |
-| `CC_SWITCH_GROK_CLI_VERSION` | CLI version，默认 `0.2.111` |
+| `CC_SWITCH_GROK_CLI_VERSION` | CLI version，默认 `1.0.13` |
 | `CC_SWITCH_GROK_CLI_USER_AGENT` | 完整 CLI User-Agent 覆盖 |
 | `CC_SWITCH_GROK_MODELS_TTL_SECONDS` | 模型目录缓存 TTL，默认 300 秒，范围 1-86400 秒 |
 | `CC_SWITCH_GROK_OAUTH_CAPABILITIES` | 逗号分隔的 capability bootstrap，或 `all` |
+
+升级后需重新构建并重启 Server。已有部署若显式设置了旧的 `CC_SWITCH_GROK_CLI_VERSION` 或 `CC_SWITCH_GROK_CLI_USER_AGENT`，还需删除旧覆盖或同步更新；环境变量仍优先于内置默认值。在宿主机执行 `grok update` 不会修改 Server 自己发送的身份。
 
 重点监控：
 
@@ -269,7 +271,7 @@ node scripts/smoke/grok-real-receipt.mjs
 
 末次复核还会经 `O_NOFOLLOW` 只读描述符重读至多 1 MiB 的完整 receipt 原始字节及 EOF，并与初始快照逐字节比较；读前、读后和配置路径的文件身份继续核对。inference、media、remote_compaction 三项对抗 fixture 在控制面请求期间等长改写文件、让末次元数据读取返回旧值时，旧流程会错误接受，现在均脱敏拒绝。元数据伪装仅验证指纹不能代替内容比较，不代表普通用户能恢复真实 `ctime`；末次检查后的竞态、跨 API 原子性和真实 xAI 接受性仍未获证明。
 
-GR-N4 还要求同一个固定 Account 分别留下 catalog 与 inference 对身份/header 的接受证据。只有明确的 version-rejected signal 或 current-commit fresh receipt 才能评审将默认 `0.2.111` 更新为参考项目的 Build `1.0.40`；`x-grok-conv-group-id` 也必须单独证明接受性和 Share/Account 隔离。静态 UUIDv5 向量只能验证派生算法，不能把状态提升为 live，也不能授权发送新 header。
+GR-N4 的历史记录保留当时默认 `0.2.111` 与参考 Build `1.0.40` 的比较。2026-10-25 用户报告的明确 version-rejected signal 已用于将默认版本提高到上游给出的最低值 `1.0.13`；该修复不代表新版本已通过本仓库的真实验收。同一个固定 Account 的 catalog/inference 接受证据仍需补齐，`x-grok-conv-group-id` 仍必须单独证明接受性和 Share/Account 隔离。静态 UUIDv5 向量只能验证派生算法，不能把状态提升为 live，也不能授权发送新 header。
 
 `remote_compaction` receipt 只证明上游协议证据，绝不自动开启运行时。即使 receipt 验证通过，`runtimeEnabled=false` 仍保持不变，后续还必须独立完成 scope、versioned AEAD、TTL、失败语义与降级设计评审。缺少任一输入或 receipt 时仅输出 `blocked_inputs/live_pending`。
 

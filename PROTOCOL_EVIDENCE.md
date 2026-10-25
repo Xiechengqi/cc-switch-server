@@ -1,5 +1,11 @@
 # Protocol evidence policy
 
+## 2026-10-25 Grok CLI 明确版本拒绝后的默认身份更新
+
+用户报告 Grok OAuth / Codex 检查收到上游错误：`Your Grok CLI version (0.2.111) is outdated. Please update to version 1.0.13 or later via grok update or the installation documentation.` 这满足既有 GR-N4 对明确 version-rejected signal 的要求。Server 使用自己的身份常量，宿主机升级 Grok CLI 不会改变检查请求；现将统一默认版本与 User-Agent 更新为 `1.0.13` / `grok-shell/1.0.13 (linux; x86_64)`，模型目录、device flow、quota 和 HTTP/WS/media 共用该版本入口。已有环境变量覆盖继续优先，部署升级必须同步清除或更新旧值。
+
+本次依据是用户报告的拒绝及其给出的最低版本，没有将参考项目的更高版本当作接受性证据。旧 observation/GR-N4 extension 保持不可变历史，当前身份变更单独记录于 `assets/contract/grok-reference-delta.json` 的 `cliIdentityUpdate`。没有新增出站 header；group header、remote compaction 与真实 operation receipt 的门槛保持原状。离线回归不能证明固定账号已接受新版本，真实验收仍为 `live_pending`。
+
 `cc-switch-server` 的 Provider 产品范围、身份和运行时行为由本仓库维护，当前权威来源是：
 
 - `assets/contract/server-provider-requirements.json`：必须覆盖的 ProviderType 与 App Surface；

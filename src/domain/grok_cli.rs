@@ -5,9 +5,9 @@ pub const GROK_CLI_WEEKLY_BILLING_URL: &str =
 pub const GROK_CLI_MONTHLY_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 pub const GROK_SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 pub const GROK_TASK_USAGE_URL: &str = "https://grok.com/rest/tasks/usage";
-pub const DEFAULT_GROK_CLI_VERSION: &str = "0.2.111";
+pub const DEFAULT_GROK_CLI_VERSION: &str = "1.0.13";
 pub const GROK_CLI_CLIENT_IDENTIFIER: &str = "grok-shell";
-pub const DEFAULT_GROK_CLI_USER_AGENT: &str = "grok-shell/0.2.111 (linux; x86_64)";
+pub const DEFAULT_GROK_CLI_USER_AGENT: &str = "grok-shell/1.0.13 (linux; x86_64)";
 pub const GROK_CLI_TOKEN_AUTH: &str = "xai-grok-cli";
 
 #[cfg(test)]
@@ -74,6 +74,15 @@ mod tests {
                 std::env::remove_var(self.name);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn default_identity_meets_reported_upstream_minimum() {
+        let _lock = GROK_ENV_LOCK.lock().await;
+        let _version = EnvGuard::set("CC_SWITCH_GROK_CLI_VERSION", "");
+        let _user_agent = EnvGuard::set("CC_SWITCH_GROK_CLI_USER_AGENT", "");
+        assert_eq!(grok_cli_version(), "1.0.13");
+        assert_eq!(grok_cli_user_agent(), "grok-shell/1.0.13 (linux; x86_64)");
     }
 
     #[tokio::test]

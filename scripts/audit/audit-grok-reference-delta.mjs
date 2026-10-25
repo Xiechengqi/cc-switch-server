@@ -679,6 +679,8 @@ assert(
   "GR-N3 catalog capability evidence boundary changed",
 );
 
+// GR-N4 is immutable historical evidence. Current defaults are checked separately
+// against the explicit upstream version-rejection update below.
 const identityGateExtension = evidenceExtensions.get("GR-N4");
 assert(
   identityGateExtension?.status === "live_pending" &&
@@ -698,12 +700,37 @@ assert(
   "GR-N4 identity live gate changed",
 );
 
+const identityUpdate = contract.cliIdentityUpdate;
+assert(
+  identityUpdate?.basis === "user_reported_upstream_version_rejection" &&
+    Number.isFinite(Date.parse(identityUpdate.recordedAt)) &&
+    Date.parse(identityUpdate.recordedAt) <= Date.parse(contract.updatedAt) &&
+    identityUpdate.previousDefaultVersion === identityGateExtension.currentServerVersion &&
+    identityUpdate.defaultVersion === "1.0.13" &&
+    identityUpdate.upstreamRequiredMinimumVersion === identityUpdate.defaultVersion &&
+    identityUpdate.liveReceiptState === "live_pending" &&
+    identityUpdate.conversationGroupHeaderEnabled === false,
+  "Grok CLI version-rejection update is invalid",
+);
+const currentIdentitySource = fs.readFileSync(path.join(repoRoot, "src/domain/grok_cli.rs"), "utf8");
+assert(
+  currentIdentitySource.includes(`DEFAULT_GROK_CLI_VERSION: &str = "${identityUpdate.defaultVersion}"`) &&
+    currentIdentitySource.includes(`DEFAULT_GROK_CLI_USER_AGENT: &str = "grok-shell/${identityUpdate.defaultVersion} (linux; x86_64)"`) &&
+    currentIdentitySource.includes("default_identity_meets_reported_upstream_minimum"),
+  "Grok current CLI identity does not match the version-rejection update",
+);
+const historicalIdentityCommit = contract.observations.find(
+  (observation) => observation.id === "GR-OBS-0013",
+).target.baselineCommit;
+
 for (const extension of [catalogCapabilityExtension, identityGateExtension]) {
   for (const evidence of extension.localEvidence) {
     safeRelative(evidence.path, `${extension.id} local path`);
     const localPath = path.join(repoRoot, evidence.path);
     assert(fs.existsSync(localPath), `${extension.id} local path is unavailable: ${evidence.path}`);
-    const source = fs.readFileSync(localPath, "utf8");
+    const source = extension.id === "GR-N4"
+      ? gitFile(repoRoot, historicalIdentityCommit, evidence.path)
+      : fs.readFileSync(localPath, "utf8");
     assert(
       Array.isArray(evidence.anchors) &&
         evidence.anchors.length > 0 &&

@@ -378,7 +378,16 @@
     ]
   },
   "legacySchemaVersion": 1,
-  "updatedAt": "2026-09-28T00:00:00Z",
+  "updatedAt": "2026-10-25T00:00:00Z",
+  "cliIdentityUpdate": {
+    "recordedAt": "2026-10-25T00:00:00Z",
+    "basis": "user_reported_upstream_version_rejection",
+    "previousDefaultVersion": "0.2.111",
+    "defaultVersion": "1.0.13",
+    "upstreamRequiredMinimumVersion": "1.0.13",
+    "liveReceiptState": "live_pending",
+    "conversationGroupHeaderEnabled": false
+  },
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",
