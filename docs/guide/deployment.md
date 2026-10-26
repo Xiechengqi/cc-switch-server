@@ -38,6 +38,7 @@ RUN_TESTS=1 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=1 scripts/release-readiness.sh
 `validate-local.sh` 固定执行：
 
 ```bash
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
 cargo fmt --check
 cargo check
 node scripts/audit/audit-provider-coverage.mjs --check

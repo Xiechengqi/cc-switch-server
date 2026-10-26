@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Match release readiness and CI for large debug async forwarding fixtures.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"
+
 cargo fmt --check
 cargo check
 node scripts/audit/audit-claude-wire-profile.mjs

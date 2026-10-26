@@ -16,6 +16,9 @@ jobs:
     name: Validate release contracts
     runs-on: ubuntu-24.04
     env:
+      # Match the local regression gates: large debug async forwarding fixtures
+      # exceed Rust's default test-thread stack.
+      RUST_MIN_STACK: "67108864"
       CC_SWITCH_ROUTER_AUDIT_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
       CC_SWITCH_ROUTER_ROOT: ${{ github.workspace }}/provider-audit/cc-switch-router
     steps:

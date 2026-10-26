@@ -112,7 +112,7 @@ cargo run -- --host 0.0.0.0 --port 15721
 cargo fmt -- --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test
+RUST_MIN_STACK=67108864 cargo test
 scripts/static-checks.sh
 ```
 

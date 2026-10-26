@@ -12,6 +12,40 @@ const repoRoot = path.resolve(
 );
 const readinessScript = path.join(repoRoot, "scripts/release-readiness.sh");
 
+test("release Rust regressions inherit the established 64 MiB test-thread stack", () => {
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/_build-release-assets.yml"),
+    "utf8",
+  );
+  const validationJob = workflow
+    .split(/^  validate:\r?\n/m)[1]
+    ?.split(/^  \S/m)[0];
+  assert.ok(validationJob, "the release validation job must exist");
+  const jobEnvironment = validationJob.match(
+    /^    env:\r?\n((?:^      [^\r\n]*\r?\n)+)/m,
+  )?.[1] || "";
+  assert.match(jobEnvironment, /^      RUST_MIN_STACK: "67108864"$/m);
+
+  for (const filter of ["domain::providers::registry::tests", "amazon_q", "web_session"]) {
+    assert.ok(
+      validationJob.includes(`          cargo test ${filter} --lib\n`),
+      `the ${filter} regression must continue to run in the configured job`,
+    );
+  }
+  for (const script of [
+    "scripts/audit/validate-local.sh",
+    "scripts/release-readiness.sh",
+    "scripts/smoke/code-agent-regression.sh",
+  ]) {
+    assert.ok(
+      fs.readFileSync(path.join(repoRoot, script), "utf8").includes(
+        'export RUST_MIN_STACK="${RUST_MIN_STACK:-67108864}"',
+      ),
+      `${script} must keep the same configurable default stack budget`,
+    );
+  }
+});
+
 test("skipped local contracts block release readiness and evidence", () => {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), "cc-switch-release-readiness-"),
