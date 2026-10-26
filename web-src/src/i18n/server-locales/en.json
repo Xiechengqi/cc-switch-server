@@ -54,6 +54,7 @@
     "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors."
   },
   "codexBankedReset": {
+    "needsReconcile": "The outcome needs reconciliation. No new credit will be consumed automatically; the shared weekly reset has not been confirmed.",
     "alreadyRedeemed": "This credit has already been used",
     "available": "Available resets",
     "availableUnit": "credit(s)",
@@ -1113,6 +1114,19 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "Unlimited",
     "userLimit": {
+      "accountReset": {
+        "label": "Account reset cycle",
+        "ready": "Account cycle ready",
+        "unavailable": "Account cycle unavailable: {{reason}}",
+        "pending": "Waiting for account cycle / verified history",
+        "noEnd": "Next reset not yet confirmed",
+        "observed": "Last observation",
+        "caveat": "Public announcements follow announcement time, not per-account execution. External resets without evidence cannot be guaranteed detectable. Confirmed cycles are retained during temporary failures.",
+        "preview": "Expected usage (not a reset). Check each user, then apply again:",
+        "exceeded": "At or over the limit",
+        "saveFirst": "Save the Share before initializing its account cycle.",
+        "notReady": "Account cycle is not ready; keep the existing period."
+      },
       "remoteChanged": "Share settings changed remotely. Reload to discard this Share draft and use the latest settings.",
       "reloadShare": "Reload Share",
       "add": "Add user",

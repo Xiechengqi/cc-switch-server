@@ -75,6 +75,10 @@ pub struct CredentialSourceIdentity {
 }
 
 impl CredentialSourceIdentity {
+    /// Internal only; never expose this enumerable credential digest on wire.
+    pub(crate) fn quota_identity(&self) -> String {
+        format!("{}:{}", self.family, hex::encode(self.digest))
+    }
     pub fn capacity_pool_id(&self, key: &[u8; 32]) -> anyhow::Result<String> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key)
             .map_err(|error| anyhow::anyhow!("initialize capacity pool HMAC: {error}"))?;

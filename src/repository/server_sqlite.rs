@@ -24,6 +24,7 @@ use crate::domain::sharing::shares::{shares_path, ShareStore};
 use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
 
 mod payload;
+mod quota;
 mod schema;
 mod wal;
 
@@ -36,7 +37,7 @@ use wal::validate_wal_if_present;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +146,7 @@ pub(crate) fn ensure_shadow(
     config_dir: &Path,
     input: ShadowImportInput<'_>,
 ) -> anyhow::Result<ShadowImportReport> {
+    upgrade_schema(config_dir)?;
     if read_marker(config_dir)?.is_some() {
         match verify_shadow(
             config_dir,
@@ -291,7 +293,7 @@ pub(crate) fn read_marker(config_dir: &Path) -> anyhow::Result<Option<MigrationM
     let marker: MigrationMarker =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     ensure!(
-        marker.schema_version == SCHEMA_VERSION as u32,
+        (1..=SCHEMA_VERSION as u32).contains(&marker.schema_version),
         "unsupported Server SQLite marker schema {}",
         marker.schema_version
     );
@@ -300,6 +302,42 @@ pub(crate) fn read_marker(config_dir: &Path) -> anyhow::Result<Option<MigrationM
         "Server SQLite marker points outside its fixed database file"
     );
     Ok(Some(marker))
+}
+
+/// Only called on the live data directory (never by read-only restore
+/// validation). Authority and source digest are preserved across the upgrade.
+pub(crate) fn upgrade_schema(config_dir: &Path) -> anyhow::Result<()> {
+    let Some(mut marker) = read_marker(config_dir)? else {
+        return Ok(());
+    };
+    let database = database_path(config_dir);
+    ensure!(
+        database.is_file(),
+        "SQLite migration marker has no database; restore a complete backup"
+    );
+    validate_wal_if_present(&database)?;
+    let connection = open_database(&database, false)?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure!(
+        i64::from(marker.schema_version) <= version,
+        "SQLite database schema is older than its authority marker; restore a complete backup"
+    );
+    let digest: String = connection.query_row(
+        "SELECT value FROM meta WHERE key='source_digest'",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        digest == marker.source_digest,
+        "SQLite migration source digest mismatch"
+    );
+    schema::migrate_to_current(&connection)?;
+    checkpoint_database(&connection)?;
+    if marker.schema_version != SCHEMA_VERSION as u32 {
+        marker.schema_version = SCHEMA_VERSION as u32;
+        write_marker(config_dir, &marker)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_backup_pair(stage_dir: &Path) -> anyhow::Result<()> {
@@ -319,7 +357,7 @@ pub(crate) fn validate_backup_pair(stage_dir: &Path) -> anyhow::Result<()> {
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     ensure!(
-        version == SCHEMA_VERSION,
+        (1..=SCHEMA_VERSION).contains(&version) && i64::from(marker.schema_version) <= version,
         "staged SQLite schema version is unsupported"
     );
     let source_digest: String = connection.query_row(
@@ -491,6 +529,7 @@ pub(crate) fn activate_authority_with_hook(
     config_dir: &Path,
     mut hook: impl FnMut(AuthorityTransitionStage) -> anyhow::Result<()>,
 ) -> anyhow::Result<MigrationMarker> {
+    upgrade_schema(config_dir)?;
     let mut marker = read_marker(config_dir)?.context("SQLite migration marker is missing")?;
     let database = database_path(config_dir);
     ensure!(database.is_file(), "SQLite authority database is missing");
@@ -566,6 +605,7 @@ pub(crate) fn authority_activation_requested() -> bool {
 }
 
 pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<AuthoritativeStores> {
+    upgrade_schema(config_dir)?;
     let marker = read_marker(config_dir)?.context("SQLite migration marker is missing")?;
     ensure!(
         marker.authority == AuthorityState::Committed,
@@ -601,7 +641,12 @@ pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<Authoritat
         let shares = ShareStore::load_or_default(&temporary)
             .context("load Shares from committed SQLite authority")?;
         let logs = load_usage_logs(&connection)?;
-        let (usage, recovered) = UsageStore::from_authoritative_logs(logs);
+        let (mut usage, mut recovered) = UsageStore::from_authoritative_logs(logs);
+        usage.quota_ledger = quota::load(&connection)?;
+        for log in &usage.logs {
+            usage.quota_ledger.record(log).map_err(anyhow::Error::msg)?;
+        }
+        recovered |= usage.quota_ledger.recover_pending();
         Ok((
             AuthoritativeStores {
                 providers,
@@ -909,6 +954,7 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
         .transaction()
         .context("begin Usage SQLite UPSERT")?;
     upsert_usage_row(&transaction, log)?;
+    quota::upsert_log(&transaction, log)?;
     bump_repository_generation(&transaction)?;
     transaction.commit().context("commit Usage SQLite UPSERT")?;
     observation.succeed();
@@ -975,6 +1021,7 @@ fn verify_committed_database(config_dir: &Path, marker: &MigrationMarker) -> any
 }
 
 fn validate_payload_digests(connection: &Connection) -> anyhow::Result<()> {
+    quota::load(connection)?;
     for table in ["providers", "shares", "usage_records"] {
         let mut statement =
             connection.prepare(&format!("SELECT payload_json,payload_sha256 FROM {table}"))?;
@@ -1353,6 +1400,8 @@ fn replace_usage_records_in_connection(
     for log in &usage.logs {
         upsert_usage_row(&transaction, log)?;
     }
+    // Detail replacement must not delete pinned exact revisions.
+    quota::merge(&transaction, &usage.quota_ledger)?;
     bump_repository_generation(&transaction)?;
     transaction
         .commit()
@@ -1487,7 +1536,11 @@ pub(crate) fn export_legacy(config_dir: &Path, destination_dir: &Path) -> anyhow
     }
     drop(statement);
     if committed {
-        let (usage, _) = UsageStore::from_authoritative_logs(load_usage_logs(&connection)?);
+        let (mut usage, _) = UsageStore::from_authoritative_logs(load_usage_logs(&connection)?);
+        usage.quota_ledger = quota::load(&connection)?;
+        for log in &usage.logs {
+            usage.quota_ledger.record(log).map_err(anyhow::Error::msg)?;
+        }
         usage
             .save(destination_dir)
             .context("export authoritative SQLite Usage to legacy format")?;
@@ -1696,6 +1749,7 @@ fn import_domain_rows(
             ],
         )?;
     }
+    quota::merge(transaction, &input.usage.quota_ledger)?;
 
     // Loading these stores already authenticated every credential envelope.
     // Matching every encrypted source key and generation to that runtime view
@@ -1708,6 +1762,11 @@ fn verify_connection(
     input: &ShadowImportInput<'_>,
     source_digest: &str,
 ) -> anyhow::Result<()> {
+    let persisted_quota = quota::load(connection)?;
+    ensure!(
+        serde_json::to_value(&persisted_quota)? == serde_json::to_value(&input.usage.quota_ledger)?,
+        "SQLite exact quota ledger differs from authoritative usage"
+    );
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     ensure!(
         integrity == "ok",
@@ -2753,5 +2812,89 @@ mod tests {
             .to_string()
             .contains("unsupported Server SQLite marker schema"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quota_schema_marker_crash_recovers_each_authority_without_reimport() {
+        for authority in [
+            AuthorityState::ShadowVerified,
+            AuthorityState::Prepared,
+            AuthorityState::Committed,
+        ] {
+            let dir = temp_dir(&format!("quota-marker-{authority:?}"));
+            let providers = ProviderStore::default();
+            let accounts = AccountStore::default();
+            let shares = ShareStore::default();
+            let mut usage = UsageStore::default();
+            let mut log = usage_log(0);
+            log.share_id = Some("share".into());
+            log.user_email = Some("u@example.com".into());
+            log.quota_attribution = Some(crate::domain::usage::quota_ledger::QuotaAttribution {
+                source_ref: "opaque".into(),
+                source_epoch: 1,
+                bucket_id: "weekly".into(),
+                started_at_ms: log.started_at_ms as i64,
+            });
+            usage.quota_ledger.begin_collection("opaque", 0);
+            usage.push(log);
+            refresh_shadow(
+                &dir,
+                ShadowImportInput {
+                    providers: &providers,
+                    accounts: &accounts,
+                    shares: &shares,
+                    usage: &usage,
+                },
+            )
+            .unwrap();
+            if authority == AuthorityState::Committed {
+                activate_authority(&dir).unwrap();
+            } else if authority == AuthorityState::Prepared {
+                activate_authority_with_hook(&dir, |stage| {
+                    if stage == AuthorityTransitionStage::MarkerPrepared {
+                        anyhow::bail!("crash")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            }
+            // SQL v2 already committed, but the marker write was lost. None
+            // of the authoritative exact rows may be reimported from JSON.
+            let mut marker = read_marker(&dir).unwrap().unwrap();
+            let digest = marker.source_digest.clone();
+            marker.schema_version = 1;
+            write_marker(&dir, &marker).unwrap();
+            upgrade_schema(&dir).unwrap();
+            upgrade_schema(&dir).unwrap();
+            let upgraded = read_marker(&dir).unwrap().unwrap();
+            assert_eq!(upgraded.schema_version, 2);
+            assert_eq!(upgraded.authority, authority);
+            assert_eq!(upgraded.source_digest, digest);
+            let connection = open_database(&database_path(&dir), true).unwrap();
+            assert_eq!(quota::load(&connection).unwrap().watermark, 1);
+            drop(connection);
+            activate_authority(&dir).unwrap();
+            assert_eq!(
+                load_authoritative(&dir)
+                    .unwrap()
+                    .usage
+                    .quota_ledger
+                    .watermark,
+                1
+            );
+            let export_parent = temp_dir("quota-rollback-export");
+            let export = export_parent.join("export");
+            export_legacy(&dir, &export).unwrap();
+            assert_eq!(
+                UsageStore::load_read_only(&export)
+                    .unwrap()
+                    .quota_ledger
+                    .watermark,
+                1
+            );
+            fs::remove_dir_all(export_parent).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

@@ -259,6 +259,80 @@ fn model_capacity_error(body: &[u8]) -> bool {
         || text.contains("model is at capacity. please try a different model")
 }
 
+pub(crate) async fn record_quota_response_headers(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    headers: &HeaderMap,
+) {
+    if execution.stored.provider_type != ProviderType::CodexOAuth {
+        return;
+    }
+    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    let mut rate = serde_json::Map::new();
+    for name in ["primary", "secondary"] {
+        let integer = |field: &str| {
+            headers
+                .get(format!("x-codex-{name}-{field}"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<i64>().ok())
+        };
+        let Some(seconds) = integer("window-minutes").and_then(|minutes| minutes.checked_mul(60))
+        else {
+            continue;
+        };
+        rate.insert(
+            format!("{name}_window"),
+            serde_json::json!({"limit_window_seconds":seconds,
+            "reset_at":integer("reset-at"), "reset_after_seconds":integer("reset-after-seconds")}),
+        );
+    }
+    if let Some(observation) = crate::domain::sharing::quota_cycle_source::codex_observation(
+        &serde_json::json!({"rate_limit":rate}),
+        now,
+    ) {
+        execution.record_quota_window(state, &observation).await;
+    }
+}
+
+pub(crate) async fn record_quota_websocket_payload(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    body: &[u8],
+) {
+    if execution.stored.provider_type != ProviderType::CodexOAuth || body.len() > 1024 * 1024 {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    if !matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("codex.rate_limits" | "rate_limits.updated")
+    ) {
+        return;
+    }
+    if value
+        .get("limit_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != "codex")
+    {
+        return;
+    }
+    // Only explicit shared-window duration fields are accepted. Generic
+    // reset_seconds/model/review counters are not evidence of a weekly bucket.
+    let raw = if value.get("rate_limit").is_some() {
+        value
+    } else {
+        serde_json::json!({"rate_limit":value.get("rate_limits")})
+    };
+    if let Some(observation) = crate::domain::sharing::quota_cycle_source::codex_observation(
+        &raw,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    ) {
+        execution.record_quota_window(state, &observation).await;
+    }
+}
+
 pub(crate) fn exhausted_window_reset_at_ms(headers: &HeaderMap, now_ms: i64) -> Option<i64> {
     let mut exhausted = ["primary", "secondary"]
         .into_iter()

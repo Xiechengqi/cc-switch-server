@@ -200,7 +200,7 @@ impl BankedResetActionError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConsumeResetCreditResult {
     pub(crate) code: Option<String>,
     pub(crate) credit_id: String,
@@ -208,6 +208,10 @@ pub(crate) struct ConsumeResetCreditResult {
     pub(crate) windows_reset: Option<i64>,
     pub(crate) available_count: Option<i64>,
     pub(crate) remaining_credits: Vec<Value>,
+    /// Only an explicit shared long-window receipt can confirm this. A count
+    /// of reset windows (including HTTP 2xx) deliberately leaves this false.
+    #[serde(default)]
+    pub(crate) shared_weekly_confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +422,22 @@ async fn consume_reset_credit_from_url(
             .and_then(nonnegative_integer),
         available_count,
         remaining_credits,
+        shared_weekly_confirmed: confirmed_shared_weekly_receipt(&raw),
     })
+}
+
+fn confirmed_shared_weekly_receipt(raw: &Value) -> bool {
+    // Do not infer a bucket from array position, a localized name, a numeric
+    // windows_reset, or a usage percentage. Unknown receipt schemas reconcile.
+    raw.get("reset_windows")
+        .and_then(Value::as_array)
+        .is_some_and(|windows| {
+            windows.iter().any(|window| {
+                window.get("scope").and_then(Value::as_str) == Some("shared")
+                    && window.get("limit_window_seconds").and_then(Value::as_i64) == Some(604_800)
+                    && window.get("reset").and_then(Value::as_bool) == Some(true)
+            })
+        })
 }
 
 pub(crate) fn select_auto_reset_credit(

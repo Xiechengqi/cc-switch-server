@@ -53,6 +53,26 @@ pub(crate) async fn record_quota_response_headers(
         crate::metrics::record_claude_quota_header_observation("absent");
         return;
     }
+    if let Some(weekly) = observations.iter().find(|observation| {
+        observation.tier_name == crate::domain::accounts::store::CLAUDE_SEVEN_DAY_QUOTA_TIER
+    }) {
+        if let Some(end) = weekly.resets_at_ms {
+            execution
+                .record_quota_window(
+                    state,
+                    &crate::domain::sharing::quota_cycle::QuotaWindowObservation {
+                        bucket_id: "shared_weekly".into(),
+                        starts_at_ms: None,
+                        ends_at_ms: end,
+                        duration_ms: Some(604_800_000),
+                        observed_at_ms: now_ms,
+                        basis:
+                            crate::domain::sharing::quota_cycle::QuotaTimeBasis::DerivedFromWindow,
+                    },
+                )
+                .await;
+        }
+    }
     let commit = state
         .record_claude_quota_window_observations_if_current(
             account_id,

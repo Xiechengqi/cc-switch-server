@@ -610,6 +610,13 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "get_codex_banked_reset_operation",
+      "support": "shim",
+      "implemented": true,
+      "feature": "settings",
+      "notes": "Read-only durable operation receipt for reconciliation; never dispatches or retries a credit consume."
+    },
+    {
       "name": "codex_referral_eligibility",
       "support": "shim",
       "implemented": true,
@@ -1411,6 +1418,14 @@
       "feature": "shares",
       "endpoint": "GET /api/shares/:id/connect-info",
       "notes": "Server-native Web compatibility command."
+    },
+    {
+      "name": "preview_share_account_reset",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/preview_share_account_reset",
+      "notes": "Per-Share capability and atomic user quota preview; no policy changes or credit consumption."
     },
     {
       "name": "get_share_detail",

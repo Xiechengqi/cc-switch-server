@@ -576,6 +576,7 @@ mod tests {
         .unwrap();
         stored.provider.id = provider_id.to_string();
         ProviderExecution {
+            quota_source_fence: None,
             stored,
             plan: Arc::new(ProviderRuntimePlan {
                 provider_key: crate::domain::providers::registry::ProviderKey::new(

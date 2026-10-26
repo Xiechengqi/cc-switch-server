@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::sharing::router_contract::ShareTokenPeriod;
 
 pub fn spawn_periodic_backups(state: ServerState) {
     tokio::spawn(async move {
@@ -778,7 +779,10 @@ pub(super) async fn run_installation_heartbeat_once(
     )
     .await
     {
-        Ok(()) => {
+        Ok(capabilities) => {
+            state
+                .record_router_quota_capability(&config, capabilities)
+                .await;
             *consecutive_failures = 0;
             *last_failure_warning = None;
             record_installation_heartbeat_success(state).await;
@@ -806,7 +810,12 @@ pub(super) async fn run_installation_heartbeat_once(
                         )
                         .await
                         {
-                            Ok(()) => Ok(()),
+                            Ok(capabilities) => {
+                                state
+                                    .record_router_quota_capability(&recovered_config, capabilities)
+                                    .await;
+                                Ok(())
+                            }
                             Err(error) => Err(error.to_string()),
                         }
                     }
@@ -960,7 +969,13 @@ pub async fn report_installation_upgrade_status(state: &ServerState) -> anyhow::
 pub fn spawn_periodic_share_sync_retry(state: ServerState) {
     tokio::spawn(async move {
         loop {
-            sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_secs(30)) => {},
+                _ = state.router_share_sync_wakeup.notified() => {},
+            }
+            if state.is_shutting_down() {
+                return;
+            }
             run_periodic_share_sync_retry_once(&state).await;
         }
     });
@@ -978,6 +993,7 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
         }
         return;
     }
+    let account_reset_supported = state.router_supports_account_reset().await;
     let pending_ids = {
         let shares = state.shares.read().await;
         shares
@@ -986,6 +1002,8 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             .filter(|share| {
                 shares.descriptor_projection_pending(share)
                     || share.router_last_sync_error.is_some()
+                    || share.user_grants.values().any(|grant| grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset)
+                    || (account_reset_supported && share.user_grants.values().any(|grant| grant.account_reset_capability.is_some()))
             })
             .map(|share| share.id.clone())
             .collect::<Vec<_>>()
@@ -1019,7 +1037,6 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
         {
             tracing::warn!(%error, "startup subscription expiry reconciliation failed");
         }
-        sleep(Duration::from_secs(60)).await;
         loop {
             let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Err(error) = state
@@ -1031,6 +1048,10 @@ pub fn spawn_account_quota_refresh(state: ServerState) {
             previous_expiry_scan_ms = now_ms;
             refresh_due_native_account_tokens(&state).await;
             refresh_due_account_quotas(&state).await;
+            refresh_referenced_share_account_quotas(&state).await;
+            if let Err(error) = state.collect_public_quota_resets().await {
+                tracing::warn!(%error, "public quota announcement collection deferred");
+            }
             let delay = next_account_quota_refresh_delay(&state).await;
             sleep(delay).await;
         }
@@ -1215,7 +1236,37 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
     let delay_ms = next_due
         .map(|due| due.saturating_sub(now).max(0) as u64)
         .unwrap_or(interval_ms as u64);
-    Duration::from_millis(delay_ms.clamp(1_000, (interval_ms as u64).min(60_000)))
+    let boundary_delay = {
+        let shares = state.shares.read().await;
+        shares
+            .quota_cycle_sources
+            .iter()
+            .filter(|(id, _)| {
+                shares.get(id).is_some_and(|share| {
+                    share.enabled
+                        && share.user_grants.values().any(|grant| {
+                            grant.active
+                                && grant.policy.token_period == ShareTokenPeriod::AccountReset
+                        })
+                })
+            })
+            .filter_map(|(_, source)| shares.quota_cycle_ledger.source(source))
+            .filter_map(|source| {
+                source
+                    .cycle
+                    .as_ref()
+                    .and_then(|cycle| cycle.ends_at_ms)
+                    .or(source.next_boundary_ms)
+            })
+            .map(|end| end.saturating_sub(now).max(1_000) as u64)
+            .min()
+            .unwrap_or(60_000)
+    };
+    Duration::from_millis(
+        delay_ms
+            .min(boundary_delay)
+            .clamp(1_000, (interval_ms as u64).min(60_000)),
+    )
 }
 
 pub(super) fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -> bool {
@@ -1244,6 +1295,7 @@ pub(super) fn account_quota_refresh_candidate(accounts: &AccountStore, account: 
         | ProviderType::GrokOAuth
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::KimiCode
         | ProviderType::OllamaCloud => {
             account
                 .access_token
@@ -1273,6 +1325,95 @@ async fn refresh_due_account_quotas(state: &ServerState) {
         .collect::<Vec<_>>();
     for account in due_accounts {
         refresh_one_account_quota(state, account, now).await;
+    }
+}
+
+/// Only explicitly referenced sources are added to the normal scheduler. In
+/// particular, an inactive but pinned Codex account is not an account-pool
+/// candidate. Network work is outside state locks and uses the existing
+/// per-account / per-Coding-Plan singleflight and generation checks.
+async fn refresh_referenced_share_account_quotas(state: &ServerState) {
+    use crate::domain::sharing::quota_cycle_source::resolve_share_source;
+    let ids: Vec<_> = state
+        .shares
+        .read()
+        .await
+        .shares
+        .iter()
+        .filter(|share| {
+            share.enabled
+                && share.user_grants.values().any(|grant| {
+                    grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
+                })
+        })
+        .map(|share| share.id.clone())
+        .collect();
+    let mut visited = std::collections::BTreeSet::new();
+    for id in ids {
+        if state.is_shutting_down() {
+            return;
+        }
+        // Advance a known boundary before attempting a potentially slow probe.
+        if let Err(error) = state.refresh_share_account_quota(&id).await {
+            tracing::warn!(%error, "referenced quota projection needs recovery");
+            continue;
+        }
+        let share = state.shares.read().await.get(&id).cloned();
+        let Some(share) = share.filter(|share| share.enabled) else {
+            continue;
+        };
+        let providers = state.providers_snapshot().await;
+        let accounts = state.accounts_snapshot().await;
+        let Ok(source) = resolve_share_source(&share, &providers, &accounts) else {
+            continue;
+        };
+        if !visited.insert(source.identity) {
+            continue;
+        }
+        if !source.account_id.is_empty() {
+            let Some(account) = accounts.accounts.iter().find(|account| {
+                account.id == source.account_id
+                    && !account.needs_relogin
+                    && account.auth_identity_generation == source.fence.identity_generation
+            }) else {
+                continue;
+            };
+            let now = now_ms_i64();
+            let boundary_due = source
+                .observation
+                .as_ref()
+                .is_some_and(|observation| observation.ends_at_ms <= now)
+                && account.last_refresh_error.is_none();
+            let due = account.quota_next_refresh_at.is_none_or(|next| next <= now) || boundary_due;
+            if due {
+                if let Err(error) = state
+                    .refresh_bound_account_quota_for_generation(
+                        account.provider_type,
+                        &account.id,
+                        account.auth_identity_generation,
+                        boundary_due,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "referenced quota refresh failed; retaining confirmed boundary");
+                }
+            }
+        } else {
+            let binding = share.bindings.first();
+            let key = ProviderKey {
+                app: binding.map_or(share.app, |binding| binding.app),
+                provider_id: binding.map_or_else(
+                    || share.provider_id.clone(),
+                    |binding| binding.provider_id.clone(),
+                ),
+            };
+            if let Err(error) = state.coding_plan_quota_snapshot(key, false).await {
+                tracing::warn!(%error, "referenced Coding Plan quota refresh failed");
+            }
+        }
+        if let Err(error) = state.refresh_share_account_quota(&id).await {
+            tracing::warn!(%error, "refreshed quota projection needs recovery");
+        }
     }
 }
 

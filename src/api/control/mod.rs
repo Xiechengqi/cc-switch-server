@@ -38,7 +38,8 @@ mod share_router;
 pub(crate) use ctl::{
     control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
-    control_refresh_share_usage, control_verify_share_account_recovery,
+    control_preview_account_reset, control_refresh_share_usage,
+    control_verify_share_account_recovery,
 };
 pub use ctl::{
     control_signature, control_signature_for_method, refresh_share_usage_items,

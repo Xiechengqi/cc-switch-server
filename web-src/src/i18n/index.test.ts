@@ -147,10 +147,15 @@ describe("i18n resources", () => {
           [...keys].sort(),
         );
         for (const key of keys) {
-          expect(
-            i18n.t(`share.${block}.${key}`, { lng: language }),
-            `${language}:share.${block}.${key}`,
-          ).toBe(bundle[key]);
+          const verifyLeaves = (value: unknown, path: string) => {
+            if (value && typeof value === "object") {
+              for (const [child, leaf] of Object.entries(value)) verifyLeaves(leaf, `${path}.${child}`);
+            } else {
+              expect(typeof value, `${language}:${path} must be a string`).toBe("string");
+              expect(i18n.t(path, { lng: language }), `${language}:${path}`).toBe(value);
+            }
+          };
+          verifyLeaves(bundle[key], `share.${block}.${key}`);
         }
       }
     },

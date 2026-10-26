@@ -29,6 +29,7 @@
 | `usage/` | 首次 SQLite 迁移前的用量账目；提交后移入只读 migration backup | 部分 |
 | `server-store.sqlite3` | providers/accounts/shares/usage 的事务型权威库与加密回滚 blob | 是 |
 | `server-store-migration.json` | SQLite schema、源摘要与 authority 状态 marker | 否 |
+| `account-reset-restore-fence.json` | 恢复前独立持久化的quota stream/用券安全栅栏，不进入备份且禁止manifest覆盖 | 否 |
 | `migration-backups/server-store-*/` | 权威切换时生成的一次性只读 legacy 回滚集 | 是 |
 | `image-capabilities/` | 图像能力探测结果 | 否 |
 | `backups/` | 备份归档（见 §5） | 是 |
@@ -61,7 +62,7 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `manifest.json` | 元数据，`USAGE_SCHEMA_VERSION = 1` |
+| `manifest.json` | 元数据，`USAGE_SCHEMA_VERSION = 2`，兼容读取v1 |
 | `requests.json` | 明细快照 |
 | `events/YYYY-MM-DD.jsonl` | 事件日志，`USAGE_JOURNAL_VERSION = 1` |
 | `rollups.json` | 聚合桶 |
@@ -75,6 +76,8 @@
 - 每 `USAGE_COMPACT_EVERY_EVENTS = 500` 个事件触发一次压实
 
 计量口径与字段语义见 [`usage-accounting.md`](usage-accounting.md)；Share 维度的用量重基线见 [`../share/user-usage-rebase.md`](../share/user-usage-rebase.md)。
+
+账号周期另在UsageStore中保留精简毫秒ledger/revisions，不受32天详情裁剪；与详情同次journal/SQL提交。v1精简账策略为retainAllExactRevisions，25万告警/100万限制新有限账号配额准入，不自动删账。ShareStore保存周期事件、公共游标、兑换回执与人工基线。详见[账号周期恢复与回退](../share/account-reset.md)。
 
 ## 5. 备份
 
@@ -90,6 +93,7 @@
 - 创建、列出、裁剪、删除、重命名与恢复由 `ServerState` 的备份协调器串行化，避免保留清理与
   pre-restore 安全备份并发修改同一目录
 - 恢复为两阶段：先 stage 再 validate，校验不过不落地
+- quota恢复在覆盖前独立写restore fence，恢复后换同步stream、提高coverage并暂停新用券；缺失历史不计零。当前没有用券reconcile解锁接口，不能删fence绕过。backup/reload已统一reference/provider/workspace/quota→各persistence gate顺序，见账号周期文档。
 - 目录 `0700`、文件 `0600`
 
 对应 API：`GET/POST /api/backup`（别名 `/api/backups`）、`POST /api/backup/:id/restore`。
@@ -110,18 +114,21 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 
 ### 7.1 SQLite schema 与不变量
 
-实现见 `src/repository/server_sqlite.rs`，当前 schema version 为 1：
+实现见 `src/repository/server_sqlite.rs`，当前schema version为2；保留v1 checksum并以独立迁移新增：
 
 - `providers` 主键为 `(app, provider_id)`，保留 revision、credential generation 和原始 S2 密文 record；
 - `accounts` 主键为 `(provider_type, account_id)`，保留 auth identity/token refresh generation 和原始字段级密文；
 - `provider_accounts`、`shares`、`share_bindings` 使用 foreign key 校验 Provider/Account/Share 图；
 - `usage_records` 以 request id 为主键，按创建时间和 Share 建索引，payload 保留未知扩展字段；
+- `quota_usage_entries` 按request/revision保存精简账项、唯一watermark、来源/用户/开始毫秒索引与payload SHA256；metadata digest及完整水位连续性另校验，详情replace不删除精简账；
 - `legacy_blobs` 保存原始加密 JSON/JSONL 字节，供一个发布窗口内精确 DB→legacy 回滚；`accounts.key` **不进入 SQLite**，回滚仍必须同时持有数据目录根密钥。
 
 所有时间写入 SQLite 时使用 Unix 毫秒并限制在 signed 64-bit 范围。所有 generation
 必须非负且不会在导入时重编号。数据库开启 `foreign_keys=ON`、`trusted_schema=OFF`、
 WAL、`synchronous=FULL`、5 秒 busy timeout 和 1000 page auto-checkpoint；这些参数是
 schema v1 的明确崩溃合同，后续只能凭故障/性能数据修改。
+
+v1→v2在单事务提交后原子补marker；数据库已v2而marker仍v1时按authority幂等恢复，不重新导入旧JSON。未知更高schema拒绝。写入v2或accountReset后不可直接换旧binary；回退必须保留新reader/账本，旧schema迁回须另设计离线迁移。
 
 ### 7.2 Shadow import、切换与验证
 

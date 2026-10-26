@@ -1492,6 +1492,7 @@ pub async fn forward_agentservice(
         &state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         usage,
     )
     .await;
@@ -1718,6 +1719,7 @@ async fn stream_response(
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let first_token_ms_shared = Arc::new(AtomicU64::new(0));
@@ -1729,6 +1731,7 @@ async fn stream_response(
         status_code: StatusCode::OK.as_u16(),
         share_id: share_id.clone(),
         user_email: user_email.clone(),
+        quota_started_at_ms,
         started,
         first_token_ms: first_token_ms_shared.clone(),
         session_entry: Some(session_entry.clone()),
@@ -2206,7 +2209,7 @@ async fn stream_response(
             Some(final_stream_status),
         )
         .await;
-        record_share_invocation_result(&state, share_id.as_deref(), user_email.as_deref(), usage)
+        record_share_invocation_result(&state, share_id.as_deref(), user_email.as_deref(), quota_started_at_ms, usage)
             .await;
         let outcome = cursor_stream_provider_outcome(final_status, final_stream_status);
         record_provider_outcome(&state, &stored, outcome).await;
@@ -2266,6 +2269,7 @@ async fn stream_semantic_response(
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let first_token_ms_shared = Arc::new(AtomicU64::new(0));
@@ -2277,6 +2281,7 @@ async fn stream_semantic_response(
         status_code: StatusCode::OK.as_u16(),
         share_id: share_id.clone(),
         user_email: user_email.clone(),
+        quota_started_at_ms,
         started,
         first_token_ms: first_token_ms_shared,
         // The semantic driver owns the active upstream reservation until it
@@ -2430,6 +2435,7 @@ async fn stream_semantic_response(
             &state,
             share_id.as_deref(),
             user_email.as_deref(),
+            quota_started_at_ms,
             usage,
         )
         .await;
@@ -4941,6 +4947,7 @@ struct CursorStreamInterruptGuard {
     status_code: u16,
     share_id: Option<String>,
     user_email: Option<String>,
+    quota_started_at_ms: Option<u128>,
     started: Instant,
     first_token_ms: Arc<AtomicU64>,
     session_entry: Option<Arc<tokio::sync::Mutex<CursorSession>>>,
@@ -4976,6 +4983,7 @@ impl Drop for CursorStreamInterruptGuard {
         let status_code = self.status_code;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
+        let quota_started_at_ms = self.quota_started_at_ms;
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms();
         let session_entry = self.session_entry.take();
@@ -4997,6 +5005,7 @@ impl Drop for CursorStreamInterruptGuard {
                 &state,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                quota_started_at_ms,
                 TokenUsage::default(),
             )
             .await;

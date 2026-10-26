@@ -54,6 +54,7 @@
     "siteHint": "所選站點會永久綁定到匯入帳號，反向代理錯誤不會觸發切站。"
   },
   "codexBankedReset": {
+    "needsReconcile": "兌換結果待核對，不會自動消耗新券；尚未確認共享週主額度重置。",
     "alreadyRedeemed": "該 credit 已被使用",
     "available": "可用重置",
     "availableUnit": "次",
@@ -1113,6 +1114,19 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "Unlimited",
     "userLimit": {
+      "accountReset": {
+        "label": "帳號重置週期",
+        "ready": "帳號週期已就緒",
+        "unavailable": "帳號週期暫不可選：{{reason}}",
+        "pending": "等待帳號週期 / 完整歷史",
+        "noEnd": "下次重置待確認",
+        "observed": "最後觀測",
+        "caveat": "公共公告依公告時間跟隨，不代表逐帳號執行；無證據的站外重置無法保證識別。暫時失敗時沿用已確認週期。",
+        "preview": "預計用量（不會歸零）；核對各使用者後再次套用：",
+        "exceeded": "達到或超過上限",
+        "saveFirst": "請先儲存 Share，再初始化帳號週期。",
+        "notReady": "帳號週期尚未就緒，請保留原週期。"
+      },
       "remoteChanged": "Share 設定已在其他位置修改。重新載入將捨棄目前的 Share 草稿並使用最新設定。",
       "reloadShare": "重新載入 Share",
       "add": "新增使用者",

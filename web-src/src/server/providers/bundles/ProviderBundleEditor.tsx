@@ -1145,6 +1145,8 @@ function BundleShareEditor({
             </div>
           ) : null}
           <ShareUserGrantsEditor
+            shareId={draft.baseline?.shareId}
+            configRevision={draft.baseline?.configRevision}
             disabled={disabled}
             value={displayedUserGrants}
             ownerEmail={normalizedOwnerEmail}

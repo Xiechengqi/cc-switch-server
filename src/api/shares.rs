@@ -17,6 +17,20 @@ pub(in crate::api) async fn list_shares(
     headers: HeaderMap,
 ) -> Result<Json<ListSharesResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    let ids: Vec<_> = state
+        .shares
+        .read()
+        .await
+        .shares
+        .iter()
+        .map(|share| share.id.clone())
+        .collect();
+    for id in ids {
+        state
+            .refresh_share_account_quota(&id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     Ok(Json(ListSharesResponse {
         ok: true,
         shares: state.shares.read().await.shares.clone(),
@@ -39,6 +53,25 @@ pub(in crate::api) async fn import_shares(
     for share in &input.shares {
         crate::domain::sharing::invariants::validate_share_import(share)
             .map_err(map_share_patch_error)?;
+    }
+    let requests_account_reset = input.shares.iter().any(|share| {
+        share.user_grants.values().any(|grant| {
+            grant.active
+                && grant.policy.token_period
+                    == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+        })
+    });
+    if requests_account_reset && !state.router_supports_account_reset().await {
+        return Err(ApiError::conflict_code(
+            "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+            "Router must negotiate accountResetV1",
+        ));
+    }
+    for share in &input.shares {
+        state
+            .refresh_share_account_quota(&share.id)
+            .await
+            .map_err(ApiError::internal)?;
     }
     let owner_email = state
         .config
@@ -85,11 +118,42 @@ pub(in crate::api) async fn import_shares(
         .len();
     input.shares = imported_store.shares;
     let imported = state
-        .try_mutate_shares_immediate(|store| {
+        .try_mutate_share_quota_immediate(|store, usage, now| {
             let mut candidate = store.clone();
+            let mut expected = BTreeMap::new();
+            for share in &mut input.shares {
+                let current = store.get(&share.id);
+                let account_grants: Vec<_> = share.user_grants.values().filter(|grant| grant.active
+                    && grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset).collect();
+                if !account_grants.is_empty() && current.is_some_and(|current| current.config_revision != share.config_revision) {
+                    return Err(ApiError::conflict_code("cc_switch_share_revision_conflict", "Imported Share changed; export and preview again"));
+                }
+                let cycle = account_grants.first().and_then(|grant| grant.account_quota_cycle.clone());
+                if account_grants.iter().any(|grant| grant.account_quota_cycle != cycle) {
+                    return Err(ApiError::conflict_code("QUOTA_CYCLE_CONFLICT", "Imported grants have inconsistent quota cycles"));
+                }
+                expected.insert(share.id.clone(), cycle);
+                for (email, grant) in &mut share.user_grants {
+                    // Exported views and manual baselines are not authority.
+                    // Only the local durable ledger may restore them.
+                    grant.account_quota_cycle = None;
+                    grant.account_reset_capability = None;
+                    grant.account_usage_baseline = current.and_then(|share| share.user_grants.get(email))
+                        .and_then(|grant| grant.account_usage_baseline.clone());
+                    if grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset {
+                        grant.usage_quota = None;
+                    }
+                }
+            }
             let imported = candidate
                 .import_shares(input.shares)
                 .map_err(map_share_patch_error)?;
+            for (id, expected) in expected {
+                if let Some(source) = candidate.quota_cycle_sources.get(&id).cloned() {
+                    candidate.project_account_reset(&id, &source, usage, now).map_err(map_share_patch_error)?;
+                }
+                candidate.validate_account_reset_configuration(&id, usage, expected.as_ref()).map_err(map_share_patch_error)?;
+            }
             crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
                 &providers,
                 &accounts,
@@ -125,6 +189,31 @@ pub(in crate::api) async fn upsert_share(
         expected_config_revision,
         mut input,
     } = command;
+    let expected_account_cycle = input
+        .user_grants
+        .values()
+        .find(|grant| {
+            grant.policy.token_period
+                == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+        })
+        .and_then(|grant| grant.account_quota_cycle.clone());
+    if input.user_grants.values().any(|grant| {
+        grant.active
+            && grant.policy.token_period
+                == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+    }) && !state.router_supports_account_reset().await
+    {
+        return Err(ApiError::conflict_code(
+            "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+            "Router must negotiate accountResetV1",
+        ));
+    }
+    if let Some(id) = &input.id {
+        state
+            .refresh_share_account_quota(id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     crate::domain::sharing::invariants::validate_and_normalize_upsert_input(&mut input)
         .map_err(map_share_patch_error)?;
     input.owner_email = Some(
@@ -193,7 +282,7 @@ pub(in crate::api) async fn upsert_share(
         _ => {}
     }
     let share = state
-        .try_mutate_shares_immediate(|store| {
+        .try_mutate_share_quota_immediate(|store, usage, now| {
             let current = input
                 .id
                 .as_deref()
@@ -225,6 +314,10 @@ pub(in crate::api) async fn upsert_share(
             let share = candidate
                 .upsert_with_capacity(input, Some(capacity_pool_id))
                 .map_err(map_share_patch_error)?;
+            if let Some(source) = candidate.quota_cycle_sources.get(&share.id).cloned() {
+                candidate.project_account_reset(&share.id, &source, usage, now).map_err(map_share_patch_error)?;
+            }
+            candidate.validate_account_reset_configuration(&share.id, usage, expected_account_cycle.as_ref()).map_err(map_share_patch_error)?;
             crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
                 &providers,
                 &accounts,
@@ -234,6 +327,7 @@ pub(in crate::api) async fn upsert_share(
                 &candidate,
             )
             .map_err(map_subscription_binding_error)?;
+            let share = candidate.get(&share.id).cloned().expect("upserted Share exists");
             *store = candidate;
             Ok::<_, ApiError>(share)
         })

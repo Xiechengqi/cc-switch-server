@@ -197,7 +197,8 @@ fn finalize_provider_selection(
             selection.max_concurrent,
         ));
     }
-    let execution = ProviderExecution::from_store(store, provider)?;
+    let execution =
+        ProviderExecution::from_store(store, provider)?.with_quota_source_fence(accounts);
     execution.ensure_operation_supported(super::provider_ops::ProviderOperation::Forward)?;
     Ok(ProviderRouteSelection { execution })
 }

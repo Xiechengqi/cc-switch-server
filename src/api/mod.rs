@@ -31,9 +31,10 @@ pub(in crate::api) use backup::*;
 pub(crate) use control::{
     control_abort_client_subdomain_adoption, control_apply_share_settings, control_client_log_tail,
     control_commit_client_subdomain_adoption, control_prepare_client_subdomain_adoption,
-    control_refresh_share_usage, control_verify_share_account_recovery, share_router_health,
-    share_router_model_health, share_router_model_health_batch, share_router_model_health_batch_v2,
-    share_router_request_logs, share_router_runtime,
+    control_preview_account_reset, control_refresh_share_usage,
+    control_verify_share_account_recovery, share_router_health, share_router_model_health,
+    share_router_model_health_batch, share_router_model_health_batch_v2, share_router_request_logs,
+    share_router_runtime,
 };
 pub use control::{
     control_signature, control_signature_for_method, refresh_share_usage_items,
@@ -279,6 +280,10 @@ pub fn app_router(state: ServerState) -> Router {
             post(control_apply_share_settings),
         )
         .route(REFRESH_SHARE_USAGE_PATH, post(control_refresh_share_usage))
+        .route(
+            "/_ctl/preview_account_reset",
+            post(control_preview_account_reset),
+        )
         .route(
             VERIFY_SHARE_ACCOUNT_RECOVERY_PATH,
             post(control_verify_share_account_recovery),

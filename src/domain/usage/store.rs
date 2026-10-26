@@ -22,7 +22,7 @@ const USAGE_DETAIL_RETENTION_MS: u128 = USAGE_DETAIL_RETENTION_DAYS * USAGE_DAY_
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
-const USAGE_SCHEMA_VERSION: u8 = 1;
+const USAGE_SCHEMA_VERSION: u8 = 2;
 const USAGE_JOURNAL_VERSION: u8 = 1;
 
 pub const CODEX_OVERFLOW_COMPACT_SUMMARY_DATA_SOURCE: &str = "codex_overflow_compact_summary";
@@ -159,6 +159,8 @@ impl Default for UsageManifest {
 pub struct UsageStore {
     pub schema_version: u8,
     #[serde(default)]
+    pub quota_ledger: super::quota_ledger::QuotaUsageLedger,
+    #[serde(default)]
     pub logs: Vec<UsageLog>,
     #[serde(default, skip)]
     pub rollups: UsageRollupStore,
@@ -215,6 +217,7 @@ impl Default for UsageStore {
         let checkpoint = UsageJournalCheckpoint::new();
         Self {
             schema_version: USAGE_SCHEMA_VERSION,
+            quota_ledger: super::quota_ledger::QuotaUsageLedger::default(),
             logs: Vec::new(),
             rollups: UsageRollupStore {
                 schema_version: USAGE_SCHEMA_VERSION,
@@ -240,6 +243,8 @@ pub struct UsageProviderHealthResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageLog {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_attribution: Option<super::quota_ledger::QuotaAttribution>,
     pub record_kind: UsageRecordKind,
     #[serde(default)]
     pub request_kind: RequestKind,
@@ -427,6 +432,7 @@ impl UsageLog {
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
     pub request_id: Option<String>,
+    pub quota_attribution: Option<super::quota_ledger::QuotaAttribution>,
     pub record_kind: UsageRecordKind,
     pub request_kind: RequestKind,
     pub operation: InferenceOperation,
@@ -552,7 +558,7 @@ impl UsageStore {
 
         let manifest = load_usage_manifest(config_dir)?;
         anyhow::ensure!(
-            manifest.schema_version == USAGE_SCHEMA_VERSION,
+            (1..=USAGE_SCHEMA_VERSION).contains(&manifest.schema_version),
             "unsupported Usage schema version {}; expected {}",
             manifest.schema_version,
             USAGE_SCHEMA_VERSION
@@ -572,11 +578,13 @@ impl UsageStore {
             Self::default()
         };
         anyhow::ensure!(
-            store.schema_version == USAGE_SCHEMA_VERSION,
+            (1..=USAGE_SCHEMA_VERSION).contains(&store.schema_version),
             "unsupported Usage snapshot schema version {}; expected {}",
             store.schema_version,
             USAGE_SCHEMA_VERSION
         );
+        store.schema_version = USAGE_SCHEMA_VERSION;
+        store.quota_ledger.validate().map_err(anyhow::Error::msg)?;
         store.provider_health = provider_health;
         let journal = load_usage_journal(config_dir)?;
         let loaded_rollups = load_usage_rollups(config_dir)?;
@@ -602,7 +610,9 @@ impl UsageStore {
         let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
         store.writes_since_compact = replayed as u64;
         store.trim_recent_window();
-        if store.recover_pending_after_restart() && persist_recovery {
+        let pending_recovered = store.recover_pending_after_restart();
+        let quota_recovered = store.quota_ledger.recover_pending();
+        if (pending_recovered || quota_recovered) && persist_recovery {
             store.save(config_dir)?;
         }
         Ok(store)
@@ -636,6 +646,9 @@ impl UsageStore {
         }
         for (previous, updated) in &replacements {
             self.rollups.replace_log(previous, updated);
+            if let Err(error) = self.quota_ledger.record(updated) {
+                self.quota_ledger.integrity_error = Some(error.into());
+            }
         }
         if !replacements.is_empty() {
             self.advance_journal_checkpoint(export_sequence);
@@ -674,6 +687,9 @@ impl UsageStore {
     }
 
     pub fn push(&mut self, log: UsageLog) {
+        if let Err(error) = self.quota_ledger.record(&log) {
+            self.quota_ledger.integrity_error = Some(error.to_string());
+        }
         if let Some(existing) = self
             .logs
             .iter_mut()
@@ -757,6 +773,9 @@ impl UsageStore {
     }
 
     fn push_log_only(&mut self, log: UsageLog) {
+        if let Err(error) = self.quota_ledger.record(&log) {
+            self.quota_ledger.integrity_error = Some(error.to_string());
+        }
         if let Some(existing) = self
             .logs
             .iter_mut()
@@ -770,6 +789,28 @@ impl UsageStore {
     }
 
     pub(crate) fn prepare_append(&self, mut log: UsageLog) -> anyhow::Result<PreparedUsageAppend> {
+        // Admission creates a durable pending revision. A later first result
+        // replaces that placeholder, it is not a second request or a conflict
+        // with its initial (zero) Token value.
+        if let Some(existing) = self
+            .logs
+            .iter()
+            .find(|existing| existing.request_id == log.request_id)
+        {
+            if existing.quota_attribution.is_some()
+                && log.usage_revision <= existing.usage_revision
+                && (existing.usage_state == UsageState::Pending
+                    || existing.failure_kind.as_deref() == Some("quota_admission"))
+            {
+                log.usage_revision = existing
+                    .usage_revision
+                    .checked_add(1)
+                    .context("usage revision overflow")?;
+            }
+        }
+        self.quota_ledger
+            .validate_log(&log)
+            .map_err(anyhow::Error::msg)?;
         let checkpoint = self
             .journal_checkpoint
             .as_ref()
@@ -922,6 +963,7 @@ impl UsageLog {
         let outcome = UsageOutcome::from_status(status_code);
         Self {
             request_id: generate_request_id(),
+            quota_attribution: None,
             record_kind: UsageRecordKind::UserInference,
             request_kind: RequestKind::Text,
             operation: InferenceOperation::Unknown,
@@ -1012,6 +1054,7 @@ impl UsageLog {
     }
 
     pub fn apply_context(&mut self, context: UsageLogContext) {
+        self.quota_attribution = context.quota_attribution;
         if let Some(request_id) = context.request_id {
             self.request_id = request_id;
         }
@@ -1574,14 +1617,15 @@ fn load_usage_rollups(config_dir: &Path) -> anyhow::Result<Option<UsageRollupSto
     }
     let content = fs::read_to_string(&path)
         .with_context(|| format!("read usage rollups {}", path.display()))?;
-    let rollups: UsageRollupStore = serde_json::from_str(&content)
+    let mut rollups: UsageRollupStore = serde_json::from_str(&content)
         .with_context(|| format!("parse usage rollups {}", path.display()))?;
     anyhow::ensure!(
-        rollups.schema_version == USAGE_SCHEMA_VERSION,
+        (1..=USAGE_SCHEMA_VERSION).contains(&rollups.schema_version),
         "unsupported Usage rollup schema version {}; expected {}",
         rollups.schema_version,
         USAGE_SCHEMA_VERSION
     );
+    rollups.schema_version = USAGE_SCHEMA_VERSION;
     Ok(Some(rollups))
 }
 

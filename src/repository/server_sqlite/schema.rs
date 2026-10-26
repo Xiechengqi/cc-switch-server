@@ -82,5 +82,119 @@ pub(super) fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
          PRAGMA user_version=1;
          COMMIT;",
         )
-        .context("initialize Server SQLite schema")
+        .context("initialize Server SQLite schema")?;
+    migrate_to_current(connection)
+}
+
+/// v1 is immutable. This transaction can be retried after a crash before the
+/// separate authority marker was updated; it never reimports legacy files.
+pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    anyhow::ensure!((1..=2).contains(&version),
+        "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=1",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == "sha256:server-store-schema-v1",
+        "Server SQLite v1 migration checksum mismatch"
+    );
+    if version == 1 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+             CREATE TABLE quota_usage_entries(
+               request_id TEXT NOT NULL,
+               usage_revision INTEGER NOT NULL CHECK(usage_revision >= 0),
+               watermark INTEGER NOT NULL UNIQUE CHECK(watermark > 0),
+               source_ref TEXT NOT NULL,
+               source_epoch INTEGER NOT NULL,
+               bucket_id TEXT NOT NULL,
+               share_id TEXT NOT NULL,
+               user_email TEXT NOT NULL,
+               started_at_ms INTEGER NOT NULL CHECK(started_at_ms >= 0),
+               payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+               payload_sha256 TEXT NOT NULL,
+               PRIMARY KEY(request_id,usage_revision)
+             ) STRICT;
+             CREATE INDEX quota_usage_scope_start_idx ON quota_usage_entries(
+               source_ref,source_epoch,bucket_id,share_id,user_email,started_at_ms,watermark);
+             INSERT INTO schema_migrations(version,name,applied_at_ms,checksum)
+             VALUES(2,'exact_account_quota_usage',0,'sha256:server-store-schema-v2-quota');
+             PRAGMA user_version=2;
+             COMMIT;",
+            )
+            .context("migrate Server SQLite v1 to v2")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=2",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == "sha256:server-store-schema-v2-quota",
+        "Server SQLite v2 migration checksum mismatch"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_v1_migration_is_idempotent_and_preserves_original_checksum() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection.execute_batch("DROP TABLE quota_usage_entries; DELETE FROM schema_migrations WHERE version=2; PRAGMA user_version=1;").unwrap();
+        connection
+            .execute(
+                "INSERT INTO meta(key,value) VALUES('existing','preserved')",
+                [],
+            )
+            .unwrap();
+        migrate_to_current(&connection).unwrap();
+        migrate_to_current(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM meta WHERE key='existing'", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn quota_higher_schema_or_changed_migration_is_never_downgraded() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection.execute_batch("PRAGMA user_version=3;").unwrap();
+        assert!(migrate_to_current(&connection)
+            .unwrap_err()
+            .to_string()
+            .contains("never downgrade"));
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        connection.execute_batch("PRAGMA user_version=2; UPDATE schema_migrations SET checksum='modified' WHERE version=1;").unwrap();
+        assert!(migrate_to_current(&connection).is_err());
+    }
 }

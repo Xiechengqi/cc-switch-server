@@ -71,12 +71,43 @@ const SHARE_TOKEN_PERIODS: ReadonlySet<string> = new Set([
   "sevenDays",
   "calendarMonth",
   "thirtyDays",
+  "accountReset",
 ]);
 
 function normalizeTokenPeriod(value: unknown): ShareTokenPeriod {
   return typeof value === "string" && SHARE_TOKEN_PERIODS.has(value)
     ? (value as ShareTokenPeriod)
     : "lifetime";
+}
+
+function normalizeAccountCycle(value: unknown): ShareUserGrant["accountQuotaCycle"] {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as RawRecord;
+  const strings = ["streamIncarnation", "sourceRef", "bucketId", "cycleId", "eventId"];
+  const numbers = ["sourceEpoch", "cycleSequence", "cycleRevision", "startsAtMs", "observedAtMs"];
+  if (!strings.every((key) => typeof raw[key] === "string" && raw[key]) ||
+      !numbers.every((key) => typeof raw[key] === "number" && Number.isSafeInteger(raw[key]))) return undefined;
+  if (Number(raw.sourceEpoch) < 1 || Number(raw.cycleSequence) < 1 || Number(raw.cycleRevision) < 1 || Number(raw.startsAtMs) < 0 ||
+      Number(raw.observedAtMs) < Number(raw.startsAtMs) || (raw.endsAtMs != null &&
+        (typeof raw.endsAtMs !== "number" || !Number.isSafeInteger(raw.endsAtMs) || raw.endsAtMs <= Number(raw.startsAtMs)))) return undefined;
+  if (!["upstreamWindow", "derivedFromWindow", "knownNaturalBoundary", "publicAnnouncement", "redeemConfirmation"].includes(String(raw.basis))) return undefined;
+  return value as ShareUserGrant["accountQuotaCycle"];
+}
+
+function normalizeAccountCapability(value: unknown): ShareUserGrant["accountResetCapability"] {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as RawRecord;
+  if (!["supported", "conditional", "unsupported"].includes(String(raw.support)) ||
+      !["ready", "initializing", "stale", "error", "needsReconcile"].includes(String(raw.syncStatus))) return undefined;
+  return value as ShareUserGrant["accountResetCapability"];
+}
+
+function normalizeAccountBaseline(value: unknown): ShareUserGrant["accountUsageBaseline"] {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as RawRecord;
+  if (!["sourceRef", "cycleId"].every((key) => typeof raw[key] === "string" && raw[key]) ||
+      !["targetTokens", "usageWatermark", "appliedAtMs"].every((key) => typeof raw[key] === "number" && Number.isSafeInteger(raw[key]) && Number(raw[key]) >= 0)) return undefined;
+  return value as ShareUserGrant["accountUsageBaseline"];
 }
 
 function normalizeUsageBucket(value: unknown): ShareUserUsageBucket {
@@ -163,6 +194,7 @@ function normalizeUsageQuota(value: unknown): ShareUserQuotaView | undefined {
   );
   if (effectiveTokensUsed == null) return undefined;
   return {
+    usageWatermark: readNumber(raw, "usageWatermark", "usage_watermark"),
     period: normalizeTokenPeriod(raw.period),
     anchorAtMs: readNumber(raw, "anchorAtMs", "anchor_at_ms"),
     windowStartsAtMs: readNumber(
@@ -194,6 +226,9 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
         : {};
     const email = readString(raw, "email") ?? key;
     const grant: ShareUserGrant = {
+      accountUsageBaseline: normalizeAccountBaseline(raw.accountUsageBaseline),
+      accountQuotaCycle: normalizeAccountCycle(raw.accountQuotaCycle),
+      accountResetCapability: normalizeAccountCapability(raw.accountResetCapability),
       email,
       role: raw.role === "owner" ? "owner" : "shareto",
       active: readBool(raw, "active") ?? true,

@@ -763,6 +763,7 @@ fn codex_websocket_cache_max_age() -> Duration {
 #[derive(Debug, Clone)]
 struct ForwardAttemptContext {
     request_started_at_ms: u128,
+    quota_request_id: String,
     attempt_budget: AttemptBudget,
     commit_guard: CommitGuard,
     binding_snapshot: Option<BindingSnapshot>,
@@ -794,6 +795,7 @@ impl Default for ForwardAttemptContext {
         let now_ms = current_time_ms();
         Self {
             request_started_at_ms: now_ms,
+            quota_request_id: format!("quota_{}", crate::domain::sharing::quota_cycle::opaque_id()),
             attempt_budget: AttemptBudget::new(
                 AttemptLimits::forward_default(
                     MAX_FORWARD_RETRY_ATTEMPTS,
@@ -1792,6 +1794,7 @@ pub async fn forward_codex_alpha_search(
             &state,
             request_context.share_id.as_deref(),
             request_context.user_email.as_deref(),
+            request_context.started_at_ms,
             TokenUsage::default(),
         )
         .await;
@@ -2064,6 +2067,8 @@ async fn summarize_codex_overflow(
     let mut summary_context = UsageLogContext {
         record_kind: UsageRecordKind::InternalSupplemental,
         parent_request_id: request_context.request_id.clone(),
+        quota_attribution: request_context.quota_attribution.clone(),
+        started_at_ms: request_context.started_at_ms,
         share_id: request_context.share_id.clone(),
         share_name: request_context.share_name.clone(),
         user_email: request_context.user_email.clone(),
@@ -2095,6 +2100,7 @@ async fn summarize_codex_overflow(
         state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         usage,
     )
     .await;
@@ -2187,6 +2193,9 @@ async fn forward_with_attempt(
         let mut request_context = request_context_from_headers(&headers);
         request_context.operation = inference_operation_for_route(route);
         request_context.started_at_ms = Some(attempt_context.request_started_at_ms);
+        if request_context.request_id.is_none() {
+            request_context.request_id = Some(attempt_context.quota_request_id.clone());
+        }
         request_context.attempt_count = Some(attempt_context.attempt().saturating_add(1));
         request_context.session_id = session_id_from_request(route, &headers, &body);
         let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
@@ -2198,6 +2207,7 @@ async fn forward_with_attempt(
             )
             .await?;
             request_context.share_name = Some(share_name);
+            begin_share_quota_usage(&state, app, &mut request_context).await?;
             Some(guard)
         } else {
             None
@@ -3009,6 +3019,7 @@ async fn forward_with_attempt(
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
+        codex::record_quota_response_headers(&state, &execution, &response_headers).await;
         claude::record_quota_response_headers(
             &state,
             &execution,
@@ -3146,6 +3157,12 @@ async fn forward_with_attempt(
                             status_code = status.as_u16();
                             response_headers = upstream.headers().clone();
                             strip_hop_by_hop_response_headers(&mut response_headers);
+                            codex::record_quota_response_headers(
+                                &state,
+                                &execution,
+                                &response_headers,
+                            )
+                            .await;
                             claude::record_quota_response_headers(
                                 &state,
                                 &execution,
@@ -3437,6 +3454,7 @@ async fn forward_with_attempt(
                 crate::metrics::record_claude_count_tokens_outcome("rate_limited");
             } else {
                 let usage = adapter.parse_usage(&decoded.body, &stored, route);
+                let quota_started_at_ms = request_context.started_at_ms;
                 let share_id_for_record = request_context.share_id.clone();
                 let user_email_for_record = request_context.user_email.clone();
                 log_usage(
@@ -3459,6 +3477,7 @@ async fn forward_with_attempt(
                     &state,
                     share_id_for_record.as_deref(),
                     user_email_for_record.as_deref(),
+                    quota_started_at_ms,
                     usage,
                 )
                 .await;
@@ -4655,6 +4674,7 @@ async fn forward_with_attempt(
                 status_code,
                 share_id: request_context.share_id.clone(),
                 user_email: request_context.user_email.clone(),
+                quota_started_at_ms: request_context.started_at_ms,
                 codex_rate_limit: (execution.driver_is("oauth.openai_codex")
                     && inspect_responses_semantics)
                     .then(|| CodexRateLimitContext {
@@ -5588,6 +5608,7 @@ async fn forward_with_attempt(
                                 &stream_state.state,
                                 stream_state.share_id.as_deref(),
                                 stream_state.user_email.as_deref(),
+                                stream_state.quota_started_at_ms,
                                 usage,
                             )
                             .await;
@@ -6094,6 +6115,7 @@ async fn forward_with_attempt(
             )
             .await;
         }
+        let quota_started_at_ms = request_context.started_at_ms;
         let share_id_for_record = request_context.share_id.clone();
         if route == ProxyRoute::ClaudeCountTokens {
             crate::metrics::record_claude_count_tokens_outcome(count_tokens_metric_outcome(status));
@@ -6124,6 +6146,7 @@ async fn forward_with_attempt(
                 &state,
                 share_id_for_record.as_deref(),
                 user_email_for_record.as_deref(),
+                quota_started_at_ms,
                 usage,
             )
             .await;
@@ -6976,6 +6999,7 @@ pub async fn forward_grok_media(
         )
         .await?;
         request_context.share_name = Some(share_name);
+        begin_share_quota_usage(&state, AppKind::Codex, &mut request_context).await?;
         Some(guard)
     } else {
         None
@@ -7062,6 +7086,7 @@ pub async fn forward_images_generations(
         )
         .await?;
         request_context.share_name = Some(share_name);
+        begin_share_quota_usage(&state, AppKind::Codex, &mut request_context).await?;
         Some(guard)
     } else {
         None
@@ -7172,6 +7197,7 @@ pub async fn forward_images_edits(
         )
         .await?;
         request_context.share_name = Some(share_name);
+        begin_share_quota_usage(&state, AppKind::Codex, &mut request_context).await?;
         Some(guard)
     } else {
         None
@@ -7404,6 +7430,7 @@ async fn forward_grok_media_with_execution(
             share_id.as_deref(),
             user_email.as_deref(),
             request_context.is_health_check,
+            request_context.started_at_ms,
             provider_outcome_from_status(error.status.as_u16()),
         )
         .await;
@@ -7521,6 +7548,7 @@ async fn forward_grok_media_with_execution(
                     share_id.as_deref(),
                     user_email.as_deref(),
                     request_context.is_health_check,
+                    request_context.started_at_ms,
                     ProviderOutcome::NetworkFailure,
                 )
                 .await;
@@ -7580,6 +7608,7 @@ async fn forward_grok_media_with_execution(
                 share_id.as_deref(),
                 user_email.as_deref(),
                 request_context.is_health_check,
+                request_context.started_at_ms,
                 ProviderOutcome::Failure {
                     status_code: StatusCode::UNAUTHORIZED.as_u16(),
                 },
@@ -7617,6 +7646,7 @@ async fn forward_grok_media_with_execution(
                 share_id.as_deref(),
                 user_email.as_deref(),
                 request_context.is_health_check,
+                request_context.started_at_ms,
                 ProviderOutcome::Failure { status_code: 502 },
             )
             .await;
@@ -7633,6 +7663,7 @@ async fn forward_grok_media_with_execution(
                 share_id.as_deref(),
                 user_email.as_deref(),
                 request_context.is_health_check,
+                request_context.started_at_ms,
                 ProviderOutcome::Failure { status_code: 502 },
             )
             .await;
@@ -7691,6 +7722,7 @@ async fn forward_grok_media_with_execution(
                     share_id.as_deref(),
                     user_email.as_deref(),
                     request_context.is_health_check,
+                    request_context.started_at_ms,
                     ProviderOutcome::NetworkFailure,
                 )
                 .await;
@@ -7726,6 +7758,7 @@ async fn forward_grok_media_with_execution(
                     share_id.as_deref(),
                     user_email.as_deref(),
                     request_context.is_health_check,
+                    request_context.started_at_ms,
                     ProviderOutcome::Failure {
                         status_code: error.status.as_u16(),
                     },
@@ -7798,6 +7831,7 @@ async fn forward_grok_media_with_execution(
                     share_id.as_deref(),
                     user_email.as_deref(),
                     request_context.is_health_check,
+                    request_context.started_at_ms,
                     ProviderOutcome::Failure {
                         status_code: error.status.as_u16(),
                     },
@@ -7846,6 +7880,7 @@ async fn forward_grok_media_with_execution(
                 share_id.as_deref(),
                 user_email.as_deref(),
                 request_context.is_health_check,
+                request_context.started_at_ms,
                 ProviderOutcome::Failure {
                     status_code: error.status.as_u16(),
                 },
@@ -7865,6 +7900,7 @@ async fn forward_grok_media_with_execution(
         share_id.as_deref(),
         user_email.as_deref(),
         request_context.is_health_check,
+        request_context.started_at_ms,
         provider_outcome_from_status(status_code),
     )
     .await;
@@ -8270,11 +8306,19 @@ async fn record_grok_media_terminal(
     share_id: Option<&str>,
     user_email: Option<&str>,
     is_health_check: bool,
+    started_at_ms: Option<u128>,
     outcome: ProviderOutcome,
 ) {
     record_provider_outcome(state, stored, outcome).await;
     if !is_health_check {
-        record_share_invocation_result(state, share_id, user_email, TokenUsage::default()).await;
+        record_share_invocation_result(
+            state,
+            share_id,
+            user_email,
+            started_at_ms,
+            TokenUsage::default(),
+        )
+        .await;
     }
 }
 
@@ -8295,6 +8339,7 @@ async fn record_grok_media_memory_exhaustion(
         share_id,
         user_email,
         request_context.is_health_check,
+        request_context.started_at_ms,
         capacity_shed_provider_outcome(),
     )
     .await;
@@ -8324,6 +8369,7 @@ impl GrokImageLifecycleGuard {
             self.share_id.as_deref(),
             self.user_email.as_deref(),
             self.request_context.is_health_check,
+            self.request_context.started_at_ms,
             provider_outcome_from_status(StatusCode::OK.as_u16()),
         )
         .await;
@@ -8338,6 +8384,7 @@ impl GrokImageLifecycleGuard {
             self.share_id.as_deref(),
             self.user_email.as_deref(),
             self.request_context.is_health_check,
+            self.request_context.started_at_ms,
             outcome,
         )
         .await;
@@ -8360,6 +8407,7 @@ impl GrokImageLifecycleGuard {
             self.share_id.as_deref(),
             self.user_email.as_deref(),
             self.request_context.is_health_check,
+            self.request_context.started_at_ms,
             capacity_shed_provider_outcome(),
         )
         .await;
@@ -8418,6 +8466,7 @@ impl Drop for GrokImageLifecycleGuard {
         }
         let state = self.state.clone();
         let stored = self.stored.clone();
+        let quota_started_at_ms = self.request_context.started_at_ms;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
         let request_context = self.request_context.clone();
@@ -8449,6 +8498,7 @@ impl Drop for GrokImageLifecycleGuard {
                     &state,
                     share_id.as_deref(),
                     user_email.as_deref(),
+                    quota_started_at_ms,
                     TokenUsage::default(),
                 )
                 .await;
@@ -8874,6 +8924,7 @@ async fn forward_codex_images_request(
             &state,
             request_context.share_id.as_deref(),
             request_context.user_email.as_deref(),
+            request_context.started_at_ms,
             usage,
         )
         .await;
@@ -9099,6 +9150,7 @@ async fn record_codex_images_prebody_failure(
         state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         usage,
     )
     .await;
@@ -10004,6 +10056,7 @@ impl CodexImagesLifecycleGuard {
             &self.state,
             self.request_context.share_id.as_deref(),
             self.request_context.user_email.as_deref(),
+            self.request_context.started_at_ms,
             usage,
         )
         .await;
@@ -10063,6 +10116,7 @@ impl Drop for CodexImagesLifecycleGuard {
                 &state,
                 request_context.share_id.as_deref(),
                 request_context.user_email.as_deref(),
+                request_context.started_at_ms,
                 usage,
             )
             .await;
@@ -11178,6 +11232,8 @@ impl ResponsesWebsocketUsageTurn {
         let parent_request_id = request_context.request_id.clone();
         let turn_id = new_audit_correlation_id("turn");
         request_context.request_id = Some(turn_id.clone());
+        request_context.started_at_ms = Some(current_time_ms());
+        begin_share_quota_usage(state, stored.app, &mut request_context).await?;
         request_context.is_streaming = true;
         request_context.stream_status = Some("pending".to_string());
         let mut accepted = AuditEvent::new("inference.request.accepted");
@@ -11429,6 +11485,7 @@ impl ResponsesWebsocketUsageTurn {
             &self.state,
             self.request_context.share_id.as_deref(),
             self.request_context.user_email.as_deref(),
+            self.request_context.started_at_ms,
             self.usage,
         )
         .await;
@@ -11523,6 +11580,7 @@ impl Drop for ResponsesWebsocketUsageTurn {
                 &state,
                 request_context.share_id.as_deref(),
                 request_context.user_email.as_deref(),
+                request_context.started_at_ms,
                 usage,
             )
             .await;
@@ -12955,6 +13013,11 @@ async fn bridge_responses_websocket_inner(
                         return Err(error);
                     }
                 };
+                match &message {
+                    TungsteniteMessage::Text(text) => codex::record_quota_websocket_payload(state, &execution, text.as_bytes()).await,
+                    TungsteniteMessage::Binary(bytes) => codex::record_quota_websocket_payload(state, &execution, bytes).await,
+                    _ => {}
+                }
                 let upstream_closed = matches!(message, TungsteniteMessage::Close(_));
                 if upstream_closed {
                     let fallback_source = websocket_close_fallback_source(
@@ -18042,6 +18105,7 @@ async fn finish_web_session_failure(
         state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         TokenUsage::default(),
     )
     .await;
@@ -18184,6 +18248,7 @@ async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Respon
         &state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         usage,
     )
     .await;
@@ -19092,6 +19157,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let stream = async_stream::stream! {
@@ -19107,6 +19173,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
             status_code: StatusCode::OK.as_u16(),
             share_id: share_id.clone(),
             user_email: user_email.clone(),
+                            quota_started_at_ms,
             started,
             first_token_ms: None,
             usage: initial_usage,
@@ -19960,6 +20027,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let stream = async_stream::stream! {
@@ -19973,6 +20041,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             status_code: StatusCode::OK.as_u16(),
             share_id: share_id.clone(),
             user_email: user_email.clone(),
+                                    quota_started_at_ms,
             started,
             first_token_ms: None,
             usage: StreamUsageAccumulator::default(),
@@ -21156,6 +21225,7 @@ async fn record_qoder_nonstream_failure(
         state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         TokenUsage::default(),
     )
     .await;
@@ -21407,6 +21477,7 @@ async fn finish_qoder_nonstream(
         &state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         usage,
     )
     .await;
@@ -21641,6 +21712,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let stream = async_stream::stream! {
@@ -21657,6 +21729,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             status_code: StatusCode::OK.as_u16(),
             share_id: share_id.clone(),
             user_email: user_email.clone(),
+                        quota_started_at_ms,
             started,
             first_token_ms: None,
             usage: initial_usage,
@@ -22019,6 +22092,7 @@ async fn finish_qoder_stream_success(guard: &mut ShareStreamInterruptGuard) {
         &guard.state,
         guard.share_id.as_deref(),
         guard.user_email.as_deref(),
+        guard.quota_started_at_ms,
         usage,
     )
     .await;
@@ -22078,6 +22152,7 @@ async fn finish_qoder_stream_failure(
         &guard.state,
         guard.share_id.as_deref(),
         guard.user_email.as_deref(),
+        guard.quota_started_at_ms,
         usage,
     )
     .await;
@@ -22128,6 +22203,7 @@ async fn finish_kiro_stream_failure(
         &guard.state,
         guard.share_id.as_deref(),
         guard.user_email.as_deref(),
+        guard.quota_started_at_ms,
         usage,
     )
     .await;
@@ -22325,6 +22401,7 @@ async fn forward_claude_deepseek(
             },
         )
         .await;
+        let quota_started_at_ms = request_context.started_at_ms;
         let share_id = request_context.share_id.clone();
         let user_email = request_context.user_email.clone();
         let sse_stream: BoxStream<'static, Result<Bytes, std::io::Error>> = if prepared.has_tools()
@@ -22365,6 +22442,7 @@ async fn forward_claude_deepseek(
                 status_code,
                 share_id: share_id.clone(),
                 user_email: user_email.clone(),
+                                quota_started_at_ms,
                 started,
                 first_token_ms: None,
                 usage: StreamUsageAccumulator::default(),
@@ -22393,6 +22471,7 @@ async fn forward_claude_deepseek(
                             &state,
                             share_id.as_deref(),
                             user_email.as_deref(),
+                            quota_started_at_ms,
                             usage,
                         ).await;
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure).await;
@@ -22426,6 +22505,7 @@ async fn forward_claude_deepseek(
                 &state,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                quota_started_at_ms,
                 usage,
             ).await;
             record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
@@ -22453,6 +22533,7 @@ async fn forward_claude_deepseek(
         output_tokens: Some(u64::from(output_tokens)),
         ..Default::default()
     };
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id_for_record = request_context.share_id.clone();
     let user_email_for_record = request_context.user_email.clone();
     log_usage(
@@ -22469,6 +22550,7 @@ async fn forward_claude_deepseek(
         &state,
         share_id_for_record.as_deref(),
         user_email_for_record.as_deref(),
+        quota_started_at_ms,
         usage,
     )
     .await;
@@ -22528,6 +22610,7 @@ async fn record_kiro_memory_exhaustion(
             state,
             request_context.share_id.as_deref(),
             request_context.user_email.as_deref(),
+            request_context.started_at_ms,
             TokenUsage::default(),
         )
         .await;
@@ -22948,6 +23031,7 @@ async fn forward_claude_kiro_inner(
         Ok(message) => message,
         Err(error) => {
             let proxy_error = ProxyError::kiro_tool_json(error);
+            let quota_started_at_ms = request_context.started_at_ms;
             let share_id = request_context.share_id.clone();
             let user_email = request_context.user_email.clone();
             log_usage(
@@ -22967,6 +23051,7 @@ async fn forward_claude_kiro_inner(
                 &state,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                quota_started_at_ms,
                 TokenUsage::default(),
             )
             .await;
@@ -23030,6 +23115,7 @@ async fn forward_claude_kiro_inner(
     } else {
         response_bytes
     };
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id_for_record = request_context.share_id.clone();
     let user_email_for_record = request_context.user_email.clone();
     log_usage(
@@ -23050,6 +23136,7 @@ async fn forward_claude_kiro_inner(
         &state,
         share_id_for_record.as_deref(),
         user_email_for_record.as_deref(),
+        quota_started_at_ms,
         usage,
     )
     .await;
@@ -23151,6 +23238,7 @@ async fn forward_claude_kiro_stream(
         },
     )
     .await;
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let stream = Box::pin(kiro::kiro_event_stream_to_claude_sse_with_request_memory(
@@ -23178,6 +23266,7 @@ async fn forward_claude_kiro_stream(
             status_code,
             share_id: share_id.clone(),
             user_email: user_email.clone(),
+                                quota_started_at_ms,
             started,
             first_token_ms: None,
             usage: StreamUsageAccumulator::default(),
@@ -23452,6 +23541,7 @@ async fn forward_claude_kiro_stream(
             &state,
             share_id.as_deref(),
             user_email.as_deref(),
+            quota_started_at_ms,
             usage,
         ).await;
         record_provider_outcome(&state, &stored, ProviderOutcome::from_status(status_code)).await;
@@ -23473,6 +23563,7 @@ struct ShareStreamInterruptGuard {
     status_code: u16,
     share_id: Option<String>,
     user_email: Option<String>,
+    quota_started_at_ms: Option<u128>,
     started: Instant,
     first_token_ms: Option<u128>,
     usage: StreamUsageAccumulator,
@@ -23493,6 +23584,7 @@ impl Drop for ShareStreamInterruptGuard {
         let stored = self.stored.clone();
         let request_id = self.request_id.clone();
         let status_code = self.status_code;
+        let quota_started_at_ms = self.quota_started_at_ms;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
@@ -23515,6 +23607,7 @@ impl Drop for ShareStreamInterruptGuard {
                 &state,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                quota_started_at_ms,
                 usage,
             )
             .await;
@@ -23744,6 +23837,7 @@ fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyE
         );
     }
     let status = match rejection.reason {
+        ShareRejectReason::QuotaUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ShareRejectReason::NotFound => StatusCode::NOT_FOUND,
         ShareRejectReason::UnsupportedApp => StatusCode::NOT_FOUND,
         ShareRejectReason::UserIdentityRequired => StatusCode::UNAUTHORIZED,
@@ -23768,10 +23862,28 @@ fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyE
     }
 }
 
+async fn begin_share_quota_usage(
+    state: &ServerState,
+    app: AppKind,
+    context: &mut UsageLogContext,
+) -> Result<(), ProxyError> {
+    state
+        .begin_share_quota_usage(app, context)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "durable quota admission failed");
+            ProxyError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "QUOTA_LEDGER_UNAVAILABLE: quota accounting needs recovery".into(),
+            }
+        })
+}
+
 pub(super) async fn record_share_invocation_result(
     state: &ServerState,
     share_id: Option<&str>,
     user_email: Option<&str>,
+    started_at_ms: Option<u128>,
     usage: TokenUsage,
 ) {
     let Some(share_id) = share_id else {
@@ -23782,7 +23894,9 @@ pub(super) async fn record_share_invocation_result(
             share_id,
             user_email,
             share_usage_tokens(usage),
-            crate::infra::time::now_ms() as i64,
+            started_at_ms
+                .and_then(|time| i64::try_from(time).ok())
+                .unwrap_or(0),
         )
         .await;
 }
@@ -23791,6 +23905,7 @@ async fn record_share_supplemental_usage(
     state: &ServerState,
     share_id: Option<&str>,
     user_email: Option<&str>,
+    started_at_ms: Option<u128>,
     usage: TokenUsage,
 ) {
     let Some(share_id) = share_id else {
@@ -23801,7 +23916,9 @@ async fn record_share_supplemental_usage(
             share_id,
             user_email,
             share_usage_tokens(usage),
-            crate::infra::time::now_ms() as i64,
+            started_at_ms
+                .and_then(|time| i64::try_from(time).ok())
+                .unwrap_or(0),
         )
         .await;
 }
@@ -25474,6 +25591,7 @@ impl ResponsesImageJsonLifecycleGuard {
             &self.state,
             self.request_context.share_id.as_deref(),
             self.request_context.user_email.as_deref(),
+            self.request_context.started_at_ms,
             usage,
         )
         .await;
@@ -25521,6 +25639,7 @@ impl Drop for ResponsesImageJsonLifecycleGuard {
                 &state,
                 request_context.share_id.as_deref(),
                 request_context.user_email.as_deref(),
+                request_context.started_at_ms,
                 TokenUsage::default(),
             )
             .await;
@@ -25730,6 +25849,7 @@ async fn record_openai_responses_aggregation_failure(
         state,
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
+        request_context.started_at_ms,
         failure.usage,
     )
     .await;
@@ -27111,6 +27231,7 @@ struct StreamForwardState {
     status_code: u16,
     share_id: Option<String>,
     user_email: Option<String>,
+    quota_started_at_ms: Option<u128>,
     codex_rate_limit: Option<CodexRateLimitContext>,
     started: Instant,
     first_token_ms: Option<u128>,
@@ -27927,6 +28048,7 @@ impl StreamForwardState {
             &self.state,
             self.share_id.as_deref(),
             self.user_email.as_deref(),
+            self.quota_started_at_ms,
             usage,
         )
         .await;
@@ -28088,6 +28210,7 @@ impl StreamForwardState {
             &self.state,
             self.share_id.as_deref(),
             self.user_email.as_deref(),
+            self.quota_started_at_ms,
             usage,
         )
         .await;
@@ -29036,6 +29159,7 @@ impl Drop for StreamForwardState {
         } else {
             self.status_code
         };
+        let quota_started_at_ms = self.quota_started_at_ms;
         let share_id = self.share_id.clone();
         let user_email = self.user_email.clone();
         let usage_result = std::mem::take(&mut self.usage).finish_with_status();
@@ -29074,6 +29198,7 @@ impl Drop for StreamForwardState {
                 &state,
                 share_id.as_deref(),
                 user_email.as_deref(),
+                quota_started_at_ms,
                 usage,
             )
             .await;
@@ -29330,7 +29455,8 @@ fn select_share_execution(
         share,
         current_time_ms(),
     )?;
-    let execution = ProviderExecution::from_store(providers, stored)?;
+    let execution =
+        ProviderExecution::from_store(providers, stored)?.with_quota_source_fence(accounts);
     execution.ensure_operation_supported(ProviderOperation::Forward)?;
     Ok((execution, share_name))
 }
@@ -29368,6 +29494,7 @@ async fn record_local_protocol_rejection(
     error: &ProxyError,
 ) {
     debug_assert!(error.is_protocol_incompatible());
+    let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     log_usage(
@@ -29393,6 +29520,7 @@ async fn record_local_protocol_rejection(
         state,
         share_id.as_deref(),
         user_email.as_deref(),
+        quota_started_at_ms,
         TokenUsage::default(),
     )
     .await;
@@ -38819,6 +38947,7 @@ mod tests {
             Some(share_id),
             Some("owner@example.com"),
             true,
+            Some(crate::infra::time::now_ms()),
             provider_outcome_from_status(200),
         )
         .await;
@@ -38842,6 +38971,7 @@ mod tests {
             Some(share_id),
             Some("owner@example.com"),
             false,
+            Some(crate::infra::time::now_ms()),
             provider_outcome_from_status(200),
         )
         .await;
@@ -41013,7 +41143,14 @@ mod tests {
             .runtime_plan(AppKind::Codex, &stored.provider.id)
             .unwrap();
         drop(providers);
-        (state, ProviderExecution { stored, plan })
+        (
+            state,
+            ProviderExecution {
+                stored,
+                plan,
+                quota_source_fence: None,
+            },
+        )
     }
 
     fn switch_codex_test_workspace(accounts: &mut AccountStore, account_id: &str) {
@@ -44604,6 +44741,33 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             "managed account refresh was rate limited; retry later"
         );
         assert!(!proxy_error.message.contains("oauth-secret"));
+    }
+
+    #[test]
+    fn quota_unavailable_share_rejections_preserve_the_stable_wire_code() {
+        for code in [
+            "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+            "ACCOUNT_RESET_NOT_READY",
+            "QUOTA_HISTORY_INCOMPLETE",
+            "QUOTA_LEDGER_UNAVAILABLE",
+            "QUOTA_LEDGER_CAPACITY_LIMIT",
+        ] {
+            let error = share_rejection_to_proxy_error(ShareInvocationRejection {
+                reason: ShareRejectReason::QuotaUnavailable,
+                message: format!("{code}: accounting needs recovery"),
+                status_changed: false,
+                concurrency: None,
+            });
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.error_code(), code);
+            assert_eq!(error.error_type(), "unavailable_error");
+            assert_eq!(error.retry_after_seconds(), None);
+        }
+        let unrelated = ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "QUOTA_LEDGER_UNAVAILABLE_OTHER: unrelated".into(),
+        };
+        assert_eq!(unrelated.error_code(), "cc_switch_no_available_provider");
     }
 
     #[test]

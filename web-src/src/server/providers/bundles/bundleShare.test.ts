@@ -18,6 +18,7 @@ vi.mock("@/lib/api/share", async (importOriginal) => {
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
+  changedBundleUserGrants,
   deleteBundleShare,
   enableBundleShare,
   isValidShareSlug,
@@ -57,6 +58,19 @@ function share(
 }
 
 describe("Provider Bundle sharing", () => {
+  it("does not treat dynamic quota refreshes as administrator edits", () => {
+    const previous: NonNullable<ShareRecord["userGrants"]> = { "u@example.com": { email: "u@example.com", active: true,
+      role: "shareto", policy: { tokenPeriod: "accountReset", tokenLimit: 100 },
+      accountResetCapability: { support: "supported", syncStatus: "ready", minimumContractVersion: 8 } } };
+    const refreshed = structuredClone(previous);
+    refreshed["u@example.com"].accountResetCapability!.syncStatus = "stale";
+    refreshed["u@example.com"].usageQuota = { period: "accountReset", windowStartsAtMs: 4123,
+      effectiveTokensUsed: 90, observedTokensUsed: 90, manualOffsetTokens: 0, observedRequestsCount: 2,
+      rebaseApplies: false, usageWatermark: 10 };
+    expect(changedBundleUserGrants(previous, refreshed)).toBeUndefined();
+    refreshed["u@example.com"].policy.tokenLimit = 200;
+    expect(changedBundleUserGrants(previous, refreshed)?.["u@example.com"].policy?.tokenLimit).toBe(200);
+  });
   it("freezes the draft revision and exact expiry while sending only changed users", async () => {
     const existing = share({ codex: "bundle-1" }, 7, "2090-10-26T12:34:56Z");
     existing.userGrants = {

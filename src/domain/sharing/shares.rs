@@ -42,7 +42,9 @@ impl ShareUserUsage {
             ShareTokenPeriod::CalendarMonth => {
                 current_bucket_tokens(&self.calendar_month, utc_calendar_month_start_ms(now_ms))
             }
-            ShareTokenPeriod::SevenDays | ShareTokenPeriod::ThirtyDays => 0,
+            ShareTokenPeriod::SevenDays
+            | ShareTokenPeriod::ThirtyDays
+            | ShareTokenPeriod::AccountReset => 0,
         }
     }
 
@@ -78,6 +80,9 @@ impl ShareUserUsage {
         requests_count: u64,
     ) -> Result<(), String> {
         match policy.token_period {
+            ShareTokenPeriod::AccountReset => {
+                self.anchored = None;
+            }
             ShareTokenPeriod::Lifetime => {
                 self.lifetime = ShareUserUsageBucket {
                     started_at_ms: 0,
@@ -275,6 +280,8 @@ struct ShareUserQuotaSnapshot {
     window: ShareUserQuotaWindow,
     observed_tokens: u64,
     observed_requests: u64,
+    baseline_observed_tokens: Option<u64>,
+    usage_watermark: u64,
 }
 
 fn quota_window_for_policy(
@@ -305,6 +312,42 @@ fn observe_user_quota(
     grant: &ShareUserGrant,
     now_ms: i64,
 ) -> Result<ShareUserQuotaSnapshot, String> {
+    if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+        let cycle = grant
+            .account_quota_cycle
+            .as_ref()
+            .ok_or("ACCOUNT_RESET_NOT_READY")?;
+        let observed = usage
+            .quota_ledger
+            .query(cycle, share_id, email, usage.quota_ledger.watermark)
+            .map_err(str::to_string)?;
+        let baseline_observed_tokens = grant
+            .account_usage_baseline
+            .as_ref()
+            .filter(|baseline| {
+                baseline.source_ref == cycle.source_ref && baseline.cycle_id == cycle.cycle_id
+            })
+            .map(|baseline| {
+                usage
+                    .quota_ledger
+                    .query(cycle, share_id, email, baseline.usage_watermark)
+                    .map(|usage| usage.0)
+            })
+            .transpose()
+            .map_err(str::to_string)?;
+        return Ok(ShareUserQuotaSnapshot {
+            window: ShareUserQuotaWindow {
+                period: ShareTokenPeriod::AccountReset,
+                anchor_at_ms: None,
+                starts_at_ms: Some(cycle.starts_at_ms),
+                ends_at_ms: cycle.ends_at_ms,
+            },
+            observed_tokens: observed.0,
+            observed_requests: observed.1,
+            baseline_observed_tokens,
+            usage_watermark: usage.quota_ledger.watermark,
+        });
+    }
     let window = quota_window_for_policy(&grant.policy, now_ms)?;
     let (starts_at_ms, ends_at_ms) = match (window.starts_at_ms, window.ends_at_ms) {
         (Some(start), Some(end)) => (start, end),
@@ -317,6 +360,8 @@ fn observe_user_quota(
         window,
         observed_tokens,
         observed_requests,
+        baseline_observed_tokens: None,
+        usage_watermark: 0,
     })
 }
 
@@ -331,6 +376,19 @@ fn rebase_matches_window(
 }
 
 fn effective_user_tokens(grant: &ShareUserGrant, snapshot: &ShareUserQuotaSnapshot) -> u64 {
+    if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+        return snapshot
+            .baseline_observed_tokens
+            .zip(grant.account_usage_baseline.as_ref())
+            .map(|(observed_at_edit, baseline)| {
+                crate::domain::usage::quota_ledger::QuotaUsageLedger::effective_with_baseline(
+                    snapshot.observed_tokens,
+                    baseline.target_tokens,
+                    observed_at_edit,
+                )
+            })
+            .unwrap_or(snapshot.observed_tokens);
+    }
     let Some(rebase) = grant
         .usage_rebase
         .as_ref()
@@ -346,6 +404,12 @@ fn effective_user_tokens(grant: &ShareUserGrant, snapshot: &ShareUserQuotaSnapsh
 }
 
 fn effective_grant_tokens_for_policy(grant: &ShareUserGrant, now_ms: i64) -> u64 {
+    if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+        return grant
+            .usage_quota
+            .map(|quota| quota.effective_tokens_used)
+            .unwrap_or(u64::MAX);
+    }
     let bucket = grant.usage.tokens_for_policy(&grant.policy, now_ms);
     if let Some(rebase) = grant.usage_rebase.as_ref() {
         if rebase.period == grant.policy.token_period
@@ -389,7 +453,12 @@ fn quota_view(
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(snapshot.observed_tokens).unwrap_or(i64::MAX)),
         observed_requests_count: snapshot.observed_requests,
-        rebase_applies: rebase_applies && grant.usage_rebase.is_some(),
+        rebase_applies: if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+            snapshot.baseline_observed_tokens.is_some()
+        } else {
+            rebase_applies && grant.usage_rebase.is_some()
+        },
+        usage_watermark: snapshot.usage_watermark,
     }
 }
 
@@ -439,6 +508,10 @@ fn utc_calendar_month_start_ms(now_ms: i64) -> i64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareStore {
+    #[serde(default)]
+    pub quota_cycle_ledger: super::quota_cycle::QuotaCycleLedger,
+    #[serde(default)]
+    pub quota_cycle_sources: BTreeMap<String, String>,
     #[serde(default)]
     pub shares: Vec<Share>,
     #[serde(default)]
@@ -817,6 +890,115 @@ pub struct UpsertShareInput {
 }
 
 impl ShareStore {
+    pub fn validate_account_reset_configuration(
+        &self,
+        share_id: &str,
+        usage: &UsageStore,
+        expected: Option<&super::quota_cycle::AccountQuotaCycle>,
+    ) -> Result<(), SharePatchError> {
+        let share = self.get(share_id).ok_or(SharePatchError::NotFound)?;
+        if !share.user_grants.values().any(|grant| {
+            grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
+        }) {
+            return Ok(());
+        }
+        let source = self
+            .quota_cycle_sources
+            .get(share_id)
+            .and_then(|source| self.quota_cycle_ledger.source(source))
+            .ok_or_else(|| SharePatchError::Invalid("ACCOUNT_RESET_UNSUPPORTED".into()))?;
+        let cycle = source
+            .cycle
+            .as_ref()
+            .ok_or_else(|| SharePatchError::Invalid("ACCOUNT_RESET_NOT_READY".into()))?;
+        if expected.is_none_or(|expected| {
+            !expected.same_cycle(cycle) || expected.cycle_revision != cycle.cycle_revision
+        }) {
+            return Err(SharePatchError::QuotaCycleConflict {
+                current: Box::new(cycle.clone()),
+            });
+        }
+        if !usage.quota_ledger.complete_for(cycle) {
+            return Err(SharePatchError::Invalid("QUOTA_HISTORY_INCOMPLETE".into()));
+        }
+        Ok(())
+    }
+
+    pub fn project_account_reset(
+        &mut self,
+        share_id: &str,
+        source_ref: &str,
+        usage: &UsageStore,
+        now_ms: i64,
+    ) -> Result<(), SharePatchError> {
+        let cycle = self
+            .quota_cycle_ledger
+            .source(source_ref)
+            .and_then(|source| source.cycle.clone());
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?;
+        for grant in share.user_grants.values_mut() {
+            grant.account_quota_cycle = cycle.clone();
+            let ready = cycle
+                .as_ref()
+                .is_some_and(|cycle| usage.quota_ledger.complete_for(cycle));
+            let stale = ready
+                && self
+                    .quota_cycle_ledger
+                    .source(source_ref)
+                    .is_some_and(|source| {
+                        source.last_observed_at_ms
+                            < cycle.as_ref().map_or(0, |cycle| cycle.starts_at_ms)
+                            || now_ms.saturating_sub(source.last_observed_at_ms) > 300_000
+                            || cycle
+                                .as_ref()
+                                .is_some_and(|cycle| cycle.ends_at_ms.is_none())
+                    });
+            grant.account_reset_capability =
+                Some(super::quota_cycle_source::AccountResetCapability {
+                    support: "supported".into(),
+                    sync_status: if !ready {
+                        "initializing"
+                    } else if stale {
+                        "stale"
+                    } else {
+                        "ready"
+                    }
+                    .into(),
+                    reason: if ready {
+                        None
+                    } else {
+                        Some("history_incomplete".into())
+                    },
+                    minimum_contract_version: 8,
+                });
+            if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+                grant.usage_quota = if ready {
+                    let snapshot = observe_user_quota(
+                        usage,
+                        share_id,
+                        &grant.email.to_ascii_lowercase(),
+                        grant,
+                        now_ms,
+                    )
+                    .map_err(SharePatchError::Invalid)?;
+                    Some(quota_view(
+                        grant,
+                        &snapshot,
+                        effective_user_tokens(grant, &snapshot),
+                        true,
+                    ))
+                } else {
+                    None
+                };
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_or_default(config_dir: &Path) -> anyhow::Result<Self> {
         let path = shares_path(config_dir);
         if !path.exists() {
@@ -829,7 +1011,13 @@ impl ShareStore {
             .with_context(|| format!("parse shares {}", path.display()))?;
         super::legacy_token_market_migration::migrate_legacy_share_contract(&mut value)
             .with_context(|| format!("migrate legacy shares {}", path.display()))?;
-        serde_json::from_value(value).with_context(|| format!("decode shares {}", path.display()))
+        let store: Self = serde_json::from_value(value)
+            .with_context(|| format!("decode shares {}", path.display()))?;
+        store
+            .quota_cycle_ledger
+            .validate()
+            .map_err(anyhow::Error::msg)?;
+        Ok(store)
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
@@ -1554,6 +1742,25 @@ impl ShareStore {
                     concurrency: None,
                 });
             }
+            if grant.policy.token_period == ShareTokenPeriod::AccountReset
+                && grant.policy.token_limit.is_some()
+                && (grant.usage_quota.is_none()
+                    || grant.account_quota_cycle.is_none()
+                    || grant
+                        .account_reset_capability
+                        .as_ref()
+                        .is_none_or(|capability| {
+                            capability.sync_status != "ready" && capability.sync_status != "stale"
+                        }))
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "ACCOUNT_RESET_NOT_READY: verified quota history is unavailable"
+                        .into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
             if grant
                 .policy
                 .token_limit
@@ -1654,7 +1861,11 @@ impl ShareStore {
                         .record_supplemental_for_policy(&policy, tokens, recorded_at_ms);
                 }
                 let used = grant.usage.tokens_for_policy(&policy, recorded_at_ms);
-                if let Some(quota) = grant.usage_quota.as_mut() {
+                if let Some(quota) = grant
+                    .usage_quota
+                    .as_mut()
+                    .filter(|_| policy.token_period != ShareTokenPeriod::AccountReset)
+                {
                     quota.effective_tokens_used = used;
                     quota.observed_tokens_used = quota.observed_tokens_used.saturating_add(tokens);
                     if count_request {
@@ -2524,7 +2735,31 @@ impl ShareStore {
             (None, Some(from_patch)) => Some(from_patch.clone()),
             (None, None) => None,
         };
+        let expected_account_cycle = patch.expected_account_cycle.clone();
+        let changes_account_policy = patch.user_grants.as_ref().is_some_and(|grants| {
+            grants.values().any(|grant| {
+                grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
+            })
+        }) || patch.user_grant_edits.as_ref().is_some_and(|edits| {
+            edits.values().any(|edit| {
+                edit.policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.token_period == ShareTokenPeriod::AccountReset)
+            })
+        });
         candidate.apply_settings_patch(share_id, patch)?;
+        // Newly created grants need the Server-owned source projection before
+        // rebuilding their account window. Never trust client-supplied copies.
+        if let Some(source_ref) = candidate.quota_cycle_sources.get(share_id).cloned() {
+            candidate.project_account_reset(share_id, &source_ref, usage, applied_at_ms)?;
+        }
+        if changes_account_policy {
+            candidate.validate_account_reset_configuration(
+                share_id,
+                usage,
+                expected_account_cycle.as_ref(),
+            )?;
+        }
         if let Some(edits) = merged_usage_edits.as_ref() {
             candidate.apply_user_usage_edits(
                 share_id,
@@ -2618,6 +2853,39 @@ impl ShareStore {
                 }
             }
 
+            if grant.policy.token_period == ShareTokenPeriod::AccountReset {
+                let cycle = grant
+                    .account_quota_cycle
+                    .as_ref()
+                    .ok_or_else(|| SharePatchError::Invalid("ACCOUNT_RESET_NOT_READY".into()))?;
+                if edit.expected_account_cycle.as_ref().is_none_or(|expected| {
+                    !expected.same_cycle(cycle) || expected.cycle_revision != cycle.cycle_revision
+                }) {
+                    return Err(SharePatchError::QuotaCycleConflict {
+                        current: Box::new(cycle.clone()),
+                    });
+                }
+                observe_user_quota(usage, share_id, &email, grant, applied_at_ms)
+                    .map_err(SharePatchError::Invalid)?;
+                grant.account_usage_baseline = match edit.action {
+                    ShareUserUsageEditAction::Clear => None,
+                    ShareUserUsageEditAction::Set => {
+                        Some(super::quota_cycle::AccountQuotaBaseline {
+                            source_ref: cycle.source_ref.clone(),
+                            cycle_id: cycle.cycle_id.clone(),
+                            target_tokens: edit.target_tokens.ok_or_else(|| {
+                                SharePatchError::Invalid("targetTokens is required".into())
+                            })?,
+                            usage_watermark: usage.quota_ledger.watermark,
+                            applied_at_ms,
+                            applied_by: operator.map(str::to_string),
+                        })
+                    }
+                };
+                grant.updated_at_ms = applied_at_ms.max(0) as u128;
+                grant.revision = grant.revision.saturating_add(1).max(1);
+                continue;
+            }
             match edit.action {
                 ShareUserUsageEditAction::Clear => {
                     grant.usage_rebase = None;
@@ -2797,6 +3065,27 @@ impl ShareStore {
             .find(|share| share.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
         for grant in share.user_grants.values_mut() {
+            if grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset {
+                match observe_user_quota(
+                    usage,
+                    share_id,
+                    &grant.email.trim().to_ascii_lowercase(),
+                    grant,
+                    now_ms,
+                ) {
+                    Ok(snapshot) => {
+                        let effective = effective_user_tokens(grant, &snapshot);
+                        grant.usage_quota = Some(quota_view(grant, &snapshot, effective, true));
+                    }
+                    Err(reason) => {
+                        grant.usage_quota = None;
+                        grant.account_reset_capability = Some(
+                            super::quota_cycle_source::AccountResetCapability::unavailable(&reason),
+                        );
+                    }
+                }
+                continue;
+            }
             if !grant.active || !grant.policy.token_period.requires_anchor() {
                 grant.usage.anchored = None;
                 continue;
@@ -3407,6 +3696,7 @@ pub enum ShareRejectReason {
     UserExpired,
     UserExhausted,
     UserParallelLimit,
+    QuotaUnavailable,
 }
 
 impl ShareRejectReason {
@@ -3424,6 +3714,7 @@ impl ShareRejectReason {
             Self::UserExpired => "UserExpired",
             Self::UserExhausted => "UserExhausted",
             Self::UserParallelLimit => "UserParallelLimit",
+            Self::QuotaUnavailable => "ACCOUNT_RESET_NOT_READY",
         }
     }
 }
@@ -3465,6 +3756,9 @@ pub enum SharePatchError {
         observed: u64,
     },
     ManagedGrantReadOnly(String),
+    QuotaCycleConflict {
+        current: Box<super::quota_cycle::AccountQuotaCycle>,
+    },
     Invalid(String),
 }
 
@@ -3478,12 +3772,16 @@ impl SharePatchError {
             Self::GrantRevisionConflict { .. } => "cc_switch_share_user_grant_revision_conflict",
             Self::UsageTargetBelowObserved { .. } => "cc_switch_share_usage_target_below_observed",
             Self::ManagedGrantReadOnly(_) => "cc_switch_share_market_grant_read_only",
+            Self::QuotaCycleConflict { .. } => "QUOTA_CYCLE_CONFLICT",
             Self::Invalid(_) => "cc_switch_share_invalid_patch",
         }
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::RevisionConflict { .. })
+        matches!(
+            self,
+            Self::RevisionConflict { .. } | Self::QuotaCycleConflict { .. }
+        )
     }
 }
 
@@ -3518,6 +3816,7 @@ impl std::fmt::Display for SharePatchError {
             Self::ManagedGrantReadOnly(email) => {
                 write!(formatter, "Share Market managed user {email} is read-only")
             }
+            Self::QuotaCycleConflict { .. } => formatter.write_str("QUOTA_CYCLE_CONFLICT"),
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -3743,6 +4042,9 @@ fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
         usage: Default::default(),
         usage_rebase: None,
         usage_quota: None,
+        account_quota_cycle: None,
+        account_reset_capability: None,
+        account_usage_baseline: None,
         created_at_ms: now,
         updated_at_ms: now,
         revoked_at_ms: None,
@@ -3855,6 +4157,11 @@ fn apply_managed_grant_operation(
                 policy.token_period_anchor_at_ms = Some(now.div_euclid(60_000) * 60_000);
             }
             validate_user_policy(&policy, now).map_err(SharePatchError::Invalid)?;
+            if policy.token_period == ShareTokenPeriod::AccountReset {
+                return Err(SharePatchError::Invalid(
+                    "market contracts cannot use accountReset".into(),
+                ));
+            }
             if share.user_grants.values().any(|grant| {
                 grant.active
                     && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
@@ -3891,6 +4198,9 @@ fn apply_managed_grant_operation(
                         .as_ref()
                         .and_then(|grant| grant.usage_rebase.clone()),
                     usage_quota: None,
+                    account_quota_cycle: None,
+                    account_reset_capability: None,
+                    account_usage_baseline: None,
                     created_at_ms: previous
                         .as_ref()
                         .map(|grant| grant.created_at_ms)
@@ -4014,6 +4324,11 @@ fn normalize_user_grants(
         // rebase and rebuild the derived snapshot below.
         grant.usage_rebase = previous.and_then(|item| item.usage_rebase.clone());
         grant.usage_quota = previous.and_then(|item| item.usage_quota);
+        grant.account_quota_cycle = previous.and_then(|item| item.account_quota_cycle.clone());
+        grant.account_reset_capability =
+            previous.and_then(|item| item.account_reset_capability.clone());
+        grant.account_usage_baseline =
+            previous.and_then(|item| item.account_usage_baseline.clone());
         grant.created_at_ms = previous
             .map(|item| item.created_at_ms)
             .filter(|value| *value > 0)
@@ -4067,6 +4382,9 @@ fn reconcile_user_grants(share: &mut Share) {
                 usage: Default::default(),
                 usage_rebase: None,
                 usage_quota: None,
+                account_quota_cycle: None,
+                account_reset_capability: None,
+                account_usage_baseline: None,
                 created_at_ms: now_ms(),
                 updated_at_ms: now_ms(),
                 revoked_at_ms: None,
@@ -4893,6 +5211,346 @@ mod tests {
         assert!(recreated.config_revision > recreated.router_synced_revision);
     }
 
+    fn account_quota_fixture() -> (
+        ShareStore,
+        UsageStore,
+        String,
+        super::super::quota_cycle::QuotaSourceFence,
+    ) {
+        use super::super::quota_cycle::*;
+        let mut input = codex_share_input("quota-share");
+        for email in ["a@example.com", "b@example.com"] {
+            add_manual_shareto(&mut input, email);
+        }
+        let mut store = ShareStore::default();
+        store.upsert(input).unwrap();
+        let fence = QuotaSourceFence::default();
+        let source = store
+            .quota_cycle_ledger
+            .register_source(
+                "verified".into(),
+                "codex_oauth".into(),
+                "weekly".into(),
+                fence.clone(),
+            )
+            .unwrap();
+        store
+            .quota_cycle_ledger
+            .observe(
+                &source,
+                &fence,
+                &QuotaWindowObservation {
+                    bucket_id: "weekly".into(),
+                    starts_at_ms: Some(1_000),
+                    ends_at_ms: 10_000,
+                    duration_ms: None,
+                    observed_at_ms: 2_000,
+                    basis: QuotaTimeBasis::UpstreamWindow,
+                },
+            )
+            .unwrap();
+        store
+            .quota_cycle_sources
+            .insert("quota-share".into(), source.clone());
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "quota-share")
+            .unwrap();
+        for email in ["a@example.com", "b@example.com"] {
+            let grant = share.user_grants.get_mut(email).unwrap();
+            grant.policy.token_period = ShareTokenPeriod::AccountReset;
+            grant.policy.token_limit = Some(100);
+        }
+        let mut usage = UsageStore::default();
+        usage.quota_ledger.begin_collection(&source, 0);
+        store
+            .project_account_reset("quota-share", &source, &usage, 2_000)
+            .unwrap();
+        (store, usage, source, fence)
+    }
+
+    fn account_quota_log(
+        source: &str,
+        id: &str,
+        email: &str,
+        started: i64,
+        tokens: u64,
+    ) -> crate::domain::usage::store::UsageLog {
+        use crate::domain::usage::{
+            quota_ledger::QuotaAttribution,
+            store::{TokenUsage, UsageLog, UsageModelMetadata},
+        };
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p1".into(),
+            "Provider".into(),
+            ProviderType::CodexOAuth,
+            200,
+            1,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                total_tokens: Some(tokens),
+                ..Default::default()
+            },
+        );
+        log.request_id = id.into();
+        log.share_id = Some("quota-share".into());
+        log.user_email = Some(email.into());
+        log.started_at_ms = started as u128;
+        log.created_at_ms = started as u128;
+        log.quota_attribution = Some(QuotaAttribution {
+            source_ref: source.into(),
+            source_epoch: 1,
+            bucket_id: "weekly".into(),
+            started_at_ms: started,
+        });
+        log
+    }
+
+    #[test]
+    fn quota_delayed_reset_baseline_correction_and_mode_roundtrip_preserve_real_usage() {
+        use super::super::quota_cycle::QuotaTimeBasis;
+        let (mut store, mut usage, source, fence) = account_quota_fixture();
+        for (id, email, start, tokens) in [
+            ("old", "a@example.com", 4_122, 10),
+            ("current", "a@example.com", 4_123, 30),
+            ("other", "b@example.com", 4_124, 40),
+        ] {
+            usage.push(account_quota_log(&source, id, email, start, tokens));
+        }
+        store
+            .quota_cycle_ledger
+            .apply_reset(
+                &source,
+                &fence,
+                "public:reset",
+                4_123,
+                8_000,
+                QuotaTimeBasis::PublicAnnouncement,
+            )
+            .unwrap();
+        store
+            .project_account_reset("quota-share", &source, &usage, 8_000)
+            .unwrap();
+        let share = store.get("quota-share").unwrap();
+        assert_eq!(
+            share.user_grants["a@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            30
+        );
+        assert_eq!(
+            share.user_grants["b@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            40
+        );
+        let cycle = share.user_grants["a@example.com"]
+            .account_quota_cycle
+            .clone()
+            .unwrap();
+        let edit: ShareUserUsageEdit = serde_json::from_value(json!({"action":"set","targetTokens":5,
+            "expectedGrantRevision":share.user_grants["a@example.com"].revision,"expectedAccountCycle":cycle})).unwrap();
+        store
+            .apply_settings_patch_with_usage_edits(
+                "quota-share",
+                ShareSettingsPatch {
+                    user_usage_edits: Some(BTreeMap::from([("a@example.com".into(), edit)])),
+                    ..Default::default()
+                },
+                None,
+                &usage,
+                8_001,
+                Some("admin"),
+            )
+            .unwrap();
+        usage.push(account_quota_log(
+            &source,
+            "late-completion",
+            "a@example.com",
+            5_000,
+            7,
+        ));
+        store
+            .quota_cycle_ledger
+            .apply_reset(
+                &source,
+                &fence,
+                "public:reset",
+                4_500,
+                8_100,
+                QuotaTimeBasis::PublicAnnouncement,
+            )
+            .unwrap();
+        store
+            .project_account_reset("quota-share", &source, &usage, 8_100)
+            .unwrap();
+        assert_eq!(
+            store.get("quota-share").unwrap().user_grants["a@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            12
+        );
+        for period in [ShareTokenPeriod::Lifetime, ShareTokenPeriod::AccountReset] {
+            let share = store.get("quota-share").unwrap();
+            let grant = &share.user_grants["a@example.com"];
+            let mut policy = grant.policy.clone();
+            policy.token_period = period;
+            let edits = serde_json::from_value(
+                json!({"a@example.com":{"expectedRevision":grant.revision,"policy":policy}}),
+            )
+            .unwrap();
+            store
+                .apply_settings_patch_with_usage_edits(
+                    "quota-share",
+                    ShareSettingsPatch {
+                        user_grant_edits: Some(edits),
+                        expected_account_cycle: store
+                            .quota_cycle_ledger
+                            .source(&source)
+                            .unwrap()
+                            .cycle
+                            .clone(),
+                        ..Default::default()
+                    },
+                    None,
+                    &usage,
+                    8_200,
+                    Some("admin"),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.get("quota-share").unwrap().user_grants["a@example.com"]
+                .usage_quota
+                .unwrap()
+                .effective_tokens_used,
+            12
+        );
+        assert_eq!(
+            store
+                .quota_cycle_ledger
+                .source(&source)
+                .unwrap()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .cycle_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn quota_old_cycle_and_mixed_batch_fail_atomically_and_reset_preserves_pause_and_total() {
+        use super::super::quota_cycle::QuotaTimeBasis;
+        let (mut store, usage, source, fence) = account_quota_fixture();
+        let old = store
+            .quota_cycle_ledger
+            .source(&source)
+            .unwrap()
+            .cycle
+            .clone()
+            .unwrap();
+        store
+            .quota_cycle_ledger
+            .apply_reset(
+                &source,
+                &fence,
+                "new",
+                4_123,
+                8_000,
+                QuotaTimeBasis::PublicAnnouncement,
+            )
+            .unwrap();
+        store
+            .project_account_reset("quota-share", &source, &usage, 8_000)
+            .unwrap();
+        let current = store
+            .quota_cycle_ledger
+            .source(&source)
+            .unwrap()
+            .cycle
+            .clone()
+            .unwrap();
+        let edits = [old, current]
+            .into_iter()
+            .map(|cycle| {
+                (
+                    "a@example.com".into(),
+                    serde_json::from_value(json!({
+            "action":"set","targetTokens":5,"expectedAccountCycle":cycle}))
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<(String, ShareUserUsageEdit)>>();
+        let before = serde_json::to_value(&store).unwrap();
+        let stale = store.apply_settings_patch_with_usage_edits(
+            "quota-share",
+            ShareSettingsPatch {
+                user_usage_edits: Some(BTreeMap::from([edits[0].clone()])),
+                ..Default::default()
+            },
+            None,
+            &usage,
+            8_001,
+            None,
+        );
+        assert!(matches!(
+            stale,
+            Err(SharePatchError::QuotaCycleConflict { .. })
+        ));
+        assert_eq!(serde_json::to_value(&store).unwrap(), before);
+        let mut invalid_second = edits[1].1.clone();
+        invalid_second.expected_grant_revision = Some(u64::MAX);
+        assert!(store
+            .apply_settings_patch_with_usage_edits(
+                "quota-share",
+                ShareSettingsPatch {
+                    user_usage_edits: Some(BTreeMap::from([
+                        edits[1].clone(),
+                        ("b@example.com".into(), invalid_second)
+                    ])),
+                    ..Default::default()
+                },
+                None,
+                &usage,
+                8_001,
+                None
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(&store).unwrap(), before);
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "quota-share")
+            .unwrap();
+        share.status = "paused".into();
+        share.tokens_used = 999;
+        share.policy.token_limit = Some(1_000);
+        store
+            .quota_cycle_ledger
+            .apply_reset(
+                &source,
+                &fence,
+                "again",
+                6_000,
+                9_000,
+                QuotaTimeBasis::PublicAnnouncement,
+            )
+            .unwrap();
+        store
+            .project_account_reset("quota-share", &source, &usage, 9_000)
+            .unwrap();
+        let share = store.get("quota-share").unwrap();
+        assert_eq!(share.status, "paused");
+        assert_eq!(share.tokens_used, 999);
+        assert_eq!(share.policy.token_limit, Some(1_000));
+    }
+
     fn codex_share_input(id: &str) -> UpsertShareInput {
         UpsertShareInput {
             id: Some(id.to_string()),
@@ -5333,6 +5991,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "USER@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(150),
                 expected_grant_revision: Some(revision),
@@ -5423,6 +6082,7 @@ mod tests {
         let clear = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Clear,
                 target_tokens: None,
                 expected_grant_revision: Some(
@@ -5477,6 +6137,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(10_000),
                 expected_grant_revision: Some(revision),
@@ -5550,6 +6211,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(60),
                 expected_grant_revision: Some(revision),
@@ -5597,6 +6259,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "renter@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(1_000),
                 expected_grant_revision: Some(revision),
@@ -5671,6 +6334,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(12_000),
                 expected_grant_revision: Some(revision),
@@ -5815,6 +6479,7 @@ mod tests {
         let edit = BTreeMap::from([(
             "user@example.com".to_string(),
             ShareUserUsageEdit {
+                expected_account_cycle: None,
                 action: ShareUserUsageEditAction::Set,
                 target_tokens: Some(12_000),
                 expected_grant_revision: Some(revision),
@@ -6164,6 +6829,7 @@ mod tests {
             user_usage_edits: Some(BTreeMap::from([(
                 "a@example.com".into(),
                 ShareUserUsageEdit {
+                    expected_account_cycle: None,
                     action: ShareUserUsageEditAction::Set,
                     target_tokens: Some(100),
                     expected_grant_revision: Some(original.user_grants["a@example.com"].revision),

@@ -2,7 +2,7 @@
 
 > 本文件是 cc-switch-server 全部文档的**唯一索引**。新增文档必须在此登记并标注状态，否则 `scripts/static-checks.sh` 的文档检查会失败。
 >
-> 最后核对：2026-10-25。
+> 最后核对：2026-10-26。
 
 ## 状态标记
 
@@ -18,7 +18,7 @@
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
 | [overview.md](architecture/overview.md) | 权威 | 三角色拓扑、资金边界、两条链路、模块分层与强约束。**架构叙述的真值来源** |
-| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧实现的 Router 协议：控制面、探针、IngressContext、Share 契约 v7 |
+| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧实现的 Router 协议：控制面、探针、IngressContext、Share v7兼容/v8能力协商 |
 | [storage.md](architecture/storage.md) | 权威 | 数据目录、文件清单、凭据加密、用量存储、备份、写入锁序 |
 | [usage-accounting.md](architecture/usage-accounting.md) | 权威 | Usage token 计量口径 |
 
@@ -63,6 +63,7 @@
 | --- | --- | --- |
 | [access-policy.md](share/access-policy.md) | 权威 | Share 访问模型（Contract v2）与一次性持久化迁移 |
 | [user-usage-rebase.md](share/user-usage-rebase.md) | 权威 | Share 用户用量重基线 |
+| [account-reset.md](share/account-reset.md) | 权威 | 账号重置周期实现、全供应商门槛、53项离线映射、存储恢复和review；真实验收独立live_pending |
 
 ## 验收 `docs/acceptance/`
 

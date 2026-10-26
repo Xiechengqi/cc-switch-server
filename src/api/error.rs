@@ -424,7 +424,24 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn account_quota_preview(error: anyhow::Error) -> Self {
+        if let Some(conflict) = error.downcast_ref::<crate::state::QuotaPreviewConflict>() {
+            return Self::conflict_code(
+                "QUOTA_CYCLE_CONFLICT",
+                "Share changed; reload and preview again",
+            )
+            .with_details(conflict.0.clone());
+        }
+        Self::internal(error)
+    }
+
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
+        if error.to_string() == "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" {
+            return Self::conflict_code(
+                "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+                "Router must negotiate accountResetV1",
+            );
+        }
         tracing::error!("internal api error: {error}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     }
@@ -572,8 +589,25 @@ pub(crate) fn map_share_patch_error(
                 format!("Share Market managed user {email} is read-only"),
             )
         }
+        crate::domain::sharing::shares::SharePatchError::QuotaCycleConflict { current } => {
+            ApiError::conflict_code("QUOTA_CYCLE_CONFLICT", "Account quota cycle changed; preview again")
+                .with_retryable(true)
+                .with_details(serde_json::json!({ "accountQuotaCycle": current, "previewRequired": true }))
+        }
         crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
-            ApiError::bad_request(message)
+            match message.as_str() {
+                "QUOTA_CYCLE_CONFLICT" | "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" => {
+                    let code = if message == "QUOTA_CYCLE_CONFLICT" { "QUOTA_CYCLE_CONFLICT" } else { "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" };
+                    ApiError::conflict_code(code, message).with_retryable(true)
+                }
+                "ACCOUNT_RESET_UNSUPPORTED" | "ACCOUNT_RESET_NOT_READY" | "QUOTA_HISTORY_INCOMPLETE" => {
+                    let code = match message.as_str() { "ACCOUNT_RESET_UNSUPPORTED" => "ACCOUNT_RESET_UNSUPPORTED",
+                        "ACCOUNT_RESET_NOT_READY" => "ACCOUNT_RESET_NOT_READY", _ => "QUOTA_HISTORY_INCOMPLETE" };
+                    ApiError::unprocessable_code(code, message)
+                }
+                _ if message.contains("tokenPeriodAnchorAtMs") => ApiError::unprocessable_code("INVALID_TOKEN_PERIOD_ANCHOR", message),
+                _ => ApiError::bad_request(message),
+            }
         }
     }
 }

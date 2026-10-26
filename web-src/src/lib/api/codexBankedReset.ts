@@ -32,6 +32,9 @@ export interface CodexBankedResetStatus {
 }
 
 export interface CodexBankedResetConsumeResult {
+  operationId?: string;
+  operationStatus?: "confirmed" | "rejected" | "unknown";
+  sharedWeeklyConfirmed?: boolean;
   code?: string | null;
   creditId: string;
   redeemRequestId: string;
@@ -60,6 +63,7 @@ export async function getCodexBankedResetStatus(
 export async function consumeCodexBankedReset(
   target: CodexBankedResetTarget,
   creditId?: string | null,
+  operationId?: string,
 ): Promise<CodexBankedResetConsumeResult> {
   return invokeCommand<CodexBankedResetConsumeResult>(
     "codex_banked_reset_consume",
@@ -68,6 +72,7 @@ export async function consumeCodexBankedReset(
       providerId: target.providerId || null,
       expectedRevision: target.expectedRevision ?? null,
       creditId: creditId?.trim() || null,
+      operationId,
     },
   );
 }

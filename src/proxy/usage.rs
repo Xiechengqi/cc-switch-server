@@ -98,6 +98,7 @@ pub(super) async fn log_usage(
         );
     }
     if let Err(error) = state.push_usage_log(log).await {
+        state.mark_quota_usage_degraded();
         tracing::warn!("failed to persist usage log: {error}");
     }
     state.emit_event(
@@ -207,7 +208,10 @@ async fn update_stream_usage_with_parse_status(
     match persisted {
         Ok(Some(_)) => {}
         Ok(None) => return,
-        Err(error) => tracing::warn!("failed to persist stream usage update: {error}"),
+        Err(error) => {
+            state.mark_quota_usage_degraded();
+            tracing::warn!("failed to persist stream usage update: {error}");
+        }
     }
     state.emit_event(
         ServerEvent::new("usage.updated", "usage")

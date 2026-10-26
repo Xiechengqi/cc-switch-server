@@ -10,7 +10,27 @@ export type ShareBindings = Partial<
 >;
 
 export type ShareTokenPeriod =
-  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays";
+  "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays" | "accountReset";
+
+export type AccountQuotaCycle = {
+  streamIncarnation: string; sourceRef: string; sourceEpoch: number; bucketId: string;
+  cycleId: string; cycleSequence: number; cycleRevision: number;
+  startsAtMs: number; endsAtMs?: number | null; observedAtMs: number; eventId: string;
+  basis: "upstreamWindow" | "derivedFromWindow" | "knownNaturalBoundary" | "publicAnnouncement" | "redeemConfirmation";
+};
+export type AccountResetCapability = {
+  support: "supported" | "conditional" | "unsupported";
+  syncStatus: "ready" | "initializing" | "stale" | "error" | "needsReconcile";
+  reason?: string | null; minimumContractVersion: number;
+};
+export type AccountResetPreview = {
+  ledgerHealth?: { revisionCount: number; capacityWarning: boolean; admissionLimit: number; retentionPolicy: string };
+  shareId: string; configRevision: number; accountQuotaCycle?: AccountQuotaCycle;
+  accountResetCapability: AccountResetCapability; complete: boolean; usageWatermark: number;
+  defaultTokenPeriod: ShareTokenPeriod;
+  rows: Array<{ email: string; currentTokens?: number | null; expectedTokens?: number | null;
+    tokenLimit?: number | null; wouldExceed?: boolean | null; reason?: string | null }>;
+};
 
 export type ShareUserPolicy = {
   parallelLimit?: number;
@@ -61,6 +81,7 @@ export type ShareUserUsageRebase = {
  * re-derived it would disagree the moment the rebase arithmetic changes.
  */
 export type ShareUserQuotaView = {
+  usageWatermark?: number;
   period: ShareTokenPeriod;
   anchorAtMs?: number;
   /** Inclusive window start; absent for `lifetime`. */
@@ -79,6 +100,7 @@ export type ShareUserQuotaView = {
 };
 
 export type ShareUserUsageEdit = {
+  expectedAccountCycle?: AccountQuotaCycle;
   action: "set" | "clear";
   /** Final effective token count desired at save time. */
   targetTokens?: number;
@@ -102,6 +124,10 @@ export type ShareTotalUsageEdit = {
 };
 
 export type ShareUserGrant = {
+  accountQuotaCycle?: AccountQuotaCycle;
+  accountResetCapability?: AccountResetCapability;
+  accountUsageBaseline?: { sourceRef: string; cycleId: string; targetTokens: number;
+    usageWatermark: number; appliedAtMs: number; appliedBy?: string | null };
   email: string;
   role: "owner" | "shareto";
   active: boolean;
@@ -238,6 +264,7 @@ export function sharePrimaryProviderId(
 
 /** Complete settings payload saved atomically from a Provider edit page. */
 export interface SaveProviderShareParams {
+  expectedAccountCycle?: AccountQuotaCycle;
   shareId: string;
   expectedConfigRevision: number;
   subdomain: string;
@@ -258,6 +285,7 @@ export interface SaveProviderShareParams {
 
 /** Bundle-scoped Share payload; enabled Surface bindings are derived by the Server. */
 export interface SaveProviderBundleShareParams {
+  expectedAccountCycle?: AccountQuotaCycle;
   userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   bundleId: string;
   shareId?: string;
@@ -668,6 +696,8 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 }
 
 export const shareApi = {
+  previewAccountReset: (shareId: string, expectedConfigRevision: number, policies?: Record<string, ShareUserPolicy>) =>
+    invokeCommand<AccountResetPreview>("preview_share_account_reset", { shareId, expectedConfigRevision, policies }),
   create,
   listReuseCandidates,
   addBinding,

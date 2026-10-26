@@ -35,6 +35,7 @@ use super::{codex_provider_api_key, setting, ProxyError};
 pub(crate) struct ProviderExecution {
     pub stored: StoredProvider,
     pub plan: Arc<ProviderRuntimePlan>,
+    pub quota_source_fence: Option<crate::domain::sharing::quota_cycle::QuotaSourceFence>,
 }
 
 pub(crate) struct PreparedProviderRequest {
@@ -106,7 +107,57 @@ impl ProviderExecution {
                     stored.provider.id
                 ),
             })?;
-        Ok(Self { stored, plan })
+        Ok(Self {
+            stored,
+            plan,
+            quota_source_fence: None,
+        })
+    }
+
+    pub fn with_quota_source_fence(mut self, accounts: &AccountStore) -> Self {
+        self.quota_source_fence =
+            self.managed_account_identity_target()
+                .and_then(|(provider_type, id, generation)| {
+                    let account = accounts.find_for_provider(provider_type, Some(id))?;
+                    (account.auth_identity_generation == generation).then(|| {
+                        crate::domain::sharing::quota_cycle::QuotaSourceFence {
+                            account_incarnation: accounts.account_incarnation(id).unwrap_or(0),
+                            identity_generation: generation,
+                            ..Default::default()
+                        }
+                    })
+                });
+        self
+    }
+
+    pub async fn record_quota_window(
+        &self,
+        state: &crate::state::ServerState,
+        observation: &crate::domain::sharing::quota_cycle::QuotaWindowObservation,
+    ) {
+        let (Some(fence), Some((_, account_id, _))) = (
+            &self.quota_source_fence,
+            self.managed_account_identity_target(),
+        ) else {
+            return;
+        };
+        let key = crate::domain::providers::registry::ProviderKey::new(
+            self.stored.app,
+            &self.stored.provider.id,
+        )
+        .expect("committed provider key");
+        if let Err(error) = state
+            .record_passive_quota_window(
+                &key,
+                self.stored.resource.revision,
+                account_id,
+                fence,
+                observation,
+            )
+            .await
+        {
+            tracing::warn!(%error, "passive account quota observation could not be committed");
+        }
     }
 
     pub fn ensure_ready(&self) -> Result<(), ProxyError> {
@@ -1381,6 +1432,7 @@ mod tests {
             _ => "legacy.frozen",
         };
         ProviderExecution {
+            quota_source_fence: None,
             stored: StoredProvider {
                 app: AppKind::Codex,
                 provider: Provider {
@@ -1464,6 +1516,7 @@ mod tests {
         );
         assert_eq!(plan.profile_id.as_str(), profile_id);
         ProviderExecution {
+            quota_source_fence: None,
             stored,
             plan: Arc::new(plan),
         }
@@ -1497,6 +1550,7 @@ mod tests {
     #[test]
     fn single_model_policy_rewrites_body_and_preserves_requested_model() {
         let execution = ProviderExecution {
+            quota_source_fence: None,
             stored: StoredProvider {
                 app: AppKind::Codex,
                 provider: Provider {

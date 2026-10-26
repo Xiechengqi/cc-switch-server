@@ -54,6 +54,7 @@
     "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。"
   },
   "codexBankedReset": {
+    "needsReconcile": "兑换结果待核对，不会自动消费新券；尚未确认共享周主桶重置。",
     "alreadyRedeemed": "该 credit 已被使用",
     "available": "可用重置",
     "availableUnit": "次",
@@ -1113,6 +1114,19 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "无上限",
     "userLimit": {
+      "accountReset": {
+        "label": "账号重置周期",
+        "ready": "账号周期已就绪",
+        "unavailable": "账号周期暂不可选：{{reason}}",
+        "pending": "等待账号周期 / 完整历史",
+        "noEnd": "下次重置待确认",
+        "observed": "最后观测",
+        "caveat": "公共公告按公告时间跟随，不代表逐账号执行；无证据的站外重置无法保证识别。暂时失败时沿用已确认周期。",
+        "preview": "预计用量（不会清零）；核对各用户后再次应用：",
+        "exceeded": "达到或超过限额",
+        "saveFirst": "请先保存 Share，再初始化账号周期。",
+        "notReady": "账号周期尚未就绪，请保留原周期。"
+      },
       "remoteChanged": "Share 配置已在其他位置修改。重新加载将丢弃当前 Share 草稿并使用最新配置。",
       "reloadShare": "重新加载 Share",
       "add": "添加用户",

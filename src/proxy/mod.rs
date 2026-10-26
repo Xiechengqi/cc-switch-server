@@ -466,6 +466,21 @@ impl ProxyError {
 
     pub fn error_code(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        if self.status == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+            for code in [
+                "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+                "ACCOUNT_RESET_NOT_READY",
+                "QUOTA_HISTORY_INCOMPLETE",
+                "QUOTA_LEDGER_UNAVAILABLE",
+                "QUOTA_LEDGER_CAPACITY_LIMIT",
+            ] {
+                if message.strip_prefix(code).is_some_and(|suffix| {
+                    suffix.is_empty() || suffix.starts_with(':') || suffix.starts_with(' ')
+                }) {
+                    return code;
+                }
+            }
+        }
         if let Some(metadata) = self.concurrency_metadata() {
             return metadata.scope.error_code();
         }

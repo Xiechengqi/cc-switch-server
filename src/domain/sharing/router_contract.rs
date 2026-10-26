@@ -31,6 +31,7 @@ use crate::domain::sharing::model_health::ShareModelHealthSummary;
 use crate::domain::sharing::shares::Share;
 
 pub const SHARE_CONTRACT_VERSION: u16 = 7;
+pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -48,6 +49,8 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_cycle: Option<super::quota_cycle::AccountQuotaCycle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_email: Option<String>,
     #[serde(
@@ -211,6 +214,7 @@ pub enum ShareTokenPeriod {
     SevenDays,
     CalendarMonth,
     ThirtyDays,
+    AccountReset,
 }
 
 pub fn supported_share_token_periods() -> Vec<ShareTokenPeriod> {
@@ -334,6 +338,8 @@ pub struct ShareUserUsageEdit {
     pub anchor_at_ms: Option<i64>,
     #[serde(default)]
     pub source: ShareUsageRebaseSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_cycle: Option<super::quota_cycle::AccountQuotaCycle>,
 }
 
 /// Explicit Share-total consumed-token edit.
@@ -388,6 +394,12 @@ pub struct ShareUserGrant {
     /// with the Server the moment the formula changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_quota: Option<ShareUserQuotaView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_quota_cycle: Option<super::quota_cycle::AccountQuotaCycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_reset_capability: Option<super::quota_cycle_source::AccountResetCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_usage_baseline: Option<super::quota_cycle::AccountQuotaBaseline>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
@@ -431,6 +443,12 @@ pub struct ShareUserQuotaView {
     /// False when a rebase exists but belongs to a window that has since
     /// rolled over, so the client can explain why the offset disappeared.
     pub rebase_applies: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub usage_watermark: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -917,6 +935,10 @@ pub struct ShareSyncOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareRequestLogEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_attribution: Option<crate::domain::usage::quota_ledger::QuotaAttribution>,
     #[serde(default)]
     pub export_sequence: u64,
     pub request_id: String,
@@ -1200,8 +1222,29 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     let model_health =
         crate::domain::sharing::model_health::summary_for_share(share, providers, accounts, usage);
 
+    let uses_account_reset = share
+        .user_grants
+        .values()
+        .any(|grant| grant.policy.token_period == ShareTokenPeriod::AccountReset);
+    let mut user_grants = share.user_grants.clone();
+    if !uses_account_reset {
+        // v7 readers deny unknown nested fields. Do not leak new projections
+        // into ordinary Shares, even after the Server started collecting them.
+        for grant in user_grants.values_mut() {
+            grant.account_quota_cycle = None;
+            grant.account_reset_capability = None;
+            grant.account_usage_baseline = None;
+            if let Some(quota) = grant.usage_quota.as_mut() {
+                quota.usage_watermark = 0;
+            }
+        }
+    }
     ShareDescriptor {
-        contract_version: SHARE_CONTRACT_VERSION,
+        contract_version: if uses_account_reset {
+            ACCOUNT_RESET_CONTRACT_VERSION
+        } else {
+            SHARE_CONTRACT_VERSION
+        },
         share_id: share.id.clone(),
         capacity_pool_id: if share.capacity_pool_id.is_empty() {
             share.id.clone()
@@ -1244,7 +1287,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         config_revision: share.config_revision,
         descriptor_generation: share.descriptor_generation,
         descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
-        user_grants: share.user_grants.clone(),
+        user_grants,
         supported_user_token_periods: supported_share_token_periods(),
     }
 }
@@ -1278,6 +1321,8 @@ fn static_descriptor_projection(
         "configRevision",
         "descriptorGeneration",
         "descriptorFingerprint",
+        "contractVersion",
+        "supportedUserTokenPeriods",
     ] {
         object.remove(field);
     }
@@ -1304,6 +1349,9 @@ fn static_descriptor_projection(
             for field in [
                 "usage",
                 "usageQuota",
+                "accountQuotaCycle",
+                "accountResetCapability",
+                "accountUsageBaseline",
                 "createdAtMs",
                 "updatedAtMs",
                 "revokedAtMs",
@@ -1335,7 +1383,7 @@ fn static_descriptor_projection(
         "runtimeFingerprints".to_string(),
         serde_json::to_value(runtime_fingerprints)?,
     );
-    object.insert("fingerprintSchema".to_string(), Value::from(1));
+    object.insert("fingerprintSchema".to_string(), Value::from(2));
 
     Ok(projection)
 }

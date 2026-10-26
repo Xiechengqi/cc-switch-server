@@ -6,10 +6,38 @@ use crate::domain::providers::runtime::{
     authoritative_managed_account, managed_account_binding_with_generation,
     managed_account_provider_type,
 };
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const CONTROL_SIGNATURE_WINDOW_MS: i64 = 5 * 60 * 1000;
+
+pub(crate) async fn control_preview_account_reset(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/preview_account_reset", &headers, &body).await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        share_id: String,
+        expected_config_revision: u64,
+        #[serde(default)]
+        policies: BTreeMap<String, crate::domain::sharing::router_contract::ShareUserPolicy>,
+    }
+    let input: Input = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    state
+        .preview_share_account_reset(
+            &input.share_id,
+            input.expected_config_revision,
+            input.policies,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::account_quota_preview)
+}
 
 pub(crate) async fn control_prepare_client_subdomain_adoption(
     State(state): State<ServerState>,
@@ -178,8 +206,9 @@ pub(crate) async fn control_apply_share_settings(
             | crate::domain::sharing::shares::SharePatchError::ManagedGrantReadOnly(_) => {
                 return Err(ApiError::conflict_code(error.code(), error.to_string()));
             }
-            crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
-                return Err(ApiError::bad_request(message));
+            crate::domain::sharing::shares::SharePatchError::QuotaCycleConflict { .. }
+            | crate::domain::sharing::shares::SharePatchError::Invalid(_) => {
+                return Err(crate::api::map_share_patch_error(error));
             }
         },
     };

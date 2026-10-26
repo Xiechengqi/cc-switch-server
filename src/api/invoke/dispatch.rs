@@ -688,8 +688,18 @@ async fn web_invoke_dispatch(
                     .0;
             Ok(json!(response))
         }
+        "preview_share_account_reset" => {
+            let id = web_arg_share_id(&args)?;
+            let revision = web_optional_u64(&args, &["expectedConfigRevision"])
+                .ok_or_else(|| ApiError::bad_request("expectedConfigRevision is required"))?;
+            let policies = args.get("policies").map(|value| serde_json::from_value(value.clone()))
+                .transpose().map_err(ApiError::bad_request)?.unwrap_or_default();
+            state.preview_share_account_reset(&id, revision, policies).await
+                .map_err(ApiError::account_quota_preview)
+        }
         "get_share_detail" => {
             let id = web_arg_share_id(&args)?;
+            state.refresh_share_account_quota(&id).await.map_err(ApiError::internal)?;
             let share = state.shares.read().await.get(&id).cloned();
             let config = state.config_snapshot().await;
             share
@@ -2104,6 +2114,18 @@ async fn web_invoke_dispatch(
             })
             .await
         }
+        "get_codex_banked_reset_operation" => {
+            let id = web_optional_string_any(&args, &["operationId", "operation_id"])
+                .ok_or_else(|| ApiError::bad_request("operationId is required"))?;
+            let shares = state.shares.read().await;
+            let operation = shares.quota_cycle_ledger.operations.get(&id)
+                .ok_or_else(|| ApiError::not_found("reset operation not found"))?;
+            Ok(json!({"operationId":operation.operation_id,"requestId":operation.request_id,
+                "status":operation.status,"confirmedAtMs":operation.confirmed_at_ms,
+                "receipt":operation.result.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+                "recoveryRequired":shares.quota_cycle_ledger.redeem_recovery_required,
+                "readOnly":true}))
+        }
         "codex_banked_reset_consume" => {
             Box::pin(async {
             let provider_id = web_optional_string_any(&args, &["providerId", "provider_id"]);
@@ -2112,6 +2134,7 @@ async fn web_invoke_dispatch(
             let account_id = web_optional_string_any(&args, &["accountId", "account_id"]);
             let credit_id =
                 web_optional_string_any(&args, &["creditId", "credit_id"]).unwrap_or_default();
+            let operation_id = web_optional_string_any(&args, &["operationId", "operation_id"]);
             let target = resolve_codex_control_account(
                 state,
                 provider_id.as_deref(),
@@ -2144,8 +2167,23 @@ async fn web_invoke_dispatch(
                 let http = state.http_client().await;
                 let timeout_ms = state.oauth_quota_refresh_timeout_ms().await;
                 let timeout = std::time::Duration::from_millis(timeout_ms.max(1_000) as u64);
-                let redeem_request_id =
-                    crate::clients::oauth::codex_reset_credits::generate_redeem_request_id();
+                let operation_id = operation_id.unwrap_or_else(||
+                    crate::clients::oauth::codex_reset_credits::stable_auto_reset_redeem_request_id(
+                        "manual", &target.account.id, &target.workspace_id, &credit_id));
+                let prepared = state.prepare_codex_reset_credit(&target.account, &credit_id, &operation_id)
+                    .await.map_err(|error| ApiError::conflict(error.to_string()))?;
+                if !prepared.dispatch {
+                    let receipt = prepared.receipt.ok_or_else(|| ApiError::conflict(
+                        "RESET_CREDIT_NEEDS_RECONCILE: previous request outcome is unknown; no new credit was consumed"))?;
+                    return Ok(json!({ "code": receipt.code, "creditId": receipt.credit_id,
+                        "redeemRequestId": receipt.redeem_request_id, "windowsReset": receipt.windows_reset,
+                        "availableCount": receipt.available_count, "remainingCredits": receipt.remaining_credits,
+                        "sharedWeeklyConfirmed": receipt.shared_weekly_confirmed, "operationId": prepared.operation_id,
+                        "operationStatus": if receipt.shared_weekly_confirmed { "confirmed" } else if receipt.code.as_deref().is_some_and(|code|
+                            matches!(code, "alreadyRedeemed" | "nothingToReset" | "noCredit" | "already_redeemed" | "nothing_to_reset" | "no_credit")) { "rejected" } else { "unknown" },
+                        "replayed": true }));
+                }
+                let redeem_request_id = prepared.request_id;
                 let mut result = crate::clients::oauth::codex_reset_credits::consume_reset_credit_with_request_id(
                     &http,
                     target.access_token()?,
@@ -2186,6 +2224,8 @@ async fn web_invoke_dispatch(
                     )
                     .await;
                 }
+                state.finish_codex_reset_credit(&prepared.operation_id, result.as_ref().ok())
+                    .await.map_err(ApiError::internal)?;
                 let result = result.map_err(|error| ApiError::bad_gateway(error.message()))?;
                 (result, target.account.auth_identity_generation)
             };
@@ -2206,6 +2246,9 @@ async fn web_invoke_dispatch(
                 "windowsReset": result.windows_reset,
                 "availableCount": result.available_count,
                 "remainingCredits": result.remaining_credits,
+                "sharedWeeklyConfirmed": result.shared_weekly_confirmed,
+                "operationStatus": if result.shared_weekly_confirmed { "confirmed" } else if result.code.as_deref().is_some_and(|code|
+                    matches!(code, "alreadyRedeemed" | "nothingToReset" | "noCredit" | "already_redeemed" | "nothing_to_reset" | "no_credit")) { "rejected" } else { "unknown" },
             }))
             })
             .await

@@ -120,12 +120,18 @@ export const CodexBankedResetPanel: React.FC<CodexBankedResetPanelProps> = ({
     }
   }, [availableCredits, selectedCreditId]);
 
+  const consumeOperations = React.useRef(new Map<string, string>());
   const consumeMutation = useMutation({
-    mutationFn: (creditId: string) =>
-      codexBankedResetApi.consumeCodexBankedReset(target, creditId),
+    mutationFn: (creditId: string) => {
+      const key = JSON.stringify([accountId, workspaceId, creditId]);
+      const operationId = consumeOperations.current.get(key) ?? crypto.randomUUID();
+      consumeOperations.current.set(key, operationId);
+      return codexBankedResetApi.consumeCodexBankedReset(target, creditId, operationId);
+    },
     onSuccess: async (result) => {
       const success = result.code === "reset" || !result.code;
-      toast[success ? "success" : "error"](consumeMessage(result.code));
+      if (result.operationStatus === "unknown") toast.warning(t("codexBankedReset.needsReconcile"));
+      else toast[success ? "success" : "error"](consumeMessage(result.code));
       await queryClient.invalidateQueries({ queryKey });
       if (success) {
         await subscriptionApi.refreshOauthQuota(

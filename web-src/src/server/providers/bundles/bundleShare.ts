@@ -256,6 +256,7 @@ export async function saveBundleShare(
     );
   }
   return shareApi.saveProviderBundleShare({
+    expectedAccountCycle: Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle,
     bundleId,
     shareId: draft.baseline?.shareId,
     expectedConfigRevision: draft.baseline?.configRevision,

@@ -167,8 +167,11 @@ use crate::logging::{
 };
 use crate::proxy::cursor::session::CursorSessionManager;
 
+mod account_reset;
 mod background;
 mod in_flight;
+
+pub(crate) use account_reset::QuotaPreviewConflict;
 
 pub use background::{
     report_installation_upgrade_status, spawn_account_quota_refresh, spawn_audit_log_uploader,
@@ -999,6 +1002,7 @@ pub struct ServerStateInner {
     shares_persistence: StorePersistenceCoordinator,
     pub(crate) shares: RwLock<ShareStore>,
     share_quota_mutations: AsyncMutex<()>,
+    quota_usage_degraded: std::sync::atomic::AtomicBool,
     share_lifecycle: AsyncMutex<()>,
     ui_settings_persistence: StorePersistenceCoordinator,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
@@ -1077,6 +1081,7 @@ pub struct ServerStateInner {
     provider_health_probe_locks: Mutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
     router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
     router_request_log_sync_wakeup: Notify,
+    router_share_sync_wakeup: Notify,
     periodic_backup_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
@@ -1108,6 +1113,7 @@ pub struct ServerStateInner {
     /// Startup-discovered public IPv4 reported to router via heartbeat.
     reported_public_ip: RwLock<Option<String>>,
     installation_heartbeat_wakeup: Notify,
+    router_quota_capability: RwLock<Option<(String, String, std::time::Instant, bool)>>,
 }
 
 #[derive(Debug)]
@@ -3538,6 +3544,10 @@ fn validate_server_backup_restore_stage(
     manifest: &crate::infra::backup::BackupManifest,
 ) -> anyhow::Result<()> {
     let includes = |name: &str| manifest.files.iter().any(|file| file.file_name == name);
+    anyhow::ensure!(
+        !includes("account-reset-restore-fence.json"),
+        "backup must not replace the independent account quota restore fence"
+    );
     validate_client_subdomain_adoption_restore_stage(config_dir, stage_dir, &includes)?;
     let validates_subscription_references = [
         "accounts.json",
@@ -5858,8 +5868,11 @@ impl ServerStateInner {
         expected_policy: Option<ui_settings::BackupPolicy>,
     ) -> anyhow::Result<Option<crate::infra::backup::BackupManifest>> {
         let _backup_operation = self.backup_operations.lock().await;
-        let _config_commit = self.config_persistence.gate.lock().await;
+        let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        let _quota = self.share_quota_mutations.lock().await;
+        let _config_commit = self.config_persistence.gate.lock().await;
         let _accounts_commit = self.accounts_persistence.gate.lock().await;
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let _shares_commit = self.shares_persistence.gate.lock().await;
@@ -6143,7 +6156,7 @@ impl ServerStateInner {
             return Ok(false);
         }
 
-        let redeem_request_id = stable_auto_reset_redeem_request_id(
+        let operation_id = stable_auto_reset_redeem_request_id(
             &current.share_id,
             &current.runtime_fingerprint,
             &current.workspace_id,
@@ -6157,6 +6170,27 @@ impl ServerStateInner {
             .await
             .context("bound Codex OAuth account disappeared before reset consume")?;
         ensure_codex_auto_reset_account_matches(&current, &account)?;
+        let prepared = self
+            .prepare_codex_reset_credit(&account, &current.candidate.credit_id, &operation_id)
+            .await?;
+        if !prepared.dispatch {
+            // Never repeat an uncertain consume. A confirmed receipt can be
+            // refreshed read-only without spending another credit.
+            if prepared
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.shared_weekly_confirmed)
+            {
+                self.refresh_codex_quota_for_account(
+                    &current.account_id,
+                    current.auth_identity_generation,
+                    true,
+                )
+                .await?;
+            }
+            return Ok(false);
+        }
+        let redeem_request_id = prepared.request_id;
         let mut result =
             consume_auto_reset_credit(&http, &account, &current, &redeem_request_id, timeout).await;
         if matches!(result, Err(BankedResetActionError::UpstreamHttp(401, _))) {
@@ -6182,6 +6216,8 @@ impl ServerStateInner {
                 consume_auto_reset_credit(&http, &account, &current, &redeem_request_id, timeout)
                     .await;
         }
+        self.finish_codex_reset_credit(&prepared.operation_id, result.as_ref().ok())
+            .await?;
         let result = result.map_err(|error| anyhow::anyhow!(error.message()))?;
         self.refresh_codex_quota_for_account(
             &current.account_id,
@@ -6193,8 +6229,6 @@ impl ServerStateInner {
             share_id = %current.share_id,
             provider_id = %current.provider_id,
             account_id = %current.account_id,
-            workspace_id = %current.workspace_id,
-            credit_id = %current.candidate.credit_id,
             redeem_request_id = %result.redeem_request_id,
             windows_reset = ?result.windows_reset,
             "automatically consumed a Share-scoped Codex banked reset credit"
@@ -6764,6 +6798,7 @@ impl ServerStateInner {
                 "legacy universal provider data requires an explicit migration; startup left it unchanged"
             );
         }
+        crate::repository::server_sqlite::upgrade_schema(&config_dir)?;
         let existing_sqlite_marker = crate::repository::server_sqlite::read_marker(&config_dir)?;
         let sqlite_committed = existing_sqlite_marker.as_ref().is_some_and(|marker| {
             marker.authority == crate::repository::server_sqlite::AuthorityState::Committed
@@ -6825,9 +6860,15 @@ impl ServerStateInner {
                 legacy_share_load.store
             }
         };
+        let quota_restored =
+            account_reset::apply_restore_quota_fence(&config_dir, &mut shares, &mut usage)?;
+        if quota_restored {
+            usage.save_snapshot(&config_dir)?;
+        }
         let integrity_outcomes =
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
-        let mut shares_changed = integrity_outcomes.iter().any(|outcome| outcome.changed());
+        let mut shares_changed =
+            quota_restored || integrity_outcomes.iter().any(|outcome| outcome.changed());
         let repaired_shares = integrity_outcomes
             .iter()
             .filter(|outcome| {
@@ -7013,6 +7054,7 @@ impl ServerStateInner {
             shares_persistence: StorePersistenceCoordinator::default(),
             shares: RwLock::new(shares),
             share_quota_mutations: AsyncMutex::new(()),
+            quota_usage_degraded: std::sync::atomic::AtomicBool::new(false),
             share_lifecycle: AsyncMutex::new(()),
             ui_settings_persistence: StorePersistenceCoordinator::default(),
             ui_settings: RwLock::new(ui_settings),
@@ -7098,6 +7140,7 @@ impl ServerStateInner {
             provider_health_probe_locks: Mutex::new(BTreeMap::new()),
             router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
             router_request_log_sync_wakeup: Notify::new(),
+            router_share_sync_wakeup: Notify::new(),
             periodic_backup_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
@@ -7127,6 +7170,7 @@ impl ServerStateInner {
             terminal: crate::api::terminal::OpsTerminalManager::new(),
             reported_public_ip: RwLock::new(None),
             installation_heartbeat_wakeup: Notify::new(),
+            router_quota_capability: RwLock::new(None),
         }))
     }
 
@@ -8108,16 +8152,21 @@ impl ServerStateInner {
         let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        let _quota = self.share_quota_mutations.lock().await;
         let _config_commit = self.config_persistence.gate.lock().await;
         let _accounts_commit = self.accounts_persistence.gate.lock().await;
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let _shares_commit = self.shares_persistence.gate.lock().await;
         let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
         let _grok_media_task_commit = self.grok_media_task_persistence.lock().await;
-        self.reload_persistent_stores_under_provider_commit().await
+        self.reload_persistent_stores_under_provider_commit(false)
+            .await
     }
 
-    async fn reload_persistent_stores_under_provider_commit(&self) -> anyhow::Result<()> {
+    async fn reload_persistent_stores_under_provider_commit(
+        &self,
+        restored_backup: bool,
+    ) -> anyhow::Result<()> {
         if apply_codex_workspace_rebind_transaction(&self.config_dir)
             .context("recover pending Codex workspace rebind transaction before reload")?
         {
@@ -8181,6 +8230,16 @@ impl ServerStateInner {
                 &mut shares,
             )?;
         let mut shares_changed = rebased_client_share_subdomains > 0;
+        if account_reset::apply_restore_quota_fence(&self.config_dir, &mut shares, &mut usage)?
+            || restored_backup
+        {
+            // A backup cannot prove completeness after its captured instant.
+            // Keep all exact history, but require a new reliable boundary (or
+            // explicit journal reconciliation), not a fabricated zero total.
+            persist_state_snapshot(&self.config_dir, usage.clone()).await?;
+            *self.router_quota_capability.write().await = None;
+            shares_changed = true;
+        }
         if let Some(owner_email) = config.owner.email.as_deref() {
             shares_changed |= !shares
                 .bind_all_to_client_owner(owner_email)
@@ -8256,6 +8315,13 @@ impl ServerStateInner {
         let _references = self.reference_mutations.lock().await;
         let _provider_commit = self.provider_commits.lock().await;
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        let _quota = self.share_quota_mutations.lock().await;
+        let _config_commit = self.config_persistence.gate.lock().await;
+        let _accounts_commit = self.accounts_persistence.gate.lock().await;
+        let _usage_commit = self.usage_persistence.gate.lock().await;
+        let _shares_commit = self.shares_persistence.gate.lock().await;
+        let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
+        let _media_commit = self.grok_media_task_persistence.lock().await;
         if apply_codex_workspace_rebind_transaction(&self.config_dir)
             .context("recover pending Codex workspace rebind transaction before restore")?
         {
@@ -8264,18 +8330,36 @@ impl ServerStateInner {
             );
         }
         let config_dir = self.config_dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let restore_result = tokio::task::spawn_blocking(move || {
             crate::infra::backup::restore_backup_with_validator(
                 &config_dir,
                 &backup_id,
                 |stage_dir, manifest| {
-                    validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)
+                    validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)?;
+                    account_reset::write_restore_quota_fence(&config_dir)
                 },
             )
         })
         .await
-        .context("backup restore task panicked")??;
-        self.reload_persistent_stores_under_provider_commit()
+        .context("backup restore task panicked")?;
+        let result = match restore_result {
+            Ok(result) => result,
+            Err(error) => {
+                // Some files may already have been replaced. Never continue
+                // admitting finite account quotas against the old in-memory
+                // snapshot after an interrupted restore.
+                self.mark_quota_usage_degraded();
+                *self.router_quota_capability.write().await = None;
+                if let Err(reload_error) = self
+                    .reload_persistent_stores_under_provider_commit(true)
+                    .await
+                {
+                    tracing::error!(%reload_error, "failed to reload interrupted backup restore; quota remains restricted");
+                }
+                return Err(error);
+            }
+        };
+        self.reload_persistent_stores_under_provider_commit(true)
             .await?;
         Ok(result)
     }
@@ -18505,18 +18589,330 @@ impl ServerStateInner {
     ) -> anyhow::Result<Result<R, E>> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Shares commit")?;
+        self.try_mutate_shares_in_workspace_transaction(mutate)
+            .await
+    }
+
+    // The caller owns codex_workspace_rebind_transactions. Never acquire that
+    // gate while holding a quota/usage gate: reload/rebind take it first.
+    async fn try_mutate_shares_in_workspace_transaction<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
         let _commit = self.shares_persistence.gate.lock().await;
         let mut candidate = self.shares.read().await.clone();
+        let previous_quota_revision = candidate.quota_cycle_ledger.revision;
+        let previous_account_policies: BTreeMap<_, _> = candidate
+            .shares
+            .iter()
+            .flat_map(|share| {
+                share
+                    .user_grants
+                    .iter()
+                    .filter(|(_, grant)| grant.active)
+                    .map(|(email, grant)| ((share.id.clone(), email.clone()), grant.policy.clone()))
+            })
+            .collect();
         let result = match mutate(&mut candidate) {
             Ok(result) => result,
             Err(error) => return Ok(Err(error)),
         };
+        let writes_account_reset = candidate.shares.iter().any(|share| {
+            share.user_grants.iter().any(|(email, grant)| {
+                grant.active
+                    && grant.policy.token_period
+                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+                    && previous_account_policies.get(&(share.id.clone(), email.clone()))
+                        != Some(&grant.policy)
+            })
+        });
+        if writes_account_reset {
+            anyhow::ensure!(
+                self.router_supports_account_reset().await,
+                "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED"
+            );
+        }
         #[cfg(test)]
         self.shares_persistence.apply_test_persist_delay().await;
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        let quota_changed = previous_quota_revision != candidate.quota_cycle_ledger.revision;
         *self.shares.write().await = candidate;
         self.shares_persistence.mark_published();
+        if quota_changed {
+            self.router_share_sync_wakeup.notify_one();
+        }
         Ok(Ok(result))
+    }
+
+    pub(crate) fn mark_quota_usage_degraded(&self) {
+        self.quota_usage_degraded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn record_router_quota_capability(
+        &self,
+        config: &ServerConfig,
+        capability: client::RouterShareCapabilities,
+    ) {
+        let value = config
+            .registered_router_identity()
+            .zip(config.router_api_base())
+            .map(|(identity, base)| {
+                (
+                    base.to_string(),
+                    identity.installation_id.clone(),
+                    std::time::Instant::now(),
+                    capability.account_reset(),
+                )
+            });
+        *self.router_quota_capability.write().await = value;
+    }
+
+    pub async fn router_supports_account_reset(&self) -> bool {
+        let config = self.config_snapshot().await;
+        let capability = self.router_quota_capability.read().await;
+        capability
+            .as_ref()
+            .is_some_and(|(base, installation, observed, supported)| {
+                *supported
+                    && observed.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *installation)
+            })
+    }
+
+    pub async fn refresh_share_account_quota(
+        self: &Arc<Self>,
+        share_id: &str,
+    ) -> anyhow::Result<()> {
+        use crate::domain::sharing::quota_cycle_source::resolve_share_source_with_coding;
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Quota refresh")?;
+        let _quota = self.share_quota_mutations.lock().await;
+        let providers = self.providers.read().await;
+        let accounts = self.accounts.read().await;
+        let _usage_commit = self.usage_persistence.gate.lock().await;
+        let share = self.shares.read().await.get(share_id).cloned();
+        let Some(share) = share else {
+            return Ok(());
+        };
+        let resolved = match resolve_share_source_with_coding(
+            &share,
+            &providers,
+            &accounts,
+            |stored| {
+                let target = coding_plan_quota_target_from_store(
+                    &providers,
+                    &ProviderKey {
+                        app: stored.app,
+                        provider_id: stored.provider.id.clone(),
+                    },
+                )
+                .ok()?;
+                self.fresh_coding_plan_quota_cache(&target, now_ms_i64())?
+                    .account_reset_window
+            },
+        ) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                let previously_bound = self
+                    .shares
+                    .read()
+                    .await
+                    .quota_cycle_sources
+                    .contains_key(share_id);
+                let invalidate = |shares: &mut ShareStore| {
+                    let removed = shares.quota_cycle_sources.remove(share_id).is_some();
+                    if let Some(share) = shares.shares.iter_mut().find(|share| share.id == share_id)
+                    {
+                        if removed {
+                            share.config_revision = share.config_revision.saturating_add(1);
+                        }
+                        for grant in share.user_grants.values_mut() {
+                            grant.account_quota_cycle = None;
+                            grant.account_reset_capability = Some(crate::domain::sharing::quota_cycle_source::AccountResetCapability::unavailable(reason));
+                            if grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset { grant.usage_quota = None; }
+                        }
+                    }
+                };
+                if previously_bound {
+                    self.try_mutate_shares_in_workspace_transaction(|shares| {
+                        invalidate(shares);
+                        Ok::<_, std::convert::Infallible>(())
+                    })
+                    .await?
+                    .unwrap_or_else(|never| match never {});
+                } else {
+                    self.mutate_shares(invalidate).await;
+                }
+                return Ok(());
+            }
+        };
+        let now = crate::infra::time::now_ms() as i64;
+        let (mut ledger, previous_source) = {
+            let shares = self.shares.read().await;
+            (
+                shares.quota_cycle_ledger.clone(),
+                shares.quota_cycle_sources.get(share_id).cloned(),
+            )
+        };
+        let before = ledger.revision;
+        let previous_fence = ledger
+            .sources
+            .get(&resolved.identity)
+            .map(|source| source.fence.clone());
+        let source_ref = ledger
+            .register_source(
+                resolved.identity.clone(),
+                resolved.provider_type.as_str().into(),
+                resolved.bucket_id.clone(),
+                resolved.fence.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        if let Some(observation) = &resolved.observation {
+            ledger
+                .observe(&source_ref, &resolved.fence, observation)
+                .map_err(anyhow::Error::msg)?;
+        }
+        ledger
+            .advance_source_due(&source_ref, now)
+            .map_err(anyhow::Error::msg)?;
+        if !self
+            .usage
+            .read()
+            .await
+            .quota_ledger
+            .coverage_from_ms
+            .contains_key(&source_ref)
+        {
+            let mut usage = self.usage.read().await.clone();
+            usage.quota_ledger.begin_collection(&source_ref, now);
+            persist_state_snapshot(&self.config_dir, usage.clone()).await?;
+            *self.usage.write().await = usage;
+            self.usage_persistence.mark_published();
+        }
+        let usage = self.usage.read().await;
+        let durable_change = ledger.revision != before
+            || previous_source.as_deref() != Some(&source_ref)
+            || previous_fence.as_ref() != Some(&resolved.fence);
+        if durable_change {
+            self.try_mutate_shares_in_workspace_transaction(|shares| {
+                shares.quota_cycle_ledger = ledger;
+                shares
+                    .quota_cycle_sources
+                    .insert(share_id.to_string(), source_ref.clone());
+                if previous_source.is_some() && previous_source.as_deref() != Some(&source_ref) {
+                    if let Some(share) = shares.shares.iter_mut().find(|share| share.id == share_id)
+                    {
+                        share.config_revision = share.config_revision.saturating_add(1);
+                    }
+                }
+                shares.project_account_reset(share_id, &source_ref, &usage, now)
+            })
+            .await?
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        } else {
+            self.mutate_shares(|shares| {
+                shares.project_account_reset(share_id, &source_ref, &usage, now)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn share_quota_attribution(
+        &self,
+        share_id: &str,
+        started_at_ms: u128,
+    ) -> Option<crate::domain::usage::quota_ledger::QuotaAttribution> {
+        let shares = self.shares.read().await;
+        let source = shares
+            .quota_cycle_ledger
+            .source(shares.quota_cycle_sources.get(share_id)?)?;
+        Some(crate::domain::usage::quota_ledger::QuotaAttribution {
+            source_ref: source.source_ref.clone(),
+            source_epoch: source.source_epoch,
+            bucket_id: source.bucket_id.clone(),
+            started_at_ms: i64::try_from(started_at_ms).ok()?,
+        })
+    }
+
+    /// Persist the immutable metering identity before any upstream work. A
+    /// crash leaves a pending record which recovery marks as unresolved.
+    pub(crate) async fn begin_share_quota_usage(
+        &self,
+        app: AppKind,
+        context: &mut UsageLogContext,
+    ) -> anyhow::Result<()> {
+        let (Some(share_id), Some(_)) =
+            (context.share_id.as_deref(), context.user_email.as_deref())
+        else {
+            return Ok(());
+        };
+        if context.is_health_check {
+            return Ok(());
+        }
+        let started = *context
+            .started_at_ms
+            .get_or_insert_with(crate::infra::time::now_ms);
+        let Some(attribution) = self.share_quota_attribution(share_id, started).await else {
+            return Ok(());
+        };
+        context.quota_attribution = Some(attribution);
+        let request_id = context
+            .request_id
+            .get_or_insert_with(|| {
+                format!("quota_{}", crate::domain::sharing::quota_cycle::opaque_id())
+            })
+            .clone();
+        let _commit = self.usage_persistence.gate.lock().await;
+        let append = {
+            let usage = self.usage.read().await;
+            if let Some(existing) = usage.logs.iter().find(|log| log.request_id == request_id) {
+                anyhow::ensure!(
+                    existing.share_id == context.share_id
+                        && existing.user_email.as_deref().is_some_and(|email| context
+                            .user_email
+                            .as_deref()
+                            .is_some_and(|candidate| email.eq_ignore_ascii_case(candidate))),
+                    "quota_request_identity_changed"
+                );
+                context
+                    .quota_attribution
+                    .clone_from(&existing.quota_attribution);
+                context.started_at_ms = Some(existing.started_at_ms);
+                return Ok(());
+            }
+            let provider_type = match app {
+                AppKind::Claude => ProviderType::Claude,
+                AppKind::Codex => ProviderType::Codex,
+                AppKind::Gemini => ProviderType::Gemini,
+            };
+            let mut pending = UsageLog::new(
+                app,
+                "pending-route".into(),
+                "Pending route".into(),
+                provider_type,
+                0,
+                0,
+                UsageModelMetadata::default(),
+                TokenUsage::default(),
+            );
+            let mut pending_context = context.clone();
+            pending_context.usage_state = Some(UsageState::Pending);
+            pending_context.outcome = Some(UsageOutcome::Pending);
+            pending_context.failure_kind = Some("quota_admission".into());
+            pending.apply_context(pending_context);
+            usage.prepare_append(pending)?
+        };
+        if let Err(error) = self.commit_usage_append(append).await {
+            self.mark_quota_usage_degraded();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn apply_share_settings_patch_immediate(
@@ -18540,6 +18936,28 @@ impl ServerStateInner {
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
+        use crate::domain::sharing::router_contract::ShareTokenPeriod;
+        let requests_account_reset = patch.user_grants.as_ref().is_some_and(|grants| {
+            grants
+                .values()
+                .any(|grant| grant.policy.token_period == ShareTokenPeriod::AccountReset)
+        }) || patch.user_grant_edits.as_ref().is_some_and(|edits| {
+            edits.values().any(|edit| {
+                edit.policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.token_period == ShareTokenPeriod::AccountReset)
+            })
+        }) || patch.user_usage_edits.as_ref().is_some_and(|edits| {
+            edits
+                .values()
+                .any(|edit| edit.expected_account_cycle.is_some())
+        });
+        if requests_account_reset && !self.router_supports_account_reset().await {
+            return Ok(Err(SharePatchError::Invalid(
+                "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED".into(),
+            )));
+        }
+        self.refresh_share_account_quota(share_id).await?;
         // Check before any Provider support side effects. The quota transaction
         // repeats this check under its mutation lock.
         if let Some(context) = &patch.edit_context {
@@ -18663,11 +19081,16 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
+        let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Quota commit")?;
         let _quota_mutation = self.share_quota_mutations.lock().await;
-        let usage = self.usage.read().await.clone();
+        let _usage_commit = self.usage_persistence.gate.lock().await;
+        let usage = self.usage.read().await;
         let applied_at_ms = crate::infra::time::now_ms() as i64;
-        self.try_mutate_shares_immediate(|shares| mutate(shares, &usage, applied_at_ms))
-            .await
+        self.try_mutate_shares_in_workspace_transaction(|shares| {
+            mutate(shares, &usage, applied_at_ms)
+        })
+        .await
     }
 
     pub async fn record_share_invocation_result(
@@ -18678,7 +19101,7 @@ impl ServerStateInner {
         recorded_at_ms: i64,
     ) {
         let _quota_mutation = self.share_quota_mutations.lock().await;
-        let usage = self.usage.read().await.clone();
+        let usage = self.usage.read().await;
         self.mutate_shares_debounced(|shares| {
             shares.record_user_invocation_result(share_id, user_email, tokens, recorded_at_ms);
             if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
@@ -18687,6 +19110,7 @@ impl ServerStateInner {
             }
         })
         .await;
+        self.router_share_sync_wakeup.notify_one();
     }
 
     pub async fn record_share_supplemental_usage(
@@ -18700,7 +19124,7 @@ impl ServerStateInner {
             return;
         }
         let _quota_mutation = self.share_quota_mutations.lock().await;
-        let usage = self.usage.read().await.clone();
+        let usage = self.usage.read().await;
         self.mutate_shares_debounced(|shares| {
             shares.record_user_supplemental_usage(share_id, user_email, tokens, recorded_at_ms);
             if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
@@ -18709,6 +19133,7 @@ impl ServerStateInner {
             }
         })
         .await;
+        self.router_share_sync_wakeup.notify_one();
     }
 
     pub async fn mutate_shares_debounced<R>(
@@ -18795,6 +19220,73 @@ impl ServerStateInner {
         now_ms: i64,
     ) -> Result<(ShareInvocation, ShareInFlightGuard), ShareInvocationRejection> {
         let _lifecycle = self.share_lifecycle.lock().await;
+        let uses_account_reset = self
+            .shares
+            .read()
+            .await
+            .get(share_id)
+            .and_then(|share| {
+                user_email.and_then(|email| share.user_grants.get(&email.to_ascii_lowercase()))
+            })
+            .is_some_and(|grant| {
+                grant.active
+                    && grant.policy.token_period
+                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+            });
+        if uses_account_reset && !self.router_supports_account_reset().await {
+            return Err(ShareInvocationRejection {
+                reason: ShareRejectReason::QuotaUnavailable,
+                message: "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED".into(),
+                status_changed: false,
+                concurrency: None,
+            });
+        }
+        if let Err(error) = self.refresh_share_account_quota(share_id).await {
+            tracing::warn!(%error, "account quota projection refresh failed");
+            self.mark_quota_usage_degraded();
+        }
+        if self
+            .quota_usage_degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let shares = self.shares.read().await;
+            if shares
+                .get(share_id)
+                .and_then(|share| {
+                    user_email.and_then(|email| share.user_grants.get(&email.to_ascii_lowercase()))
+                })
+                .is_some_and(|grant| {
+                    grant.policy.token_period
+                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+                        && grant.policy.token_limit.is_some()
+                })
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "QUOTA_LEDGER_UNAVAILABLE: quota accounting needs recovery".into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
+        }
+        if uses_account_reset && self.usage.read().await.quota_ledger.capacity_limited() {
+            let shares = self.shares.read().await;
+            if shares
+                .get(share_id)
+                .and_then(|share| {
+                    user_email.and_then(|email| share.user_grants.get(&email.to_ascii_lowercase()))
+                })
+                .is_some_and(|grant| grant.policy.token_limit.is_some())
+            {
+                tracing::warn!("exact quota ledger capacity limit reached; preserve history and restrict new finite admissions");
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "QUOTA_LEDGER_CAPACITY_LIMIT: exact history must be retained".into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
+        }
         let result = self
             .mutate_shares(|shares| {
                 shares.validate_for_invocation(share_id, app, user_email, now_ms)
@@ -20096,6 +20588,17 @@ pub(crate) async fn authoritative_share_descriptor(
         );
         let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
         let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+        let account_reset_supported = state.router_supports_account_reset().await;
+        anyhow::ensure!(
+            account_reset_supported
+                || !share
+                    .user_grants
+                    .values()
+                    .any(|grant| grant.policy.token_period
+                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset),
+            "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED"
+        );
+        apply_account_reset_descriptor_projection(&mut descriptor, &share, account_reset_supported);
         state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
         let prepared = state
@@ -20119,6 +20622,46 @@ pub(crate) async fn authoritative_share_descriptor(
         return Ok(descriptor);
     }
     anyhow::bail!("Share changed repeatedly while building its authoritative descriptor")
+}
+
+fn apply_account_reset_descriptor_projection(
+    descriptor: &mut ShareDescriptor,
+    share: &Share,
+    supported: bool,
+) {
+    if !supported {
+        return;
+    }
+    descriptor.contract_version =
+        crate::domain::sharing::router_contract::ACCOUNT_RESET_CONTRACT_VERSION;
+    for (email, grant) in &mut descriptor.user_grants {
+        if let Some(current) = share.user_grants.get(email) {
+            grant
+                .account_quota_cycle
+                .clone_from(&current.account_quota_cycle);
+            grant
+                .account_reset_capability
+                .clone_from(&current.account_reset_capability);
+            grant
+                .account_usage_baseline
+                .clone_from(&current.account_usage_baseline);
+        }
+    }
+    use crate::domain::sharing::router_contract::ShareTokenPeriod;
+    if !descriptor
+        .supported_user_token_periods
+        .contains(&ShareTokenPeriod::AccountReset)
+        && descriptor.user_grants.values().any(|grant| {
+            grant
+                .account_reset_capability
+                .as_ref()
+                .is_some_and(|capability| capability.sync_status == "ready")
+        })
+    {
+        descriptor
+            .supported_user_token_periods
+            .push(ShareTokenPeriod::AccountReset);
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -21027,6 +21570,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let accounts = state.accounts.read().await.clone();
         let usage = state.usage.read().await.clone();
         let config = state.config_snapshot().await;
+        let account_reset_supported = state.router_supports_account_reset().await;
         let shares = state
             .shares
             .read()
@@ -21047,6 +21591,14 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                 );
                 let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
                 let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+                // v8 read-only capabilities also describe ordinary users, so
+                // a ready source can offer an explicit migration. These
+                // dynamic fields do not enter the static fingerprint.
+                apply_account_reset_descriptor_projection(
+                    &mut descriptor,
+                    share,
+                    account_reset_supported,
+                );
                 state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
                 Ok((share.id.clone(), descriptor, fingerprint))
             })
@@ -21081,7 +21633,12 @@ fn build_router_share_upsert_ops_with_policy<'a>(
             .into_iter()
             .filter_map(|(share_id, mut descriptor, _)| {
                 let share = projection_state.get(&share_id)?;
-                if !force
+                let account_reset = descriptor.user_grants.values().any(|grant|
+                    grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset);
+                if account_reset && !account_reset_supported { return None; }
+                let has_quota_capability = account_reset_supported && descriptor.user_grants.values().any(|grant|
+                    grant.account_reset_capability.is_some());
+                if !force && !account_reset && !has_quota_capability
                     && !projection_state.descriptor_projection_pending(share)
                     && share.router_last_sync_error.is_none()
                 {
@@ -21457,6 +22014,8 @@ pub(crate) async fn share_request_log_entry(
         .or_else(|| log.actual_model.clone())
         .unwrap_or_default();
     Some(ShareRequestLogEntry {
+        started_at_ms: i64::try_from(log.started_at_ms).ok(),
+        quota_attribution: log.quota_attribution.clone(),
         export_sequence: log.router_export_sequence,
         request_id: log.request_id.clone(),
         request_kind: log.request_kind.as_str().to_string(),
@@ -31123,6 +31682,141 @@ mod tests {
         );
         store.save(config_dir).unwrap();
         fs::read(providers_path(config_dir)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn quota_redeem_unknown_confirmed_and_duplicate_receipts_are_durable() {
+        use crate::clients::oauth::codex_reset_credits::ConsumeResetCreditResult;
+        use crate::domain::sharing::quota_cycle::*;
+        let state = test_state();
+        let source = state
+            .mutate_shares_immediate(|shares| {
+                let ledger = &mut shares.quota_cycle_ledger;
+                let fence = QuotaSourceFence::default();
+                let source = ledger
+                    .register_source(
+                        "identity".into(),
+                        "codex_oauth".into(),
+                        "weekly".into(),
+                        fence.clone(),
+                    )
+                    .unwrap();
+                ledger
+                    .apply_reset(
+                        &source,
+                        &fence,
+                        "initial",
+                        1_000,
+                        2_000,
+                        QuotaTimeBasis::UpstreamWindow,
+                    )
+                    .unwrap();
+                ledger
+                    .begin_redeem(ResetCreditOperation {
+                        operation_id: "operation".into(),
+                        request_id: "stable-request".into(),
+                        source_ref: source.clone(),
+                        fence,
+                        status: ResetCreditStatus::Dispatched,
+                        created_at_ms: 2_000,
+                        confirmed_at_ms: None,
+                        result: None,
+                        credit_fingerprint: "credit".into(),
+                    })
+                    .unwrap();
+                source
+            })
+            .await
+            .unwrap();
+        state
+            .finish_codex_reset_credit("operation", None)
+            .await
+            .unwrap();
+        let stored = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            stored.quota_cycle_ledger.operations["operation"].status,
+            ResetCreditStatus::Unknown
+        );
+        assert_eq!(
+            stored
+                .quota_cycle_ledger
+                .source(&source)
+                .unwrap()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .cycle_sequence,
+            1
+        );
+        let receipt = ConsumeResetCreditResult {
+            code: None,
+            credit_id: "credit".into(),
+            redeem_request_id: "stable-request".into(),
+            windows_reset: Some(2),
+            available_count: Some(0),
+            remaining_credits: vec![],
+            shared_weekly_confirmed: false,
+        };
+        state
+            .finish_codex_reset_credit("operation", Some(&receipt))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.shares.read().await.quota_cycle_ledger.operations["operation"].status,
+            ResetCreditStatus::Unknown
+        );
+        let confirmed = ConsumeResetCreditResult {
+            shared_weekly_confirmed: true,
+            ..receipt
+        };
+        state
+            .finish_codex_reset_credit("operation", Some(&confirmed))
+            .await
+            .unwrap();
+        let before = ShareStore::load_or_default(&state.config_dir).unwrap();
+        state
+            .finish_codex_reset_credit("operation", Some(&confirmed))
+            .await
+            .unwrap();
+        state
+            .finish_codex_reset_credit("operation", None)
+            .await
+            .unwrap();
+        let after = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            after.quota_cycle_ledger.operations["operation"].status,
+            ResetCreditStatus::Confirmed
+        );
+        assert_eq!(
+            before.quota_cycle_ledger.revision,
+            after.quota_cycle_ledger.revision
+        );
+        assert_eq!(
+            after
+                .quota_cycle_ledger
+                .source(&source)
+                .unwrap()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .cycle_sequence,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_backup_and_reload_share_one_gate_order() {
+        let state = test_state();
+        let (backup, reload) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                state.create_consistent_backup(Some("quota-lock-test".into())),
+                state.reload_persistent_stores()
+            )
+        })
+        .await
+        .expect("backup/reload must not deadlock");
+        backup.unwrap();
+        reload.unwrap();
     }
 
     fn test_state() -> ServerState {

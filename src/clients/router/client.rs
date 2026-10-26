@@ -959,13 +959,32 @@ async fn send_register_installation_request_with_timeout(
         .map_err(|error| RegisterInstallationAttemptError::InvalidResponse(error.to_string()))
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterShareCapabilities {
+    #[serde(default)]
+    pub share_contract_version: u16,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl RouterShareCapabilities {
+    pub fn account_reset(&self) -> bool {
+        self.share_contract_version >= 8
+            && self
+                .capabilities
+                .iter()
+                .any(|value| value == "accountResetV1")
+    }
+}
+
 pub async fn send_installation_heartbeat(
     http: &reqwest::Client,
     config: &ServerConfig,
     boot_id: &str,
     public_ip: Option<&str>,
     log_collection_enabled: bool,
-) -> Result<(), InstallationHeartbeatError> {
+) -> Result<RouterShareCapabilities, InstallationHeartbeatError> {
     let api_base = config
         .router_api_base()
         .ok_or_else(|| {
@@ -987,7 +1006,24 @@ pub async fn send_installation_heartbeat(
         .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        let body = read_bounded_router_registration_response_body(response)
+            .await
+            .map_err(|error| InstallationHeartbeatError::Transient(error.to_string()))?;
+        // Older Routers may return no body; absence never grants capability.
+        if body.truncated {
+            return Err(InstallationHeartbeatError::Transient(
+                "heartbeat response is too large".into(),
+            ));
+        }
+        return if body.bytes.iter().all(u8::is_ascii_whitespace) {
+            Ok(RouterShareCapabilities::default())
+        } else {
+            serde_json::from_slice(&body.bytes).map_err(|error| {
+                InstallationHeartbeatError::Transient(format!(
+                    "invalid heartbeat capabilities: {error}"
+                ))
+            })
+        };
     }
     let body = read_bounded_router_error_body(response)
         .await

@@ -61,6 +61,9 @@ pub fn token_period_window(
         .ok_or_else(|| "current time is outside the supported UTC range".to_string())?;
 
     Ok(match policy.token_period {
+        ShareTokenPeriod::AccountReset => {
+            return Err("accountReset requires verified account quota context".to_string())
+        }
         ShareTokenPeriod::Lifetime => TokenPeriodWindow {
             starts_at_ms: None,
             ends_at_ms: None,

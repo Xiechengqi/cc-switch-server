@@ -946,6 +946,8 @@ fn ensure_router_domain_matches(
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveProviderBundleShareCommand {
+    #[serde(default)]
+    expected_account_cycle: Option<crate::domain::sharing::quota_cycle::AccountQuotaCycle>,
     bundle_id: String,
     #[serde(default)]
     share_id: Option<String>,
@@ -1149,6 +1151,7 @@ fn stage_provider_bundle_share(
                 capacity_pool_id.to_string(),
                 subdomain,
                 ShareSettingsPatch {
+                    expected_account_cycle: command.expected_account_cycle.clone(),
                     description: Some(description),
                     free_access: Some(free_access),
                     token_limit: Some(command.token_limit),
@@ -1260,6 +1263,18 @@ fn stage_provider_bundle_share(
     store
         .rebuild_user_usage_from_history(&share.id, usage, applied_at_ms)
         .map_err(map_share_patch_error)?;
+    if let Some(source) = store.quota_cycle_sources.get(&share.id).cloned() {
+        store
+            .project_account_reset(&share.id, &source, usage, applied_at_ms)
+            .map_err(map_share_patch_error)?;
+    }
+    store
+        .validate_account_reset_configuration(
+            &share.id,
+            usage,
+            command.expected_account_cycle.as_ref(),
+        )
+        .map_err(map_share_patch_error)?;
     Ok(Some(store.get(&share.id).cloned().expect(
         "new Provider Bundle Share remains in the candidate store",
     )))
@@ -1274,6 +1289,32 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     reject_retired_share_input_fields(value)?;
     let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
         .map_err(ApiError::bad_request)?;
+    let requests_account_reset = command.user_grants.as_ref().is_some_and(|grants| {
+        grants.values().any(|grant| {
+            grant.active
+                && grant.policy.token_period
+                    == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+        })
+    }) || command.user_grant_edits.as_ref().is_some_and(|edits| {
+        edits.values().any(|edit| {
+            edit.policy.as_ref().is_some_and(|policy| {
+                policy.token_period
+                    == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+            })
+        })
+    });
+    if requests_account_reset && !state.router_supports_account_reset().await {
+        return Err(ApiError::conflict_code(
+            "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
+            "Router must negotiate accountResetV1",
+        ));
+    }
+    if let Some(id) = &command.share_id {
+        state
+            .refresh_share_account_quota(id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     if command.bundle_id.trim().is_empty() || command.bundle_id != command.bundle_id.trim() {
         return Err(ApiError::bad_request(
             "bundleId must be non-empty and trimmed",
@@ -1567,6 +1608,13 @@ pub(in crate::api) async fn web_save_provider_share(
     let value = web_payload(args, &["params", "input"]);
     reject_retired_share_input_fields(value)?;
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
+    state
+        .refresh_share_account_quota(&share_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let expected_account_cycle = web_optional_deserialize::<
+        crate::domain::sharing::quota_cycle::AccountQuotaCycle,
+    >(value, "expectedAccountCycle")?;
     let expected_config_revision = web_optional_i64(
         value,
         &["expectedConfigRevision", "expected_config_revision"],
@@ -1624,6 +1672,7 @@ pub(in crate::api) async fn web_save_provider_share(
         .apply_settings_patch_with_usage(
             &share_id,
             ShareSettingsPatch {
+                expected_account_cycle: expected_account_cycle.clone(),
                 description: Some(description),
                 free_access: Some(free_access),
                 token_limit: Some(token_limit),
@@ -1717,6 +1766,7 @@ pub(in crate::api) async fn web_save_provider_share(
             store
                 .replace_configured_share(candidate)
                 .map_err(map_share_patch_error)?;
+            store.validate_account_reset_configuration(&share_id, usage, expected_account_cycle.as_ref()).map_err(map_share_patch_error)?;
             if let Some(edits) = user_usage_edits.as_ref() {
                 store
                     .apply_user_usage_edits(

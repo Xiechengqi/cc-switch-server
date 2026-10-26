@@ -278,6 +278,12 @@ if (requireDirectory(serverRoot, "Server audit root")) {
     /pub const SHARE_CONTRACT_VERSION: u16 = 7;/,
     "Share Contract v7 constant",
   );
+  requireText(
+    serverRoot,
+    "src/domain/sharing/router_contract.rs",
+    /pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;/,
+    "explicit Account Reset Share Contract v8 extension",
+  );
   requireBlock(
     serverRoot,
     "src/domain/sharing/router_contract.rs",
@@ -411,8 +417,8 @@ if (requireDirectory(routerRoot, "Router audit root")) {
   requireText(
     routerRoot,
     "src/models.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 7;/,
-    "Share Contract v7 constant",
+    /pub const SHARE_CONTRACT_VERSION: u16 = 8;/,
+    "Share Contract v8 reader constant",
   );
   requireBlock(
     routerRoot,

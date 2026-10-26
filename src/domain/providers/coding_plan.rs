@@ -521,6 +521,8 @@ pub enum CodingPlanQuotaState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodingPlanQuotaView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_reset_window: Option<crate::domain::sharing::quota_cycle::QuotaWindowObservation>,
     pub state: CodingPlanQuotaState,
     pub windows: Vec<CodingPlanQuotaWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -558,6 +560,7 @@ impl CodingPlanQuotaView {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             state: CodingPlanQuotaState::Unavailable,
+            account_reset_window: None,
             windows: Vec::new(),
             plan: None,
             observed_at_ms: None,
@@ -569,6 +572,7 @@ impl CodingPlanQuotaView {
     pub fn unknown(reason: impl Into<String>) -> Self {
         Self {
             state: CodingPlanQuotaState::Unknown,
+            account_reset_window: None,
             windows: Vec::new(),
             plan: None,
             observed_at_ms: None,
@@ -759,6 +763,8 @@ pub fn parse_kimi_quota(body: &Value, observed_at_ms: i64) -> anyhow::Result<Cod
 
     let mut view = finish_quota_view(body, windows, observed_at_ms)?;
     view.plan = kimi_membership_plan(body);
+    view.account_reset_window =
+        crate::domain::sharing::quota_cycle_source::kimi_observation(body, observed_at_ms);
     Ok(view)
 }
 
@@ -777,7 +783,8 @@ pub fn parse_zhipu_quota(body: &Value, observed_at_ms: i64) -> anyhow::Result<Co
     let mut unclassified = Vec::new();
     for item in limits {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if !kind.eq_ignore_ascii_case("TOKENS_LIMIT") {
+        if !kind.eq_ignore_ascii_case("TOKENS_LIMIT") && !kind.eq_ignore_ascii_case("CREDIT_LIMIT")
+        {
             continue;
         }
         let window_kind = match item.get("unit") {
@@ -833,7 +840,15 @@ pub fn parse_zhipu_quota(body: &Value, observed_at_ms: i64) -> anyhow::Result<Co
         window.kind = kind;
         classified.insert(kind, window);
     }
-    finish_quota_view(body, classified.into_values().collect(), observed_at_ms)
+    finish_quota_view(body, classified.into_values().collect(), observed_at_ms).map(|mut view| {
+        view.account_reset_window =
+            crate::domain::sharing::quota_cycle_source::coding_plan_observation(
+                CodingPlanQuotaAdapter::Zhipu,
+                body,
+                observed_at_ms,
+            );
+        view
+    })
 }
 
 pub fn parse_minimax_quota(
@@ -906,7 +921,15 @@ pub fn parse_minimax_quota(
             "weeklyEndTime",
         )?);
     }
-    finish_quota_view(body, windows, observed_at_ms)
+    finish_quota_view(body, windows, observed_at_ms).map(|mut view| {
+        view.account_reset_window =
+            crate::domain::sharing::quota_cycle_source::coding_plan_observation(
+                CodingPlanQuotaAdapter::Minimax,
+                body,
+                observed_at_ms,
+            );
+        view
+    })
 }
 
 pub fn parse_volcengine_afp_quota(
@@ -951,6 +974,11 @@ pub fn parse_volcengine_afp_quota(
         });
     }
     let mut view = finish_quota_view(body, windows, observed_at_ms)?;
+    view.account_reset_window = crate::domain::sharing::quota_cycle_source::coding_plan_observation(
+        CodingPlanQuotaAdapter::Volcengine,
+        body,
+        observed_at_ms,
+    );
     view.plan = result
         .get("PlanType")
         .and_then(Value::as_str)
@@ -1030,6 +1058,11 @@ pub fn parse_volcengine_coding_quota(
         }
     }
     let mut view = finish_quota_view(body, windows.into_values().collect(), observed_at_ms)?;
+    view.account_reset_window = crate::domain::sharing::quota_cycle_source::coding_plan_observation(
+        CodingPlanQuotaAdapter::Volcengine,
+        body,
+        observed_at_ms,
+    );
     view.plan = Some("Coding Plan".to_string());
     Ok(view)
 }
@@ -1179,6 +1212,7 @@ fn finish_quota_view(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     Ok(CodingPlanQuotaView {
+        account_reset_window: None,
         state: CodingPlanQuotaState::Supported,
         windows,
         plan,
@@ -1757,6 +1791,7 @@ mod tests {
 
     fn supported_quota(observed_at_ms: i64) -> CodingPlanQuotaView {
         CodingPlanQuotaView {
+            account_reset_window: None,
             state: CodingPlanQuotaState::Supported,
             windows: vec![CodingPlanQuotaWindow {
                 kind: CodingPlanQuotaWindowKind::FiveHour,

@@ -1813,6 +1813,7 @@ fn parse_kimi_usage_quota(body: &Value, now_ms: i64) -> Result<AccountQuota, Quo
         tiers,
         extra_usage: Some(json!({
             "source": "coding_v1_usages",
+            "raw": body,
             "plan": plan,
             "queriedAt": now_ms,
         })),

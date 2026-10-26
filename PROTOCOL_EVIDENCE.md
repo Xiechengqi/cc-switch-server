@@ -1,5 +1,17 @@
 # Protocol evidence policy
 
+## 2026-10-26 账号重置周期：实现与证据门槛
+
+核对既有quota parser与生成`docs/provider/coverage.md`，展示resets_at还可能是账期/包到期，不能通用触发。实现只使用Codex明确604800秒共享窗（绝对优先、缺失才相对秒）、Claude共享seven_day（含同身份被动头），不将短窗/review/模型桶混为账号主周期。Codex HTTP/WS被动观测带provider revision/account incarnation/identity generation fence；WS仅接受当前WHAM风格形状，离线fixture不证明全部真实WS schema。
+
+条件adapter包括Kiro/Q的AGENTIC_REQUEST订阅base、Cursor Dashboard included原账期、Copilot有限premium及既有paid/free UTC日期、Kimi共享weekly、GLM明确type/unit、MiniMax active general weekly毫秒、Volc AFPWeekly.ResetTime毫秒/Coding ResetTimestamp秒。每种均有字段缺失/单位/桶隔离负例；不从数组位置、展示名、最大duration/最晚reset推主桶。Provider-owned来源固定Family/origin/credential scope，沿用总credential generation保护quota slot，不伪称独立slot计数器。
+
+公共codex-resets.com按实施规划2026-10-26只读OpenAPI核对冻结：executed regular，observed或白名单x_post，announced_at作为publicAnnouncement业务边界，不是逐账号执行时间；scheduled/watch/banked不触发。运行时固定无auth HTTPS、禁止redirect、分页/ETag/大小/退避有界，状态变化不代替history。status只作变化探测，不声称完整schema已被证明。
+
+兑换仅2xx/windows_reset数量不足以证明主桶。预留reset_windows(scope=shared,limit_window_seconds=604800,reset=true)明确回执形状的正例只验证本地防护，没有厂商原始回执证据；现有计数回执仍unknown、不重消费。restore fence后无自动reconcile解锁。不得将自造fixture当厂商证据。
+
+Grok主桶、Qoder status/稳定scope、Antigravity/AGY summary与Share模型覆盖尚未闭合，明确conditional；CodeBuddy/Trae包到期不触发；Ollama/Gemini模型桶/按量key/不可查询Plan拒绝不可靠周期。TokenRouter的project-doc会话限制继续保留，未读取其业务源码。全部25 ProviderType/20 typed Profile分类、研究时固定参考HEAD、延期开放门槛及53项离线证据见`docs/share/account-reset.md`与原实施规划。没有新增参考工作区的构建/CI/运行依赖，所有真实验收独立live_pending，未部署。
+
 ## 2026-10-25 Grok CLI 明确版本拒绝后的默认身份更新
 
 用户报告 Grok OAuth / Codex 检查收到上游错误：`Your Grok CLI version (0.2.111) is outdated. Please update to version 1.0.13 or later via grok update or the installation documentation.` 这满足既有 GR-N4 对明确 version-rejected signal 的要求。Server 使用自己的身份常量，宿主机升级 Grok CLI 不会改变检查请求；现将统一默认版本与 User-Agent 更新为 `1.0.13` / `grok-shell/1.0.13 (linux; x86_64)`，模型目录、device flow、quota 和 HTTP/WS/media 共用该版本入口。已有环境变量覆盖继续优先，部署升级必须同步清除或更新旧值。
