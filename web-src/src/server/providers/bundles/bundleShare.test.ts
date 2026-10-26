@@ -57,6 +57,22 @@ function share(
 }
 
 describe("Provider Bundle sharing", () => {
+  it("freezes the draft revision and exact expiry while sending only changed users", async () => {
+    const existing = share({ codex: "bundle-1" }, 7, "2090-10-26T12:34:56Z");
+    existing.userGrants = {
+      "a@example.com": { email: "a@example.com", role: "shareto", active: true, revision: 3, policy: { parallelLimit: 2 } },
+      "b@example.com": { email: "b@example.com", role: "shareto", active: true, revision: 4, policy: { parallelLimit: 8 } },
+    };
+    const draft = createBundleShareDraft(existing);
+    draft.userGrants["a@example.com"] = { ...draft.userGrants["a@example.com"], policy: { parallelLimit: 5 } };
+    await saveBundleShare("bundle-1", draft, { ...existing, configRevision: 8 });
+    const sent = shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0];
+    expect(sent.expectedConfigRevision).toBe(7);
+    expect(sent.expiresAt).toBe(existing.expiresAt);
+    expect(sent.userGrants).toBeUndefined();
+    expect(sent.userGrantEdits).toEqual({ "a@example.com": { expectedRevision: 3, policy: { parallelLimit: 5 } } });
+    expect(sent.userUsageEdits).toEqual({});
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });

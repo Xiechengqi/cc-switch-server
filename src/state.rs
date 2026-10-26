@@ -18540,6 +18540,37 @@ impl ServerStateInner {
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
+        // Check before any Provider support side effects. The quota transaction
+        // repeats this check under its mutation lock.
+        if let Some(context) = &patch.edit_context {
+            let shares = self.shares.read().await;
+            if let Some(receipt) = shares
+                .applied_settings_operations
+                .get(&context.operation_id)
+            {
+                if receipt.patch_fingerprint
+                    != crate::domain::sharing::router_contract::share_settings_fingerprint(
+                        share_id, &patch,
+                    )
+                {
+                    return Ok(Err(SharePatchError::Invalid(
+                        "settings operationId was reused with a different payload".into(),
+                    )));
+                }
+                return Ok(shares
+                    .get(share_id)
+                    .cloned()
+                    .ok_or(SharePatchError::NotFound));
+            }
+            if let Some(share) = shares.get(share_id) {
+                if context.expected_config_revision != share.config_revision {
+                    return Ok(Err(SharePatchError::RevisionConflict {
+                        expected: context.expected_config_revision,
+                        current: share.config_revision,
+                    }));
+                }
+            }
+        }
         let Some(support) = patch.support.clone() else {
             return self
                 .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
@@ -18617,10 +18648,13 @@ impl ServerStateInner {
         };
 
         self.try_mutate_share_quota_immediate(move |shares, usage, applied_at_ms| {
-            for binding in &missing_bindings {
-                shares.add_binding(share_id, binding.clone())?;
-            }
-            shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
+            shares.apply_settings_patch_with_bindings_and_usage(
+                share_id,
+                patch,
+                &missing_bindings,
+                usage,
+                applied_at_ms,
+            )
         })
         .await
     }
@@ -20177,13 +20211,23 @@ async fn apply_and_ack_share_edit(
                     );
                 }
             }
+            // Carry the authoritative result in the ACK too: a failed
+            // descriptor sync must not leave Router showing a stale quota
+            // after it acknowledges this exact settings operation.
+            let applied_share = if edit.patch.edit_context.is_some() {
+                authoritative_share_descriptor(state, &edit.share_id)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
             (
                 "applied".to_string(),
                 None,
                 None,
                 None,
-                None,
-                None,
+                applied_share.as_ref().map(|share| share.config_revision),
+                applied_share,
                 applied_at_ms,
                 effective_policy,
             )
@@ -20241,6 +20285,16 @@ async fn apply_and_ack_share_edit(
         }
     };
     let ack = ShareEditAckPayload {
+        settings_receipt: match edit.patch.edit_context.as_ref() {
+            Some(context) => state
+                .shares
+                .read()
+                .await
+                .applied_settings_operations
+                .get(&context.operation_id)
+                .cloned(),
+            None => None,
+        },
         edit_id: edit.id.clone(),
         revision: edit.revision,
         status: ack_status,

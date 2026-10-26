@@ -17,6 +17,13 @@ import {
 } from "@/utils/shareUtils";
 
 export interface ProviderBundleShareDraft {
+  baseline?: {
+    shareId: string;
+    configRevision: number;
+    userGrants: ShareUserGrantMap;
+    expiry: ProviderBundleShareExpiry;
+    expiresAt: string;
+  };
   enabled: boolean;
   subdomain: string;
   description: string;
@@ -115,6 +122,15 @@ export function createBundleShareDraft(
         : undefined,
   };
   return {
+    baseline: share ? {
+      shareId: share.id,
+      configRevision: share.configRevision ?? 0,
+      userGrants: { ...canonicalUserGrants, ...buildShareUserGrants({
+        source: canonicalUserGrants, ownerEmail: share.ownerEmail, aclEmails: shareToEmails, defaultPolicy,
+      }) },
+      expiry,
+      expiresAt: share.expiresAt,
+    } : undefined,
     enabled: Boolean(
       share && share.status !== "paused" && share.status !== "deleted",
     ),
@@ -184,6 +200,7 @@ function limitValue(value: string, fallback: number): number {
 }
 
 function expiresAt(draft: ProviderBundleShareDraft): string {
+  if (draft.baseline && draft.expiry === draft.baseline.expiry) return draft.baseline.expiresAt;
   if (draft.expiry === "permanent") return PERMANENT_EXPIRES_AT;
   const preset = BUNDLE_SHARE_EXPIRY_PRESETS.find(
     (candidate) => candidate.value === draft.expiry,
@@ -209,6 +226,9 @@ export async function saveBundleShare(
   const expiry = expiresAt(draft);
   const userGrants = Object.keys(draft.userGrants).length
     ? draft.userGrants
+    : undefined;
+  const userGrantEdits = draft.baseline
+    ? changedBundleUserGrants(draft.baseline.userGrants, draft.userGrants)
     : undefined;
   const allowedUsageEmails = new Set(
     Object.values(draft.userGrants)
@@ -237,8 +257,8 @@ export async function saveBundleShare(
   }
   return shareApi.saveProviderBundleShare({
     bundleId,
-    shareId: existing?.id,
-    expectedConfigRevision: existing?.configRevision,
+    shareId: draft.baseline?.shareId,
+    expectedConfigRevision: draft.baseline?.configRevision,
     enabled: draft.enabled,
     subdomain: subdomain || existing?.shareSlug || "",
     description: draft.description.trim() || undefined,
@@ -251,9 +271,30 @@ export async function saveBundleShare(
     bankedResetExpiryLeadMinutes,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     grokMediaPolicy: draft.grokMediaPolicy,
-    userGrants,
+    userGrants: draft.baseline ? undefined : userGrants,
+    userGrantEdits,
     userUsageEdits,
   });
+}
+
+/** Only policy/authorization intent goes over the wire, never live counters. */
+export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: ShareUserGrantMap) {
+  const changes: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }> = {};
+  const policyKey = (policy: ShareUserPolicy) => JSON.stringify([
+    policy.parallelLimit ?? null, policy.tokenLimit ?? null, policy.tokenPeriod ?? "lifetime",
+    policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null,
+  ]);
+  for (const email of new Set([...Object.keys(baseline), ...Object.keys(draft)])) {
+    const previous = baseline[email];
+    const next = draft[email];
+    if ((previous?.active !== false && previous?.manager === "routerShareMarket") ||
+        (next?.active !== false && next?.manager === "routerShareMarket")) continue;
+    const wasActive = !!previous && previous.active !== false;
+    const active = !!next && next.active !== false;
+    if (wasActive === active && (!active || policyKey(previous.policy) === policyKey(next.policy))) continue;
+    changes[email] = { expectedRevision: previous?.revision ?? 0, policy: active ? next.policy : null };
+  }
+  return Object.keys(changes).length ? changes : undefined;
 }
 
 export async function enableBundleShare(

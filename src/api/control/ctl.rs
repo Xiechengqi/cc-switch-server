@@ -112,6 +112,7 @@ pub(crate) async fn control_apply_share_settings(
     }
     // Control RPC is Router → Client only. Managed Share Market grants must be
     // applied here too; the ordinary dashboard patch helper rejects them.
+    let edit_context = input.patch.edit_context.clone();
     let share = match state
         .apply_router_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
@@ -161,7 +162,7 @@ pub(crate) async fn control_apply_share_settings(
                 return Err(ApiError::conflict_code(
                     "cc_switch_share_revision_conflict",
                     format!(
-                        "managed grant expected config revision {expected}, current revision is {current}"
+                        "share settings expected config revision {expected}, current revision is {current}; reload the editor"
                     ),
                 )
                 .with_retryable(true)
@@ -188,6 +189,16 @@ pub(crate) async fn control_apply_share_settings(
     Ok(Json(ControlApplyShareSettingsResponse {
         ok: true,
         share: descriptor,
+        settings_receipt: match edit_context {
+            Some(context) => state
+                .shares
+                .read()
+                .await
+                .applied_settings_operations
+                .get(&context.operation_id)
+                .cloned(),
+            None => None,
+        },
     }))
 }
 
@@ -1031,6 +1042,8 @@ pub(crate) struct ControlAbortClientSubdomainAdoptionResponse {
 pub(crate) struct ControlApplyShareSettingsResponse {
     ok: bool,
     share: ShareDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings_receipt: Option<crate::domain::sharing::router_contract::ShareSettingsReceipt>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -457,6 +457,9 @@ pub struct ShareStore {
     pub router_descriptor_sync_diagnostic: Option<String>,
     #[serde(default)]
     pub applied_router_control_operations: BTreeMap<String, AppliedRouterControlOperation>,
+    #[serde(default)]
+    pub applied_settings_operations:
+        BTreeMap<String, crate::domain::sharing::router_contract::ShareSettingsReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2258,6 +2261,69 @@ impl ShareStore {
         if let Some(policy) = patch.grok_media_policy {
             share.grok_media_policy = policy;
         }
+        if patch.user_grant_edits.is_some() && patch.user_grants.is_some() {
+            return Err(SharePatchError::Invalid(
+                "cannot mix userGrants and userGrantEdits".into(),
+            ));
+        }
+        if let Some(edits) = patch.user_grant_edits.as_ref() {
+            let mut merged = share
+                .user_grants
+                .iter()
+                .filter(|(_, grant)| grant.active)
+                .map(|(email, grant)| (email.clone(), grant.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (email, edit) in edits {
+                let canonical = normalize_verified_email(email)?;
+                if canonical != *email {
+                    return Err(SharePatchError::Invalid(
+                        "userGrantEdits keys must be normalized emails".into(),
+                    ));
+                }
+                let previous = share.user_grants.get(email);
+                if previous.is_some_and(|grant| {
+                    grant.active && grant.manager == ShareGrantManager::RouterShareMarket
+                }) {
+                    return Err(SharePatchError::ManagedGrantReadOnly(email.clone()));
+                }
+                let current = previous.map_or(0, |grant| grant.revision);
+                if edit.expected_revision != current {
+                    return Err(SharePatchError::GrantRevisionConflict {
+                        email: email.clone(),
+                        expected: edit.expected_revision,
+                        current,
+                    });
+                }
+                if let Some(policy) = &edit.policy {
+                    let mut grant = previous.cloned().unwrap_or_default();
+                    grant.email = email.clone();
+                    grant.active = true;
+                    grant.role = if share.owner_email.as_deref() == Some(email) {
+                        "owner"
+                    } else {
+                        "shareto"
+                    }
+                    .into();
+                    grant.manager = if grant.role == "owner" {
+                        ShareGrantManager::Owner
+                    } else {
+                        ShareGrantManager::Manual
+                    };
+                    grant.entitlement_id = None;
+                    grant.policy = policy.clone();
+                    merged.insert(email.clone(), grant);
+                } else {
+                    if share.owner_email.as_deref() == Some(email) {
+                        return Err(SharePatchError::Invalid(
+                            "share owner cannot be revoked".into(),
+                        ));
+                    }
+                    merged.remove(email);
+                }
+            }
+            share.user_grants =
+                normalize_user_grants(&merged, &share.user_grants, share.owner_email.as_deref())?;
+        }
         let explicit_user_grants = patch.user_grants;
         if let Some(user_grants) = explicit_user_grants.as_ref() {
             share.user_grants = normalize_user_grants(
@@ -2356,6 +2422,44 @@ impl ShareStore {
             .is_some()
     }
 
+    /// Provider surface expansion and settings are one versioned operation.
+    /// Intermediate binding revisions are never published or persisted.
+    pub(crate) fn apply_settings_patch_with_bindings_and_usage(
+        &mut self,
+        share_id: &str,
+        patch: ShareSettingsPatch,
+        bindings: &[ShareBinding],
+        usage: &UsageStore,
+        applied_at_ms: i64,
+    ) -> Result<Share, SharePatchError> {
+        if bindings.is_empty()
+            || patch.edit_context.as_ref().is_some_and(|context| {
+                self.applied_settings_operations
+                    .contains_key(&context.operation_id)
+            })
+        {
+            return self.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms);
+        }
+        let original_revision = self
+            .get(share_id)
+            .ok_or(SharePatchError::NotFound)?
+            .config_revision;
+        let mut candidate = self.clone();
+        for binding in bindings {
+            candidate.add_binding(share_id, binding.clone())?;
+        }
+        candidate
+            .shares
+            .iter_mut()
+            .find(|share| share.id == share_id)
+            .ok_or(SharePatchError::NotFound)?
+            .config_revision = original_revision;
+        let saved =
+            candidate.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)?;
+        *self = candidate;
+        Ok(saved)
+    }
+
     pub fn apply_settings_patch_with_usage(
         &mut self,
         share_id: &str,
@@ -2386,6 +2490,34 @@ impl ShareStore {
             .get(share_id)
             .cloned()
             .ok_or(SharePatchError::NotFound)?;
+        let context = patch.edit_context.clone();
+        let fingerprint =
+            crate::domain::sharing::router_contract::share_settings_fingerprint(share_id, &patch);
+        if let Some(context) = &context {
+            if context.operation_id.is_empty()
+                || context.operation_id.len() > 128
+                || patch.managed_grant.is_some()
+                || usage_edits.is_some()
+            {
+                return Err(SharePatchError::Invalid(
+                    "invalid settings edit context".into(),
+                ));
+            }
+            if let Some(receipt) = self.applied_settings_operations.get(&context.operation_id) {
+                if receipt.patch_fingerprint != fingerprint {
+                    return Err(SharePatchError::Invalid(
+                        "settings operationId was reused with a different payload".into(),
+                    ));
+                }
+                return Ok(original);
+            }
+            if context.expected_config_revision != original.config_revision {
+                return Err(SharePatchError::RevisionConflict {
+                    expected: context.expected_config_revision,
+                    current: original.config_revision,
+                });
+            }
+        }
         let mut candidate = self.clone();
         let merged_usage_edits = match (usage_edits, patch.user_usage_edits.as_ref()) {
             (Some(explicit), _) => Some(explicit.clone()),
@@ -2408,6 +2540,25 @@ impl ShareStore {
             .get(share_id)
             .cloned()
             .ok_or(SharePatchError::NotFound)?;
+        if let Some(context) = context {
+            // Bounded receipt retention. Evicted operations cannot replay: their
+            // frozen config revision predates the successful mutation.
+            if candidate.applied_settings_operations.len() >= 4096 {
+                if let Some(evicted_id) =
+                    candidate.applied_settings_operations.keys().next().cloned()
+                {
+                    candidate.applied_settings_operations.remove(&evicted_id);
+                }
+            }
+            candidate.applied_settings_operations.insert(
+                context.operation_id.clone(),
+                crate::domain::sharing::router_contract::ShareSettingsReceipt {
+                    operation_id: context.operation_id,
+                    patch_fingerprint: fingerprint,
+                    config_revision: share.config_revision,
+                },
+            );
+        }
         *self = candidate;
         Ok(share)
     }
@@ -3346,7 +3497,7 @@ impl std::fmt::Display for SharePatchError {
             Self::PolicyDivergent(message) => formatter.write_str(message),
             Self::RevisionConflict { expected, current } => write!(
                 formatter,
-                "managed grant expected config revision {expected}, current revision is {current}"
+                "share settings expected config revision {expected}, current revision is {current}; reload the editor"
             ),
             Self::GrantRevisionConflict {
                 email,
@@ -3879,6 +4030,17 @@ fn normalize_user_grants(
             ShareGrantManager::Manual
         };
         grant.entitlement_id = None;
+        if let Some(previous) = previous {
+            if previous.active == grant.active
+                && previous.role == grant.role
+                && previous.policy == grant.policy
+                && previous.manager == grant.manager
+                && previous.entitlement_id == grant.entitlement_id
+            {
+                grant.revision = previous.revision;
+                grant.updated_at_ms = previous.updated_at_ms;
+            }
+        }
         normalized.insert(email, grant);
     }
     Ok(normalized)
@@ -5859,6 +6021,236 @@ mod tests {
         assert_eq!(usage.week.requests_count, 1);
         assert_eq!(usage.calendar_month.requests_count, 1);
         assert_eq!(usage.tokens_for(ShareTokenPeriod::Lifetime, now), 10);
+    }
+
+    #[test]
+    fn sparse_settings_edits_are_atomic_and_preserve_untouched_grant_revisions() {
+        use crate::domain::sharing::router_contract::ShareUserGrantEdit;
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("sparse-edit");
+        add_manual_shareto(&mut input, "a@example.com");
+        add_manual_shareto(&mut input, "b@example.com");
+        let original = store.upsert(input).unwrap();
+        let make_edit = |email: &str, revision: u64| {
+            (
+                email.to_string(),
+                ShareUserGrantEdit {
+                    expected_revision: revision,
+                    policy: Some(ShareUserPolicy {
+                        parallel_limit: Some(3),
+                        ..Default::default()
+                    }),
+                },
+            )
+        };
+        let usage = UsageStore::default();
+        let bad = ShareSettingsPatch {
+            user_grant_edits: Some(BTreeMap::from([
+                make_edit(
+                    "a@example.com",
+                    original.user_grants["a@example.com"].revision,
+                ),
+                make_edit("b@example.com", 99),
+            ])),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.apply_settings_patch_with_usage("sparse-edit", bad, &usage, 1),
+            Err(SharePatchError::GrantRevisionConflict { .. })
+        ));
+        assert_eq!(
+            store.get("sparse-edit").unwrap().config_revision,
+            original.config_revision
+        );
+        assert_eq!(
+            store.get("sparse-edit").unwrap().user_grants,
+            original.user_grants
+        );
+        let patch = ShareSettingsPatch {
+            user_grant_edits: Some(BTreeMap::from([make_edit(
+                "a@example.com",
+                original.user_grants["a@example.com"].revision,
+            )])),
+            ..Default::default()
+        };
+        let saved = store
+            .apply_settings_patch_with_usage("sparse-edit", patch, &usage, 1)
+            .unwrap();
+        assert_eq!(
+            saved.user_grants["b@example.com"].revision,
+            original.user_grants["b@example.com"].revision
+        );
+        assert_eq!(
+            saved.user_grants["a@example.com"].revision,
+            original.user_grants["a@example.com"].revision + 1
+        );
+        let noop = store
+            .apply_settings_patch_with_usage(
+                "sparse-edit",
+                ShareSettingsPatch {
+                    user_grants: Some(saved.user_grants.clone()),
+                    ..Default::default()
+                },
+                &usage,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            noop.user_grants["a@example.com"].revision,
+            saved.user_grants["a@example.com"].revision
+        );
+    }
+
+    #[test]
+    fn settings_binding_expansion_uses_the_original_revision_and_replays_once() {
+        use crate::domain::sharing::router_contract::{ShareSettingsEditContext, ShareSupport};
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("expand-edit")).unwrap();
+        let patch = ShareSettingsPatch {
+            edit_context: Some(ShareSettingsEditContext {
+                operation_id: "expand-1".into(),
+                expected_config_revision: original.config_revision,
+            }),
+            support: Some(ShareSupport {
+                claude: true,
+                codex: true,
+                gemini: false,
+            }),
+            ..Default::default()
+        };
+        let bindings = [ShareBinding {
+            app: AppKind::Claude,
+            provider_id: "claude-extra".into(),
+            provider_type: ProviderType::Claude,
+        }];
+        let saved = store
+            .apply_settings_patch_with_bindings_and_usage(
+                "expand-edit",
+                patch.clone(),
+                &bindings,
+                &UsageStore::default(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(saved.config_revision, original.config_revision + 1);
+        assert_eq!(saved.bindings.len(), original.bindings.len() + 1);
+        let replay = store
+            .apply_settings_patch_with_bindings_and_usage(
+                "expand-edit",
+                patch,
+                &bindings,
+                &UsageStore::default(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(replay.config_revision, saved.config_revision);
+        assert_eq!(replay.bindings, saved.bindings);
+    }
+
+    #[test]
+    fn settings_retry_after_restart_does_not_reapply_calibration_or_accept_payload_drift() {
+        use crate::domain::sharing::router_contract::{
+            share_settings_fingerprint, ShareSettingsEditContext,
+        };
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("retry-edit");
+        add_manual_shareto(&mut input, "a@example.com");
+        let original = store.upsert(input).unwrap();
+        let patch = ShareSettingsPatch {
+            edit_context: Some(ShareSettingsEditContext {
+                operation_id: "operation-1".into(),
+                expected_config_revision: original.config_revision,
+            }),
+            user_usage_edits: Some(BTreeMap::from([(
+                "a@example.com".into(),
+                ShareUserUsageEdit {
+                    action: ShareUserUsageEditAction::Set,
+                    target_tokens: Some(100),
+                    expected_grant_revision: Some(original.user_grants["a@example.com"].revision),
+                    period: Some(ShareTokenPeriod::Lifetime),
+                    anchor_at_ms: None,
+                    source: Default::default(),
+                },
+            )])),
+            ..Default::default()
+        };
+        let usage = UsageStore::default();
+        let first = store
+            .apply_settings_patch_with_usage("retry-edit", patch.clone(), &usage, 1000)
+            .unwrap();
+        let receipt = store.applied_settings_operations["operation-1"].clone();
+        assert_eq!(
+            receipt.patch_fingerprint,
+            share_settings_fingerprint("retry-edit", &patch)
+        );
+        assert!(receipt.config_revision > original.config_revision);
+        let mut reopened: ShareStore =
+            serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        let retry = reopened
+            .apply_settings_patch_with_usage("retry-edit", patch.clone(), &usage, 5000)
+            .unwrap();
+        assert_eq!(retry.config_revision, first.config_revision);
+        assert_eq!(retry.user_grants, first.user_grants);
+        let mut changed = patch.clone();
+        changed
+            .user_usage_edits
+            .as_mut()
+            .unwrap()
+            .get_mut("a@example.com")
+            .unwrap()
+            .target_tokens = Some(200);
+        assert!(reopened
+            .apply_settings_patch_with_usage("retry-edit", changed, &usage, 6000)
+            .is_err());
+        reopened.applied_settings_operations.clear();
+        assert!(matches!(
+            reopened.apply_settings_patch_with_usage("retry-edit", patch, &usage, 7000),
+            Err(SharePatchError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_settings_cannot_edit_managed_grants_or_mix_replacement_and_delta() {
+        use crate::domain::sharing::router_contract::ShareUserGrantEdit;
+        let mut store = ShareStore::default();
+        let mut input = codex_share_input("protected-edit");
+        add_manual_shareto(&mut input, "a@example.com");
+        let original = store.upsert(input).unwrap();
+        store.shares[0]
+            .user_grants
+            .get_mut("a@example.com")
+            .unwrap()
+            .manager = ShareGrantManager::RouterShareMarket;
+        let patch = ShareSettingsPatch {
+            user_grant_edits: Some(BTreeMap::from([(
+                "a@example.com".into(),
+                ShareUserGrantEdit {
+                    expected_revision: original.user_grants["a@example.com"].revision,
+                    policy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.apply_settings_patch_with_usage(
+                "protected-edit",
+                patch.clone(),
+                &UsageStore::default(),
+                1
+            ),
+            Err(SharePatchError::ManagedGrantReadOnly(_))
+        ));
+        assert!(store
+            .apply_settings_patch_with_usage(
+                "protected-edit",
+                ShareSettingsPatch {
+                    user_grants: Some(original.user_grants),
+                    ..patch
+                },
+                &UsageStore::default(),
+                1
+            )
+            .is_err());
     }
 
     #[test]

@@ -600,6 +600,8 @@ pub struct SharePendingEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareEditAckPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_receipt: Option<crate::domain::sharing::router_contract::ShareSettingsReceipt>,
     pub edit_id: String,
     pub revision: i64,
     pub status: String,
@@ -3285,6 +3287,7 @@ mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                settings_receipt: None,
                 edit_id: "edit-42".to_string(),
                 revision: 7,
                 status: "applied".to_string(),
@@ -3318,6 +3321,7 @@ mod tests {
     fn revision_conflict_ack_includes_authoritative_share_snapshot() {
         let payload = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                settings_receipt: None,
                 edit_id: "edit-conflict".into(),
                 revision: 8,
                 status: "rejected".into(),
@@ -4900,6 +4904,7 @@ mod tests {
     #[test]
     fn share_edit_ack_envelope_reuses_the_exact_raw_ack() {
         let ack = ShareEditAckPayload {
+            settings_receipt: None,
             edit_id: "edit-raw-ack".into(),
             revision: 7,
             status: "rejected".into(),

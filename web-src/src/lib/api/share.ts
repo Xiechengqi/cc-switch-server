@@ -258,6 +258,7 @@ export interface SaveProviderShareParams {
 
 /** Bundle-scoped Share payload; enabled Surface bindings are derived by the Server. */
 export interface SaveProviderBundleShareParams {
+  userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   bundleId: string;
   shareId?: string;
   expectedConfigRevision?: number;

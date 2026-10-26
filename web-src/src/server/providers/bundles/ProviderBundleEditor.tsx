@@ -949,6 +949,7 @@ function BundleShareEditor({
   ownerEmail,
   shareUrl,
   showGrokMedia,
+  disabled = false,
 }: {
   draft: ProviderBundleShareDraft;
   /**
@@ -961,6 +962,7 @@ function BundleShareEditor({
   ownerEmail: string;
   shareUrl?: string | null;
   showGrokMedia: boolean;
+  disabled?: boolean;
 }) {
   const { t } = useTranslation();
   const routerManagedEmails = useMemo(
@@ -1143,6 +1145,7 @@ function BundleShareEditor({
             </div>
           ) : null}
           <ShareUserGrantsEditor
+            disabled={disabled}
             value={displayedUserGrants}
             ownerEmail={normalizedOwnerEmail}
             defaultPolicy={defaultUserPolicy}
@@ -1310,6 +1313,7 @@ export function ProviderBundleEditor({
     null,
   );
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [requestDefaults, setRequestDefaults] =
     useState<ProviderRequestDefaults | null>(null);
   const [healthCheckConfig, setHealthCheckConfig] =
@@ -1705,6 +1709,7 @@ export function ProviderBundleEditor({
     }));
 
   const submit = async () => {
+    if (savingRef.current) return;
     const nextValidation = firstBundleValidationIssue(draft);
     setValidation(nextValidation);
     if (nextValidation) {
@@ -1739,9 +1744,11 @@ export function ProviderBundleEditor({
       );
       return;
     }
+    savingRef.current = true;
     setSaving(true);
     try {
-      const saved = await providersApi.upsertBundle(
+      const saved = bundle && !duplicate && stableStringify(draft) === draftBaselineRef.current
+        ? bundle : await providersApi.upsertBundle(
         toProviderBundleWriteDraft(draft),
       );
       const savedDraft = editProviderBundleDraft(saved);
@@ -1773,6 +1780,7 @@ export function ProviderBundleEditor({
       ]);
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -2932,13 +2940,26 @@ export function ProviderBundleEditor({
             aria-labelledby="bundle-tab-share"
             ref={shareSectionRef}
           >
-            <BundleShareEditor
-              draft={shareDraft}
-              onChange={setShareDraft}
-              ownerEmail={ownerEmail}
-              shareUrl={shareUrl}
-              showGrokMedia={grokDriverOptions}
-            />
+            {shareDirty && existingShare && shareDraft.baseline?.configRevision !== existingShare.configRevision ? (
+              <div role="alert" className="mb-3 flex items-center gap-3 text-sm text-amber-700">
+                <span>{t("share.userLimit.remoteChanged")}</span>
+                <Button type="button" variant="outline" disabled={saving} onClick={() => {
+                  const next = createBundleShareDraft(existingShare);
+                  shareBaselineRef.current = stableStringify(next);
+                  setShareDraft(next);
+                }}>{t("share.userLimit.reloadShare")}</Button>
+              </div>
+            ) : null}
+            <fieldset disabled={saving} className="min-w-0">
+              <BundleShareEditor
+                draft={shareDraft}
+                onChange={setShareDraft}
+                ownerEmail={ownerEmail}
+                shareUrl={shareUrl}
+                showGrokMedia={grokDriverOptions}
+                disabled={saving}
+              />
+            </fieldset>
           </div>
         ) : null}
       </div>

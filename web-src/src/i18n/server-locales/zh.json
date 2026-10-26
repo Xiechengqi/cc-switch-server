@@ -144,6 +144,7 @@
     "unknownRecipient": "未知收件人"
   },
   "common": {
+    "apply": "应用",
     "add": "添加",
     "all": "全部",
     "authStatusLoadFailed": "无法加载认证状态。",
@@ -1112,6 +1113,8 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "无上限",
     "userLimit": {
+      "remoteChanged": "Share 配置已在其他位置修改。重新加载将丢弃当前 Share 草稿并使用最新配置。",
+      "reloadShare": "重新加载 Share",
       "add": "添加用户",
       "anchor": "周期开始时间（UTC）",
       "anchorHint": "从该 UTC 时间起每隔固定天数重置，不可晚于当前时间。",
@@ -1123,7 +1126,7 @@
       "batchTitle": "批量编辑用户限制",
       "clearRebase": "清除重基线",
       "consumedBelowObserved": "已消耗 Token 不能低于当前观测值（{{observed}}）。",
-      "consumedHint": "当前有效用量为 {{effective}}；保存后以该值为基线，并继续累加新请求。当前观测值为 {{observed}}。",
+      "consumedHint": "当前有效用量为 {{effective}}；观测值为 {{observed}}。只有主动修改此项才校准用量，普通配额修改不影响已用量。",
       "consumedTokens": "已消耗 Token（当前周期）",
       "currentWindow": "当前周期：{{start}} 至 {{end}}",
       "edit": "编辑用户限制",

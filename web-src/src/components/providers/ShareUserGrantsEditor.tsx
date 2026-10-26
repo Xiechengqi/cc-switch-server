@@ -204,21 +204,20 @@ function usageEditForGrant(
   };
 }
 
-function batchPolicyDraft(grant: ShareUserGrant, usageEdits: ShareUserUsageEditMap): BatchPolicyDraft {
+function batchPolicyDraft(grant: ShareUserGrant): BatchPolicyDraft {
   const draft = policyDraft(grant.email, grant.policy);
-  const usage = usageEditForGrant(grant, usageEdits);
   return {
     parallelLimit: draft.parallelLimit,
     tokenLimit: draft.tokenLimit,
     tokenPeriod: draft.tokenPeriod,
     tokenPeriodAnchor: draft.tokenPeriodAnchor,
     expiresAt: draft.expiresAt,
-    consumedTokens: usage.consumedTokens,
-    usageAction: usage.usageAction === "clear" ? "clear" : "set",
-    applyParallelLimit: true,
-    applyTokenLimit: true,
-    applyConsumedTokens: true,
-    applyExpiresAt: true,
+    consumedTokens: "",
+    usageAction: "set",
+    applyParallelLimit: false,
+    applyTokenLimit: false,
+    applyConsumedTokens: false,
+    applyExpiresAt: false,
   };
 }
 
@@ -332,7 +331,7 @@ export function ShareUserGrantsEditor({
     const firstSelected = grants.find((grant) => selectedEditableEmails.has(grant.email));
     if (!firstSelected) return;
     setBatchError("");
-    setBatchDraft(batchPolicyDraft(firstSelected, usageEdits));
+    setBatchDraft(batchPolicyDraft(firstSelected));
   };
 
   const saveDraft = () => {
@@ -361,6 +360,7 @@ export function ShareUserGrantsEditor({
       previous && !reuseMarketTombstone ? observedGrantTokens(previous) : 0;
     const usageInvalid =
       draft.usageAction === "set" &&
+      !!draft.consumedTokens.trim() &&
       (consumedTokens == null ||
         !Number.isSafeInteger(consumedTokens) ||
         consumedTokens < 0 ||
@@ -456,10 +456,10 @@ export function ShareUserGrantsEditor({
           anchorAtMs: tokenPeriodAnchorAtMs,
           source: usageEdits[editingEmail ?? email]?.source ?? "manual",
         };
-      } else if (draft.usageAction === "clear" && previous?.usageRebase) {
+      } else if (draft.usageAction === "clear") {
         nextEdits[email] = {
           action: "clear",
-          expectedGrantRevision: previous.revision,
+          expectedGrantRevision: previous?.revision,
           period: draft.tokenPeriod,
           anchorAtMs: tokenPeriodAnchorAtMs,
         };
@@ -614,7 +614,7 @@ export function ShareUserGrantsEditor({
               : grant.policy.tokenPeriodAnchorAtMs,
             source: usageEdits[email]?.source ?? "manual",
           };
-        } else if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "clear" && grant.usageRebase) {
+        } else if (batchDraft.applyConsumedTokens && batchDraft.usageAction === "clear") {
           nextEdits[email] = {
             action: "clear",
             expectedGrantRevision: grant.revision,
@@ -623,8 +623,9 @@ export function ShareUserGrantsEditor({
               ? tokenPeriodAnchorAtMs
               : grant.policy.tokenPeriodAnchorAtMs,
           };
-        } else {
-          delete nextEdits[email];
+        } else if (batchDraft.applyTokenLimit && nextEdits[email]) {
+          // Preserve an explicit calibration already staged in this draft.
+          nextEdits[email] = { ...nextEdits[email], period: batchDraft.tokenPeriod, anchorAtMs: tokenPeriodAnchorAtMs };
         }
       }
       onUsageEditsChange(nextEdits);
@@ -1006,7 +1007,7 @@ export function ShareUserGrantsEditor({
           ) : null}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setDraft(null)}>{t("common.cancel", { defaultValue: "取消" })}</Button>
-            <Button type="button" onClick={saveDraft}>{t("common.save", { defaultValue: "保存" })}</Button>
+            <Button type="button" onClick={saveDraft}>{t("common.apply", { defaultValue: "应用" })}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

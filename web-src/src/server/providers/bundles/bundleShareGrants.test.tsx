@@ -10,6 +10,8 @@ import {
 } from "./bundleShare";
 import i18n from "@/i18n";
 
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+
 const GRANT: ShareUserGrantMap = {
   "friend@example.com": {
     email: "friend@example.com",
@@ -51,6 +53,57 @@ function typeInto(input: HTMLInputElement, value: string) {
 }
 
 describe("Provider Bundle share user grants", () => {
+  it("batch edits only opted-in fields despite unequal usage and preserves staged calibration", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    let latest = createBundleShareDraft();
+    function Harness() {
+      const [draft, setDraft] = useState(() => {
+        const next = createBundleShareDraft();
+        for (const [email, tokens] of [["a@example.com", 100], ["b@example.com", 200]] as const) {
+          next.userGrants[email] = {
+            email, active: true, role: "shareto", revision: 1,
+            policy: { tokenPeriod: "lifetime", parallelLimit: 2, tokenLimit: 1000 },
+            usageQuota: { period: "lifetime", effectiveTokensUsed: tokens, observedTokensUsed: tokens,
+              manualOffsetTokens: 0, observedRequestsCount: 1, rebaseApplies: false },
+          };
+        }
+        next.userUsageEdits = { "a@example.com": { action: "set", targetTokens: 300, expectedGrantRevision: 1 } };
+        return next;
+      });
+      latest = draft;
+      const handlers = bundleShareGrantHandlers(setDraft);
+      return <ShareUserGrantsEditor value={draft.userGrants} ownerEmail="owner@example.com"
+        defaultPolicy={{ tokenPeriod: "lifetime" }} usageEdits={draft.userUsageEdits}
+        onChange={handlers.onChange} onUsageEditsChange={handlers.onUsageEditsChange} />;
+    }
+    try {
+      await act(async () => { root.render(<Harness />); });
+      await act(async () => { findButton(i18n.t("share.userLimit.batchEdit")).click(); });
+      for (const email of ["a@example.com", "b@example.com"]) {
+        await act(async () => {
+          document.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("share.userLimit.selectUser", { email })}"]`)!.click();
+        });
+      }
+      await act(async () => { findButton(i18n.t("share.userLimit.batchEditSelected", { count: 2 })).click(); });
+      const checkboxes = document.querySelectorAll('[role="dialog"] button[role="checkbox"]');
+      expect(checkboxes.length).toBe(4);
+      for (const checkbox of checkboxes) expect(checkbox.getAttribute("aria-checked")).toBe("false");
+      await act(async () => { document.querySelector<HTMLButtonElement>("#share-user-batch-parallel-enabled")!.click(); });
+      await act(async () => { typeInto(document.querySelector<HTMLInputElement>('[role="dialog"] input[type="number"]')!, "3"); });
+      await act(async () => { findButton(i18n.t("share.userLimit.batchApply", { count: 2 })).click(); });
+      expect(latest.userGrants["a@example.com"].policy.parallelLimit).toBe(3);
+      expect(latest.userGrants["b@example.com"].policy.parallelLimit).toBe(3);
+      expect(latest.userGrants["b@example.com"].policy.tokenLimit).toBe(1000);
+      expect(latest.userUsageEdits).toEqual({ "a@example.com": { action: "set", targetTokens: 300, expectedGrantRevision: 1 } });
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+
   it("adds an authorized user to a brand-new Bundle Share draft", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -87,7 +140,7 @@ describe("Provider Bundle share user grants", () => {
       typeInto(email!, "friend@example.com");
     });
     await act(async () => {
-      findButton(i18n.t("common.save")).click();
+      findButton(i18n.t("common.apply", { defaultValue: "应用" })).click();
     });
 
     expect(Object.keys(latest.userGrants).sort()).toEqual([

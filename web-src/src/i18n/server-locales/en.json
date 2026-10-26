@@ -144,6 +144,7 @@
     "unknownRecipient": "Unknown recipient"
   },
   "common": {
+    "apply": "Apply",
     "add": "Add",
     "all": "All",
     "authStatusLoadFailed": "Failed to load authentication status.",
@@ -1112,6 +1113,8 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "Unlimited",
     "userLimit": {
+      "remoteChanged": "Share settings changed remotely. Reload to discard this Share draft and use the latest settings.",
+      "reloadShare": "Reload Share",
       "add": "Add user",
       "anchor": "Period start (UTC)",
       "anchorHint": "Resets at fixed intervals from this UTC time. It cannot be in the future.",
@@ -1123,7 +1126,7 @@
       "batchTitle": "Batch edit user limits",
       "clearRebase": "Clear baseline",
       "consumedBelowObserved": "Consumed tokens cannot be below current observed usage ({{observed}}).",
-      "consumedHint": "Current effective usage: {{effective}}. Saving uses this value as the baseline and adds future requests. Current observed usage: {{observed}}.",
+      "consumedHint": "Effective usage: {{effective}}; observed: {{observed}}. Only explicitly editing this field changes the baseline; ordinary quota edits leave usage unchanged.",
       "consumedTokens": "Consumed tokens (current period)",
       "currentWindow": "Current period: {{start}} to {{end}}",
       "edit": "Edit user limits",

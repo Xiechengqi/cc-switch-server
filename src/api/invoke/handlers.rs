@@ -965,6 +965,9 @@ struct SaveProviderBundleShareCommand {
     #[serde(default)]
     user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
     #[serde(default)]
+    user_grant_edits:
+        Option<BTreeMap<String, crate::domain::sharing::router_contract::ShareUserGrantEdit>>,
+    #[serde(default)]
     share_usage_edit: Option<ShareTotalUsageEdit>,
     #[serde(default)]
     allow_personal_credits: bool,
@@ -1161,6 +1164,7 @@ fn stage_provider_bundle_share(
                         enabled_apps,
                     )),
                     user_grants: command.user_grants.clone(),
+                    user_grant_edits: command.user_grant_edits.clone(),
                     ..ShareSettingsPatch::default()
                 },
                 command.user_usage_edits.as_ref(),

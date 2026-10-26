@@ -124,6 +124,7 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
 - 跨存储写操作按字段声明顺序取锁：
   `config → providers → accounts → usage → shares → ui_settings → sessions → oauth_logins`。
 - shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_immediate` / `mutate_shares_debounced` / `mutate_share` / `replace_shares` / `validate_share_invocation`；调用方不得再感知立即保存或 debounce 落盘细节。
+- Share 用户配置通过 `userGrantEdits` 增量提交，并与显式 `userUsageEdits` 在同一 quota mutation 中完整校验、原子提交；未修改用户不推进 revision。Router 同步 RPC 与异步队列共用 `editContext`，成功回执和 Share 一同持久化，重试不得重复执行用量校准。Provider Bundle 编辑器冻结 Share 基线版本，未编辑到期项时保留原始绝对到期时间。
 
 ### 4.3 UI 独立性
 
