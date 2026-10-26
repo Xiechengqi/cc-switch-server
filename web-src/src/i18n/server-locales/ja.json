@@ -144,6 +144,7 @@
     "unknownRecipient": "不明な宛先"
   },
   "common": {
+    "apply": "適用",
     "add": "追加",
     "all": "すべて",
     "authStatusLoadFailed": "認証状態を読み込めませんでした。",
@@ -1112,6 +1113,8 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "無上限",
     "userLimit": {
+      "remoteChanged": "Share 設定が別の場所で変更されました。再読み込みすると、編集中の Share の内容を破棄し、最新の設定を読み込みます。",
+      "reloadShare": "Share を再読み込み",
       "add": "ユーザーを追加",
       "anchor": "周期開始日時（UTC）",
       "anchorHint": "この UTC 日時を起点に固定間隔でリセットします。未来の日時は指定できません。",
@@ -1123,7 +1126,7 @@
       "batchTitle": "ユーザー制限を一括編集",
       "clearRebase": "基準をクリア",
       "consumedBelowObserved": "消費済み Token は現在の観測値（{{observed}}）未満にできません。",
-      "consumedHint": "現在の有効使用量は {{effective}} です。保存後はこの値を基準に新しいリクエストを加算します。現在の観測値は {{observed}} です。",
+      "consumedHint": "現在の有効使用量は {{effective}}、観測値は {{observed}} です。この項目を明示的に変更した場合のみ使用量を補正します。通常のクォータ変更では使用量は変わりません。",
       "consumedTokens": "消費済み Token（現在の期間）",
       "currentWindow": "現在の期間：{{start}} ～ {{end}}",
       "edit": "ユーザー制限を編集",

@@ -144,6 +144,7 @@
     "unknownRecipient": "未知收件人"
   },
   "common": {
+    "apply": "套用",
     "add": "新增",
     "all": "全部",
     "authStatusLoadFailed": "無法載入認證狀態。",
@@ -1112,6 +1113,8 @@
     "tunnelUrl": "Tunnel URL",
     "unlimited": "Unlimited",
     "userLimit": {
+      "remoteChanged": "Share 設定已在其他位置修改。重新載入將捨棄目前的 Share 草稿並使用最新設定。",
+      "reloadShare": "重新載入 Share",
       "add": "新增使用者",
       "anchor": "週期開始時間（UTC）",
       "anchorHint": "從該 UTC 時間起每隔固定天數重設，不可晚於目前時間。",
@@ -1123,7 +1126,7 @@
       "batchTitle": "批次編輯使用者限制",
       "clearRebase": "清除重設基線",
       "consumedBelowObserved": "已消耗 Token 不得低於目前觀測值（{{observed}}）。",
-      "consumedHint": "目前有效用量為 {{effective}}；儲存後以此值為基線，並繼續累加新請求。目前觀測值為 {{observed}}。",
+      "consumedHint": "目前有效用量為 {{effective}}；觀測值為 {{observed}}。只有主動修改此項才會校正用量，一般配額修改不影響已用量。",
       "consumedTokens": "已消耗 Token（目前週期）",
       "currentWindow": "目前週期：{{start}} 至 {{end}}",
       "edit": "編輯使用者限制",

@@ -166,6 +166,22 @@ describe("i18n resources", () => {
     }
   });
 
+  it.each(languages)(
+    "provides Share editing actions in %s without translation fallback",
+    (language) => {
+      for (const key of [
+        "common.apply",
+        "share.userLimit.reloadShare",
+        "share.userLimit.remoteChanged",
+      ]) {
+        const value = i18n.getResource(language, "translation", key);
+        expect(typeof value, `${language}:${key}`).toBe("string");
+        expect(value.trim().length, `${language}:${key}`).toBeGreaterThan(0);
+        expect(i18n.t(key, { lng: language, fallbackLng: false })).toBe(value);
+      }
+    },
+  );
+
   it("shares account copy while retaining provider-specific overrides", () => {
     for (const language of languages) {
       expect(i18n.t("claudeOauth.retry", { lng: language })).toBe(
