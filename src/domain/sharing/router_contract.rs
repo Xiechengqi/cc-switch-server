@@ -32,6 +32,7 @@ use crate::domain::sharing::shares::Share;
 
 pub const SHARE_CONTRACT_VERSION: u16 = 7;
 pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;
+pub const MARKET_TRIAL_CONTRACT_VERSION: u16 = 9;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -202,6 +203,43 @@ pub struct ShareManagedGrantOperation {
     /// when it actually applies the grant, so queueing time is never consumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_phase: Option<ShareMarketPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_allowance: Option<u64>,
+    /// A one-time trial cap, independent of the ordinary periodic quota.
+    /// None means time-only; zero is never a valid cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShareMarketPhase {
+    Trial,
+    Paid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareMarketEntitlement {
+    pub trial_scope_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_allowance: Option<u64>,
+    pub email: String,
+    pub phase: ShareMarketPhase,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_token_limit: Option<u64>,
+    pub trial_tokens_used: u64,
+    pub usage_revision: u64,
+    #[serde(default)]
+    pub usage_uncertain: bool,
+    pub applied_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +570,8 @@ pub struct ShareDescriptor {
     pub descriptor_fingerprint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_entitlements: BTreeMap<String, ShareMarketEntitlement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_user_token_periods: Vec<ShareTokenPeriod>,
 }
@@ -1288,6 +1328,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         descriptor_generation: share.descriptor_generation,
         descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
         user_grants,
+        market_entitlements: share.market_entitlements.clone(),
         supported_user_token_periods: supported_share_token_periods(),
     }
 }
@@ -1359,6 +1400,16 @@ fn static_descriptor_projection(
             ] {
                 grant.remove(field);
             }
+        }
+    }
+    if let Some(states) = object
+        .get_mut("marketEntitlements")
+        .and_then(Value::as_object_mut)
+    {
+        for state in states.values_mut().filter_map(Value::as_object_mut) {
+            state.remove("trialTokensUsed");
+            state.remove("usageUncertain");
+            state.remove("usageRevision");
         }
     }
 
@@ -2438,6 +2489,43 @@ mod tests {
             static_descriptor_fingerprint(&display_descriptor, &display_providers).unwrap()
         );
 
+        let mut market = descriptor.clone();
+        market.market_entitlements.insert(
+            "one-time".into(),
+            ShareMarketEntitlement {
+                trial_scope_id: "scope".into(),
+                trial_token_allowance: Some(100),
+                email: "renter@example.com".into(),
+                phase: ShareMarketPhase::Trial,
+                active: true,
+                trial_token_limit: Some(100),
+                trial_tokens_used: 0,
+                usage_revision: 0,
+                usage_uncertain: false,
+                applied_at_ms: 1_000,
+                paid_started_at_ms: None,
+            },
+        );
+        let market_fingerprint = static_descriptor_fingerprint(&market, &providers).unwrap();
+        let state = market.market_entitlements.get_mut("one-time").unwrap();
+        state.trial_tokens_used = 50;
+        state.usage_revision = 1;
+        state.usage_uncertain = true;
+        assert_eq!(
+            market_fingerprint,
+            static_descriptor_fingerprint(&market, &providers).unwrap(),
+            "dynamic trial usage cannot bump descriptor generations"
+        );
+        market
+            .market_entitlements
+            .get_mut("one-time")
+            .unwrap()
+            .active = false;
+        assert_ne!(
+            market_fingerprint,
+            static_descriptor_fingerprint(&market, &providers).unwrap()
+        );
+
         // Every proxied request rewrites the per-grant usage bucket.  If that
         // bucket reached the projection, ordinary traffic would bump the
         // descriptor generation and produce a Router sync storm.
@@ -3406,6 +3494,10 @@ mod tests {
             router_synced_descriptor_generation: 0,
             router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
+            market_requests: BTreeMap::new(),
+            market_compacted_usage: BTreeMap::new(),
+            market_receipts_before_ms: 0,
         }
     }
 

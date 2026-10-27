@@ -916,6 +916,10 @@ mod tests {
             router_synced_descriptor_generation: 0,
             router_synced_descriptor_fingerprint: None,
             user_grants: BTreeMap::new(),
+            market_entitlements: BTreeMap::new(),
+            market_requests: BTreeMap::new(),
+            market_compacted_usage: BTreeMap::new(),
+            market_receipts_before_ms: 0,
         }
     }
 

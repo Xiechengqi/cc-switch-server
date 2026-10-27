@@ -158,7 +158,7 @@ use crate::domain::sharing::shares::{
 };
 use crate::domain::usage::store::{
     PreparedUsageAppend, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageOutcome,
-    UsageState, UsageStore,
+    UsageRecordKind, UsageState, UsageStore,
 };
 use crate::logging::{
     classify_network_error, error_fingerprint, opaque_ref, AuditCursor, AuditEvent, AuditLog,
@@ -969,6 +969,8 @@ impl DeviceFlowPrincipalStore {
     }
 }
 
+type CachedRouterShareCapabilities = (String, String, std::time::Instant, (bool, bool));
+
 #[derive(Debug)]
 pub struct ServerStateInner {
     pub bind_addr: SocketAddr,
@@ -1113,7 +1115,7 @@ pub struct ServerStateInner {
     /// Startup-discovered public IPv4 reported to router via heartbeat.
     reported_public_ip: RwLock<Option<String>>,
     installation_heartbeat_wakeup: Notify,
-    router_quota_capability: RwLock<Option<(String, String, std::time::Instant, bool)>>,
+    router_quota_capability: RwLock<Option<CachedRouterShareCapabilities>>,
 }
 
 #[derive(Debug)]
@@ -6869,6 +6871,10 @@ impl ServerStateInner {
             shares.repair_integrity(&providers, &accounts, &reasoning_root_key.key);
         let mut shares_changed =
             quota_restored || integrity_outcomes.iter().any(|outcome| outcome.changed());
+        for share in &mut shares.shares {
+            shares_changed |= crate::domain::sharing::market_trials::recover(share, &usage, false)
+                .map_err(anyhow::Error::msg)?;
+        }
         let repaired_shares = integrity_outcomes
             .iter()
             .filter(|outcome| {
@@ -8230,6 +8236,13 @@ impl ServerStateInner {
                 &mut shares,
             )?;
         let mut shares_changed = rebased_client_share_subdomains > 0;
+        if restored_backup {
+            for share in &mut shares.shares {
+                shares_changed |=
+                    crate::domain::sharing::market_trials::recover(share, &usage, true)
+                        .map_err(anyhow::Error::msg)?;
+            }
+        }
         if account_reset::apply_restore_quota_fence(&self.config_dir, &mut shares, &mut usage)?
             || restored_backup
         {
@@ -13400,6 +13413,8 @@ impl ServerStateInner {
     }
 
     pub async fn push_usage_log(&self, log: UsageLog) -> anyhow::Result<()> {
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Usage commit")?;
         let _commit = self.usage_persistence.gate.lock().await;
         #[cfg(test)]
         self.usage_persistence.apply_test_persist_delay().await;
@@ -13410,6 +13425,31 @@ impl ServerStateInner {
 
     async fn commit_usage_append(&self, append: PreparedUsageAppend) -> anyhow::Result<UsageLog> {
         let expected_log = append.log().clone();
+        let has_market_receipt = self.shares.read().await.shares.iter().any(|share| {
+            share.market_requests.contains_key(&expected_log.request_id)
+                || (expected_log.record_kind == UsageRecordKind::InternalSupplemental
+                    && expected_log
+                        .parent_request_id
+                        .as_ref()
+                        .is_some_and(|id| share.market_requests.contains_key(id)))
+        });
+        if has_market_receipt {
+            let result = self
+                .try_mutate_shares_in_workspace_transaction(|store| {
+                    for share in &mut store.shares {
+                        crate::domain::sharing::market_trials::record(share, &expected_log)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.mark_quota_usage_degraded();
+                return Err(error);
+            }
+            self.router_share_sync_wakeup.notify_one();
+        }
         if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
             let config_dir = self.config_dir.clone();
             let persisted_log = expected_log.clone();
@@ -13481,6 +13521,8 @@ impl ServerStateInner {
         min_interval_ms: u128,
     ) -> anyhow::Result<UsageLog> {
         anyhow::ensure!(log.is_health_check, "usage log is not a health check");
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Health Usage commit")?;
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
@@ -13513,6 +13555,8 @@ impl ServerStateInner {
         request_id: &str,
         update: impl FnOnce(&mut UsageLog),
     ) -> anyhow::Result<Option<UsageLog>> {
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Usage update")?;
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
@@ -13535,6 +13579,8 @@ impl ServerStateInner {
         request_id: &str,
         update: impl FnOnce(&mut UsageLog) -> bool,
     ) -> anyhow::Result<bool> {
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Usage conditional update")?;
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
@@ -18662,7 +18708,7 @@ impl ServerStateInner {
                     base.to_string(),
                     identity.installation_id.clone(),
                     std::time::Instant::now(),
-                    capability.account_reset(),
+                    (capability.account_reset(), capability.market_trials()),
                 )
             });
         *self.router_quota_capability.write().await = value;
@@ -18674,7 +18720,23 @@ impl ServerStateInner {
         capability
             .as_ref()
             .is_some_and(|(base, installation, observed, supported)| {
-                *supported
+                supported.0
+                    && observed.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *installation)
+            })
+    }
+
+    pub async fn router_supports_market_trials(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, installation, observed, supported)| {
+                supported.1
                     && observed.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -18854,6 +18916,69 @@ impl ServerStateInner {
         };
         if context.is_health_check {
             return Ok(());
+        }
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Market Usage admission")?;
+        let request_id = context
+            .request_id
+            .get_or_insert_with(|| {
+                format!(
+                    "market_{}",
+                    crate::domain::sharing::quota_cycle::opaque_id()
+                )
+            })
+            .clone();
+        let market_started = *context
+            .started_at_ms
+            .get_or_insert_with(crate::infra::time::now_ms);
+        let market_share_id = share_id.to_string();
+        let market_email = context.user_email.clone().unwrap_or_default();
+        let has_market = self
+            .shares
+            .read()
+            .await
+            .get(&market_share_id)
+            .and_then(|share| {
+                share
+                    .user_grants
+                    .get(&market_email.to_ascii_lowercase())
+                    .and_then(|grant| grant.entitlement_id.as_ref())
+                    .map(|id| share.market_entitlements.contains_key(id))
+            })
+            .unwrap_or(false);
+        if has_market {
+            anyhow::ensure!(
+                self.router_supports_market_trials().await,
+                "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED"
+            );
+            anyhow::ensure!(
+                !self
+                    .quota_usage_degraded
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "MARKET_USAGE_UNAVAILABLE"
+            );
+            self.try_mutate_shares_in_workspace_transaction(|store| {
+                store
+                    .validate_for_invocation(
+                        &market_share_id,
+                        app,
+                        Some(&market_email),
+                        crate::infra::time::now_ms() as i64,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == market_share_id)
+                    .ok_or_else(|| anyhow::anyhow!("Share disappeared before admission"))?;
+                crate::domain::sharing::market_trials::admit(
+                    share,
+                    &market_email,
+                    &request_id,
+                    i64::try_from(market_started).unwrap_or(i64::MAX),
+                )
+            })
+            .await??;
         }
         let started = *context
             .started_at_ms
@@ -20599,6 +20724,15 @@ pub(crate) async fn authoritative_share_descriptor(
             "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED"
         );
         apply_account_reset_descriptor_projection(&mut descriptor, &share, account_reset_supported);
+        if state.router_supports_market_trials().await {
+            descriptor.contract_version =
+                crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION;
+        } else {
+            anyhow::ensure!(
+                share.market_entitlements.is_empty(),
+                "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED"
+            );
+        }
         state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
         let prepared = state
@@ -21571,6 +21705,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let usage = state.usage.read().await.clone();
         let config = state.config_snapshot().await;
         let account_reset_supported = state.router_supports_account_reset().await;
+        let market_trial_supported = state.router_supports_market_trials().await;
         let shares = state
             .shares
             .read()
@@ -21580,8 +21715,31 @@ fn build_router_share_upsert_ops_with_policy<'a>(
             .filter(|share| share_ids.contains(&share.id))
             .cloned()
             .collect::<Vec<_>>();
+        // Capability loss must isolate managed v9 Shares without blocking
+        // unrelated ordinary Shares in the same synchronization batch.
+        let unsupported = shares
+            .iter()
+            .filter(|share| !market_trial_supported && !share.market_entitlements.is_empty())
+            .map(|share| share.id.clone())
+            .collect::<BTreeSet<_>>();
+        const UPGRADE_REQUIRED: &str = "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED";
+        if shares.iter().any(|share| {
+            unsupported.contains(&share.id)
+                && share.router_last_sync_error.as_deref() != Some(UPGRADE_REQUIRED)
+        }) {
+            state
+                .mutate_shares_immediate(|store| {
+                    for share in &mut store.shares {
+                        if unsupported.contains(&share.id) {
+                            share.router_last_sync_error = Some(UPGRADE_REQUIRED.to_string());
+                        }
+                    }
+                })
+                .await?;
+        }
         let prepared = shares
             .iter()
+            .filter(|share| !unsupported.contains(&share.id))
             .map(|share| {
                 let descriptor = descriptor_for_share_with_accounts_and_usage(
                     share,
@@ -21599,6 +21757,10 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                     share,
                     account_reset_supported,
                 );
+                if market_trial_supported {
+                    descriptor.contract_version =
+                        crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION;
+                }
                 state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
                 Ok((share.id.clone(), descriptor, fingerprint))
             })
@@ -21638,7 +21800,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                 if account_reset && !account_reset_supported { return None; }
                 let has_quota_capability = account_reset_supported && descriptor.user_grants.values().any(|grant|
                     grant.account_reset_capability.is_some());
-                if !force && !account_reset && !has_quota_capability
+                if !force && !account_reset && !has_quota_capability && descriptor.market_entitlements.is_empty()
                     && !projection_state.descriptor_projection_pending(share)
                     && share.router_last_sync_error.is_none()
                 {
@@ -31828,6 +31990,205 @@ mod tests {
         test_state_at(config_dir)
     }
 
+    #[tokio::test]
+    async fn market_trial_capability_loss_isolates_only_managed_shares_in_a_sync_batch() {
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "trial-batch").await;
+        state
+            .mutate_shares_immediate(|store| {
+                for id in ["ordinary-batch", "managed-batch"] {
+                    store
+                        .upsert(router_sync_share_input(id, &format!("{id}-provider")))
+                        .unwrap();
+                }
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|share| share.id == "managed-batch")
+                    .unwrap()
+                    .market_entitlements
+                    .insert(
+                        "managed-entitlement".into(),
+                        serde_json::from_value(json!({
+                            "trialScopeId": "managed-scope",
+                            "email": "renter@example.com",
+                            "phase": "trial",
+                            "active": true,
+                            "trialTokenAllowance": 100,
+                            "trialTokenLimit": 100,
+                            "trialTokensUsed": 0,
+                            "usageRevision": 0,
+                            "usageUncertain": false,
+                            "appliedAtMs": 1000
+                        }))
+                        .unwrap(),
+                    );
+            })
+            .await
+            .unwrap();
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 7,
+                    capabilities: vec![],
+                },
+            )
+            .await;
+        let operations = build_router_share_upsert_ops_with_policy(
+            &state,
+            &BTreeSet::from(["ordinary-batch".into(), "managed-batch".into()]),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(operations.len(), 1);
+        let descriptor = operations[0].share.as_ref().unwrap();
+        assert_eq!(descriptor.share_id, "ordinary-batch");
+        assert_eq!(descriptor.contract_version, 7);
+        assert_eq!(
+            state
+                .shares
+                .read()
+                .await
+                .get("managed-batch")
+                .unwrap()
+                .router_last_sync_error
+                .as_deref(),
+            Some("MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED")
+        );
+    }
+
+    #[tokio::test]
+    async fn market_trial_state_admission_settlement_and_crash_recovery_are_durable() {
+        use crate::domain::sharing::router_contract::{
+            ShareGrantManager, ShareMarketEntitlement, ShareMarketPhase, ShareUserGrant,
+        };
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "trial-state-install").await;
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 9,
+                    capabilities: vec!["marketTrialV1".into()],
+                },
+            )
+            .await;
+        state
+            .mutate_shares_immediate(|store| {
+                let mut input = router_sync_share_input("trial-state", "trial-state-provider");
+                input.enabled = Some(true);
+                input.status = Some("active".into());
+                let created = store.upsert(input).unwrap();
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == created.id)
+                    .unwrap();
+                share.user_grants.insert(
+                    "renter@example.com".into(),
+                    ShareUserGrant {
+                        email: "renter@example.com".into(),
+                        active: true,
+                        manager: ShareGrantManager::RouterShareMarket,
+                        entitlement_id: Some("trial-state-entitlement".into()),
+                        ..Default::default()
+                    },
+                );
+                share.market_entitlements.insert(
+                    "trial-state-entitlement".into(),
+                    ShareMarketEntitlement {
+                        trial_scope_id: "trial-state-scope".into(),
+                        trial_token_allowance: Some(100),
+                        email: "renter@example.com".into(),
+                        phase: ShareMarketPhase::Trial,
+                        active: true,
+                        trial_token_limit: Some(100),
+                        trial_tokens_used: 0,
+                        usage_revision: 0,
+                        usage_uncertain: false,
+                        applied_at_ms: now_ms_i64(),
+                        paid_started_at_ms: None,
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let mut context = UsageLogContext {
+            request_id: Some("market-state-request".into()),
+            share_id: Some("trial-state".into()),
+            user_email: Some("renter@example.com".into()),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            state.begin_share_quota_usage(AppKind::Codex, &mut context),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p".into(),
+            "p".into(),
+            ProviderType::Codex,
+            200,
+            1,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(40),
+                ..Default::default()
+            },
+        );
+        log.apply_context(context.clone());
+        tokio::time::timeout(Duration::from_secs(3), state.push_usage_log(log))
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .update_usage_log("market-state-request", |log| {
+                log.input_tokens = Some(60);
+                log.usage_revision += 1;
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = ShareStore::load_or_default(&state.config_dir).unwrap();
+        assert_eq!(
+            saved.get("trial-state").unwrap().market_entitlements["trial-state-entitlement"]
+                .trial_tokens_used,
+            60
+        );
+        context.request_id = Some("market-crashed-request".into());
+        state
+            .begin_share_quota_usage(AppKind::Codex, &mut context)
+            .await
+            .unwrap();
+        state.mark_quota_usage_degraded();
+        context.request_id = Some("market-after-persist-error".into());
+        assert!(state
+            .begin_share_quota_usage(AppKind::Codex, &mut context)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MARKET_USAGE_UNAVAILABLE"));
+        let config_dir = state.config_dir.clone();
+        drop(state);
+        let restarted = test_state_at(config_dir);
+        let recovered = restarted.shares.read().await;
+        let entitlement =
+            &recovered.get("trial-state").unwrap().market_entitlements["trial-state-entitlement"];
+        assert_eq!(entitlement.trial_tokens_used, 60);
+        assert!(
+            entitlement.usage_uncertain,
+            "a persisted admission with no usage is not zero consumption"
+        );
+        drop(recovered);
+    }
+
     fn test_state_at(config_dir: PathBuf) -> ServerState {
         try_test_state_at(config_dir).unwrap()
     }
@@ -34556,6 +34917,10 @@ mod tests {
             router_synced_descriptor_generation: 0,
             router_synced_descriptor_fingerprint: None,
             user_grants: std::collections::BTreeMap::new(),
+            market_entitlements: Default::default(),
+            market_requests: Default::default(),
+            market_compacted_usage: Default::default(),
+            market_receipts_before_ms: 0,
         }
     }
 }

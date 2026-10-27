@@ -1363,6 +1363,10 @@ async fn ordinary_share_settings_entrypoint_rejects_managed_grants() {
                     email: "renter@example.com".to_string(),
                     policy: None,
                     duration_seconds: None,
+                    market_phase: None,
+                    trial_token_limit: None,
+                    trial_scope_id: None,
+                    trial_token_allowance: None,
                 }),
                 ..ShareSettingsPatch::default()
             },

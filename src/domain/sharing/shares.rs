@@ -160,11 +160,64 @@ impl ShareUserUsage {
         );
     }
 
-    fn record_for_policy(&mut self, policy: &ShareUserPolicy, tokens: u64, now_ms: i64) {
+    pub(super) fn record_for_policy(&mut self, policy: &ShareUserPolicy, tokens: u64, now_ms: i64) {
         self.record_for_policy_inner(policy, tokens, now_ms, true);
     }
 
-    fn record_supplemental_for_policy(
+    /// Cumulative-revision deltas may arrive out of order. Never reset a newer
+    /// periodic bucket when settling an older request, and count a request once.
+    pub(super) fn record_market_delta(
+        &mut self,
+        policy: &ShareUserPolicy,
+        tokens: u64,
+        at: i64,
+        count: bool,
+    ) {
+        record_bucket(&mut self.lifetime, 0, tokens, count);
+        for (bucket, start) in [
+            (&mut self.day, utc_day_start_ms(at)),
+            (&mut self.week, utc_week_start_ms(at)),
+            (&mut self.calendar_month, utc_calendar_month_start_ms(at)),
+        ] {
+            if start >= bucket.started_at_ms {
+                record_bucket(bucket, start, tokens, count);
+            }
+        }
+        if policy.token_period.requires_anchor() {
+            if let Ok(window) = token_period_window(policy, at) {
+                if let (Some(anchor), Some(start)) =
+                    (policy.token_period_anchor_at_ms, window.starts_at_ms)
+                {
+                    let bucket = self.anchored.get_or_insert(ShareAnchoredUsageBucket {
+                        period: policy.token_period,
+                        anchor_at_ms: anchor,
+                        started_at_ms: start,
+                        tokens_used: 0,
+                        requests_count: 0,
+                    });
+                    if bucket.period != policy.token_period
+                        || bucket.anchor_at_ms != anchor
+                        || start > bucket.started_at_ms
+                    {
+                        *bucket = ShareAnchoredUsageBucket {
+                            period: policy.token_period,
+                            anchor_at_ms: anchor,
+                            started_at_ms: start,
+                            tokens_used: 0,
+                            requests_count: 0,
+                        };
+                    }
+                    if bucket.started_at_ms == start {
+                        bucket.tokens_used = bucket.tokens_used.saturating_add(tokens);
+                        bucket.requests_count =
+                            bucket.requests_count.saturating_add(u64::from(count));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn record_supplemental_for_policy(
         &mut self,
         policy: &ShareUserPolicy,
         tokens: u64,
@@ -705,6 +758,14 @@ pub struct Share {
     pub router_synced_descriptor_fingerprint: Option<String>,
     #[serde(default)]
     pub user_grants: BTreeMap<String, ShareUserGrant>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_entitlements: BTreeMap<String, super::router_contract::ShareMarketEntitlement>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_requests: BTreeMap<String, super::market_trials::MarketRequestReceipt>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub market_compacted_usage: BTreeMap<String, super::market_trials::CompactedUsage>,
+    #[serde(default)]
+    pub market_receipts_before_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1179,7 +1240,7 @@ impl ShareStore {
             .unwrap_or_default();
 
         let share = Share {
-            id: share_id,
+            id: share_id.clone(),
             capacity_pool_id,
             owner_email,
             app,
@@ -1234,6 +1295,22 @@ impl ShareStore {
             router_synced_descriptor_generation,
             router_synced_descriptor_fingerprint,
             user_grants: preserved_user_grants.clone(),
+            market_entitlements: self
+                .get(&share_id)
+                .map(|s| s.market_entitlements.clone())
+                .unwrap_or_default(),
+            market_requests: self
+                .get(&share_id)
+                .map(|s| s.market_requests.clone())
+                .unwrap_or_default(),
+            market_compacted_usage: self
+                .get(&share_id)
+                .map(|s| s.market_compacted_usage.clone())
+                .unwrap_or_default(),
+            market_receipts_before_ms: self
+                .get(&share_id)
+                .map(|s| s.market_receipts_before_ms)
+                .unwrap_or_default(),
         };
 
         let mut share = share;
@@ -1719,6 +1796,31 @@ impl ShareStore {
             });
         }
         if let Some(grant) = user_grant {
+            if grant
+                .entitlement_id
+                .as_ref()
+                .is_some_and(|id| super::market_trials::uncertain(share, id))
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "MARKET_USAGE_UNAVAILABLE: unresolved metering requires cleanup"
+                        .into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
+            if grant
+                .entitlement_id
+                .as_ref()
+                .is_some_and(|id| super::market_trials::exhausted(share, id))
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::UserExhausted,
+                    message: "MARKET_TRIAL_EXHAUSTED: trial conversion is pending".into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
             if !grant.policy.allowed_apps.is_empty() && !grant.policy.allowed_apps.contains(&app) {
                 return Err(ShareInvocationRejection {
                     reason: ShareRejectReason::AppNotAllowed,
@@ -1836,7 +1938,12 @@ impl ShareStore {
             .filter(|value| !value.is_empty())
             .map(str::to_ascii_lowercase)
         {
-            if let Some(grant) = share.user_grants.get_mut(&email) {
+            if let Some(grant) = share.user_grants.get_mut(&email).filter(|grant| {
+                grant
+                    .entitlement_id
+                    .as_ref()
+                    .is_none_or(|id| !share.market_entitlements.contains_key(id))
+            }) {
                 let policy = grant.policy.clone();
                 let baseline = effective_grant_tokens_for_policy(grant, recorded_at_ms);
                 let current = grant.usage.tokens_for_policy(&policy, recorded_at_ms);
@@ -3009,6 +3116,13 @@ impl ShareStore {
                 grant.usage_quota = None;
                 continue;
             }
+            if grant
+                .entitlement_id
+                .as_ref()
+                .is_some_and(|id| share.market_entitlements.contains_key(id))
+            {
+                continue;
+            }
             let normalized_email = grant.email.trim().to_ascii_lowercase();
             let snapshot = observe_user_quota(usage, share_id, &normalized_email, grant, now_ms)
                 .map_err(SharePatchError::Invalid)?;
@@ -3065,6 +3179,13 @@ impl ShareStore {
             .find(|share| share.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
         for grant in share.user_grants.values_mut() {
+            if grant
+                .entitlement_id
+                .as_ref()
+                .is_some_and(|id| share.market_entitlements.contains_key(id))
+            {
+                continue;
+            }
             if grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset {
                 match observe_user_quota(
                     usage,
@@ -4097,7 +4218,13 @@ fn validate_managed_grant_operation(
             Ok(())
         }
         ShareManagedGrantAction::Revoke => {
-            if operation.policy.is_some() || operation.duration_seconds.is_some() {
+            if operation.policy.is_some()
+                || operation.duration_seconds.is_some()
+                || operation.market_phase.is_some()
+                || operation.trial_token_limit.is_some()
+                || operation.trial_scope_id.is_some()
+                || operation.trial_token_allowance.is_some()
+            {
                 return Err(SharePatchError::Invalid(
                     "managed grant revoke must not include policy or durationSeconds".to_string(),
                 ));
@@ -4127,6 +4254,73 @@ fn apply_managed_grant_operation(
             let mut policy = operation.policy.clone().ok_or_else(|| {
                 SharePatchError::Invalid("managed grant upsert requires policy".to_string())
             })?;
+            if operation.market_phase.is_none()
+                && share
+                    .market_entitlements
+                    .contains_key(&operation.entitlement_id)
+            {
+                return Err(SharePatchError::Invalid(
+                    "market phase cannot be removed from a versioned entitlement".into(),
+                ));
+            }
+            if operation.market_phase.is_none() && operation.trial_token_limit.is_some() {
+                return Err(SharePatchError::Invalid(
+                    "trial Token cap requires a market phase".into(),
+                ));
+            }
+            if let Some(phase) = operation.market_phase {
+                super::market_trials::validate_transition(
+                    share,
+                    &operation.entitlement_id,
+                    &email,
+                    phase,
+                    operation.trial_token_limit,
+                )?;
+                let scope = operation
+                    .trial_scope_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty() && id.len() <= 128)
+                    .ok_or_else(|| {
+                        SharePatchError::Invalid(
+                            "market phase requires a trial scope identity".into(),
+                        )
+                    })?;
+                if operation.trial_token_limit.is_some()
+                    != operation.trial_token_allowance.is_some()
+                    || operation
+                        .trial_token_limit
+                        .zip(operation.trial_token_allowance)
+                        .is_some_and(|(budget, allowance)| {
+                            budget > allowance || allowance > 9_007_199_254_740_991
+                        })
+                {
+                    return Err(SharePatchError::Invalid(
+                        "invalid one-time market trial budget".into(),
+                    ));
+                }
+                if share
+                    .market_entitlements
+                    .get(&operation.entitlement_id)
+                    .is_some_and(|e| {
+                        e.trial_scope_id != scope
+                            || (phase == super::router_contract::ShareMarketPhase::Trial
+                                && e.trial_token_allowance != operation.trial_token_allowance)
+                    })
+                {
+                    return Err(SharePatchError::Invalid(
+                        "market trial scope or allowance cannot be changed".into(),
+                    ));
+                }
+                if share
+                    .market_entitlements
+                    .values()
+                    .any(|e| e.trial_scope_id == scope && !e.email.eq_ignore_ascii_case(&email))
+                {
+                    return Err(SharePatchError::Invalid(
+                        "market trial scope is assigned to another user".into(),
+                    ));
+                }
+            }
             if policy.parallel_limit == Some(0) || policy.token_limit == Some(0) {
                 return Err(SharePatchError::Invalid(
                     "user limits must be positive or unlimited".to_string(),
@@ -4183,6 +4377,33 @@ fn apply_managed_grant_operation(
             }
 
             let previous = share.user_grants.get(&email).cloned();
+            if let Some(phase) = operation.market_phase {
+                use super::router_contract::{ShareMarketEntitlement, ShareMarketPhase};
+                let state = share
+                    .market_entitlements
+                    .entry(operation.entitlement_id.clone())
+                    .or_insert_with(|| ShareMarketEntitlement {
+                        trial_scope_id: operation.trial_scope_id.clone().unwrap_or_default(),
+                        trial_token_allowance: operation.trial_token_allowance,
+                        email: email.clone(),
+                        phase,
+                        active: true,
+                        trial_token_limit: operation.trial_token_limit,
+                        trial_tokens_used: 0,
+                        usage_revision: 0,
+                        usage_uncertain: false,
+                        applied_at_ms: now,
+                        paid_started_at_ms: None,
+                    });
+                if state.phase != phase {
+                    state.applied_at_ms = now;
+                }
+                state.phase = phase;
+                state.active = true;
+                if phase == ShareMarketPhase::Paid && state.paid_started_at_ms.is_none() {
+                    state.paid_started_at_ms = Some(now);
+                }
+            }
             share.user_grants.insert(
                 email.clone(),
                 ShareUserGrant {
@@ -4217,8 +4438,12 @@ fn apply_managed_grant_operation(
                     entitlement_id: Some(operation.entitlement_id.clone()),
                 },
             );
+            super::market_trials::project(share);
         }
         ShareManagedGrantAction::Revoke => {
+            if let Some(state) = share.market_entitlements.get_mut(&operation.entitlement_id) {
+                state.active = false;
+            }
             let Some((grant_email, grant)) = share.user_grants.iter().find(|(_, grant)| {
                 grant.manager == ShareGrantManager::RouterShareMarket
                     && grant.entitlement_id.as_deref() == Some(operation.entitlement_id.as_str())
@@ -4459,6 +4684,10 @@ mod tests {
                 allowed_apps: Vec::new(),
             }),
             duration_seconds: None,
+            market_phase: None,
+            trial_token_limit: None,
+            trial_scope_id: None,
+            trial_token_allowance: None,
         }
     }
 
@@ -4473,6 +4702,436 @@ mod tests {
         )
         .unwrap();
         assert!(tombstone.has_legacy_router_target());
+    }
+
+    #[test]
+    fn market_trial_budget_survives_periods_restart_and_paid_phase_with_late_usage() {
+        use crate::domain::sharing::{market_trials, router_contract::ShareMarketPhase};
+        use crate::domain::usage::store::{TokenUsage, UsageLog, UsageModelMetadata};
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("trial-budget")).unwrap();
+        let mut op = managed_operation(
+            "trial-op",
+            "trial-entitlement",
+            share.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        op.market_phase = Some(ShareMarketPhase::Trial);
+        op.trial_token_limit = Some(100);
+        op.trial_scope_id = Some("scope".into());
+        op.trial_token_allowance = Some(100);
+        store
+            .apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store.shares.iter_mut().find(|s| s.id == share.id).unwrap();
+        market_trials::admit(share, "renter@example.com", "trial-request", 1_000).unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p1".into(),
+            "Provider".into(),
+            ProviderType::Codex,
+            200,
+            1,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(120),
+                ..Default::default()
+            },
+        );
+        log.request_id = "trial-request".into();
+        log.share_id = Some(share.id.clone());
+        log.user_email = Some("renter@example.com".into());
+        log.usage_state = crate::domain::usage::store::UsageState::Pending;
+        assert!(
+            !market_trials::record(share, &log).unwrap(),
+            "partial streaming usage is not a conflicting final revision"
+        );
+        assert_eq!(
+            share.market_entitlements["trial-entitlement"].trial_tokens_used,
+            0
+        );
+        log.usage_state = crate::domain::usage::store::UsageState::Observed;
+        assert!(market_trials::record(share, &log).unwrap());
+        assert!(!market_trials::record(share, &log).unwrap());
+        assert_eq!(
+            share.market_entitlements["trial-entitlement"].trial_tokens_used,
+            120
+        );
+        assert!(
+            market_trials::admit(share, "renter@example.com", "over-limit", 86_401_000).is_err(),
+            "a new quota day does not renew the trial"
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        let mut store: ShareStore = serde_json::from_str(&json).unwrap();
+        let revision = store.get("trial-budget").unwrap().config_revision;
+        op.operation_id = "paid-op".into();
+        op.share_sequence = 2;
+        op.expected_config_revision = revision;
+        op.market_phase = Some(ShareMarketPhase::Paid);
+        op.trial_token_limit = None;
+        op.trial_token_allowance = None;
+        store
+            .apply_settings_patch(
+                "trial-budget",
+                ShareSettingsPatch {
+                    managed_grant: Some(op),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "trial-budget")
+            .unwrap();
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            0,
+            "paid quota starts fresh"
+        );
+        log.usage_revision += 2;
+        log.input_tokens = Some(150);
+        market_trials::record(share, &log).unwrap();
+        assert_eq!(
+            share.market_entitlements["trial-entitlement"].trial_tokens_used, 150,
+            "supplemental usage stays in the original phase"
+        );
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            0
+        );
+        market_trials::admit(share, "renter@example.com", "paid-request", 86_402_000).unwrap();
+        log.request_id = "paid-request".into();
+        log.usage_revision = 1;
+        log.input_tokens = Some(30);
+        market_trials::record(share, &log).unwrap();
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            30
+        );
+        log.request_id = "late-trial-summary".into();
+        log.parent_request_id = Some("trial-request".into());
+        log.record_kind = crate::domain::usage::store::UsageRecordKind::InternalSupplemental;
+        log.input_tokens = Some(5);
+        log.usage_revision = 1;
+        market_trials::record(share, &log).unwrap();
+        assert_eq!(
+            share.market_entitlements["trial-entitlement"].trial_tokens_used,
+            155
+        );
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            30,
+            "late supplemental usage also stays in the original phase"
+        );
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .requests_count,
+            1
+        );
+        market_trials::admit(share, "renter@example.com", "paid-cancelled", 86_403_000).unwrap();
+        log.request_id = "paid-cancelled".into();
+        log.record_kind = crate::domain::usage::store::UsageRecordKind::UserInference;
+        log.parent_request_id = None;
+        log.input_tokens = Some(0);
+        log.usage_state = crate::domain::usage::store::UsageState::Interrupted;
+        market_trials::record(share, &log).unwrap();
+        assert!(
+            !market_trials::uncertain(share, "trial-entitlement"),
+            "normal paid cancellation must not reclaim a healthy paid rental"
+        );
+        let usage = UsageStore::default();
+        store
+            .rebuild_user_usage_from_history("trial-budget", &usage, 86_402_000)
+            .unwrap();
+        assert_eq!(
+            store.get("trial-budget").unwrap().user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            30,
+            "recent-log rebuilding must not replace durable phase accounting"
+        );
+    }
+
+    #[test]
+    fn market_trial_usage_deltas_keep_new_periods_and_count_each_request_once() {
+        let policy = ShareUserPolicy {
+            token_period: ShareTokenPeriod::Day,
+            ..Default::default()
+        };
+        let mut usage = ShareUserUsage::default();
+        usage.record_market_delta(&policy, 40, 1_000, true);
+        usage.record_market_delta(&policy, 30, 86_401_000, true);
+        usage.record_market_delta(&policy, 20, 1_000, false);
+        assert_eq!(
+            usage.day.tokens_used, 30,
+            "a late old result cannot reset today's usage"
+        );
+        assert_eq!(usage.day.requests_count, 1);
+        assert_eq!(usage.lifetime.tokens_used, 90);
+        assert_eq!(usage.lifetime.requests_count, 2);
+        usage.record_market_delta(&policy, 5, 86_401_000, false);
+        assert_eq!(usage.day.tokens_used, 35);
+        assert_eq!(
+            usage.day.requests_count, 1,
+            "supplements do not add user requests"
+        );
+    }
+
+    #[test]
+    fn market_trial_phase_and_cap_cannot_be_recreated_and_zero_is_not_a_user_quota() {
+        use crate::domain::sharing::router_contract::ShareMarketPhase;
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("trial-fences")).unwrap();
+        let mut op = managed_operation(
+            "one",
+            "entitlement",
+            share.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        op.market_phase = Some(ShareMarketPhase::Trial);
+        op.trial_token_limit = None;
+        op.trial_scope_id = Some("scope".into());
+        store
+            .apply_settings_patch(
+                &share.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store.get(&share.id).unwrap();
+        assert!(crate::domain::sharing::market_trials::validate_transition(
+            share,
+            "entitlement",
+            "renter@example.com",
+            ShareMarketPhase::Trial,
+            Some(1)
+        )
+        .is_err());
+        assert!(crate::domain::sharing::market_trials::validate_transition(
+            share,
+            "entitlement",
+            "renter@example.com",
+            ShareMarketPhase::Trial,
+            Some(0)
+        )
+        .is_err());
+        op.operation_id = "two".into();
+        op.share_sequence = 2;
+        op.expected_config_revision = share.config_revision;
+        op.policy.as_mut().unwrap().token_limit = Some(0);
+        assert!(store
+            .apply_settings_patch(
+                "trial-fences",
+                ShareSettingsPatch {
+                    managed_grant: Some(op),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn market_trial_delayed_old_entitlement_usage_exhausts_the_shared_scope() {
+        use super::super::{market_trials, router_contract::ShareMarketPhase};
+        use crate::domain::usage::store::{TokenUsage, UsageLog, UsageModelMetadata};
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("trial-scope")).unwrap();
+        let mut op = managed_operation(
+            "scope-1",
+            "first",
+            original.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        op.market_phase = Some(ShareMarketPhase::Trial);
+        op.trial_scope_id = Some("shared-scope".into());
+        op.trial_token_limit = Some(100);
+        op.trial_token_allowance = Some(100);
+        store
+            .apply_settings_patch(
+                &original.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == original.id)
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "old-request", 1_000).unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p".into(),
+            "p".into(),
+            ProviderType::Codex,
+            200,
+            1,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(40),
+                ..Default::default()
+            },
+        );
+        log.request_id = "old-request".into();
+        log.share_id = Some(original.id.clone());
+        log.user_email = Some("renter@example.com".into());
+        market_trials::record(share, &log).unwrap();
+        share.market_entitlements.get_mut("first").unwrap().active = false;
+        share
+            .user_grants
+            .get_mut("renter@example.com")
+            .unwrap()
+            .active = false;
+        op.operation_id = "scope-2".into();
+        op.share_sequence = 2;
+        op.expected_config_revision = share.config_revision;
+        op.entitlement_id = "second".into();
+        op.trial_token_limit = Some(60);
+        store
+            .apply_settings_patch(
+                &original.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == original.id)
+            .unwrap();
+        assert!(market_trials::admit(share, "renter@example.com", "new-request", 2_000).is_ok());
+        log.usage_revision += 1;
+        log.input_tokens = Some(110);
+        market_trials::record(share, &log).unwrap();
+        assert!(market_trials::exhausted(share, "second"));
+        assert!(
+            market_trials::admit(share, "renter@example.com", "new-after-late", 3_000).is_err()
+        );
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            0,
+            "late old usage must not consume the new grant's periodic quota"
+        );
+        let recovered = market_trials::recover(share, &UsageStore::default(), false).unwrap();
+        assert!(
+            recovered,
+            "the admitted unfinished new request remains unknown after a process restart"
+        );
+        assert!(market_trials::uncertain(share, "second"));
+    }
+
+    #[test]
+    fn market_trial_receipts_compact_without_resetting_lifetime_or_reopening_old_requests() {
+        use super::super::{market_trials, router_contract::ShareMarketPhase};
+        use crate::domain::usage::store::{TokenUsage, UsageLog, UsageModelMetadata};
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("trial-compaction")).unwrap();
+        let mut op = managed_operation(
+            "compact-1",
+            "paid",
+            original.config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        op.market_phase = Some(ShareMarketPhase::Paid);
+        op.trial_scope_id = Some("compact-scope".into());
+        store
+            .apply_settings_patch(
+                &original.id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == original.id)
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "old", 1_000).unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Codex,
+            "p".into(),
+            "p".into(),
+            ProviderType::Codex,
+            200,
+            1,
+            UsageModelMetadata::default(),
+            TokenUsage {
+                input_tokens: Some(70),
+                ..Default::default()
+            },
+        );
+        log.request_id = "old".into();
+        log.share_id = Some(original.id.clone());
+        log.user_email = Some("renter@example.com".into());
+        market_trials::record(share, &log).unwrap();
+        let at = market_trials::RECEIPT_RETENTION_MS + 86_400_000;
+        market_trials::admit(share, "renter@example.com", "recent", at).unwrap();
+        assert!(!share.market_requests.contains_key("old"));
+        assert_eq!(share.market_compacted_usage["paid"].paid_tokens, 70);
+        log.request_id = "recent".into();
+        log.input_tokens = Some(30);
+        market_trials::record(share, &log).unwrap();
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            100
+        );
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .requests_count,
+            2
+        );
+        assert!(market_trials::admit(share, "renter@example.com", "old", 1_000).is_err());
+        let json = serde_json::to_string(&store).unwrap();
+        let reloaded: ShareStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.get(&original.id).unwrap().user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            100
+        );
     }
 
     #[test]
@@ -7602,6 +8261,10 @@ mod tests {
             descriptor_fingerprint: None,
             router_synced_descriptor_generation: 0,
             router_synced_descriptor_fingerprint: None,
+            market_entitlements: BTreeMap::new(),
+            market_requests: BTreeMap::new(),
+            market_compacted_usage: BTreeMap::new(),
+            market_receipts_before_ms: 0,
             user_grants: BTreeMap::from([(
                 "user@example.com".to_string(),
                 ShareUserGrant {

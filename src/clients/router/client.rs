@@ -969,6 +969,9 @@ pub struct RouterShareCapabilities {
 }
 
 impl RouterShareCapabilities {
+    pub fn market_trials(&self) -> bool {
+        self.share_contract_version >= 9 && self.capabilities.iter().any(|c| c == "marketTrialV1")
+    }
     pub fn account_reset(&self) -> bool {
         self.share_contract_version >= 8
             && self

@@ -73,9 +73,9 @@ Server 侧校验（`src/clients/router/ingress.rs`）：
 
 Router 通过**未签名**头 `x-cc-switch-ingress-body-limit` 声明其上限；Server 的生效值为 `min(本地 requestBodyLimits, Router 声明)`。本地值存于 `server.json` 的 `requestBodyLimits`。
 
-## 7. Share 契约 v7兼容与v8协商
+## 7. Share 契约 v7兼容与v8/v9协商
 
-Server 普通未协商descriptor保持 Share Contract v7；accountReset及其只读投影须显式协商后写v8。Router滚动升级可读v2..v8，Share Market最低版本仍v5。各版本在v2的统一Share访问边界上逐步追加：
+Server 普通未协商descriptor保持 Share Contract v7；accountReset及其只读投影须显式协商后写v8，一次性市场试用须 `marketTrialV1`＋reader≥9 后写 v9。Router滚动升级可读v2..v9，Share Market最低版本仍v5。各版本在v2的统一Share访问边界上逐步追加：
 
 - v2：`freeAccess`（默认 `false`，即私有）、`userGrants`、`tokenLimit`、`parallelLimit`。
 - v4：不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
@@ -83,6 +83,7 @@ Server 普通未协商descriptor保持 Share Contract v7；accountReset及其只
 - v6：scoped quota metadata。
 - v7：quota 中独立的 `unobservedTiers`（套餐已确认但尚无真实数值观测的容量池，只用于展示），以及仅 Codex OAuth 使用的 `bankedReset` 摘要。二者都不参与调度、限流、可用性或容量评分。
 - v8：`accountReset`、`accountQuotaCycle/accountResetCapability/accountUsageBaseline`和usageWatermark。heartbeat须同时声明shareContractVersion≥8与accountResetV1；Server能力缓存绑定Router URL/installation且300秒失效。普通v7省略新嵌套字段，市场合同不新增动态周期。
+- v9：一次性市场试用 `marketEntitlements` 与 managed operation 的 phase、scope、原始 Token allowance／本次剩余 cap。转发前持久化请求阶段，累计修订不能倒退或复活预算；正式额度不接收试用迟到用量。使用量变化不提升静态 generation，但持续进行完整 descriptor 同步。已有 v9 状态而 Router 不再声明能力时明确拒绝降级发布，不伪装成 v7。见 [市场试用](../share/market-trials.md)。
 
 账号周期动态视图不进入静态fingerprint/configRevision/generation；当前复用完整descriptor同步/ACK，Notify及30秒周期持续重放，并非独立精确quota水位ACK。Router按stream、source/epoch、cycle顺序/修订与usage水位合并，允许合法下降修正，不用历史max复活旧周期；恢复换stream全量握手并退休旧流。详情和运维限制见[账号重置周期](../share/account-reset.md)。
 

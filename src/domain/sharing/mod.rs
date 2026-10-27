@@ -1,6 +1,7 @@
 pub mod credential_source;
 pub mod invariants;
 pub(crate) mod legacy_token_market_migration;
+pub mod market_trials;
 pub mod model_health;
 pub mod previous_response_cache;
 pub mod quota_cycle;
