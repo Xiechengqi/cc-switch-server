@@ -113,8 +113,12 @@ pub(crate) async fn record_limit_evidence(
     let now_ms = current_time_ms().min(i64::MAX as u128) as i64;
     let expires_at_ms =
         now_ms.saturating_add(i64::try_from(limit.retry_delay_ms.max(1_000)).unwrap_or(i64::MAX));
+    let client_identity = execution
+        .antigravity_client_identity
+        .clone()
+        .unwrap_or_else(crate::domain::antigravity_identity::antigravity_client_identity);
     if let Err(error) = state
-        .record_antigravity_capability_observation_if_current(
+        .record_antigravity_capability_observation_for_client_if_current(
             snapshot,
             account_incarnation,
             crate::domain::accounts::capability_evidence::MODEL_CAPACITY_DIMENSION,
@@ -126,6 +130,7 @@ pub(crate) async fn record_limit_evidence(
                 reason: Some(limit.kind.reason()),
                 expires_at_ms: Some(expires_at_ms),
             },
+            &client_identity,
         )
         .await
     {
@@ -346,21 +351,12 @@ pub(crate) async fn prepare_reasoning_replay(
         return Ok(None);
     };
     let now_ms = replay_now_ms();
-    let (previous_chain, mut snapshot) = state
+    let (previous_chain, mut snapshot, mut previous_chain_memory) = state
         .antigravity_reasoning_replays
-        .get(&scope, now_ms)
-        .await;
+        .get_accounted(&scope, now_ms, request_memory)
+        .await
+        .map_err(|error| error.into_proxy_error())?;
     let mut previous_chain = previous_chain.map(Arc::new);
-    let previous_chain_memory = request_memory
-        .map(|budget| {
-            budget
-                .reserve(
-                    RequestMemoryComponent::ReasoningReplay,
-                    snapshot.retained_bytes(),
-                )
-                .map_err(|error| error.into_proxy_error())
-        })
-        .transpose()?;
     let mut ownership = CacheSnapshotOwnership::from_hit(
         "antigravity_reasoning",
         scope.ownership_digest(),
@@ -396,15 +392,12 @@ pub(crate) async fn prepare_reasoning_replay(
             {
                 let refreshed = state
                     .antigravity_reasoning_replays
-                    .get(&scope, now_ms)
-                    .await;
+                    .get_accounted(&scope, now_ms, request_memory)
+                    .await
+                    .map_err(|error| error.into_proxy_error())?;
                 previous_chain = refreshed.0.map(Arc::new);
                 snapshot = refreshed.1;
-                if let Some(reservation) = previous_chain_memory.as_ref() {
-                    reservation
-                        .resize(snapshot.retained_bytes())
-                        .map_err(|error| error.into_proxy_error())?;
-                }
+                previous_chain_memory = refreshed.2;
                 ownership = CacheSnapshotOwnership::from_hit(
                     "antigravity_reasoning",
                     scope.ownership_digest(),

@@ -21,6 +21,10 @@ use super::{ProxyError, ProxyRoute};
 
 const MAX_STREAM_TRANSFORM_SSE_EVENT_BYTES: usize = 128 * 1024 * 1024;
 
+#[cfg(test)]
+#[path = "stream_transforms/codex_phase_tests.rs"]
+mod codex_phase_tests;
+
 #[derive(Debug)]
 pub(super) struct StreamEventTransformer {
     upstream: Option<UpstreamFormat>,
@@ -461,10 +465,11 @@ impl StreamBridgeState {
             Self::GeminiAnthropic(state) => state.retained_bytes(),
             Self::GeminiOpenAi(state) => state.retained_bytes(),
             Self::ResponsesChat(state) => state.retained_bytes(),
+            Self::ResponsesAnthropic(state) => state.retained_bytes(),
             Self::ChatResponses(state) => state.retained_bytes(),
             Self::AnthropicResponses(state) => state.retained_bytes(),
             Self::ToGemini(state) => state.retained_bytes(),
-            Self::GrokResponsesTools(_) | Self::ResponsesAnthropic(_) | Self::AnthropicChat(_) => 0,
+            Self::GrokResponsesTools(_) | Self::AnthropicChat(_) => 0,
         }
     }
 
@@ -782,6 +787,9 @@ struct ResponsesAnthropicState {
     tools: BTreeMap<i64, ToolBlockState>,
     item_ids: BTreeMap<i64, String>,
     emitted_text_items: BTreeSet<String>,
+    completed_text_items: BTreeSet<String>,
+    text_item_keys: BTreeSet<String>,
+    message_phases: super::responses_phase::MessagePhases,
     completed_reasoning_items: BTreeSet<String>,
     completed_tool_items: BTreeSet<String>,
     pending_tool_arguments: BTreeMap<i64, String>,
@@ -817,6 +825,89 @@ struct CustomToolInputState {
 }
 
 impl ResponsesAnthropicState {
+    fn retained_bytes(&self) -> usize {
+        let node = std::mem::size_of::<usize>() * 3;
+        let strings = |values: &BTreeSet<String>| {
+            values.iter().fold(0usize, |bytes, value| {
+                bytes
+                    .saturating_add(value.capacity())
+                    .saturating_add(std::mem::size_of::<String>() + node)
+            })
+        };
+        let custom = |input: &CustomToolInputState| {
+            input
+                .delta
+                .capacity()
+                .saturating_add(input.done.as_ref().map_or(0, retained_json_bytes))
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(self.tools.values().fold(0usize, |bytes, tool| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(i64, ToolBlockState)>() + node)
+                    .saturating_add(custom(&tool.custom_input))
+            }))
+            .saturating_add(self.item_ids.values().fold(0usize, |bytes, id| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(i64, String)>() + node)
+                    .saturating_add(id.capacity())
+            }))
+            .saturating_add(strings(&self.emitted_text_items))
+            .saturating_add(strings(&self.completed_text_items))
+            .saturating_add(strings(&self.text_item_keys))
+            .saturating_add(strings(&self.completed_reasoning_items))
+            .saturating_add(strings(&self.completed_tool_items))
+            .saturating_add(self.message_phases.retained_bytes())
+            .saturating_add(
+                self.pending_tool_arguments
+                    .values()
+                    .fold(0usize, |bytes, value| {
+                        bytes
+                            .saturating_add(std::mem::size_of::<(i64, String)>() + node)
+                            .saturating_add(value.capacity())
+                    }),
+            )
+            .saturating_add(
+                self.pending_custom_inputs
+                    .values()
+                    .fold(0usize, |bytes, value| {
+                        bytes
+                            .saturating_add(
+                                std::mem::size_of::<(i64, CustomToolInputState)>() + node,
+                            )
+                            .saturating_add(custom(value))
+                    }),
+            )
+            .saturating_add(
+                self.pending_tool_items
+                    .values()
+                    .fold(0usize, |bytes, value| {
+                        bytes
+                            .saturating_add(std::mem::size_of::<i64>() + node)
+                            .saturating_add(retained_json_bytes(value))
+                    }),
+            )
+            .saturating_add(self.response_usage.as_ref().map_or(0, retained_json_bytes))
+    }
+
+    // Text stays standard text on this surface. Preserve item boundaries even
+    // when a later message arrives only on done, and never close a newer item
+    // because of a duplicate completed snapshot for an older one.
+    fn prepare_text_item(&mut self, input: &Value, item: Option<&Value>) -> Vec<StreamFrame> {
+        let keys = response_item_keys(input, item, &self.item_ids);
+        let frames = if !keys.is_empty()
+            && !self.text_item_keys.is_empty()
+            && keys.is_disjoint(&self.text_item_keys)
+        {
+            self.close_text_block()
+        } else {
+            Vec::new()
+        };
+        if !keys.is_empty() {
+            self.text_item_keys = keys;
+        }
+        frames
+    }
+
     fn deferred_for_gemini() -> Self {
         Self {
             defer_tool_blocks: true,
@@ -908,6 +999,7 @@ impl ResponsesAnthropicState {
         };
         mark_response_item_emitted(&mut self.emitted_text_items, input, None, &self.item_ids);
         let mut frames = self.ensure_message_start(input);
+        frames.extend(self.prepare_text_item(input, input.get("item")));
         frames.extend(self.close_reasoning_block(None));
         frames.extend(self.ensure_text_block());
         let index = self.text_block.expect("text block was opened").index;
@@ -961,6 +1053,17 @@ impl ResponsesAnthropicState {
             return Vec::new();
         };
         self.remember_item_identity(input, item);
+        if item.get("type").and_then(Value::as_str) == Some("message") {
+            if response_item_was_emitted(
+                &self.completed_text_items,
+                input,
+                Some(item),
+                &self.item_ids,
+            ) {
+                return Vec::new();
+            }
+            return self.prepare_text_item(input, Some(item));
+        }
         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
             return self.ensure_message_start(input);
         }
@@ -1208,7 +1311,7 @@ impl ResponsesAnthropicState {
         }
         if item.get("type").and_then(Value::as_str) == Some("message") {
             if response_item_was_emitted(
-                &self.emitted_text_items,
+                &self.completed_text_items,
                 input,
                 Some(item),
                 &self.item_ids,
@@ -1216,13 +1319,30 @@ impl ResponsesAnthropicState {
                 return Vec::new();
             }
             let mut frames = Vec::new();
-            if let Some(text) = response_message_text(item) {
-                let mut packed = input.clone();
-                packed["delta"] = Value::String(text);
-                frames.extend(self.text_delta(&packed));
+            if !response_item_was_emitted(
+                &self.emitted_text_items,
+                input,
+                Some(item),
+                &self.item_ids,
+            ) {
+                if let Some(text) = response_message_text(item) {
+                    let mut packed = input.clone();
+                    packed["delta"] = Value::String(text);
+                    frames.extend(self.text_delta(&packed));
+                }
+            }
+            let keys = response_item_keys(input, Some(item), &self.item_ids);
+            if keys.is_empty() || !keys.is_disjoint(&self.text_item_keys) {
+                frames.extend(self.close_text_block());
             }
             mark_response_item_emitted(
                 &mut self.emitted_text_items,
+                input,
+                Some(item),
+                &self.item_ids,
+            );
+            mark_response_item_emitted(
+                &mut self.completed_text_items,
                 input,
                 Some(item),
                 &self.item_ids,
@@ -1362,15 +1482,20 @@ impl ResponsesAnthropicState {
     }
 
     fn remember_item_identity(&mut self, input: &Value, item: &Value) {
-        let (Some(output_index), Some(item_id)) = (
+        if let (Some(output_index), Some(item_id)) = (
             response_output_index(input),
             item.get("id")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty()),
-        ) else {
-            return;
-        };
-        self.item_ids.insert(output_index, item_id.to_string());
+        ) {
+            self.item_ids.insert(output_index, item_id.to_string());
+        }
+        self.message_phases.observe(
+            item,
+            &response_item_keys(input, Some(item), &self.item_ids),
+            "messages",
+            "response",
+        );
     }
 
     fn event_output_index(&self, input: &Value) -> Option<i64> {
@@ -1584,6 +1709,7 @@ impl ResponsesAnthropicState {
     }
 
     fn close_text_block(&mut self) -> Vec<StreamFrame> {
+        self.text_item_keys.clear();
         let Some(block) = self.text_block.as_mut().filter(|block| block.open) else {
             return Vec::new();
         };
@@ -1689,6 +1815,7 @@ struct GeminiAnthropicToolKey {
 #[derive(Debug)]
 struct GeminiAnthropicToolState {
     id: String,
+    id_was_explicit: bool,
     name: String,
     arguments: Value,
     signature: Option<String>,
@@ -2181,6 +2308,9 @@ impl GeminiAnthropicState {
             part_index,
             occurrence,
         };
+        let compatible_identity = |tool: &GeminiAnthropicToolState| {
+            !tool.emitted && explicit_id.is_none_or(|id| !tool.id_was_explicit || tool.id == id)
+        };
         let key = explicit_id
             .and_then(|id| {
                 self.tools
@@ -2190,19 +2320,25 @@ impl GeminiAnthropicState {
             .or_else(|| {
                 self.tools
                     .get(&slot)
-                    .filter(|tool| !tool.emitted && tool.name == name)
+                    .filter(|tool| compatible_identity(tool) && tool.name == name)
                     .map(|_| slot.clone())
             })
             .or_else(|| {
                 self.tools.iter().find_map(|(key, tool)| {
-                    (!tool.emitted
+                    (compatible_identity(tool)
                         && key.candidate_index == candidate_index
                         && key.occurrence == occurrence
                         && tool.name == name)
                         .then(|| key.clone())
                 })
             })
-            .unwrap_or(slot);
+            .unwrap_or_else(|| {
+                let mut vacant = slot;
+                while self.tools.contains_key(&vacant) {
+                    vacant.occurrence = vacant.occurrence.saturating_add(1);
+                }
+                vacant
+            });
         if !self.tools.contains_key(&key) {
             let id = explicit_id.map(str::to_string).unwrap_or_else(|| {
                 format!(
@@ -2215,6 +2351,7 @@ impl GeminiAnthropicState {
                 key.clone(),
                 GeminiAnthropicToolState {
                     id,
+                    id_was_explicit: explicit_id.is_some(),
                     name: name.to_string(),
                     arguments: json!({}),
                     signature: None,
@@ -2225,6 +2362,7 @@ impl GeminiAnthropicState {
         let tool = self.tools.get_mut(&key).expect("tool exists");
         if let Some(explicit_id) = explicit_id {
             tool.id = explicit_id.to_string();
+            tool.id_was_explicit = true;
         }
         if let Some(arguments) = function_call
             .get("args")
@@ -2547,7 +2685,7 @@ enum GeminiOpenAiTarget {
     Responses(AnthropicResponsesState),
     Chat {
         responses: AnthropicResponsesState,
-        chat: ResponsesChatState,
+        chat: Box<ResponsesChatState>,
     },
 }
 
@@ -2557,7 +2695,8 @@ impl GeminiOpenAiState {
             GeminiOpenAiTarget::Responses(responses) => responses.retained_bytes(),
             GeminiOpenAiTarget::Chat { responses, chat } => responses
                 .retained_bytes()
-                .saturating_add(chat.retained_bytes()),
+                .saturating_add(chat.retained_bytes())
+                .saturating_add(std::mem::size_of::<ResponsesChatState>()),
         };
         self.source.retained_bytes().saturating_add(target)
     }
@@ -2581,7 +2720,7 @@ impl GeminiOpenAiState {
             source: GeminiAnthropicState::with_web_search_expected(web_search_expected),
             target: GeminiOpenAiTarget::Chat {
                 responses: AnthropicResponsesState::new(responses_tool_context),
-                chat: ResponsesChatState::new(downstream_include_usage),
+                chat: Box::new(ResponsesChatState::new(downstream_include_usage)),
             },
         }
     }
@@ -2693,7 +2832,8 @@ impl ToGeminiState {
     fn retained_bytes(&self) -> usize {
         let source = match &self.source {
             ToAnthropicSource::Chat(state) => state.retained_bytes(),
-            ToAnthropicSource::Anthropic | ToAnthropicSource::Responses(_) => 0,
+            ToAnthropicSource::Responses(state) => state.retained_bytes(),
+            ToAnthropicSource::Anthropic => 0,
         };
         source.saturating_add(self.target.retained_bytes())
     }
@@ -3803,6 +3943,7 @@ struct ResponsesChatState {
     tools: BTreeMap<i64, ResponsesChatToolState>,
     item_ids: BTreeMap<i64, String>,
     emitted_text_items: BTreeSet<String>,
+    message_phases: super::responses_phase::MessagePhases,
     emitted_reasoning_items: BTreeSet<String>,
     emitted_annotations: BTreeSet<String>,
     include_usage: bool,
@@ -3820,6 +3961,7 @@ impl Default for ResponsesChatState {
             tools: BTreeMap::new(),
             item_ids: BTreeMap::new(),
             emitted_text_items: BTreeSet::new(),
+            message_phases: Default::default(),
             emitted_reasoning_items: BTreeSet::new(),
             emitted_annotations: BTreeSet::new(),
             include_usage: true,
@@ -3878,6 +4020,7 @@ impl ResponsesChatState {
         self.response_id
             .capacity()
             .saturating_add(self.model.capacity())
+            .saturating_add(self.message_phases.retained_bytes())
             .saturating_add(tools)
             .saturating_add(item_ids)
             .saturating_add(string_set_bytes(&self.emitted_text_items))
@@ -4247,13 +4390,20 @@ impl ResponsesChatState {
     }
 
     fn remember_item_identity(&mut self, input: &Value, item: &Value) {
-        let (Some(output_index), Some(item_id)) = (
+        if let (Some(output_index), Some(item_id)) = (
             response_output_index(input),
-            item.get("id").and_then(Value::as_str),
-        ) else {
-            return;
-        };
-        self.item_ids.insert(output_index, item_id.to_string());
+            item.get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty()),
+        ) {
+            self.item_ids.insert(output_index, item_id.to_string());
+        }
+        self.message_phases.observe(
+            item,
+            &response_item_keys(input, Some(item), &self.item_ids),
+            "chat",
+            "response",
+        );
     }
 
     fn resolve_tool_index(&self, output_index: i64, item: &Value) -> i64 {
@@ -6125,6 +6275,18 @@ impl AnthropicResponsesState {
             return;
         };
         for (key, value) in incoming {
+            if key == "output_tokens_details" {
+                if let Some(details) = transforms::openai_output_details_from_anthropic_usage(usage)
+                {
+                    // Normalize each sparse update before merging aliases so a
+                    // later explicit zero supersedes either previous spelling.
+                    merge_json_value(
+                        target.entry(key.clone()).or_insert_with(|| json!({})),
+                        &details,
+                    );
+                }
+                continue;
+            }
             target.insert(key.clone(), value.clone());
         }
     }
@@ -6538,6 +6700,75 @@ mod tests {
         assert!(output.contains("\"type\":\"upstream_error\""));
         assert!(output.contains("upstream failed"));
         assert!(!output.contains("Google upstream embedded error"));
+    }
+
+    #[test]
+    fn antigravity_r4_stream_distinct_calls_keep_global_tool_identity() {
+        let mut state = GeminiOpenAiState::chat(transforms::ResponsesToolContext::default(), false);
+        let mut frames = Vec::new();
+        for (id, q) in [("call-a", 1), ("call-b", 2), ("call-c", 3)] {
+            frames.extend(
+                state
+                    .transform(&json!({"candidates":[{"content":{"parts":[{
+                        "functionCall":{"id":id,"name":"lookup","args":{"q":q}}
+                    }]}}]}))
+                    .unwrap(),
+            );
+        }
+        frames.extend(
+            state
+                .transform(&json!({"candidates":[{"finishReason":"STOP"}]}))
+                .unwrap(),
+        );
+        frames.extend(state.finish_stream().unwrap());
+        let values = json_stream_frames(&frames);
+        let calls = values
+            .iter()
+            .filter_map(|value| value.pointer("/choices/0/delta/tool_calls"))
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter(|call| call.get("id").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            3,
+            "separate Gemini parts must not overwrite the previous call"
+        );
+        for (index, id) in ["call-a", "call-b", "call-c"].into_iter().enumerate() {
+            assert_eq!(calls[index]["index"], index);
+            assert_eq!(calls[index]["id"], id);
+        }
+    }
+
+    #[test]
+    fn antigravity_r4_stream_same_explicit_id_keeps_argument_fragments() {
+        let mut state = GeminiAnthropicState::default();
+        let mut frames = Vec::new();
+        for args in [json!({"q": 1}), json!({"page": 2})] {
+            frames.extend(state.transform(&json!({"candidates":[{"content":{"parts":[{
+                "functionCall":{"id":"call-a","name":"lookup","args":args}
+            }]}}]})));
+        }
+        frames.extend(state.transform(&json!({"candidates":[{"finishReason":"STOP"}]})));
+        frames.extend(state.finish_stream().unwrap());
+        let values = json_stream_frames(&frames);
+        let calls = values
+            .iter()
+            .filter(|value| {
+                value["type"] == "content_block_start"
+                    && value["content_block"]["type"] == "tool_use"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["content_block"]["id"], "call-a");
+        let arguments = values
+            .iter()
+            .filter_map(|value| value.pointer("/delta/partial_json").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            json!({"q":1,"page":2})
+        );
     }
 
     #[test]
@@ -7202,6 +7433,79 @@ mod tests {
             frames.extend(state.transform(&event));
         }
         frames
+    }
+
+    #[test]
+    fn claude_r4_stream_usage_merges_thinking_details() {
+        for (late_details, expected) in [
+            (json!({"accepted_prediction_tokens": 2}), 4),
+            (json!({"thinking_tokens": 0}), 0),
+            (json!({"thinking_tokens": -1}), 4),
+            (json!({"thinking_tokens": "invalid"}), 4),
+            (json!({"reasoning_tokens": 0}), 0),
+        ] {
+            let mut responses =
+                AnthropicResponsesState::new(transforms::ResponsesToolContext::default());
+            let mut chat =
+                AnthropicChatState::new(transforms::ResponsesToolContext::default(), true);
+            let events = [
+                json!({"type": "message_start", "message": {
+                    "id": "msg_claude_r4_stream", "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 13, "output_tokens": 0,
+                        "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2,
+                        "output_tokens_details": {"thinking_tokens": 4, "rejected_prediction_tokens": 1}}
+                }}),
+                json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens_details": late_details}}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 10}}),
+                json!({"type": "message_stop"}),
+                json!({"type": "message_stop"}),
+            ];
+            let mut response_frames = Vec::new();
+            let mut chat_frames = Vec::new();
+            for event in events {
+                response_frames.extend(responses.transform(&event));
+                chat_frames.extend(chat.transform(&event));
+            }
+            let response_usages = response_frames
+                .iter()
+                .filter_map(|frame| {
+                    let transforms::StreamPayload::Json(event) = &frame.payload else {
+                        return None;
+                    };
+                    (event["type"] == "response.completed")
+                        .then(|| event["response"]["usage"].clone())
+                })
+                .collect::<Vec<_>>();
+            let chat_usages = chat_frames
+                .iter()
+                .filter_map(|frame| {
+                    let transforms::StreamPayload::Json(event) = &frame.payload else {
+                        return None;
+                    };
+                    (event["choices"] == json!([]) && event.get("usage").is_some())
+                        .then(|| event["usage"].clone())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(response_usages.len(), 1);
+            assert_eq!(chat_usages.len(), 1);
+            for (usage, key) in [
+                (&response_usages[0], "output_tokens_details"),
+                (&chat_usages[0], "completion_tokens_details"),
+            ] {
+                assert_eq!(usage["total_tokens"], 28);
+                assert_eq!(usage[key]["reasoning_tokens"], expected, "{late_details}");
+                assert_eq!(
+                    usage[key]["rejected_prediction_tokens"], 1,
+                    "{late_details}"
+                );
+                if late_details.get("accepted_prediction_tokens").is_some() {
+                    assert_eq!(usage[key]["accepted_prediction_tokens"], 2);
+                }
+                assert!(usage[key].get("thinking_tokens").is_none());
+            }
+            assert_eq!(done_frame_count(&response_frames), 1);
+            assert_eq!(done_frame_count(&chat_frames), 1);
+        }
     }
 
     #[test]

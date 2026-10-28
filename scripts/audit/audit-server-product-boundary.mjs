@@ -201,11 +201,53 @@ export function stripCfgTestModules(source) {
   }
 }
 
-export function sourceBoundaryViolations(relativePath, source) {
+// Out-of-line modules inherit their crate root's cfg(test). Only recognize
+// explicit declarations in declaration-only crate roots, and revoke exclusion if any
+// other production source names that module or one of its source files. This
+// is deliberately narrower than a general Rust module resolver.
+export function cfgTestExternalSourcePaths(sources) {
+  const excluded = new Set();
+  const declaration = /^#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/gm;
+  const escapePattern = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const crateRoot of ["src/lib.rs", "src/main.rs"]) {
+    const rootSource = stripCfgTestModules(sources[crateRoot] ?? "");
+    // Comments, literals, path attributes or other code need a richer resolver;
+    // do not infer a test-only file from a lookalike declaration inside them.
+    const otherRootCode = rootSource.replace(declaration, "").replace(
+      /^(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;/gm, "",
+    ).trim();
+    if (otherRootCode) continue;
+    for (const match of rootSource.matchAll(declaration)) {
+      const module = match[1];
+      const prefix = `src/${module}/`;
+      const candidates = Object.keys(sources).filter((name) =>
+        name === `src/${module}.rs` || name.startsWith(prefix));
+      if (!sources[`src/${module}.rs`] && !sources[`${prefix}mod.rs`]) continue;
+      const names = new Set([module]);
+      for (const candidate of candidates) {
+        const basename = path.posix.basename(candidate, ".rs");
+        if (basename !== "mod") names.add(basename);
+      }
+      const reference = new RegExp(`\\b(?:${[...names].map(escapePattern).join("|")})\\b`);
+      const productionReference = Object.entries(sources).some(([name, source]) => {
+        if (candidates.includes(name)) return false;
+        const production = stripCfgTestModules(source);
+        const withoutOwnGate = name === crateRoot
+          ? production.slice(0, match.index) + production.slice(match.index + match[0].length)
+          : production;
+        return reference.test(withoutOwnGate);
+      });
+      if (!productionReference) candidates.forEach((name) => excluded.add(name));
+    }
+  }
+  return excluded;
+}
+
+export function sourceBoundaryViolations(relativePath, source, { testOnly = false } = {}) {
   const violations = [];
   const extension = path.extname(relativePath);
   if (extension === ".rs") {
-    const production = stripCfgTestModules(source);
+    const production = testOnly ? "" : stripCfgTestModules(source);
     for (const [label, pattern] of rustRemovedFeaturePatterns) {
       if (pattern.test(production))
         violations.push(`${relativePath}: ${label} symbol`);
@@ -323,8 +365,15 @@ export function auditServerProductBoundary(root = repoRoot) {
       violations.push(`${relativePath}: removed feature file exists`);
     }
   }
+  const rustSources = Object.fromEntries(
+    walkFiles(path.join(root, "src"), new Set([".rs"])).map((absolutePath) => [
+      path.relative(root, absolutePath).replaceAll(path.sep, "/"),
+      fs.readFileSync(absolutePath, "utf8"),
+    ]),
+  );
+  const testOnlyRustFiles = cfgTestExternalSourcePaths(rustSources);
   for (const absolutePath of [
-    ...walkFiles(path.join(root, "src"), new Set([".rs"])),
+    ...Object.keys(rustSources).map((name) => path.join(root, name)),
     ...walkFiles(
       path.join(root, "web-src", "src"),
       new Set([".ts", ".tsx", ".js", ".jsx"]),
@@ -337,6 +386,7 @@ export function auditServerProductBoundary(root = repoRoot) {
       ...sourceBoundaryViolations(
         relativePath,
         fs.readFileSync(absolutePath, "utf8"),
+        { testOnly: testOnlyRustFiles.has(relativePath) },
       ),
     );
   }

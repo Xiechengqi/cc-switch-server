@@ -216,11 +216,26 @@ fn apply_forward_contract_inner(
     let mut thread_mode = None;
     let mut client_class = ClaudeClientClass::ThirdPartyAnthropic;
     if !body.is_empty() {
-        let mut value = serde_json::from_slice(body).map_err(|error| {
+        let mut value: Value = serde_json::from_slice(body).map_err(|error| {
             ProxyError::bad_request(format!(
                 "claude oauth request body must be valid json: {error}"
             ))
         })?;
+        if !is_count_tokens
+            && value
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(claude_model_capability)
+                .is_some_and(|capability| !capability.supports_forced_tool_choice())
+            && value
+                .pointer("/tool_choice/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "any" | "tool"))
+        {
+            return Err(ProxyError::bad_request(
+                "Selected Claude model does not support forced tool_choice; choose auto/none or a model supporting forced tools",
+            ));
+        }
         thread_mode = super::claude_thread_alias::thread_mode_from_value(&value)?;
         let billing_header = claude_billing_header_text_for_prompt(
             first_user_text_for_billing(&value).unwrap_or_default(),
@@ -5186,6 +5201,105 @@ mod tests {
             let output = std::str::from_utf8(&output).unwrap();
             assert!(output.contains("\"name\":\"mcp.server:read\""));
             assert!(output.ends_with("\n\r\n"));
+        }
+    }
+
+    #[test]
+    fn claude_r4_forced_tool_choice_rejects_unsupported_model_without_downgrade() {
+        for model in ["claude-opus-5-5", "claude-opus-5-5[1m]"] {
+            for choice in [json!({"type":"any"}), json!({"type":"tool", "name":"Read"})] {
+                let request = json!({
+                    "model": model, "max_tokens": 64, "thinking": {"type":"adaptive"},
+                    "tool_choice": choice, "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+                    "messages":[{"role":"user","content":"read file"}]
+                });
+                let mut body = Bytes::from(serde_json::to_vec(&request).unwrap());
+                let original = body.clone();
+                let mut url = "https://api.anthropic.com/v1/messages".to_string();
+                let error = apply_forward_contract(
+                    &mut url,
+                    &mut body,
+                    &HeaderMap::new(),
+                    "r4-claude",
+                    false,
+                    None,
+                )
+                .err()
+                .expect("unsupported forced tool choice must fail before forwarding");
+                assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+                assert!(error.message.contains("forced tool_choice"));
+                assert_eq!(body, original);
+
+                apply_count_tokens_forward_contract(
+                    &mut url,
+                    &mut body,
+                    &HeaderMap::new(),
+                    "r4-claude",
+                    false,
+                )
+                .unwrap();
+                let counted: Value = serde_json::from_slice(&body).unwrap();
+                assert!(counted.get("tool_choice").is_none());
+                assert!(counted.get("thinking").is_none());
+                assert_eq!(counted["tools"][0]["name"], "Read");
+            }
+        }
+    }
+
+    #[test]
+    fn claude_r4_tool_choice_preserves_supported_models_and_nonforced_choices() {
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-fable-5-1",
+            "vendor-claude-opus-5-5",
+        ] {
+            let mut url = "https://api.anthropic.com/v1/messages".to_string();
+            let mut body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model":model, "max_tokens":64, "thinking":{"type":"adaptive"},
+                    "tool_choice":{"type":"any"}, "messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"name":"Read","input_schema":{"type":"object"}}]
+                }))
+                .unwrap(),
+            );
+            apply_forward_contract(
+                &mut url,
+                &mut body,
+                &HeaderMap::new(),
+                "r4-claude-allowed",
+                false,
+                None,
+            )
+            .unwrap();
+            let actual: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(actual["tool_choice"]["type"], "any", "{model}");
+            assert!(
+                actual.get("thinking").is_none(),
+                "existing forced-tool compatibility: {model}"
+            );
+        }
+        for choice in ["auto", "none"] {
+            let mut url = "https://api.anthropic.com/v1/messages".to_string();
+            let mut body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model":"claude-opus-5-5", "max_tokens":64, "thinking":{"type":"adaptive"},
+                    "tool_choice":{"type":choice}, "messages":[{"role":"user","content":"hi"}]
+                }))
+                .unwrap(),
+            );
+            apply_forward_contract(
+                &mut url,
+                &mut body,
+                &HeaderMap::new(),
+                "r4-claude-allowed",
+                false,
+                None,
+            )
+            .unwrap();
+            let actual: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(actual["tool_choice"]["type"], choice);
+            assert_eq!(actual["thinking"]["type"], "adaptive");
         }
     }
 

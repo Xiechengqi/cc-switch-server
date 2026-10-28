@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::infra::resident_memory::{
+    process_resident_memory, retained_json_bytes, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 use serde_json::Value;
 
 const CACHE_TTL_MS: i64 = 10 * 60 * 1_000;
@@ -32,12 +35,14 @@ struct PreviousResponseCacheKey {
     response_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreviousResponseCacheEntry {
     items: Vec<Value>,
     bytes: usize,
     expires_at_ms: i64,
     access_sequence: u64,
+    retained_bytes: usize,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +52,16 @@ pub enum PreviousResponseUnavailableReason {
     ByteEvicted,
     EntryTooLarge,
     TooManyItems,
+    MemoryCapacity,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreviousResponseTombstone {
     reason: PreviousResponseUnavailableReason,
     expires_at_ms: i64,
     access_sequence: u64,
+    retained_bytes: usize,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,6 +69,9 @@ pub struct PreviousResponseCacheStats {
     pub current_entries: usize,
     pub current_bytes: usize,
     pub current_tombstones: usize,
+    pub current_retained_bytes: usize,
+    pub high_water_retained_bytes: usize,
+    pub process_capacity_rejections: u64,
     pub high_water_entries: usize,
     pub high_water_bytes: usize,
     pub max_observed_entry_bytes: usize,
@@ -77,21 +88,39 @@ pub struct PreviousResponseCacheStats {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PreviousResponseCacheLookup {
-    pub items: Option<Vec<Value>>,
+pub struct PreviousResponseCacheLookup<T = Vec<Value>> {
+    pub items: Option<T>,
     pub unavailable_reason: Option<PreviousResponseUnavailableReason>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PreviousResponseCache {
     entries: BTreeMap<PreviousResponseCacheKey, PreviousResponseCacheEntry>,
     tombstones: BTreeMap<PreviousResponseCacheKey, PreviousResponseTombstone>,
     total_bytes: usize,
     access_sequence: u64,
     stats: PreviousResponseCacheStats,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for PreviousResponseCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl PreviousResponseCache {
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            total_bytes: 0,
+            access_sequence: 0,
+            stats: PreviousResponseCacheStats::default(),
+            parent,
+        }
+    }
+
     pub fn get(
         &mut self,
         scope: &PreviousResponseCacheScope,
@@ -107,6 +136,18 @@ impl PreviousResponseCache {
         response_id: &str,
         now_ms: i64,
     ) -> PreviousResponseCacheLookup {
+        self.lookup_with(scope, response_id, now_ms, <[Value]>::to_vec)
+    }
+
+    /// Borrow under the cache lock so callers can admit their working set
+    /// before cloning selected items. The callback must not block or reenter.
+    pub fn lookup_with<T>(
+        &mut self,
+        scope: &PreviousResponseCacheScope,
+        response_id: &str,
+        now_ms: i64,
+        prepare: impl FnOnce(&[Value]) -> T,
+    ) -> PreviousResponseCacheLookup<T> {
         self.cleanup(now_ms);
         let Some(key) = cache_key(scope, response_id) else {
             self.stats.invalid_response_id_rejections =
@@ -122,7 +163,7 @@ impl PreviousResponseCache {
             entry.access_sequence = self.access_sequence;
             self.stats.hits = self.stats.hits.saturating_add(1);
             return PreviousResponseCacheLookup {
-                items: Some(entry.items.clone()),
+                items: Some(prepare(&entry.items)),
                 unavailable_reason: None,
             };
         }
@@ -174,6 +215,29 @@ impl PreviousResponseCache {
             );
             return false;
         }
+        let retained_bytes = items.iter().fold(
+            key.retained_bytes::<PreviousResponseCacheEntry>()
+                .saturating_add(
+                    items
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Value>()),
+                ),
+            |bytes, item| {
+                bytes.saturating_add(
+                    retained_json_bytes(item).saturating_sub(std::mem::size_of::<Value>()),
+                )
+            },
+        );
+        let Some(memory) = self.parent.reserve(retained_bytes) else {
+            self.stats.process_capacity_rejections =
+                self.stats.process_capacity_rejections.saturating_add(1);
+            self.mark_tombstone(
+                key,
+                PreviousResponseUnavailableReason::MemoryCapacity,
+                now_ms,
+            );
+            return false;
+        };
         self.tombstones.remove(&key);
         if let Some(previous) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
@@ -216,6 +280,8 @@ impl PreviousResponseCache {
                 bytes,
                 expires_at_ms: now_ms.saturating_add(CACHE_TTL_MS),
                 access_sequence: self.access_sequence,
+                retained_bytes,
+                _memory: memory,
             },
         );
         self.total_bytes = self.total_bytes.saturating_add(bytes);
@@ -257,6 +323,13 @@ impl PreviousResponseCache {
         reason: PreviousResponseUnavailableReason,
         now_ms: i64,
     ) {
+        let retained_bytes = key.retained_bytes::<PreviousResponseTombstone>();
+        let Some(memory) = self.parent.reserve(retained_bytes) else {
+            // Diagnostics are optional. A missing required context remains a
+            // strict miss even when no tombstone can be retained.
+            self.refresh_current_stats();
+            return;
+        };
         self.access_sequence = self.access_sequence.wrapping_add(1);
         self.tombstones.insert(
             key,
@@ -264,6 +337,8 @@ impl PreviousResponseCache {
                 reason,
                 expires_at_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
                 access_sequence: self.access_sequence,
+                retained_bytes,
+                _memory: memory,
             },
         );
         while self.tombstones.len() > TOMBSTONE_MAX_ENTRIES {
@@ -284,8 +359,42 @@ impl PreviousResponseCache {
         self.stats.current_entries = self.entries.len();
         self.stats.current_bytes = self.total_bytes;
         self.stats.current_tombstones = self.tombstones.len();
+        self.stats.current_retained_bytes = self.entries.values().fold(0_usize, |bytes, entry| {
+            bytes.saturating_add(entry.retained_bytes)
+        });
+        self.stats.current_retained_bytes = self
+            .tombstones
+            .values()
+            .fold(self.stats.current_retained_bytes, |bytes, entry| {
+                bytes.saturating_add(entry.retained_bytes)
+            });
+        self.stats.high_water_retained_bytes = self
+            .stats
+            .high_water_retained_bytes
+            .max(self.stats.current_retained_bytes);
         self.stats.high_water_entries = self.stats.high_water_entries.max(self.entries.len());
         self.stats.high_water_bytes = self.stats.high_water_bytes.max(self.total_bytes);
+    }
+}
+
+impl PreviousResponseCacheKey {
+    fn retained_bytes<T>(&self) -> usize {
+        // Include value/key storage and an index allowance. This logical
+        // estimate does not claim allocator or exact B-tree node accounting.
+        [
+            &self.scope.share_id,
+            &self.scope.principal,
+            &self.scope.provider_id,
+            &self.scope.runtime_fingerprint,
+            &self.scope.account_id,
+            &self.scope.workspace_id,
+            &self.response_id,
+        ]
+        .into_iter()
+        .fold(
+            std::mem::size_of::<(Self, T)>().saturating_add(std::mem::size_of::<usize>() * 3),
+            |bytes, value| bytes.saturating_add(value.capacity()),
+        )
     }
 }
 
@@ -306,10 +415,23 @@ fn cache_key(
 }
 
 fn encoded_items_size(items: &[Value]) -> Option<usize> {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("previous response size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     items.iter().try_fold(0_usize, |total, item| {
-        serde_json::to_vec(item)
-            .ok()
-            .and_then(|encoded| total.checked_add(encoded.len()))
+        let mut writer = CountingWriter(0);
+        serde_json::to_writer(&mut writer, item).ok()?;
+        total.checked_add(writer.0)
     })
 }
 
@@ -332,6 +454,58 @@ mod tests {
             credential_fingerprint: [1; 32],
             workspace_id: "workspace-a".to_string(),
         }
+    }
+
+    #[test]
+    fn codex_r4_previous_response_charges_allocations_and_releases_expiry_and_tombstones() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = PreviousResponseCache::with_parent(parent.clone());
+        let base = scope("share-r4", "user-r4");
+        let mut text = String::with_capacity(65_536);
+        text.push_str("short");
+        assert!(cache.insert(base.clone(), "resp-r4", vec![Value::String(text)], 1_000));
+        let retained = parent.snapshot().used_bytes;
+        assert!(retained >= 65_536);
+        assert!(cache.stats().current_bytes < retained);
+        assert_eq!(cache.stats().current_retained_bytes, retained);
+        assert!(cache.get(&base, "resp-r4", 1_000 + CACHE_TTL_MS).is_none());
+        assert!(parent.snapshot().used_bytes < retained);
+        assert!(
+            parent.snapshot().used_bytes > 0,
+            "expiry diagnostic has an owner"
+        );
+        cache.lookup(&base, "missing", 1_000 + CACHE_TTL_MS + TOMBSTONE_TTL_MS);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(cache.insert(
+            base,
+            "resp-next",
+            vec![json!({"call_id":"next"})],
+            2_000_000
+        ));
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
+    }
+
+    #[test]
+    fn codex_r4_previous_response_capacity_denial_preserves_strict_scoped_miss() {
+        let parent = ResidentMemoryBudget::new(Some(0));
+        let mut cache = PreviousResponseCache::with_parent(parent.clone());
+        let base = scope("share-r4", "user-r4");
+        assert!(!cache.insert(
+            base.clone(),
+            "resp-r4",
+            vec![json!({"call_id":"private"})],
+            1_000
+        ));
+        assert!(cache.get(&base, "resp-r4", 1_001).is_none());
+        assert!(cache
+            .get(&scope("share-decoy", "user-r4"), "resp-r4", 1_001)
+            .is_none());
+        assert_eq!(cache.stats().process_capacity_rejections, 1);
+        assert_eq!(cache.stats().current_entries, 0);
+        assert_eq!(cache.stats().current_tombstones, 0);
+        assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
     #[test]

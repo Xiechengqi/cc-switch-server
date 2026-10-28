@@ -961,6 +961,53 @@ assert(
   "Kiro persistence or remote-store boundary changed",
 );
 
+const r4Sources = contract.r4Sources ?? [];
+assert(r4Sources.length === 1, "Kiro R4 committed source missing");
+for (const source of r4Sources) {
+  assert(source.sourceId === "kiro-rs" && commitPattern.test(source.snapshotCommit) &&
+    commitPattern.test(source.snapshotTree) && source.readMode === "read_only_committed_git_objects" &&
+    source.excludedWorktreeEntries === 0 && source.files?.length === 7,
+    "Kiro R4 source identity changed");
+  for (const file of source.files) {
+    safeRelative(file.path, "Kiro R4 source path");
+    assert(digestPattern.test(file.sha256), "Kiro R4 source digest invalid");
+    if (checkSources) {
+      const root = sourceRootById.get(source.sourceId);
+      assert(gitTree(root, source.snapshotCommit) === source.snapshotTree &&
+        sha256(gitFile(root, source.snapshotCommit, file.path, null)) === file.sha256,
+        `Kiro R4 committed object changed: ${file.path}`);
+    }
+  }
+}
+const r4 = contract.r4Reviews ?? [];
+assert(r4.length === 1 && r4[0].id === "R4-KI-01", "Kiro R4 review set changed");
+const review = r4[0];
+assert(review.status === "working_tree_fixture_verified" && Number.isFinite(Date.parse(review.reviewedAt)) &&
+  review.vendorWireChanged === false && review.liveAcceptance === "live_pending" &&
+  review.sharedWork?.includes("R4-CORE-02") &&
+  review.decision === "keep_usage_priority_and_context_subtraction_shadow_extend_local_ownership",
+  "Kiro R4 must preserve usage/live and protocol boundaries");
+assert(commitPattern.test(review.target?.baselineCommit) && review.target.implementationCommit === null &&
+  review.target.readMode === "working_tree" && review.target.validationScope?.includes("excluding_concurrent_Share_Market") &&
+  review.target.contracts?.length === 5, "Kiro R4 target scope changed");
+for (const local of review.target.contracts) {
+  safeRelative(local.path, "Kiro R4 local path");
+  const source = fs.readFileSync(path.join(repoRoot, local.path), "utf8");
+  assert(local.anchors?.length > 0 && local.anchors.every((anchor) => source.includes(anchor)),
+    `Kiro R4 local evidence missing: ${local.path}`);
+}
+assert(review.capacity?.processMode === "observe_only" && review.capacity.cacheEntries === 4096 &&
+  review.capacity.pendingAndInFlightMutations === 8192 && review.capacity.notificationQueue === 2 &&
+  review.capacity.modelCatalogs === 128 && review.capacity.ideVersions === 1 &&
+  review.capacity.modelFreshTtlMs === 300000 && review.capacity.modelMaximumStaleMs === 86400000 &&
+  review.capacity.atomicPublicationAdmission === true && review.capacity.detachedWriterBatchKeepsOwner === true &&
+  review.capacity.failedBatchMergeRequiresNewAdmission === false && review.capacity.memoryOnlyDirtyQueue === false &&
+  review.usage?.authoritativeZeroWins === true && review.usage.contextOutputSubtraction === "shadow_only_live_pending" &&
+  review.usage.inferenceHealthPenaltyForOptionalCachePressure === false &&
+  review.timingInventory?.newMilestoneInstrumentation === false && review.timingInventory.performanceClaim === null &&
+  review.retainedBoundaries?.length === 4 && review.limitations?.length === 4,
+  "Kiro R4 ownership, metering or measurement scope changed");
+
 console.log(
   `kiro reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${receipts.length} pending receipts${
     checkSources ? ", external objects verified" : ", external check optional"

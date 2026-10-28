@@ -813,3 +813,13 @@ requestId, credit, model, client, requestTime, inputTrunc, input, agentPurpose
 ### 拒答分片的非流保真（2026-10-13）
 
 CodeBuddy 流式清洗保留非空 `delta.refusal`；非流聚合现将多段拒答按原顺序拼接为 `choices[0].message.refusal`，并计入请求生命周期内存预算。只含拒答的回答不会因非流聚合而丢失可见内容；`finish_reason` 沿用上游值。固定 decoder→aggregator 反例在旧实现中得到空拒答，修复后保留完整文本。推荐 `cli2api` 的已提交清洗器也保留非空拒答，但其非流聚合未收集此字段；本项是目标 Server 的流/非流语义对齐，不推断两站厂商实际发送形状。出站请求、账号与站点绑定、唯一 `[DONE]`+EOF、receipt schema 和 Intl/CN 真实验收状态不变。
+
+
+## R4：目录与并发发现的本地容量（2026-10-27）
+
+目录使用128项B-tree，8分钟fresh、24小时最大stale与原身份键不变，访问/发布时惰性清理。缓存snapshot共享不可变payload及一份父预算owner，最后引用释放才退账；替换准入失败移除旧目录，当前新结果正常返回且不缓存，不能复活旧模型授权。single-flight最多128个注册，等待者/guard共享owner；新注册预算或数量不足时，在目录fetch前返回`503 / cc_switch_request_memory_exhausted`，不刷新、不重放、不罚账号。进程默认只观测，硬上限需按部署测量启用。逻辑稀疏索引估算不是RSS，控制面fetch/parse/不缓存结果scratch未声称全部归属。
+
+R4-CB-01比较完整客户端tuple后继续使用本仓受审2.142.0及原目录身份。参考新CLI/IDE/Product/Session组合与Global desktop目录UA没有本仓Intl/CN两站真实回执，不能只换版本或把目录模型当成生成接受性。个人CLI的private-data=false保持，企业不扩张；WAF对system/developer/assistant及user/tool/reasoning字串的重写均不采纳。两个站点与CB-N4继续live_pending；现有响应头超时、非认证refresh分类、11148历史修复、唯一DONE+EOF和取消usage保留。没有新增统一milestone或socket-write计量，验证范围见计划§20.8。
+
+
+CORE-03统一观察见增强计划§20.10.7：两站独立send/headers/read和原同账号恢复分attempt记录；sanitize后的文本、推理及实际工具字段才算首内容，空字段/role/usage/finish-only排除。原DONE+EOF、错误锁存、license/limit与恢复合同保持，HTTP仅body handoff，取消和真实末owner释放独立。计时不改变提示词、客户端身份、目录、usage或健康；两站真实验收继续live_pending。

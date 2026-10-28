@@ -556,6 +556,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
             capability_observations: Default::default(),
         }
     }
@@ -577,6 +578,8 @@ mod tests {
         stored.provider.id = provider_id.to_string();
         ProviderExecution {
             quota_source_fence: None,
+            codex_quota_target: None,
+            antigravity_client_identity: None,
             stored,
             plan: Arc::new(ProviderRuntimePlan {
                 provider_key: crate::domain::providers::registry::ProviderKey::new(

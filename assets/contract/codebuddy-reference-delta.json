@@ -105,7 +105,9 @@
       "deltas": [
         {
           "id": "interrupted_tool_round_11148",
-          "commits": ["cdc80d6216d2cd074759843531b9229c925fd247"],
+          "commits": [
+            "cdc80d6216d2cd074759843531b9229c925fd247"
+          ],
           "files": [
             {
               "commit": "cdc80d6216d2cd074759843531b9229c925fd247",
@@ -121,7 +123,9 @@
         },
         {
           "id": "namespace_and_reasoning_history",
-          "commits": ["a9ae393d317c6907b3f3c85fcc3768755e0dde8f"],
+          "commits": [
+            "a9ae393d317c6907b3f3c85fcc3768755e0dde8f"
+          ],
           "files": [
             {
               "commit": "a9ae393d317c6907b3f3c85fcc3768755e0dde8f",
@@ -187,7 +191,9 @@
         },
         {
           "id": "stream_cancellation_fixture",
-          "commits": ["76c4dab3a1cd337107211c298e59c294e1c03312"],
+          "commits": [
+            "76c4dab3a1cd337107211c298e59c294e1c03312"
+          ],
           "files": [
             {
               "commit": "76c4dab3a1cd337107211c298e59c294e1c03312",
@@ -294,7 +300,9 @@
         },
         {
           "id": "responses_incomplete_terminal",
-          "commits": ["f44e887a4fdc3a16017730e0156d6a153077bd60"],
+          "commits": [
+            "f44e887a4fdc3a16017730e0156d6a153077bd60"
+          ],
           "files": [
             {
               "commit": "f44e887a4fdc3a16017730e0156d6a153077bd60",
@@ -320,7 +328,9 @@
         },
         {
           "id": "malformed_arguments_permissive_drop",
-          "commits": ["aeaa4ac5b9d085f3880069cddff270e9947064a4"],
+          "commits": [
+            "aeaa4ac5b9d085f3880069cddff270e9947064a4"
+          ],
           "files": [
             {
               "commit": "aeaa4ac5b9d085f3880069cddff270e9947064a4",
@@ -351,7 +361,9 @@
         },
         {
           "id": "namespace_identity_round_trip",
-          "commits": ["b415dd0460bbf07d58bcb476adc2192f5fe3b4f6"],
+          "commits": [
+            "b415dd0460bbf07d58bcb476adc2192f5fe3b4f6"
+          ],
           "files": [
             {
               "commit": "b415dd0460bbf07d58bcb476adc2192f5fe3b4f6",
@@ -372,7 +384,9 @@
         },
         {
           "id": "custom_tool_round_trip",
-          "commits": ["9f9b66ef60ff97b20cd602475665bc854a7b9cf0"],
+          "commits": [
+            "9f9b66ef60ff97b20cd602475665bc854a7b9cf0"
+          ],
           "files": [
             {
               "commit": "9f9b66ef60ff97b20cd602475665bc854a7b9cf0",
@@ -1963,5 +1977,224 @@
       "deepseekV41Runtime",
       "receiptAutoEnablesCapabilities"
     ]
-  }
+  },
+  "r4Sources": [
+    {
+      "sourceId": "cli2api-head",
+      "snapshotCommit": "c7e4e73f64e661028a235e71306dba54ece48435",
+      "snapshotTree": "06520c39c5061b51704328a1bc94d951d0b56b04",
+      "readMode": "read_only_committed_git_objects",
+      "excludedWorktreeEntries": [
+        "?? proxy.html",
+        "?? proxy.md"
+      ],
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/credential.go",
+          "sha256": "38d151ae0edc0d2d54eb6e7f38689288113355f0060cd2d6d50b5bc84af41fc8",
+          "reviewedAnchors": [
+            "CLIVersion",
+            "DesktopVersionGlobal",
+            "IDEVersion"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/credential_test.go",
+          "sha256": "e018931df60857404190a34ed20026251413ebd8b5517a006bb7436961c1bbe2",
+          "reviewedAnchors": [
+            "TestDecodeCredentialCamelCase"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/headers.go",
+          "sha256": "13c9a213d92e1b336d2a87f85fbd9f12a81521cd1e3e38010528a6ea3f34f4dc",
+          "reviewedAnchors": [
+            "setCLIChannelHeaders",
+            "SetCatalogHeaders",
+            "SetRefreshHeaders",
+            "privateDataHeader"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/ttfb.go",
+          "sha256": "429bf5bc9d42a770b088dcb073dc69e4a479cd387263d0c57eef88cfc2c3eb6a",
+          "reviewedAnchors": [
+            "doWithFirstByteTimeout",
+            "cancelOnCloseBody"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/ttfb_test.go",
+          "sha256": "c588d19b33d6298657c7b35ffd93fd279f54e9d993f065d96f96f15ba82d4111",
+          "reviewedAnchors": [
+            "TestChatStreamKeepsBodyAliveAfterHead"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/client.go",
+          "sha256": "a5896ad5f25cfc498236d10fb242dc6a7ec34c26fa02af1db52b7528c1facd35",
+          "reviewedAnchors": [
+            "Refresh(ctx",
+            "refreshFailureIsAuth"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "376692ba46d81103eba527ee7e1b94171df63849268fe7de3cbc0f6033fe6056",
+          "reviewedAnchors": [
+            "TestCatalogHeadersUseDesktopUAOnlyForGlobal",
+            "TestChatHeadersStayRegionSpecificAndIncludeCLIChannel"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/upstream_align_test.go",
+          "sha256": "f2b9843c465042254e66349a7cefd574b81cd1c5da324625417701463611b0b7",
+          "reviewedAnchors": [
+            "TestChat401RefreshNonAuthSurfacesUnavailable",
+            "TestPrivateDataHeaderModes"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/payload.go",
+          "sha256": "0fcbaebbd9cbe59bcec846b332aee1da7ce2c86c9ebe4b1c59ac86730b9c3d2a",
+          "reviewedAnchors": [
+            "sanitizeWAFKeywords",
+            "sanitizeFingerprintText"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/waf_fingerprint_test.go",
+          "sha256": "3f9c11b3b52756e7861926ab1ea83fc55dcc5cdf02720dffdf6e3fc2e7f96bb0",
+          "reviewedAnchors": [
+            "TestSanitizeWAFIdentityAndGUIRules"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/versions_test.go",
+          "sha256": "b09a248e3ff686b5fca2c1c549bf26e5d505f066df4eb4a87b94451edf072e81",
+          "reviewedAnchors": [
+            "TestClientVersionsAndDesktopUserAgents"
+          ]
+        }
+      ]
+    }
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-CB-01",
+      "sharedWork": [
+        "R4-CORE-02"
+      ],
+      "reviewedAt": "2026-10-27T17:51:39.974868+00:00",
+      "status": "working_tree_fixture_verified",
+      "decision": "keep_reviewed_identity_tuple_and_catalog_authority_extend_local_ownership",
+      "vendorWireChanged": false,
+      "liveAcceptance": "live_pending",
+      "identity": {
+        "currentCliVersion": "2.142.0",
+        "referenceCliVersion": "2.161.0",
+        "referenceGlobalDesktopVersion": "5.8.4",
+        "referenceCnDesktopVersion": "5.8.3",
+        "referenceIdeVersion": "2.168.2",
+        "privateDataPersonalCli": "false",
+        "requestAndSessionHeaderLifecycle": "keep_current_request_id_fanout_no_new_session_identity",
+        "catalogIdentity": "keep_current_reviewed_cli_profile_no_desktop_catalog_inference",
+        "requiresSeparateIntlCnReceipts": true,
+        "wafTextRewriteAdopted": false
+      },
+      "capacity": {
+        "processMode": "observe_only",
+        "catalogEntries": 128,
+        "catalogFlights": 128,
+        "index": "bounded_btree",
+        "freshTtlMs": 480000,
+        "maximumStaleAgeMs": 86400000,
+        "expiry": "lazy_on_lookup_or_publication",
+        "snapshotsSharePayloadAndOwner": true,
+        "rejectedReplacement": "remove_old_authorization_return_current_uncached",
+        "newFlightAdmissionFailure": "local_503_memory_capacity_before_catalog_fetch_no_refresh_or_inference_replay"
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_worktree_excluding_concurrent_Share_Market",
+        "contracts": [
+          {
+            "path": "src/proxy/codebuddy_runtime/resident.rs",
+            "anchors": [
+              "codebuddy_r4_catalog_owner_follows_last_shared_snapshot",
+              "codebuddy_r4_rejected_catalog_replacement_returns_current_without_old_authorization",
+              "codebuddy_r4_authoritative_empty_under_pressure_cannot_revive_previous_models",
+              "codebuddy_r4_catalog_count_and_lazy_expiry_release_index_owners",
+              "codebuddy_r4_catalog_flights_share_waiters_and_keep_last_guard_owner",
+              "codebuddy_r4_active_catalog_flights_are_count_bounded_and_cancelled_waiters_release"
+            ]
+          },
+          {
+            "path": "src/proxy/codebuddy_runtime.rs",
+            "anchors": [
+              "codebuddy_r4_prompt_identity_and_tool_result_text_remain_opaque"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codebuddy_http_tests.rs",
+            "anchors": [
+              "codebuddy_r4_discovery_capacity_rejection_is_local_and_sends_no_requests",
+              "codebuddy_http_fixture_covers_both_sites_all_surfaces_and_response_modes",
+              "codebuddy_downstream_cancel_releases_upstream_before_and_after_done_marker",
+              "codebuddy_both_sites_keep_one_request_budget_across_401_recovery"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/codebuddy.rs",
+            "anchors": [
+              "only_session_dead_invalid_grant_marks_refresh_as_relogin"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "CodeBuddyRuntimeError::MemoryCapacity => ProxyError::request_memory_exhausted()"
+            ]
+          },
+          {
+            "path": "src/state.rs",
+            "anchors": [
+              ".ok_or(CodeBuddyRuntimeError::MemoryCapacity)?"
+            ]
+          },
+          {
+            "path": "src/api/providers.rs",
+            "anchors": [
+              "CodeBuddy local model discovery capacity is exhausted"
+            ]
+          }
+        ]
+      },
+      "timingInventory": {
+        "origin": "existing_shared_forward_attempt_timer_before_CodeBuddy_preparation_after_binding_admission",
+        "firstTokenMs": "existing_first_nonempty_downstream_transform_output_not_successful_socket_write",
+        "responseHeaderTimeout": "existing_independent_send_timeout_dropped_after_headers",
+        "bodyTimeout": "existing_first_wire_chunk_then_idle_timeout",
+        "newMilestoneInstrumentation": false,
+        "successfulSocketWriteMeasurement": false,
+        "performanceClaim": null
+      },
+      "retainedBoundaries": [
+        "Intl_and_CN_personal_accounts_remain_independent_live_pending",
+        "single_bound_account_site_token_generation_fencing",
+        "precommit_single_same_account_401_refresh_only",
+        "unique_DONE_plus_EOF_and_cancellation_usage_tail_unchanged",
+        "CB_N4_v4_1_runtime_disabled_no_catalog_to_generation_inference",
+        "no_WAF_prompt_reasoning_or_tool_body_rewrite"
+      ],
+      "limitations": [
+        "logical_sparse_index_estimates_are_not_RSS",
+        "control_plane_fetch_parse_and_uncached_result_scratch_not_fully_parent_budgeted",
+        "flight_expiry_is_lazy_registry_release_not_background_sweep",
+        "fixtures_do_not_prove_vendor_new_client_tuple_acceptance_or_deployment_capacity"
+      ]
+    }
+  ]
 }

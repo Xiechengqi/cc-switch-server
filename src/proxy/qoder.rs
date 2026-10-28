@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::proxy::request_timing::TimingResult;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
@@ -247,6 +248,15 @@ impl QoderSseDecoder {
         }
         let result = self.push_classified_inner(chunk);
         self.failed |= result.is_err();
+        if result.is_err() {
+            if let Some(timing) = self
+                .request_memory
+                .as_ref()
+                .and_then(RequestMemoryBudget::timing)
+            {
+                timing.observe_terminal(TimingResult::Failed);
+            }
+        }
         result
     }
 
@@ -285,6 +295,15 @@ impl QoderSseDecoder {
         }
         let result = self.finish_classified_inner();
         self.failed |= result.is_err();
+        if result.is_err() {
+            if let Some(timing) = self
+                .request_memory
+                .as_ref()
+                .and_then(RequestMemoryBudget::timing)
+            {
+                timing.observe_terminal(TimingResult::Failed);
+            }
+        }
         result
     }
 
@@ -308,6 +327,13 @@ impl QoderSseDecoder {
             )));
         }
         self.complete = true;
+        if let Some(timing) = self
+            .request_memory
+            .as_ref()
+            .and_then(RequestMemoryBudget::timing)
+        {
+            timing.observe_terminal(TimingResult::Complete);
+        }
         let output_capacity = projected_vec_capacity(
             0,
             0,
@@ -477,6 +503,13 @@ impl QoderSseDecoder {
             self.saw_tool_calls |= tool_calls;
             if let Some(id) = self.canonical_chat_id.as_ref() {
                 canonical["id"] = Value::String(id.clone());
+            }
+            if let Some(timing) = self
+                .request_memory
+                .as_ref()
+                .and_then(RequestMemoryBudget::timing)
+            {
+                timing.observe_chat_value(&canonical);
             }
             let canonical = serde_json::to_vec(&canonical).map_err(|error| {
                 ProxyError::bad_gateway(format!("encode Qoder SSE body: {error}"))

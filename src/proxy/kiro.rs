@@ -13,6 +13,7 @@ use crate::proxy::request_memory::{
     retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
     RequestMemoryReservation,
 };
+use crate::proxy::request_timing::{ForwardTiming, TimingResult, WaitKind};
 use crate::proxy::{ProxyError, ProxyRoute};
 use base64::Engine;
 use bytes::Bytes;
@@ -1970,6 +1971,7 @@ fn canonical_prompt_cache_value(value: &Value) -> Value {
 
 #[derive(Default)]
 struct SseBuilder {
+    timing: Option<ForwardTiming>,
     message_id: String,
     model: String,
     tool_name_registry: KiroToolNameRegistry,
@@ -1991,6 +1993,13 @@ struct SseBuilder {
 }
 
 impl SseBuilder {
+    fn observed_sse(&self, event: &str, value: Value) -> Bytes {
+        if let Some(timing) = &self.timing {
+            timing.observe_anthropic_value(&value);
+        }
+        sse(event, value)
+    }
+
     fn new(model: String, tool_name_map: HashMap<String, String>) -> Self {
         let context_window = context_window_size(&model);
         Self::new_with_registry(
@@ -2027,7 +2036,7 @@ impl SseBuilder {
     }
 
     fn initial(&self) -> Bytes {
-        sse(
+        self.observed_sse(
             "message_start",
             json!({
                 "type": "message_start",
@@ -2076,13 +2085,13 @@ impl SseBuilder {
             let index = self.next_index;
             self.next_index += 1;
             self.text_index = Some(index);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_start",
                 json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
             ));
             index
         };
-        out.push(sse(
+        out.push(self.observed_sse(
             "content_block_delta",
             json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
         ));
@@ -2104,7 +2113,7 @@ impl SseBuilder {
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
             let index = self.text_index.unwrap_or(0);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":index}),
             ));
@@ -2112,11 +2121,11 @@ impl SseBuilder {
         out.extend(self.stop_thinking_block());
         let index = self.next_index;
         self.next_index += 1;
-        out.push(sse(
+        out.push(self.observed_sse(
             "content_block_start",
             json!({"type":"content_block_start","index":index,"content_block":{"type":"redacted_thinking","data":data}}),
         ));
-        out.push(sse(
+        out.push(self.observed_sse(
             "content_block_stop",
             json!({"type":"content_block_stop","index":index}),
         ));
@@ -2132,7 +2141,7 @@ impl SseBuilder {
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
             if let Some(index) = self.text_index {
-                out.push(sse(
+                out.push(self.observed_sse(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":index}),
                 ));
@@ -2148,13 +2157,13 @@ impl SseBuilder {
             let index = self.next_index;
             self.next_index += 1;
             self.thinking_index = Some(index);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_start",
                 json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}),
             ));
             index
         };
-        out.push(sse(
+        out.push(self.observed_sse(
             "content_block_delta",
             json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
         ));
@@ -2199,7 +2208,7 @@ impl SseBuilder {
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
             let index = self.text_index.unwrap_or(0);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":index}),
             ));
@@ -2212,7 +2221,7 @@ impl SseBuilder {
             self.next_index += 1;
             self.tool_indices.insert(id.clone(), index);
             self.tool_names.insert(id.clone(), name.clone());
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_start",
                 json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
             ));
@@ -2225,7 +2234,7 @@ impl SseBuilder {
                 message: error.to_string(),
             })?;
         if input != "{}" {
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_delta",
                 json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}),
             ));
@@ -2233,7 +2242,7 @@ impl SseBuilder {
         self.output_tokens += estimate_tokens(&name) + estimate_tokens(&input);
         self.seen_tool_signatures
             .insert(tool_signature(&name, &parsed_input));
-        out.push(sse(
+        out.push(self.observed_sse(
             "content_block_stop",
             json!({"type":"content_block_stop","index":index}),
         ));
@@ -2266,7 +2275,7 @@ impl SseBuilder {
             if self.text_index.is_some() && !self.text_stopped {
                 self.text_stopped = true;
                 let index = self.text_index.unwrap_or(0);
-                out.push(sse(
+                out.push(self.observed_sse(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":index}),
                 ));
@@ -2279,18 +2288,18 @@ impl SseBuilder {
                 self.tool_indices.len() + 1
             );
             self.tool_indices.insert(id.clone(), index);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_start",
                 json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":leaked.name,"input":{}}}),
             ));
             let input = serde_json::to_string(&leaked.input).unwrap_or_else(|_| "{}".to_string());
             if input != "{}" {
-                out.push(sse(
+                out.push(self.observed_sse(
                     "content_block_delta",
                     json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}),
                 ));
             }
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":index}),
             ));
@@ -2299,7 +2308,7 @@ impl SseBuilder {
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
             let index = self.text_index.unwrap_or(0);
-            out.push(sse(
+            out.push(self.observed_sse(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":index}),
             ));
@@ -2317,7 +2326,7 @@ impl SseBuilder {
             "cache_creation_input_tokens":usage.cache_creation_tokens
         });
         usage.apply_metering_fields(&mut usage_json);
-        out.push(sse(
+        out.push(self.observed_sse(
             "message_delta",
             json!({
                 "type":"message_delta",
@@ -2325,7 +2334,7 @@ impl SseBuilder {
                 "usage":usage_json
             }),
         ));
-        out.push(sse("message_stop", json!({"type":"message_stop"})));
+        out.push(self.observed_sse("message_stop", json!({"type":"message_stop"})));
         out
     }
 
@@ -2406,7 +2415,7 @@ impl SseBuilder {
             .take()
             .unwrap_or_else(|| THINKING_SIGNATURE_FALLBACK.to_string());
         vec![
-            sse(
+            self.observed_sse(
                 "content_block_delta",
                 json!({
                     "type":"content_block_delta",
@@ -2417,7 +2426,7 @@ impl SseBuilder {
                     }
                 }),
             ),
-            sse(
+            self.observed_sse(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":index}),
             ),
@@ -3019,9 +3028,11 @@ fn kiro_event_stream_to_anthropic_sse(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let prompt_cache_usage = prompt_cache_usage?;
+        let timing = request_memory.as_ref().and_then(RequestMemoryBudget::timing);
         let mut decoder = wire::EventStreamDecoder::strict();
         let mut builder = SseBuilder::new_with_registry(model, tool_name_registry, context_window);
         builder.set_prompt_cache_usage(prompt_cache_usage);
+        builder.timing = timing.clone();
         let stream_memory = request_memory
             .map(|budget| KiroStreamMemory::new(budget, &decoder, &builder))
             .transpose()?;
@@ -3036,6 +3047,7 @@ fn kiro_event_stream_to_anthropic_sse(
         let mut saw_complete_frame = false;
         let mut saw_end = false;
         loop {
+            let read_wait = timing.as_ref().map(|timing| timing.wait(WaitKind::UpstreamRead));
             let next = if let Some(deadline) = read_deadline {
                 tokio::select! {
                     biased;
@@ -3047,6 +3059,7 @@ fn kiro_event_stream_to_anthropic_sse(
             } else {
                 Ok(stream.next().await)
             }?;
+            drop(read_wait);
             let Some(chunk) = next else {
                 break;
             };
@@ -3077,6 +3090,7 @@ fn kiro_event_stream_to_anthropic_sse(
                     .map_err(|error| kiro_stream_io_error(error.into()))?;
                 let output = if matches!(&event, wire::Event::End) {
                     saw_end = true;
+                    if let Some(timing) = &timing { timing.observe_terminal(TimingResult::Complete); }
                     Vec::new()
                 } else {
                     process_event_to_sse(&mut builder, event).map_err(kiro_stream_io_error)?
@@ -3118,6 +3132,7 @@ fn kiro_event_stream_to_anthropic_sse(
                 .map_err(|error| kiro_stream_io_error(error.into()))?;
             let output = if matches!(&event, wire::Event::End) {
                 saw_end = true;
+                if let Some(timing) = &timing { timing.observe_terminal(TimingResult::Complete); }
                 Vec::new()
             } else {
                 process_event_to_sse(&mut builder, event).map_err(kiro_stream_io_error)?
@@ -4127,6 +4142,7 @@ mod tests {
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
         }
     }
 
@@ -6686,6 +6702,137 @@ mod tests {
             .any(|chunk| String::from_utf8_lossy(chunk).contains("message_stop")));
     }
 
+    struct KiroR4UpstreamDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for KiroR4UpstreamDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn kiro_r4_observed_upstream(
+        receiver: tokio::sync::mpsc::Receiver<Bytes>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send {
+        futures_util::stream::unfold(
+            (receiver, KiroR4UpstreamDrop(dropped)),
+            |(mut receiver, owner)| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|bytes| (Ok(bytes), (receiver, owner)))
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn kiro_r4_stream_cancel_drops_upstream_but_output_bytes_keep_their_owner() {
+        use crate::infra::resident_memory::ResidentMemoryBudget;
+        let parent = ResidentMemoryBudget::new(None);
+        let budget = RequestMemoryBudget::with_parent(8 * 1024 * 1024, parent.clone());
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let upstream = kiro_r4_observed_upstream(receiver, dropped.clone());
+        let mut stream = Box::pin(kiro_event_stream_to_anthropic_sse(
+            upstream,
+            "claude-sonnet-4-8".to_string(),
+            KiroToolNameRegistry::default(),
+            Ok(KiroPromptCacheUsage::default()),
+            None,
+            None,
+            1_000_000,
+            Some(budget.clone()),
+        ));
+        let initial = stream.next().await.unwrap().unwrap();
+        sender
+            .send(Bytes::from(fixture_event_frame(
+                "assistantResponseEvent",
+                &json!({"content":"retained output"}),
+            )))
+            .await
+            .unwrap();
+        let output = stream.next().await.unwrap().unwrap();
+        drop(stream);
+        drop(budget);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(initial);
+        drop(output);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(sender.send(Bytes::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn kiro_r4_stream_eof_truncation_and_idle_timeout_release_parent_owners() {
+        use crate::infra::resident_memory::ResidentMemoryBudget;
+        for case in ["eof", "truncated", "idle_timeout"] {
+            let parent = ResidentMemoryBudget::new(None);
+            let budget = RequestMemoryBudget::with_parent(8 * 1024 * 1024, parent.clone());
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            sender
+                .send(Bytes::from(fixture_event_frame(
+                    "assistantResponseEvent",
+                    &json!({"content":"bounded stream"}),
+                )))
+                .await
+                .unwrap();
+            let mut sender = Some(sender);
+            match case {
+                "eof" => {
+                    sender
+                        .as_ref()
+                        .unwrap()
+                        .send(Bytes::from(fixture_event_frame("endEvent", &json!({}))))
+                        .await
+                        .unwrap();
+                    drop(sender.take());
+                }
+                "truncated" => {
+                    sender
+                        .as_ref()
+                        .unwrap()
+                        .send(Bytes::copy_from_slice(
+                            &fixture_event_frame(
+                                "assistantResponseEvent",
+                                &json!({"content":"late"}),
+                            )[..10],
+                        ))
+                        .await
+                        .unwrap();
+                    drop(sender.take());
+                }
+                _ => {}
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                kiro_event_stream_to_anthropic_sse(
+                    kiro_r4_observed_upstream(receiver, dropped.clone()),
+                    "claude-sonnet-4-8".to_string(),
+                    KiroToolNameRegistry::default(),
+                    Ok(KiroPromptCacheUsage::default()),
+                    None,
+                    Some(Duration::from_millis(10)),
+                    1_000_000,
+                    Some(budget.clone()),
+                )
+                .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.iter().any(Result::is_err), case != "eof", "{case}");
+            let has_stop = output
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .any(|bytes| String::from_utf8_lossy(bytes).contains("message_stop"));
+            assert_eq!(has_stop, case == "eof", "{case}");
+            assert!(dropped.load(std::sync::atomic::Ordering::Acquire), "{case}");
+            drop(output);
+            drop(budget);
+            assert_eq!(parent.snapshot().used_bytes, 0, "{case}");
+        }
+    }
+
     #[test]
     fn detects_terminal_kiro_client_validation_reasons() {
         assert!(is_client_validation_error(
@@ -6981,5 +7128,57 @@ mod tests {
         out.push(7);
         out.extend_from_slice(&(value.len() as u16).to_be_bytes());
         out.extend_from_slice(value.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod core03_timing_tests {
+    use super::*;
+    use crate::proxy::request_timing::TimingSlot;
+    use std::time::Instant;
+
+    #[test]
+    fn kiro_core03_builder_observes_only_normalized_content_and_completed_tools() {
+        let make = || {
+            let slot = TimingSlot::default();
+            let timing = slot
+                .begin_for_provider(ProviderType::KiroOAuth, "messages", Instant::now())
+                .unwrap();
+            let mut builder = SseBuilder::new(
+                "fixture".into(),
+                HashMap::from([("search".into(), "search".into())]),
+            );
+            builder.timing = Some(timing.clone());
+            (builder, timing)
+        };
+        let (mut builder, timing) = make();
+        builder.initial();
+        builder.usage_event(
+            "metadataEvent",
+            &json!({"tokenUsage":{"inputTokens":0,"outputTokens":0}}),
+        );
+        assert!(builder.assistant_delta("").is_empty());
+        assert!(builder
+            .reasoning_delta(&json!({"signature":"opaque"}))
+            .is_empty());
+        assert!(builder
+            .tool_delta("call", "search", "{\"q\":", false)
+            .unwrap()
+            .is_empty());
+        assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+        assert!(!builder
+            .tool_delta("call", "search", "\"hello\"}", true)
+            .unwrap()
+            .is_empty());
+        assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_number());
+        for redacted in [false, true] {
+            let (mut builder, timing) = make();
+            if redacted {
+                builder.redacted_thinking_block("opaque");
+            } else {
+                builder.thinking_delta("reasoning");
+            }
+            assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_number());
+        }
     }
 }

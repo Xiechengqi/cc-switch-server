@@ -37,6 +37,7 @@ pub(super) struct UpstreamTerminalDetector {
     terminal: Option<UpstreamTerminal>,
     max_event_bytes: usize,
     responses: Option<ResponsesTransportDecoder>,
+    timing: Option<super::request_timing::ForwardTiming>,
 }
 
 impl UpstreamTerminalDetector {
@@ -47,6 +48,7 @@ impl UpstreamTerminalDetector {
         };
         Self {
             format,
+            timing: None,
             pending: Vec::new(),
             terminal: None,
             max_event_bytes,
@@ -57,6 +59,10 @@ impl UpstreamTerminalDetector {
                 )
             }),
         }
+    }
+
+    pub(super) fn set_timing(&mut self, timing: Option<super::request_timing::ForwardTiming>) {
+        self.timing = timing;
     }
 
     pub(super) fn max_event_bytes(&self) -> usize {
@@ -113,7 +119,7 @@ impl UpstreamTerminalDetector {
             }
             let event = self.pending[..event_end].to_vec();
             self.pending.drain(..event_end + delimiter_len);
-            if let Some(terminal) = event_terminal(self.format, &event) {
+            if let Some(terminal) = event_terminal(self.format, &event, self.timing.as_ref()) {
                 self.terminal = Some(terminal);
                 self.pending.clear();
                 return Ok(());
@@ -163,7 +169,11 @@ fn value_terminal(format: UpstreamFormat, value: &Value) -> Option<UpstreamTermi
     }
 }
 
-fn event_terminal(format: UpstreamFormat, event: &[u8]) -> Option<UpstreamTerminal> {
+fn event_terminal(
+    format: UpstreamFormat,
+    event: &[u8],
+    timing: Option<&super::request_timing::ForwardTiming>,
+) -> Option<UpstreamTerminal> {
     let Ok(text) = std::str::from_utf8(event) else {
         return None;
     };
@@ -192,7 +202,7 @@ fn event_terminal(format: UpstreamFormat, event: &[u8]) -> Option<UpstreamTermin
     }
     payload
         .as_deref()
-        .and_then(|payload| payload_terminal(format, payload))
+        .and_then(|payload| payload_terminal(format, payload, timing))
 }
 
 fn declared_event_terminal(format: UpstreamFormat, event: &str) -> Option<UpstreamTerminal> {
@@ -215,17 +225,28 @@ fn declared_event_terminal(format: UpstreamFormat, event: &str) -> Option<Upstre
     }
 }
 
-fn payload_terminal(format: UpstreamFormat, payload: &str) -> Option<UpstreamTerminal> {
+fn payload_terminal(
+    format: UpstreamFormat,
+    payload: &str,
+    timing: Option<&super::request_timing::ForwardTiming>,
+) -> Option<UpstreamTerminal> {
     if payload == "[DONE]" {
         return (format == UpstreamFormat::OpenAiChat).then_some(UpstreamTerminal::Completed);
     }
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return None;
     };
+    if let Some(timing) = timing {
+        match format {
+            UpstreamFormat::AnthropicMessages => timing.observe_anthropic_value(&value),
+            UpstreamFormat::GeminiNative => timing.observe_gemini_value(&value),
+            _ => {}
+        }
+    }
     value_terminal(format, &value)
 }
 
-fn gemini_terminal(value: &Value) -> bool {
+pub(super) fn gemini_terminal(value: &Value) -> bool {
     let value = value.get("response").unwrap_or(value);
     value
         .pointer("/promptFeedback/blockReason")

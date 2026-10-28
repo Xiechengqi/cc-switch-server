@@ -567,11 +567,30 @@ pub(super) fn inspect_json_document(
     body: &[u8],
     count_tokens: bool,
 ) -> Result<AnthropicJsonObservation, AnthropicProtocolError> {
+    inspect_json_document_with_timing(body, count_tokens, None)
+}
+
+pub(super) fn inspect_json_document_with_timing(
+    body: &[u8],
+    count_tokens: bool,
+    timing: Option<&super::request_timing::ForwardTiming>,
+) -> Result<AnthropicJsonObservation, AnthropicProtocolError> {
     let value = serde_json::from_slice::<Value>(body).map_err(|error| {
         AnthropicProtocolError::new(format!("Anthropic body is not valid JSON: {error}"))
     })?;
+    inspect_json_value_with_timing(&value, count_tokens, timing)
+}
+
+pub(super) fn inspect_json_value_with_timing(
+    value: &Value,
+    count_tokens: bool,
+    timing: Option<&super::request_timing::ForwardTiming>,
+) -> Result<AnthropicJsonObservation, AnthropicProtocolError> {
     if value.get("type").and_then(Value::as_str) == Some("error") {
-        return Ok(AnthropicJsonObservation::Error(anthropic_error(&value)));
+        if let Some(timing) = timing {
+            timing.observe_terminal(super::request_timing::TimingResult::Failed);
+        }
+        return Ok(AnthropicJsonObservation::Error(anthropic_error(value)));
     }
     if count_tokens {
         let valid = value.get("input_tokens").and_then(Value::as_u64).is_some();
@@ -581,7 +600,15 @@ pub(super) fn inspect_json_document(
             ));
         }
     } else {
-        validate_message(&value)?;
+        validate_message(value)?;
+    }
+    if let Some(timing) = timing {
+        if count_tokens {
+            timing.mark(super::request_timing::Milestone::FirstSemantic);
+        } else {
+            timing.observe_anthropic_value(value);
+        }
+        timing.observe_terminal(super::request_timing::TimingResult::Complete);
     }
     Ok(AnthropicJsonObservation::Success)
 }

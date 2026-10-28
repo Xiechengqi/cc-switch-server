@@ -208,6 +208,25 @@ pub fn resolve_share_source_with_coding(
 }
 
 pub fn account_observation(account: &Account) -> Option<QuotaWindowObservation> {
+    if account.provider_type == ProviderType::CodexOAuth {
+        if let Some(observation) = account
+            .codex_passive_quota
+            .as_ref()
+            .filter(|passive| passive.auth_identity_generation == account.auth_identity_generation)
+            .and_then(|passive| passive.snapshot.weekly_observation())
+            .filter(|observation| {
+                observation.observed_at_ms > account.quota_refreshed_at.unwrap_or(-1)
+            })
+        {
+            let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            if observation.observed_at_ms <= now.saturating_add(300_000)
+                && now <= observation.observed_at_ms.saturating_add(30 * 60 * 1000)
+                && observation.ends_at_ms > now
+            {
+                return Some(observation);
+            }
+        }
+    }
     if account.provider_type == ProviderType::ClaudeOAuth {
         if let Some(passive) = account
             .quota_window_observations

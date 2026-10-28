@@ -11534,6 +11534,7 @@ mod tests {
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
         }
     }
 }

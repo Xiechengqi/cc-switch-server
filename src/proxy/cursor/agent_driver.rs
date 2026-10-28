@@ -43,6 +43,7 @@ use super::super::forwarder::{
 use super::super::request_memory::{
     retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryReservation,
 };
+use super::super::request_timing::{Milestone, TimingResult, TimingSlot, WaitKind};
 use super::super::router::ProxyRoute;
 use super::super::usage::{log_usage, update_stream_usage};
 use super::super::{setting, ProxyError};
@@ -140,6 +141,7 @@ pub struct AgentServiceForwardOptions {
     pub runtime_fingerprint: String,
     pub timeouts: CursorH2Timeouts,
     pub request_memory: Option<RequestMemoryBudget>,
+    pub(in crate::proxy) timing: TimingSlot,
 }
 
 enum CursorCredential {
@@ -213,6 +215,7 @@ struct CursorAttemptContext {
     binding: BindingSnapshot,
     rail: String,
     request_memory: Option<RequestMemoryBudget>,
+    timing: Option<TimingSlot>,
 }
 
 impl CursorAttemptContext {
@@ -240,7 +243,26 @@ impl CursorAttemptContext {
             binding,
             rail,
             request_memory,
+            timing: None,
         })
+    }
+
+    fn begin_retry(&self, stored: &StoredProvider) {
+        let Some(slot) = self.timing.as_ref() else {
+            return;
+        };
+        let Some(previous) = slot.get() else {
+            return;
+        };
+        // Preserve the original fixed surface across same-binding recovery.
+        if let Some(timing) =
+            slot.begin_for_provider(stored.provider_type, previous.surface(), Instant::now())
+        {
+            if let Some(budget) = self.request_memory.as_ref() {
+                budget.set_timing(timing.clone());
+            }
+            timing.mark(Milestone::Admission);
+        }
     }
 
     async fn reserve(
@@ -864,6 +886,11 @@ async fn drive_semantic_attempts(
                 },
             });
         }
+        let retry_wait = attempt_context
+            .timing
+            .as_ref()
+            .and_then(TimingSlot::get)
+            .map(|timing| timing.wait(WaitKind::Retry));
         semantic_attempt += 1;
         if let Some(memory) = active_plan_memory.as_ref() {
             memory
@@ -916,6 +943,8 @@ async fn drive_semantic_attempts(
         };
         conversation_generation = conversation_generation.saturating_add(1);
         let retry_session_key = new_semantic_retry_session_key(&session_key, rail);
+        drop(retry_wait);
+        attempt_context.begin_retry(stored);
         let opened = match acquire_ready_session(
             &retry_context,
             &retry_session_key,
@@ -1042,6 +1071,7 @@ pub async fn forward_agentservice(
         runtime_fingerprint,
         timeouts,
         request_memory,
+        timing,
     } = options;
     let mut request_context = request_context;
     request_context.usage_estimated = true;
@@ -1288,6 +1318,7 @@ pub async fn forward_agentservice(
         request_memory.clone(),
     )
     .await?;
+    attempt_context.timing = Some(timing);
     let session_open_context = CursorSessionOpenContext {
         state: &state,
         stored: &stored,
@@ -1677,6 +1708,9 @@ async fn stream_response(
         .with_custom_tool_names(custom_tool_names)
         .with_response_tool_namespaces(response_tool_namespaces);
     let start_events = writer.start_events();
+    let timing = request_memory
+        .as_ref()
+        .and_then(RequestMemoryBudget::timing);
     let response_memory = request_memory
         .map(CursorResponseMemory::new)
         .transpose()
@@ -1900,7 +1934,7 @@ async fn stream_response(
             {
                 Ok(ExecHandling::Continue) => {}
                 Ok(ExecHandling::ToolCall(tool_call)) => {
-                    if let Err(error) = mark_session_business_output(&session_entry).await {
+                    if let Err(error) = mark_session_business_output(&session_entry, true).await {
                         final_status = error.status.as_u16();
                         final_stream_status = cursor_stream_status_for_error(&error);
                         close_failed_cursor_stream_session(&state, &session_entry).await;
@@ -2060,7 +2094,7 @@ async fn stream_response(
                     writer.has_response_content(),
                 );
                 if business_output {
-                    if let Err(error) = mark_session_business_output(&session_entry).await {
+                    if let Err(error) = mark_session_business_output(&session_entry, writer.has_response_content()).await {
                         final_status = error.status.as_u16();
                         final_stream_status = cursor_stream_status_for_error(&error);
                         ended = true;
@@ -2123,7 +2157,7 @@ async fn stream_response(
                             for event in cursor_stream_error_events(&mut writer, &error) {
                                 yield Ok::<_, std::io::Error>(Bytes::from(event));
                             }
-                        } else if let Err(error) = mark_session_business_output(&session_entry).await {
+                        } else if let Err(error) = mark_session_business_output(&session_entry, writer.has_response_content()).await {
                             final_status = error.status.as_u16();
                             final_stream_status = cursor_stream_status_for_error(&error);
                             close_failed_cursor_stream_session(&state, &session_entry).await;
@@ -2177,6 +2211,13 @@ async fn stream_response(
             }
             done_events = cursor_stream_error_events(&mut writer, &error);
             done_events.extend(writer.done_events());
+        }
+        if let Some(timing) = &timing {
+            timing.observe_terminal(if final_stream_status == "completed" {
+                TimingResult::Complete
+            } else {
+                TimingResult::Failed
+            });
         }
         for event in done_events {
             yield Ok::<_, std::io::Error>(Bytes::from(event));
@@ -2409,6 +2450,13 @@ async fn stream_semantic_response(
             }
         };
 
+        if let Some(timing) = request_memory.as_ref().and_then(RequestMemoryBudget::timing) {
+            timing.observe_terminal(if final_stream_status == "completed" {
+                TimingResult::Complete
+            } else {
+                TimingResult::Failed
+            });
+        }
         for event in events {
             let bytes = match response_memory.as_ref() {
                 Some(memory) => memory.own_buffered_event(event),
@@ -2549,7 +2597,7 @@ async fn drive_non_stream(
         match handle_exec_event(state, &session_entry, &mut exec_dedup, exec_event).await? {
             ExecHandling::Continue => {}
             ExecHandling::ToolCall(tool_call) => {
-                mark_session_business_output(&session_entry).await?;
+                mark_session_business_output(&session_entry, true).await?;
                 let tool_name = tool_call.name.clone();
                 if custom_tool_names
                     .iter()
@@ -2580,6 +2628,9 @@ async fn drive_non_stream(
                     .transpose()
                     .map_err(|error| error.into_proxy_error())?
                     .unwrap_or(body);
+                if let Some(timing) = request_memory.and_then(RequestMemoryBudget::timing) {
+                    timing.observe_terminal(TimingResult::Complete);
+                }
                 return Ok(DriveOutcome::Parked {
                     body,
                     usage: writer_usage(&writer),
@@ -2620,7 +2671,8 @@ async fn drive_non_stream(
                         &buffered_events,
                     )?;
                     if business_output {
-                        mark_session_business_output(&session_entry).await?;
+                        mark_session_business_output(&session_entry, writer.has_response_content())
+                            .await?;
                     }
                 }
                 CursorDeltaOutcome::TurnEnded(events) => {
@@ -2628,7 +2680,8 @@ async fn drive_non_stream(
                     if !writer.has_response_content() {
                         return Err(cursor_empty_response_error(rail));
                     }
-                    mark_session_business_output(&session_entry).await?;
+                    mark_session_business_output(&session_entry, writer.has_response_content())
+                        .await?;
                     buffered_events.extend(writer.done_events());
                     sync_cursor_response_memory(
                         response_memory.as_ref(),
@@ -2649,6 +2702,9 @@ async fn drive_non_stream(
                         .transpose()
                         .map_err(|error| error.into_proxy_error())?
                         .unwrap_or(body);
+                    if let Some(timing) = request_memory.and_then(RequestMemoryBudget::timing) {
+                        timing.observe_terminal(TimingResult::Complete);
+                    }
                     return Ok(DriveOutcome::Completed {
                         body,
                         usage: writer_usage(&writer),
@@ -2663,7 +2719,7 @@ async fn drive_non_stream(
             cursor_kv_terminal_events(rail, kv_terminal_candidate, &mut writer, &mut filter)?
         {
             buffered_events.extend(events);
-            mark_session_business_output(&session_entry).await?;
+            mark_session_business_output(&session_entry, writer.has_response_content()).await?;
             buffered_events.extend(writer.done_events());
             sync_cursor_response_memory(
                 response_memory.as_ref(),
@@ -2684,6 +2740,9 @@ async fn drive_non_stream(
                 .transpose()
                 .map_err(|error| error.into_proxy_error())?
                 .unwrap_or(body);
+            if let Some(timing) = request_memory.and_then(RequestMemoryBudget::timing) {
+                timing.observe_terminal(TimingResult::Complete);
+            }
             return Ok(DriveOutcome::Completed {
                 body,
                 usage: writer_usage(&writer),
@@ -3458,6 +3517,11 @@ async fn acquire_or_open_session(
                 match action {
                     CursorAgentServiceAuthAction::UseResponse => return Err(error),
                     CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                        let wait = attempt_context
+                            .timing
+                            .as_ref()
+                            .and_then(TimingSlot::get)
+                            .map(|timing| timing.wait(WaitKind::Retry));
                         recover_cursor_unauthorized(
                             context.state,
                             context.stored,
@@ -3477,6 +3541,8 @@ async fn acquire_or_open_session(
                         .await?;
                         active_session_key =
                             rekey_cursor_session(&active_session_key, refreshed_scope);
+                        drop(wait);
+                        attempt_context.begin_retry(context.stored);
                     }
                 }
             }
@@ -3538,6 +3604,11 @@ async fn acquire_ready_session(
                 return Ok(opened);
             }
             CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                let wait = attempt_context
+                    .timing
+                    .as_ref()
+                    .and_then(TimingSlot::get)
+                    .map(|timing| timing.wait(WaitKind::Retry));
                 context
                     .state
                     .cursor_sessions
@@ -3561,6 +3632,8 @@ async fn acquire_ready_session(
                 )
                 .await?;
                 let refreshed_key = rekey_cursor_session(&opened.key, refreshed_scope);
+                drop(wait);
+                attempt_context.begin_retry(context.stored);
                 opened =
                     acquire_or_open_session(context, &refreshed_key, None, attempt_context).await?;
             }
@@ -3948,6 +4021,7 @@ async fn close_failed_cursor_stream_session(
 
 async fn mark_session_business_output(
     session_entry: &Arc<tokio::sync::Mutex<CursorSession>>,
+    has_content: bool,
 ) -> Result<(), ProxyError> {
     let mut session = session_entry.lock().await;
     let stream = session
@@ -3955,6 +4029,11 @@ async fn mark_session_business_output(
         .as_mut()
         .ok_or_else(|| ProxyError::conflict("Cursor AgentService session has no live h2 stream"))?;
     stream.mark_business_output();
+    if has_content {
+        if let Some(timing) = stream.timing() {
+            timing.mark(Milestone::FirstSemantic);
+        }
+    }
     Ok(())
 }
 
@@ -4410,6 +4489,9 @@ async fn close_unusable_continuation_session(
                     }
                     super::session::CursorContinuationClaimError::CapacityExhausted => {
                         ProxyError::cursor_continuation_claim_capacity_exhausted()
+                    }
+                    super::session::CursorContinuationClaimError::MemoryCapacityExhausted => {
+                        ProxyError::request_memory_exhausted()
                     }
                 });
             }
@@ -5009,7 +5091,9 @@ impl Drop for CursorStreamInterruptGuard {
                 TokenUsage::default(),
             )
             .await;
-            record_provider_outcome(&state, &stored, provider_outcome).await;
+            if let Some(provider_outcome) = provider_outcome {
+                record_provider_outcome(&state, &stored, provider_outcome).await;
+            }
             if let Some(entry) = session_entry {
                 state
                     .cursor_sessions
@@ -5023,16 +5107,17 @@ impl Drop for CursorStreamInterruptGuard {
 fn cursor_stream_drop_classification(
     parked_handoff: bool,
     status_code: u16,
-) -> (&'static str, ProviderOutcome) {
+) -> (&'static str, Option<ProviderOutcome>) {
     if parked_handoff {
-        ("completed", ProviderOutcome::from_status(status_code))
+        ("completed", Some(ProviderOutcome::from_status(status_code)))
     } else {
-        ("interrupted", ProviderOutcome::NetworkFailure)
+        ("client_cancelled", None)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    include!("core03_timing_tests.rs");
     use super::*;
     use crate::proxy::cursor::agent_proto::McpToolDef;
     use futures_util::StreamExt;
@@ -7108,12 +7193,107 @@ mod tests {
     fn parked_stream_handoff_is_not_classified_as_a_network_interruption() {
         assert_eq!(
             cursor_stream_drop_classification(true, 200),
-            ("completed", ProviderOutcome::Success { status_code: 200 })
+            (
+                "completed",
+                Some(ProviderOutcome::Success { status_code: 200 })
+            )
         );
         assert_eq!(
             cursor_stream_drop_classification(false, 200),
-            ("interrupted", ProviderOutcome::NetworkFailure)
+            ("client_cancelled", None)
         );
+        assert_eq!(
+            cursor_stream_provider_outcome(502, "failed"),
+            ProviderOutcome::NetworkFailure
+        );
+        assert_eq!(
+            cursor_stream_provider_outcome(429, "failed"),
+            ProviderOutcome::RateLimited { status_code: 429 }
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_review_downstream_drop_records_cancelled_usage_and_closes_real_session() {
+        for rail in [CursorProtocolRail::OAuthCli, CursorProtocolRail::ApiKeySdk] {
+            let state = cursor_stream_test_state("r4-cancel-guard");
+            let config_dir = state.config_dir.clone();
+            let provider_type = match rail {
+                CursorProtocolRail::OAuthCli => ProviderType::CursorOAuth,
+                CursorProtocolRail::ApiKeySdk => ProviderType::CursorApiKey,
+            };
+            let stored = cursor_endpoint_provider(provider_type, json!({}));
+            let key =
+                CursorSessionKey::new(CursorSessionScope::fixture("r4-cancel"), "conversation");
+            let entry = state
+                .cursor_sessions
+                .reserve(
+                    key.clone(),
+                    rail,
+                    HashMap::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    "/workspace".into(),
+                )
+                .await
+                .unwrap();
+            let lease = state
+                .account_in_flight
+                .try_acquire(provider_type, "account", 1)
+                .unwrap();
+            let response = stream_response(
+                state.clone(),
+                stored,
+                entry.clone(),
+                key.clone(),
+                super::super::protocol::CursorResponseFormat::AnthropicMessages,
+                "model".into(),
+                1,
+                UsageLogContext::default(),
+                Instant::now(),
+                UsageModelMetadata::default(),
+                Some(lease),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            assert!(!body.next().await.unwrap().unwrap().is_empty());
+            assert!(state.cursor_sessions.has(&key).await);
+            drop(body);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let usage = state.usage_snapshot().await;
+                    let cancelled = usage.logs.last().is_some_and(|log| {
+                        log.stream_status.as_deref() == Some("client_cancelled")
+                            && log.outcome == crate::domain::usage::store::UsageOutcome::Interrupted
+                    });
+                    if cancelled && !state.cursor_sessions.has(&key).await {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel guard completes usage and releases session");
+            assert_eq!(entry.lock().await.state, SessionState::Closed);
+            assert_eq!(
+                state
+                    .account_in_flight
+                    .snapshot()
+                    .current(provider_type, "account"),
+                0
+            );
+            assert_eq!(state.usage_snapshot().await.logs.len(), 1);
+            assert_eq!(
+                cursor_stream_drop_classification(false, 200),
+                ("client_cancelled", None)
+            );
+            drop(entry);
+            drop(state);
+            std::fs::remove_dir_all(config_dir).unwrap();
+        }
     }
 
     #[test]
@@ -7420,7 +7600,7 @@ async fn cached_cursor_api_key_token(
     if let Some(token) = state.cursor_api_key_tokens.get(&scope, now).await {
         return Ok(token);
     }
-    let _flight = state.cursor_api_key_tokens.lock(&scope).await;
+    let _flight = state.cursor_api_key_tokens.lock(&scope).await?;
     let now = crate::infra::time::now_ms() as i64;
     ensure_cursor_api_key_auth_cooldown_elapsed(state, &scope, now).await?;
     if let Some(token) = state.cursor_api_key_tokens.get(&scope, now).await {

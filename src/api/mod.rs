@@ -1868,6 +1868,10 @@ fn qoder_runtime_api_error(error: crate::state::QoderRuntimeError) -> ApiError {
         crate::state::QoderRuntimeError::IdentityChanged => {
             ApiError::conflict("Qoder Provider or Account identity changed during model discovery")
         }
+        crate::state::QoderRuntimeError::MemoryCapacity => ApiError::service_unavailable_code(
+            "cc_switch_request_memory_exhausted",
+            "Local process memory capacity is exhausted",
+        ),
         crate::state::QoderRuntimeError::CredentialPersistenceDegraded => {
             ApiError::service_unavailable_code(
                 "qoder_credential_persistence_degraded",
@@ -2028,7 +2032,11 @@ async fn append_cursor_api_key_models(
             if let Some(catalog) = state.cursor_model_catalogs.fresh(&scope, now).await {
                 (Some(catalog), false)
             } else {
-                let _flight = state.cursor_model_catalogs.lock(&scope).await;
+                let Ok(_flight) = state.cursor_model_catalogs.lock(&scope).await else {
+                    // Local process capacity cannot authorize a stale model or
+                    // start an unaccounted discovery request.
+                    continue;
+                };
                 if let Some(catalog) = state.cursor_model_catalogs.fresh(&scope, now).await {
                     (Some(catalog), false)
                 } else {
@@ -5994,14 +6002,26 @@ async fn ephemeral_image_file(
         validate_router_share_surface(&state, &headers, AppKind::Codex)
             .await
             .map_err(|error| {
-                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id, error)
+                InferenceApiError::proxy(InferenceSurface::OpenAi, request_id.clone(), error)
             })?;
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    let image = match state.image_capability(token).await {
+    let mode = if method == Method::HEAD {
+        crate::image_store::ImageCapabilityRead::Head
+    } else {
+        crate::image_store::ImageCapabilityRead::Body
+    };
+    let image = match state.image_capability(token, mode).await {
         Ok(Some(image)) => image,
         Ok(None) => return Ok(StatusCode::NOT_FOUND.into_response()),
+        Err(error) if error.is::<crate::image_store::ImageCapabilityCapacityError>() => {
+            return Err(InferenceApiError::proxy(
+                InferenceSurface::OpenAi,
+                request_id,
+                proxy::ProxyError::request_memory_exhausted(),
+            ));
+        }
         Err(error) => {
             tracing::error!(error = %error, "image capability read failed");
             return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -6010,7 +6030,7 @@ async fn ephemeral_image_file(
     let body = if method == Method::HEAD {
         Body::empty()
     } else {
-        Body::from(image.data.clone())
+        Body::from(image.data)
     };
     let mut response = Response::new(body);
     response.headers_mut().insert(
@@ -6022,7 +6042,7 @@ async fn ephemeral_image_file(
     );
     response.headers_mut().insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&image.data.len().to_string())
+        HeaderValue::from_str(&image.byte_length.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     response.headers_mut().insert(

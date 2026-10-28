@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::domain::accounts::store::Account;
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 pub const GROK_MODELS_URL: &str = "https://cli-chat-proxy.grok.com/v1/models";
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -75,14 +78,69 @@ impl GrokModelCatalogFailure {
 
 #[derive(Debug, Clone)]
 struct CachedCatalog {
-    models: Vec<String>,
-    capabilities: BTreeMap<String, GrokModelCapability>,
-    source_url: String,
-    etag: Option<String>,
+    models: Arc<Vec<String>>,
+    capabilities: Arc<BTreeMap<String, GrokModelCapability>>,
+    source_url: Arc<str>,
+    etag: Option<Arc<str>>,
     fetched_at: Instant,
     fresh_for: Duration,
     fetched_at_ms: i64,
     request_revision: u64,
+    _memory: Option<ResidentMemoryReservation>,
+}
+
+fn catalog_retained_bytes(scope: &GrokModelCatalogScope, catalog: &CachedCatalog) -> usize {
+    let mut bytes = std::mem::size_of::<(GrokModelCatalogScope, CachedCatalog)>()
+        .saturating_add(std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12);
+    for value in [
+        &scope.app,
+        &scope.provider_id,
+        &scope.runtime_fingerprint,
+        &scope.account_id,
+    ] {
+        bytes = bytes.saturating_add(value.capacity());
+    }
+    bytes = bytes
+        .saturating_add(
+            catalog
+                .models
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(catalog.models.iter().map(String::capacity).sum::<usize>())
+        .saturating_add(catalog.source_url.len())
+        .saturating_add(catalog.etag.as_ref().map_or(0, |value| value.len()))
+        .saturating_add(std::mem::size_of::<usize>() * 8);
+    for (model, capability) in catalog.capabilities.iter() {
+        bytes = bytes
+            .saturating_add(
+                std::mem::size_of::<(String, GrokModelCapability)>()
+                    .saturating_add(std::mem::size_of::<usize>() * 2)
+                    .saturating_mul(12),
+            )
+            .saturating_add(model.capacity())
+            .saturating_add(
+                capability
+                    .reasoning_efforts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                capability
+                    .reasoning_efforts
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                capability
+                    .default_reasoning_effort
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            );
+    }
+    bytes
 }
 
 static REQUEST_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -109,7 +167,16 @@ fn publish_catalog(
     entries: &mut BTreeMap<GrokModelCatalogScope, CachedCatalog>,
     scope: &GrokModelCatalogScope,
     catalog: CachedCatalog,
-) -> bool {
+) -> Result<bool, GrokModelCatalogFailure> {
+    publish_catalog_with_parent(entries, scope, catalog, &process_resident_memory())
+}
+
+fn publish_catalog_with_parent(
+    entries: &mut BTreeMap<GrokModelCatalogScope, CachedCatalog>,
+    scope: &GrokModelCatalogScope,
+    mut catalog: CachedCatalog,
+    parent: &ResidentMemoryBudget,
+) -> Result<bool, GrokModelCatalogFailure> {
     let same_owner = |candidate: &GrokModelCatalogScope| {
         candidate.app == scope.app
             && candidate.provider_id == scope.provider_id
@@ -135,7 +202,7 @@ fn publish_catalog(
                     && cached.request_revision > catalog.request_revision))
     });
     if superseded {
-        return false;
+        return Ok(false);
     }
     entries.retain(|candidate, _| {
         if !same_owner(candidate) {
@@ -156,6 +223,19 @@ fn publish_catalog(
         candidate_generation > incoming_generation
             || (candidate_generation == incoming_generation && candidate != scope)
     });
+    if catalog._memory.is_none() {
+        catalog._memory = Some(
+            parent
+                .reserve(catalog_retained_bytes(scope, &catalog))
+                .ok_or_else(|| {
+                    GrokModelCatalogFailure::new(
+                        503,
+                        false,
+                        "Grok model catalog exceeded local process memory capacity",
+                    )
+                })?,
+        );
+    }
     entries.insert(scope.clone(), catalog);
     while entries.len() > MAX_CACHED_CATALOGS {
         let Some(oldest) = entries
@@ -167,7 +247,7 @@ fn publish_catalog(
         };
         entries.remove(&oldest);
     }
-    true
+    Ok(true)
 }
 
 pub async fn catalog_revision_is_current(scope: &GrokModelCatalogScope, revision: u64) -> bool {
@@ -296,7 +376,7 @@ async fn fetch_catalog(
         cached.request_revision = request_revision;
         let result = catalog_from_cache(&cached, "upstream_not_modified", false);
         let mut entries = cache().lock().await;
-        if !publish_catalog(&mut entries, scope, cached) {
+        if !publish_catalog(&mut entries, scope, cached)? {
             return Err(GrokModelCatalogFailure::new(
                 409,
                 false,
@@ -376,16 +456,17 @@ async fn fetch_catalog(
             &mut entries,
             scope,
             CachedCatalog {
-                models: models.clone(),
-                capabilities: capabilities.clone(),
-                source_url: source_url.clone(),
-                etag,
+                models: Arc::new(models.clone()),
+                capabilities: Arc::new(capabilities.clone()),
+                source_url: source_url.clone().into(),
+                etag: etag.map(Into::into),
                 fetched_at: Instant::now(),
                 fresh_for: ttl,
                 fetched_at_ms,
                 request_revision,
+                _memory: None,
             },
-        ) {
+        )? {
             return Err(GrokModelCatalogFailure::new(
                 409,
                 false,
@@ -430,10 +511,10 @@ fn catalog_from_cache(
     stale: bool,
 ) -> GrokModelCatalog {
     GrokModelCatalog {
-        models: cached.models.clone(),
-        capabilities: cached.capabilities.clone(),
+        models: cached.models.as_ref().clone(),
+        capabilities: cached.capabilities.as_ref().clone(),
         source,
-        source_url: cached.source_url.clone(),
+        source_url: cached.source_url.to_string(),
         stale,
         fetched_at_ms: Some(cached.fetched_at_ms),
         request_revision: cached.request_revision,
@@ -616,6 +697,60 @@ mod tests {
         }
     }
 
+    fn resident_catalog() -> CachedCatalog {
+        CachedCatalog {
+            models: Arc::new(vec!["grok-resident-model".into()]),
+            capabilities: Arc::new(BTreeMap::new()),
+            source_url: "https://example.test/models".into(),
+            etag: Some("etag-resident".into()),
+            fetched_at: Instant::now(),
+            fresh_for: DEFAULT_CACHE_TTL,
+            fetched_at_ms: 1,
+            request_revision: 1,
+            _memory: None,
+        }
+    }
+
+    #[test]
+    fn grok_r4_catalog_snapshot_shares_payload_and_retains_its_resident_owner() {
+        let parent = ResidentMemoryBudget::new(None);
+        let scope = scope("resident-catalog", 1);
+        let mut entries = BTreeMap::new();
+        assert!(
+            publish_catalog_with_parent(&mut entries, &scope, resident_catalog(), &parent).unwrap()
+        );
+        let held = entries.get(&scope).unwrap().clone();
+        let used = parent.snapshot().used_bytes;
+        assert!(used > 0);
+        assert!(Arc::ptr_eq(&held.models, &entries[&scope].models));
+        assert!(Arc::ptr_eq(
+            &held.capabilities,
+            &entries[&scope].capabilities
+        ));
+        drop(entries);
+        assert_eq!(parent.snapshot().used_bytes, used);
+        drop(held);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn grok_r4_catalog_capacity_rejection_removes_superseded_authorization() {
+        let parent = ResidentMemoryBudget::new(None);
+        let scope = scope("capacity-catalog", 1);
+        let mut entries = BTreeMap::new();
+        assert!(
+            publish_catalog_with_parent(&mut entries, &scope, resident_catalog(), &parent).unwrap()
+        );
+        parent.configure_limit(Some(0));
+        let error = publish_catalog_with_parent(&mut entries, &scope, resident_catalog(), &parent)
+            .unwrap_err();
+        assert_eq!(error.status_code, 503);
+        assert!(!error.is_unauthorized());
+        assert!(!error.retryable);
+        assert!(entries.is_empty());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
     #[test]
     fn catalog_publication_prioritizes_account_lifecycle_over_request_order() {
         let old = scope("publication-order", 1);
@@ -628,30 +763,31 @@ mod tests {
             ..old.clone()
         };
         let cached = |revision| CachedCatalog {
-            models: vec!["model".to_string()],
-            capabilities: BTreeMap::new(),
-            source_url: "https://example.test/models".to_string(),
+            models: Arc::new(vec!["model".to_string()]),
+            capabilities: Arc::new(BTreeMap::new()),
+            source_url: "https://example.test/models".into(),
             etag: None,
             fetched_at: Instant::now(),
             fresh_for: DEFAULT_CACHE_TTL,
             fetched_at_ms: 1,
             request_revision: revision,
+            _memory: None,
         };
         let mut entries = BTreeMap::new();
-        assert!(publish_catalog(&mut entries, &refreshed, cached(2)));
-        assert!(!publish_catalog(&mut entries, &old, cached(100)));
-        assert!(publish_catalog(&mut entries, &recreated, cached(1)));
-        assert!(!publish_catalog(&mut entries, &refreshed, cached(200)));
-        assert!(!publish_catalog(&mut entries, &recreated, cached(0)));
-        assert!(publish_catalog(&mut entries, &recreated, cached(3)));
+        assert!(publish_catalog(&mut entries, &refreshed, cached(2)).unwrap());
+        assert!(!publish_catalog(&mut entries, &old, cached(100)).unwrap());
+        assert!(publish_catalog(&mut entries, &recreated, cached(1)).unwrap());
+        assert!(!publish_catalog(&mut entries, &refreshed, cached(200)).unwrap());
+        assert!(!publish_catalog(&mut entries, &recreated, cached(0)).unwrap());
+        assert!(publish_catalog(&mut entries, &recreated, cached(3)).unwrap());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries.get(&recreated).unwrap().request_revision, 3);
         let updated_provider = GrokModelCatalogScope {
             provider_revision: 2,
             ..recreated.clone()
         };
-        assert!(publish_catalog(&mut entries, &updated_provider, cached(4)));
-        assert!(!publish_catalog(&mut entries, &recreated, cached(1000)));
+        assert!(publish_catalog(&mut entries, &updated_provider, cached(4)).unwrap());
+        assert!(!publish_catalog(&mut entries, &recreated, cached(1000)).unwrap());
         assert!(entries.contains_key(&updated_provider));
     }
 
@@ -663,33 +799,30 @@ mod tests {
             ..first.clone()
         };
         let cached = |revision: u64| CachedCatalog {
-            models: vec![format!("model-{revision}")],
-            capabilities: BTreeMap::new(),
+            models: Arc::new(vec![format!("model-{revision}")]),
+            capabilities: Arc::new(BTreeMap::new()),
             source_url: "https://example.test/models".into(),
             etag: None,
             fetched_at: Instant::now(),
             fresh_for: DEFAULT_CACHE_TTL,
             fetched_at_ms: revision as i64,
             request_revision: revision,
+            _memory: None,
         };
         let mut entries = BTreeMap::new();
-        assert!(publish_catalog(&mut entries, &first, cached(1)));
-        assert!(publish_catalog(&mut entries, &second, cached(2)));
+        assert!(publish_catalog(&mut entries, &first, cached(1)).unwrap());
+        assert!(publish_catalog(&mut entries, &second, cached(2)).unwrap());
         assert_eq!(entries.len(), 2);
         assert!(entries.contains_key(&first));
         assert!(entries.contains_key(&second));
-        assert!(publish_catalog(&mut entries, &first, cached(3)));
+        assert!(publish_catalog(&mut entries, &first, cached(3)).unwrap());
         assert!(entries.contains_key(&second));
         for index in 3..=MAX_CACHED_CATALOGS + 1 {
             let variant = GrokModelCatalogScope {
                 request_identity_fingerprint: [index as u8; 32],
                 ..first.clone()
             };
-            assert!(publish_catalog(
-                &mut entries,
-                &variant,
-                cached(index as u64 + 1)
-            ));
+            assert!(publish_catalog(&mut entries, &variant, cached(index as u64 + 1)).unwrap());
         }
         assert_eq!(entries.len(), MAX_CACHED_CATALOGS);
         assert!(!entries.contains_key(&second));

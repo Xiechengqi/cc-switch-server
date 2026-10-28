@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use super::resident::entry_bytes;
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 use crate::proxy::request_memory::{
     retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
     RequestMemoryReservation,
@@ -78,7 +82,7 @@ struct Key {
     response_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry {
     items: Vec<Value>,
     conversation_id: String,
@@ -86,6 +90,7 @@ struct Entry {
     bytes: usize,
     expires_at_ms: i64,
     access_sequence: u64,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Debug, Clone)]
@@ -115,12 +120,27 @@ struct Inner {
     access_sequence: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CursorCompletedResponseStore {
     inner: Mutex<Inner>,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for CursorCompletedResponseStore {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl CursorCompletedResponseStore {
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            parent,
+        }
+    }
+
+    #[cfg(test)]
     pub fn get(
         &self,
         scope: &CursorResponseScope,
@@ -238,6 +258,29 @@ impl CursorCompletedResponseStore {
         if let Some(previous) = inner.entries.remove(&key) {
             inner.total_bytes = inner.total_bytes.saturating_sub(previous.bytes);
         }
+        let retained = items.iter().fold(
+            entry_bytes::<Key, Entry>(
+                key.scope
+                    .0
+                    .capacity()
+                    .saturating_add(key.response_id.capacity())
+                    .saturating_add(conversation_id.len())
+                    .saturating_add(local_task_state.origin_turn_digest.capacity())
+                    .saturating_add(
+                        items
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Value>()),
+                    ),
+            ),
+            |bytes, item| {
+                bytes.saturating_add(
+                    retained_json_bytes(item).saturating_sub(std::mem::size_of::<Value>()),
+                )
+            },
+        );
+        let Some(memory) = self.parent.reserve(retained) else {
+            return false;
+        };
         while inner.entries.len() >= MAX_ENTRIES
             || inner.total_bytes.saturating_add(bytes) > MAX_BYTES
         {
@@ -264,6 +307,7 @@ impl CursorCompletedResponseStore {
                 bytes,
                 expires_at_ms: now_ms.saturating_add(TTL_MS),
                 access_sequence,
+                _memory: memory,
             },
         );
         inner.total_bytes = inner.total_bytes.saturating_add(bytes);
@@ -285,11 +329,29 @@ fn cache_key(scope: &CursorResponseScope, response_id: &str) -> Option<Key> {
 }
 
 fn encoded_size(items: &[Value]) -> Option<usize> {
-    items.iter().try_fold(0usize, |total, item| {
-        serde_json::to_vec(item)
-            .ok()
-            .and_then(|encoded| total.checked_add(encoded.len()))
-    })
+    // Counting must not allocate a second, potentially huge serialized copy
+    // before the cache's entry/process admission has even run.
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|total| *total <= MAX_ENTRY_BYTES)
+                .ok_or_else(|| {
+                    std::io::Error::other("Cursor cache entry exceeds its byte limit")
+                })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    for item in items {
+        serde_json::to_writer(&mut counter, item).ok()?;
+    }
+    Some(counter.0)
 }
 
 fn cleanup(inner: &mut Inner, now_ms: i64) {
@@ -324,6 +386,117 @@ mod tests {
             user_email: Some("USER@example.com"),
             workspace_id: "/workspace",
         })
+    }
+
+    #[test]
+    fn cursor_r4_completed_cache_and_request_copy_have_separate_parent_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let store = CursorCompletedResponseStore::with_parent(parent.clone());
+        let scope = scope("retained-owner");
+        assert!(store.insert(
+            scope.clone(),
+            "resp-a",
+            "conversation-a",
+            vec![json!({"content":"x".repeat(4096)})],
+            CursorLocalTaskState::default(),
+            1_000
+        ));
+        let stored_bytes = parent.snapshot().used_bytes;
+        assert!(stored_bytes > 4096);
+        let request = RequestMemoryBudget::with_parent(64 * 1024, parent.clone());
+        let (copy, memory) = store
+            .get_accounted(&scope, "resp-a", 1_001, Some(&request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent.snapshot().used_bytes,
+            stored_bytes + request.snapshot().used_bytes
+        );
+        assert!(request.snapshot().used_bytes > 4096);
+        assert!(store.get(&scope, "resp-a", 1_000 + TTL_MS).is_none());
+        assert_eq!(parent.snapshot().used_bytes, request.snapshot().used_bytes);
+        assert_eq!(copy.conversation_id, "conversation-a");
+        drop((copy, memory));
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn cursor_r4_completed_cache_pressure_rejects_without_evicting_another_scope() {
+        let parent = ResidentMemoryBudget::new(None);
+        let store = CursorCompletedResponseStore::with_parent(parent.clone());
+        let scope = scope("pressure");
+        let insert = |id, conversation| {
+            store.insert(
+                scope.clone(),
+                id,
+                conversation,
+                vec![json!({"content":"cached"})],
+                CursorLocalTaskState::default(),
+                1_000,
+            )
+        };
+        assert!(insert("resp-a", "conversation-a"));
+        let used = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(used));
+        assert!(!insert("resp-b", "conversation-b"));
+        assert!(store.get(&scope, "resp-b", 1_001).is_none());
+        assert_eq!(
+            store.get(&scope, "resp-a", 1_001).unwrap().conversation_id,
+            "conversation-a"
+        );
+        assert_eq!(parent.snapshot().used_bytes, used);
+        parent.configure_limit(Some(0));
+        assert!(!insert("resp-a", "conversation-new"));
+        assert!(store.get(&scope, "resp-a", 1_001).is_none());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn cursor_r4_completed_cache_count_eviction_and_drop_release_parent() {
+        let parent = ResidentMemoryBudget::new(None);
+        let store = CursorCompletedResponseStore::with_parent(parent.clone());
+        let scope = scope("eviction");
+        for index in 0..=MAX_ENTRIES {
+            assert!(store.insert(
+                scope.clone(),
+                &format!("resp-{index}"),
+                "conversation",
+                vec![json!({"content":"cached"})],
+                CursorLocalTaskState::default(),
+                1_000
+            ));
+        }
+        assert!(store.get(&scope, "resp-0", 1_001).is_none());
+        assert_eq!(parent.snapshot().active_reservations, MAX_ENTRIES);
+        drop(store);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
+    }
+
+    #[test]
+    fn cursor_r4_completed_size_counter_bounds_escaped_json_before_admission() {
+        let small = vec![json!({"content":"\0\"\\\n🦀"})];
+        assert_eq!(
+            encoded_size(&small),
+            Some(serde_json::to_vec(&small[0]).unwrap().len())
+        );
+        // Each NUL expands to six JSON bytes. Raw text fits the entry cap,
+        // while the serialized form plus object syntax exceeds it.
+        let items = vec![json!({"content":"\0".repeat(MAX_ENTRY_BYTES / 6)})];
+        assert!(items[0]["content"].as_str().unwrap().len() < MAX_ENTRY_BYTES);
+        assert!(encoded_size(&items).is_none());
+        let parent = ResidentMemoryBudget::new(Some(0));
+        let store = CursorCompletedResponseStore::with_parent(parent.clone());
+        assert!(!store.insert(
+            scope("escaped"),
+            "resp",
+            "conversation",
+            items,
+            CursorLocalTaskState::default(),
+            1_000
+        ));
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().rejections, 0);
     }
 
     #[test]

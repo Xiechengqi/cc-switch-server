@@ -32,6 +32,7 @@ mod forwarder;
 mod gemini_grounding;
 mod grok;
 pub(crate) mod grok_replay;
+mod grok_timing;
 pub(crate) mod kimi;
 pub(crate) mod kimi_runtime;
 pub(crate) mod kiro;
@@ -50,7 +51,10 @@ pub(crate) mod reasoning_bridge;
 mod remote_image;
 mod request_governance;
 mod request_memory;
+mod request_timing;
 mod response_semantics;
+mod responses_phase;
+mod responses_tool_identity;
 mod responses_transport;
 mod responses_wire;
 mod retry_policy;
@@ -354,7 +358,7 @@ impl ProxyError {
         }
     }
 
-    pub(super) fn request_memory_exhausted() -> Self {
+    pub(crate) fn request_memory_exhausted() -> Self {
         Self {
             status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
             message: format!(

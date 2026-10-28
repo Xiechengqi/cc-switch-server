@@ -3972,6 +3972,10 @@ fn codebuddy_runtime_api_error(error: crate::state::CodeBuddyRuntimeError) -> Ap
                 "CodeBuddy credentials are waiting for durable persistence",
             )
         }
+        crate::state::CodeBuddyRuntimeError::MemoryCapacity => ApiError::service_unavailable_code(
+            "cc_switch_request_memory_exhausted",
+            "CodeBuddy local model discovery capacity is exhausted",
+        ),
         crate::state::CodeBuddyRuntimeError::InvalidAccount(message) => {
             ApiError::bad_request(message)
         }
@@ -8462,6 +8466,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn antigravity_r4_publication_fences_client_changes_and_persisted_observations() {
+        use crate::domain::accounts::capability_evidence::{
+            account_capability_projections, AccountCapabilityFreshness,
+            AccountCapabilityObservationState, AccountCapabilityState, MODEL_CAPACITY_DIMENSION,
+            MODEL_CATALOG_DIMENSION,
+        };
+        use crate::domain::antigravity_identity::{
+            antigravity_client_identity, TestAntigravityIdentity,
+        };
+        for rail in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let versions = TestAntigravityIdentity::new("2.2.1");
+            versions.scope(async {
+                let state = provider_api_test_state(&format!("r4-ag-publish-{}",rail.as_str()));
+                let snapshot = state.mutate_accounts_immediate(move |accounts| accounts.upsert(
+                    serde_json::from_value(json!({"id":"r4-ag-publish","providerType":rail.as_str(),"accessToken":"bound-token","authIdentityGeneration":1,"raw":{"projectId":"bound-project"}})).unwrap()
+                )).await.unwrap();
+                let (_,incarnation) = state.find_antigravity_account_with_incarnation(rail,&snapshot.id).await.unwrap();
+                let old = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                    descriptors:Vec::new(),source:"authenticated_fetch_available_models",source_url:"https://example.test/models".to_string(),
+                    stale:false,fetched_at_ms:chrono::Utc::now().timestamp_millis(),request_revision:1,client_identity:antigravity_client_identity()
+                };
+                assert!(state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&old).await.unwrap());
+                let current = state.find_account_for_provider(rail,&snapshot.id).await.unwrap();
+                let plan = account_capability_projections(&current,old.fetched_at_ms).pop().unwrap();
+                assert_eq!(plan.dimensions[MODEL_CATALOG_DIMENSION].state,AccountCapabilityState::Unsupported);
+                assert_eq!(plan.dimensions[MODEL_CATALOG_DIMENSION].freshness,AccountCapabilityFreshness::Fresh);
+                versions.update("2.3.4");
+                let encoded = serde_json::to_value(&current).unwrap();
+                let restored = serde_json::from_value(encoded).unwrap();
+                let plan = account_capability_projections(&restored,old.fetched_at_ms).pop().unwrap();
+                assert_eq!(plan.dimensions[MODEL_CATALOG_DIMENSION].freshness,AccountCapabilityFreshness::Superseded);
+                assert!(!state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&old).await.unwrap());
+                let old_stale = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {stale:true,..old.clone()};
+                assert!(!state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&old_stale).await.unwrap());
+                let new = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
+                    request_revision:2,client_identity:antigravity_client_identity(),..old.clone()
+                };
+                assert!(state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&new).await.unwrap());
+                let late = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {request_revision:u64::MAX,..old.clone()};
+                assert!(!state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&late).await.unwrap());
+                let unchanged = state.find_account_for_provider(rail,&snapshot.id).await.unwrap().capability_observations;
+                let stale_new = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {stale:true,..new.clone()};
+                assert!(state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&stale_new).await.unwrap());
+                assert_eq!(state.find_account_for_provider(rail,&snapshot.id).await.unwrap().capability_observations,unchanged);
+                let observation = || crate::state::CurrentAccountCapabilityObservation {
+                    provider_type:rail,auth_identity_generation:snapshot.auth_identity_generation,state:AccountCapabilityObservationState::Unsupported,
+                    source:"google_rpc_error",reason:Some("model_capacity"),expires_at_ms:None,
+                };
+                assert!(!state.record_antigravity_capability_observation_for_client_if_current(&snapshot,incarnation,MODEL_CAPACITY_DIMENSION,observation(),&old.client_identity).await.unwrap());
+                assert!(state.record_antigravity_capability_observation_for_client_if_current(&snapshot,incarnation,MODEL_CAPACITY_DIMENSION,observation(),&new.client_identity).await.unwrap());
+                let latest = state.find_account_for_provider(rail,&snapshot.id).await.unwrap();
+                assert!(latest.capability_observations.values().filter(|o|o.source == "fetch_available_models" || o.source == "google_rpc_error").all(|o|o.antigravity_client_identity.as_ref() == Some(&new.client_identity)));
+            }).await;
+        }
+    }
+
+    #[tokio::test]
     async fn antigravity_late_old_token_cannot_replace_empty_catalog_or_evidence() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8610,6 +8671,7 @@ mod tests {
                 stale: false,
                 fetched_at_ms: chrono::Utc::now().timestamp_millis(),
                 request_revision: 0,
+                client_identity: crate::domain::antigravity_identity::antigravity_client_identity(),
             };
         assert!(!state
             .record_antigravity_model_catalog_observations_for_generation(

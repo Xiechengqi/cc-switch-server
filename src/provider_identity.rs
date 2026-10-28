@@ -1,15 +1,16 @@
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const ANTIGRAVITY_VERSION_ENV: &str = "CC_SWITCH_ANTIGRAVITY_CLIENT_VERSION";
-const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.2.1";
+use crate::domain::antigravity_identity::{
+    antigravity_client_identity, configured_antigravity_version, update_cached_antigravity_version,
+    valid_antigravity_version,
+};
 const ANTIGRAVITY_MANIFEST_URL: &str =
     "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
-const ANTIGRAVITY_HUB_PLATFORM: &str = "darwin/arm64";
 const ANTIGRAVITY_CLIENT_METADATA_PLATFORM: i32 = 2;
 const ANTIGRAVITY_UPDATER_USER_AGENT: &str = "electron-builder";
 const ANTIGRAVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
@@ -20,7 +21,6 @@ pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.54.0";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
 pub const GEMINI_CLI_X_GOOG_API_CLIENT: &str = "google-genai-sdk/1.41.0 gl-node/v22.19.0";
 
-static ANTIGRAVITY_VERSION: OnceLock<RwLock<String>> = OnceLock::new();
 static ANTIGRAVITY_UPDATER_STARTED: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -33,22 +33,11 @@ pub fn server_user_agent() -> String {
 }
 
 pub fn antigravity_version() -> String {
-    if let Some(version) = configured_antigravity_version() {
-        return version;
-    }
-    ANTIGRAVITY_VERSION
-        .get_or_init(|| RwLock::new(ANTIGRAVITY_FALLBACK_VERSION.to_string()))
-        .read()
-        .map(|version| version.clone())
-        .unwrap_or_else(|_| ANTIGRAVITY_FALLBACK_VERSION.to_string())
+    antigravity_client_identity().version
 }
 
 pub fn antigravity_user_agent() -> String {
-    format!(
-        "antigravity/hub/{} {}",
-        antigravity_version(),
-        ANTIGRAVITY_HUB_PLATFORM
-    )
+    antigravity_client_identity().user_agent
 }
 
 pub fn antigravity_client_metadata() -> Value {
@@ -87,12 +76,7 @@ pub fn spawn_antigravity_version_updater() {
         loop {
             match fetch_antigravity_version().await {
                 Ok(version) => {
-                    if let Ok(mut cached) = ANTIGRAVITY_VERSION
-                        .get_or_init(|| RwLock::new(ANTIGRAVITY_FALLBACK_VERSION.to_string()))
-                        .write()
-                    {
-                        *cached = version.clone();
-                    }
+                    update_cached_antigravity_version(&version);
                     tracing::debug!(version, "refreshed Antigravity client version");
                 }
                 Err(error) => {
@@ -102,13 +86,6 @@ pub fn spawn_antigravity_version_updater() {
             tokio::time::sleep(ANTIGRAVITY_REFRESH_INTERVAL).await;
         }
     });
-}
-
-fn configured_antigravity_version() -> Option<String> {
-    std::env::var(ANTIGRAVITY_VERSION_ENV)
-        .ok()
-        .map(|version| version.trim().to_string())
-        .filter(|version| valid_antigravity_version(version))
 }
 
 async fn fetch_antigravity_version() -> anyhow::Result<String> {
@@ -140,14 +117,6 @@ fn parse_antigravity_manifest(manifest: &str) -> anyhow::Result<String> {
         bail!("Antigravity manifest contains an invalid version");
     }
     Ok(version.to_string())
-}
-
-fn valid_antigravity_version(version: &str) -> bool {
-    !version.is_empty()
-        && version.len() <= 64
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-_+".contains(&byte))
 }
 
 #[cfg(test)]

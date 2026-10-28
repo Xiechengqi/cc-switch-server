@@ -172,6 +172,18 @@ pub fn set_previous_response_cache_stats(stats: &PreviousResponseCacheStats) {
         ("current_entries", stats.current_entries as f64),
         ("current_bytes", stats.current_bytes as f64),
         ("current_tombstones", stats.current_tombstones as f64),
+        (
+            "current_retained_bytes",
+            stats.current_retained_bytes as f64,
+        ),
+        (
+            "high_water_retained_bytes",
+            stats.high_water_retained_bytes as f64,
+        ),
+        (
+            "process_capacity_rejections_total",
+            stats.process_capacity_rejections as f64,
+        ),
         ("high_water_entries", stats.high_water_entries as f64),
         ("high_water_bytes", stats.high_water_bytes as f64),
         (
@@ -589,6 +601,20 @@ pub fn record_reasoning_bridge(direction: &'static str, outcome: &'static str) {
     .increment(1);
 }
 
+pub fn record_responses_phase_downgrade(
+    target: &'static str,
+    direction: &'static str,
+    phase: &'static str,
+) {
+    metrics::counter!(
+        "cc_switch_responses_phase_downgrade_total",
+        "target" => target,
+        "direction" => direction,
+        "phase" => phase
+    )
+    .increment(1);
+}
+
 pub fn record_kimi_thinking_replay(outcome: &'static str, count: u64) {
     metrics::counter!(
         "cc_switch_kimi_thinking_replay_total",
@@ -659,6 +685,23 @@ pub fn record_proxy_semantic_guard(surface: &'static str, observation: &'static 
     .increment(1);
 }
 
+pub(crate) fn record_codex_quota_observer(outcome: &'static str) {
+    metrics::counter!("cc_switch_codex_quota_observer_total", "outcome" => outcome).increment(1);
+}
+
+pub(crate) fn set_process_resident_memory(
+    snapshot: crate::infra::resident_memory::ResidentMemorySnapshot,
+) {
+    metrics::gauge!("cc_switch_process_resident_memory_used_bytes").set(snapshot.used_bytes as f64);
+    metrics::gauge!("cc_switch_process_resident_memory_high_water_bytes")
+        .set(snapshot.high_water_bytes as f64);
+    metrics::gauge!("cc_switch_process_resident_memory_limit_bytes")
+        .set(snapshot.limit_bytes.unwrap_or(0) as f64);
+    metrics::gauge!("cc_switch_process_resident_memory_active_reservations")
+        .set(snapshot.active_reservations as f64);
+    metrics::gauge!("cc_switch_process_resident_memory_rejections").set(snapshot.rejections as f64);
+}
+
 pub fn record_request_memory_reservation(
     component: &'static str,
     bytes: usize,
@@ -696,7 +739,85 @@ pub fn record_request_memory_high_water(
     .record(limit_bytes as f64);
 }
 
+// Callers use closed phase/result enums and literal surfaces. Runtime model,
+// account, share, session and response identifiers never become timing labels.
+pub(crate) fn record_forward_milestone(
+    provider_type: &'static str,
+    surface: &'static str,
+    scope: &'static str,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+) {
+    metrics::histogram!("cc_switch_forward_milestone_seconds", "provider_type" => provider_type,
+        "surface" => surface, "scope" => scope, "phase" => phase)
+    .record(elapsed.as_secs_f64());
+}
+
+pub(crate) fn record_forward_wait(
+    provider_type: &'static str,
+    surface: &'static str,
+    scope: &'static str,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+) {
+    metrics::histogram!("cc_switch_forward_wait_seconds", "provider_type" => provider_type,
+        "surface" => surface, "scope" => scope, "phase" => phase)
+    .record(elapsed.as_secs_f64());
+}
+
+pub(crate) fn record_forward_timeline(
+    provider_type: &'static str,
+    surface: &'static str,
+    scope: &'static str,
+    result: &'static str,
+    elapsed: std::time::Duration,
+) {
+    metrics::counter!("cc_switch_forward_timelines_total", "provider_type" => provider_type,
+        "surface" => surface, "scope" => scope, "result" => result)
+    .increment(1);
+    metrics::histogram!("cc_switch_forward_duration_seconds", "provider_type" => provider_type,
+        "surface" => surface, "scope" => scope, "result" => result)
+    .record(elapsed.as_secs_f64());
+}
+
 fn describe() {
+    metrics::describe_histogram!(
+        "cc_switch_forward_milestone_seconds",
+        "Monotonic Provider request/attempt milestones; HTTP handoff is not socket delivery"
+    );
+    metrics::describe_histogram!("cc_switch_forward_wait_seconds", "Provider operation wait intervals; concurrent intervals may overlap and must not be summed as wall time");
+    metrics::describe_histogram!(
+        "cc_switch_forward_duration_seconds",
+        "Provider observed timeline duration by bounded delivery result; separate from usage success"
+    );
+    metrics::describe_counter!(
+        "cc_switch_forward_timelines_total",
+        "Finished Provider observation timelines, including explicit unfinished exits"
+    );
+    metrics::describe_counter!(
+        "cc_switch_codex_quota_observer_total",
+        "Passive Codex quota queue, coalescing and persistence outcomes; never generation usage"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_process_resident_memory_used_bytes",
+        "Logical retained bytes charged to the process parent budget; not RSS"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_process_resident_memory_high_water_bytes",
+        "Process logical retained-byte high water"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_process_resident_memory_limit_bytes",
+        "Process logical retained-byte hard limit, or zero for observation only"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_process_resident_memory_active_reservations",
+        "Distinct live owners charged to the process parent budget"
+    );
+    metrics::describe_gauge!(
+        "cc_switch_process_resident_memory_rejections",
+        "Cumulative process parent budget growth rejections"
+    );
     metrics::describe_gauge!(
         "cc_switch_account_inflight",
         "Current managed-account in-flight requests aggregated by provider type"
@@ -920,6 +1041,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_proxy_semantic_guard_total",
         "Bounded Responses semantic classifications at downstream commit boundaries"
+    );
+    metrics::describe_counter!(
+        "cc_switch_responses_phase_downgrade_total",
+        "Responses message phases flattened to standard text without a phase carrier; at most once per phase per conversion"
     );
     metrics::describe_counter!(
         "cc_switch_responses_sse_transport_total",

@@ -43,7 +43,9 @@
         },
         {
           "id": "gpt_image_25",
-          "commits": ["d1a024e9400bc65bd78ccd908945cf2eacc2835e"],
+          "commits": [
+            "d1a024e9400bc65bd78ccd908945cf2eacc2835e"
+          ],
           "files": [
             {
               "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
@@ -88,7 +90,9 @@
         },
         {
           "id": "websocket_prewarm_and_named_output",
-          "commits": ["bd03aabcf157e215ef50c5984d873f690a5c22bf"],
+          "commits": [
+            "bd03aabcf157e215ef50c5984d873f690a5c22bf"
+          ],
           "files": [
             {
               "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
@@ -104,7 +108,9 @@
         },
         {
           "id": "empty_bootstrap_announcements",
-          "commits": ["cb73cd9936116848274afad42a41a4079325d383"],
+          "commits": [
+            "cb73cd9936116848274afad42a41a4079325d383"
+          ],
           "files": [
             {
               "commit": "cb73cd9936116848274afad42a41a4079325d383",
@@ -120,7 +126,9 @@
         },
         {
           "id": "websocket_fragmented_write_fairness",
-          "commits": ["b5ba02c2e3627e975538e217575abee9f73eccd8"],
+          "commits": [
+            "b5ba02c2e3627e975538e217575abee9f73eccd8"
+          ],
           "files": [
             {
               "commit": "b5ba02c2e3627e975538e217575abee9f73eccd8",
@@ -143,7 +151,9 @@
       "deltas": [
         {
           "id": "gpt_image_25_cross_check",
-          "commits": ["f5220891b77d217fa32ab2e4d0cd254825fce780"],
+          "commits": [
+            "f5220891b77d217fa32ab2e4d0cd254825fce780"
+          ],
           "files": [
             {
               "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
@@ -159,7 +169,9 @@
         },
         {
           "id": "input_item_internal_metadata_scope",
-          "commits": ["dc47d1310006058d27c01320c76b3c2eb757a7f2"],
+          "commits": [
+            "dc47d1310006058d27c01320c76b3c2eb757a7f2"
+          ],
           "files": [
             {
               "commit": "dc47d1310006058d27c01320c76b3c2eb757a7f2",
@@ -175,7 +187,9 @@
         },
         {
           "id": "request_lifecycle_memory_budget",
-          "commits": ["19ee8db4eb02ab03a298bcd4139ba468ed86b54d"],
+          "commits": [
+            "19ee8db4eb02ab03a298bcd4139ba468ed86b54d"
+          ],
           "files": [
             {
               "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
@@ -274,7 +288,9 @@
       "benchmarkEvidence": false,
       "upstreamReceipt": false,
       "path": "docs/provider/codex-oauth.md",
-      "anchors": ["WS prewarm evidence gate"]
+      "anchors": [
+        "WS prewarm evidence gate"
+      ]
     },
     {
       "id": "CX-06",
@@ -282,7 +298,9 @@
       "runtimeEnabled": false,
       "dependsOn": "CX-03",
       "path": "docs/provider/codex-oauth.md",
-      "anchors": ["GPT Image 2.5 quota/cache evidence gate"]
+      "anchors": [
+        "GPT Image 2.5 quota/cache evidence gate"
+      ]
     }
   ],
   "incrementalEnhancements": [
@@ -615,20 +633,30 @@
         {
           "disposition": "adopt",
           "commit": "eb5873d234f690ed376bc9d3195f8bd2d274d3c3",
-          "paths": ["proxy/model_registry.go", "proxy/translator.go"],
+          "paths": [
+            "proxy/model_registry.go",
+            "proxy/translator.go"
+          ],
           "contract": "gpt-6-astra cold-start catalog and major-only max reasoning"
         },
         {
           "disposition": "differential",
           "commit": "b983742b211df0a8571a9866e4e977adf767c005",
-          "paths": ["proxy/schema_policy.go", "proxy/schema_policy_test.go"],
+          "paths": [
+            "proxy/schema_policy.go",
+            "proxy/schema_policy_test.go"
+          ],
           "contract": "Astra string lengths only on final native Lite WebSocket transport"
         },
         {
           "disposition": "reject",
           "commit": "370494145b314c495ffe2900e744face15033d53",
           "revertedBy": "600636c8f9d9d8d6c56025ae1786522f6dfb0c4b",
-          "paths": ["proxy/prism_client.go", "proxy/prism_executor.go", "proxy/prism_integration.go"],
+          "paths": [
+            "proxy/prism_client.go",
+            "proxy/prism_executor.go",
+            "proxy/prism_integration.go"
+          ],
           "contract": "Prism independent-quota bypass was reverted and is outside the fixed-binding protocol contract"
         }
       ]
@@ -648,7 +676,9 @@
       "deltas": [
         {
           "id": "octal_nul_schema_pattern",
-          "commits": ["320100ecf767f9807883b959550c954c5b075bff"],
+          "commits": [
+            "320100ecf767f9807883b959550c954c5b075bff"
+          ],
           "files": [
             {
               "commit": "320100ecf767f9807883b959550c954c5b075bff",
@@ -664,7 +694,9 @@
         },
         {
           "id": "nested_cache_breakpoint_scope",
-          "commits": ["3662d1535a8b5c86e3a96fdd41e9bab2e16018a5"],
+          "commits": [
+            "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5"
+          ],
           "files": [
             {
               "commit": "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5",
@@ -680,7 +712,9 @@
         },
         {
           "id": "responses_private_event_filter",
-          "commits": ["dd013f9e2993ccb840ce9da74308dfe30ecce15c"],
+          "commits": [
+            "dd013f9e2993ccb840ce9da74308dfe30ecce15c"
+          ],
           "files": [
             {
               "commit": "dd013f9e2993ccb840ce9da74308dfe30ecce15c",
@@ -696,7 +730,9 @@
         },
         {
           "id": "reasoning_across_tool_turns",
-          "commits": ["40cc6489879ad2e08f71384137ea650359d8bb9f"],
+          "commits": [
+            "40cc6489879ad2e08f71384137ea650359d8bb9f"
+          ],
           "files": [
             {
               "commit": "40cc6489879ad2e08f71384137ea650359d8bb9f",
@@ -712,7 +748,9 @@
         },
         {
           "id": "item_author_recipient_metadata_scope",
-          "commits": ["3b2882b72eeeea31f80062786644dbc930973dfb"],
+          "commits": [
+            "3b2882b72eeeea31f80062786644dbc930973dfb"
+          ],
           "files": [
             {
               "commit": "3b2882b72eeeea31f80062786644dbc930973dfb",
@@ -728,7 +766,9 @@
         },
         {
           "id": "upstream_reported_model",
-          "commits": ["25f40d8cf8dfa8765e45873060cf41056cd1b112"],
+          "commits": [
+            "25f40d8cf8dfa8765e45873060cf41056cd1b112"
+          ],
           "files": [
             {
               "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
@@ -749,7 +789,9 @@
         },
         {
           "id": "duplex_websocket_steering",
-          "commits": ["42c9680eee553b047e46ac85a6b1543e87e526e7"],
+          "commits": [
+            "42c9680eee553b047e46ac85a6b1543e87e526e7"
+          ],
           "files": [
             {
               "commit": "42c9680eee553b047e46ac85a6b1543e87e526e7",
@@ -770,7 +812,9 @@
       "deltas": [
         {
           "id": "upstream_reported_model_cross_check",
-          "commits": ["dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d"],
+          "commits": [
+            "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d"
+          ],
           "files": [
             {
               "commit": "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d",
@@ -786,7 +830,9 @@
         },
         {
           "id": "response_schema_orphan_required",
-          "commits": ["288a28cb0275631d0f9e78024878cb05ed33085d"],
+          "commits": [
+            "288a28cb0275631d0f9e78024878cb05ed33085d"
+          ],
           "files": [
             {
               "commit": "288a28cb0275631d0f9e78024878cb05ed33085d",
@@ -807,74 +853,111 @@
     {
       "id": "CX-N5",
       "status": "fixture_verified",
-      "referenceDeltas": ["octal_nul_schema_pattern"],
+      "referenceDeltas": [
+        "octal_nul_schema_pattern"
+      ],
       "evidence": [
         {
           "path": "src/proxy/tool_schema.rs",
-          "anchors": ["has_incompatible_codex_unicode_escape", "codex_strips_octal_nul_only_from_schema_patterns"]
+          "anchors": [
+            "has_incompatible_codex_unicode_escape",
+            "codex_strips_octal_nul_only_from_schema_patterns"
+          ]
         }
       ]
     },
     {
       "id": "CX-N6",
       "status": "fixture_verified",
-      "referenceDeltas": ["nested_cache_breakpoint_scope"],
+      "referenceDeltas": [
+        "nested_cache_breakpoint_scope"
+      ],
       "evidence": [
         {
           "path": "src/proxy/forwarder.rs",
-          "anchors": ["sanitize_codex_oauth_input_item_metadata", "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+          "anchors": [
+            "sanitize_codex_oauth_input_item_metadata",
+            "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"
+          ]
         }
       ]
     },
     {
       "id": "CX-N7",
       "status": "fixture_verified",
-      "referenceDeltas": ["responses_private_event_filter"],
+      "referenceDeltas": [
+        "responses_private_event_filter"
+      ],
       "evidence": [
         {
           "path": "src/proxy/response_semantics.rs",
-          "anchors": ["responses_event_is_filtered", "standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+          "anchors": [
+            "responses_event_is_filtered",
+            "standard_responses_stream_filters_private_and_unknown_events_by_both_names",
+            "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"
+          ]
         }
       ]
     },
     {
       "id": "CX-N8",
       "status": "fixture_verified",
-      "referenceDeltas": ["reasoning_across_tool_turns"],
+      "referenceDeltas": [
+        "reasoning_across_tool_turns"
+      ],
       "evidence": [
         {
           "path": "src/proxy/transforms.rs",
-          "anchors": ["remember_latest_real_reasoning", "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+          "anchors": [
+            "remember_latest_real_reasoning",
+            "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"
+          ]
         }
       ]
     },
     {
       "id": "CX-N9",
       "status": "fixture_verified",
-      "referenceDeltas": ["item_author_recipient_metadata_scope"],
+      "referenceDeltas": [
+        "item_author_recipient_metadata_scope"
+      ],
       "evidence": [
         {
           "path": "src/proxy/forwarder.rs",
-          "anchors": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+          "anchors": [
+            "codex_compact_request_uses_the_exact_item_metadata_sanitizer",
+            "codex_websocket_request_uses_the_same_sanitizer",
+            "codex_websocket_http_fallback_completes_the_existing_turn_log"
+          ]
         }
       ]
     },
     {
       "id": "CX-N10",
       "status": "fixture_verified",
-      "referenceDeltas": ["upstream_reported_model", "upstream_reported_model_cross_check"],
+      "referenceDeltas": [
+        "upstream_reported_model",
+        "upstream_reported_model_cross_check"
+      ],
       "evidence": [
         {
           "path": "src/proxy/response_semantics.rs",
-          "anchors": ["ReportedResponseModelObserver", "reported_response_model_is_bounded_and_terminal_authoritative"]
+          "anchors": [
+            "ReportedResponseModelObserver",
+            "reported_response_model_is_bounded_and_terminal_authoritative"
+          ]
         },
         {
           "path": "src/domain/usage/store.rs",
-          "anchors": ["reported_model_observation_round_trips_and_old_logs_default_to_unknown"]
+          "anchors": [
+            "reported_model_observation_round_trips_and_old_logs_default_to_unknown"
+          ]
         },
         {
           "path": "tests/api_contract.rs",
-          "anchors": ["web_usage_requests_uses_stable_filters_and_cursor_pagination"]
+          "anchors": [
+            "web_usage_requests_uses_stable_filters_and_cursor_pagination"
+          ]
         }
       ],
       "authorityBoundary": "reported model is diagnostic-only and cannot change response bytes, routing, billing, retry, fallback, actual_model, or Router Share payloads"
@@ -882,11 +965,19 @@
     {
       "id": "CX-N11",
       "status": "fixture_verified",
-      "referenceDeltas": ["duplex_websocket_steering"],
+      "referenceDeltas": [
+        "duplex_websocket_steering"
+      ],
       "evidence": [
         {
           "path": "src/proxy/forwarder.rs",
-          "anchors": ["RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY", "codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+          "anchors": [
+            "RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY",
+            "codex_pending_write_accepts_only_exact_text_or_binary_steering",
+            "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending",
+            "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+            "codex_websocket_large_upload_cancellation_is_not_write_starved"
+          ]
         }
       ],
       "queueCapacity": 8,
@@ -895,11 +986,16 @@
     {
       "id": "CX-N12",
       "status": "fixture_verified",
-      "referenceDeltas": ["response_schema_orphan_required"],
+      "referenceDeltas": [
+        "response_schema_orphan_required"
+      ],
       "evidence": [
         {
           "path": "src/proxy/tool_schema.rs",
-          "anchors": ["prune_codex_required_without_properties", "codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+          "anchors": [
+            "prune_codex_required_without_properties",
+            "codex_response_schema_prunes_only_evidenced_orphan_required_keys"
+          ]
         }
       ],
       "referenceBoundary": "$ref and $dynamicRef nodes remain opaque"
@@ -961,20 +1057,35 @@
           {
             "commit": "e56abd56f1424b9b25b4609839833724100f3ef5",
             "tree": "130f2266fdf1195d9263c69fc8fc11319b46bd70",
-            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
-            "symbols": ["NormalizeCodexToolSchemas", "stripIncompatiblePatterns"]
+            "paths": [
+              "internal/runtime/executor/helps/codex_tool_schema.go",
+              "internal/runtime/executor/helps/codex_tool_schema_test.go"
+            ],
+            "symbols": [
+              "NormalizeCodexToolSchemas",
+              "stripIncompatiblePatterns"
+            ]
           },
           {
             "commit": "37ce368c5002bc4a83cd622ec01602b0b7984672",
             "tree": "92c0a7010319e15bd66ceded336f71a98de7c2f5",
-            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
-            "symbols": ["patternProperties", "isPureConstBranch"]
+            "paths": [
+              "internal/runtime/executor/helps/codex_tool_schema.go",
+              "internal/runtime/executor/helps/codex_tool_schema_test.go"
+            ],
+            "symbols": [
+              "patternProperties",
+              "isPureConstBranch"
+            ]
           }
         ],
         "sourceDigest": "3572955a138656b133d4ed45efd69a84c0195aaaecbd0f76590490bd0ee28e66"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-01", "CX-02"],
+      "enhancementIds": [
+        "CX-01",
+        "CX-02"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -983,10 +1094,18 @@
         "contracts": [
           {
             "path": "src/proxy/tool_schema.rs",
-            "anchors": ["has_incompatible_codex_unicode_escape", "codex_schema_sanitizer_fails_closed_at_each_budget", "simplify_codex_const_union", "codex_leaves_uncertain_const_unions_unchanged"]
+            "anchors": [
+              "has_incompatible_codex_unicode_escape",
+              "codex_schema_sanitizer_fails_closed_at_each_budget",
+              "simplify_codex_const_union",
+              "codex_leaves_uncertain_const_unions_unchanged"
+            ]
           }
         ],
-        "fixtureIds": ["codex_schema_sanitizer_fails_closed_at_each_budget", "codex_leaves_uncertain_const_unions_unchanged"]
+        "fixtureIds": [
+          "codex_schema_sanitizer_fails_closed_at_each_budget",
+          "codex_leaves_uncertain_const_unions_unchanged"
+        ]
       },
       "reason": "Adopt bounded Unicode-pattern removal and only equivalence-preserving pure const-union simplification; uncertain unions remain unchanged."
     },
@@ -1003,14 +1122,22 @@
           {
             "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
             "tree": "ac9c3fe8abcdf98513d7b08f0ca2535ff5c99323",
-            "paths": ["internal/runtime/executor/codex_openai_images.go", "internal/runtime/executor/codex_openai_images_test.go"],
-            "symbols": ["codexGPTImage25Model", "TestCodexExecutorDirectOpenAIImage25Models"]
+            "paths": [
+              "internal/runtime/executor/codex_openai_images.go",
+              "internal/runtime/executor/codex_openai_images_test.go"
+            ],
+            "symbols": [
+              "codexGPTImage25Model",
+              "TestCodexExecutorDirectOpenAIImage25Models"
+            ]
           }
         ],
         "sourceDigest": "c88f711be47e7eb9d31cf22d835cee3d1c66927d0b126bea00754ff02e250788"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["CX-03"],
+      "enhancementIds": [
+        "CX-03"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -1019,10 +1146,15 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["CODEX_IMAGES_LIVE_PENDING_25_MODELS", "codex_image_25_variants_remain_independently_live_evidence_gated"]
+            "anchors": [
+              "CODEX_IMAGES_LIVE_PENDING_25_MODELS",
+              "codex_image_25_variants_remain_independently_live_evidence_gated"
+            ]
           }
         ],
-        "fixtureIds": ["codex_image_25_variants_remain_independently_live_evidence_gated"]
+        "fixtureIds": [
+          "codex_image_25_variants_remain_independently_live_evidence_gated"
+        ]
       },
       "reason": "Keep each GPT Image 2.5 variant unpublished and fail closed until its own generation, edit, Responses, usage, error and quota receipt exists."
     },
@@ -1039,20 +1171,34 @@
           {
             "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
             "tree": "da486dd2b21a345cb2bb59cc0f4c48ac8e41ff24",
-            "paths": ["sdk/api/handlers/openai_responses_stream_error.go", "sdk/api/handlers/openai_responses_stream_error_test.go"],
-            "symbols": ["BuildOpenAIResponsesStreamErrorChunk", "BuildOpenAIResponsesStreamFailedChunk"]
+            "paths": [
+              "sdk/api/handlers/openai_responses_stream_error.go",
+              "sdk/api/handlers/openai_responses_stream_error_test.go"
+            ],
+            "symbols": [
+              "BuildOpenAIResponsesStreamErrorChunk",
+              "BuildOpenAIResponsesStreamFailedChunk"
+            ]
           },
           {
             "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
             "tree": "98821a0f228dbb87c11e9e43fa917f13dacbcdc0",
-            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
-            "symbols": ["newCodexBootstrapOverloadErr", "isCodexOverloadBootstrapFailure"]
+            "paths": [
+              "internal/runtime/executor/codex_executor_terminal.go",
+              "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"
+            ],
+            "symbols": [
+              "newCodexBootstrapOverloadErr",
+              "isCodexOverloadBootstrapFailure"
+            ]
           }
         ],
         "sourceDigest": "d75062f3f09960241cdb9ec5312f21ebd03f386d2567aae4d577dbd45f0380d9"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-04"],
+      "enhancementIds": [
+        "CX-04"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -1061,10 +1207,16 @@
         "contracts": [
           {
             "path": "src/proxy/openai_capacity_shed.rs",
-            "anchors": ["codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence", "codex_bootstrap_overload_golden_is_precommit_capacity_failure"]
+            "anchors": [
+              "codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence",
+              "codex_bootstrap_overload_golden_is_precommit_capacity_failure"
+            ]
           }
         ],
-        "fixtureIds": ["codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence", "codex_bootstrap_overload_golden_is_precommit_capacity_failure"]
+        "fixtureIds": [
+          "codex_http_sse_ws_differential_golden_preserves_nested_detail_and_sequence",
+          "codex_bootstrap_overload_golden_is_precommit_capacity_failure"
+        ]
       },
       "reason": "Preserve nested error details and sequence numbers across HTTP, SSE and WS while treating only proven bootstrap capacity failures as pre-commit recovery candidates."
     },
@@ -1081,14 +1233,22 @@
           {
             "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
             "tree": "2f9d378751cf56c35b0ae008556b77653d0e78e6",
-            "paths": ["sdk/api/handlers/openai/openai_responses_websocket_prewarm.go", "sdk/api/handlers/openai/openai_responses_websocket_test.go"],
-            "symbols": ["shouldHandleResponsesWebsocketPrewarmLocally", "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"]
+            "paths": [
+              "sdk/api/handlers/openai/openai_responses_websocket_prewarm.go",
+              "sdk/api/handlers/openai/openai_responses_websocket_test.go"
+            ],
+            "symbols": [
+              "shouldHandleResponsesWebsocketPrewarmLocally",
+              "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"
+            ]
           }
         ],
         "sourceDigest": "33775a99ec28a53305805aabdd8f2e4a7ad12f4d416879fd3e19fcd8999b17b0"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["CX-05"],
+      "enhancementIds": [
+        "CX-05"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -1097,14 +1257,20 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"]
+            "anchors": [
+              "codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"
+            ]
           },
           {
             "path": "docs/provider/codex-oauth.md",
-            "anchors": ["WS prewarm evidence gate"]
+            "anchors": [
+              "WS prewarm evidence gate"
+            ]
           }
         ],
-        "fixtureIds": ["codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"]
+        "fixtureIds": [
+          "codex_websocket_http_fallback_golden_keeps_precommit_and_attempt_boundaries"
+        ]
       },
       "reason": "Do not synthesize a prewarm lifecycle until the upstream accepts it and a fixed-binding benchmark proves stable TTFB benefit; existing fallback remains strictly pre-response.create."
     },
@@ -1121,14 +1287,22 @@
           {
             "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
             "tree": "697a3f37bd7d452ef9f0c1eae6a4cb4b547688ae",
-            "paths": ["proxy/images.go", "proxy/images25_test.go"],
-            "symbols": ["isGPTImage2FamilyModel", "TestGPTImage25ImagesIngressToUpstream"]
+            "paths": [
+              "proxy/images.go",
+              "proxy/images25_test.go"
+            ],
+            "symbols": [
+              "isGPTImage2FamilyModel",
+              "TestGPTImage25ImagesIngressToUpstream"
+            ]
           }
         ],
         "sourceDigest": "7c3fa8c440ace2b0a9b75302417eff6cdb562aba90602509709852e8203d6816"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["CX-06"],
+      "enhancementIds": [
+        "CX-06"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -1137,14 +1311,21 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["CODEX_IMAGES_LIVE_PENDING_25_MODELS", "codex_image_25_variants_remain_independently_live_evidence_gated"]
+            "anchors": [
+              "CODEX_IMAGES_LIVE_PENDING_25_MODELS",
+              "codex_image_25_variants_remain_independently_live_evidence_gated"
+            ]
           },
           {
             "path": "docs/provider/codex-oauth.md",
-            "anchors": ["GPT Image 2.5 quota/cache evidence gate"]
+            "anchors": [
+              "GPT Image 2.5 quota/cache evidence gate"
+            ]
           }
         ],
-        "fixtureIds": ["codex_image_25_variants_remain_independently_live_evidence_gated"]
+        "fixtureIds": [
+          "codex_image_25_variants_remain_independently_live_evidence_gated"
+        ]
       },
       "reason": "Keep 2.5-specific quota and cache behavior disabled until each exact model receipt proves cooldown scope, capability persistence and multi-replica behavior."
     },
@@ -1161,14 +1342,22 @@
           {
             "commit": "cb73cd9936116848274afad42a41a4079325d383",
             "tree": "8aa29a2cadc889fe35264f55a8484997c85f4bf3",
-            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
-            "symbols": ["isCodexBootstrapBufferableEvent", "isCodexEmptyPart"]
+            "paths": [
+              "internal/runtime/executor/codex_executor_terminal.go",
+              "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"
+            ],
+            "symbols": [
+              "isCodexBootstrapBufferableEvent",
+              "isCodexEmptyPart"
+            ]
           }
         ],
         "sourceDigest": "d4d2cb715eec7c9ba9cdf4bd400ba99eb1bf43e58e1f968bdadc8f3aca6ecd33"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N1"],
+      "enhancementIds": [
+        "CX-N1"
+      ],
       "target": {
         "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
         "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
@@ -1177,10 +1366,17 @@
         "contracts": [
           {
             "path": "src/proxy/response_semantics.rs",
-            "anchors": ["is_empty_startup_announcement", "codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier", "codex_visible_or_unknown_startup_announcements_commit_fail_closed"]
+            "anchors": [
+              "is_empty_startup_announcement",
+              "codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier",
+              "codex_visible_or_unknown_startup_announcements_commit_fail_closed"
+            ]
           }
         ],
-        "fixtureIds": ["codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier", "codex_visible_or_unknown_startup_announcements_commit_fail_closed"]
+        "fixtureIds": [
+          "codex_empty_startup_announcements_are_lifecycle_on_the_shared_classifier",
+          "codex_visible_or_unknown_startup_announcements_commit_fail_closed"
+        ]
       },
       "reason": "Classify only a closed set of semantically empty startup announcements as lifecycle; visible or unknown payloads commit fail closed."
     },
@@ -1197,14 +1393,22 @@
           {
             "commit": "dc47d1310006058d27c01320c76b3c2eb757a7f2",
             "tree": "5c80406357552f40ae71edebfa73c02bf3686590",
-            "paths": ["proxy/translator.go", "proxy/translator_test.go"],
-            "symbols": ["responsesInputInternalMetadataField", "stripResponsesInputInternalMetadata"]
+            "paths": [
+              "proxy/translator.go",
+              "proxy/translator_test.go"
+            ],
+            "symbols": [
+              "responsesInputInternalMetadataField",
+              "stripResponsesInputInternalMetadata"
+            ]
           }
         ],
         "sourceDigest": "3c5fc599c6e24460f7279f8a0902cbdda8fa0ba2d3c217e81ba5a67d3888db10"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N2"],
+      "enhancementIds": [
+        "CX-N2"
+      ],
       "target": {
         "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
         "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
@@ -1213,10 +1417,15 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["sanitize_codex_oauth_request_body", "codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"]
+            "anchors": [
+              "sanitize_codex_oauth_request_body",
+              "codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"
+            ]
           }
         ],
-        "fixtureIds": ["codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"]
+        "fixtureIds": [
+          "codex_oauth_request_sanitizer_strips_only_input_item_internal_metadata"
+        ]
       },
       "reason": "Strip only the input-item top-level internal metadata field; nested content, arguments, unrelated extensions and item ordering remain byte-semantic."
     },
@@ -1233,14 +1442,22 @@
           {
             "commit": "b5ba02c2e3627e975538e217575abee9f73eccd8",
             "tree": "e7718c0b0c4223442994871df0879a130a7325f6",
-            "paths": ["internal/runtime/executor/codex_websockets_session.go", "internal/runtime/executor/codex_websockets_executor_test.go"],
-            "symbols": ["writeMessage", "TestCodexWebsockets_ChunkedWriteAllowsPongInterleaving"]
+            "paths": [
+              "internal/runtime/executor/codex_websockets_session.go",
+              "internal/runtime/executor/codex_websockets_executor_test.go"
+            ],
+            "symbols": [
+              "writeMessage",
+              "TestCodexWebsockets_ChunkedWriteAllowsPongInterleaving"
+            ]
           }
         ],
         "sourceDigest": "b9ef52be9a25f9f7fbbf7e73b998a2762844cfee722450e437d7e7ffee05f537"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N3"],
+      "enhancementIds": [
+        "CX-N3"
+      ],
       "target": {
         "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
         "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
@@ -1249,10 +1466,17 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["write_responses_websocket_message", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+            "anchors": [
+              "write_responses_websocket_message",
+              "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+              "codex_websocket_large_upload_cancellation_is_not_write_starved"
+            ]
           }
         ],
-        "fixtureIds": ["codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+        "fixtureIds": [
+          "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+          "codex_websocket_large_upload_cancellation_is_not_write_starved"
+        ]
       },
       "reason": "Use one bounded writer owner and continuation frames while preserving the existing pool and fixed-identity replay boundary; control traffic and cancellation remain responsive."
     },
@@ -1269,14 +1493,25 @@
           {
             "commit": "19ee8db4eb02ab03a298bcd4139ba468ed86b54d",
             "tree": "0048e1ab6395c61eb9a915a9cdc9732e803775df",
-            "paths": ["security/request_memory.go", "security/request_memory_test.go", "proxy/responses_ws_memory_test.go"],
-            "symbols": ["TryAcquireRequestMemory", "RequestMemoryReservation", "ReadRequestMemory"]
+            "paths": [
+              "security/request_memory.go",
+              "security/request_memory_test.go",
+              "proxy/responses_ws_memory_test.go"
+            ],
+            "symbols": [
+              "TryAcquireRequestMemory",
+              "RequestMemoryReservation",
+              "ReadRequestMemory"
+            ]
           }
         ],
         "sourceDigest": "a24363de04414b3bcb2f2c8596dd90caf4a0b9db924594c57e11d55c789ba9cd"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N4", "CORE-N2"],
+      "enhancementIds": [
+        "CX-N4",
+        "CORE-N2"
+      ],
       "target": {
         "baselineCommit": "38af767ee38f1d42139c5ea16ea71a98e1f859ae",
         "baselineTree": "31d6a11120f2f321b5a364c43f27a176970b955e",
@@ -1285,14 +1520,23 @@
         "contracts": [
           {
             "path": "src/proxy/request_memory.rs",
-            "anchors": ["RequestMemoryBudget", "exhaustion_is_sticky_but_release_always_returns_capacity", "retained_bytes_release_only_after_the_last_view_is_dropped"]
+            "anchors": [
+              "RequestMemoryBudget",
+              "exhaustion_is_sticky_but_release_always_returns_capacity",
+              "retained_bytes_release_only_after_the_last_view_is_dropped"
+            ]
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["cc_switch_request_memory_exhausted"]
+            "anchors": [
+              "cc_switch_request_memory_exhausted"
+            ]
           }
         ],
-        "fixtureIds": ["exhaustion_is_sticky_but_release_always_returns_capacity", "retained_bytes_release_only_after_the_last_view_is_dropped"]
+        "fixtureIds": [
+          "exhaustion_is_sticky_but_release_always_returns_capacity",
+          "retained_bytes_release_only_after_the_last_view_is_dropped"
+        ]
       },
       "reason": "Adopt a request-scoped sticky resident-memory budget across Codex HTTP and WS; exhaustion cancels the active upstream and denies every replay or fallback lane."
     },
@@ -1309,20 +1553,34 @@
           {
             "commit": "259130863d4bc4a781b07b2e36e2ba70bf82cfb5",
             "tree": "da486dd2b21a345cb2bb59cc0f4c48ac8e41ff24",
-            "paths": ["sdk/api/handlers/openai_responses_stream_error.go", "sdk/api/handlers/openai_responses_stream_error_test.go"],
-            "symbols": ["BuildOpenAIResponsesStreamErrorChunk", "BuildOpenAIResponsesStreamFailedChunk"]
+            "paths": [
+              "sdk/api/handlers/openai_responses_stream_error.go",
+              "sdk/api/handlers/openai_responses_stream_error_test.go"
+            ],
+            "symbols": [
+              "BuildOpenAIResponsesStreamErrorChunk",
+              "BuildOpenAIResponsesStreamFailedChunk"
+            ]
           },
           {
             "commit": "3ae9093da837c32667d2f2b65e8ad448fdf1bb8f",
             "tree": "98821a0f228dbb87c11e9e43fa917f13dacbcdc0",
-            "paths": ["internal/runtime/executor/codex_executor_terminal.go", "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"],
-            "symbols": ["newCodexBootstrapOverloadErr", "isCodexOverloadBootstrapFailure"]
+            "paths": [
+              "internal/runtime/executor/codex_executor_terminal.go",
+              "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go"
+            ],
+            "symbols": [
+              "newCodexBootstrapOverloadErr",
+              "isCodexOverloadBootstrapFailure"
+            ]
           }
         ],
         "sourceDigest": "d75062f3f09960241cdb9ec5312f21ebd03f386d2567aae4d577dbd45f0380d9"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CORE-N1"],
+      "enhancementIds": [
+        "CORE-N1"
+      ],
       "target": {
         "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
         "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
@@ -1331,14 +1589,25 @@
         "contracts": [
           {
             "path": "src/proxy/providers/codex/mod.rs",
-            "anchors": ["handle_rate_limit", "semantic_rate_limit_error", "capacity_retry_allowed", "rate_limit_until"]
+            "anchors": [
+              "handle_rate_limit",
+              "semantic_rate_limit_error",
+              "capacity_retry_allowed",
+              "rate_limit_until"
+            ]
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["codex_unknown_429_cools_only_the_share_model", "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"]
+            "anchors": [
+              "codex_unknown_429_cools_only_the_share_model",
+              "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"
+            ]
           }
         ],
-        "fixtureIds": ["codex_unknown_429_cools_only_the_share_model", "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"]
+        "fixtureIds": [
+          "codex_unknown_429_cools_only_the_share_model",
+          "codex_sse_capacity_shed_retries_same_account_before_downstream_commit"
+        ]
       },
       "reason": "Move Codex rate-limit scope, reset parsing and capacity retry decisions behind one Provider boundary without changing wire, fixed binding or total attempt budget."
     },
@@ -1355,14 +1624,22 @@
           {
             "commit": "d1a024e9400bc65bd78ccd908945cf2eacc2835e",
             "tree": "ac9c3fe8abcdf98513d7b08f0ca2535ff5c99323",
-            "paths": ["internal/runtime/executor/codex_openai_images.go", "internal/runtime/executor/codex_openai_images_test.go"],
-            "symbols": ["codexGPTImage25Model", "TestCodexExecutorDirectOpenAIImage25Models"]
+            "paths": [
+              "internal/runtime/executor/codex_openai_images.go",
+              "internal/runtime/executor/codex_openai_images_test.go"
+            ],
+            "symbols": [
+              "codexGPTImage25Model",
+              "TestCodexExecutorDirectOpenAIImage25Models"
+            ]
           }
         ],
         "sourceDigest": "c88f711be47e7eb9d31cf22d835cee3d1c66927d0b126bea00754ff02e250788"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["LIVE-N1"],
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
       "target": {
         "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
         "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
@@ -1371,14 +1648,25 @@
         "contracts": [
           {
             "path": "scripts/smoke/codex-real-receipt.mjs",
-            "anchors": ["operationSpecs", "gpt_image_2_5_sunburst", "contract_verified", "live_pending"]
+            "anchors": [
+              "operationSpecs",
+              "gpt_image_2_5_sunburst",
+              "contract_verified",
+              "live_pending"
+            ]
           },
           {
             "path": "scripts/audit/codex-real-receipt.test.mjs",
-            "anchors": ["accepts only a complete fixture receipt as live_pending", "control-plane failures never print tokens, prompts, or raw bodies"]
+            "anchors": [
+              "accepts only a complete fixture receipt as live_pending",
+              "control-plane failures never print tokens, prompts, or raw bodies"
+            ]
           }
         ],
-        "fixtureIds": ["accepts only a complete fixture receipt as live_pending", "control-plane failures never print tokens, prompts, or raw bodies"]
+        "fixtureIds": [
+          "accepts only a complete fixture receipt as live_pending",
+          "control-plane failures never print tokens, prompts, or raw bodies"
+        ]
       },
       "reason": "Add three exact-model private Image receipt gates; fixture mode and the billable probe remain live_pending and cannot publish a variant."
     },
@@ -1395,14 +1683,22 @@
           {
             "commit": "bd03aabcf157e215ef50c5984d873f690a5c22bf",
             "tree": "2f9d378751cf56c35b0ae008556b77653d0e78e6",
-            "paths": ["sdk/api/handlers/openai/openai_responses_websocket_prewarm.go", "sdk/api/handlers/openai/openai_responses_websocket_test.go"],
-            "symbols": ["shouldHandleResponsesWebsocketPrewarmLocally", "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"]
+            "paths": [
+              "sdk/api/handlers/openai/openai_responses_websocket_prewarm.go",
+              "sdk/api/handlers/openai/openai_responses_websocket_test.go"
+            ],
+            "symbols": [
+              "shouldHandleResponsesWebsocketPrewarmLocally",
+              "TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream"
+            ]
           }
         ],
         "sourceDigest": "33775a99ec28a53305805aabdd8f2e4a7ad12f4d416879fd3e19fcd8999b17b0"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["LIVE-N1"],
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
       "target": {
         "baselineCommit": "b9ea8d609ce7f3e34addb7bc4e9e315a5e0e650c",
         "baselineTree": "858db5af1ee58f9d7acde31fe816faa62e313e36",
@@ -1411,14 +1707,23 @@
         "contracts": [
           {
             "path": "scripts/smoke/codex-real-receipt.mjs",
-            "anchors": ["ws_prewarm", "benchmarkSamples", "pre_response_create_only", "live_pending"]
+            "anchors": [
+              "ws_prewarm",
+              "benchmarkSamples",
+              "pre_response_create_only",
+              "live_pending"
+            ]
           },
           {
             "path": "scripts/audit/codex-real-receipt.test.mjs",
-            "anchors": ["WS benchmark measurements require benefit, samples, and reuse"]
+            "anchors": [
+              "WS benchmark measurements require benefit, samples, and reuse"
+            ]
           }
         ],
-        "fixtureIds": ["WS benchmark measurements require benefit, samples, and reuse"]
+        "fixtureIds": [
+          "WS benchmark measurements require benefit, samples, and reuse"
+        ]
       },
       "reason": "Add an independent WS prewarm receipt gate that requires upstream acceptance, measured TTFB benefit, connection reuse and strict pre-commit fallback."
     },
@@ -1435,14 +1740,22 @@
           {
             "commit": "f5220891b77d217fa32ab2e4d0cd254825fce780",
             "tree": "697a3f37bd7d452ef9f0c1eae6a4cb4b547688ae",
-            "paths": ["proxy/images.go", "proxy/images25_test.go"],
-            "symbols": ["nextImagesMainModelAfterUnsupported", "TestGPTImage25OfficialPricingIgnoresBatch"]
+            "paths": [
+              "proxy/images.go",
+              "proxy/images25_test.go"
+            ],
+            "symbols": [
+              "nextImagesMainModelAfterUnsupported",
+              "TestGPTImage25OfficialPricingIgnoresBatch"
+            ]
           }
         ],
         "sourceDigest": "7c3fa8c440ace2b0a9b75302417eff6cdb562aba90602509709852e8203d6816"
       },
       "disposition": "reject",
-      "enhancementIds": ["CX-R1"],
+      "enhancementIds": [
+        "CX-R1"
+      ],
       "target": {
         "baselineCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "baselineTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
@@ -1451,7 +1764,9 @@
         "contracts": [
           {
             "path": "cc-switch-server-enhance.md",
-            "anchors": ["禁止账号池选号"]
+            "anchors": [
+              "禁止账号池选号"
+            ]
           }
         ],
         "fixtureIds": []
@@ -1471,14 +1786,22 @@
           {
             "commit": "320100ecf767f9807883b959550c954c5b075bff",
             "tree": "c870e566adde2597bf7f54d8617e41d64bf1601a",
-            "paths": ["internal/runtime/executor/helps/codex_tool_schema.go", "internal/runtime/executor/helps/codex_tool_schema_test.go"],
-            "symbols": ["stripIncompatiblePatternsFromJSON", "TestNormalizeCodexToolSchemas_StripsOctalNULPatternEscape"]
+            "paths": [
+              "internal/runtime/executor/helps/codex_tool_schema.go",
+              "internal/runtime/executor/helps/codex_tool_schema_test.go"
+            ],
+            "symbols": [
+              "stripIncompatiblePatternsFromJSON",
+              "TestNormalizeCodexToolSchemas_StripsOctalNULPatternEscape"
+            ]
           }
         ],
         "sourceDigest": "e0e2ba890c7c26a6eefa9771ab8cb8af8ce98a6c66c4e09c834a409f8cc4d10c"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N5"],
+      "enhancementIds": [
+        "CX-N5"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1487,10 +1810,15 @@
         "contracts": [
           {
             "path": "src/proxy/tool_schema.rs",
-            "anchors": ["has_incompatible_codex_unicode_escape", "codex_strips_octal_nul_only_from_schema_patterns"]
+            "anchors": [
+              "has_incompatible_codex_unicode_escape",
+              "codex_strips_octal_nul_only_from_schema_patterns"
+            ]
           }
         ],
-        "fixtureIds": ["codex_strips_octal_nul_only_from_schema_patterns"]
+        "fixtureIds": [
+          "codex_strips_octal_nul_only_from_schema_patterns"
+        ]
       },
       "reason": "Recognize active octal NUL and odd-backslash forms only in schema pattern nodes; preserve escaped text, x00 forms and non-schema lookalikes."
     },
@@ -1507,14 +1835,22 @@
           {
             "commit": "3662d1535a8b5c86e3a96fdd41e9bab2e16018a5",
             "tree": "4b78f97e8da16252cbbc451355814e6999f4dc8a",
-            "paths": ["internal/translator/codex/openai/responses/codex_openai-responses_request.go", "internal/translator/codex/openai/responses/codex_openai-responses_request_test.go"],
-            "symbols": ["stripCodexResponsesCacheBreakpoints", "TestStripCodexResponsesCacheBreakpoints_CombinedItemAndPartLevel"]
+            "paths": [
+              "internal/translator/codex/openai/responses/codex_openai-responses_request.go",
+              "internal/translator/codex/openai/responses/codex_openai-responses_request_test.go"
+            ],
+            "symbols": [
+              "stripCodexResponsesCacheBreakpoints",
+              "TestStripCodexResponsesCacheBreakpoints_CombinedItemAndPartLevel"
+            ]
           }
         ],
         "sourceDigest": "9e3c09dc3f47e2f9349e9836f63d9e589e88c3fabf7f756972bbd0d5eba833eb"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N6"],
+      "enhancementIds": [
+        "CX-N6"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1523,10 +1859,15 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["sanitize_codex_oauth_input_item_metadata", "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+            "anchors": [
+              "sanitize_codex_oauth_input_item_metadata",
+              "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"
+            ]
           }
         ],
-        "fixtureIds": ["codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"]
+        "fixtureIds": [
+          "codex_oauth_request_sanitizer_strips_exact_item_metadata_and_cache_breakpoints"
+        ]
       },
       "reason": "Strip exact cache-breakpoint hints only at Responses input-item and protocol part boundaries while preserving arguments and ordinary user JSON."
     },
@@ -1543,14 +1884,22 @@
           {
             "commit": "dd013f9e2993ccb840ce9da74308dfe30ecce15c",
             "tree": "6fab73ac157b6786bd682c4d8ea20c90485218fb",
-            "paths": ["sdk/api/handlers/openai/openai_responses_handlers.go", "sdk/api/handlers/openai/openai_responses_handlers_stream_test.go"],
-            "symbols": ["shouldFilterPrivateEvent", "TestResponsesSSEFramer_FiltersUpstreamPrivateEvents"]
+            "paths": [
+              "sdk/api/handlers/openai/openai_responses_handlers.go",
+              "sdk/api/handlers/openai/openai_responses_handlers_stream_test.go"
+            ],
+            "symbols": [
+              "shouldFilterPrivateEvent",
+              "TestResponsesSSEFramer_FiltersUpstreamPrivateEvents"
+            ]
           }
         ],
         "sourceDigest": "41e50c3a09ec920dbb598268739065610773c98a1226b2720bdda4501cbc743a"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N7"],
+      "enhancementIds": [
+        "CX-N7"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1559,10 +1908,17 @@
         "contracts": [
           {
             "path": "src/proxy/response_semantics.rs",
-            "anchors": ["responses_event_is_filtered", "standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+            "anchors": [
+              "responses_event_is_filtered",
+              "standard_responses_stream_filters_private_and_unknown_events_by_both_names",
+              "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"
+            ]
           }
         ],
-        "fixtureIds": ["standard_responses_stream_filters_private_and_unknown_events_by_both_names", "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"]
+        "fixtureIds": [
+          "standard_responses_stream_filters_private_and_unknown_events_by_both_names",
+          "native_codex_stream_allows_only_reviewed_metadata_beyond_public_events"
+        ]
       },
       "reason": "Check declared SSE names and payload types together; standard clients receive only the public closed set and reviewed native clients gain only codex.response.metadata."
     },
@@ -1579,14 +1935,22 @@
           {
             "commit": "40cc6489879ad2e08f71384137ea650359d8bb9f",
             "tree": "6ccb4fb2832986a7ee71afe0700868face588224",
-            "paths": ["internal/translator/openai/openai/responses/openai_openai-responses_request.go", "internal/translator/openai/openai/responses/openai_openai-responses_request_test.go"],
-            "symbols": ["ConvertOpenAIResponsesRequestToOpenAIChatCompletions", "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesReasoningOnFollowUpToolTurns"]
+            "paths": [
+              "internal/translator/openai/openai/responses/openai_openai-responses_request.go",
+              "internal/translator/openai/openai/responses/openai_openai-responses_request_test.go"
+            ],
+            "symbols": [
+              "ConvertOpenAIResponsesRequestToOpenAIChatCompletions",
+              "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesReasoningOnFollowUpToolTurns"
+            ]
           }
         ],
         "sourceDigest": "9a745becb5f2ab116c0dd0f868b5045652fc899a0849d1a261805f845f70c13f"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N8"],
+      "enhancementIds": [
+        "CX-N8"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1595,10 +1959,15 @@
         "contracts": [
           {
             "path": "src/proxy/transforms.rs",
-            "anchors": ["remember_latest_real_reasoning", "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+            "anchors": [
+              "remember_latest_real_reasoning",
+              "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"
+            ]
           }
         ],
-        "fixtureIds": ["responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"]
+        "fixtureIds": [
+          "responses_reasoning_reuses_only_real_content_across_contiguous_tool_rounds"
+        ]
       },
       "reason": "Reuse only the most recent real reasoning across contiguous tool rounds, clear it at user or system boundaries, and reject the reference placeholder fabrication."
     },
@@ -1615,14 +1984,22 @@
           {
             "commit": "3b2882b72eeeea31f80062786644dbc930973dfb",
             "tree": "7b69a212e2a0f580c30c0a063f699262bc9140fd",
-            "paths": ["internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2.go", "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2_test.go"],
-            "symbols": ["rewriteCodexAgentMessageInput", "TestRewriteCodexMultiAgentV2Input_StripsAuthorAndRecipient_Issue6136"]
+            "paths": [
+              "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2.go",
+              "internal/client/codex/optimize-multi-agent-v2/optimize_multi_agent_v2_test.go"
+            ],
+            "symbols": [
+              "rewriteCodexAgentMessageInput",
+              "TestRewriteCodexMultiAgentV2Input_StripsAuthorAndRecipient_Issue6136"
+            ]
           }
         ],
         "sourceDigest": "4871a70c1b54541e5521d163756a718f303e424ac3984bc982ccfd1359701922"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N9"],
+      "enhancementIds": [
+        "CX-N9"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1631,10 +2008,18 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+            "anchors": [
+              "codex_compact_request_uses_the_exact_item_metadata_sanitizer",
+              "codex_websocket_request_uses_the_same_sanitizer",
+              "codex_websocket_http_fallback_completes_the_existing_turn_log"
+            ]
           }
         ],
-        "fixtureIds": ["codex_compact_request_uses_the_exact_item_metadata_sanitizer", "codex_websocket_request_uses_the_same_sanitizer", "codex_websocket_http_fallback_completes_the_existing_turn_log"]
+        "fixtureIds": [
+          "codex_compact_request_uses_the_exact_item_metadata_sanitizer",
+          "codex_websocket_request_uses_the_same_sanitizer",
+          "codex_websocket_http_fallback_completes_the_existing_turn_log"
+        ]
       },
       "reason": "Apply the exact input-item metadata sanitizer consistently to Responses, Compact, native WebSocket and WebSocket-to-HTTP fallback without traversing user content."
     },
@@ -1651,14 +2036,24 @@
           {
             "commit": "25f40d8cf8dfa8765e45873060cf41056cd1b112",
             "tree": "8eaef687b4c1c31045fe3d5d2dfb186cd8e19f4a",
-            "paths": ["internal/runtime/executor/helps/response_model.go", "internal/runtime/executor/helps/response_model_test.go", "internal/runtime/executor/codex_response_model_test.go"],
-            "symbols": ["extractCodexResponseModelEvent", "TestExtractCodexResponseModel", "TestObserveCodexTokenEventRecordsResponseModel"]
+            "paths": [
+              "internal/runtime/executor/helps/response_model.go",
+              "internal/runtime/executor/helps/response_model_test.go",
+              "internal/runtime/executor/codex_response_model_test.go"
+            ],
+            "symbols": [
+              "extractCodexResponseModelEvent",
+              "TestExtractCodexResponseModel",
+              "TestObserveCodexTokenEventRecordsResponseModel"
+            ]
           }
         ],
         "sourceDigest": "3c080746bdcb625d492f8e82db118e136e438da79b7ed2f86575022fe0b0406f"
       },
       "disposition": "adopt",
-      "enhancementIds": ["CX-N10"],
+      "enhancementIds": [
+        "CX-N10"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1667,18 +2062,30 @@
         "contracts": [
           {
             "path": "src/proxy/response_semantics.rs",
-            "anchors": ["ReportedResponseModelObserver", "reported_response_model_is_bounded_and_terminal_authoritative"]
+            "anchors": [
+              "ReportedResponseModelObserver",
+              "reported_response_model_is_bounded_and_terminal_authoritative"
+            ]
           },
           {
             "path": "src/domain/usage/store.rs",
-            "anchors": ["reported_model_observation_round_trips_and_old_logs_default_to_unknown"]
+            "anchors": [
+              "reported_model_observation_round_trips_and_old_logs_default_to_unknown"
+            ]
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["persist_codex_reported_model", "codex_websocket_logs_each_response_create_with_effective_policy"]
+            "anchors": [
+              "persist_codex_reported_model",
+              "codex_websocket_logs_each_response_create_with_effective_policy"
+            ]
           }
         ],
-        "fixtureIds": ["reported_response_model_is_bounded_and_terminal_authoritative", "reported_model_observation_round_trips_and_old_logs_default_to_unknown", "codex_websocket_logs_each_response_create_with_effective_policy"]
+        "fixtureIds": [
+          "reported_response_model_is_bounded_and_terminal_authoritative",
+          "reported_model_observation_round_trips_and_old_logs_default_to_unknown",
+          "codex_websocket_logs_each_response_create_with_effective_policy"
+        ]
       },
       "reason": "Record a bounded terminal-authoritative upstream model observation for local diagnostics only; it cannot overwrite actual_model or influence routing, billing, retry or fallback."
     },
@@ -1695,14 +2102,22 @@
           {
             "commit": "dbfd3f89f953a12bd2c502f1d818ff1c75d15a7d",
             "tree": "ca3fd8b4bf860df31e1d81e0131020584f6ba23c",
-            "paths": ["proxy/upstream_response_model.go", "proxy/upstream_response_model_test.go"],
-            "symbols": ["upstreamResponseModelObserver", "TestUpstreamResponseModelObserverFirstAndTerminal"]
+            "paths": [
+              "proxy/upstream_response_model.go",
+              "proxy/upstream_response_model_test.go"
+            ],
+            "symbols": [
+              "upstreamResponseModelObserver",
+              "TestUpstreamResponseModelObserverFirstAndTerminal"
+            ]
           }
         ],
         "sourceDigest": "a17ff1f3ed26759a22568ce5ae26a46f223929b2a791063f8733d708db30c1ae"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N10"],
+      "enhancementIds": [
+        "CX-N10"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1711,14 +2126,23 @@
         "contracts": [
           {
             "path": "src/proxy/response_semantics.rs",
-            "anchors": ["ReportedResponseModelObserver", "responses_inspector_observes_reported_model_without_changing_wire"]
+            "anchors": [
+              "ReportedResponseModelObserver",
+              "responses_inspector_observes_reported_model_without_changing_wire"
+            ]
           },
           {
             "path": "tests/api_contract.rs",
-            "anchors": ["web_usage_requests_uses_stable_filters_and_cursor_pagination", "reportedModel"]
+            "anchors": [
+              "web_usage_requests_uses_stable_filters_and_cursor_pagination",
+              "reportedModel"
+            ]
           }
         ],
-        "fixtureIds": ["responses_inspector_observes_reported_model_without_changing_wire", "web_usage_requests_uses_stable_filters_and_cursor_pagination"]
+        "fixtureIds": [
+          "responses_inspector_observes_reported_model_without_changing_wire",
+          "web_usage_requests_uses_stable_filters_and_cursor_pagination"
+        ]
       },
       "reason": "Use the independent observer as a cross-check while keeping cc-switch-server's explicit source, mismatch and conflict fields local to its own usage API contract."
     },
@@ -1735,14 +2159,22 @@
           {
             "commit": "42c9680eee553b047e46ac85a6b1543e87e526e7",
             "tree": "11a866334cfca8f0d4940aee93e47ba7fb90e02c",
-            "paths": ["internal/runtime/executor/codex_websockets_duplex.go", "internal/runtime/executor/codex_websockets_duplex_test.go"],
-            "symbols": ["streamCodexDuplex", "TestCodexDuplexQueuedCreateDoesNotBlockSubsequentSteer"]
+            "paths": [
+              "internal/runtime/executor/codex_websockets_duplex.go",
+              "internal/runtime/executor/codex_websockets_duplex_test.go"
+            ],
+            "symbols": [
+              "streamCodexDuplex",
+              "TestCodexDuplexQueuedCreateDoesNotBlockSubsequentSteer"
+            ]
           }
         ],
         "sourceDigest": "f0a7ed7b0325f0f836209c708737c42d32690cc4f91a2c92456d342a843713ab"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N11"],
+      "enhancementIds": [
+        "CX-N11"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1751,10 +2183,21 @@
         "contracts": [
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY", "codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+            "anchors": [
+              "RESPONSES_WEBSOCKET_WRITE_QUEUE_CAPACITY",
+              "codex_pending_write_accepts_only_exact_text_or_binary_steering",
+              "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending",
+              "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+              "codex_websocket_large_upload_cancellation_is_not_write_starved"
+            ]
           }
         ],
-        "fixtureIds": ["codex_pending_write_accepts_only_exact_text_or_binary_steering", "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending", "codex_websocket_large_upload_keeps_both_ping_lanes_responsive", "codex_websocket_large_upload_cancellation_is_not_write_starved"]
+        "fixtureIds": [
+          "codex_pending_write_accepts_only_exact_text_or_binary_steering",
+          "codex_websocket_large_upload_accepts_bounded_steering_while_write_pending",
+          "codex_websocket_large_upload_keeps_both_ping_lanes_responsive",
+          "codex_websocket_large_upload_cancellation_is_not_write_starved"
+        ]
       },
       "reason": "The differential fixture reproduced rejection during a pending large write, so add an eight-slot bounded writer queue and admit only exact Codex response.steer frames without starving ping or cancellation."
     },
@@ -1771,14 +2214,23 @@
           {
             "commit": "288a28cb0275631d0f9e78024878cb05ed33085d",
             "tree": "cf4351a713ddacd125d22e61485997b89808e9c5",
-            "paths": ["proxy/translator.go", "proxy/translator_test.go"],
-            "symbols": ["alignRequiredWithProperties", "TestPrepareResponsesBody_AlignsRequiredWithProperties", "TestPrepareResponsesBody_PrunesRequiredOnNodesWithoutProperties"]
+            "paths": [
+              "proxy/translator.go",
+              "proxy/translator_test.go"
+            ],
+            "symbols": [
+              "alignRequiredWithProperties",
+              "TestPrepareResponsesBody_AlignsRequiredWithProperties",
+              "TestPrepareResponsesBody_PrunesRequiredOnNodesWithoutProperties"
+            ]
           }
         ],
         "sourceDigest": "824337ab56dd0dac07b3dceadac885783a1c6e6df4e25df75c7edfec81ee4843"
       },
       "disposition": "differential",
-      "enhancementIds": ["CX-N12"],
+      "enhancementIds": [
+        "CX-N12"
+      ],
       "target": {
         "baselineCommit": "ad5d0d46056b13127fba720a4ff00d224b25b79f",
         "baselineTree": "ee3285e92929669a9a4e5beaeb741034f9daac29",
@@ -1787,10 +2239,15 @@
         "contracts": [
           {
             "path": "src/proxy/tool_schema.rs",
-            "anchors": ["prune_codex_required_without_properties", "codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+            "anchors": [
+              "prune_codex_required_without_properties",
+              "codex_response_schema_prunes_only_evidenced_orphan_required_keys"
+            ]
           }
         ],
-        "fixtureIds": ["codex_response_schema_prunes_only_evidenced_orphan_required_keys"]
+        "fixtureIds": [
+          "codex_response_schema_prunes_only_evidenced_orphan_required_keys"
+        ]
       },
       "reason": "The strict text-format differential exposed orphan required keys, so apply the schema-aware narrow repair to composition and pure object nodes while keeping reference nodes opaque."
     }
@@ -1800,7 +2257,10 @@
       "id": "CODEX-R2-FINAL-2026-09-28",
       "status": "reviewed_and_fixed",
       "reviewedAt": "2026-09-28T00:00:00Z",
-      "sourceObservationIds": ["CX-OBS-0016", "CX-OBS-0022"],
+      "sourceObservationIds": [
+        "CX-OBS-0016",
+        "CX-OBS-0022"
+      ],
       "reviewedImplementationCommit": "f8907742b163b239a981cddcc3962410f0712677",
       "reviewedImplementationTree": "9e4bfc5d8fdfd882c74bc63d1f2ab3510bea5a33",
       "targetReviewCommit": "26eb389e5b0c8457f64bb70f60614ff5b1c1a140",
@@ -1855,7 +2315,14 @@
           "param": null,
           "details": {
             "reason": "bootstrap_capacity",
-            "retry": {"class": "same_account", "opaque": [1, 2, 3]}
+            "retry": {
+              "class": "same_account",
+              "opaque": [
+                1,
+                2,
+                3
+              ]
+            }
           }
         }
       },
@@ -1869,7 +2336,14 @@
           "param": null,
           "details": {
             "reason": "bootstrap_capacity",
-            "retry": {"class": "same_account", "opaque": [1, 2, 3]}
+            "retry": {
+              "class": "same_account",
+              "opaque": [
+                1,
+                2,
+                3
+              ]
+            }
           }
         }
       }
@@ -1878,7 +2352,10 @@
       {
         "type": "response.created",
         "sequence_number": 0,
-        "response": {"id": "resp_fixture", "status": "in_progress"}
+        "response": {
+          "id": "resp_fixture",
+          "status": "in_progress"
+        }
       },
       {
         "type": "response.output_item.added",
@@ -1894,7 +2371,11 @@
       {
         "type": "response.completed",
         "sequence_number": 2,
-        "response": {"id": "resp_fixture", "status": "completed", "output": []}
+        "response": {
+          "id": "resp_fixture",
+          "status": "completed",
+          "output": []
+        }
       }
     ],
     "namedToolOutputRequest": {
@@ -1914,8 +2395,570 @@
       "sameAccount": true,
       "sharedAttemptBudget": true,
       "postCommitReplay": false,
-      "handshakeFallbackStatuses": [500, 502, 503, 504],
-      "handshakeNoFallbackStatuses": [400, 401, 403, 429]
+      "handshakeFallbackStatuses": [
+        500,
+        502,
+        503,
+        504
+      ],
+      "handshakeNoFallbackStatuses": [
+        400,
+        401,
+        403,
+        429
+      ]
     }
+  },
+  "r4Reviews": [
+    {
+      "id": "R4-CX-03",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "files": [
+            {
+              "path": "internal/runtime/executor/codex_executor_terminal.go",
+              "sha256": "ae4094bfc2030f9535139d73b1ea75f52bfc919c27a7f8f3c1b91232864080cc"
+            },
+            {
+              "path": "internal/runtime/executor/codex_stream_bootstrap_buffering_test.go",
+              "sha256": "52d737c8962481c091f223967d88c7e3b250c05c62578de60d9030fd67b0282c"
+            }
+          ]
+        },
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "proxy/wsrelay/read_pump.go",
+              "sha256": "145ea649b242d370dbab4db07c5ce70e75b36955d108ba0bcdb1cb4e82fd7bf0"
+            },
+            {
+              "path": "proxy/wsrelay/read_pump_test.go",
+              "sha256": "156265c45a5712a71b3608ae8445353c55a82b01ebf6e5b2999bad72c903dfeb"
+            },
+            {
+              "path": "proxy/overflow_compact.go",
+              "sha256": "78d274b4d5bc673779a025d03ac07fe0da9bce8c2647506abb47279dd9f3d333"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/proxy/response_semantics.rs",
+            "anchors": [
+              "codex_r4_metadata_never_masks_generation_errors_or_unknown_content",
+              "codex_r4_sse_names_cannot_relabel_content_as_metadata"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_r4_tests.rs",
+            "anchors": [
+              "codex_r4_metadata_never_retimes_first_content_or_idle_deadline",
+              "codex_r4_idle_telemetry_is_not_delivered_but_unknown_response_events_are",
+              "codex_r4_websocket_metadata_then_eof_has_no_first_token_or_http_replay"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Classify only exact reviewed metadata envelopes independently of content, timing, transport commitment and generation terminals. Preserve native/public SSE visibility and conservative unknown-event handling; sending Codex create still forbids HTTP replay.",
+      "outstanding": []
+    },
+    {
+      "id": "R4-CX-04",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "proxy/responses_ws_interrupt.go",
+              "sha256": "1676cdddd493301a9e5bb1f5cda8513ab3bd4be57c06dd55b3b12e0889ec6e32"
+            },
+            {
+              "path": "proxy/openai_responses_ws_interrupt.go",
+              "sha256": "5dd9f3e9bfdacbf391f71e4d3277a490da0b1c71e3abce90d99e9cc10fb00d10"
+            },
+            {
+              "path": "proxy/wsrelay/interrupt.go",
+              "sha256": "646fbaea4579ececdd4f0f66393dc9ebd1cc2e02271704f5e5c67e90955e27bd"
+            },
+            {
+              "path": "proxy/wsrelay/read_pump.go",
+              "sha256": "145ea649b242d370dbab4db07c5ce70e75b36955d108ba0bcdb1cb4e82fd7bf0"
+            },
+            {
+              "path": "proxy/wsrelay/read_pump_test.go",
+              "sha256": "156265c45a5712a71b3608ae8445353c55a82b01ebf6e5b2999bad72c903dfeb"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/proxy/providers/codex/control.rs",
+            "anchors": [
+              "codex_r4_interrupt_state_fences_identity_duplicates_ack_and_terminal"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_r4_tests.rs",
+            "anchors": [
+              "codex_r4_failed_interrupt_preserves_generation_and_single_usage",
+              "codex_r4_interrupt_ack_order_timeout_and_duplicate_requests_are_connection_local",
+              "codex_r4_http_fallback_interrupt_is_explicitly_unsupported_and_keeps_stream",
+              "codex_r4_response_identity_change_finishes_usage_once"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Fence exact mode, response and physical connection; deduplicate requests and ACKs. Preserve real accepted/failed ACKs separately from generation semantics. Bound ACK wait without reconnect/replay or a second terminal/usage. HTTP fallback reports proxy-sourced unsupported and continues the original stream; it never fabricates upstream acceptance.",
+      "outstanding": []
+    },
+    {
+      "id": "R4-CX-02",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "proxy/codex_usage_frames.go",
+              "sha256": "25bd40305bbb721fb6ad651bcfa69e73501e1a570d832c478229d82b189c8899"
+            },
+            {
+              "path": "proxy/codex_usage_frames_test.go",
+              "sha256": "2b54513d4d3cf33ec16303be0f0c0aeed919d0eb1e5fdef1c7a369f1d53765d9"
+            },
+            {
+              "path": "auth/usage_frame_observation.go",
+              "sha256": "33d0874e516b346ef1bb20acffb69f1b015c0d955cd1cf3fb56e3a99f5a2a6e1"
+            },
+            {
+              "path": "auth/usage_frame_persist.go",
+              "sha256": "4abb8d5dda6727b4d4a2e3b4df3a3ad53b65b528d7a4e3499a383b9338b65c40"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/domain/accounts/codex_quota.rs",
+            "anchors": [
+              "codex_r4_quota_dialects_sparse_zero_false_buckets_and_reset_bounds",
+              "codex_r4_quota_identity_time_fences_and_persisted_snapshots_survive_restart"
+            ]
+          },
+          {
+            "path": "src/state/codex_quota.rs",
+            "anchors": [
+              "codex_r4_quota_queue_is_bounded_merges_partial_fields_and_releases_on_shutdown"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_r4_tests.rs",
+            "anchors": [
+              "codex_r4_quota_observation_does_not_wait_for_persistence_or_write_token_usage"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Normalize reviewed default-bucket quota dialects and allowlisted metadata headers into sparse timestamped observations. Fence Provider/account/auth/token generations, coalesce a bounded process-budgeted queue off the reader, and persist through state domain methods. Never record generation tokens or impose account health/cooldown from passive frames.",
+      "outstanding": []
+    },
+    {
+      "id": "R4-CORE-02",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "security/request_memory.go",
+              "sha256": "8d180e452bf9cedcfe81fd791005de3a71027de90aeb48d944a0be313515714c"
+            },
+            {
+              "path": "security/request_memory_test.go",
+              "sha256": "978520b0ca766f4a9d5264aa47091e34cf660646db6220cf6e496245b724e790"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/infra/resident_memory.rs",
+            "anchors": [
+              "codex_r4_process_budget_tracks_observation_limits_and_shared_ownership",
+              "codex_r4_concurrent_reservations_cannot_overcommit_process_capacity"
+            ]
+          },
+          {
+            "path": "src/proxy/request_memory.rs",
+            "anchors": [
+              "codex_r4_child_parent_growth_is_atomic_sticky_and_releases_on_cancel"
+            ]
+          },
+          {
+            "path": "src/proxy/codex_models.rs",
+            "anchors": [
+              "codex_r4_manifest_owners_release_on_replacement_eviction_and_drop",
+              "codex_r4_manifest_capacity_denial_keeps_last_good_identity_snapshot"
+            ]
+          },
+          {
+            "path": "src/domain/sharing/previous_response_cache.rs",
+            "anchors": [
+              "codex_r4_previous_response_charges_allocations_and_releases_expiry_and_tombstones",
+              "codex_r4_previous_response_capacity_denial_preserves_strict_scoped_miss"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_resident_tests.rs",
+            "anchors": [
+              "codex_r4_idle_and_active_frames_keep_one_owner_across_turn_changes",
+              "codex_r4_idle_capacity_failure_and_constructor_denial_do_not_replay",
+              "codex_r4_aborting_full_idle_read_queue_releases_pending_frame_owner",
+              "codex_r4_pool_capacity_ttl_acquire_and_peer_close_release_owners"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/codex_referrals.rs",
+            "anchors": [
+              "codex_r4_referral_pool_owners_follow_eviction_and_inflight_clones"
+            ]
+          },
+          {
+            "path": "src/image_store.rs",
+            "anchors": [
+              "codex_r4_image_download_owner_follows_last_bytes_view",
+              "codex_r4_image_head_verifies_with_bounded_memory_and_capacity_is_not_corruption",
+              "codex_r4_abandoned_blocking_image_read_releases_completed_payload"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_r4_tests.rs",
+            "anchors": [
+              "codex_r4_previous_context_capacity_is_not_a_required_context_miss",
+              "codex_r4_previous_context_working_copies_release_and_wire_owner_survives_clones",
+              "codex_r4_websocket_context_transfers_wire_charge_for_text_and_binary",
+              "codex_r4_websocket_context_capacity_keeps_original_frame_and_scope_miss_contract",
+              "codex_r4_previous_id_copy_is_admitted_without_trimming_or_truncation",
+              "codex_r4_websocket_body_extraction_preserves_flat_and_nested_requests"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Add a process parent to existing request reservations and the Codex observation queue. Default observation-only; explicit deployment cap, atomic parent/child growth, sticky child failure, unconditional shrink/drop and shared owner accounting. Aggregate metrics count logical retained bytes, not RSS. Codex independent owners now include manifest model/capability allocations and fixed index capacity; previous-response JSON, identity scope, index estimates and tombstones; idle/active WS read payloads, bounded queue/socket wrapper and pool index allowances; and referral session key/entry owners retained by in-flight clones. Optional cache denials preserve scoped miss or last-good behavior. Opaque library allocations and exact allocator RSS remain outside the logical estimate. Image GET now admits before bounded payload allocation and binds a parent owner to the final Bytes view; HEAD retains full SHA integrity validation using at most a 64 KiB reusable buffer. Previous-response expansion borrows cached items through state/domain callbacks, admits selected clones and parse/merge/serialization working sets before allocation, moves current input rather than cloning, and transfers wire ownership into HTTP Bytes or WS turn reservations. Capacity errors are distinct from actual required-context misses and never authorize replay or Provider penalties. Temporary lookup scope keys and required-context tool-pair index allowances also remain admitted until their stages complete. The outer HTTP opaque previous-response ID copy is admitted before allocation; WS borrows that ID. Nested response bodies and the active request body move instead of deep cloning. Broader normalization/parser-library scratch is not claimed as fully covered.",
+      "outstanding": [
+        "per_provider_review_of_independent_long_lived_cache_ownership",
+        "deployment_measurement_before_selecting_a_process_hard_limit"
+      ],
+      "limitations": [
+        "Encoded previous-response byte limits remain separate from allocation-oriented retained-byte estimates.",
+        "Tungstenite/Tokio/reqwest internals, cookie/TLS/HTTP pools, allocator slack and exact B-tree node sizes require actual Server RSS measurements.",
+        "Image payload and context working-set owners do not cover complete directory scans/metadata snapshots or opaque parser/allocator scratch; index allowances are logical estimates, and a started blocking file task completes and drops its result after cancellation."
+      ]
+    },
+    {
+      "id": "R4-CX-01",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "files": [
+            {
+              "path": "internal/translator/codex/claude/codex_claude_response.go",
+              "sha256": "90851e1b34b39e8211687fc94079adf1e9456e8017499274ff7e1f34f67ae45e"
+            },
+            {
+              "path": "internal/translator/codex/claude/codex_claude_commentary_phase_test.go",
+              "sha256": "c00c370bc784648439d98a485167c5062cf341f9ee9a8ce436387e1928bd2961"
+            },
+            {
+              "path": "internal/translator/codex/claude/codex_claude_commentary_replay_test.go",
+              "sha256": "b749e4abfb4474db65752cd48648f478947ed43ce9831dcc31f79a33366ac02f"
+            },
+            {
+              "path": "internal/translator/codex/claude/codex_claude_commentary_cross_format_test.go",
+              "sha256": "4cdcddb4b9753cb033ede6a98bd9c84d5f6c8cbfa3a13e06a6e40027eedddc44"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/proxy/stream_transforms/codex_phase_tests.rs",
+            "anchors": [
+              "codex_r4_phase_message_boundaries_match_json_without_reasoning_forgery",
+              "codex_r4_phase_commentary_tool_final_and_real_reasoning_stay_separate",
+              "codex_r4_phase_sparse_done_and_conflicts_do_not_create_new_phase_labels",
+              "codex_r4_phase_native_responses_request_and_sse_preserve_original_fields",
+              "codex_r4_phase_bridge_retained_state_is_charged"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Capture phases per message item, preserve standard text order and Messages item boundaries, retain native Responses fields, and expose bounded downgrade metrics. Missing phases preserve captured state; unknown/conflicting strings never become dynamic labels. Keep existing per-item delta deduplication; account for all retained Responses-to-Messages state. Genuine encrypted reasoning keeps its existing authenticated replay. No commentary-as-thinking or private phase signature protocol.",
+      "outstanding": [],
+      "limitations": [
+        "Standard Chat/Messages cannot losslessly carry or recover Responses phases; public text is preserved without inventing phase or encrypted reasoning on history replay."
+      ]
+    },
+    {
+      "id": "R4-CORE-03",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "sources": [
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "security/request_memory.go",
+              "sha256": "8d180e452bf9cedcfe81fd791005de3a71027de90aeb48d944a0be313515714c"
+            },
+            {
+              "path": "security/request_memory_test.go",
+              "sha256": "978520b0ca766f4a9d5264aa47091e34cf660646db6220cf6e496245b724e790"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/proxy/request_timing.rs",
+            "anchors": [
+              "codex_r4_timing_excludes_metadata_control_and_liveness_from_first_semantic",
+              "codex_r4_timing_retries_keep_request_origin_and_independent_attempt_results",
+              "codex_r4_timing_http_handoff_and_last_buffer_release_are_distinct",
+              "codex_r4_timing_cancel_drain_waits_for_remaining_payload_owners",
+              "codex_r4_timing_empty_terminal_never_fabricates_content_or_writer_completion",
+              "codex_r4_timing_late_close_cannot_relabel_completed_delivery_as_cancellation"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/codex_r4_tests.rs",
+            "anchors": [
+              "codex_r4_http_timing_observes_real_forwarding_and_aggregation",
+              "codex_r4_writer_completion_keeps_the_enqueued_attempt_after_retry",
+              "codex_r4_http_fallback_records_actual_downstream_write_without_semantic_commit"
+            ]
+          },
+          {
+            "path": "src/test_support/codex_server_probe.rs",
+            "anchors": [
+              "codex_server_loopback_measurement",
+              "bounded cancellation close handshake"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Independently implement bounded monotonic request/attempt observations in the Server, using the existing frozen owner-lifecycle principle for final logical release. Do not claim the referenced memory implementation supplies these Rust timing semantics or a newly reviewed TokenRouter timing implementation. Observe admission/send/headers/business semantic content, local HTTP body handoff or WS sink completion, terminal and last tracked memory-owner release separately. Capture an attempt when queueing a WS write, never infer writer success from conservative Sent, preserve legacy first_token_ms/usage/retry behavior, and keep unclassified exits unfinished. The frozen ignored-test assembly now measures the real Server API router and signed Share ingress over loopback on native WS, HTTP-fallback WS, HTTP SSE and HTTP JSON, using the codec probe's four synthetic input generators plus cancellation and 8 MiB slow-reader rows. These are sequential debug/test-process measurements, not vendor acceptance, isolated production RSS or a baseline speedup. The initial actual Server run exposed missing fallback downstream write observations; the relay now measures the real sink wait and marks success only after Ok while preserving the existing result/error semantics.",
+      "timingContract": {
+        "requestOrigin": "forwarding_entry_after_API_ingress",
+        "attemptOrigin": "preparation_after_retry_wait",
+        "httpDelivery": "body_handoff_only",
+        "websocketDelivery": "local_sink_send_completion",
+        "upstreamWriteCompletion": "writer_success_only_never_conservative_Sent",
+        "release": "last_tracked_request_budget_owner",
+        "unclassifiedExits": "unfinished",
+        "waitIntervals": "operation_wall_time_may_overlap",
+        "legacyFirstTokenChanged": false,
+        "controlsCountAsFirstSemantic": false,
+        "labels": [
+          "provider_type",
+          "surface",
+          "scope",
+          "phase",
+          "result"
+        ]
+      },
+      "outstanding": [
+        "deployment_measurement_before_selecting_a_process_hard_limit",
+        "remaining_provider_timing_and_resource_review"
+      ],
+      "measurement": {
+        "path": "assets/contract/codex-r4-server-probe.json",
+        "sha256": "b6d6d2d9a296c3a02e1df00c98891e584f0b8fd604f92e399caa87e2e23fb53d",
+        "evidenceState": "offline_loopback_test_assembly_measurement",
+        "baselineSpeedupClaim": false,
+        "productionCapacityClaim": false
+      }
+    },
+    {
+      "id": "R4-CX-05",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_reviewed_no_wire_delta",
+      "decision": "keep_current_encoding",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "files": [
+            {
+              "path": "internal/runtime/executor/codex_executor_request.go",
+              "sha256": "df863e10b658054aab7b36e8253eb1a4376da4a1696b8ad19304d5f96f8f873d"
+            },
+            {
+              "path": "internal/api/response_compression.go",
+              "sha256": "da2fe073c7e67d11a577a645d3b68df66d7f7af6e3205318288ff02c70c695aa"
+            },
+            {
+              "path": "internal/runtime/executor/codex_websockets_connection.go",
+              "sha256": "8fc0b1082f163a3f99f3b3fbca7185eeb1a4d14f61a7278061aa06281c7a6633"
+            }
+          ]
+        },
+        {
+          "sourceId": "codex2api",
+          "snapshotCommit": "3c6adfda702efed67931b2d98a491d72bd9d91b5",
+          "snapshotTree": "6630ed69c78dd11dfd8bbbc3220155f3df4bfefb",
+          "files": [
+            {
+              "path": "proxy/codex_request_compression.go",
+              "sha256": "4c8c0d2466d726df02ab48a0a3685b014f3e603e8eea5f8cc1977e5919c2ab4b"
+            },
+            {
+              "path": "proxy/codex_request_compression_test.go",
+              "sha256": "0c953c873d8caba56836e6e151b076f3b282e94d81a7d02eb2b5cc6e9cf6d20a"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "fn responses_websocket_http_replay_allowed"
+            ]
+          },
+          {
+            "path": "scripts/bench/codex-request-compression.py",
+            "anchors": [
+              "def payload("
+            ]
+          },
+          {
+            "path": "src/test_support/codex_server_probe.rs",
+            "anchors": [
+              "codex_server_loopback_measurement",
+              "override_provider_runtime_endpoint_for_test"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "vendorAcceptance": "live_pending",
+      "reason": "Close this round with unchanged HTTP outbound, downstream and WebSocket encodings. The codec probe establishes payload-dependent byte/CPU costs only; the Server loopback assembly measures current uncompressed paths and cannot establish real endpoint acceptance or compressed transport benefit. CLIProxyAPI independently gates outgoing compression by endpoint and benefit, implements negotiated downstream flush/Vary, and negotiates WS compression; codex2api uses a different default and endpoint policy. Neither policy is an interchangeable Server contract. Preserve fixed binding and the existing no-post-create HTTP-replay boundary; do not adopt generic 400/415 plaintext resend or enable new codec scratch outside process accounting.",
+      "keptEncoding": {
+        "outboundHttp": true,
+        "downstreamHttp": true,
+        "websocket": true
+      },
+      "broad400415ReplayAdopted": false,
+      "offlineDecisionComplete": true,
+      "futureEnablementRequires": [
+        "same_endpoint_same_rail_vendor_acceptance",
+        "bounded_codec_scratch_and_owner_lifecycle",
+        "stream_flush_negotiation_and_replay_contracts",
+        "measured_network_benefit_and_CPU_TTFT_cancel_tradeoff",
+        "explicit_endpoint_and_transport_scope"
+      ],
+      "outstanding": []
+    }
+  ],
+  "r4CategoryReview": {
+    "reviewedAt": "2026-10-27T15:10:55.508414532+00:00",
+    "status": "offline_complete",
+    "implementationCommit": null,
+    "liveAcceptance": "live_pending",
+    "concurrentShareMarketValidated": false,
+    "scope": "isolated_Codex_worktree_with_prior_Claude_Qoder_Antigravity_changes_excluding_concurrent_Share_Market_changes",
+    "completed": [
+      "R4-CX-01",
+      "R4-CX-02",
+      "R4-CX-03",
+      "R4-CX-04",
+      "R4-CX-05",
+      "Codex_R4-CORE-02_owner_and_working_set_entry",
+      "Codex_R4-CORE-03_milestones_and_loopback_measurement"
+    ],
+    "retainedLimits": [
+      "five_live_operations_stay_live_pending",
+      "shared_process_cap_default_remains_observation_only",
+      "other_provider_caches_and_timing_require_their_own_review",
+      "opaque_allocator_and_transport_internal_memory_not_fully_accounted",
+      "debug_process_RSS_is_not_production_capacity",
+      "no_new_HTTP_downstream_or_WebSocket_compression",
+      "no_UI_automation_deployment_commit_or_push"
+    ]
   }
 }

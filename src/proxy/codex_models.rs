@@ -4,6 +4,9 @@ use std::sync::{OnceLock, RwLock};
 use serde_json::Value;
 
 use crate::domain::providers::store::StoredProvider;
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 const MANIFEST_CACHE_SCOPE_LIMIT: usize = 4;
 
@@ -134,18 +137,35 @@ struct ManifestModelScope {
     auth_identity_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct ManifestModelCacheEntry {
     scope: ManifestModelScope,
     models: Vec<ManifestModelCapability>,
+    _memory: ResidentMemoryReservation,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ManifestModelCache {
     entries: Vec<ManifestModelCacheEntry>,
+    parent: ResidentMemoryBudget,
+    index_memory: Option<ResidentMemoryReservation>,
+}
+
+impl Default for ManifestModelCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl ManifestModelCache {
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            entries: Vec::new(),
+            parent,
+            index_memory: None,
+        }
+    }
+
     fn update_from_body(&mut self, scope: Option<ManifestModelScope>, body: &[u8]) -> usize {
         let Some(models) = parse_manifest_models(body) else {
             return self.model_ids(scope.as_ref()).len();
@@ -161,13 +181,59 @@ impl ManifestModelCache {
         let Some(scope) = scope else {
             return 0;
         };
-        self.entries.retain(|entry| entry.scope != scope);
-        let model_count = models.len();
-        self.entries.push(ManifestModelCacheEntry { scope, models });
-        if self.entries.len() > MANIFEST_CACHE_SCOPE_LIMIT {
-            let overflow = self.entries.len() - MANIFEST_CACHE_SCOPE_LIMIT;
-            self.entries.drain(..overflow);
+        let bytes = models.iter().fold(
+            scope.account_id.capacity().saturating_add(
+                models
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ManifestModelCapability>()),
+            ),
+            |bytes, model| {
+                [
+                    &model.reasoning_efforts,
+                    &model.input_modalities,
+                    &model.service_tiers,
+                ]
+                .into_iter()
+                .fold(
+                    bytes.saturating_add(model.id.capacity()),
+                    |bytes, values| {
+                        values.as_ref().map_or(bytes, |values| {
+                            values.iter().fold(
+                                bytes.saturating_add(
+                                    values
+                                        .capacity()
+                                        .saturating_mul(std::mem::size_of::<String>()),
+                                ),
+                                |bytes, value| bytes.saturating_add(value.capacity()),
+                            )
+                        })
+                    },
+                )
+            },
+        );
+        let Some(memory) = self.parent.reserve(bytes) else {
+            return self.model_ids(Some(&scope)).len();
+        };
+        if self.index_memory.is_none() {
+            let Some(index_memory) = self.parent.reserve(
+                MANIFEST_CACHE_SCOPE_LIMIT
+                    .saturating_mul(std::mem::size_of::<ManifestModelCacheEntry>()),
+            ) else {
+                return self.model_ids(Some(&scope)).len();
+            };
+            self.entries = Vec::with_capacity(MANIFEST_CACHE_SCOPE_LIMIT);
+            self.index_memory = Some(index_memory);
         }
+        self.entries.retain(|entry| entry.scope != scope);
+        if self.entries.len() == MANIFEST_CACHE_SCOPE_LIMIT {
+            self.entries.remove(0);
+        }
+        let model_count = models.len();
+        self.entries.push(ManifestModelCacheEntry {
+            scope,
+            models,
+            _memory: memory,
+        });
         model_count
     }
 
@@ -711,6 +777,53 @@ mod tests {
             cache.model_ids(manifest_model_scope(&provider).as_ref()),
             ["gpt-last-known-good"]
         );
+    }
+
+    #[test]
+    fn codex_r4_manifest_owners_release_on_replacement_eviction_and_drop() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ManifestModelCache::with_parent(parent.clone());
+        let scope = manifest_model_scope(&manifest_provider("owner-account", 1));
+        let mut model = manifest_model("large-capability");
+        model.reasoning_efforts = Some(vec!["effort".repeat(1000)]);
+        assert_eq!(cache.replace(scope.clone(), vec![model]), 1);
+        let large = parent.snapshot().used_bytes;
+        assert!(large > 6_000);
+        assert_eq!(
+            cache.replace(scope.clone(), vec![manifest_model("small")]),
+            1
+        );
+        assert!(parent.snapshot().used_bytes < large);
+        for generation in 2..=8 {
+            cache.replace(
+                manifest_model_scope(&manifest_provider("owner-account", generation)),
+                vec![manifest_model("other")],
+            );
+        }
+        assert!(cache.model_ids(scope.as_ref()).is_empty());
+        assert_eq!(cache.entries.len(), MANIFEST_CACHE_SCOPE_LIMIT);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
+    }
+
+    #[test]
+    fn codex_r4_manifest_capacity_denial_keeps_last_good_identity_snapshot() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ManifestModelCache::with_parent(parent.clone());
+        let scope = manifest_model_scope(&manifest_provider("capacity-account", 1));
+        cache.replace(scope.clone(), vec![manifest_model("known-good")]);
+        let used = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(used));
+        assert_eq!(
+            cache.replace(scope.clone(), vec![manifest_model("rejected")]),
+            1
+        );
+        assert_eq!(cache.model_ids(scope.as_ref()), ["known-good"]);
+        assert_eq!(parent.snapshot().used_bytes, used);
+        assert!(parent.snapshot().rejections > 0);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
     fn manifest_model(id: &str) -> ManifestModelCapability {

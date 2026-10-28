@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
+
 const IMAGE_STORE_DIRECTORY: &str = "image-capabilities";
 const IMAGE_STORE_ENTRIES_DIRECTORY: &str = "entries";
 const IMAGE_STORE_LOCK_FILE: &str = ".lock";
@@ -18,11 +23,23 @@ const IMAGE_STORE_SCHEMA_VERSION: u32 = 1;
 const IMAGE_CAPABILITY_TTL_MS: i64 = 60 * 60 * 1000;
 const IMAGE_CAPABILITY_MAX_ENTRIES: usize = 128;
 const IMAGE_CAPABILITY_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const IMAGE_HEAD_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageCapabilityRead {
+    Body,
+    Head,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("image capability memory capacity exhausted")]
+pub(crate) struct ImageCapabilityCapacityError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImageCapability {
     pub(crate) data: Bytes,
     pub(crate) mime_type: String,
+    pub(crate) byte_length: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +50,19 @@ pub(crate) struct ImageCapabilityHandle {
 #[derive(Debug)]
 pub(crate) struct ImageCapabilityStore {
     root: PathBuf,
+    parent: ResidentMemoryBudget,
+}
+
+struct ImagePayload {
+    data: Vec<u8>,
+    _memory: ResidentMemoryReservation,
+    _capacity_memory: Option<ResidentMemoryReservation>,
+}
+
+impl AsRef<[u8]> for ImagePayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +92,13 @@ impl ImageCapabilityStore {
     }
 
     fn at(root: PathBuf) -> anyhow::Result<Self> {
+        Self::with_parent(root, process_resident_memory())
+    }
+
+    fn with_parent(root: PathBuf, parent: ResidentMemoryBudget) -> anyhow::Result<Self> {
         create_private_directory(&root)?;
         create_private_directory(&root.join(IMAGE_STORE_ENTRIES_DIRECTORY))?;
-        let store = Self { root };
+        let store = Self { root, parent };
         let mut lock = store.lock()?;
         let snapshot = store.cleanup_locked(now_ms())?;
         set_store_size_metrics(&snapshot);
@@ -147,11 +181,25 @@ impl ImageCapabilityStore {
         Ok(ImageCapabilityHandle { token })
     }
 
-    pub(crate) fn get(&self, token: &str) -> anyhow::Result<Option<ImageCapability>> {
-        self.get_at(token, now_ms())
+    pub(crate) fn get(
+        &self,
+        token: &str,
+        mode: ImageCapabilityRead,
+    ) -> anyhow::Result<Option<ImageCapability>> {
+        self.get_at_mode(token, now_ms(), mode)
     }
 
+    #[cfg(test)]
     fn get_at(&self, token: &str, now_ms: i64) -> anyhow::Result<Option<ImageCapability>> {
+        self.get_at_mode(token, now_ms, ImageCapabilityRead::Body)
+    }
+
+    fn get_at_mode(
+        &self,
+        token: &str,
+        now_ms: i64,
+        mode: ImageCapabilityRead,
+    ) -> anyhow::Result<Option<ImageCapability>> {
         if !valid_token(token) {
             crate::metrics::record_image_capability_event("miss");
             return Ok(None);
@@ -167,18 +215,8 @@ impl ImageCapabilityStore {
             return Ok(None);
         };
 
-        let data_path = self.data_path(token);
-        let data = match fs::read(&data_path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read image capability data {}", data_path.display()))
-            }
-        };
-        let valid = u64::try_from(data.len()).ok() == Some(metadata.byte_length)
-            && hex::encode(Sha256::digest(&data)) == metadata.sha256;
-        if !valid {
+        let data = self.read_verified_payload(token, &metadata, mode)?;
+        let Some(data) = data else {
             self.remove_pair_locked(token)?;
             snapshot.entries.remove(token);
             snapshot.total_bytes = snapshot.total_bytes.saturating_sub(metadata.byte_length);
@@ -186,14 +224,84 @@ impl ImageCapabilityStore {
             crate::metrics::record_image_capability_event("corrupt");
             lock.unlock()?;
             return Ok(None);
-        }
+        };
         set_store_size_metrics(&snapshot);
         crate::metrics::record_image_capability_event("hit");
         lock.unlock()?;
         Ok(Some(ImageCapability {
-            data: Bytes::from(data),
+            data,
             mime_type: metadata.mime_type,
+            byte_length: metadata.byte_length,
         }))
+    }
+
+    /// Validate both GET and HEAD under the cross-process lock. File length
+    /// never controls an unbounded allocation, including a racing file growth.
+    fn read_verified_payload(
+        &self,
+        token: &str,
+        metadata: &ImageCapabilityMetadata,
+        mode: ImageCapabilityRead,
+    ) -> anyhow::Result<Option<Bytes>> {
+        let data_path = self.data_path(token);
+        let mut file = match fs::File::open(&data_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("open image capability payload"),
+        };
+        if file.metadata()?.len() != metadata.byte_length {
+            return Ok(None);
+        }
+        let length = usize::try_from(metadata.byte_length)?;
+        let buffer_length = match mode {
+            ImageCapabilityRead::Body => length,
+            ImageCapabilityRead::Head => length.min(IMAGE_HEAD_VERIFY_BUFFER_BYTES),
+        };
+        let memory = self
+            .parent
+            .reserve(buffer_length.saturating_add(std::mem::size_of::<ImagePayload>()))
+            .ok_or(ImageCapabilityCapacityError)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(buffer_length)
+            .map_err(|_| ImageCapabilityCapacityError)?;
+        let capacity_memory = (data.capacity() > buffer_length)
+            .then(|| {
+                self.parent
+                    .reserve(data.capacity() - buffer_length)
+                    .ok_or(ImageCapabilityCapacityError)
+            })
+            .transpose()?;
+        data.resize(buffer_length, 0);
+        let mut hasher = Sha256::new();
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk_length = remaining.min(buffer_length);
+            let target = match mode {
+                ImageCapabilityRead::Body => &mut data[length - remaining..][..chunk_length],
+                ImageCapabilityRead::Head => &mut data[..chunk_length],
+            };
+            if let Err(error) = file.read_exact(target) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(error).context("read image capability payload");
+            }
+            hasher.update(target);
+            remaining -= chunk_length;
+        }
+        // Probe one extra byte without growing the buffer, even if another
+        // process ignored the store lock and appended after the length check.
+        if file.read(&mut [0u8; 1])? != 0 || hex::encode(hasher.finalize()) != metadata.sha256 {
+            return Ok(None);
+        }
+        if mode == ImageCapabilityRead::Head {
+            return Ok(Some(Bytes::new()));
+        }
+        Ok(Some(Bytes::from_owner(ImagePayload {
+            data,
+            _memory: memory,
+            _capacity_memory: capacity_memory,
+        })))
     }
 
     fn cleanup_locked(&self, now_ms: i64) -> anyhow::Result<StoreSnapshot> {
@@ -528,5 +636,111 @@ mod tests {
                 .is_some());
         }
         fs::remove_dir_all(root.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn codex_r4_image_download_owner_follows_last_bytes_view() {
+        let (root, _) = test_store("resident-owner");
+        let parent = ResidentMemoryBudget::new(None);
+        let store = ImageCapabilityStore::with_parent(root.clone(), parent.clone()).unwrap();
+        let handle = store
+            .insert_at(Bytes::from(vec![7; 1024]), "image/png".into(), 10)
+            .unwrap();
+        let image = store.get_at(&handle.token, 11).unwrap().unwrap();
+        let charged = 1024 + std::mem::size_of::<ImagePayload>();
+        assert_eq!(parent.snapshot().used_bytes, charged);
+        let clone = image.data.clone();
+        let slice = image.data.slice(100..101);
+        drop(image);
+        drop(store);
+        assert_eq!(parent.snapshot().used_bytes, charged);
+        drop(clone);
+        assert_eq!(slice.as_ref(), &[7]);
+        assert_eq!(parent.snapshot().used_bytes, charged);
+        drop(slice);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_r4_image_head_verifies_with_bounded_memory_and_capacity_is_not_corruption() {
+        let (root, _) = test_store("resident-head");
+        let parent = ResidentMemoryBudget::new(Some(
+            IMAGE_HEAD_VERIFY_BUFFER_BYTES + std::mem::size_of::<ImagePayload>(),
+        ));
+        let store = ImageCapabilityStore::with_parent(root.clone(), parent.clone()).unwrap();
+        let length = IMAGE_HEAD_VERIFY_BUFFER_BYTES * 3;
+        let handle = store
+            .insert_at(Bytes::from(vec![5; length]), "image/png".into(), 10)
+            .unwrap();
+        let error = store.get_at(&handle.token, 11).unwrap_err();
+        assert!(error.is::<ImageCapabilityCapacityError>());
+        assert!(store.data_path(&handle.token).exists());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        let head = store
+            .get_at_mode(&handle.token, 12, ImageCapabilityRead::Head)
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.byte_length, length as u64);
+        assert!(head.data.is_empty());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(
+            parent.snapshot().high_water_bytes,
+            IMAGE_HEAD_VERIFY_BUFFER_BYTES + std::mem::size_of::<ImagePayload>()
+        );
+
+        let mut corrupt = vec![5; length];
+        corrupt[length - 1] = 6;
+        fs::write(store.data_path(&handle.token), corrupt).unwrap();
+        assert!(store
+            .get_at_mode(&handle.token, 13, ImageCapabilityRead::Head)
+            .unwrap()
+            .is_none());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(!store.data_path(&handle.token).exists());
+
+        let handle = store
+            .insert_at(Bytes::from_static(b"small"), "image/png".into(), 20)
+            .unwrap();
+        fs::write(store.data_path(&handle.token), vec![0; length]).unwrap();
+        parent.configure_limit(Some(0));
+        let rejections = parent.snapshot().rejections;
+        assert!(store.get_at(&handle.token, 21).unwrap().is_none());
+        assert_eq!(parent.snapshot().rejections, rejections);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_r4_abandoned_blocking_image_read_releases_completed_payload() {
+        let (root, _) = test_store("resident-cancel");
+        let parent = ResidentMemoryBudget::new(None);
+        let store = ImageCapabilityStore::with_parent(root.clone(), parent.clone()).unwrap();
+        let handle = store
+            .insert_at(Bytes::from_static(b"image"), "image/png".into(), 10)
+            .unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = store.get_at(&handle.token, 11);
+            ready.send(()).unwrap();
+            wait.recv().unwrap();
+            result
+        });
+        started.await.unwrap();
+        assert!(parent.snapshot().used_bytes > 0);
+        task.abort();
+        drop(task);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while parent.snapshot().used_bytes != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(parent.snapshot().active_reservations, 0);
+        fs::remove_dir_all(root).unwrap();
     }
 }

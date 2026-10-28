@@ -205,6 +205,27 @@ impl ServerStateInner {
         fence: &QuotaSourceFence,
         observation: &QuotaWindowObservation,
     ) -> anyhow::Result<bool> {
+        self.record_passive_quota_window_for_token(
+            key,
+            provider_revision,
+            account_id,
+            fence,
+            observation,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_passive_quota_window_for_token(
+        self: &Arc<Self>,
+        key: &ProviderKey,
+        provider_revision: u64,
+        account_id: &str,
+        fence: &QuotaSourceFence,
+        observation: &QuotaWindowObservation,
+        token_generation: Option<u64>,
+    ) -> anyhow::Result<bool> {
         let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         let _quota = self.share_quota_mutations.lock().await;
         let providers = self.providers.read().await;
@@ -220,6 +241,11 @@ impl ServerStateInner {
             crate::domain::providers::runtime::authoritative_managed_account(stored, &accounts)
                 .filter(|account| {
                     account.id == account_id
+                        && token_generation
+                            .is_none_or(|generation| account.token_refresh_generation == generation)
+                        && account
+                            .quota_refreshed_at
+                            .is_none_or(|at| observation.observed_at_ms >= at)
                         && account.auth_identity_generation == fence.identity_generation
                         && accounts.account_incarnation(account_id)
                             == Some(fence.account_incarnation)

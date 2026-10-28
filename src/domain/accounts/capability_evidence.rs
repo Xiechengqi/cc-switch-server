@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::Account;
+use crate::domain::antigravity_identity::{antigravity_client_identity, AntigravityClientIdentity};
 use crate::domain::providers::model::ProviderType;
 
 pub const GEMINI_CODE_PLAN_CAPABILITY: &str = "gemini_code_plan";
@@ -58,6 +59,8 @@ pub struct AccountCapabilityObservation {
     pub observed_at_ms: i64,
     pub expires_at_ms: i64,
     pub auth_identity_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_client_identity: Option<AntigravityClientIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +74,8 @@ pub struct AccountCapabilityObservationDraft {
     pub reason: Option<String>,
     pub observed_at_ms: i64,
     pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_client_identity: Option<AntigravityClientIdentity>,
 }
 
 impl AccountCapabilityObservationDraft {
@@ -91,7 +96,16 @@ impl AccountCapabilityObservationDraft {
             reason: reason.map(str::to_string),
             observed_at_ms,
             expires_at_ms: expires_at_ms.max(observed_at_ms),
+            antigravity_client_identity: None,
         }
+    }
+
+    pub fn with_antigravity_client_identity(
+        mut self,
+        identity: &AntigravityClientIdentity,
+    ) -> Self {
+        self.antigravity_client_identity = Some(identity.clone());
+        self
     }
 
     pub fn gemini_project(supported: bool, observed_at_ms: i64, reason: Option<&str>) -> Self {
@@ -249,12 +263,15 @@ pub fn record_observation_drafts(
             observed_at_ms: draft.observed_at_ms,
             expires_at_ms: draft.expires_at_ms,
             auth_identity_generation: account.auth_identity_generation,
+            antigravity_client_identity: draft.antigravity_client_identity,
         };
         let should_replace = account
             .capability_observations
             .get(&key)
             .is_none_or(|current| {
                 current.auth_identity_generation != account.auth_identity_generation
+                    || current.antigravity_client_identity
+                        != observation.antigravity_client_identity
                     || current.observed_at_ms <= observation.observed_at_ms
             });
         if should_replace {
@@ -428,6 +445,7 @@ fn antigravity_capability_projection(
     now_ms: i64,
     rail: &str,
 ) -> AccountCapabilityProjection {
+    let client_identity = antigravity_client_identity();
     let mut dimensions = BTreeMap::new();
     dimensions.insert(
         CREDENTIAL_FLOW_DIMENSION.to_string(),
@@ -445,7 +463,13 @@ fn antigravity_capability_projection(
     ] {
         dimensions.insert(
             dimension.to_string(),
-            observation_projection(account, ANTIGRAVITY_CODE_PLAN_CAPABILITY, dimension, now_ms),
+            observation_projection_for_client(
+                account,
+                ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                dimension,
+                now_ms,
+                Some(&client_identity),
+            ),
         );
     }
     let state = aggregate_state(dimensions.values().map(|evidence| evidence.state));
@@ -641,6 +665,18 @@ fn observation_projection(
     dimension: &str,
     now_ms: i64,
 ) -> AccountCapabilityEvidenceProjection {
+    let identity =
+        (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY).then(antigravity_client_identity);
+    observation_projection_for_client(account, capability, dimension, now_ms, identity.as_ref())
+}
+
+fn observation_projection_for_client(
+    account: &Account,
+    capability: &str,
+    dimension: &str,
+    now_ms: i64,
+    identity: Option<&AntigravityClientIdentity>,
+) -> AccountCapabilityEvidenceProjection {
     let Some(observation) = account
         .capability_observations
         .get(&observation_key(capability, dimension))
@@ -655,8 +691,10 @@ fn observation_projection(
             evidence_auth_identity_generation: None,
         };
     };
-    let (state, freshness) = if observation.auth_identity_generation
-        != account.auth_identity_generation
+    let client_superseded = identity
+        .is_some_and(|identity| !observation_matches_antigravity_client(observation, identity));
+    let (state, freshness) = if client_superseded
+        || observation.auth_identity_generation != account.auth_identity_generation
     {
         (
             AccountCapabilityState::Stale,
@@ -683,7 +721,11 @@ fn observation_projection(
         state,
         freshness,
         source: observation.source.clone(),
-        reason: observation.reason.clone(),
+        reason: if client_superseded {
+            Some("antigravity_client_identity_superseded".to_string())
+        } else {
+            observation.reason.clone()
+        },
         observed_at_ms: Some(observation.observed_at_ms),
         expires_at_ms: Some(observation.expires_at_ms),
         evidence_auth_identity_generation: Some(observation.auth_identity_generation),
@@ -743,12 +785,55 @@ pub fn fresh_observation_state(
     dimension: &str,
     now_ms: i64,
 ) -> Option<AccountCapabilityObservationState> {
+    let identity =
+        (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY).then(antigravity_client_identity);
+    fresh_observation_state_for_client(account, capability, dimension, now_ms, identity.as_ref())
+}
+
+pub fn fresh_antigravity_observation_state(
+    account: &Account,
+    dimension: &str,
+    now_ms: i64,
+    identity: &AntigravityClientIdentity,
+) -> Option<AccountCapabilityObservationState> {
+    fresh_observation_state_for_client(
+        account,
+        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+        dimension,
+        now_ms,
+        Some(identity),
+    )
+}
+
+fn observation_matches_antigravity_client(
+    observation: &AccountCapabilityObservation,
+    identity: &AntigravityClientIdentity,
+) -> bool {
+    match observation.antigravity_client_identity.as_ref() {
+        Some(observed) => observed == identity,
+        None => !matches!(
+            observation.source.as_str(),
+            "fetch_available_models" | "google_rpc_error"
+        ),
+    }
+}
+
+fn fresh_observation_state_for_client(
+    account: &Account,
+    capability: &str,
+    dimension: &str,
+    now_ms: i64,
+    identity: Option<&AntigravityClientIdentity>,
+) -> Option<AccountCapabilityObservationState> {
     account
         .capability_observations
         .get(&observation_key(capability, dimension))
         .filter(|observation| {
             observation.auth_identity_generation == account.auth_identity_generation
                 && observation.expires_at_ms > now_ms
+                && identity.is_none_or(|identity| {
+                    observation_matches_antigravity_client(observation, identity)
+                })
         })
         .map(|observation| observation.state)
 }
@@ -773,6 +858,115 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::AccountStore;
     use serde_json::json;
+
+    #[test]
+    fn antigravity_r4_unversioned_catalog_evidence_cannot_authorize_current_client() {
+        let mut account = account(ProviderType::AntigravityOAuth);
+        record_observation_drafts(
+            &mut account,
+            [AccountCapabilityObservationDraft::antigravity_feature(
+                MODEL_CATALOG_DIMENSION,
+                AccountCapabilityObservationState::Supported,
+                "fetch_available_models",
+                None,
+                1_000,
+                Some(5_000),
+            )],
+        );
+        assert_eq!(
+            fresh_observation_state(
+                &account,
+                ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                MODEL_CATALOG_DIMENSION,
+                2_000,
+            ),
+            None,
+            "persisted catalogs without the request client identity cannot be fresh"
+        );
+        let projection = account_capability_projections(&account, 2_000)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            projection.dimensions[MODEL_CATALOG_DIMENSION].freshness,
+            AccountCapabilityFreshness::Superseded
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_r4_persisted_evidence_is_superseded_after_client_change() {
+        use crate::domain::antigravity_identity::TestAntigravityIdentity;
+        let versions = TestAntigravityIdentity::new("2.2.1");
+        versions
+            .scope(async {
+                let mut account = account(ProviderType::AgyOAuth);
+                let first = antigravity_client_identity();
+                let draft = |identity: &AntigravityClientIdentity, observed_at| {
+                    AccountCapabilityObservationDraft::antigravity_feature(
+                        MODEL_CATALOG_DIMENSION,
+                        AccountCapabilityObservationState::Supported,
+                        "fetch_available_models",
+                        None,
+                        observed_at,
+                        Some(5_000),
+                    )
+                    .with_antigravity_client_identity(identity)
+                };
+                record_observation_drafts(&mut account, [draft(&first, 2_000)]);
+                let encoded = serde_json::to_value(&account).unwrap();
+                let mut restored: Account = serde_json::from_value(encoded).unwrap();
+                assert!(has_fresh_supported_observation(
+                    &restored,
+                    ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                    MODEL_CATALOG_DIMENSION,
+                    3_000
+                ));
+                versions.update("2.3.4");
+                assert_eq!(
+                    fresh_observation_state(
+                        &restored,
+                        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                        MODEL_CATALOG_DIMENSION,
+                        3_000
+                    ),
+                    None
+                );
+                let projection = account_capability_projections(&restored, 3_000)
+                    .pop()
+                    .unwrap();
+                assert_eq!(
+                    projection.dimensions[MODEL_CATALOG_DIMENSION].freshness,
+                    AccountCapabilityFreshness::Superseded
+                );
+                assert_eq!(
+                    projection.dimensions[MODEL_CATALOG_DIMENSION]
+                        .reason
+                        .as_deref(),
+                    Some("antigravity_client_identity_superseded")
+                );
+                let second = antigravity_client_identity();
+                assert_eq!(
+                    record_observation_drafts(&mut restored, [draft(&second, 1_000)]),
+                    1
+                );
+                assert!(has_fresh_supported_observation(
+                    &restored,
+                    ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                    MODEL_CATALOG_DIMENSION,
+                    3_000
+                ));
+                restored.auth_identity_generation += 1;
+                assert_eq!(
+                    fresh_observation_state(
+                        &restored,
+                        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                        MODEL_CATALOG_DIMENSION,
+                        3_000
+                    ),
+                    None
+                );
+            })
+            .await;
+    }
 
     fn account(provider_type: ProviderType) -> Account {
         serde_json::from_value(json!({
@@ -1073,6 +1267,13 @@ mod tests {
                 ],
             );
 
+            for observation in account
+                .capability_observations
+                .values_mut()
+                .filter(|observation| observation.source == "fetch_available_models")
+            {
+                observation.antigravity_client_identity = Some(antigravity_client_identity());
+            }
             let projections = account_capability_projections(&account, 2_000);
             assert_eq!(projections.len(), 2);
             assert_eq!(projections[0].capability, GEMINI_CODE_PLAN_CAPABILITY);

@@ -948,6 +948,94 @@ for (const [rail, site] of [
   );
 }
 
+const r4Ids = new Set(["R4-CORE-01", "R4-QD-01", "R4-QD-02"]);
+for (const review of contract.r4Reviews ?? []) {
+  assert(r4Ids.delete(review.id), `unexpected or duplicate Qoder R4 review ${review.id}`);
+  const researched = review.id === "R4-QD-02";
+  assert(
+    Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.status === (researched ? "researched_live_pending" : "working_tree_fixture_verified") &&
+      review.liveAcceptance === "live_pending" &&
+      review.decision === ({
+        "R4-CORE-01": "adapt",
+        "R4-QD-01": "partial_adapt",
+        "R4-QD-02": "defer_missing_official_oracle",
+      })[review.id],
+    `${review.id} claims an unsupported R4 evidence state`,
+  );
+  const source = review.source;
+  assert(
+    source?.sourceId === "tokenrouter" &&
+      source.snapshotCommit === "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd" &&
+      source.deltaCommit === source.snapshotCommit &&
+      source.deltaTree === "df18b022d78c4760a89f5d0c372b5467bbc4c60f" &&
+      source.readMode === "read_only_committed_git_objects" &&
+      Array.isArray(source.files) && source.files.length >= 2,
+    `${review.id} lost its frozen source identity`,
+  );
+  for (const file of source.files) {
+    safeRelative(file.path, `${review.id} source`);
+    assert(digestPattern.test(file.sha256), `${review.id} has an invalid source digest`);
+    if (checkSources) {
+      const sourceRoot = sourceRootById.get(source.sourceId);
+      assert(
+        gitTree(sourceRoot, source.deltaCommit) === source.deltaTree &&
+          sha256(gitFile(sourceRoot, source.deltaCommit, file.path, null)) === file.sha256,
+        `${review.id} source object drifted`,
+      );
+    }
+  }
+  assert(
+    commitPattern.test(review.target?.baselineCommit) &&
+      review.target.implementationCommit === null &&
+      review.target.readMode === "working_tree" &&
+      Array.isArray(review.target.contracts) && review.target.contracts.length > 0,
+    `${review.id} must distinguish working-tree evidence from committed implementation`,
+  );
+  for (const fixture of review.target.contracts) {
+    safeRelative(fixture.path, `${review.id} target`);
+    const content = fs.readFileSync(path.join(repoRoot, fixture.path), "utf8");
+    assert(
+      Array.isArray(fixture.anchors) && fixture.anchors.length > 0 &&
+        fixture.anchors.every((anchor) => content.includes(anchor)),
+      `${review.id} has an unavailable local fixture anchor`,
+    );
+  }
+  if (review.id === "R4-QD-01") {
+    assert(
+      review.declaredHistory === "fixture_verified" && review.retiredHistory === "live_pending",
+      "Qoder declared-history repair must not promote retired-history acceptance",
+    );
+    exact(review.rails, ["global_oauth", "global_pat", "cn_oauth"], "R4-QD-01 rails");
+    exact(review.surfaces, ["claude", "codex", "gemini"], "R4-QD-01 surfaces");
+  }
+  if (researched) {
+    assert(
+      review.productionCodeChanged === false && review.cnPatEnabled === false,
+      "CN PAT cannot be enabled from reference-only evidence",
+    );
+    exact(review.missingEvidence, [
+      "independent_official_cn_pat_bundle_and_digest",
+      "cn_pat_wire_oracle_and_mutations",
+      "independent_registry_import_rotation_contract",
+      "cn_pat_private_real_receipt",
+    ], "R4-QD-02 evidence gate");
+  }
+}
+assert(r4Ids.size === 0, "Qoder R4 review coverage is incomplete");
+const historyDelta = readJson(path.join(repoRoot, "assets/contract/qoder-r4-history-delta.json"));
+assert(
+  historyDelta.format === "cc-switch-qoder-r4-history-delta" && historyDelta.schemaVersion === 1 &&
+    historyDelta.liveAcceptance === "live_pending" &&
+    historyDelta.referenceObservation?.commit === "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd" &&
+    historyDelta.referenceObservation.evidence === "read_only_source_observation_not_an_executed_reference_payload_or_live_receipt",
+  "Qoder history delta cannot claim executed reference or live evidence",
+);
+exact(historyDelta.cases?.map((entry) => entry.id), [
+  "retired_namespace_cannot_acquire_current_flat_identity",
+  "explicit_reset_does_not_promote_historical_discovery",
+], "Qoder final history payload fixtures");
+
 console.log(
-  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${referenceReviewExtensions.size} reference reviews, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
+  `qoder reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} committed-object snapshot, ${referenceReviewExtensions.size} reference reviews, ${observationIds.size} immutable observations, ${contract.r4Reviews.length} R4 working-tree/research reviews, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, revision ${truth.driverContractRevision}, ${acceptance.requiredChecks.length} real checks, external check ${checkSources ? "verified" : "optional"})`,
 );

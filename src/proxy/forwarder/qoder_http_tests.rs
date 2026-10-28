@@ -2003,6 +2003,145 @@ fn qoder_responses_alias_rejects_share_user_model_and_account_drift_before_netwo
 }
 
 #[test]
+fn qoder_r4_review_discovery_capacity_is_local_and_zero_outbound_on_every_rail_surface() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-r4-flight-{}-{}", rail.label(), app.as_str());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(Some(0));
+                let mut state = qoder_test_state(&name);
+                Arc::get_mut(&mut state)
+                    .expect("unique fixture state")
+                    .qoder_runtime =
+                    crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+                let (provider_id, account_id) =
+                    install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
+                        .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let error = forward_qoder_surface(
+                    state.clone(),
+                    app,
+                    provider_id,
+                    &share_id,
+                    "owner@example.com",
+                    "capacity",
+                    false,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.is_request_memory_exhausted(),
+                    "{rail:?}/{app:?}: {error:?}"
+                );
+                assert_eq!(fixture.count(&fixture.model_requests), 0);
+                assert_eq!(fixture.count(&fixture.generation_requests), 0);
+                assert_eq!(fixture.count(&fixture.pat_exchanges), 0);
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+                assert_eq!(parent.snapshot().used_bytes, 0);
+                assert!(!state.share_in_flight.has_in_flight(&share_id));
+                assert_eq!(
+                    state
+                        .account_in_flight
+                        .snapshot()
+                        .current(ProviderType::QoderCosy, &account_id),
+                    0
+                );
+                let account = state
+                    .find_account_for_provider(ProviderType::QoderCosy, &account_id)
+                    .await
+                    .unwrap();
+                assert!(!account.needs_relogin);
+                let usage = state.usage_snapshot().await;
+                assert_eq!(
+                    usage.logs.last().unwrap().failure_kind.as_deref(),
+                    Some("memory_capacity")
+                );
+                assert!(!QoderRuntimeError::MemoryCapacity.is_authentication_failure());
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_r4_review_optional_alias_pressure_keeps_completed_response_successful() {
+    run_qoder_async_test(async {
+        for streaming in [false, true] {
+            let name = format!("qoder-r4-alias-pressure-{streaming}");
+            let (address, fixture, server) = spawn_qoder_upstream(
+                QoderFixtureRail::GlobalOauth,
+                vec![QoderGenerationReply::Success],
+            )
+            .await;
+            let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(None);
+            let mut state = qoder_test_state(&name);
+            Arc::get_mut(&mut state).unwrap().qoder_runtime =
+                crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            let (provider_id, _) = install_qoder_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                QoderFixtureRail::GlobalOauth,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_qoder_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            let first = forward_qoder_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id.clone(),
+                &share_id,
+                "owner@example.com",
+                "first",
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.status(), StatusCode::OK);
+            collect(first).await;
+            parent.configure_limit(Some(0));
+            let next = forward_qoder_surface(
+                state.clone(),
+                AppKind::Codex,
+                provider_id,
+                &share_id,
+                "owner@example.com",
+                "next",
+                streaming,
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.status(), StatusCode::OK);
+            let body = String::from_utf8(collect(next).await).unwrap();
+            assert!(!body.contains("cc_switch_request_memory_exhausted"));
+            let usage = state.usage_snapshot().await;
+            assert_eq!(usage.logs.last().unwrap().outcome, UsageOutcome::Success);
+            assert_eq!(fixture.count(&fixture.model_requests), 1);
+            assert_eq!(fixture.count(&fixture.generation_requests), 2);
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+            assert!(parent.snapshot().rejections > 0);
+            server.abort();
+        }
+    });
+}
+
+#[test]
 fn qoder_request_memory_rejects_all_surfaces_before_any_upstream_request() {
     run_qoder_async_test(async {
         for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
@@ -2507,6 +2646,194 @@ fn qoder_malformed_sse_wrapper_fails_all_bound_rails_and_surfaces() {
                 assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{name}: {error:?}");
                 assert_eq!(fixture.count(&fixture.generation_requests), 1, "{name}");
                 assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+                server.abort();
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_r4_ambiguous_or_history_only_selectors_fail_before_any_upstream_request() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            let name = format!("qoder-r4-identities-{}", rail.label());
+            let (address, fixture, server) =
+                spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+            let state = qoder_test_state(&name);
+            let (provider_id, _) = install_qoder_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                rail,
+                &format!("http://{address}"),
+            )
+            .await;
+            let share_id = format!("{name}-share");
+            install_qoder_share(
+                &state,
+                &share_id,
+                AppKind::Codex,
+                &provider_id,
+                "owner@example.com",
+            )
+            .await;
+            for stream in [false, true] {
+                for mut request in [
+                    json!({"tools":[
+                        {"type":"namespace","name":"a","tools":[{"type":"function","name":"b__c"}]},
+                        {"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}
+                    ],"input":"read"}),
+                    json!({"tools":[{"type":"custom","name":"read"}],"tool_choice":{"type":"function","name":"read"},"input":"read"}),
+                    json!({"tools":[],"tool_choice":{"type":"function","namespace":"retired","name":"read"},"input":[
+                        {"type":"function_call","call_id":"old","namespace":"retired","name":"read","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"old","output":"old result"}
+                    ]}),
+                ] {
+                    request["model"] = json!(MODEL_KEY);
+                    request["stream"] = json!(stream);
+                    for _ in 0..2 {
+                        let error = super::forward_for_test_surface(
+                            state.clone(),
+                            ProxyRoute::CodexResponses,
+                            provider_id.clone(),
+                            None,
+                            qoder_headers(&share_id, "owner@example.com", "identity-session"),
+                            Bytes::from(request.to_string()),
+                        )
+                        .await
+                        .expect_err("ambiguous or undeclared identity must fail locally");
+                        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{name}: {error:?}");
+                        request["tools"].as_array_mut().unwrap().reverse();
+                    }
+                }
+            }
+            assert_eq!(fixture.count(&fixture.generation_requests), 0, "{name}");
+            assert_eq!(fixture.count(&fixture.model_requests), 0, "{name}");
+            assert_eq!(fixture.count(&fixture.pat_exchanges), 0, "{name}");
+            assert_eq!(fixture.count(&fixture.refresh_requests), 0, "{name}");
+            server.abort();
+        }
+    });
+}
+
+#[test]
+fn qoder_r4_declared_history_survives_choice_on_every_rail_and_surface() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("qoder-r4-history-{}-{app:?}", rail.label());
+                let (address, fixture, server) =
+                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let state = qoder_test_state(&name);
+                let (provider_id, _) =
+                    install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
+                        .await;
+                let share_id = format!("{name}-share");
+                install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                for stream in [false, true] {
+                    for named in [false, true] {
+                        let (route, gemini_path, body) = surface_request(app, stream);
+                        let mut request: Value = serde_json::from_slice(&body).unwrap();
+                        match app {
+                            AppKind::Claude => {
+                                request["tools"] = json!([{"name":"read","input_schema":{"type":"object"}},{"name":"write","input_schema":{"type":"object"}}]);
+                                request["tool_choice"] = if named {
+                                    json!({"type":"tool","name":"write"})
+                                } else {
+                                    json!({"type":"none"})
+                                };
+                                request["messages"] = json!([
+                                    {"role":"assistant","content":[{"type":"tool_use","id":"old-read","name":"read","input":{"path":"original"}}]},
+                                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"old-read","content":"original result"}]},
+                                    {"role":"user","content":"continue"}
+                                ]);
+                            }
+                            AppKind::Codex => {
+                                request["tools"] = json!([{"type":"function","name":"read","parameters":{"type":"object"}},{"type":"function","name":"write","parameters":{"type":"object"}}]);
+                                request["tool_choice"] = if named {
+                                    json!({"type":"function","name":"write"})
+                                } else {
+                                    json!("none")
+                                };
+                                request["input"] = json!([
+                                    {"type":"function_call","call_id":"old-read","name":"read","arguments":"{\"path\":\"original\"}"},
+                                    {"type":"function_call_output","call_id":"old-read","output":"original result"},
+                                    {"role":"user","content":"continue"}
+                                ]);
+                            }
+                            AppKind::Gemini => {
+                                request["tools"] = json!([{"functionDeclarations":[{"name":"read","parameters":{"type":"object"}},{"name":"write","parameters":{"type":"object"}}]}]);
+                                request["toolConfig"] = if named {
+                                    json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["write"]}})
+                                } else {
+                                    json!({"functionCallingConfig":{"mode":"NONE"}})
+                                };
+                                request["contents"] = json!([
+                                    {"role":"model","parts":[{"functionCall":{"name":"read","args":{"path":"original"}}}]},
+                                    {"role":"user","parts":[{"functionResponse":{"name":"read","response":{"result":"original result"}}}]},
+                                    {"role":"user","parts":[{"text":"continue"}]}
+                                ]);
+                            }
+                        }
+                        let response = super::forward_for_test_surface(
+                            state.clone(),
+                            route,
+                            provider_id.clone(),
+                            gemini_path,
+                            qoder_headers(
+                                &share_id,
+                                "owner@example.com",
+                                &format!("history-{stream}-{named}"),
+                            ),
+                            Bytes::from(request.to_string()),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(response.status(), StatusCode::OK, "{name}");
+                        collect(response).await;
+                        let observations = fixture.generation_observations();
+                        let payload = observations.last().unwrap().decoded_body.as_ref().unwrap();
+                        let messages = payload["messages"].as_array().unwrap();
+                        let call = messages
+                            .iter()
+                            .find_map(|message| {
+                                message
+                                    .get("tool_calls")
+                                    .and_then(Value::as_array)
+                                    .and_then(|calls| calls.first())
+                            })
+                            .expect("declared history was removed from final COSY payload");
+                        assert_eq!(call["function"]["name"], "read", "{name}");
+                        let arguments: Value =
+                            serde_json::from_str(call["function"]["arguments"].as_str().unwrap())
+                                .unwrap();
+                        assert_eq!(arguments, json!({"path":"original"}));
+                        let result = messages
+                            .iter()
+                            .find(|message| message["role"] == "tool")
+                            .unwrap();
+                        assert_eq!(result["tool_call_call_id"], call["id"]);
+                        assert!(result["contents"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("original result"));
+                        let tools = payload["tools"].as_array().unwrap();
+                        assert_eq!(tools.len(), usize::from(named), "{name}");
+                        if named {
+                            assert_eq!(tools[0]["function"]["name"], "write");
+                        }
+                    }
+                }
+                assert_eq!(fixture.count(&fixture.generation_requests), 4, "{name}");
                 server.abort();
             }
         }
@@ -3189,6 +3516,359 @@ fn qoder_generation_fences_account_provider_runtime_and_binding_drift_before_out
             assert!(result.is_err(), "{drift} drift must be fenced");
             assert_eq!(fixture.count(&fixture.model_requests), 0, "{drift}");
             assert_eq!(fixture.count(&fixture.generation_requests), 0, "{drift}");
+            server.abort();
+        }
+    });
+}
+
+// These fixtures observe the production COSY loops on local listeners. Vendor
+// acceptance and per-rail credential validation remain separate live gates.
+async fn qoder_core03_attempt(
+    state: &ServerState,
+    route: ProxyRoute,
+    id: &str,
+) -> ForwardAttemptContext {
+    let accounts = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let in_flight = state.account_in_flight.snapshot();
+    let execution = select_test_provider(&providers, &accounts, route.app(), id, Some(&in_flight))
+        .unwrap()
+        .execution;
+    ForwardAttemptContext {
+        execution: Some(execution),
+        provider_binding_pinned: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn qoder_core03_three_rails_four_surfaces_stream_and_nonstream() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for route in [
+                ProxyRoute::ClaudeMessages,
+                ProxyRoute::CodexResponses,
+                ProxyRoute::CodexChatCompletions,
+                ProxyRoute::Gemini,
+            ] {
+                for streaming in [false, true] {
+                    let (address, fixture, server) =
+                        spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                    let state = qoder_test_state("qoder-core03-surfaces");
+                    let (id, _) = install_qoder_provider(
+                        &state,
+                        "qoder-core03",
+                        route.app(),
+                        rail,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share = "qoder-core03-share";
+                    install_qoder_share(&state, share, route.app(), &id, "owner@example.com").await;
+                    let (_, path, mut body) = surface_request(route.app(), streaming);
+                    if route == ProxyRoute::CodexChatCompletions {
+                        body = Bytes::from(json!({"model":MODEL_KEY,"stream":streaming,"messages":[{"role":"user","content":"hi"}]}).to_string());
+                    }
+                    let attempt = qoder_core03_attempt(&state, route, &id).await;
+                    let slot = attempt.timing.clone();
+                    let response = forward_with_attempt(
+                        state,
+                        route,
+                        path,
+                        qoder_headers(share, "owner@example.com", "core03"),
+                        body,
+                        attempt,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = collect(response).await;
+                    assert!(String::from_utf8_lossy(&bytes).contains("ready"));
+                    let snapshot = slot.get().unwrap().request().snapshot();
+                    assert_eq!(snapshot["providerType"], "qoder_cosy");
+                    assert_eq!(snapshot["result"], "complete", "{snapshot}");
+                    for phase in [
+                        "admission",
+                        "send_started",
+                        "headers",
+                        "first_semantic",
+                        "terminal",
+                        "http_body_handoff",
+                        "owner_released",
+                    ] {
+                        assert!(
+                            snapshot["milestonesMs"][phase].is_number(),
+                            "{phase}: {snapshot}"
+                        );
+                    }
+                    assert!(snapshot["milestonesMs"]["downstream_write_completed"].is_null());
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1);
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_core03_decoder_observes_content_before_eof_but_defers_terminal() {
+    let slot = TimingSlot::default();
+    let timing = slot
+        .begin_for_provider(ProviderType::QoderCosy, "messages", Instant::now())
+        .unwrap();
+    let memory = RequestMemoryBudget::new(1024 * 1024);
+    memory.set_timing(timing.clone());
+    let mut decoder =
+        super::super::qoder::QoderSseDecoder::with_request_memory(Some(memory)).unwrap();
+    decoder
+        .push(Bytes::from_static(b": keepalive\n\n"))
+        .unwrap();
+    let mut control = inner_success_chunk(None, false);
+    control["choices"][0]["delta"] = json!({"role":"assistant","content":""});
+    control["usage"] = json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0});
+    decoder.push(qoder_wrapper(json!("OK"), control)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+    let content = qoder_wrapper(json!("OK"), inner_success_chunk(Some("ready"), false));
+    decoder.push(content.slice(..8)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+    decoder.push(content.slice(8..)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_number());
+    let mut terminal = inner_success_chunk(None, true);
+    terminal["choices"][0]["finish_reason"] = json!("length");
+    decoder.push(qoder_wrapper(json!("OK"), terminal)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["terminal"].is_null());
+    decoder.finish().unwrap();
+    timing.finish_delivery(true);
+    assert_eq!(timing.request().snapshot()["result"], "incomplete");
+}
+
+#[derive(Clone, Default)]
+struct QoderCore03Samples(Arc<Mutex<Vec<metrics::Key>>>);
+struct QoderCore03Histogram(QoderCore03Samples, metrics::Key);
+impl metrics::HistogramFn for QoderCore03Histogram {
+    fn record(&self, _: f64) {
+        self.0 .0.lock().unwrap().push(self.1.clone());
+    }
+}
+impl metrics::Recorder for QoderCore03Samples {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        key: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::from_arc(Arc::new(QoderCore03Histogram(self.clone(), key.clone())))
+    }
+}
+
+#[test]
+fn qoder_core03_original_auth_recovery_keeps_separate_attempts_on_every_rail() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for rail in [
+                QoderFixtureRail::GlobalOauth,
+                QoderFixtureRail::CnOauth,
+                QoderFixtureRail::Pat,
+            ] {
+                let samples = QoderCore03Samples::default();
+                let _recorder = metrics::set_default_local_recorder(&samples);
+                let (address, fixture, server) = spawn_qoder_upstream(
+                    rail,
+                    vec![
+                        QoderGenerationReply::HttpUnauthorized,
+                        QoderGenerationReply::Success,
+                    ],
+                )
+                .await;
+                let state = qoder_test_state("qoder-core03-retry");
+                let (id, _) = install_qoder_provider(
+                    &state,
+                    "qoder-core03",
+                    AppKind::Codex,
+                    rail,
+                    &format!("http://{address}"),
+                )
+                .await;
+                install_qoder_share(
+                    &state,
+                    "core03-share",
+                    AppKind::Codex,
+                    &id,
+                    "owner@example.com",
+                )
+                .await;
+                let attempt = qoder_core03_attempt(&state, ProxyRoute::CodexResponses, &id).await;
+                let slot = attempt.timing.clone();
+                let (_, path, body) = surface_request(AppKind::Codex, true);
+                let response = forward_with_attempt(
+                    state,
+                    ProxyRoute::CodexResponses,
+                    path,
+                    qoder_headers("core03-share", "owner@example.com", "retry"),
+                    body,
+                    attempt,
+                )
+                .await
+                .unwrap();
+                collect(response).await;
+                let snapshot = slot.get().unwrap().request().snapshot();
+                assert_eq!(snapshot["result"], "complete");
+                assert!(snapshot["waitsMs"]["retry"].as_f64().unwrap() > 0.0);
+                let samples = samples.0.lock().unwrap();
+                for (scope, result) in [
+                    ("attempt", "retried"),
+                    ("attempt", "complete"),
+                    ("request", "complete"),
+                ] {
+                    assert_eq!(
+                        samples
+                            .iter()
+                            .filter(|key| key.name() == "cc_switch_forward_duration_seconds"
+                                && [
+                                    ("provider_type", "qoder_cosy"),
+                                    ("scope", scope),
+                                    ("result", result)
+                                ]
+                                .iter()
+                                .all(|(name, value)| key
+                                    .labels()
+                                    .any(|label| label.key() == *name && label.value() == *value)))
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(fixture.count(&fixture.generation_requests), 2);
+                assert_eq!(
+                    fixture.count(&fixture.refresh_requests),
+                    usize::from(rail != QoderFixtureRail::Pat)
+                );
+                server.abort();
+            }
+        });
+}
+
+#[test]
+fn qoder_core03_headers_cancel_and_committed_abort_keep_real_owner_and_no_replay() {
+    run_qoder_async_test(async {
+        for mode in 0..3 {
+            let fixture = QoderFixtureState::new(QoderFixtureRail::GlobalOauth, vec![]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app=axum::Router::new().route(QODER_MODEL_LIST_PATH,get(qoder_model_list))
+                .route(QODER_GENERATION_PATH.split('?').next().unwrap(),post(move || {
+                    observed.fetch_add(1,Ordering::SeqCst);
+                    async move {
+                        if mode==0 {std::future::pending::<()>().await;}
+                        let chunks=async_stream::stream! {
+                            yield Ok::<_,std::convert::Infallible>(qoder_wrapper(json!("OK"),inner_success_chunk(Some("ready"),false)));
+                            if mode==1 {std::future::pending::<()>().await;}
+                        };
+                        Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from_stream(chunks)).unwrap()
+                    }
+                })).with_state(fixture);
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let state = qoder_test_state("qoder-core03-cancel");
+            let (id, _) = install_qoder_provider(
+                &state,
+                "qoder-core03",
+                AppKind::Claude,
+                QoderFixtureRail::GlobalOauth,
+                &format!("http://{address}"),
+            )
+            .await;
+            install_qoder_share(
+                &state,
+                "core03-share",
+                AppKind::Claude,
+                &id,
+                "owner@example.com",
+            )
+            .await;
+            let attempt = qoder_core03_attempt(&state, ProxyRoute::ClaudeMessages, &id).await;
+            let slot = attempt.timing.clone();
+            let (_, path, body) = surface_request(AppKind::Claude, true);
+            let mut pending = Box::pin(forward_with_attempt(
+                state,
+                ProxyRoute::ClaudeMessages,
+                path,
+                qoder_headers("core03-share", "owner@example.com", "cancel"),
+                body,
+                attempt,
+            ));
+            if mode == 0 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+                        .await
+                        .is_err()
+                );
+                let request = slot.get().unwrap().request();
+                assert!(request.snapshot()["milestonesMs"]["send_started"].is_number());
+                assert!(request.snapshot()["milestonesMs"]["headers"].is_null());
+                drop(pending);
+                assert_eq!(request.snapshot()["result"], "cancelled");
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_number());
+            } else {
+                let response = pending.await.unwrap();
+                let request = slot.get().unwrap().request();
+                let mut stream = response.into_body().into_data_stream();
+                let retained = loop {
+                    let frame = stream.next().await.unwrap().unwrap();
+                    if String::from_utf8_lossy(&frame).contains("ready") {
+                        break frame;
+                    }
+                };
+                if mode == 2 {
+                    while let Some(frame) = stream.next().await {
+                        drop(frame);
+                    }
+                }
+                drop(stream);
+                assert_eq!(
+                    request.snapshot()["result"],
+                    if mode == 2 { "failed" } else { "cancelled" }
+                );
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_null());
+                drop(retained);
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_number());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
             server.abort();
         }
     });

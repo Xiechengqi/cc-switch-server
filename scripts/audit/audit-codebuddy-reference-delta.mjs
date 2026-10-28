@@ -1002,6 +1002,66 @@ for (const [relativePath, anchors] of [
   }
 }
 
+
+const r4HistoricalFields = ["format", "schemaVersion", "legacySchemaVersion", "capturedAt", "updatedAt", "policy", "observationPolicy", "legacyV1", "sources", "sourceExtensions", "incrementalEnhancementExtensions", "secondRoundReviews", "sourceSnapshots", "reviewedRejections", "observations", "evidenceExtensions", "registryTruth", "capabilities", "incrementalEnhancements", "fixtureAcceptance", "providerLifecycle", "realAcceptance"];
+assert(objectDigest(Object.fromEntries(r4HistoricalFields.map((field) => [field, contract[field]]))) ===
+  "274936055424bf3692910d09cd76cebe92551aeae360d741506bee1e670d46c3", "CodeBuddy R4 changed pre-existing history");
+const r4Sources = contract.r4Sources ?? [];
+assert(r4Sources.length === 1, "CodeBuddy R4 source snapshot missing");
+for (const source of r4Sources) {
+  assert(source.sourceId === "cli2api-head" && commitPattern.test(source.snapshotCommit) &&
+    commitPattern.test(source.snapshotTree) && source.readMode === "read_only_committed_git_objects" &&
+    JSON.stringify(source.excludedWorktreeEntries) === JSON.stringify(["?? proxy.html", "?? proxy.md"]) &&
+    source.files?.length === 11, "CodeBuddy R4 committed-object identity changed");
+  for (const file of source.files) {
+    safeRelative(file.path, "CodeBuddy R4 source path");
+    assert(digestPattern.test(file.sha256) && file.reviewedAnchors?.length > 0,
+      "CodeBuddy R4 source digest/anchors missing");
+    if (checkSources) {
+      const root = sourceRootById.get(source.sourceId);
+      const content = gitFile(root, source.snapshotCommit, file.path, null);
+      assert(gitTree(root, source.snapshotCommit) === source.snapshotTree &&
+        sha256(content) === file.sha256 &&
+        file.reviewedAnchors.every((anchor) => content.toString("utf8").includes(anchor)),
+        `CodeBuddy R4 committed evidence changed: ${file.path}`);
+    }
+  }
+}
+const r4Reviews = contract.r4Reviews ?? [];
+assert(r4Reviews.length === 1 && r4Reviews[0].id === "R4-CB-01", "CodeBuddy R4 review missing");
+const r4 = r4Reviews[0];
+assert(r4.status === "working_tree_fixture_verified" && Number.isFinite(Date.parse(r4.reviewedAt)) &&
+  r4.decision === "keep_reviewed_identity_tuple_and_catalog_authority_extend_local_ownership" &&
+  r4.vendorWireChanged === false && r4.liveAcceptance === "live_pending" &&
+  JSON.stringify(r4.sharedWork) === JSON.stringify(["R4-CORE-02"]),
+  "CodeBuddy R4 must keep wire and real-evidence boundaries");
+assert(r4.identity?.currentCliVersion === "2.142.0" && r4.identity.referenceCliVersion === "2.161.0" &&
+  r4.identity.referenceGlobalDesktopVersion === "5.8.4" && r4.identity.referenceCnDesktopVersion === "5.8.3" &&
+  r4.identity.referenceIdeVersion === "2.168.2" && r4.identity.privateDataPersonalCli === "false" &&
+  r4.identity.requiresSeparateIntlCnReceipts === true && r4.identity.wafTextRewriteAdopted === false,
+  "CodeBuddy R4 identity drifted without two-site acceptance");
+assert(r4.capacity?.processMode === "observe_only" && r4.capacity.catalogEntries === 128 &&
+  r4.capacity.catalogFlights === 128 && r4.capacity.index === "bounded_btree" &&
+  r4.capacity.freshTtlMs === 480000 && r4.capacity.maximumStaleAgeMs === 86400000 &&
+  r4.capacity.snapshotsSharePayloadAndOwner === true &&
+  r4.capacity.rejectedReplacement === "remove_old_authorization_return_current_uncached" &&
+  r4.capacity.newFlightAdmissionFailure === "local_503_memory_capacity_before_catalog_fetch_no_refresh_or_inference_replay",
+  "CodeBuddy R4 ownership/admission contract changed");
+assert(commitPattern.test(r4.target?.baselineCommit) && r4.target.implementationCommit === null &&
+  r4.target.readMode === "working_tree" &&
+  r4.target.validationScope === "isolated_worktree_excluding_concurrent_Share_Market" &&
+  r4.target.contracts?.length === 7, "CodeBuddy R4 target scope changed");
+for (const local of r4.target.contracts) {
+  safeRelative(local.path, "CodeBuddy R4 local evidence path");
+  const source = fs.readFileSync(path.join(repoRoot, local.path), "utf8");
+  assert(local.anchors?.length > 0 && local.anchors.every((anchor) => source.includes(anchor)),
+    `CodeBuddy R4 local evidence missing: ${local.path}`);
+}
+assert(r4.timingInventory?.newMilestoneInstrumentation === false &&
+  r4.timingInventory.successfulSocketWriteMeasurement === false && r4.timingInventory.performanceClaim === null &&
+  r4.retainedBoundaries?.length === 6 && r4.limitations?.length === 4,
+  "CodeBuddy R4 measurement or retained-boundary scope changed");
+
 console.log(
   `codebuddy reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} dirty-worktree-excluded snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, ${enhancements.size + contract.incrementalEnhancementExtensions.length} enhancements, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}${
     checkSources ? ", external objects verified" : ", external check optional"

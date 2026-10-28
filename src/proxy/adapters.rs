@@ -14,8 +14,7 @@ use super::thinking::{apply_thinking_pipeline, ThinkingPipelineConfig};
 use super::tool_schema::{normalize_antigravity_request_schemas, normalize_gemini_tool_schemas};
 use super::{join_url, setting, transforms, ProxyError, ProxyRoute};
 use crate::domain::accounts::capability_evidence::{
-    antigravity_model_search_dimension, fresh_observation_state, AccountCapabilityObservationState,
-    ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+    antigravity_model_search_dimension, AccountCapabilityObservationState,
 };
 use crate::domain::accounts::managers::{manager_for, AccountManager, CredentialKind};
 use crate::domain::accounts::store::{Account, AccountStore};
@@ -218,11 +217,7 @@ impl ProviderAdapter for GenericForwardingAdapter {
     }
 
     fn parse_usage(&self, body: &[u8], stored: &StoredProvider, route: ProxyRoute) -> TokenUsage {
-        serde_json::from_slice::<Value>(body)
-            .map(|value| {
-                usage_from_json_with_semantics(&value, usage_input_semantics_for(stored, route))
-            })
-            .unwrap_or_default()
+        self.parse_usage_observing(body, stored, route, |_| {})
     }
 }
 
@@ -241,6 +236,23 @@ pub(super) fn usage_input_semantics_for(
 }
 
 impl GenericForwardingAdapter {
+    /// Reuse the existing usage document for read-only observations. No second
+    /// response tree or additional admission failure is introduced for metrics.
+    pub(super) fn parse_usage_observing(
+        &self,
+        body: &[u8],
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        observe: impl FnOnce(&Value),
+    ) -> TokenUsage {
+        serde_json::from_slice::<Value>(body)
+            .map(|value| {
+                observe(&value);
+                usage_from_json_with_semantics(&value, usage_input_semantics_for(stored, route))
+            })
+            .unwrap_or_default()
+    }
+
     fn transform_request_inner(
         &self,
         body: Bytes,
@@ -2137,6 +2149,7 @@ fn normalize_coding_plan_request(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn finalize_runtime_protocol_auth(
     plan: &ProviderRuntimePlan,
     stored: &StoredProvider,
@@ -2145,11 +2158,32 @@ pub(super) fn finalize_runtime_protocol_auth(
     endpoint: &mut String,
     headers: &mut Vec<(String, String)>,
 ) -> Result<(), ProxyError> {
+    let identity = crate::domain::antigravity_identity::antigravity_client_identity();
+    finalize_runtime_protocol_auth_for_antigravity_identity(
+        plan,
+        stored,
+        accounts,
+        request,
+        endpoint,
+        headers,
+        Some(&identity),
+    )
+}
+
+pub(super) fn finalize_runtime_protocol_auth_for_antigravity_identity(
+    plan: &ProviderRuntimePlan,
+    stored: &StoredProvider,
+    accounts: &AccountStore,
+    request: &mut AdapterRequest,
+    endpoint: &mut String,
+    headers: &mut Vec<(String, String)>,
+    identity: Option<&crate::domain::antigravity_identity::AntigravityClientIdentity>,
+) -> Result<(), ProxyError> {
     if stored.provider_type == ProviderType::KimiCode {
         super::kimi::finalize_account_identity(plan, accounts, headers)?;
     }
     if is_gemini_v1internal_provider_type(stored.provider_type) {
-        apply_gemini_v1internal_contract(plan, stored, accounts, request, endpoint)?;
+        apply_gemini_v1internal_contract(plan, stored, accounts, request, endpoint, identity)?;
     }
     if plan.driver_id.as_str() != "aws.bedrock_sigv4" {
         return Ok(());
@@ -2286,6 +2320,7 @@ fn apply_gemini_v1internal_contract(
     accounts: &AccountStore,
     request: &mut AdapterRequest,
     endpoint: &mut String,
+    identity: Option<&crate::domain::antigravity_identity::AntigravityClientIdentity>,
 ) -> Result<(), ProxyError> {
     let expected_provider_type = match plan.driver_id.as_str() {
         "oauth.gemini_code_assist" => ProviderType::GeminiCli,
@@ -2377,10 +2412,14 @@ fn apply_gemini_v1internal_contract(
     sanitize_gemini_v1internal_request(&mut inner, antigravity_identity)?;
     let web_search = antigravity_identity && gemini_request_has_google_search(&inner);
     if web_search {
-        let selected_model = select_antigravity_web_search_model(
+        let identity = identity
+            .cloned()
+            .unwrap_or_else(crate::domain::antigravity_identity::antigravity_client_identity);
+        let selected_model = select_antigravity_web_search_model_for_identity(
             account,
             &model,
             chrono::Utc::now().timestamp_millis(),
+            &identity,
         )?;
         if selected_model != model {
             model = selected_model;
@@ -2456,27 +2495,43 @@ fn gemini_request_has_google_search(value: &Value) -> bool {
         })
 }
 
+#[cfg(test)]
 fn select_antigravity_web_search_model(
     account: &Account,
     requested_model: &str,
     now_ms: i64,
 ) -> Result<String, ProxyError> {
-    let state = fresh_observation_state(
+    select_antigravity_web_search_model_for_identity(
         account,
-        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+        requested_model,
+        now_ms,
+        &crate::domain::antigravity_identity::antigravity_client_identity(),
+    )
+}
+
+fn select_antigravity_web_search_model_for_identity(
+    account: &Account,
+    requested_model: &str,
+    now_ms: i64,
+    identity: &crate::domain::antigravity_identity::AntigravityClientIdentity,
+) -> Result<String, ProxyError> {
+    let state = crate::domain::accounts::capability_evidence::fresh_antigravity_observation_state(
+        account,
         &antigravity_model_search_dimension(requested_model),
         now_ms,
+        identity,
     );
     if state == Some(AccountCapabilityObservationState::Supported) {
         return Ok(requested_model.to_string());
     }
 
-    let fallback_state = fresh_observation_state(
-        account,
-        ANTIGRAVITY_CODE_PLAN_CAPABILITY,
-        &antigravity_model_search_dimension(ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL),
-        now_ms,
-    );
+    let fallback_state =
+        crate::domain::accounts::capability_evidence::fresh_antigravity_observation_state(
+            account,
+            &antigravity_model_search_dimension(ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL),
+            now_ms,
+            identity,
+        );
     if fallback_state == Some(AccountCapabilityObservationState::Unsupported) {
         return Err(ProxyError {
             status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -4470,6 +4525,22 @@ mod tests {
     }
 
     #[test]
+    fn qoder_r4_bridge_identity_checks_leave_native_responses_unchanged() {
+        let stored = stored_provider(AppKind::Codex, ProviderType::Codex, json!({}));
+        let input = json!({"model":"fixture-model","tools":[
+            {"type":"namespace","name":"a","tools":[{"type":"function","name":"b__c"}]},
+            {"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}
+        ],"tool_choice":{"type":"function","namespace":"old","name":"read"},"input":"original"});
+        let output = transform_body_for_upstream(
+            Bytes::from(input.to_string()),
+            &stored,
+            Some(ProxyRoute::CodexResponses),
+        )
+        .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), input);
+    }
+
+    #[test]
     fn qoder_profiles_canonicalize_all_three_app_surfaces_to_openai_chat() {
         let cases = [
             (
@@ -4696,6 +4767,7 @@ mod tests {
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
         }
     }
 
@@ -5478,6 +5550,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn antigravity_r4_search_consumes_only_the_captured_client_generation() {
+        use crate::domain::accounts::capability_evidence::{
+            record_observation_drafts, AccountCapabilityObservationDraft,
+        };
+        use crate::domain::antigravity_identity::{
+            antigravity_client_identity, TestAntigravityIdentity,
+        };
+        let versions = TestAntigravityIdentity::new("2.2.1");
+        versions.scope(async {
+            let mut account: Account = serde_json::from_value(json!({"id":"r4-search","providerType":"antigravity_oauth","authIdentityGeneration":1})).unwrap();
+            let captured = antigravity_client_identity();
+            record_observation_drafts(&mut account,[AccountCapabilityObservationDraft::antigravity_feature(
+                &antigravity_model_search_dimension("gemini-search-native"),AccountCapabilityObservationState::Supported,
+                "fetch_available_models",None,100,Some(10_000)
+            ).with_antigravity_client_identity(&captured)]);
+            versions.update("2.3.4");
+            assert_eq!(select_antigravity_web_search_model(&account,"gemini-search-native",1_000).unwrap(),ANTIGRAVITY_WEB_SEARCH_FALLBACK_MODEL);
+            assert_eq!(select_antigravity_web_search_model_for_identity(&account,"gemini-search-native",1_000,&captured).unwrap(),"gemini-search-native");
+        }).await;
+    }
+
     #[test]
     fn antigravity_web_search_model_selection_uses_fresh_per_model_evidence() {
         use crate::domain::accounts::capability_evidence::{
@@ -5501,6 +5595,9 @@ mod tests {
                 None,
                 observed_at_ms,
                 Some(expires_at_ms),
+            )
+            .with_antigravity_client_identity(
+                &crate::domain::antigravity_identity::antigravity_client_identity(),
             )
         };
 
@@ -5610,6 +5707,65 @@ mod tests {
 
         assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
         assert!(error.message.contains("identity changed"));
+    }
+
+    #[test]
+    fn antigravity_r4_delegated_claude_keeps_its_gemini_tool_contract() {
+        for rail in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let accounts = AccountStore {
+                accounts:vec![serde_json::from_value(json!({"id":"r4-delegated","providerType":rail.as_str(),"authIdentityGeneration":1,"accessToken":"bound-token","raw":{"projectId":"bound-project"}})).unwrap()],..Default::default()
+            };
+            let stored = stored_provider(AppKind::Claude, rail, json!({}));
+            let plan = gemini_v1internal_runtime_plan(rail, "r4-delegated");
+            for (choice, mode) in [
+                (json!({"type":"any"}), "ANY"),
+                (json!({"type":"tool","name":"lookup"}), "ANY"),
+                (json!({"type":"none"}), "NONE"),
+            ] {
+                let input = json!({"model":"claude-opus-5-5","max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":1024},
+                    "messages":[{"role":"user","content":"look up"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":choice
+                });
+                let mut request = adapter_for(AppKind::Claude, rail)
+                    .transform_request_for_route(
+                        Bytes::from(input.to_string()),
+                        &stored,
+                        ProxyRoute::ClaudeMessages,
+                        None,
+                    )
+                    .unwrap();
+                let mut endpoint = plan.endpoint.clone();
+                finalize_runtime_protocol_auth(
+                    &plan,
+                    &stored,
+                    &accounts,
+                    &mut request,
+                    &mut endpoint,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                let wire: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(wire["model"], "claude-opus-5-5");
+                assert_eq!(
+                    wire["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+                    mode
+                );
+                assert_eq!(
+                    wire["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    1024
+                );
+                assert_eq!(
+                    wire["request"]["tools"][0]["functionDeclarations"][0]["name"],
+                    "lookup"
+                );
+                if choice["type"] == "tool" {
+                    assert_eq!(
+                        wire["request"]["toolConfig"]["functionCallingConfig"]
+                            ["allowedFunctionNames"],
+                        json!(["lookup"])
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -94,13 +94,15 @@ Claude OAuth 出站 Messages/count_tokens 会在最终 CCH 之前，仅对历史
 
 Messages beta 由确定顺序的 capability engine 生成，未知客户端 beta 不透传。2.1.280 新增的 per-turn control/timing、mid-conversation tool changes、inline tools、system clear-at、dangerous tool safeguards、thinking binding/resumption 和 prompt cache eviction 均按模型能力、正文形状或显式请求 gate；Opus 5.5 自动启用 per-turn control，timing 只在顶层/消息级 `output_config.timing` 或显式请求时启用。Opus 5.5 的 OpenAI ingress reasoning 转换也读取同一 capability registry：显式 disabled/none 会收敛为 adaptive/low，避免发送该模型拒绝的 `thinking.type=disabled`。`thinking-display-updates-2026-08-18` 只在 `thinking.display="updates"` 时加入并与 redact beta 互斥。普通工具数组不触发 advanced-tool-use；只有审计过的 regex/BM25 tool-search 类型或 `defer_loading=true`（含 `custom.defer_loading`）才加入。Advisor 只识别精确的 `tools[].type=advisor_20260301`。普通 OAuth Messages 不再无条件获得 fallback-credit；只有显式 beta、有效 `fallback_credit_token` 或已获准保留的 OAuth `fallbacks` 才加入。服务端不会主动开启 model fallback：数组和 `default` 分别要求客户端显式请求匹配的 server-side-fallback beta；错配和 `count_tokens` fallback 字段均在最终 CCH 前移除。`count_tokens` 使用独立小集合，不继承 generation-only beta。模型目录、发现 metadata、reasoning 转换和 beta engine 共用 versioned capability registry；未知模型不乐观注入 model-gated beta。可用 `CC_SWITCH_CLAUDE_BETA_PROFILE=minimal` 回退到最小服务端 profile，不改变账号绑定。
 
-cache-control pass 在 CCH 前全局扫描 tools、system 和 messages，规范化 TTL/order、最多保留 4 个 breakpoint，并优先保留最后 tool、最后 system 和最近 message marker；重复执行幂等。forced `tool_choice` 会同步移除不兼容的 thinking/context-management。可用 `CC_SWITCH_CLAUDE_CACHE_REWRITE=disabled` 关闭该 pass。
+cache-control pass 在 CCH 前全局扫描 tools、system 和 messages，规范化 TTL/order、最多保留 4 个 breakpoint，并优先保留最后 tool、最后 system 和最近 message marker；重复执行幂等。已审核的 `claude-opus-5-5`（含 `[1m]` 后缀）不支持本仓强制工具组合，生成请求的 `tool_choice.type=any|tool` 在身份、别名和签名改写前返回明确的 400，不静默降为 `auto`，也不删除签名历史。判断使用最终映射后的模型；其他模型保留移除不兼容顶层 thinking/context-management 的既有策略。`count_tokens` 仍删除生成专用字段后计数。可用 `CC_SWITCH_CLAUDE_CACHE_REWRITE=disabled` 关闭 cache pass，该开关不绕过模型约束。
 
 第三方请求的默认 tool 缓存断点只落在最后一个非 deferred tool；`defer_loading=true` 与 `custom.defer_loading=true` 都不接收自动注入。若全部工具都 deferred，则不注入 tool 断点，仍可在最近 user message 注入滚动断点。客户端显式提供的 tool 缓存标记不会因本规则被改写或删除。当前 Responses `tool_search` 仍经兼容式 `tool_search` 函数桥，不等同于上游原生 tool-search；显式 `execution=server` 等非客户端执行的声明与历史调用/结果会在 Responses→Anthropic 转换前返回 400，不能伪装成客户端可执行函数。缺省 execution 的既有兼容形状和显式 `client` 保持。原生开关、模型/credential 能力与请求内固定决策须另行差分和真实接受性验证后才能开放。
 
 请求类别 cache matrix 进一步区分 main、subagent、probe/title helper、native helper 与 `count_tokens`：main native 保留 extended profile；subagent 默认回到 5m，但 body/header 明确请求 1h 时保留；probe/helper 总是抑制 1h；`count_tokens` 不发 generation-only extended TTL。判断只扫描受支持的 cache-control 位置，不把历史正文中的任意同名字段当成 TTL 请求。
 
 OpenAI Chat/Responses 转 Claude 时，只有 `response_format=json_object|json_schema` 或 Responses `text.format` 会加入 Claude-scoped structured-output system instruction，并保留已有 operator instructions；普通 text 请求不改写。OpenAI Chat 流转 Anthropic 时，tool/text/reasoning block 采用严格单开块状态机，交错内容与后续 tool 在当前 tool 结束后按序释放。Claude 流转 OpenAI Chat 时，usage 从 `message_start` 与多个 `message_delta` 按字段合并；原始下游明确 `stream_options.include_usage=true` 才在 finish 后、`[DONE]` 前得到唯一 `choices: []` usage tail，显式零和 cache read/write 均保留。失败前局部 usage 仍由 server-side accumulator 写入失败记录，不重复计费。
+
+Anthropic 输出转换到 OpenAI Chat/Responses 时，`output_tokens_details.thinking_tokens` 归一到目标 details 的 `reasoning_tokens`；只接受非负整数，显式 0 保留。若两种名称同时合法，以 Anthropic 字段为准；否则保留已有合法 `reasoning_tokens`。SSE 对稀疏 details 逐字段合并，晚到的非法计数不抹去已观察的合法计数，其他明细保留。reasoning 是总 output 的子集，不再次累加；cache read/write 和 provider metering 不变。原生 Anthropic 透传不改写字段。`pause_turn` 保持 Responses `incomplete` 且 `incomplete_details=null`，不伪装成生成已完成，也不自动继续生成。
 
 Codex Responses 入口转到 Claude OAuth 时，省略或设为 `null` 的输出上限先按目标 Claude 模型目录填充，再计算 reasoning budget：已注册的非 Fable 模型使用目录中的 `max_output_tokens`，Fable 默认保守限制为 64,000；未知模型沿用共享转换器的 8,192。显式提供的 `max_output_tokens`、兼容别名 `max_completion_tokens` 或 `max_tokens` 保持原有转换语义；此规则不扩展到 Chat、Claude API Key 或其他 Provider。模型目录上限是静态能力证据，不代表当前订阅账号已获真实接受性验证。
 
@@ -277,3 +279,9 @@ Claude OAuth 流只有在 `message_start`、至少一条含对象 `delta` 且 us
 ## 终止原因的类型与后续内容栅栏（2026-10-10）
 
 流式 `message_delta.delta.stop_reason` 显式为非空字符串时，检查器记住其值；随后任何 `content_block_start/delta/stop` 都作为本地协议错误拒绝，第二个不同终止原因也拒绝。缺省或 `null` 不打开此栅栏，保留 usage-only delta 后继续内容的既有兼容；`stop_sequence` 只校验字符串或 `null`，不据离线 fixture 限定厂商停止原因枚举。非流式 Messages JSON 共用字段类型校验。Claude OAuth HTTP 回环确认迟到内容不能记为成功或 completed 用量；此项不改变出站请求、CL-N7/CL-N8 或五项真实 receipt 的 `live_pending` 状态。
+
+## 本地转发时间观察（2026-10-27）
+
+Claude OAuth 的 Messages、Chat、Responses、Gemini 流/非流和独立 `count_tokens` 路径接入共享 request/attempt 观察器。HTTP 从转发入口开始，API 收包和鉴权不在该时段；既有 `first_token_ms`、deadline、用量、重试和提交判定保持。准入、发出、headers、首语义内容、body handoff、终态和末次已核算 request owner 释放分别观测，取消到释放也独立计时。HTTP body handoff 只表示框架交出正文，不代表 socket 写成功或客户端已消费。
+
+首语义内容排除空 block、ping、签名、usage 与停止原因；有效零 `count_tokens` 仍算结果。`max_tokens`、`pause_turn` 和 `model_context_window_exceeded` 仅将当前 attempt 观察为 incomplete。指标标签使用固定 Provider/surface/phase/result，不含账号、模型、会话、正文或工具参数。JSON 生成响应复用既有语义/usage 解析结果；非权威观察失败不新增响应拒绝。此观察器不构成厂商接受性或性能提升证据，五项真实 operation 继续分别保持 `live_pending`。

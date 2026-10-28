@@ -17,6 +17,7 @@ pub mod model;
 pub mod profile;
 pub mod protocol;
 pub mod request_builder;
+mod resident;
 pub mod response_state;
 pub mod session;
 pub mod tool_bridge;

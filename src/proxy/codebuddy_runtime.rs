@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -6,6 +6,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::domain::codebuddy::{CodeBuddyAccountProfile, CodeBuddySite};
+use crate::infra::resident_memory::ResidentMemoryBudget;
+
+mod resident;
 
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
@@ -53,7 +56,7 @@ const CN_REVIEWED_MODELS: &[&str] = &[
     "hunyuan-chat",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CodeBuddyRuntimeScope(String);
 
 impl CodeBuddyRuntimeScope {
@@ -124,17 +127,29 @@ pub struct CodeBuddyModelCapability {
     pub supports_reasoning: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CodeBuddyModelCatalog {
-    pub enabled_models: Vec<String>,
-    /// Reviewed, non-sensitive projection of each enabled vendor config.
-    /// The vendor response can contain prompt/UIN/AppId fields and must never
-    /// be retained verbatim past the parser boundary.
-    pub raw_configs: BTreeMap<String, Value>,
-    pub capabilities: BTreeMap<String, CodeBuddyModelCapability>,
+    data: Arc<resident::ResidentCatalog>,
     pub fetched_at_ms: i64,
     pub stale: bool,
     expires_at_ms: i64,
+}
+
+impl std::ops::Deref for CodeBuddyModelCatalog {
+    type Target = FetchedCodeBuddyModelCatalog;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data.value
+    }
+}
+
+impl PartialEq for CodeBuddyModelCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.value == other.data.value
+            && self.fetched_at_ms == other.fetched_at_ms
+            && self.stale == other.stale
+            && self.expires_at_ms == other.expires_at_ms
+    }
 }
 
 impl CodeBuddyModelCatalog {
@@ -260,10 +275,10 @@ impl std::fmt::Debug for PreparedCodeBuddyRuntime {
     }
 }
 
-#[derive(Default)]
 pub struct CodeBuddyRuntimeCache {
-    catalogs: RwLock<HashMap<CodeBuddyRuntimeScope, CodeBuddyModelCatalog>>,
-    catalog_flights: Mutex<HashMap<CodeBuddyRuntimeScope, Arc<Mutex<()>>>>,
+    catalogs: RwLock<BTreeMap<CodeBuddyRuntimeScope, CodeBuddyModelCatalog>>,
+    catalog_flights: Mutex<resident::CatalogFlights>,
+    parent: ResidentMemoryBudget,
 }
 
 impl std::fmt::Debug for CodeBuddyRuntimeCache {
@@ -271,79 +286,6 @@ impl std::fmt::Debug for CodeBuddyRuntimeCache {
         formatter
             .debug_struct("CodeBuddyRuntimeCache")
             .finish_non_exhaustive()
-    }
-}
-
-impl CodeBuddyRuntimeCache {
-    pub async fn catalog(
-        &self,
-        scope: &CodeBuddyRuntimeScope,
-        now_ms: i64,
-    ) -> Option<CodeBuddyModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(scope)
-            .filter(|catalog| catalog.is_fresh(now_ms))
-            .cloned()
-    }
-
-    pub async fn stale_catalog(
-        &self,
-        scope: &CodeBuddyRuntimeScope,
-        now_ms: i64,
-    ) -> Option<CodeBuddyModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(scope)
-            .filter(|catalog| catalog.is_usable_stale(now_ms))
-            .map(CodeBuddyModelCatalog::as_stale)
-    }
-
-    pub async fn insert_catalog(
-        &self,
-        scope: CodeBuddyRuntimeScope,
-        fetched: FetchedCodeBuddyModelCatalog,
-        now_ms: i64,
-    ) -> CodeBuddyModelCatalog {
-        let catalog = CodeBuddyModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
-            fetched_at_ms: now_ms,
-            stale: false,
-            expires_at_ms: now_ms.saturating_add(CODEBUDDY_MODEL_CATALOG_TTL_MS),
-        };
-        let mut catalogs = self.catalogs.write().await;
-        catalogs.insert(scope, catalog.clone());
-        while catalogs.len() > MAX_RUNTIME_ENTRIES {
-            let Some(oldest) = catalogs
-                .iter()
-                .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
-                .map(|(scope, _)| scope.clone())
-            else {
-                break;
-            };
-            catalogs.remove(&oldest);
-        }
-        catalog
-    }
-
-    pub async fn invalidate_scope(&self, scope: &CodeBuddyRuntimeScope) {
-        self.catalogs.write().await.remove(scope);
-    }
-
-    pub async fn catalog_lock(&self, scope: &CodeBuddyRuntimeScope) -> OwnedMutexGuard<()> {
-        let flight = {
-            let mut flights = self.catalog_flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-            flights
-                .entry(scope.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        flight.lock_owned().await
     }
 }
 
@@ -1638,5 +1580,43 @@ mod tests {
             .unwrap();
             assert_eq!(payload["tool_choice"], choice);
         }
+    }
+
+    #[test]
+    fn codebuddy_r4_prompt_identity_and_tool_result_text_remain_opaque() {
+        let identity = "You are Codex Agent, built by OpenAI.";
+        let gui = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.";
+        let arguments = r#"{"text":"You are an AI agent powered by DeepSeek Harness."}"#;
+        let input = json!({
+            "messages": [
+                {"role":"system","content":identity},
+                {"role":"developer","content":gui},
+                {"role":"user","content":identity},
+                {"role":"assistant","content":identity,"reasoning_content":gui,
+                 "tool_calls":[{"id":"call_opaque","type":"function","function":{"name":"lookup","arguments":arguments}}]},
+                {"role":"tool","tool_call_id":"call_opaque","content":gui},
+                {"role":"user","content":gui}
+            ],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+        });
+        let payload = build_codebuddy_payload(&input, "default-model", &text_capability()).unwrap();
+        assert_eq!(
+            input["messages"].as_array().unwrap().len(),
+            payload["messages"].as_array().unwrap().len()
+        );
+        for (original, forwarded) in input["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(payload["messages"].as_array().unwrap())
+        {
+            assert_eq!(forwarded["content"], original["content"]);
+        }
+        assert_eq!(payload["messages"][3]["reasoning"], gui);
+        assert_eq!(
+            payload["messages"][3]["tool_calls"][0]["function"]["arguments"],
+            arguments
+        );
+        assert_eq!(payload["messages"][4]["tool_call_id"], "call_opaque");
     }
 }

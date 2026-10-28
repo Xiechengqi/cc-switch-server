@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -165,52 +165,83 @@ impl ReferralError {
 struct SessionClient {
     client: reqwest::Client,
     touched: u64,
+    _memory: crate::infra::resident_memory::ResidentMemoryReservation,
 }
 
-#[derive(Default)]
 struct SessionClientPool {
-    clients: HashMap<String, SessionClient>,
+    clients: BTreeMap<String, SessionClient>,
     clock: u64,
+    parent: crate::infra::resident_memory::ResidentMemoryBudget,
+}
+
+impl Default for SessionClientPool {
+    fn default() -> Self {
+        Self::with_parent(crate::infra::resident_memory::process_resident_memory())
+    }
 }
 
 static SESSION_CLIENTS: OnceLock<Mutex<SessionClientPool>> = OnceLock::new();
 
-fn referral_client(session_key: &str) -> Result<reqwest::Client, ReferralError> {
+fn referral_client(session_key: &str) -> Result<SessionClient, ReferralError> {
     let pool = SESSION_CLIENTS.get_or_init(|| Mutex::new(SessionClientPool::default()));
     let mut pool = pool.lock().map_err(|_| ReferralError::ClientUnavailable)?;
-    pool.clock = pool.clock.saturating_add(1);
-    let touched = pool.clock;
-    if let Some(entry) = pool.clients.get_mut(session_key) {
-        entry.touched = touched;
-        return Ok(entry.client.clone());
-    }
-    let client = crate::infra::http::outbound_client_builder()
-        .map_err(|_| ReferralError::ClientUnavailable)?
-        .cookie_store(true)
-        .connect_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(2)
-        .tcp_keepalive(Duration::from_secs(60))
-        .no_gzip()
-        .build()
-        .map_err(|_| ReferralError::ClientUnavailable)?;
-    if pool.clients.len() >= MAX_SESSION_CLIENTS {
-        if let Some(oldest) = pool
-            .clients
-            .iter()
-            .min_by_key(|(_, entry)| entry.touched)
-            .map(|(key, _)| key.clone())
-        {
-            pool.clients.remove(&oldest);
+    pool.client(session_key)
+}
+
+impl SessionClientPool {
+    fn with_parent(parent: crate::infra::resident_memory::ResidentMemoryBudget) -> Self {
+        Self {
+            clients: BTreeMap::new(),
+            clock: 0,
+            parent,
         }
     }
-    pool.clients.insert(
-        session_key.to_string(),
-        SessionClient {
-            client: client.clone(),
+
+    fn client(&mut self, session_key: &str) -> Result<SessionClient, ReferralError> {
+        self.clock = self.clock.saturating_add(1);
+        let touched = self.clock;
+        if let Some(entry) = self.clients.get_mut(session_key) {
+            entry.touched = touched;
+            return Ok(entry.clone());
+        }
+        // Only directly owned key/entry/index storage is estimated here. Reqwest
+        // cookie/TLS/connection allocations are opaque and require RSS probes.
+        let memory = self
+            .parent
+            .reserve(
+                session_key
+                    .len()
+                    .saturating_add(std::mem::size_of::<(String, SessionClient)>())
+                    .saturating_add(std::mem::size_of::<usize>() * 3),
+            )
+            .ok_or(ReferralError::ClientUnavailable)?;
+        let client = crate::infra::http::outbound_client_builder()
+            .map_err(|_| ReferralError::ClientUnavailable)?
+            .cookie_store(true)
+            .connect_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(Duration::from_secs(60))
+            .no_gzip()
+            .build()
+            .map_err(|_| ReferralError::ClientUnavailable)?;
+        if self.clients.len() >= MAX_SESSION_CLIENTS {
+            if let Some(oldest) = self
+                .clients
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+            {
+                self.clients.remove(&oldest);
+            }
+        }
+        let entry = SessionClient {
+            client,
             touched,
-        },
-    );
-    Ok(client)
+            _memory: memory,
+        };
+        self.clients.insert(session_key.to_string(), entry.clone());
+        Ok(entry)
+    }
 }
 
 fn referral_request(
@@ -464,7 +495,7 @@ async fn query_eligibility_from_url(
     let client = referral_client(session_key)?;
     let url = format!("{}/eligibility", base_url.trim_end_matches('/'));
     let request = referral_request(
-        &client,
+        &client.client,
         reqwest::Method::GET,
         &url,
         access_token,
@@ -608,7 +639,7 @@ async fn send_invites_to_url(
     let emails = normalize_referral_emails(emails)?;
     let client = referral_client(session_key)?;
     let request = referral_request(
-        &client,
+        &client.client,
         reqwest::Method::POST,
         base_url,
         access_token,
@@ -684,7 +715,7 @@ async fn query_tracking_from_url(
     let client = referral_client(session_key)?;
     let url = format!("{}/tracking", base_url.trim_end_matches('/'));
     let request = referral_request(
-        &client,
+        &client.client,
         reqwest::Method::GET,
         &url,
         access_token,
@@ -762,6 +793,35 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn codex_r4_referral_pool_owners_follow_eviction_and_inflight_clones() {
+        let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(None);
+        let mut pool = SessionClientPool::with_parent(parent.clone());
+        let first = pool.client("r4-original-session").unwrap();
+        let first_bytes = parent.snapshot().used_bytes;
+        let shared = first.clone();
+        assert_eq!(parent.snapshot().used_bytes, first_bytes);
+        for index in 0..MAX_SESSION_CLIENTS {
+            drop(pool.client(&format!("r4-session-{index}")).unwrap());
+        }
+        assert!(!pool.clients.contains_key("r4-original-session"));
+        assert_eq!(pool.clients.len(), MAX_SESSION_CLIENTS);
+        drop(pool);
+        assert_eq!(parent.snapshot().used_bytes, first_bytes);
+        drop(first);
+        assert_eq!(parent.snapshot().used_bytes, first_bytes);
+        drop(shared);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        parent.configure_limit(Some(0));
+        let mut rejected = SessionClientPool::with_parent(parent.clone());
+        assert!(matches!(
+            rejected.client("r4-rejected"),
+            Err(ReferralError::ClientUnavailable)
+        ));
+        assert!(rejected.clients.is_empty());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
 
     async fn test_server(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -433,6 +433,7 @@ mod tests {
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
         };
         let cursor = cursor_account_from_managed_account(&account);
         assert_eq!(cursor.machine_id(), "machine");

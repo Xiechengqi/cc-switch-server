@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
+import { auditCodexServerProbe } from "./codex-server-probe-contract.mjs";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const baselinePath = path.join(
@@ -912,8 +913,123 @@ assert(
   "Codex WS to HTTP fallback boundary changed",
 );
 
+const r4Ids = new Set(["R4-CX-01", "R4-CX-02", "R4-CX-03", "R4-CX-04", "R4-CX-05", "R4-CORE-02", "R4-CORE-03"]);
+for (const review of baseline.r4Reviews ?? []) {
+  assert(r4Ids.delete(review.id), `unexpected or duplicate Codex R4 review ${review.id}`);
+  const noWire = review.id === "R4-CX-05";
+  assert(
+    Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.status === (noWire ? "working_tree_reviewed_no_wire_delta" : "working_tree_fixture_verified") &&
+      review.decision === (noWire ? "keep_current_encoding" : "adapt") &&
+      review.liveAcceptance === "live_pending",
+    `${review.id} claims an unsupported R4 evidence state`,
+  );
+  assert(Array.isArray(review.sources) && review.sources.length > 0, `${review.id} lacks frozen sources`);
+  for (const source of review.sources) {
+    assert(
+      sourceById.has(source.sourceId) && commitPattern.test(source.snapshotCommit) &&
+        commitPattern.test(source.snapshotTree) && source.files?.length >= 2,
+      `${review.id} has an invalid R4 source snapshot`,
+    );
+    for (const file of source.files) {
+      assertSafePath(file.path, `${review.id} source`);
+      assert(digestPattern.test(file.sha256), `${review.id} source digest is invalid`);
+      if (checkSources) {
+        const sourceRoot = sourceRootById.get(source.sourceId);
+        assert(
+          gitTree(sourceRoot, source.snapshotCommit) === source.snapshotTree &&
+            sha256(gitFile(sourceRoot, source.snapshotCommit, file.path, null)) === file.sha256,
+          `${review.id} source object drifted`,
+        );
+      }
+    }
+  }
+  assert(
+    commitPattern.test(review.target?.baselineCommit) && review.target.implementationCommit === null &&
+      review.target.readMode === "working_tree" &&
+      review.target.validationScope?.includes("excluding_concurrent_Share_Market") &&
+      Array.isArray(review.target.contracts) && review.target.contracts.length > 0,
+    `${review.id} must distinguish isolated working-tree validation from committed implementation`,
+  );
+  for (const contract of review.target.contracts) {
+    assertSafePath(contract.path, `${review.id} target`);
+    const content = fs.readFileSync(path.join(repoRoot, contract.path), "utf8");
+    assert(
+      Array.isArray(contract.anchors) && contract.anchors.length > 0 &&
+        contract.anchors.every((anchor) => content.includes(anchor)),
+      `${review.id} has an unavailable local fixture anchor`,
+    );
+  }
+  if (review.id === "R4-CORE-03") {
+    const timing = review.timingContract;
+    assert(timing?.requestOrigin === "forwarding_entry_after_API_ingress" &&
+      timing.attemptOrigin === "preparation_after_retry_wait" &&
+      timing.httpDelivery === "body_handoff_only" &&
+      timing.websocketDelivery === "local_sink_send_completion" &&
+      timing.upstreamWriteCompletion === "writer_success_only_never_conservative_Sent" &&
+      timing.release === "last_tracked_request_budget_owner" &&
+      timing.unclassifiedExits === "unfinished" &&
+      timing.waitIntervals === "operation_wall_time_may_overlap" &&
+      timing.legacyFirstTokenChanged === false && timing.controlsCountAsFirstSemantic === false &&
+      JSON.stringify(timing.labels) === JSON.stringify(["provider_type", "surface", "scope", "phase", "result"]),
+      "Codex timing must distinguish forwarding origin, semantic content, local handoff/write and final logical release");
+    assert(review.measurement?.path === "assets/contract/codex-r4-server-probe.json" &&
+      review.measurement.evidenceState === "offline_loopback_test_assembly_measurement" &&
+      review.measurement.sha256 === sha256(fs.readFileSync(path.join(repoRoot, review.measurement.path))) &&
+      review.measurement.baselineSpeedupClaim === false && review.measurement.productionCapacityClaim === false,
+      "timing measurement must identify a frozen Server test assembly without claiming production speedup/capacity");
+  }
+  if (noWire) {
+    assert(JSON.stringify(review.keptEncoding) === JSON.stringify({ outboundHttp: true, downstreamHttp: true, websocket: true }) &&
+      review.broad400415ReplayAdopted === false && review.vendorAcceptance === "live_pending" &&
+      review.offlineDecisionComplete === true && review.outstanding?.length === 0 &&
+      review.futureEnablementRequires?.includes("bounded_codec_scratch_and_owner_lifecycle") &&
+      review.futureEnablementRequires?.includes("same_endpoint_same_rail_vendor_acceptance") &&
+      review.futureEnablementRequires?.includes("stream_flush_negotiation_and_replay_contracts"),
+      "Codex compression decision must close this round without enabling wire or broad plaintext replay");
+  }
+  if (review.id === "R4-CORE-02") {
+    assert(review.outstanding?.includes("per_provider_review_of_independent_long_lived_cache_ownership"),
+      "process-parent fixtures cannot claim completion of unreviewed Provider cache ownership");
+  }
+}
+assert(r4Ids.size === 0, "Codex R4 fixture coverage is incomplete");
+
+const codecProbe = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract/codex-r4-compression-probe.json"), "utf8"));
+assert(
+  codecProbe.format === "cc-switch-codex-compression-codec-probe" && codecProbe.schemaVersion === 1 &&
+    codecProbe.evidenceState === "offline_synthetic_codec_measurement" &&
+    codecProbe.networkRequests === 0 && codecProbe.serverStarted === false &&
+    codecProbe.scriptSha256 === sha256(fs.readFileSync(path.join(repoRoot, "scripts/bench/codex-request-compression.py"))),
+  "Codex codec measurements must identify their local generator and evidence boundary",
+);
+assert(
+  codecProbe.results?.length === 4 && codecProbe.results.every((result) =>
+    result.roundTripExact === true && result.samples >= 3 && digestPattern.test(result.inputSha256) &&
+      result.plainBodyBytes > 0 && result.zstdBodyBytes > 0 &&
+      ["p50", "p95", "p99"].every((key) => Number.isFinite(result.encodingCpuMs?.[key]) && result.encodingCpuMs[key] >= 0)),
+  "Codex codec measurements lack reproducible inputs or valid results",
+);
+assert(
+  codecProbe.limits?.includes("does_not_measure_TTFT_cancellation_or_upstream_acceptance") &&
+    codecProbe.decision === "keep_current_outbound_encoding_pending_transport_and_endpoint_evidence",
+  "Codex codec measurements cannot claim production acceptance or enable compression",
+);
+
+const serverProbe = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract/codex-r4-server-probe.json"), "utf8"));
+auditCodexServerProbe(serverProbe, codecProbe);
+for (const source of ["scripts/bench/codex-server-probe.py", "scripts/bench/codex-request-compression.py", "src/test_support/codex_server_probe.rs"]) {
+  assert(serverProbe.sourceSha256?.[source] === sha256(fs.readFileSync(path.join(repoRoot, source))),
+    `Codex Server measurement source changed: ${source}`);
+}
+assert(baseline.r4CategoryReview?.status === "offline_complete" &&
+  baseline.r4CategoryReview.implementationCommit === null &&
+  baseline.r4CategoryReview.liveAcceptance === "live_pending" &&
+  baseline.r4CategoryReview.concurrentShareMarketValidated === false,
+  "Codex category review must keep working-tree, live and concurrent integration evidence separate");
+
 console.log(
-  `codex reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${acceptanceOperations.size} live-pending operations${
+  `codex reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${baseline.r4Reviews.length} R4 working-tree reviews, ${acceptanceOperations.size} live-pending operations${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

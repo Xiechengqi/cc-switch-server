@@ -16,6 +16,7 @@ use super::agent_proto::{is_end_stream, ConnectFrame, ConnectFrameParser, ProtoE
 use crate::proxy::request_memory::{
     RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError, RequestMemoryReservation,
 };
+use crate::proxy::request_timing::{ForwardTiming, Milestone, WaitKind};
 use crate::proxy::ProxyError;
 use async_stream::stream;
 use axum::http::StatusCode;
@@ -235,6 +236,13 @@ impl CursorH2Stream {
                 CursorOutputDeadlineKind::Idle,
                 timeouts.request,
             ));
+        let timing = request_memory
+            .as_ref()
+            .and_then(RequestMemoryBudget::timing);
+        if let Some(timing) = &timing {
+            timing.mark(Milestone::SendStarted);
+        }
+        let wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
         let response = tokio::time::timeout_at(header_deadline, client.request(req))
             .await
             .map_err(|_| {
@@ -253,6 +261,10 @@ impl CursorH2Stream {
                     cursor_transport_diagnostic(&e)
                 ))
             })?;
+        drop(wait);
+        if let Some(timing) = &timing {
+            timing.mark(Milestone::Headers);
+        }
 
         Ok(Self {
             writer: Some(tx),
@@ -295,6 +307,10 @@ impl CursorH2Stream {
             })
             .transpose()?
             .unwrap_or(frame);
+        if let Some(timing) = self.timing() {
+            // This is a queue handoff, not a completed socket write.
+            timing.mark(Milestone::SendStarted);
+        }
         tx.send(frame)
             .map_err(|_| cursor_forward_error("Cursor h2 stream 已关闭，无法继续写入"))
     }
@@ -303,6 +319,12 @@ impl CursorH2Stream {
     /// H2 END_STREAM on the request body. After this, [`send_frame`] fails fast.
     pub fn close_writer(&mut self) {
         self.writer = None;
+    }
+
+    pub(super) fn timing(&self) -> Option<ForwardTiming> {
+        self.request_memory
+            .as_ref()
+            .and_then(RequestMemoryBudget::timing)
     }
 
     /// Move retained parser/pending state to the request that reacquires a
@@ -357,7 +379,12 @@ impl CursorH2Stream {
             .map_err(|error| error.into_proxy_error())?;
         let read = async {
             while out.len() < max_bytes {
-                let Some(frame) = self.response.body_mut().frame().await else {
+                let wait = self
+                    .timing()
+                    .map(|timing| timing.wait(WaitKind::UpstreamRead));
+                let frame = self.response.body_mut().frame().await;
+                drop(wait);
+                let Some(frame) = frame else {
                     self.closed = true;
                     break;
                 };
@@ -410,6 +437,9 @@ impl CursorH2Stream {
 
         loop {
             let deadline = self.output_phase.deadline();
+            let wait = self
+                .timing()
+                .map(|timing| timing.wait(WaitKind::UpstreamRead));
             let frame_result = match deadline {
                 Some((deadline, kind, timeout)) => {
                     tokio::time::timeout_at(deadline, self.response.body_mut().frame())
@@ -418,6 +448,7 @@ impl CursorH2Stream {
                 }
                 None => self.response.body_mut().frame().await,
             };
+            drop(wait);
 
             let body_frame = match frame_result {
                 Some(Ok(f)) => f,
@@ -1100,3 +1131,7 @@ mod tests {
         assert!(resumed_at + Duration::from_millis(81) > phase.deadline().unwrap().0);
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+pub(crate) mod lifecycle_tests;

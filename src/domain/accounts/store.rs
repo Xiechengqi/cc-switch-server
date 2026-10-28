@@ -161,6 +161,8 @@ pub struct Account {
     pub capacity_pool_limits: BTreeMap<String, AccountCapacityPoolLimit>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quota_window_observations: BTreeMap<String, AccountQuotaWindowObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_passive_quota: Option<super::codex_quota::CodexPassiveQuota>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capability_observations: BTreeMap<String, AccountCapabilityObservation>,
 }
@@ -994,6 +996,7 @@ impl AccountStore {
             needs_relogin: false,
             capacity_pool_limits: BTreeMap::new(),
             quota_window_observations: BTreeMap::new(),
+            codex_passive_quota: None,
             capability_observations: BTreeMap::new(),
         };
 
@@ -1033,6 +1036,7 @@ impl AccountStore {
             if account.provider_type == existing.provider_type {
                 account.capacity_pool_limits = existing.capacity_pool_limits.clone();
                 account.quota_window_observations = existing.quota_window_observations.clone();
+                account.codex_passive_quota = existing.codex_passive_quota.clone();
                 account.capability_observations = existing.capability_observations.clone();
             }
             if account.provider_type == ProviderType::CodexOAuth {
@@ -1864,6 +1868,7 @@ fn advance_account_generations(previous: &Account, current: &mut Account) {
         current.auth_identity_generation = current.auth_identity_generation.saturating_add(1);
         current.capacity_pool_limits.clear();
         current.quota_window_observations.clear();
+        current.codex_passive_quota = None;
     }
     if previous_token != current_token {
         current.token_refresh_generation = current.token_refresh_generation.saturating_add(1);

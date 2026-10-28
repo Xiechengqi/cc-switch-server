@@ -10,6 +10,11 @@ use super::reasoning_bridge::{
     openai_reasoning_item_from_anthropic_block, reasoning_summary_text,
     responses_reasoning_item_from_anthropic_block, unsigned_responses_reasoning_item,
 };
+pub(super) use super::responses_tool_identity::ResponsesToolKind;
+use super::responses_tool_identity::{
+    HistoricalToolNames, ResponsesToolIdentity as ResponsesToolSpec, APPLY_PATCH_PROXY_NAME,
+    CHAT_TOOL_NAME_MAX_LEN, LOCAL_SHELL_PROXY_NAME, TOOL_SEARCH_PROXY_NAME,
+};
 use super::tool_media::{
     extract_tool_media, flush_chat_media, queue_chat_media, sanitized_tool_text, ToolMediaPart,
     ToolMediaScope,
@@ -19,32 +24,12 @@ use super::tool_schema::{normalize_function_parameters, normalize_gemini_functio
 const DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS: u64 = 8192;
 const DEFAULT_UPSTREAM_REFUSAL_MESSAGE: &str = "The upstream model refused to provide a response.";
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
-const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
-const APPLY_PATCH_PROXY_NAME: &str = "cc_switch_apply_patch";
-const LOCAL_SHELL_PROXY_NAME: &str = "cc_switch_local_shell";
-const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResponsesToolKind {
-    Function,
-    Namespace,
-    Custom,
-    ToolSearch,
-    ApplyPatch,
-    LocalShell,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResponsesToolSpec {
-    kind: ResponsesToolKind,
-    name: String,
-    namespace: Option<String>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResponsesToolContext {
     chat_name_to_spec: BTreeMap<String, ResponsesToolSpec>,
     namespace_name_to_chat_name: BTreeMap<(String, String), String>,
+    historical_names: HistoricalToolNames,
+    validation_error: Option<String>,
     web_search_requested: bool,
 }
 
@@ -78,7 +63,10 @@ impl ResponsesToolContext {
                     .saturating_add(chat_name.capacity())
             },
         );
-        chat_specs.saturating_add(namespace_names)
+        chat_specs
+            .saturating_add(namespace_names)
+            .saturating_add(self.historical_names.retained_bytes())
+            .saturating_add(self.validation_error.as_ref().map_or(0, String::capacity))
     }
 
     fn from_custom_tool_names(names: &BTreeSet<String>) -> Self {
@@ -145,6 +133,77 @@ impl ResponsesToolContext {
             .get(&(namespace.to_string(), name.to_string()))
             .cloned()
             .unwrap_or_else(|| flatten_namespace_tool_name(namespace, name))
+    }
+
+    fn history_name(&self, item: &Value) -> Option<String> {
+        self.history_name_from_object(item.as_object()?)
+    }
+
+    fn history_name_from_object(&self, item: &Map<String, Value>) -> Option<String> {
+        let identity = response_history_tool_identity_object(item)?;
+        self.historical_names.get(&identity).map(str::to_string)
+    }
+
+    fn validate_bridge_request(&self, input: &Value) -> Result<(), TransformError> {
+        if let Some(error) = &self.validation_error {
+            return Err(TransformError::new(error));
+        }
+        if let Some(choice) = input.get("tool_choice") {
+            self.selected_chat_name(choice)?;
+        }
+        Ok(())
+    }
+
+    fn selected_chat_name(&self, choice: &Value) -> Result<Option<String>, TransformError> {
+        let Some(object) = choice.as_object() else {
+            return Ok(None);
+        };
+        let namespace = object
+            .get("namespace")
+            .or_else(|| choice.pointer("/function/namespace"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let choice_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (kind, name) = match choice_type {
+            "function" | "custom" => (
+                if choice_type == "custom" {
+                    ResponsesToolKind::Custom
+                } else if namespace.is_some() {
+                    ResponsesToolKind::Namespace
+                } else {
+                    ResponsesToolKind::Function
+                },
+                object
+                    .get("name")
+                    .or_else(|| choice.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            "tool_search" => (ResponsesToolKind::ToolSearch, "tool_search"),
+            "apply_patch" => (ResponsesToolKind::ApplyPatch, "apply_patch"),
+            "local_shell" => (ResponsesToolKind::LocalShell, "local_shell"),
+            "tool" => {
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return self
+                    .chat_name_to_spec
+                    .contains_key(name)
+                    .then(|| Some(name.to_string()))
+                    .ok_or_else(|| {
+                        TransformError::new("Responses tool_choice references an undeclared tool")
+                    });
+            }
+            _ => return Ok(None),
+        };
+        self.chat_name_to_spec.iter()
+            .find(|(_, spec)| spec.kind == kind && spec.name == name && spec.namespace.as_deref() == namespace)
+            .map(|(alias, _)| Some(alias.clone()))
+            .ok_or_else(|| TransformError::new("Responses tool_choice references an undeclared tool identity or mismatched tool kind"))
     }
 
     pub(crate) fn response_item_id(&self, call_id: &str, chat_name: &str) -> String {
@@ -220,7 +279,22 @@ impl ResponsesToolContext {
     }
 
     fn add_spec(&mut self, chat_name: String, spec: ResponsesToolSpec) {
-        if chat_name.is_empty() || self.chat_name_to_spec.contains_key(&chat_name) {
+        if chat_name.is_empty() {
+            return;
+        }
+        if let Some(previous) = self.chat_name_to_spec.get(&chat_name) {
+            if previous != &spec && self.validation_error.is_none() {
+                self.validation_error = Some(
+                    if previous.kind == ResponsesToolKind::ToolSearch
+                        || spec.kind == ResponsesToolKind::ToolSearch
+                    {
+                        "built-in tool_search conflicts with another converted tool identity"
+                            .to_string()
+                    } else {
+                        format!("Responses tool identity collision at converted name '{chat_name}'; rename one of the tools")
+                    },
+                );
+            }
             return;
         }
         if let Some(namespace) = spec.namespace.as_ref() {
@@ -292,6 +366,15 @@ impl ResponsesToolContext {
                     .into_iter()
                     .flatten()
                 {
+                    if !matches!(
+                        child.get("type").and_then(Value::as_str),
+                        None | Some("" | "function")
+                    ) {
+                        self.validation_error.get_or_insert_with(|| {
+                            "Responses namespace may contain only function tools".to_string()
+                        });
+                        continue;
+                    }
                     let Some(name) = response_tool_name(child) else {
                         continue;
                     };
@@ -337,10 +420,57 @@ pub(crate) fn responses_tool_context(input: &Value) -> ResponsesToolContext {
     for tool in response_tools_from_request(input) {
         context.add_response_tool(tool);
     }
-    if let Some(history) = input.get("input") {
-        collect_tool_search_output_tools(history, &mut context);
+    match HistoricalToolNames::build(
+        response_input_items(input)
+            .iter()
+            .filter_map(response_history_tool_identity)
+            .collect(),
+        context
+            .chat_name_to_spec
+            .iter()
+            .map(|(alias, spec)| (alias.clone(), spec.clone())),
+    ) {
+        Ok(names) => context.historical_names = names,
+        Err(error) => {
+            context.validation_error.get_or_insert(error);
+        }
     }
     context
+}
+
+fn response_history_tool_identity(item: &Value) -> Option<ResponsesToolSpec> {
+    response_history_tool_identity_object(item.as_object()?)
+}
+
+fn response_history_tool_identity_object(item: &Map<String, Value>) -> Option<ResponsesToolSpec> {
+    let namespace = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (kind, name) = match item.get("type").and_then(Value::as_str)? {
+        "function_call" => (
+            if namespace.is_some() {
+                ResponsesToolKind::Namespace
+            } else {
+                ResponsesToolKind::Function
+            },
+            item.get("name").and_then(Value::as_str)?,
+        ),
+        "custom_tool_call" => (
+            ResponsesToolKind::Custom,
+            item.get("name").and_then(Value::as_str)?,
+        ),
+        "tool_search_call" => (ResponsesToolKind::ToolSearch, "tool_search"),
+        "apply_patch_call" => (ResponsesToolKind::ApplyPatch, "apply_patch"),
+        "local_shell_call" => (ResponsesToolKind::LocalShell, "local_shell"),
+        _ => return None,
+    };
+    Some(ResponsesToolSpec {
+        kind,
+        name: name.to_string(),
+        namespace,
+    })
 }
 
 fn request_has_web_search_tool(input: &Value) -> bool {
@@ -373,7 +503,10 @@ pub(crate) fn responses_tool_context_from_bytes(input: &[u8]) -> ResponsesToolCo
 pub(crate) fn normalize_grok_responses_tool_compatibility(
     input: &mut Value,
 ) -> Result<bool, TransformError> {
+    validate_response_tool_type_collisions(input)?;
     let context = responses_tool_context(input);
+    context.validate_bridge_request(input)?;
+    let explicit_reset = response_tools_explicitly_reset(input);
     let Some(object) = input.as_object_mut() else {
         return Ok(false);
     };
@@ -409,12 +542,18 @@ pub(crate) fn normalize_grok_responses_tool_compatibility(
                             )
                         })?
                         .clone();
-                    let normalized = normalize_grok_response_tool_list(&source, &context, true)?;
+                    let normalized = if explicit_reset {
+                        Vec::new()
+                    } else {
+                        normalize_grok_response_tool_list(&source, &context, true)?
+                    };
                     changed |= normalized != source;
                     item_object.insert("tools".to_string(), Value::Array(normalized));
                 }
                 Some("tool_search_output") => {
-                    if let Some(tools) = item_object.get("tools").and_then(Value::as_array) {
+                    if let Some(tools) =
+                        history_declaration_tools(item_object).filter(|_| !explicit_reset)
+                    {
                         loaded_tools
                             .extend(normalize_grok_response_tool_list(tools, &context, true)?);
                     }
@@ -434,22 +573,14 @@ pub(crate) fn normalize_grok_responses_tool_compatibility(
                     changed = true;
                 }
                 Some("function_call") => {
-                    let Some(namespace) = item_object
-                        .get("namespace")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|namespace| !namespace.is_empty())
-                    else {
+                    let Some(alias) = context.history_name_from_object(item_object) else {
                         continue;
                     };
-                    let name = item_object
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let alias = context.chat_name_for_response_function(name, Some(namespace));
+                    changed |= item_object.get("name").and_then(Value::as_str)
+                        != Some(alias.as_str())
+                        || item_object.contains_key("namespace");
                     item_object.insert("name".to_string(), Value::String(alias));
                     item_object.remove("namespace");
-                    changed = true;
                 }
                 _ => {}
             }
@@ -643,9 +774,7 @@ fn normalize_grok_tool_history_item(
         .unwrap_or_default();
     match item_type {
         "custom_tool_call" => {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            let namespace = item.get("namespace").and_then(Value::as_str);
-            let name = context.chat_name_for_response_function(name, namespace);
+            let name = context.history_name_from_object(item).unwrap_or_default();
             let input = item.get("input").and_then(Value::as_str).ok_or_else(|| {
                 TransformError::new("Grok Responses custom_tool_call.input must be a string")
             })?;
@@ -655,15 +784,15 @@ fn normalize_grok_tool_history_item(
             }))
         }
         "tool_search_call" => Ok(json!({
-            "type": "function_call", "call_id": call_id, "name": TOOL_SEARCH_PROXY_NAME,
+            "type": "function_call", "call_id": call_id, "name": context.history_name_from_object(item),
             "arguments": response_history_arguments(item.get("arguments").or_else(|| item.get("query")))
         })),
         "apply_patch_call" => Ok(json!({
-            "type": "function_call", "call_id": call_id, "name": APPLY_PATCH_PROXY_NAME,
+            "type": "function_call", "call_id": call_id, "name": context.history_name_from_object(item),
             "arguments": json!({"operation": item.get("operation").cloned().unwrap_or(Value::Null)}).to_string()
         })),
         "local_shell_call" => Ok(json!({
-            "type": "function_call", "call_id": call_id, "name": LOCAL_SHELL_PROXY_NAME,
+            "type": "function_call", "call_id": call_id, "name": context.history_name_from_object(item),
             "arguments": json!({"action": item.get("action").cloned().unwrap_or(Value::Null)}).to_string()
         })),
         "custom_tool_call_output" | "apply_patch_call_output" | "local_shell_call_output" => {
@@ -706,40 +835,9 @@ fn normalize_grok_tool_choice(
     choice: &mut Value,
     context: &ResponsesToolContext,
 ) -> Result<bool, TransformError> {
-    let Some(object) = choice.as_object_mut() else {
+    let Some(name) = context.selected_chat_name(choice)? else {
         return Ok(false);
     };
-    let choice_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let (name, namespace) = match choice_type {
-        "function" | "custom" => (
-            object
-                .get("name")
-                .or_else(|| object.get("function").and_then(|value| value.get("name")))
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            object
-                .get("namespace")
-                .or_else(|| {
-                    object
-                        .get("function")
-                        .and_then(|value| value.get("namespace"))
-                })
-                .and_then(Value::as_str),
-        ),
-        "tool_search" => (TOOL_SEARCH_PROXY_NAME, None),
-        "apply_patch" => (APPLY_PATCH_PROXY_NAME, None),
-        "local_shell" => (LOCAL_SHELL_PROXY_NAME, None),
-        _ => return Ok(false),
-    };
-    if name.is_empty() {
-        return Err(TransformError::new(
-            "Grok Responses tool_choice name is required",
-        ));
-    }
-    let name = context.chat_name_for_response_function(name, namespace);
     *choice = json!({"type": "function", "name": name});
     Ok(true)
 }
@@ -807,32 +905,6 @@ fn parse_local_shell_action(arguments: &str) -> Value {
         return action;
     }
     json!({"type": "exec", "command": arguments})
-}
-
-fn collect_tool_search_output_tools(value: &Value, context: &mut ResponsesToolContext) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_tool_search_output_tools(item, context);
-            }
-        }
-        Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("tool_search_output") {
-                for tool in object
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    context.add_response_tool(tool);
-                }
-            }
-            for value in object.values() {
-                collect_tool_search_output_tools(value, context);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
@@ -1002,7 +1074,9 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
 pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
     validate_anthropic_tool_search_execution(input)?;
+    super::responses_phase::observe_items(input, "input", "messages", "request");
     let tool_context = responses_tool_context(input);
+    tool_context.validate_bridge_request(input)?;
     let mut output = Map::new();
     copy_string(input, &mut output, "model");
     copy_bool(input, &mut output, "stream");
@@ -1314,7 +1388,9 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
     effort_mode: ReasoningEffortMode,
 ) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
+    super::responses_phase::observe_items(input, "input", "chat", "request");
     let tool_context = responses_tool_context(input);
+    tool_context.validate_bridge_request(input)?;
     let mut messages = Vec::new();
     let mut pending_media = Vec::new();
     let mut pending_reasoning = Vec::new();
@@ -1397,7 +1473,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
     if let Some(tool_choice) = input.get("tool_choice") {
         output.insert(
             "tool_choice".to_string(),
-            openai_response_tool_choice_to_chat(tool_choice, &tool_context),
+            openai_response_tool_choice_to_chat(tool_choice, &tool_context)?,
         );
     }
     if let Some(format) = input.pointer("/text/format") {
@@ -1567,6 +1643,7 @@ pub fn openai_chat_response_to_anthropic(input: &Value) -> Result<Value, Transfo
 }
 
 pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, TransformError> {
+    super::responses_phase::observe_items(input, "output", "messages", "response");
     let mut content = Vec::new();
     let mut web_search_requests = 0_u64;
     let mut x_search_requests = 0_u64;
@@ -1629,6 +1706,7 @@ pub fn openai_responses_response_to_anthropic(input: &Value) -> Result<Value, Tr
 }
 
 pub fn openai_responses_response_to_chat(input: &Value) -> Result<Value, TransformError> {
+    super::responses_phase::observe_items(input, "output", "chat", "response");
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     let mut reasoning = Vec::new();
@@ -3845,9 +3923,17 @@ fn append_response_tool_call_to_chat(
     if pending_reasoning.is_empty() {
         append_pending_reasoning(pending_reasoning, latest_real_reasoning.clone());
     }
-    let Some(tool_call) = openai_response_function_call_to_chat(item, tool_context) else {
+    let Some(mut tool_call) = openai_response_function_call_to_chat(item, tool_context) else {
         return;
     };
+    if let Some(name) = tool_context.history_name(item) {
+        tool_call["function"]["name"] = json!(name);
+    }
+    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+        if let Some(Value::String(arguments)) = item.get("arguments") {
+            tool_call["function"]["arguments"] = json!(arguments);
+        }
+    }
     if let Some(message) = messages.last_mut().filter(|message| {
         message.get("role").and_then(Value::as_str) == Some("assistant")
             && message.get("content").is_some_and(Value::is_null)
@@ -4078,38 +4164,40 @@ fn response_tools_from_request(input: &Value) -> Vec<&Value> {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    if let Some(history) = input.get("input") {
-        collect_response_tools_from_history(history, &mut tools);
+    if !response_tools_explicitly_reset(input) {
+        for item in response_input_items(input) {
+            if let Some(declarations) = item.as_object().and_then(history_declaration_tools) {
+                tools.extend(declarations);
+            }
+        }
     }
     tools
 }
 
-fn collect_response_tools_from_history<'a>(value: &'a Value, tools: &mut Vec<&'a Value>) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_response_tools_from_history(item, tools);
-            }
-        }
-        Value::Object(object) => {
-            if matches!(
-                object.get("type").and_then(Value::as_str),
-                Some("additional_tools" | "tool_search_output")
-            ) {
-                tools.extend(
-                    object
-                        .get("tools")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten(),
-                );
-            }
-            for nested in object.values() {
-                collect_response_tools_from_history(nested, tools);
-            }
-        }
-        _ => {}
+fn response_input_items(input: &Value) -> &[Value] {
+    match input.get("input") {
+        Some(Value::Array(items)) => items,
+        Some(item @ Value::Object(_)) => std::slice::from_ref(item),
+        _ => &[],
     }
+}
+
+fn response_tools_explicitly_reset(input: &Value) -> bool {
+    input
+        .get("tools")
+        .is_some_and(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty))
+}
+
+fn history_declaration_tools(item: &Map<String, Value>) -> Option<&Vec<Value>> {
+    match item.get("type").and_then(Value::as_str)? {
+        "additional_tools" => {}
+        "tool_search_output"
+            if item
+                .get("status")
+                .is_none_or(|status| status.as_str() == Some("completed")) => {}
+        _ => return None,
+    }
+    item.get("tools").and_then(Value::as_array)
 }
 
 fn validate_response_tool_type_collisions(input: &Value) -> Result<(), TransformError> {
@@ -4323,39 +4411,11 @@ fn openai_response_function_tool_to_chat(tool: &Value, name: &str) -> Option<Val
 fn openai_response_tool_choice_to_chat(
     tool_choice: &Value,
     tool_context: &ResponsesToolContext,
-) -> Value {
-    match tool_choice {
-        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
-            let name = object
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let namespace = object.get("namespace").and_then(Value::as_str);
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool_context.chat_name_for_response_function(name, namespace)
-                }
-            })
-        }
-        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("custom") => {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": object.get("name").and_then(Value::as_str).unwrap_or_default()
-                }
-            })
-        }
-        Value::Object(object)
-            if object.get("type").and_then(Value::as_str) == Some("tool_search") =>
-        {
-            json!({
-                "type": "function",
-                "function": {"name": "tool_search"}
-            })
-        }
-        _ => tool_choice.clone(),
-    }
+) -> Result<Value, TransformError> {
+    Ok(match tool_context.selected_chat_name(tool_choice)? {
+        Some(name) => json!({"type":"function","function":{"name":name}}),
+        None => tool_choice.clone(),
+    })
 }
 
 fn openai_response_function_call_to_chat(
@@ -4641,14 +4701,9 @@ fn openai_response_request_tool_call_to_anthropic(
         .and_then(Value::as_str)
         .unwrap_or("function_call");
     let original_name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-    let name = match item_type {
-        "tool_search_call" => TOOL_SEARCH_PROXY_NAME.to_string(),
-        "function_call" => tool_context.chat_name_for_response_function(
-            original_name,
-            item.get("namespace").and_then(Value::as_str),
-        ),
-        _ => original_name.to_string(),
-    };
+    let name = tool_context
+        .history_name(item)
+        .unwrap_or_else(|| original_name.to_string());
     let input = match item_type {
         "custom_tool_call" => {
             json!({"input": item.get("input").cloned().unwrap_or_else(|| json!(""))})
@@ -6417,7 +6472,9 @@ fn apply_openai_tool_controls_to_anthropic(
 
     if let Some(tool_choice) = input
         .get("tool_choice")
-        .and_then(|choice| openai_tool_choice_to_anthropic(choice, tool_context))
+        .map(|choice| openai_tool_choice_to_anthropic(choice, tool_context))
+        .transpose()?
+        .flatten()
     {
         let forced = matches!(
             tool_choice.get("type").and_then(Value::as_str),
@@ -6461,8 +6518,13 @@ fn apply_openai_tool_controls_to_anthropic(
 fn openai_tool_choice_to_anthropic(
     tool_choice: &Value,
     tool_context: Option<&ResponsesToolContext>,
-) -> Option<Value> {
-    match tool_choice {
+) -> Result<Option<Value>, TransformError> {
+    if let Some(context) = tool_context {
+        if let Some(name) = context.selected_chat_name(tool_choice)? {
+            return Ok(Some(json!({"type":"tool","name":name})));
+        }
+    }
+    Ok(match tool_choice {
         Value::String(choice) => match choice.as_str() {
             "auto" => Some(json!({"type": "auto"})),
             "required" => Some(json!({"type": "any"})),
@@ -6472,7 +6534,7 @@ fn openai_tool_choice_to_anthropic(
         Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
             Some("auto" | "any" | "none") => Some(tool_choice.clone()),
             Some("required") => Some(json!({"type": "any"})),
-            Some(choice_type @ ("function" | "custom")) => choice
+            Some("function" | "custom") => choice
                 .get("name")
                 .or_else(|| {
                     choice
@@ -6481,21 +6543,7 @@ fn openai_tool_choice_to_anthropic(
                 })
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .map(|name| {
-                    let name = if choice_type == "function" {
-                        tool_context
-                            .map(|context| {
-                                context.chat_name_for_response_function(
-                                    name,
-                                    choice.get("namespace").and_then(Value::as_str),
-                                )
-                            })
-                            .unwrap_or_else(|| name.to_string())
-                    } else {
-                        name.to_string()
-                    };
-                    json!({"type": "tool", "name": name})
-                }),
+                .map(|name| json!({"type": "tool", "name": name})),
             Some("tool_search") => Some(json!({"type": "tool", "name": "tool_search"})),
             Some("tool") => choice
                 .get("name")
@@ -6505,7 +6553,7 @@ fn openai_tool_choice_to_anthropic(
             _ => None,
         },
         _ => None,
-    }
+    })
 }
 
 fn openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
@@ -7122,6 +7170,23 @@ pub(crate) fn add_gemini_reasoning_usage_details(anthropic: &mut Value, gemini: 
     }
 }
 
+/// Anthropic thinking and OpenAI reasoning are the same output-token subset.
+/// Keep explicit zero and unrelated details, without accepting malformed counts.
+pub(super) fn openai_output_details_from_anthropic_usage(usage: Option<&Value>) -> Option<Value> {
+    let details = usage?.get("output_tokens_details")?.as_object()?;
+    let reasoning_tokens = details
+        .get("thinking_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| details.get("reasoning_tokens").and_then(Value::as_u64));
+    let mut normalized = details.clone();
+    normalized.remove("thinking_tokens");
+    normalized.remove("reasoning_tokens");
+    if let Some(tokens) = reasoning_tokens {
+        normalized.insert("reasoning_tokens".to_string(), json!(tokens));
+    }
+    Some(Value::Object(normalized))
+}
+
 fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
     let fresh_input_tokens = usage_number(usage, &[&["input_tokens"]]).unwrap_or(0);
     let output_tokens = usage_number(usage, &[&["output_tokens"]]).unwrap_or(0);
@@ -7140,8 +7205,8 @@ fn openai_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["prompt_tokens_details"]["cached_creation_tokens"] = json!(cache_creation);
     }
-    if let Some(details) = usage.and_then(|usage| usage.get("output_tokens_details")) {
-        output["completion_tokens_details"] = details.clone();
+    if let Some(details) = openai_output_details_from_anthropic_usage(usage) {
+        output["completion_tokens_details"] = details;
     }
     if let Some(output) = output.as_object_mut() {
         copy_provider_metering(usage, output);
@@ -7167,8 +7232,8 @@ pub(super) fn openai_responses_usage_from_anthropic_usage(usage: Option<&Value>)
         output["cache_creation_input_tokens"] = json!(cache_creation);
         output["input_tokens_details"]["cache_write_tokens"] = json!(cache_creation);
     }
-    if let Some(details) = usage.and_then(|usage| usage.get("output_tokens_details")) {
-        output["output_tokens_details"] = details.clone();
+    if let Some(details) = openai_output_details_from_anthropic_usage(usage) {
+        output["output_tokens_details"] = details;
     }
     if let Some(output) = output.as_object_mut() {
         copy_provider_metering(usage, output);
@@ -9862,6 +9927,92 @@ mod tests {
     }
 
     #[test]
+    fn claude_r4_json_usage_normalizes_thinking_details() {
+        let cases = [
+            (json!({"thinking_tokens": 4}), Some(4)),
+            (json!({"thinking_tokens": 0}), Some(0)),
+            (json!({"reasoning_tokens": 3}), Some(3)),
+            (
+                json!({"thinking_tokens": 4, "reasoning_tokens": 9}),
+                Some(4),
+            ),
+            (
+                json!({"thinking_tokens": -1, "reasoning_tokens": 2}),
+                Some(2),
+            ),
+            (json!({"thinking_tokens": -1}), None),
+            (json!({"thinking_tokens": 1.5}), None),
+            (json!({"thinking_tokens": "4"}), None),
+            (json!({"thinking_tokens": true}), None),
+            (json!({"thinking_tokens": null}), None),
+            (json!({"reasoning_tokens": -2}), None),
+            (json!({}), None),
+        ];
+        for (details, expected) in cases {
+            let mut details = details;
+            details["accepted_prediction_tokens"] = json!(1);
+            let input = json!({
+                "id": "msg_claude_r4_usage", "type": "message", "role": "assistant",
+                "model": "claude-opus-5-5", "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 13, "output_tokens": 10,
+                    "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2,
+                    "output_tokens_details": details, "credit_usage": 0.5}
+            });
+            let original = input.clone();
+            let chat = anthropic_response_to_openai_chat(&input).unwrap();
+            let responses = anthropic_response_to_openai_responses(&input).unwrap();
+            for (usage, detail_key, input_key, output_key) in [
+                (
+                    &chat["usage"],
+                    "completion_tokens_details",
+                    "prompt_tokens",
+                    "completion_tokens",
+                ),
+                (
+                    &responses["usage"],
+                    "output_tokens_details",
+                    "input_tokens",
+                    "output_tokens",
+                ),
+            ] {
+                assert_eq!(usage[input_key], 18);
+                assert_eq!(usage[output_key], 10);
+                assert_eq!(usage["total_tokens"], 28);
+                assert_eq!(usage["credit_usage"], 0.5);
+                assert_eq!(usage[detail_key]["accepted_prediction_tokens"], 1);
+                assert_eq!(
+                    usage[detail_key].get("reasoning_tokens"),
+                    expected.map(Value::from).as_ref(),
+                    "{details}"
+                );
+                assert!(
+                    usage[detail_key].get("thinking_tokens").is_none(),
+                    "{details}"
+                );
+            }
+            assert_eq!(input, original, "native Anthropic usage remains untouched");
+        }
+        for details in [Value::Null, json!(4), json!([]), json!("invalid")] {
+            let usage =
+                json!({"input_tokens": 1, "output_tokens": 2, "output_tokens_details": details});
+            assert!(openai_usage_from_anthropic_usage(Some(&usage))
+                .get("completion_tokens_details")
+                .is_none());
+            assert!(openai_responses_usage_from_anthropic_usage(Some(&usage))
+                .get("output_tokens_details")
+                .is_none());
+        }
+        let usage = json!({"input_tokens": 1, "output_tokens": 2});
+        assert!(openai_usage_from_anthropic_usage(Some(&usage))
+            .get("completion_tokens_details")
+            .is_none());
+        assert!(openai_responses_usage_from_anthropic_usage(Some(&usage))
+            .get("output_tokens_details")
+            .is_none());
+    }
+
+    #[test]
     fn responses_anthropic_usage_round_trip_preserves_cache_creation() {
         let responses_usage = json!({
             "input_tokens": 100,
@@ -11390,6 +11541,284 @@ mod tests {
             Some(&json!("custom_tool_call"))
         );
         assert_eq!(output.pointer("/output/0/input"), Some(&json!("pwd")));
+    }
+
+    #[test]
+    fn qoder_r4_active_response_tool_identity_collisions_fail_in_both_bridges() {
+        let long_namespace = "工具".repeat(40);
+        let namespace = |group: &str, name: &str| {
+            json!({
+                "type":"namespace", "name":group,
+                "tools":[{"type":"function","name":name,"parameters":{"type":"object"}}]
+            })
+        };
+        for mut tools in [
+            vec![namespace("a", "b__c"), namespace("a__b", "c")],
+            vec![
+                namespace(&long_namespace, "b__c"),
+                namespace(&format!("{long_namespace}__b"), "c"),
+            ],
+            vec![
+                json!({"type":"function","name":"browser__js"}),
+                namespace("browser", "js"),
+            ],
+            vec![
+                json!({"type":"custom","name":"browser__js"}),
+                namespace("browser", "js"),
+            ],
+            vec![
+                json!({"type":"apply_patch"}),
+                json!({"type":"function","name":APPLY_PATCH_PROXY_NAME}),
+            ],
+            vec![
+                json!({"type":"local_shell"}),
+                json!({"type":"custom","name":LOCAL_SHELL_PROXY_NAME}),
+            ],
+        ] {
+            for _ in 0..2 {
+                let request = json!({"model":"qwen3.8-max","input":"read","tools":tools});
+                assert!(
+                    openai_responses_to_chat(&request).is_err(),
+                    "Chat accepted {tools:?}"
+                );
+                assert!(
+                    openai_responses_to_anthropic(&request).is_err(),
+                    "Messages accepted {tools:?}"
+                );
+                let mut grok = request.clone();
+                assert!(
+                    normalize_grok_responses_tool_compatibility(&mut grok).is_err(),
+                    "native compatibility accepted {tools:?}"
+                );
+                tools.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn qoder_r4_retired_history_names_are_distinct_stable_and_not_callable() {
+        let long_namespace = "工具命名空间".repeat(40);
+        let pairs = [
+            ("one", "a", "b__c"),
+            ("two", "a__b", "c"),
+            ("three", "retired", "tool_search"),
+            ("four", "工具命名空间", "历史函数"),
+            ("five", long_namespace.as_str(), "b__c"),
+        ];
+        let mut expected = None;
+        for reversed in [false, true] {
+            let mut input = Vec::new();
+            let mut order = (0..pairs.len()).collect::<Vec<_>>();
+            if reversed {
+                order.reverse();
+            }
+            for index in order {
+                let (id, namespace, name) = pairs[index];
+                input.push(json!({"type":"function_call","call_id":id,"namespace":namespace,"name":name,"arguments":"{\"literal\":\"a__b__c\"}"}));
+                input.push(
+                    json!({"type":"function_call_output","call_id":id,"output":"result a__b__c"}),
+                );
+            }
+            let request = json!({
+                "model":"qwen3.8-max", "tools":[{"type":"function","name":"a__b__c"},{"type":"tool_search"}],
+                "tool_choice":"none", "input":input
+            });
+            let original = request.clone();
+            let chat = openai_responses_to_chat(&request).unwrap();
+            let mut names = BTreeMap::new();
+            for message in chat["messages"].as_array().unwrap() {
+                for call in message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = call["function"]["name"].as_str().unwrap();
+                    assert!(
+                        name.is_ascii() && name.len() <= CHAT_TOOL_NAME_MAX_LEN,
+                        "{name}"
+                    );
+                    assert!(
+                        !matches!(name, "a__b__c" | "tool_search"),
+                        "history acquired a current identity"
+                    );
+                    assert_eq!(call["function"]["arguments"], r#"{"literal":"a__b__c"}"#);
+                    names.insert(call["id"].as_str().unwrap().to_string(), name.to_string());
+                }
+            }
+            assert_eq!(names.len(), pairs.len());
+            assert_eq!(names.values().collect::<BTreeSet<_>>().len(), pairs.len());
+            let context = responses_tool_context(&request);
+            for name in names.values() {
+                assert!(
+                    context.tool_kind(name).is_none(),
+                    "retired tool acquired response authority"
+                );
+            }
+            let anthropic = openai_responses_to_anthropic(&request).unwrap();
+            let anthropic_names = anthropic["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().unwrap())
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| {
+                    (
+                        block["id"].as_str().unwrap().to_string(),
+                        block["name"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(names, anthropic_names);
+            let mut grok = request.clone();
+            normalize_grok_responses_tool_compatibility(&mut grok).unwrap();
+            let grok_names = grok["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .map(|item| {
+                    (
+                        item["call_id"].as_str().unwrap().to_string(),
+                        item["name"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(names, grok_names);
+            if let Some(expected) = &expected {
+                assert_eq!(&names, expected);
+            } else {
+                expected = Some(names);
+            }
+            assert_eq!(request, original);
+            assert_eq!(chat["tools"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn qoder_r4_history_cannot_authorize_undeclared_or_wrong_kind_selectors() {
+        for tools in [json!([]), json!([{"type":"tool_search"}])] {
+            let request = json!({
+                "model":"qwen3.8-max", "tools":tools,
+                "tool_choice":{"type":"function","namespace":"retired","name":"read"},
+                "input":[
+                    {"type":"function_call","call_id":"old","namespace":"retired","name":"read","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"old","output":"old result"}
+                ]
+            });
+            assert!(openai_responses_to_chat(&request).is_err());
+            assert!(openai_responses_to_anthropic(&request).is_err());
+            assert!(normalize_grok_responses_tool_compatibility(&mut request.clone()).is_err());
+        }
+        let request = json!({"model":"qwen3.8-max","input":"read",
+            "tools":[{"type":"custom","name":"read"}],"tool_choice":{"type":"function","name":"read"}});
+        assert!(openai_responses_to_chat(&request).is_err());
+        assert!(openai_responses_to_anthropic(&request).is_err());
+        assert!(normalize_grok_responses_tool_compatibility(&mut request.clone()).is_err());
+    }
+
+    #[test]
+    fn qoder_r4_explicit_tool_reset_and_opaque_results_do_not_add_declarations() {
+        let definition = json!({"type":"function","name":"retired","parameters":{"type":"object"}});
+        for reset in [json!([]), Value::Null] {
+            let request = json!({
+                "model":"qwen3.8-max", "tools":reset,"tool_choice":"none",
+                "input":[
+                    {"type":"additional_tools","tools":[definition.clone()]},
+                    {"type":"tool_search_output","call_id":"search","tools":[definition.clone()],"output":"loaded"},
+                    {"type":"function_call","call_id":"old","name":"retired","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"old","output":"old result"}
+                ]
+            });
+            for output in [
+                openai_responses_to_chat(&request).unwrap(),
+                openai_responses_to_anthropic(&request).unwrap(),
+            ] {
+                assert!(
+                    output
+                        .get("tools")
+                        .is_none_or(|tools| tools.as_array().unwrap().is_empty()),
+                    "{output}"
+                );
+            }
+            let mut grok = request.clone();
+            normalize_grok_responses_tool_compatibility(&mut grok).unwrap();
+            assert!(grok
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().unwrap().is_empty()));
+            assert!(grok["input"][0]["tools"].as_array().unwrap().is_empty());
+        }
+        let request = json!({
+            "model":"qwen3.8-max", "tools":[{"type":"function","name":"read"}],
+            "input":[
+                {"type":"function_call","call_id":"read","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"read","output":{"type":"additional_tools","tools":[definition]}}
+            ]
+        });
+        let output = openai_responses_to_chat(&request).unwrap();
+        assert_eq!(
+            output["tools"].as_array().unwrap().len(),
+            1,
+            "result data became executable"
+        );
+        for status in [json!("in_progress"), json!("failed"), Value::Null, json!(3)] {
+            let request = json!({"input":[{"type":"tool_search_output","call_id":"search","status":status,"tools":[{"type":"function","name":"not_loaded"}]}]});
+            assert!(response_tools_from_request(&request).is_empty());
+        }
+    }
+
+    #[test]
+    fn qoder_r4_invalid_history_does_not_get_an_invented_tool_name() {
+        for name in ["", " "] {
+            let request = json!({"input":[{"type":"function_call","call_id":"old","namespace":"old","name":name,"arguments":"{}"}]});
+            assert!(openai_responses_to_chat(&request).is_err());
+            assert!(openai_responses_to_anthropic(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn qoder_r4_history_preserves_raw_arguments_and_reserves_kind_and_bare_names() {
+        let arguments = "{ \"text\" : \"read__read and tool_search\" }";
+        let request = json!({
+            "tools":[{"type":"custom","name":"read"},{"type":"function","name":"tool_search"}],
+            "input":[
+                {"type":"function_call","call_id":"wrong-kind","name":"read","arguments":arguments},
+                {"type":"function_call_output","call_id":"wrong-kind","output":"unchanged"},
+                {"type":"function_call","call_id":"bare","name":"read__read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"bare","output":"unchanged"},
+                {"type":"function_call","call_id":"qualified","namespace":"read","name":"read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"qualified","output":"unchanged"},
+                {"type":"tool_search_call","call_id":"builtin","arguments":{"query":"old"}},
+                {"type":"tool_search_output","call_id":"builtin","output":"unchanged"}
+            ]
+        });
+        let context = responses_tool_context(&request);
+        let chat = openai_responses_to_chat(&request).unwrap();
+        let calls = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| {
+                message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0]["function"]["arguments"], arguments);
+        assert_ne!(calls[0]["function"]["name"], "read");
+        assert_eq!(calls[1]["function"]["name"], "read__read");
+        assert_ne!(calls[2]["function"]["name"], "read__read");
+        assert_ne!(calls[3]["function"]["name"], "tool_search");
+        for call in calls {
+            assert!(context
+                .tool_kind(call["function"]["name"].as_str().unwrap())
+                .is_none());
+        }
+        let without_history = responses_tool_context(&json!({"tools":request["tools"]}));
+        assert!(context.retained_bytes() > without_history.retained_bytes() + arguments.len());
     }
 
     #[test]

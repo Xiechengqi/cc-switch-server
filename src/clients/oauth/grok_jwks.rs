@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::{
@@ -11,6 +11,10 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::infra::resident_memory::{
+    process_resident_memory, serialized_json_bytes, ResidentMemoryBudget, ResidentMemoryReservation,
+};
+
 const DEFAULT_XAI_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 const DEFAULT_XAI_ISSUER: &str = "https://auth.x.ai";
 const DEFAULT_XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -20,6 +24,7 @@ const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 const MAX_JWKS_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CACHED_OIDC_DOCUMENTS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrokJwtError {
@@ -69,13 +74,15 @@ struct ProviderMetadata {
 #[derive(Clone)]
 struct CachedProvider {
     fetched_at: Instant,
-    metadata: ProviderMetadata,
+    metadata: Arc<ProviderMetadata>,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Clone)]
 struct CachedJwks {
     fetched_at: Instant,
-    set: JwkSet,
+    set: Arc<JwkSet>,
+    _memory: ResidentMemoryReservation,
 }
 
 fn provider_cache() -> &'static RwLock<BTreeMap<String, CachedProvider>> {
@@ -206,7 +213,7 @@ async fn load_provider(http: &reqwest::Client) -> Result<ProviderMetadata, GrokJ
     validate_xai_endpoint(&discovery_url, &xai_discovery_hosts())?;
     if let Some(cached) = provider_cache().read().await.get(&discovery_url).cloned() {
         if cached.fetched_at.elapsed() < CACHE_TTL {
-            return Ok(cached.metadata);
+            return Ok(cached.metadata.as_ref().clone());
         }
     }
 
@@ -224,12 +231,11 @@ async fn load_provider(http: &reqwest::Client) -> Result<ProviderMetadata, GrokJ
         jwks_uri,
         algorithms: document.id_token_signing_alg_values_supported,
     };
-    provider_cache().write().await.insert(
+    cache_provider(
+        &mut *provider_cache().write().await,
         discovery_url,
-        CachedProvider {
-            fetched_at: Instant::now(),
-            metadata: metadata.clone(),
-        },
+        &metadata,
+        &process_resident_memory(),
     );
     Ok(metadata)
 }
@@ -289,14 +295,105 @@ async fn load_key(http: &reqwest::Client, jwks_uri: &Url, kid: &str) -> Result<J
         .find(|key| key.common.key_id.as_deref() == Some(kid))
         .cloned()
         .ok_or_else(|| GrokJwtError::UnknownKey(kid.to_string()))?;
-    jwks_cache().write().await.insert(
+    cache_jwks(
+        &mut *jwks_cache().write().await,
         cache_key.to_string(),
-        CachedJwks {
-            fetched_at: Instant::now(),
-            set,
-        },
+        set,
+        &process_resident_memory(),
     );
     Ok(key)
+}
+
+fn cache_provider(
+    cache: &mut BTreeMap<String, CachedProvider>,
+    key: String,
+    metadata: &ProviderMetadata,
+    parent: &ResidentMemoryBudget,
+) {
+    cache.retain(|existing, cached| existing != &key && cached.fetched_at.elapsed() < CACHE_TTL);
+    let bytes = std::mem::size_of::<(String, CachedProvider)>()
+        .saturating_add(std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12)
+        .saturating_add(key.capacity())
+        .saturating_add(metadata.issuer.capacity())
+        .saturating_add(metadata.jwks_uri.as_str().len().saturating_mul(2))
+        .saturating_add(
+            metadata
+                .algorithms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(
+            metadata
+                .algorithms
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>(),
+        );
+    let Some(memory) = parent.reserve(bytes) else {
+        return;
+    };
+    if cache.len() >= MAX_CACHED_OIDC_DOCUMENTS {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.fetched_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        key,
+        CachedProvider {
+            fetched_at: Instant::now(),
+            metadata: Arc::new(metadata.clone()),
+            _memory: memory,
+        },
+    );
+}
+
+fn cache_jwks(
+    cache: &mut BTreeMap<String, CachedJwks>,
+    key: String,
+    set: JwkSet,
+    parent: &ResidentMemoryBudget,
+) {
+    cache.retain(|existing, cached| existing != &key && cached.fetched_at.elapsed() < CACHE_TTL);
+    let Some(encoded) = serialized_json_bytes(&set, MAX_JWKS_RESPONSE_BODY_BYTES) else {
+        return;
+    };
+    // JWK library internals are opaque; allow a deliberately sparse tree and
+    // string expansion per encoded byte instead of calling this an RSS count.
+    let bytes = std::mem::size_of::<(String, CachedJwks)>()
+        .saturating_add(std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12)
+        .saturating_add(key.capacity())
+        .saturating_add(
+            set.keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Jwk>()),
+        )
+        .saturating_add(encoded.saturating_mul(32));
+    let Some(memory) = parent.reserve(bytes) else {
+        return;
+    };
+    if cache.len() >= MAX_CACHED_OIDC_DOCUMENTS {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.fetched_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        key,
+        CachedJwks {
+            fetched_at: Instant::now(),
+            set: Arc::new(set),
+            _memory: memory,
+        },
+    );
 }
 
 async fn cached_key(jwks_uri: &str, kid: &str) -> Option<Jwk> {
@@ -381,23 +478,21 @@ fn env_non_empty(name: &str) -> Option<String> {
 pub(crate) async fn install_test_provider(jwk: Jwk) {
     let discovery_url = xai_discovery_url();
     let jwks_uri = Url::parse("https://auth.x.ai/.well-known/jwks.json").unwrap();
-    provider_cache().write().await.insert(
+    cache_provider(
+        &mut *provider_cache().write().await,
         discovery_url,
-        CachedProvider {
-            fetched_at: Instant::now(),
-            metadata: ProviderMetadata {
-                issuer: DEFAULT_XAI_ISSUER.to_string(),
-                jwks_uri: jwks_uri.clone(),
-                algorithms: vec![XAI_ID_TOKEN_ALGORITHM_NAME.to_string()],
-            },
+        &ProviderMetadata {
+            issuer: DEFAULT_XAI_ISSUER.to_string(),
+            jwks_uri: jwks_uri.clone(),
+            algorithms: vec![XAI_ID_TOKEN_ALGORITHM_NAME.to_string()],
         },
+        &process_resident_memory(),
     );
-    jwks_cache().write().await.insert(
+    cache_jwks(
+        &mut *jwks_cache().write().await,
         jwks_uri.to_string(),
-        CachedJwks {
-            fetched_at: Instant::now(),
-            set: JwkSet { keys: vec![jwk] },
-        },
+        JwkSet { keys: vec![jwk] },
+        &process_resident_memory(),
     );
 }
 
@@ -405,6 +500,67 @@ pub(crate) async fn install_test_provider(jwk: Jwk) {
 pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn grok_r4_oidc_caches_are_budgeted_bounded_and_optional_under_pressure() {
+        let parent = ResidentMemoryBudget::new(None);
+        let metadata = ProviderMetadata {
+            issuer: DEFAULT_XAI_ISSUER.into(),
+            jwks_uri: Url::parse("https://auth.x.ai/jwks").unwrap(),
+            algorithms: vec!["ES256".into()],
+        };
+        let mut providers = BTreeMap::new();
+        for index in 0..MAX_CACHED_OIDC_DOCUMENTS + 1 {
+            cache_provider(
+                &mut providers,
+                format!("discovery-{index}"),
+                &metadata,
+                &parent,
+            );
+        }
+        assert_eq!(providers.len(), MAX_CACHED_OIDC_DOCUMENTS);
+        let owner = providers.values().next().unwrap().clone();
+        let used = parent.snapshot().used_bytes;
+        assert!(used > 0);
+        drop(providers);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(owner);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        parent.configure_limit(Some(0));
+        let mut providers = BTreeMap::new();
+        cache_provider(&mut providers, "rejected".into(), &metadata, &parent);
+        assert!(providers.is_empty());
+        assert_eq!(metadata.algorithms, ["ES256"]);
+    }
+
+    #[test]
+    fn grok_r4_jwks_replacement_and_expiry_release_old_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let make_set = || {
+            serde_json::from_value::<JwkSet>(serde_json::json!({"keys":[{
+                "kty":"EC", "crv":"P-256", "x":"AQ", "y":"AQ", "kid":"resident"
+            }]}))
+            .unwrap()
+        };
+        let mut entries = BTreeMap::new();
+        cache_jwks(&mut entries, "keys-a".into(), make_set(), &parent);
+        let held = entries["keys-a"].clone();
+        let charged = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(0));
+        cache_jwks(&mut entries, "keys-a".into(), make_set(), &parent);
+        assert!(entries.is_empty());
+        assert_eq!(parent.snapshot().used_bytes, charged);
+        drop(held);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        parent.configure_limit(None);
+        cache_jwks(&mut entries, "expired".into(), make_set(), &parent);
+        entries.get_mut("expired").unwrap().fetched_at -= CACHE_TTL;
+        cache_jwks(&mut entries, "current".into(), make_set(), &parent);
+        assert!(!entries.contains_key("expired"));
+        assert_eq!(entries.len(), 1);
+        drop(entries);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
 
     const TEST_KID: &str = "cc-switch-grok-test-ec";
     const TEST_EC_X: &str = "w7JAoU_gJbZJvV-zCOvU9yFJq0FNC_edCMRM78P8eQQ";

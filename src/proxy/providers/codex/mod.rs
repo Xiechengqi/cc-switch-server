@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+pub(in crate::proxy) mod control;
+
 use axum::http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use serde_json::Value;
@@ -259,7 +261,7 @@ fn model_capacity_error(body: &[u8]) -> bool {
         || text.contains("model is at capacity. please try a different model")
 }
 
-pub(crate) async fn record_quota_response_headers(
+pub(crate) fn record_quota_response_headers(
     state: &ServerState,
     execution: &ProviderExecution,
     headers: &HeaderMap,
@@ -267,69 +269,62 @@ pub(crate) async fn record_quota_response_headers(
     if execution.stored.provider_type != ProviderType::CodexOAuth {
         return;
     }
-    let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-    let mut rate = serde_json::Map::new();
-    for name in ["primary", "secondary"] {
-        let integer = |field: &str| {
-            headers
-                .get(format!("x-codex-{name}-{field}"))
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<i64>().ok())
-        };
-        let Some(seconds) = integer("window-minutes").and_then(|minutes| minutes.checked_mul(60))
-        else {
-            continue;
-        };
-        rate.insert(
-            format!("{name}_window"),
-            serde_json::json!({"limit_window_seconds":seconds,
-            "reset_at":integer("reset-at"), "reset_after_seconds":integer("reset-after-seconds")}),
-        );
-    }
-    if let Some(observation) = crate::domain::sharing::quota_cycle_source::codex_observation(
-        &serde_json::json!({"rate_limit":rate}),
-        now,
+    let Some(target) = &execution.codex_quota_target else {
+        return;
+    };
+    let headers: serde_json::Map<_, _> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            crate::domain::accounts::codex_quota::quota_header(name.as_str())
+                .then(|| {
+                    Some((
+                        name.as_str().to_string(),
+                        Value::String(value.to_str().ok()?.to_string()),
+                    ))
+                })
+                .flatten()
+        })
+        .collect();
+    let value = serde_json::json!({"type":"codex.response.metadata","headers":headers});
+    if let Some(snapshot) = crate::domain::accounts::codex_quota::frame_snapshot(
+        &value,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
     ) {
-        execution.record_quota_window(state, &observation).await;
+        state.observe_codex_quota(target, snapshot);
     }
 }
 
-pub(crate) async fn record_quota_websocket_payload(
+pub(crate) fn record_quota_websocket_payload(
     state: &ServerState,
     execution: &ProviderExecution,
     body: &[u8],
 ) {
-    if execution.stored.provider_type != ProviderType::CodexOAuth || body.len() > 1024 * 1024 {
+    if execution.stored.provider_type != ProviderType::CodexOAuth || body.len() > 64 * 1024 {
         return;
     }
+    let Some(target) = &execution.codex_quota_target else {
+        return;
+    };
+    // Parsing is temporary and bounded separately from the queued projection.
+    let Some(_workspace) = crate::infra::resident_memory::process_resident_memory()
+        .reserve(body.len().saturating_mul(32))
+    else {
+        crate::metrics::record_codex_quota_observer("capacity");
+        return;
+    };
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return;
     };
-    if !matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("codex.rate_limits" | "rate_limits.updated")
-    ) {
-        return;
-    }
-    if value
-        .get("limit_id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| id != "codex")
+    if super::super::response_semantics::classify_value(&value)
+        != super::super::response_semantics::SemanticObservation::Metadata
     {
         return;
     }
-    // Only explicit shared-window duration fields are accepted. Generic
-    // reset_seconds/model/review counters are not evidence of a weekly bucket.
-    let raw = if value.get("rate_limit").is_some() {
-        value
-    } else {
-        serde_json::json!({"rate_limit":value.get("rate_limits")})
-    };
-    if let Some(observation) = crate::domain::sharing::quota_cycle_source::codex_observation(
-        &raw,
+    if let Some(snapshot) = crate::domain::accounts::codex_quota::frame_snapshot(
+        &value,
         crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
     ) {
-        execution.record_quota_window(state, &observation).await;
+        state.observe_codex_quota(target, snapshot);
     }
 }
 

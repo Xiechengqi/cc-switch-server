@@ -845,8 +845,70 @@ assert(
   "Cursor fail-closed protobuf/EOF boundary changed",
 );
 
+const r4 = contract.r4Reviews;
+assert(Array.isArray(r4) && r4.length === 1, "Cursor requires one scoped R4 review");
+const r4Review = r4[0];
+assert(r4Review.id === "R4-CUR-01" &&
+  JSON.stringify(r4Review.sharedWork) === JSON.stringify(["R4-CORE-02"]) &&
+  Number.isFinite(Date.parse(r4Review.reviewedAt)) &&
+  r4Review.status === "working_tree_fixture_verified" &&
+  r4Review.decision === "keep_protocol_extend_resource_ownership" &&
+  r4Review.liveAcceptance === "live_pending" &&
+  r4Review.wireChanged === false && r4Review.newProviderWireGap === false,
+  "Cursor R4 review must separate local resource ownership from vendor wire acceptance");
+assert(r4Review.sources?.length === 1, "Cursor R4 frozen source is missing");
+const r4Source = r4Review.sources[0];
+assert(r4Source.sourceId === "omniroute" &&
+  r4Source.snapshotCommit === "443d66996d69d7ecf887fd61158404a3cca1b192" &&
+  r4Source.snapshotTree === "8d1c312f61d115767c9478416cb039750eaf113a" &&
+  r4Source.readMode === "read_only_committed_git_objects" &&
+  r4Source.excludedWorktreeEntries === 22 && r4Source.files?.length === 4,
+  "Cursor R4 must exclude the dirty worktree and retain exact committed sources");
+for (const file of r4Source.files) {
+  safeRelative(file.path, "Cursor R4 source path");
+  assert(digestPattern.test(file.sha256), "Cursor R4 source digest is malformed");
+  if (checkSources) {
+    const sourceRoot = sourceRootById.get(r4Source.sourceId);
+    assert(gitTree(sourceRoot, r4Source.snapshotCommit) === r4Source.snapshotTree &&
+      sha256(gitFile(sourceRoot, r4Source.snapshotCommit, file.path, null)) === file.sha256,
+      `Cursor R4 source drifted: ${file.path}`);
+  }
+}
+const r4Target = r4Review.target;
+assert(commitPattern.test(r4Target?.baselineCommit) &&
+  r4Target.implementationCommit === null && r4Target.readMode === "working_tree" &&
+  r4Target.validationScope?.includes("excluding_concurrent_Share_Market") &&
+  r4Target.contracts?.length === 6,
+  "Cursor R4 must identify the isolated, uncommitted validation scope");
+for (const local of r4Target.contracts) {
+  safeRelative(local.path, "Cursor R4 target path");
+  const content = fs.readFileSync(path.join(repoRoot, local.path), "utf8");
+  assert(local.anchors?.length > 0 && local.anchors.every((anchor) => content.includes(anchor)),
+    `Cursor R4 local evidence unavailable: ${local.path}`);
+}
+const r4Capacity = r4Review.capacity;
+assert(r4Capacity?.batchClaimsAtomic === true &&
+  r4Capacity.staleReplacementInvalidatedOnRejection === true &&
+  r4Capacity.newFlightRejectedBeforeUpstream === true &&
+  r4Capacity.logicalEstimateNotRss === true &&
+  r4Capacity.closedShellChargedUntilLastArc === true &&
+  r4Capacity.independentCachesLazyExpiry === true &&
+  r4Capacity.completedEntryLimitBytes === 8 * 1024 * 1024 &&
+  r4Capacity.completedTotalLimitBytes === 64 * 1024 * 1024 &&
+  r4Capacity.completedCountLimit === 2000 && r4Capacity.sessionCountLimit === 100,
+  "Cursor R4 lost an owner/admission boundary or changed existing capacity limits");
+assert(r4Review.timingInventory?.controlsCountAsFirstToken === false &&
+  r4Review.timingInventory.newMilestoneInstrumentation === false &&
+  r4Review.timingInventory.deliveryMeasurement === "no_new_socket_write_measurement" &&
+  r4Review.outstanding?.length === 0 &&
+  contract.r4CategoryReview?.status === "offline_complete" &&
+  contract.r4CategoryReview.implementationCommit === null &&
+  contract.r4CategoryReview.liveAcceptance === "live_pending" &&
+  contract.r4CategoryReview.concurrentShareMarketValidated === false,
+  "Cursor R4 must not claim new timing, committed, live, or concurrent Market validation");
+
 console.log(
-  `cursor reference delta audit ok (${immutableLegacyDigests.size} legacy fields, ${incrementalReviewExtensions.size} no-wire review extension, ${observationIds.size} immutable observations, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
+  `cursor reference delta audit ok (${immutableLegacyDigests.size} legacy fields, ${incrementalReviewExtensions.size} no-wire review extension, ${observationIds.size} immutable observations, ${r4.length} R4 working-tree review, ${expectedChecks.length} checks per rail, ${rails.size} live-pending rails${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

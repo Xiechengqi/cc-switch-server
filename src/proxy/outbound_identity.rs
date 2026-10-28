@@ -5,9 +5,18 @@ use crate::domain::providers::runtime::ProviderRuntimePlan;
 
 use super::ProxyError;
 
+#[cfg(test)]
 pub(super) fn finalize_headers(
     plan: &ProviderRuntimePlan,
     headers: &mut Vec<(String, String)>,
+) -> Result<(), ProxyError> {
+    finalize_headers_for_antigravity_identity(plan, headers, None)
+}
+
+pub(super) fn finalize_headers_for_antigravity_identity(
+    plan: &ProviderRuntimePlan,
+    headers: &mut Vec<(String, String)>,
+    identity: Option<&crate::domain::antigravity_identity::AntigravityClientIdentity>,
 ) -> Result<(), ProxyError> {
     match plan.outbound_identity_policy {
         OutboundIdentityPolicy::ServerIdentity => {
@@ -34,7 +43,12 @@ pub(super) fn finalize_headers(
             family: ManagedVersionFamily::Antigravity,
         } => {
             scrub_antigravity_headers(headers);
-            set_user_agent(headers, crate::provider_identity::antigravity_user_agent());
+            set_user_agent(
+                headers,
+                identity
+                    .map(|identity| identity.user_agent.clone())
+                    .unwrap_or_else(crate::provider_identity::antigravity_user_agent),
+            );
             replace_header(
                 headers,
                 "client-metadata",
@@ -312,6 +326,44 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn antigravity_r4_outbound_headers_keep_the_captured_client_generation() {
+        use crate::domain::antigravity_identity::{
+            antigravity_client_identity, TestAntigravityIdentity,
+        };
+        let versions = TestAntigravityIdentity::new("2.2.1");
+        versions
+            .scope(async {
+                let captured = antigravity_client_identity();
+                versions.update("2.3.4");
+                let mut headers = vec![("User-Agent".to_string(), "untrusted".to_string())];
+                finalize_headers_for_antigravity_identity(
+                    &plan(OutboundIdentityPolicy::ManagedVersion {
+                        family: ManagedVersionFamily::Antigravity,
+                    }),
+                    &mut headers,
+                    Some(&captured),
+                )
+                .unwrap();
+                assert_eq!(
+                    headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .unwrap()
+                        .1,
+                    captured.user_agent
+                );
+            })
+            .await;
     }
 
     #[test]

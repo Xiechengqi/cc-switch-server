@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::proxy::request_timing::TimingResult;
 use bytes::Bytes;
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -198,6 +199,15 @@ impl CodeBuddySseDecoder {
         }
         let result = self.push_classified_inner(chunk);
         self.failed |= result.is_err();
+        if result.is_err() {
+            if let Some(timing) = self
+                .request_memory
+                .as_ref()
+                .and_then(RequestMemoryBudget::timing)
+            {
+                timing.observe_terminal(TimingResult::Failed);
+            }
+        }
         result
     }
 
@@ -229,6 +239,15 @@ impl CodeBuddySseDecoder {
         }
         let result = self.finish_classified_inner();
         self.failed |= result.is_err();
+        if result.is_err() {
+            if let Some(timing) = self
+                .request_memory
+                .as_ref()
+                .and_then(RequestMemoryBudget::timing)
+            {
+                timing.observe_terminal(TimingResult::Failed);
+            }
+        }
         result
     }
 
@@ -245,6 +264,13 @@ impl CodeBuddySseDecoder {
             );
         }
         self.complete = true;
+        if let Some(timing) = self
+            .request_memory
+            .as_ref()
+            .and_then(RequestMemoryBudget::timing)
+        {
+            timing.observe_terminal(TimingResult::Complete);
+        }
         let output_capacity = projected_vec_capacity(
             0,
             0,
@@ -399,6 +425,13 @@ impl CodeBuddySseDecoder {
                     .and_then(Value::as_str)
                     .is_some_and(|reason| !reason.trim().is_empty())
             });
+        }
+        if let Some(timing) = self
+            .request_memory
+            .as_ref()
+            .and_then(RequestMemoryBudget::timing)
+        {
+            timing.observe_chat_value(&value);
         }
         let canonical = serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_gateway(format!("encode CodeBuddy SSE chunk: {error}"))

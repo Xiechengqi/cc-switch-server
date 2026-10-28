@@ -9,13 +9,18 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
+
+use crate::infra::resident_memory::{process_resident_memory, ResidentMemoryBudget};
+
+mod resident;
+use resident::{CacheResident, PendingOwner, MAX_PENDING_MUTATIONS};
 
 pub(super) const CACHE_CAPACITY: usize = 4096;
 pub(super) const DEFAULT_TTL_SECS: i64 = 5 * 60;
@@ -41,6 +46,7 @@ pub(super) enum CacheDecision {
     UncacheableBreakpoint,
     TooManyBreakpoints,
     MixedTtlOrder,
+    LocalCapacity,
 }
 
 impl CacheDecision {
@@ -56,6 +62,7 @@ impl CacheDecision {
             Self::UncacheableBreakpoint => "uncacheable_breakpoint",
             Self::TooManyBreakpoints => "too_many_breakpoints",
             Self::MixedTtlOrder => "mixed_ttl_order",
+            Self::LocalCapacity => "local_capacity",
         }
     }
 
@@ -153,17 +160,31 @@ fn default_ttl_secs() -> i64 {
     DEFAULT_TTL_SECS
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingMutation {
     generation: u64,
     entry: Option<CacheEntry>,
+    _owner: Option<PendingOwner>,
 }
 
-#[derive(Default)]
 struct CacheState {
-    entries: HashMap<u64, CacheEntry>,
-    pending: HashMap<u64, PendingMutation>,
+    entries: BTreeMap<u64, CacheEntry>,
+    pending: BTreeMap<u64, PendingMutation>,
     generation: u64,
+    resident: CacheResident,
+    persist_enabled: bool,
+}
+
+impl CacheState {
+    fn new(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            generation: 0,
+            resident: CacheResident::new(parent, MAX_PENDING_MUTATIONS),
+            persist_enabled: false,
+        }
+    }
 }
 
 enum WriterCommand {
@@ -232,9 +253,14 @@ impl PromptCacheScope<'_> {
 
 impl KiroPromptCache {
     pub(super) fn new(persist_base_path: Option<PathBuf>) -> Self {
+        Self::with_parent(persist_base_path, process_resident_memory())
+    }
+
+    fn with_parent(persist_base_path: Option<PathBuf>, parent: ResidentMemoryBudget) -> Self {
+        let mut initial = CacheState::new(parent);
         let Some(base_path) = persist_base_path else {
             return Self {
-                state: Arc::new(Mutex::new(CacheState::default())),
+                state: Arc::new(Mutex::new(initial)),
                 writer: None,
             };
         };
@@ -249,16 +275,20 @@ impl KiroPromptCache {
                     %error,
                     "Kiro prompt-cache SQLite startup load failed; continuing in memory"
                 );
-                (HashMap::new(), 0)
+                (BTreeMap::new(), 0)
             }
         };
-        crate::metrics::set_kiro_prompt_cache_entries(entries.len());
-
-        let state = Arc::new(Mutex::new(CacheState {
-            entries,
-            pending: HashMap::new(),
-            generation,
-        }));
+        for (hash, entry) in entries {
+            if let Some(memory) = initial.resident.entry() {
+                initial.entries.insert(hash, entry);
+                initial.resident.entries.insert(hash, memory);
+            } else {
+                crate::metrics::record_kiro_prompt_cache_persistence("startup_capacity");
+            }
+        }
+        initial.generation = generation;
+        crate::metrics::set_kiro_prompt_cache_entries(initial.entries.len());
+        let state = Arc::new(Mutex::new(initial));
         let queued = Arc::new(AtomicBool::new(false));
         let persisted_generation = Arc::new(AtomicU64::new(generation));
         let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
@@ -286,6 +316,10 @@ impl KiroPromptCache {
         if writer.is_none() {
             crate::metrics::record_kiro_prompt_cache_persistence("writer_spawn_failed");
         }
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .persist_enabled = writer.is_some();
         Self { state, writer }
     }
 
@@ -295,8 +329,8 @@ impl KiroPromptCache {
             .iter()
             .fold(0_u32, |total, block| total.saturating_add(block.tokens));
         let (breakpoints, decision) = resolve_breakpoints(&blocks, body.get("cache_control"));
-        crate::metrics::record_kiro_prompt_cache_decision(decision.as_str());
         if breakpoints.is_empty() || !decision.simulates_cache() {
+            crate::metrics::record_kiro_prompt_cache_decision(decision.as_str());
             return PromptCacheUsage {
                 prompt_total_estimate,
                 decision,
@@ -307,7 +341,20 @@ impl KiroPromptCache {
         let (cumulative_tokens, cumulative_hashes) = cumulative_prompt(&blocks, namespace, body);
         let now = unix_timestamp_secs();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let mut touched = HashMap::<u64, Option<CacheEntry>>::new();
+        let capacity_miss = || {
+            crate::metrics::record_kiro_prompt_cache_decision(
+                CacheDecision::LocalCapacity.as_str(),
+            );
+            PromptCacheUsage {
+                prompt_total_estimate,
+                decision: CacheDecision::LocalCapacity,
+                ..PromptCacheUsage::default()
+            }
+        };
+        let Some(_scratch) = state.resident.scratch(state.entries.len()) else {
+            return capacity_miss();
+        };
+        let mut touched = BTreeMap::<u64, Option<CacheEntry>>::new();
 
         let expired = state
             .entries
@@ -315,7 +362,6 @@ impl KiroPromptCache {
             .filter_map(|(hash, entry)| (entry.expires_at <= now).then_some(*hash))
             .collect::<Vec<_>>();
         for hash in expired {
-            state.entries.remove(&hash);
             touched.insert(hash, None);
         }
 
@@ -324,18 +370,19 @@ impl KiroPromptCache {
             let start = lookback_start_index(&blocks, breakpoint.block_index);
             for index in (start..=breakpoint.block_index).rev() {
                 let hash = cumulative_hashes[index];
-                let Some(entry) = state.entries.get_mut(&hash) else {
+                let Some(entry) = state.entries.get(&hash) else {
                     continue;
                 };
                 if entry.expires_at <= now {
                     continue;
                 }
+                let mut entry = entry.clone();
                 let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
                 entry.ttl_secs = ttl;
                 entry.last_hit_at = now;
                 entry.expires_at = now.saturating_add(ttl);
                 deepest_read = deepest_read.max(entry.tokens);
-                touched.insert(hash, Some(entry.clone()));
+                touched.insert(hash, Some(entry));
                 break;
             }
         }
@@ -349,28 +396,73 @@ impl KiroPromptCache {
                 expires_at: now.saturating_add(ttl),
                 last_hit_at: now,
             };
-            state.entries.insert(hash, entry.clone());
             touched.insert(hash, Some(entry));
         }
-        enforce_capacity(&mut state, &mut touched);
+        enforce_capacity(&state.entries, &mut touched);
         let covered = breakpoints
             .last()
             .map(|breakpoint| cumulative_tokens[breakpoint.block_index])
             .unwrap_or(0);
 
+        // Reserve the entire publication before changing TTL, cache entries,
+        // generations or dirty mutations. A rejected optional estimate cannot
+        // lose a disk tombstone or manufacture a cache hit.
+        let mut entry_owners = BTreeMap::new();
+        let mut pending_owners = BTreeMap::new();
+        for (hash, entry) in &touched {
+            if entry.is_some() && !state.entries.contains_key(hash) {
+                let Some(memory) = state.resident.entry() else {
+                    return capacity_miss();
+                };
+                entry_owners.insert(*hash, memory);
+            }
+            if state.persist_enabled && !state.pending.contains_key(hash) {
+                let Some(owner) = state.resident.pending() else {
+                    return capacity_miss();
+                };
+                pending_owners.insert(*hash, owner);
+            }
+        }
         if !touched.is_empty() {
             state.generation = state.generation.saturating_add(1);
             let generation = state.generation;
             for (hash, entry) in touched {
-                state
-                    .pending
-                    .insert(hash, PendingMutation { generation, entry });
+                match entry.as_ref() {
+                    Some(entry) => {
+                        state.entries.insert(hash, entry.clone());
+                        if let Some(memory) = entry_owners.remove(&hash) {
+                            state.resident.entries.insert(hash, memory);
+                        }
+                    }
+                    None => {
+                        state.entries.remove(&hash);
+                        state.resident.entries.remove(&hash);
+                    }
+                }
+                if state.persist_enabled {
+                    if let Some(mutation) = state.pending.get_mut(&hash) {
+                        mutation.generation = generation;
+                        mutation.entry = entry;
+                    } else {
+                        state.pending.insert(
+                            hash,
+                            PendingMutation {
+                                generation,
+                                entry,
+                                _owner: Some(
+                                    pending_owners.remove(&hash).expect("mutation admitted"),
+                                ),
+                            },
+                        );
+                    }
+                }
             }
         }
         let entry_count = state.entries.len();
         drop(state);
         crate::metrics::set_kiro_prompt_cache_entries(entry_count);
         self.schedule_flush();
+        crate::metrics::record_kiro_prompt_cache_decision(decision.as_str());
 
         PromptCacheUsage {
             cache_read_estimate: deepest_read.min(covered),
@@ -502,19 +594,35 @@ pub(super) fn shutdown_global(cache: Option<&KiroPromptCache>) {
     }
 }
 
-fn enforce_capacity(state: &mut CacheState, touched: &mut HashMap<u64, Option<CacheEntry>>) {
-    if state.entries.len() <= CACHE_CAPACITY {
+fn enforce_capacity(
+    entries: &BTreeMap<u64, CacheEntry>,
+    touched: &mut BTreeMap<u64, Option<CacheEntry>>,
+) {
+    let added = touched
+        .iter()
+        .filter(|(hash, entry)| entry.is_some() && !entries.contains_key(*hash))
+        .count();
+    let deleted = touched
+        .iter()
+        .filter(|(hash, entry)| entry.is_none() && entries.contains_key(*hash))
+        .count();
+    let next_count = entries.len().saturating_add(added).saturating_sub(deleted);
+    if next_count <= CACHE_CAPACITY {
         return;
     }
-    let drop_count = state.entries.len() - CACHE_CAPACITY;
-    let mut victims = state
-        .entries
+    let drop_count = next_count - CACHE_CAPACITY;
+    let mut victims = entries
         .iter()
+        .filter(|(hash, _)| !touched.contains_key(*hash))
         .map(|(hash, entry)| (*hash, entry.last_hit_at))
+        .chain(
+            touched
+                .iter()
+                .filter_map(|(hash, entry)| entry.as_ref().map(|entry| (*hash, entry.last_hit_at))),
+        )
         .collect::<Vec<_>>();
     victims.sort_unstable_by_key(|(hash, last_hit_at)| (*last_hit_at, *hash));
     for (hash, _) in victims.into_iter().take(drop_count) {
-        state.entries.remove(&hash);
         touched.insert(hash, None);
     }
 }
@@ -863,7 +971,7 @@ fn sqlite_path_for(base_path: &Path) -> PathBuf {
 fn load_or_migrate(
     legacy_path: &Path,
     sqlite_path: &Path,
-) -> Result<(HashMap<u64, CacheEntry>, u64), String> {
+) -> Result<(BTreeMap<u64, CacheEntry>, u64), String> {
     if let Some(parent) = sqlite_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -876,7 +984,7 @@ fn load_or_migrate(
         .map_err(|error| error.to_string())?;
     if count == 0 && legacy_path.exists() {
         if let Ok(bytes) = std::fs::read(legacy_path) {
-            if let Ok(entries) = serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
+            if let Ok(entries) = serde_json::from_slice::<BTreeMap<u64, CacheEntry>>(&bytes) {
                 let now = unix_timestamp_secs();
                 let mut valid = entries
                     .into_iter()
@@ -891,7 +999,7 @@ fn load_or_migrate(
                 let valid = valid
                     .into_iter()
                     .take(CACHE_CAPACITY)
-                    .collect::<HashMap<_, _>>();
+                    .collect::<BTreeMap<_, _>>();
                 import_legacy(&mut connection, &valid)?;
                 crate::metrics::record_kiro_prompt_cache_persistence("legacy_json_imported");
             }
@@ -949,7 +1057,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn load_entries(connection: &mut Connection) -> Result<(HashMap<u64, CacheEntry>, u64), String> {
+fn load_entries(connection: &mut Connection) -> Result<(BTreeMap<u64, CacheEntry>, u64), String> {
     let now = unix_timestamp_secs();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -976,7 +1084,7 @@ fn load_entries(connection: &mut Connection) -> Result<(HashMap<u64, CacheEntry>
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let mut entries = HashMap::new();
+    let mut entries = BTreeMap::new();
     {
         let mut statement = transaction
             .prepare(
@@ -1017,7 +1125,7 @@ fn load_entries(connection: &mut Connection) -> Result<(HashMap<u64, CacheEntry>
 
 fn import_legacy(
     connection: &mut Connection,
-    entries: &HashMap<u64, CacheEntry>,
+    entries: &BTreeMap<u64, CacheEntry>,
 ) -> Result<(), String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1045,7 +1153,7 @@ fn persist_mutations(
     connection: &mut Connection,
     expected_generation: u64,
     target_generation: u64,
-    mutations: &HashMap<u64, PendingMutation>,
+    mutations: &BTreeMap<u64, PendingMutation>,
 ) -> Result<(), String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1258,13 +1366,13 @@ fn collect_command(
     }
 }
 
-fn take_pending(state: &Mutex<CacheState>) -> (HashMap<u64, PendingMutation>, u64) {
+fn take_pending(state: &Mutex<CacheState>) -> (BTreeMap<u64, PendingMutation>, u64) {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     let target = state.generation;
     (std::mem::take(&mut state.pending), target)
 }
 
-fn merge_pending(state: &Mutex<CacheState>, mutations: HashMap<u64, PendingMutation>) {
+fn merge_pending(state: &Mutex<CacheState>, mutations: BTreeMap<u64, PendingMutation>) {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     for (hash, mutation) in mutations {
         if state
@@ -1326,6 +1434,227 @@ mod tests {
             }],
             "messages": [{"role": "user", "content": "hello"}]
         })
+    }
+
+    fn blocked_writer_cache(parent: ResidentMemoryBudget, slots: usize) -> KiroPromptCache {
+        let cache = KiroPromptCache::with_parent(None, parent.clone());
+        let mut state = cache.state.lock().unwrap();
+        state.resident = CacheResident::new(parent, slots);
+        // Model a writer that is unavailable until the test detaches/merges a
+        // batch. Production enables this only after successfully spawning it.
+        state.persist_enabled = true;
+        drop(state);
+        cache
+    }
+
+    #[test]
+    fn kiro_r4_memory_only_cache_has_owned_entries_and_no_unused_dirty_queue() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = KiroPromptCache::with_parent(None, parent.clone());
+        let body = explicit_body();
+        assert_eq!(cache.compute_usage(&body, "owned").cache_read_estimate, 0);
+        assert!(cache.compute_usage(&body, "owned").cache_read_estimate > 0);
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), state.resident.entries.len());
+        assert!(state.pending.is_empty());
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(state);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_capacity_miss_preserves_previous_entries_ttl_and_generation() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = KiroPromptCache::with_parent(None, parent.clone());
+        let body = explicit_body();
+        cache.compute_usage(&body, "previous");
+        let (entries, generation) = {
+            let state = cache.state.lock().unwrap();
+            (state.entries.clone(), state.generation)
+        };
+        let used = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(used));
+        let missed = cache.compute_usage(&body, "new-identity");
+        assert_eq!(missed.decision, CacheDecision::LocalCapacity);
+        assert_eq!(missed.split_against_total(137), (137, 0, 0));
+        assert_eq!(missed.cache_read_estimate, 0);
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries, entries);
+        assert_eq!(state.generation, generation);
+        assert_eq!(parent.snapshot().used_bytes, used);
+        drop(state);
+        parent.configure_limit(None);
+        assert!(cache.compute_usage(&body, "previous").cache_read_estimate > 0);
+        assert_eq!(
+            cache
+                .compute_usage(&body, "new-identity")
+                .cache_read_estimate,
+            0
+        );
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_partial_publication_admission_rolls_back_all_owners_and_slots() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = blocked_writer_cache(parent.clone(), 2);
+        let state = cache.state.lock().unwrap();
+        let scratch = state.resident.scratch(0).unwrap();
+        let scratch_bytes = parent.snapshot().used_bytes;
+        drop(scratch);
+        let entry = state.resident.entry().unwrap();
+        let entry_bytes = parent.snapshot().used_bytes;
+        drop(entry);
+        drop(state);
+        parent.configure_limit(Some(scratch_bytes + entry_bytes));
+        assert_eq!(
+            cache.compute_usage(&explicit_body(), "rejected").decision,
+            CacheDecision::LocalCapacity
+        );
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.is_empty() && state.pending.is_empty());
+        assert!(state.resident.entries.is_empty());
+        assert_eq!(state.resident.pending_count(), 0);
+        assert_eq!(state.generation, 0);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_pending_bound_includes_inflight_batch_and_preserves_disk_tombstones() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = blocked_writer_cache(parent.clone(), 2);
+        let body = explicit_body();
+        cache.compute_usage(&body, "old");
+        let (inflight, _) = take_pending(&cache.state);
+        let hash = *inflight.keys().next().unwrap();
+        {
+            let mut state = cache.state.lock().unwrap();
+            state.entries.get_mut(&hash).unwrap().expires_at = 0;
+        }
+        // Expiry deletion plus new entry needs two pending slots, while the
+        // detached batch still owns one. Publication must remain atomic.
+        assert_eq!(
+            cache.compute_usage(&body, "new").decision,
+            CacheDecision::LocalCapacity
+        );
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.contains_key(&hash));
+        assert!(state.pending.is_empty());
+        assert_eq!(state.resident.pending_count(), 1);
+        drop(state);
+        drop(inflight); // model successful durable acknowledgement
+        assert_ne!(
+            cache.compute_usage(&body, "new").decision,
+            CacheDecision::LocalCapacity
+        );
+        let state = cache.state.lock().unwrap();
+        assert!(!state.entries.contains_key(&hash));
+        assert!(state.pending[&hash].entry.is_none());
+        assert_eq!(state.pending.len(), 2);
+        assert_eq!(state.resident.pending_count(), 2);
+        drop(state);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_failed_batch_merge_transfers_ownership_and_keeps_newer_generation() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = blocked_writer_cache(parent.clone(), 2);
+        let body = explicit_body();
+        cache.compute_usage(&body, "scope");
+        let (old, first_generation) = take_pending(&cache.state);
+        let old_charge = parent.snapshot().used_bytes;
+        assert!(cache.compute_usage(&body, "scope").cache_read_estimate > 0);
+        assert!(parent.snapshot().used_bytes > old_charge);
+        merge_pending(&cache.state, old);
+        let state = cache.state.lock().unwrap();
+        assert!(state
+            .pending
+            .values()
+            .all(|mutation| mutation.generation > first_generation));
+        assert_eq!(state.resident.pending_count(), 1);
+        assert_eq!(parent.snapshot().used_bytes, old_charge);
+        drop(state);
+        let (batch, _) = take_pending(&cache.state);
+        drop(cache);
+        assert!(
+            parent.snapshot().used_bytes > 0,
+            "writer still owns detached mutations"
+        );
+        drop(batch);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_expiry_and_count_eviction_release_index_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = KiroPromptCache::with_parent(None, parent.clone());
+        {
+            let mut state = cache.state.lock().unwrap();
+            let now = unix_timestamp_secs();
+            for hash in 0..CACHE_CAPACITY as u64 {
+                let memory = state.resident.entry().unwrap();
+                state.resident.entries.insert(hash, memory);
+                state.entries.insert(
+                    hash,
+                    CacheEntry {
+                        tokens: 1,
+                        ttl_secs: 300,
+                        expires_at: now + 300,
+                        last_hit_at: 0,
+                    },
+                );
+            }
+        }
+        let charged = parent.snapshot().used_bytes;
+        cache.compute_usage(&explicit_body(), "newest");
+        let mut state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), CACHE_CAPACITY);
+        assert_eq!(state.entries.len(), state.resident.entries.len());
+        assert_eq!(parent.snapshot().used_bytes, charged);
+        state
+            .entries
+            .values_mut()
+            .for_each(|entry| entry.expires_at = 0);
+        drop(state);
+        cache.compute_usage(&explicit_body(), "newest");
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        assert!(parent.snapshot().used_bytes < charged);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn kiro_r4_persisted_cache_skips_unadmitted_startup_entries_without_changing_disk() {
+        let base = temp_base("r4-startup-capacity");
+        {
+            let cache = KiroPromptCache::new(Some(base.clone()));
+            cache.compute_usage(&explicit_body(), "persisted");
+            cache.flush_for_test(Duration::from_secs(2)).unwrap();
+        }
+        let parent = ResidentMemoryBudget::new(Some(0));
+        {
+            let cache = KiroPromptCache::with_parent(Some(base.clone()), parent.clone());
+            assert!(cache.state.lock().unwrap().entries.is_empty());
+            assert_eq!(
+                cache.compute_usage(&explicit_body(), "persisted").decision,
+                CacheDecision::LocalCapacity
+            );
+        }
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        let cache = KiroPromptCache::new(Some(base.clone()));
+        assert!(
+            cache
+                .compute_usage(&explicit_body(), "persisted")
+                .cache_read_estimate
+                > 0
+        );
+        cache.shutdown(Duration::from_secs(2)).unwrap();
+        drop(cache);
+        let _ = std::fs::remove_file(sqlite_path_for(&base));
     }
 
     #[test]
@@ -1725,7 +2054,7 @@ mod tests {
         };
         std::fs::write(
             &base,
-            serde_json::to_vec(&HashMap::from([(7_u64, entry.clone())])).unwrap(),
+            serde_json::to_vec(&BTreeMap::from([(7_u64, entry.clone())])).unwrap(),
         )
         .unwrap();
         let cache = KiroPromptCache::new(Some(base.clone()));
@@ -1768,10 +2097,11 @@ mod tests {
                 [],
             )
             .unwrap();
-        let mutations = HashMap::from([(
+        let mutations = BTreeMap::from([(
             1,
             PendingMutation {
                 generation: 1,
+                _owner: None,
                 entry: Some(CacheEntry {
                     tokens: 10,
                     ttl_secs: 300,

@@ -24,7 +24,11 @@
       "rootEnv": "CC_SWITCH_KIRO_RS_AUDIT_ROOT",
       "defaultRelativeRoot": "../proxy/Kiro/kiro.rs",
       "commit": "22d2c2d0695ba350890072c19990f54782827ae5",
-      "historicalCommits": ["f2cc574", "19b7f4b", "47633a4"],
+      "historicalCommits": [
+        "f2cc574",
+        "19b7f4b",
+        "47633a4"
+      ],
       "files": [
         {
           "path": "src/anthropic/cache_metering.rs",
@@ -38,7 +42,9 @@
       "deltas": [
         {
           "id": "unique_bare_namespaced_tool",
-          "commits": ["f413e7de13108094cca7c59a57ca3c2c6cf1e40a"],
+          "commits": [
+            "f413e7de13108094cca7c59a57ca3c2c6cf1e40a"
+          ],
           "files": [
             {
               "commit": "f413e7de13108094cca7c59a57ca3c2c6cf1e40a",
@@ -49,7 +55,9 @@
         },
         {
           "id": "profile_arn_compatibility_fallback",
-          "commits": ["3194bb29331e42d6c143bd3d35bae4e0aec80c7d"],
+          "commits": [
+            "3194bb29331e42d6c143bd3d35bae4e0aec80c7d"
+          ],
           "files": [
             {
               "commit": "3194bb29331e42d6c143bd3d35bae4e0aec80c7d",
@@ -259,14 +267,20 @@
       "id": "KI-04",
       "status": "live_pending",
       "path": "docs/provider/kiro-prompt-cache.md",
-      "anchors": ["KI-04：真实验收", "全部保持 `live_pending`"]
+      "anchors": [
+        "KI-04：真实验收",
+        "全部保持 `live_pending`"
+      ]
     },
     {
       "id": "KI-05",
       "status": "live_pending",
       "runtimeEnabled": false,
       "path": "docs/provider/kiro-prompt-cache.md",
-      "anchors": ["KI-05：共享缓存门禁", "runtimeEnabled=false"]
+      "anchors": [
+        "KI-05：共享缓存门禁",
+        "runtimeEnabled=false"
+      ]
     }
   ],
   "incrementalEnhancements": [
@@ -293,7 +307,9 @@
         },
         {
           "path": "src/proxy/forwarder.rs",
-          "anchors": ["kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"]
+          "anchors": [
+            "kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"
+          ]
         }
       ]
     },
@@ -352,7 +368,9 @@
         },
         {
           "path": "src/proxy/forwarder.rs",
-          "anchors": ["kiro_and_amazon_q_compact_fail_before_any_upstream_request"]
+          "anchors": [
+            "kiro_and_amazon_q_compact_fail_before_any_upstream_request"
+          ]
         }
       ]
     }
@@ -452,14 +470,54 @@
       "sharedCacheRuntime"
     ],
     "receipts": [
-      {"authKind": "builder_id", "region": "us-east-1", "status": "live_pending", "receipt": null},
-      {"authKind": "builder_id", "region": "eu-central-1", "status": "live_pending", "receipt": null},
-      {"authKind": "idc", "region": "us-east-1", "status": "live_pending", "receipt": null},
-      {"authKind": "idc", "region": "eu-central-1", "status": "live_pending", "receipt": null},
-      {"authKind": "social", "region": "us-east-1", "status": "live_pending", "receipt": null},
-      {"authKind": "social", "region": "eu-central-1", "status": "live_pending", "receipt": null},
-      {"authKind": "api_key", "region": "us-east-1", "status": "live_pending", "receipt": null},
-      {"authKind": "api_key", "region": "eu-central-1", "status": "live_pending", "receipt": null}
+      {
+        "authKind": "builder_id",
+        "region": "us-east-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "builder_id",
+        "region": "eu-central-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "idc",
+        "region": "us-east-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "idc",
+        "region": "eu-central-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "social",
+        "region": "us-east-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "social",
+        "region": "eu-central-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "api_key",
+        "region": "us-east-1",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "authKind": "api_key",
+        "region": "eu-central-1",
+        "status": "live_pending",
+        "receipt": null
+      }
     ]
   },
   "sharedCacheGate": {
@@ -537,9 +595,19 @@
     {
       "id": "CORE-N2-KIRO",
       "status": "fixture_verified",
-      "rails": ["kiro_oauth", "amazon_q_oauth"],
-      "surfaces": ["claude_messages", "codex_chat_completions", "codex_responses"],
-      "transports": ["http_eventstream", "sse_eventstream"],
+      "rails": [
+        "kiro_oauth",
+        "amazon_q_oauth"
+      ],
+      "surfaces": [
+        "claude_messages",
+        "codex_chat_completions",
+        "codex_responses"
+      ],
+      "transports": [
+        "http_eventstream",
+        "sse_eventstream"
+      ],
       "stickyExhaustion": true,
       "canonicalAndWireBounded": true,
       "imageExpansionBounded": true,
@@ -637,7 +705,9 @@
         "deltaId": "prompt_cache_breakpoints",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/cache_metering.rs"],
+        "paths": [
+          "src/anthropic/cache_metering.rs"
+        ],
         "symbols": [
           "compute_cache_usage",
           "top_level_auto_caching_advances_and_hits_longest_prefix",
@@ -647,7 +717,9 @@
         "sourceDigest": "7434515e0a47fbb80d1dbbc5c56cfb986dc78b6f918b9777f7913c3eb0200bcf"
       },
       "disposition": "adopt",
-      "enhancementIds": ["KI-01"],
+      "enhancementIds": [
+        "KI-01"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -697,7 +769,9 @@
         "sourceDigest": "d2a63af00ff49b46e1ed5bbbb76b94aa2d951a6a7df50a6d7455d388249516f5"
       },
       "disposition": "differential",
-      "enhancementIds": ["KI-02"],
+      "enhancementIds": [
+        "KI-02"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -713,7 +787,9 @@
             ]
           }
         ],
-        "fixtureIds": ["kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate"]
+        "fixtureIds": [
+          "kiro_upstream_explicit_zero_cache_usage_overrides_local_estimate"
+        ]
       },
       "reason": "Keep authoritative upstream usage, including explicit zero, ahead of local estimates while conserving the final input-token total."
     },
@@ -728,12 +804,19 @@
         "deltaId": "cache_persistence_differential",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/cache_metering.rs"],
-        "symbols": ["CacheMeter", "flush_and_reload_round_trip"],
+        "paths": [
+          "src/anthropic/cache_metering.rs"
+        ],
+        "symbols": [
+          "CacheMeter",
+          "flush_and_reload_round_trip"
+        ],
         "sourceDigest": "267007b1f9b186050a4640cdbde164fbc29f75d132dbe4403b10a5f7aaf3f34b"
       },
       "disposition": "differential",
-      "enhancementIds": ["KI-03"],
+      "enhancementIds": [
+        "KI-03"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
@@ -768,12 +851,20 @@
         "deltaId": "live_cache_cost_gate",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/cache_metering.rs", "src/anthropic/handlers.rs"],
-        "symbols": ["compute_cache_usage", "execute_non_stream_request"],
+        "paths": [
+          "src/anthropic/cache_metering.rs",
+          "src/anthropic/handlers.rs"
+        ],
+        "symbols": [
+          "compute_cache_usage",
+          "execute_non_stream_request"
+        ],
         "sourceDigest": "6821123cdbc80d10a7889f840831f80700dd8e0965ff17b511243de68c5296d5"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["KI-04"],
+      "enhancementIds": [
+        "KI-04"
+      ],
       "target": {
         "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
         "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
@@ -782,14 +873,21 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["prompt_cache_auto_explicit_no_cache", "upstream_usage_precedence"]
+            "anchors": [
+              "prompt_cache_auto_explicit_no_cache",
+              "upstream_usage_precedence"
+            ]
           },
           {
             "path": "scripts/audit/kiro-real-receipt.test.mjs",
-            "anchors": ["all eight Kiro auth-kind and region receipts remain independent"]
+            "anchors": [
+              "all eight Kiro auth-kind and region receipts remain independent"
+            ]
           }
         ],
-        "fixtureIds": ["all eight Kiro auth-kind and region receipts remain independent"]
+        "fixtureIds": [
+          "all eight Kiro auth-kind and region receipts remain independent"
+        ]
       },
       "reason": "Fixture cache hits cannot prove vendor-side cost or entitlement; every auth-kind and region scope remains independently live-pending."
     },
@@ -804,12 +902,20 @@
         "deltaId": "shared_cache_gate",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/cache_metering.rs", "src/kiro/session_affinity.rs"],
-        "symbols": ["RedisCacheStore", "SessionAffinity"],
+        "paths": [
+          "src/anthropic/cache_metering.rs",
+          "src/kiro/session_affinity.rs"
+        ],
+        "symbols": [
+          "RedisCacheStore",
+          "SessionAffinity"
+        ],
         "sourceDigest": "39dc68eb8b6219d99315b1460d219f6b5d8464a552e19768a7681629ab8d9447"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["KI-05"],
+      "enhancementIds": [
+        "KI-05"
+      ],
       "target": {
         "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
         "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
@@ -818,14 +924,22 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["shared_cache_disabled", "\"runtimeEnabled\": false", "reference_redis_runtime_dependency"]
+            "anchors": [
+              "shared_cache_disabled",
+              "\"runtimeEnabled\": false",
+              "reference_redis_runtime_dependency"
+            ]
           },
           {
             "path": "scripts/audit/kiro-real-receipt.test.mjs",
-            "anchors": ["Kiro fixture receipt can never impersonate live_verified"]
+            "anchors": [
+              "Kiro fixture receipt can never impersonate live_verified"
+            ]
           }
         ],
-        "fixtureIds": ["Kiro fixture receipt can never impersonate live_verified"]
+        "fixtureIds": [
+          "Kiro fixture receipt can never impersonate live_verified"
+        ]
       },
       "reason": "Keep shared cache disabled until a real multi-replica need and independent safety evidence exist; reference Redis and affinity do not establish either."
     },
@@ -840,7 +954,10 @@
         "deltaId": "unique_bare_namespaced_tool",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/responses.rs", "src/anthropic/stream.rs"],
+        "paths": [
+          "src/anthropic/responses.rs",
+          "src/anthropic/stream.rs"
+        ],
         "symbols": [
           "resolve_declared_tool",
           "declared_tool_resolution_prefers_exact_and_rejects_ambiguous_bare_names",
@@ -849,7 +966,9 @@
         "sourceDigest": "70c5ea2251e7583dc54009063901d7f837512adcf14250447200fa1ed780b2b9"
       },
       "disposition": "adopt",
-      "enhancementIds": ["KI-N1"],
+      "enhancementIds": [
+        "KI-N1"
+      ],
       "target": {
         "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
         "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
@@ -866,7 +985,9 @@
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"]
+            "anchors": [
+              "kiro_unique_bare_tool_name_is_restored_on_all_three_surfaces"
+            ]
           }
         ],
         "fixtureIds": [
@@ -888,7 +1009,9 @@
         "deltaId": "narrow_profile_arn_fallback",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/kiro/token_manager.rs"],
+        "paths": [
+          "src/kiro/token_manager.rs"
+        ],
         "symbols": [
           "should_retry_usage_api_without_profile_arn",
           "test_usage_api_profile_arn_error_fallback_only_for_arn_attempt"
@@ -896,7 +1019,9 @@
         "sourceDigest": "0c03bb48353a422a0847c41d9173d946f78b371c8af8a8f60e88793b55867603"
       },
       "disposition": "differential",
-      "enhancementIds": ["KI-N2"],
+      "enhancementIds": [
+        "KI-N2"
+      ],
       "target": {
         "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
         "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
@@ -936,12 +1061,21 @@
         "deltaId": "remote_compaction_gate",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/responses.rs", "src/anthropic/responses_compaction.rs"],
-        "symbols": ["Operation::RemoteCompact", "compaction_trigger must be the final input item", "execute_non_stream_request"],
+        "paths": [
+          "src/anthropic/responses.rs",
+          "src/anthropic/responses_compaction.rs"
+        ],
+        "symbols": [
+          "Operation::RemoteCompact",
+          "compaction_trigger must be the final input item",
+          "execute_non_stream_request"
+        ],
         "sourceDigest": "237bfe08b6c03bb6f2d97c6594c082d3997b97ce3744555165695ba41e9e52eb"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["KI-N3"],
+      "enhancementIds": [
+        "KI-N3"
+      ],
       "target": {
         "baselineCommit": "cc4e263d5cec0d22917b7bda054d263e7c7b8fd6",
         "baselineTree": "331ea778066de8b5defa4b8db6b50d6d4907de30",
@@ -950,11 +1084,16 @@
         "contracts": [
           {
             "path": "src/proxy/kiro.rs",
-            "anchors": ["enforce_disabled_compaction_contract", "compact_contract_is_disabled_for_kiro_and_amazon_q_only"]
+            "anchors": [
+              "enforce_disabled_compaction_contract",
+              "compact_contract_is_disabled_for_kiro_and_amazon_q_only"
+            ]
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["kiro_and_amazon_q_compact_fail_before_any_upstream_request"]
+            "anchors": [
+              "kiro_and_amazon_q_compact_fail_before_any_upstream_request"
+            ]
           }
         ],
         "fixtureIds": [
@@ -980,11 +1119,17 @@
           "src/kiro/provider.rs",
           "src/kiro/parser/decoder.rs"
         ],
-        "symbols": ["execute_non_stream_request", "KiroProvider", "EventStreamDecoder"],
+        "symbols": [
+          "execute_non_stream_request",
+          "KiroProvider",
+          "EventStreamDecoder"
+        ],
         "sourceDigest": "34471000c854d0037fbba4d71dbb2c655874a303ab88c2047e5595a37b383bdd"
       },
       "disposition": "differential",
-      "enhancementIds": ["CORE-N1"],
+      "enhancementIds": [
+        "CORE-N1"
+      ],
       "target": {
         "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
         "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
@@ -1002,10 +1147,15 @@
           },
           {
             "path": "src/proxy/forwarder.rs",
-            "anchors": ["kiro_provider::prepare_canonical_request", "kiro_provider::prepare_bound_request"]
+            "anchors": [
+              "kiro_provider::prepare_canonical_request",
+              "kiro_provider::prepare_bound_request"
+            ]
           }
         ],
-        "fixtureIds": ["provider_facade_keeps_kiro_and_amazon_q_product_labels_distinct"]
+        "fixtureIds": [
+          "provider_facade_keeps_kiro_and_amazon_q_product_labels_distinct"
+        ]
       },
       "reason": "Move canonical request, exact Account/catalog preparation and Provider-specific classification behind a facade while keeping Share, lease, usage, terminal and attempt ownership shared."
     },
@@ -1027,11 +1177,19 @@
           "src/kiro/endpoint/cli.rs",
           "src/kiro/endpoint/ide.rs"
         ],
-        "symbols": ["CredentialType", "effective_auth_region", "effective_api_region", "register_client", "exchange_code_for_token"],
+        "symbols": [
+          "CredentialType",
+          "effective_auth_region",
+          "effective_api_region",
+          "register_client",
+          "exchange_code_for_token"
+        ],
         "sourceDigest": "9f54a73f7edbc1bf24a9ab2f9ffcb5a4777b43527ca2f323751522c32c8a7c91"
       },
       "disposition": "live_gate",
-      "enhancementIds": ["LIVE-N1"],
+      "enhancementIds": [
+        "LIVE-N1"
+      ],
       "target": {
         "baselineCommit": "d050cf21d9b783f4eb3ffb083a8646a2522036aa",
         "baselineTree": "b3c218e41c67ac37d7f300d56eaf024d67af0675",
@@ -1040,7 +1198,11 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["\"authKind\": \"builder_id\"", "\"authKind\": \"api_key\"", "\"region\": \"eu-central-1\""]
+            "anchors": [
+              "\"authKind\": \"builder_id\"",
+              "\"authKind\": \"api_key\"",
+              "\"region\": \"eu-central-1\""
+            ]
           },
           {
             "path": "scripts/audit/kiro-real-receipt.test.mjs",
@@ -1050,7 +1212,9 @@
             ]
           }
         ],
-        "fixtureIds": ["all eight Kiro auth-kind and region receipts remain independent"]
+        "fixtureIds": [
+          "all eight Kiro auth-kind and region receipts remain independent"
+        ]
       },
       "reason": "Require eight independent private receipts for Builder ID, IdC, Social and API Key across two regions; fixture success never upgrades live state."
     },
@@ -1065,12 +1229,21 @@
         "deltaId": "broad_fallback_and_rotation_rejected",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/kiro/token_manager.rs", "src/kiro/provider.rs"],
-        "symbols": ["select_next_credential", "sticky_candidate", "account_rate_limit_with_fallback"],
+        "paths": [
+          "src/kiro/token_manager.rs",
+          "src/kiro/provider.rs"
+        ],
+        "symbols": [
+          "select_next_credential",
+          "sticky_candidate",
+          "account_rate_limit_with_fallback"
+        ],
         "sourceDigest": "d7b542ec193b4de60046cb76ce758faa0a4b4b451d7166e3eac55831c9dd7e47"
       },
       "disposition": "reject",
-      "enhancementIds": ["KI-R1"],
+      "enhancementIds": [
+        "KI-R1"
+      ],
       "target": {
         "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
         "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
@@ -1079,11 +1252,19 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["no credential-rail fallback", "no cross-region fallback", "no cross-account fallback", "no cross-Provider fallback"]
+            "anchors": [
+              "no credential-rail fallback",
+              "no cross-region fallback",
+              "no cross-account fallback",
+              "no cross-Provider fallback"
+            ]
           },
           {
             "path": "cc-switch-server-enhance.md",
-            "anchors": ["不能换账号", "不扩大 profileArn fallback"]
+            "anchors": [
+              "不能换账号",
+              "不扩大 profileArn fallback"
+            ]
           }
         ],
         "fixtureIds": []
@@ -1106,11 +1287,17 @@
           "src/kiro/session_affinity.rs",
           "src/kiro/token_manager.rs"
         ],
-        "symbols": ["RedisCacheStore", "SessionAffinity", "select_next_credential"],
+        "symbols": [
+          "RedisCacheStore",
+          "SessionAffinity",
+          "select_next_credential"
+        ],
         "sourceDigest": "c66740d9dc36c24d2e4b3675c76263a136186c2059391f6ae6507f91f301d004"
       },
       "disposition": "reject",
-      "enhancementIds": ["KI-R2"],
+      "enhancementIds": [
+        "KI-R2"
+      ],
       "target": {
         "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
         "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
@@ -1119,11 +1306,17 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["account_affinity", "cache_hit_account_selection", "reference_redis_runtime_dependency"]
+            "anchors": [
+              "account_affinity",
+              "cache_hit_account_selection",
+              "reference_redis_runtime_dependency"
+            ]
           },
           {
             "path": "cc-switch-server-enhance.md",
-            "anchors": ["不迁入 Redis/多副本 cache、账号 affinity 或调度"]
+            "anchors": [
+              "不迁入 Redis/多副本 cache、账号 affinity 或调度"
+            ]
           }
         ],
         "fixtureIds": []
@@ -1141,12 +1334,20 @@
         "deltaId": "remote_compaction_auto_enable_rejected",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/anthropic/responses.rs", "src/anthropic/responses_compaction.rs"],
-        "symbols": ["Operation::RemoteCompact", "compaction_trigger must be the final input item"],
+        "paths": [
+          "src/anthropic/responses.rs",
+          "src/anthropic/responses_compaction.rs"
+        ],
+        "symbols": [
+          "Operation::RemoteCompact",
+          "compaction_trigger must be the final input item"
+        ],
         "sourceDigest": "54d4625f1202d198255511bd2d38791a8d3bc97f43fd8a2846ea0a6a0426c800"
       },
       "disposition": "reject",
-      "enhancementIds": ["KI-R3"],
+      "enhancementIds": [
+        "KI-R3"
+      ],
       "target": {
         "baselineCommit": "1124082bc5a1799f03b9e9b63e2e410652497028",
         "baselineTree": "4c40bf67ce5c7e301bfde72874cb9fd1be741c6a",
@@ -1155,11 +1356,17 @@
         "contracts": [
           {
             "path": "assets/contract/kiro-reference-delta.json",
-            "anchors": ["receiptAutoEnablesCompact", "\"runtimeEnabled\": false", "zeroUpstreamBeforeReject"]
+            "anchors": [
+              "receiptAutoEnablesCompact",
+              "\"runtimeEnabled\": false",
+              "zeroUpstreamBeforeReject"
+            ]
           },
           {
             "path": "cc-switch-server-enhance.md",
-            "anchors": ["不因参考项目支持就直接启用 remote compaction"]
+            "anchors": [
+              "不因参考项目支持就直接启用 remote compaction"
+            ]
           }
         ],
         "fixtureIds": []
@@ -1177,12 +1384,22 @@
         "deltaId": "eventstream_frame_buffer_memory_signal",
         "commit": "be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863",
         "tree": "5e656c1bf70aac0224a68251b2065966db01e933",
-        "paths": ["src/kiro/parser/decoder.rs", "src/kiro/parser/frame.rs"],
-        "symbols": ["DEFAULT_MAX_BUFFER_SIZE", "MAX_MESSAGE_SIZE", "BufferOverflow", "MessageTooLarge"],
+        "paths": [
+          "src/kiro/parser/decoder.rs",
+          "src/kiro/parser/frame.rs"
+        ],
+        "symbols": [
+          "DEFAULT_MAX_BUFFER_SIZE",
+          "MAX_MESSAGE_SIZE",
+          "BufferOverflow",
+          "MessageTooLarge"
+        ],
         "sourceDigest": "04020906c408b2fdb206eb6eb4a52ef04c42863551f38fb44f1b4d57eef2484d"
       },
       "disposition": "differential",
-      "enhancementIds": ["CORE-N2"],
+      "enhancementIds": [
+        "CORE-N2"
+      ],
       "target": {
         "baselineCommit": "f21b63e82d27c5e07d9fa196b7c122e1a33e27d9",
         "baselineTree": "154e049700e91739ada3714fd4b78f4a9f6d0b2f",
@@ -1201,11 +1418,15 @@
           },
           {
             "path": "src/proxy/kiro/image.rs",
-            "anchors": ["image_decode_working_set_obeys_request_memory_budget"]
+            "anchors": [
+              "image_decode_working_set_obeys_request_memory_budget"
+            ]
           },
           {
             "path": "src/proxy/request_memory.rs",
-            "anchors": ["serialized_json_size_matches_compact_serde_output"]
+            "anchors": [
+              "serialized_json_size_matches_compact_serde_output"
+            ]
           }
         ],
         "fixtureIds": [
@@ -1251,5 +1472,155 @@
       "realAcceptance": "f07d07a31161ce9517b45a63b813f33cc1d83e3173413e808daeff7987d45884",
       "sharedCacheGate": "3ab26a5c161d3b1a16daf7fb04c4e1f59b211f053561ad02b434e19b7e72bb45"
     }
-  }
+  },
+  "r4Sources": [
+    {
+      "sourceId": "kiro-rs",
+      "snapshotCommit": "9066e9c4fe90c7e97d241900a6ce8eb52cc46903",
+      "snapshotTree": "5d22f040f0e4b0aa775e61547540b3c040293cd8",
+      "readMode": "read_only_committed_git_objects",
+      "excludedWorktreeEntries": 0,
+      "files": [
+        {
+          "path": "src/token.rs",
+          "sha256": "b3d8c4bc99f4b08864fbc63c4f265f5195ef72b12488d2f3b3267935b5bfd860"
+        },
+        {
+          "path": "src/kiro/parser/frame.rs",
+          "sha256": "0c3a13d6da5d527dae0a9721a593a4d599572dd98794f9c5107b8f586ee1d035"
+        },
+        {
+          "path": "src/kiro/endpoint/mod.rs",
+          "sha256": "1c0078dc4621d3dc8aa0b47052df4e903e2314b4344ff8e6e7e94a65b1ade24f"
+        },
+        {
+          "path": "src/kiro/endpoint/cli.rs",
+          "sha256": "63293a714395b447032a537c05a12a52bca8903c6a3d5b167f026365154a7e9f"
+        },
+        {
+          "path": "src/kiro/endpoint/ide.rs",
+          "sha256": "986ce78b1710d1e678d0c0e12b23e0a9c5c469209e887321bb87db867dc647e4"
+        },
+        {
+          "path": "src/anthropic/cache_metering.rs",
+          "sha256": "f18d4cc2ee73a817359366a45b560c6fa684915422d9131c01ca46e19ab48fd5"
+        },
+        {
+          "path": "src/anthropic/stream.rs",
+          "sha256": "1c2168d5f67ab8ce8cbcc1e2b7a97c5bdafb6ba598f179e1e169e86abdc6c1b0"
+        }
+      ]
+    }
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-KI-01",
+      "sharedWork": [
+        "R4-CORE-02"
+      ],
+      "reviewedAt": "2026-10-27T17:21:32.932869+00:00",
+      "status": "working_tree_fixture_verified",
+      "decision": "keep_usage_priority_and_context_subtraction_shadow_extend_local_ownership",
+      "vendorWireChanged": false,
+      "liveAcceptance": "live_pending",
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_worktree_excluding_concurrent_Share_Market",
+        "contracts": [
+          {
+            "path": "src/proxy/kiro_prompt_cache.rs",
+            "anchors": [
+              "kiro_r4_memory_only_cache_has_owned_entries_and_no_unused_dirty_queue",
+              "kiro_r4_capacity_miss_preserves_previous_entries_ttl_and_generation",
+              "kiro_r4_partial_publication_admission_rolls_back_all_owners_and_slots",
+              "kiro_r4_pending_bound_includes_inflight_batch_and_preserves_disk_tombstones",
+              "kiro_r4_failed_batch_merge_transfers_ownership_and_keeps_newer_generation",
+              "kiro_r4_expiry_and_count_eviction_release_index_owners",
+              "kiro_r4_persisted_cache_skips_unadmitted_startup_entries_without_changing_disk"
+            ]
+          },
+          {
+            "path": "src/proxy/kiro.rs",
+            "anchors": [
+              "kiro_context_output_subtraction_remains_shadow_only_without_live_receipt",
+              "kiro_r4_stream_cancel_drops_upstream_but_output_bytes_keep_their_owner",
+              "kiro_r4_stream_eof_truncation_and_idle_timeout_release_parent_owners"
+            ]
+          },
+          {
+            "path": "src/proxy/kiro_prompt_cache/resident.rs",
+            "anchors": [
+              "MAX_PENDING_MUTATIONS",
+              "pub(super) fn pending",
+              "impl Drop for PendingOwner"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/kiro_runtime.rs",
+            "anchors": [
+              "models_snapshot",
+              "publish_models",
+              "publish_ide"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/kiro_runtime/resident.rs",
+            "anchors": [
+              "kiro_r4_catalog_snapshot_shares_owner_until_last_payload_drop",
+              "kiro_r4_catalog_pressure_invalidates_replacement_without_reusing_old_authorization",
+              "kiro_r4_catalog_count_eviction_and_lazy_stale_expiry_release_owners",
+              "kiro_r4_ide_version_is_optional_and_replacement_releases_old_charge"
+            ]
+          }
+        ]
+      },
+      "capacity": {
+        "processMode": "observe_only",
+        "cacheEntries": 4096,
+        "pendingAndInFlightMutations": 8192,
+        "notificationQueue": 2,
+        "index": "bounded_btree",
+        "atomicPublicationAdmission": true,
+        "detachedWriterBatchKeepsOwner": true,
+        "failedBatchMergeRequiresNewAdmission": false,
+        "memoryOnlyDirtyQueue": false,
+        "admissionFailure": "optional_local_estimate_miss_keep_previous_state_and_durable_mutations",
+        "expiry": "lazy_on_cache_computation",
+        "modelCatalogs": 128,
+        "ideVersions": 1,
+        "modelFreshTtlMs": 300000,
+        "modelMaximumStaleMs": 86400000,
+        "discoveryAdmissionFailure": "return_current_catalog_without_caching_remove_replaced_entry"
+      },
+      "usage": {
+        "authoritativeZeroWins": true,
+        "metadataMetricsContextFallbackPriorityUnchanged": true,
+        "contextOutputSubtraction": "shadow_only_live_pending",
+        "cacheEstimationIsVendorSavingsEvidence": false,
+        "inferenceHealthPenaltyForOptionalCachePressure": false
+      },
+      "timingInventory": {
+        "origin": "existing_forward_attempt_started_before_Kiro_preparation_and_auth_work_after_binding_admission",
+        "firstCompleteFrameDeadline": "absolute_from_upstream_send_partial_bytes_and_local_message_start_do_not_extend",
+        "idleDeadline": "rearmed_only_by_complete_valid_frame",
+        "newMilestoneInstrumentation": false,
+        "successfulSocketWriteMeasurement": false,
+        "performanceClaim": null
+      },
+      "retainedBoundaries": [
+        "four_auth_kinds_by_two_regions_remain_independent_live_pending",
+        "metadata_tokenUsage_including_zero_overrides_fallback",
+        "no_cross_account_or_inference_region_or_auth_rail_retry",
+        "no_shared_cache_or_remote_compaction"
+      ],
+      "limitations": [
+        "logical sparse-index estimates are not RSS or allocator measurements",
+        "startup_SQLite_and_legacy_parse_SQLite_connection_and_control_plane_discovery_result_scratch_not_fully_parent_budgeted",
+        "stream_drop_fixtures_observe_adapter_stream_ownership_not_vendor_socket_or_health_classification",
+        "parent_hard_limit_remains_opt_in_no_production_capacity_or_speed_claim"
+      ]
+    }
+  ]
 }

@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-09-28T00:00:00Z",
+  "updatedAt": "2026-10-27T00:00:00Z",
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
@@ -1083,6 +1083,118 @@
           "anchors": ["invalid_custom_names_only", "CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS"]
         }
       ]
+    }
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-CL-01",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adopt",
+      "source": {
+        "sourceId": "cliproxyapi",
+        "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+        "deltaCommit": "43f5386bc3b904caa6106c879dd5dbc2d1e86ceb",
+        "deltaTree": "282eb00d97eea64494d945eaee4bf0681149adcc",
+        "files": [
+          {
+            "path": "internal/translator/claude/openai/chat-completions/claude_openai_response.go",
+            "sha256": "b7bf234149ca26d2ef690f2aa48f5029bef32bff984781b1b57279352c2d7a57"
+          },
+          {
+            "path": "internal/translator/claude/openai/chat-completions/claude_openai_response_test.go",
+            "sha256": "2729cb8f618a521ad8c83c7588cc8a836f65f8c16f4a097bd6b5c1ad42e65daf"
+          }
+        ]
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "openai_output_details_from_anthropic_usage",
+              "claude_r4_json_usage_normalizes_thinking_details"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "claude_r4_stream_usage_merges_thinking_details"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Normalize only valid nonnegative thinking counts into OpenAI reasoning details; preserve zero, sparse siblings, cache and provider metering without adding reasoning to total output. Native Anthropic stays unchanged."
+    },
+    {
+      "id": "R4-CL-02",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "source": {
+        "sourceId": "cliproxyapi",
+        "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+        "deltaCommit": "1d45a5f3329025414ee430341daf2686cf0c029a",
+        "deltaTree": "5f706ccb93b0557a95d25a7bb1a6ce21c13be9a8",
+        "files": [
+          {
+            "path": "internal/runtime/executor/helps/claude_tool_choice.go",
+            "sha256": "d998d6c9ef908467a1ef1e7db40c94ee428dce227a03d573b5c4fc8a8e8ec8d2"
+          },
+          {
+            "path": "internal/runtime/executor/claude_issue7000_test.go",
+            "sha256": "b116506423605c64bd3ed3f813c3d863fe9bde6abecafa9ade978a199c2a1486"
+          },
+          {
+            "path": "internal/runtime/executor/claude_issue7000_regression_test.go",
+            "sha256": "b43d5853cdb491a04d334cccbc0aa23b7a8c5851032d5df1921f1784c83cb331"
+          }
+        ]
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/domain/claude_models.rs",
+            "anchors": [
+              "supports_forced_tool_choice"
+            ]
+          },
+          {
+            "path": "src/proxy/claude_oauth.rs",
+            "anchors": [
+              "claude_r4_forced_tool_choice_rejects_unsupported_model_without_downgrade",
+              "claude_r4_tool_choice_preserves_supported_models_and_nonforced_choices"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "claude_r4_forced_tools_fail_before_network_on_native_chat_and_responses"
+            ]
+          },
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "anthropic_pause_turn_is_incomplete_without_token_limit_details"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "anthropic_pause_turn_stream_is_incomplete_once_without_token_limit_details"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Reject forced tools locally for the exact reviewed Opus 5.5 model after routing rather than silently changing required to auto or discarding signed history. Keep other models, count_tokens and pause_turn incomplete semantics; delegated Antigravity is reviewed in its own slice."
     }
   ]
 }

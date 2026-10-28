@@ -2575,3 +2575,434 @@ fn codebuddy_final_terminal_chunk_commits_success_without_an_extra_downstream_po
         }
     });
 }
+
+#[test]
+fn codebuddy_r4_discovery_capacity_rejection_is_local_and_sends_no_requests() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let name = format!("codebuddy-r4-flight-{}-{}", site.as_str(), app.as_str());
+                let (address, fixture, server) =
+                    spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success]).await;
+                let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(Some(0));
+                let mut state = codebuddy_test_state(&name);
+                Arc::get_mut(&mut state)
+                    .expect("unique fixture state")
+                    .codebuddy_runtime =
+                    crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache::with_parent(
+                        parent.clone(),
+                    );
+                let (provider_id, account_id) = install_codebuddy_provider(
+                    &state,
+                    &name,
+                    app,
+                    site,
+                    &format!("http://{address}"),
+                )
+                .await;
+                let share_id = format!("{name}-share");
+                install_codebuddy_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                    .await;
+                let error =
+                    forward_codebuddy_surface(state.clone(), app, provider_id, &share_id, false)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    error.is_request_memory_exhausted(),
+                    "{site:?}/{app:?}: {error:?}"
+                );
+                assert_eq!(fixture.count(&fixture.config_requests), 0);
+                assert_eq!(fixture.count(&fixture.generation_requests), 0);
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+                assert_eq!(parent.snapshot().used_bytes, 0);
+                assert!(!state.share_in_flight.has_in_flight(&share_id));
+                assert_eq!(
+                    state
+                        .account_in_flight
+                        .snapshot()
+                        .current(ProviderType::CodeBuddyOAuth, &account_id),
+                    0
+                );
+                let account = state
+                    .find_account_for_provider(ProviderType::CodeBuddyOAuth, &account_id)
+                    .await
+                    .unwrap();
+                assert!(!account.needs_relogin);
+                let usage = state.usage_snapshot().await;
+                let log = usage.logs.last().expect("capacity rejection records usage");
+                assert_eq!(log.failure_kind.as_deref(), Some("memory_capacity"));
+                assert_eq!(
+                    capacity_shed_provider_outcome(),
+                    ProviderOutcome::CapacityShed { status_code: 503 }
+                );
+                assert!(!CodeBuddyRuntimeError::MemoryCapacity.is_authentication_failure());
+                server.abort();
+            }
+        }
+    });
+}
+
+#[derive(Clone, Default)]
+struct CodeBuddyCore03Samples(Arc<Mutex<Vec<metrics::Key>>>);
+struct CodeBuddyCore03Histogram(CodeBuddyCore03Samples, metrics::Key);
+impl metrics::HistogramFn for CodeBuddyCore03Histogram {
+    fn record(&self, _: f64) {
+        self.0 .0.lock().unwrap().push(self.1.clone());
+    }
+}
+impl metrics::Recorder for CodeBuddyCore03Samples {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        key: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::from_arc(Arc::new(CodeBuddyCore03Histogram(
+            self.clone(),
+            key.clone(),
+        )))
+    }
+}
+
+// Local timing fixtures retain the existing site, identity, terminal, and
+// recovery checks; they do not stand in for either site's live receipt.
+async fn codebuddy_core03_attempt(
+    state: &ServerState,
+    route: ProxyRoute,
+    id: &str,
+) -> ForwardAttemptContext {
+    let accounts = state.accounts_snapshot().await;
+    let providers = state.providers.read().await;
+    let in_flight = state.account_in_flight.snapshot();
+    let execution = select_test_provider(&providers, &accounts, route.app(), id, Some(&in_flight))
+        .unwrap()
+        .execution;
+    ForwardAttemptContext {
+        execution: Some(execution),
+        provider_binding_pinned: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn codebuddy_core03_both_sites_four_surfaces_stream_and_nonstream() {
+    run_codebuddy_async_test(async {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            for route in [
+                ProxyRoute::ClaudeMessages,
+                ProxyRoute::CodexResponses,
+                ProxyRoute::CodexChatCompletions,
+                ProxyRoute::Gemini,
+            ] {
+                for streaming in [false, true] {
+                    let (address, fixture, server) =
+                        spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success])
+                            .await;
+                    let state = codebuddy_test_state("core03-surfaces");
+                    let (id, _) = install_codebuddy_provider(
+                        &state,
+                        "core03",
+                        route.app(),
+                        site,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    install_codebuddy_share(
+                        &state,
+                        "core03-share",
+                        route.app(),
+                        &id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let (_, path, mut body) = surface_request(route.app(), streaming);
+                    if route == ProxyRoute::CodexChatCompletions {
+                        body=Bytes::from(json!({"model":"auto","stream":streaming,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}).to_string());
+                    }
+                    let attempt = codebuddy_core03_attempt(&state, route, &id).await;
+                    let slot = attempt.timing.clone();
+                    let response = forward_with_attempt(
+                        state,
+                        route,
+                        path,
+                        codebuddy_headers("core03-share", "owner@example.com", "core03"),
+                        body,
+                        attempt,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = collect(response).await;
+                    assert!(String::from_utf8_lossy(&bytes).contains("ready"));
+                    let snapshot = slot.get().unwrap().request().snapshot();
+                    assert_eq!(snapshot["providerType"], "codebuddy_oauth");
+                    assert_eq!(snapshot["result"], "complete", "{snapshot}");
+                    for phase in [
+                        "admission",
+                        "send_started",
+                        "headers",
+                        "first_semantic",
+                        "terminal",
+                        "http_body_handoff",
+                        "owner_released",
+                    ] {
+                        assert!(
+                            snapshot["milestonesMs"][phase].is_number(),
+                            "{phase}: {snapshot}"
+                        );
+                    }
+                    assert!(snapshot["milestonesMs"]["downstream_write_completed"].is_null());
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1);
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn codebuddy_core03_sanitized_content_excludes_empty_fields_and_waits_for_eof() {
+    let slot = TimingSlot::default();
+    let timing = slot
+        .begin_for_provider(ProviderType::CodeBuddyOAuth, "messages", Instant::now())
+        .unwrap();
+    let memory = RequestMemoryBudget::new(1024 * 1024);
+    memory.set_timing(timing.clone());
+    let mut decoder =
+        super::super::codebuddy::CodeBuddySseDecoder::with_request_memory(Some(memory)).unwrap();
+    decoder
+        .push_classified(Bytes::from_static(b": heartbeat\n\n"))
+        .unwrap();
+    decoder.push_classified(chat_chunk("", None)).unwrap();
+    decoder.push_classified(Bytes::from(format!("data: {}\n\n",json!({"id":"fixture","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}})))).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+    let content = chat_chunk("ready", None);
+    decoder.push_classified(content.slice(..8)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+    decoder.push_classified(content.slice(8..)).unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_number());
+    decoder
+        .push_classified(chat_chunk("", Some("length")))
+        .unwrap();
+    decoder
+        .push_classified(Bytes::from_static(b"data: [DONE]\n\n"))
+        .unwrap();
+    assert!(timing.request().snapshot()["milestonesMs"]["terminal"].is_null());
+    decoder.finish_classified().unwrap();
+    timing.finish_delivery(true);
+    assert_eq!(timing.request().snapshot()["result"], "incomplete");
+}
+
+#[test]
+fn codebuddy_core03_both_sites_original_401_recovery_has_independent_attempts() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                let samples = CodeBuddyCore03Samples::default();
+                let _recorder = metrics::set_default_local_recorder(&samples);
+                let (address, fixture, server) = spawn_codebuddy_upstream(
+                    site,
+                    vec![
+                        CodeBuddyGenerationReply::HttpUnauthorized,
+                        CodeBuddyGenerationReply::Success,
+                    ],
+                )
+                .await;
+                let state = codebuddy_test_state("core03-retry");
+                let (id, _) = install_codebuddy_provider(
+                    &state,
+                    "core03",
+                    AppKind::Codex,
+                    site,
+                    &format!("http://{address}"),
+                )
+                .await;
+                install_codebuddy_share(
+                    &state,
+                    "core03-share",
+                    AppKind::Codex,
+                    &id,
+                    "owner@example.com",
+                )
+                .await;
+                let attempt =
+                    codebuddy_core03_attempt(&state, ProxyRoute::CodexResponses, &id).await;
+                let slot = attempt.timing.clone();
+                let (_, path, body) = surface_request(AppKind::Codex, true);
+                let response = forward_with_attempt(
+                    state,
+                    ProxyRoute::CodexResponses,
+                    path,
+                    codebuddy_headers("core03-share", "owner@example.com", "retry"),
+                    body,
+                    attempt,
+                )
+                .await
+                .unwrap();
+                collect(response).await;
+                let snapshot = slot.get().unwrap().request().snapshot();
+                assert_eq!(snapshot["result"], "complete");
+                assert!(snapshot["waitsMs"]["retry"].as_f64().unwrap() > 0.0);
+                let samples = samples.0.lock().unwrap();
+                for (scope, result) in [
+                    ("attempt", "retried"),
+                    ("attempt", "complete"),
+                    ("request", "complete"),
+                ] {
+                    assert_eq!(
+                        samples
+                            .iter()
+                            .filter(|key| key.name() == "cc_switch_forward_duration_seconds"
+                                && [
+                                    ("provider_type", "codebuddy_oauth"),
+                                    ("scope", scope),
+                                    ("result", result)
+                                ]
+                                .iter()
+                                .all(|(name, value)| key
+                                    .labels()
+                                    .any(|label| label.key() == *name && label.value() == *value)))
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(fixture.count(&fixture.generation_requests), 2);
+                assert_eq!(fixture.count(&fixture.refresh_requests), 1);
+                server.abort();
+            }
+        });
+}
+
+#[test]
+fn codebuddy_core03_headers_and_committed_cancel_or_truncation_keep_last_owner_and_no_replay() {
+    run_codebuddy_async_test(async {
+        for mode in 0..3 {
+            let fixture = CodeBuddyFixtureState::new(CodeBuddySite::Intl, vec![]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = axum::Router::new()
+                .route(CODEBUDDY_CONFIG_PATH, get(codebuddy_config))
+                .route(CODEBUDDY_ACCOUNTS_PATH, get(codebuddy_accounts))
+                .route(
+                    CODEBUDDY_CHAT_PATH.split('?').next().unwrap(),
+                    post(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if mode == 0 {
+                                std::future::pending::<()>().await;
+                            }
+                            let chunks = async_stream::stream! {
+                                yield Ok::<_,std::convert::Infallible>(chat_chunk("ready",None));
+                                if mode==1 {std::future::pending::<()>().await;}
+                            };
+                            Response::builder()
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .body(Body::from_stream(chunks))
+                                .unwrap()
+                        }
+                    }),
+                )
+                .with_state(fixture);
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let state = codebuddy_test_state("core03-cancel");
+            let (id, _) = install_codebuddy_provider(
+                &state,
+                "core03",
+                AppKind::Claude,
+                CodeBuddySite::Intl,
+                &format!("http://{address}"),
+            )
+            .await;
+            install_codebuddy_share(
+                &state,
+                "core03-share",
+                AppKind::Claude,
+                &id,
+                "owner@example.com",
+            )
+            .await;
+            let attempt = codebuddy_core03_attempt(&state, ProxyRoute::ClaudeMessages, &id).await;
+            let slot = attempt.timing.clone();
+            let (_, path, body) = surface_request(AppKind::Claude, true);
+            let mut pending = Box::pin(forward_with_attempt(
+                state,
+                ProxyRoute::ClaudeMessages,
+                path,
+                codebuddy_headers("core03-share", "owner@example.com", "cancel"),
+                body,
+                attempt,
+            ));
+            if mode == 0 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+                        .await
+                        .is_err()
+                );
+                let request = slot.get().unwrap().request();
+                assert!(request.snapshot()["milestonesMs"]["send_started"].is_number());
+                assert!(request.snapshot()["milestonesMs"]["headers"].is_null());
+                drop(pending);
+                assert_eq!(request.snapshot()["result"], "cancelled");
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_number());
+            } else {
+                let response = pending.await.unwrap();
+                let request = slot.get().unwrap().request();
+                let mut stream = response.into_body().into_data_stream();
+                let retained = loop {
+                    let frame = stream.next().await.unwrap().unwrap();
+                    if String::from_utf8_lossy(&frame).contains("ready") {
+                        break frame;
+                    }
+                };
+                if mode == 2 {
+                    while let Some(frame) = stream.next().await {
+                        drop(frame);
+                    }
+                }
+                drop(stream);
+                assert_eq!(
+                    request.snapshot()["result"],
+                    if mode == 2 { "failed" } else { "cancelled" }
+                );
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_null());
+                drop(retained);
+                assert!(request.snapshot()["milestonesMs"]["owner_released"].is_number());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    });
+}

@@ -41,34 +41,35 @@ impl RequestMemoryComponent {
     }
 }
 
-/// Returns a conservative allocation-sized estimate without serializing the
-/// value. This is used for request-scoped JSON state that survives between
-/// stream chunks; transient parse/output values are accounted separately.
-pub(super) fn retained_json_bytes(value: &Value) -> usize {
-    fn dynamic_bytes(value: &Value) -> usize {
-        match value {
-            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
-            Value::String(value) => value.capacity(),
-            Value::Array(values) => values
-                .capacity()
-                .saturating_mul(std::mem::size_of::<Value>())
-                .saturating_add(values.iter().map(dynamic_bytes).sum::<usize>()),
-            Value::Object(values) => values.iter().fold(
-                values.len().saturating_mul(
-                    std::mem::size_of::<String>()
-                        .saturating_add(std::mem::size_of::<Value>())
-                        .saturating_add(std::mem::size_of::<usize>() * 3),
-                ),
-                |bytes, (key, value)| {
-                    bytes
-                        .saturating_add(key.capacity())
-                        .saturating_add(dynamic_bytes(value))
-                },
-            ),
+pub(super) use crate::infra::resident_memory::retained_json_bytes;
+
+/// Conservative logical parser working set before allocating a Value. JSON
+/// punctuation inside strings is payload, not a collection allocation. Exact
+/// retained capacity replaces this estimate once parsing succeeds.
+pub(super) fn json_parse_working_bytes(bytes: &[u8]) -> usize {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut structural = 0usize;
+    for &byte in bytes {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if matches!(byte, b'[' | b'{' | b',' | b':') {
+            structural = structural.saturating_add(1);
         }
     }
-
-    std::mem::size_of::<Value>().saturating_add(dynamic_bytes(value))
+    bytes
+        .len()
+        .saturating_mul(2)
+        .saturating_add(structural.saturating_mul(128))
+        .saturating_add(512)
 }
 
 /// Computes the exact compact JSON byte length without materializing another
@@ -165,6 +166,8 @@ pub(crate) struct RequestMemoryBudget {
 
 struct RequestMemoryBudgetInner {
     state: Mutex<RequestMemoryState>,
+    parent: crate::infra::resident_memory::ResidentMemoryBudget,
+    timing: Mutex<Option<super::request_timing::ForwardTiming>>,
 }
 
 #[derive(Debug)]
@@ -187,6 +190,16 @@ impl fmt::Debug for RequestMemoryBudget {
 
 impl RequestMemoryBudget {
     pub(super) fn new(limit_bytes: usize) -> Self {
+        Self::with_parent(
+            limit_bytes,
+            crate::infra::resident_memory::process_resident_memory(),
+        )
+    }
+
+    pub(super) fn with_parent(
+        limit_bytes: usize,
+        parent: crate::infra::resident_memory::ResidentMemoryBudget,
+    ) -> Self {
         Self {
             inner: Arc::new(RequestMemoryBudgetInner {
                 state: Mutex::new(RequestMemoryState {
@@ -196,6 +209,8 @@ impl RequestMemoryBudget {
                     active_reservations: 0,
                     exhausted: false,
                 }),
+                parent,
+                timing: Mutex::new(None),
             }),
         }
     }
@@ -217,6 +232,42 @@ impl RequestMemoryBudget {
         };
         reservation.resize(bytes)?;
         Ok(reservation)
+    }
+
+    pub(super) fn set_timing(&self, timing: super::request_timing::ForwardTiming) {
+        *self
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(timing);
+    }
+
+    /// An observation may be omitted when scratch cannot fit. Declining it
+    /// must not poison the forwarding budget or change recovery eligibility.
+    pub(super) fn reserve_observation_scratch(
+        &self,
+        bytes: usize,
+    ) -> Option<RequestMemoryReservation> {
+        let component = RequestMemoryComponent::StreamRetainedState;
+        self.resize_inner(component, 0, bytes, false).ok()?;
+        Some(RequestMemoryReservation {
+            inner: Arc::new(RequestMemoryReservationInner {
+                budget: self.clone(),
+                component,
+                state: Mutex::new(ReservationState {
+                    bytes,
+                    released: false,
+                }),
+            }),
+        })
+    }
+
+    pub(super) fn timing(&self) -> Option<super::request_timing::ForwardTiming> {
+        self.inner
+            .timing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub(super) fn snapshot(&self) -> RequestMemorySnapshot {
@@ -247,7 +298,10 @@ impl RequestMemoryBudget {
         if state.exhausted {
             0
         } else {
-            state.limit_bytes.saturating_sub(state.used_bytes)
+            state
+                .limit_bytes
+                .saturating_sub(state.used_bytes)
+                .min(self.inner.parent.remaining_bytes())
         }
     }
 
@@ -300,12 +354,23 @@ impl RequestMemoryBudget {
         current: usize,
         next: usize,
     ) -> Result<(), RequestMemoryError> {
+        self.resize_inner(component, current, next, true)
+    }
+
+    fn resize_inner(
+        &self,
+        component: RequestMemoryComponent,
+        current: usize,
+        next: usize,
+        exhaust_on_failure: bool,
+    ) -> Result<(), RequestMemoryError> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if next <= current {
+            self.inner.parent.try_resize(current, next);
             let released = current - next;
             state.used_bytes = state.used_bytes.saturating_sub(released);
             if current > 0 && next == 0 {
@@ -315,8 +380,11 @@ impl RequestMemoryBudget {
         }
 
         let additional = next - current;
-        if state.exhausted || additional > state.limit_bytes.saturating_sub(state.used_bytes) {
-            state.exhausted = true;
+        if state.exhausted
+            || additional > state.limit_bytes.saturating_sub(state.used_bytes)
+            || !self.inner.parent.try_resize(current, next)
+        {
+            state.exhausted |= exhaust_on_failure;
             crate::metrics::record_request_memory_reservation(
                 component.as_str(),
                 additional,
@@ -357,6 +425,13 @@ impl AsRef<[u8]> for RequestMemoryBytes {
 
 impl Drop for RequestMemoryBudgetInner {
     fn drop(&mut self) {
+        if let Some(timing) = self
+            .timing
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            timing.request().owner_released();
+        }
         let state = self
             .state
             .get_mut()
@@ -480,6 +555,40 @@ impl Drop for RequestMemoryReservationInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_r4_child_parent_growth_is_atomic_sticky_and_releases_on_cancel() {
+        use crate::infra::resident_memory::ResidentMemoryBudget;
+        let parent = ResidentMemoryBudget::new(Some(100));
+        let first = RequestMemoryBudget::with_parent(80, parent.clone());
+        let second = RequestMemoryBudget::with_parent(80, parent.clone());
+        let raw = first
+            .reserve(RequestMemoryComponent::InboundRaw, 60)
+            .unwrap();
+        let other = second
+            .reserve(RequestMemoryComponent::DecodedBody, 30)
+            .unwrap();
+        assert!(other.resize(50).is_err());
+        assert_eq!(second.snapshot().used_bytes, 30);
+        assert_eq!(other.bytes(), 30);
+        assert_eq!(parent.snapshot().used_bytes, 90);
+        assert_eq!(parent.snapshot().active_reservations, 2);
+        assert_eq!(parent.snapshot().rejections, 1);
+        assert!(second.is_exhausted());
+        other.resize(10).unwrap();
+        assert!(other.resize(11).is_err());
+        assert_eq!(parent.snapshot().used_bytes, 70);
+        drop(raw);
+        drop(other);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
+        // Rejection by the child must not leave a temporary charge in the parent.
+        assert!(first
+            .reserve(RequestMemoryComponent::ToolArguments, 81)
+            .is_err());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().rejections, 1);
+    }
 
     #[test]
     fn request_budget_accounts_resizes_and_releases_once_across_clones() {

@@ -16,13 +16,15 @@ use super::h2_client::CursorH2Stream;
 use super::memory::session_retained_bytes;
 use super::profile::CursorProtocolRail;
 use super::request_builder::ResponseToolNamespace;
+use super::resident::{entry_bytes, ResidentEntry};
 use super::response_state::CursorLocalTaskState;
+use crate::infra::resident_memory::{process_resident_memory, ResidentMemoryBudget};
 use crate::proxy::request_memory::{
     RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError, RequestMemoryReservation,
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
@@ -36,7 +38,7 @@ const DEFAULT_MAX_SESSIONS: usize = 100;
 ///
 /// The digest deliberately hides Account, Share, user, and API-key identity
 /// material while retaining exact generation/runtime fencing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CursorSessionScope(String);
 
 pub struct CursorSessionScopeInput<'a> {
@@ -109,7 +111,7 @@ fn update_scope_component(hasher: &mut Sha256, label: &str, value: &str) {
     hasher.update(value.as_bytes());
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CursorSessionKey {
     scope: CursorSessionScope,
     conversation_id: String,
@@ -138,12 +140,11 @@ impl CursorSessionKey {
             .capacity()
             .saturating_add(self.conversation_id.capacity())
             .saturating_mul(2)
-            .saturating_add(std::mem::size_of::<Self>())
-            .saturating_add(std::mem::size_of::<usize>())
+            .saturating_add(entry_bytes::<Self, Arc<Mutex<CursorSession>>>(0))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CursorScopedIndexKey {
     scope: CursorSessionScope,
     raw_id: String,
@@ -195,6 +196,7 @@ pub enum CursorSessionReserveError {
 pub enum CursorContinuationClaimError {
     AlreadyClaimed,
     CapacityExhausted,
+    MemoryCapacityExhausted,
 }
 
 /// Live state of a single AgentService run.
@@ -303,17 +305,23 @@ impl CursorSession {
             task.abort();
         }
         self.stream = None;
-        self.declared_tool_names.clear();
-        self.declared_tools.clear();
-        self.custom_tool_names.clear();
-        self.response_tool_namespaces.clear();
-        self.semantic_items.clear();
-        self.working_directory.clear();
-        self.pending_tool_calls.clear();
-        self.cold_resume_completed_calls.clear();
-        self.blob_store.clear();
-        self.request_memory = None;
+        self.declared_tool_names = Vec::new();
+        self.declared_tools = Vec::new();
+        self.custom_tool_names = Vec::new();
+        self.response_tool_namespaces = Vec::new();
+        self.semantic_items = Vec::new();
+        self.local_task_state = CursorLocalTaskState::default();
+        self.working_directory = String::new();
+        self.pending_tool_calls = HashMap::new();
+        self.cold_resume_completed_calls = Vec::new();
+        self.blob_store = HashMap::new();
         self.index_retained_bytes = 0;
+        if let Some(memory) = &self.request_memory {
+            // Closed Arcs can outlive registry removal. Keep charging their
+            // small shell until the last owner drops, after releasing bulk
+            // allocations. Shrinking is allowed after sticky exhaustion.
+            let _ = memory.resize(session_retained_bytes(self));
+        }
     }
 }
 
@@ -334,13 +342,14 @@ impl std::fmt::Debug for CursorSessionManager {
 }
 
 struct Inner {
-    sessions: RwLock<HashMap<CursorSessionKey, Arc<Mutex<CursorSession>>>>,
-    response_sessions: RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
-    tool_call_sessions: RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
+    sessions: RwLock<BTreeMap<CursorSessionKey, Arc<Mutex<CursorSession>>>>,
+    response_sessions: RwLock<BTreeMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
+    tool_call_sessions: RwLock<BTreeMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
     /// Recently consumed cold-continuation identifiers. These short-lived,
     /// scope-fenced claims close the race after a parked entry and its live
     /// indexes have been removed but a duplicate request is still in flight.
-    continuation_claims: RwLock<HashMap<CursorScopedIndexKey, Instant>>,
+    continuation_claims: RwLock<BTreeMap<CursorScopedIndexKey, ResidentEntry<Instant>>>,
+    parent: ResidentMemoryBudget,
     idle_ttl: Duration,
     max_sessions: usize,
 }
@@ -391,12 +400,17 @@ impl Default for CursorSessionManager {
 
 impl CursorSessionManager {
     pub fn new(idle_ttl: Duration, max_sessions: usize) -> Self {
+        Self::with_parent(idle_ttl, max_sessions, process_resident_memory())
+    }
+
+    fn with_parent(idle_ttl: Duration, max_sessions: usize, parent: ResidentMemoryBudget) -> Self {
         Self {
             inner: Arc::new(Inner {
-                sessions: RwLock::new(HashMap::new()),
-                response_sessions: RwLock::new(HashMap::new()),
-                tool_call_sessions: RwLock::new(HashMap::new()),
-                continuation_claims: RwLock::new(HashMap::new()),
+                sessions: RwLock::new(BTreeMap::new()),
+                response_sessions: RwLock::new(BTreeMap::new()),
+                tool_call_sessions: RwLock::new(BTreeMap::new()),
+                continuation_claims: RwLock::new(BTreeMap::new()),
+                parent,
                 idle_ttl,
                 max_sessions,
             }),
@@ -413,7 +427,7 @@ impl CursorSessionManager {
     ) -> Result<(), CursorContinuationClaimError> {
         let now = Instant::now();
         let mut claims = self.inner.continuation_claims.write().await;
-        claims.retain(|_, claimed_at| now.duration_since(*claimed_at) <= self.inner.idle_ttl);
+        claims.retain(|_, claimed_at| now.duration_since(claimed_at.value) <= self.inner.idle_ttl);
         let keys = raw_ids
             .iter()
             .filter_map(|raw_id| CursorScopedIndexKey::new(scope, raw_id))
@@ -425,9 +439,18 @@ impl CursorSessionManager {
         if claims.len().saturating_add(keys.len()) > max_claims {
             return Err(CursorContinuationClaimError::CapacityExhausted);
         }
-        for key in keys {
-            claims.insert(key, now);
-        }
+        // Reserve the complete batch before publishing any claim. A failed
+        // admission must never consume a prefix of a continuation's IDs.
+        let prepared = keys
+            .into_iter()
+            .map(|key| {
+                let dynamic = key.scope.0.capacity().saturating_add(key.raw_id.capacity());
+                ResidentEntry::new::<CursorScopedIndexKey>(&self.inner.parent, now, dynamic)
+                    .map(|value| (key, value))
+                    .ok_or(CursorContinuationClaimError::MemoryCapacityExhausted)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        claims.extend(prepared);
         Ok(())
     }
 
@@ -440,7 +463,7 @@ impl CursorSessionManager {
     ) -> bool {
         let now = Instant::now();
         let mut claims = self.inner.continuation_claims.write().await;
-        claims.retain(|_, claimed_at| now.duration_since(*claimed_at) <= self.inner.idle_ttl);
+        claims.retain(|_, claimed_at| now.duration_since(claimed_at.value) <= self.inner.idle_ttl);
         raw_ids.iter().any(|raw_id| {
             CursorScopedIndexKey::new(scope, raw_id).is_some_and(|key| claims.contains_key(&key))
         })
@@ -598,7 +621,6 @@ impl CursorSessionManager {
                     }
                     let inner = Arc::downgrade(&self.inner);
                     let parked_entry = Arc::downgrade(&entry);
-                    let key = session.key.clone();
                     let idle_ttl = self.inner.idle_ttl;
                     let task = tokio::spawn(async move {
                         tokio::time::sleep(idle_ttl.saturating_add(Duration::from_millis(1))).await;
@@ -606,6 +628,7 @@ impl CursorSessionManager {
                         else {
                             return;
                         };
+                        let key = entry.lock().await.key.clone();
                         let manager = CursorSessionManager { inner };
                         manager
                             .evict_expired_candidate(&key, &entry, Instant::now())
@@ -738,7 +761,7 @@ impl CursorSessionManager {
 
     async fn resolve_index_binding(
         &self,
-        index: &RwLock<HashMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
+        index: &RwLock<BTreeMap<CursorScopedIndexKey, CursorSessionIndexBinding>>,
         index_key: &CursorScopedIndexKey,
     ) -> Option<CursorSessionReference> {
         // Expired parked owners must not make a still-live ID ambiguous.
@@ -780,6 +803,7 @@ impl CursorSessionManager {
                 value
                     .candidates
                     .retain(|candidate| !Weak::ptr_eq(&candidate.entry, &weak));
+                value.candidates.shrink_to_fit();
                 !value.candidates.is_empty()
             });
         }
@@ -789,6 +813,7 @@ impl CursorSessionManager {
                 value
                     .candidates
                     .retain(|candidate| !Weak::ptr_eq(&candidate.entry, &weak));
+                value.candidates.shrink_to_fit();
                 !value.candidates.is_empty()
             });
         }
@@ -845,9 +870,9 @@ impl CursorSessionManager {
         // A timer may be this very task. Drop its handle before clearing
         // retained state so it cannot abort itself before index cleanup.
         session.idle_expiry_task = None;
-        session.clear_retained_state();
         drop(session);
         self.remove_indexes_for_session(entry).await;
+        entry.lock().await.clear_retained_state();
         true
     }
 
@@ -894,9 +919,9 @@ impl CursorSessionManager {
             };
             if removed {
                 session.state = SessionState::Closed;
-                session.clear_retained_state();
                 drop(session);
                 self.remove_indexes_for_session(&entry).await;
+                entry.lock().await.clear_retained_state();
             }
         }
     }
@@ -987,6 +1012,11 @@ mod tests {
         assert!(next_budget.snapshot().used_bytes > 4_096);
 
         mgr.release(acquired, SessionState::Closed).await;
+        // This test still owns the closed session Arc. Its shell stays
+        // charged until that last reference is dropped.
+        assert!(next_budget.snapshot().used_bytes > 0);
+        assert!(next_budget.snapshot().used_bytes < original_used);
+        drop(entry);
         assert_eq!(next_budget.snapshot().used_bytes, 0);
         assert_eq!(next_budget.snapshot().active_reservations, 0);
     }
@@ -1454,6 +1484,103 @@ mod tests {
             !mgr.continuation_was_claimed(&scope, &[" call-a".to_string()])
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_continuation_claim_batch_rejects_atomically_and_expires_parent_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mgr = CursorSessionManager::with_parent(Duration::from_secs(1), 4, parent.clone());
+        let scope = CursorSessionScope::fixture("claims-memory");
+        mgr.claim_continuation_ids(&scope, &["call-a".to_string()])
+            .await
+            .unwrap();
+        let used = parent.snapshot().used_bytes;
+        assert!(used > 0);
+        parent.configure_limit(Some(used * 2 + 1));
+        let batch = vec!["call-b".to_string(), "call-c".to_string()];
+        assert_eq!(
+            mgr.claim_continuation_ids(&scope, &batch).await,
+            Err(CursorContinuationClaimError::MemoryCapacityExhausted)
+        );
+        assert!(!mgr.continuation_was_claimed(&scope, &batch).await);
+        assert_eq!(parent.snapshot().used_bytes, used);
+        for entry in mgr.inner.continuation_claims.write().await.values_mut() {
+            entry.value = Instant::now() - Duration::from_secs(2);
+        }
+        assert!(
+            !mgr.continuation_was_claimed(&scope, &["call-a".to_string()])
+                .await
+        );
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_closed_session_releases_bulk_capacity_but_charges_lingering_arc() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mgr = CursorSessionManager::with_parent(Duration::from_secs(60), 4, parent.clone());
+        let budget = RequestMemoryBudget::with_parent(128 * 1024, parent.clone());
+        let key = session_key(&CursorSessionScope::fixture("closed-shell"));
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![serde_json::json!({"content":"x".repeat(8192)})],
+                "/workspace".repeat(1024),
+            )
+            .await
+            .unwrap();
+        entry.lock().await.attach_request_memory(&budget).unwrap();
+        let used = parent.snapshot().used_bytes;
+        mgr.release(entry.clone(), SessionState::Closed).await;
+        assert!(!mgr.has(&key).await);
+        {
+            let session = entry.lock().await;
+            assert_eq!(session.semantic_items.capacity(), 0);
+            assert_eq!(session.working_directory.capacity(), 0);
+            assert_eq!(session.blob_store.capacity(), 0);
+            assert_eq!(session.pending_tool_calls.capacity(), 0);
+            assert_eq!(session.state, SessionState::Closed);
+        }
+        assert!(parent.snapshot().used_bytes > 0);
+        assert!(parent.snapshot().used_bytes + 8192 < used);
+        drop(entry);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_parent_pressure_during_parked_transfer_preserves_original_owner() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mgr = CursorSessionManager::with_parent(Duration::from_secs(60), 4, parent.clone());
+        let original = RequestMemoryBudget::with_parent(64 * 1024, parent.clone());
+        let next = RequestMemoryBudget::with_parent(64 * 1024, parent.clone());
+        let key = session_key(&CursorSessionScope::fixture("parked-parent"));
+        let entry = mgr
+            .reserve(
+                key.clone(),
+                CursorProtocolRail::OAuthCli,
+                HashMap::new(),
+                Vec::new(),
+                vec![serde_json::json!({"content":"x".repeat(4096)})],
+                String::new(),
+            )
+            .await
+            .unwrap();
+        entry.lock().await.attach_request_memory(&original).unwrap();
+        mgr.release(entry.clone(), SessionState::AwaitingToolResult)
+            .await;
+        let used = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(used));
+        let acquired = mgr.acquire(&key).await.unwrap();
+        assert!(acquired.lock().await.attach_request_memory(&next).is_err());
+        assert_eq!(original.snapshot().used_bytes, used);
+        assert_eq!(next.snapshot().used_bytes, 0);
+        assert!(next.snapshot().exhausted);
+        mgr.release(acquired, SessionState::Closed).await;
+        drop(entry);
+        assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
     #[tokio::test]

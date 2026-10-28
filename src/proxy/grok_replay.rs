@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use bytes::Bytes;
@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 use super::request_memory::{
     retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
@@ -24,7 +28,7 @@ const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_ITEMS: usize = 256;
 pub(crate) const TTL_MS: i64 = 30 * 60 * 1_000;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct GrokReplayScope(String);
 
 impl fmt::Debug for GrokReplayScope {
@@ -159,25 +163,31 @@ impl GrokReplaySnapshot {
     }
 }
 
-#[derive(Clone)]
 struct Entry {
     proof: Option<GrokReplayProof>,
     generation: u64,
     touched_at_ms: i64,
     expires_at_ms: i64,
     bytes: usize,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Default)]
 struct Store {
-    entries: HashMap<GrokReplayScope, Entry>,
+    entries: BTreeMap<GrokReplayScope, Entry>,
     generation: u64,
     total_bytes: usize,
 }
 
-#[derive(Default)]
 pub(crate) struct GrokReplayCache {
     store: Mutex<Store>,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for GrokReplayCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl fmt::Debug for GrokReplayCache {
@@ -187,6 +197,13 @@ impl fmt::Debug for GrokReplayCache {
 }
 
 impl GrokReplayCache {
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            store: Mutex::new(Store::default()),
+            parent,
+        }
+    }
+
     pub(crate) async fn snapshot(
         &self,
         scope: &GrokReplayScope,
@@ -194,8 +211,15 @@ impl GrokReplayCache {
     ) -> GrokReplaySnapshot {
         let mut store = self.store.lock().await;
         prune(&mut store, now_ms);
-        if !store.entries.contains_key(scope) {
-            reserve(&mut store, scope.clone(), now_ms);
+        if !store.entries.contains_key(scope)
+            && !reserve(&mut store, scope.clone(), now_ms, &self.parent)
+        {
+            // Optional replay cannot publish without an admitted CAS owner.
+            // A fresh uninstalled generation also fences older writers.
+            return GrokReplaySnapshot {
+                generation: next_generation(&mut store),
+                bytes: 0,
+            };
         }
         let entry = store.entries.get_mut(scope).expect("scope is reserved");
         entry.touched_at_ms = now_ms;
@@ -221,8 +245,17 @@ impl GrokReplayCache {
     > {
         let mut store = self.store.lock().await;
         prune(&mut store, now_ms);
-        if !store.entries.contains_key(scope) {
-            reserve(&mut store, scope.clone(), now_ms);
+        if !store.entries.contains_key(scope)
+            && !reserve(&mut store, scope.clone(), now_ms, &self.parent)
+        {
+            return Ok((
+                None,
+                GrokReplaySnapshot {
+                    generation: next_generation(&mut store),
+                    bytes: 0,
+                },
+                None,
+            ));
         }
         let entry = store.entries.get_mut(scope).expect("scope is reserved");
         entry.touched_at_ms = now_ms;
@@ -277,6 +310,10 @@ impl GrokReplayCache {
             return false;
         }
         remove(&mut store, &scope);
+        let Some(memory) = self.parent.reserve(entry_retained_bytes(&scope, bytes)) else {
+            // Do not expose the superseded proof again after a failed update.
+            return false;
+        };
         let generation = next_generation(&mut store);
         store.total_bytes = store.total_bytes.saturating_add(bytes);
         store.entries.insert(
@@ -287,6 +324,7 @@ impl GrokReplayCache {
                 touched_at_ms: now_ms,
                 expires_at_ms: now_ms.saturating_add(TTL_MS),
                 bytes,
+                _memory: memory,
             },
         );
         enforce_limits(&mut store);
@@ -304,7 +342,7 @@ impl GrokReplayCache {
             return false;
         }
         remove(&mut store, scope);
-        reserve(&mut store, scope.clone(), now_ms);
+        reserve(&mut store, scope.clone(), now_ms, &self.parent);
         true
     }
 
@@ -330,7 +368,25 @@ fn next_generation(store: &mut Store) -> u64 {
     store.generation
 }
 
-fn reserve(store: &mut Store, scope: GrokReplayScope, now_ms: i64) {
+fn entry_retained_bytes(scope: &GrokReplayScope, proof_bytes: usize) -> usize {
+    // A sparse B-tree node per entry is deliberately conservative. Deletion
+    // frees nodes, unlike retaining the high-water capacity of a HashMap.
+    std::mem::size_of::<(GrokReplayScope, Entry)>()
+        .saturating_add(std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12)
+        .saturating_add(scope.0.capacity())
+        .saturating_add(proof_bytes)
+}
+
+fn reserve(
+    store: &mut Store,
+    scope: GrokReplayScope,
+    now_ms: i64,
+    parent: &ResidentMemoryBudget,
+) -> bool {
+    let Some(memory) = parent.reserve(entry_retained_bytes(&scope, 0)) else {
+        return false;
+    };
     let generation = next_generation(store);
     store.entries.insert(
         scope,
@@ -340,9 +396,11 @@ fn reserve(store: &mut Store, scope: GrokReplayScope, now_ms: i64) {
             touched_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(TTL_MS),
             bytes: 0,
+            _memory: memory,
         },
     );
     enforce_limits(store);
+    true
 }
 
 fn remove(store: &mut Store, scope: &GrokReplayScope) {
@@ -352,15 +410,14 @@ fn remove(store: &mut Store, scope: &GrokReplayScope) {
 }
 
 fn prune(store: &mut Store, now_ms: i64) {
-    let expired = store
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.expires_at_ms <= now_ms)
-        .map(|(scope, _)| scope.clone())
-        .collect::<Vec<_>>();
-    for scope in expired {
-        remove(store, &scope);
-    }
+    store.entries.retain(|_, entry| {
+        if entry.expires_at_ms > now_ms {
+            true
+        } else {
+            store.total_bytes = store.total_bytes.saturating_sub(entry.bytes);
+            false
+        }
+    });
 }
 
 fn enforce_limits(store: &mut Store) {
@@ -381,8 +438,7 @@ fn valid_proof_bytes(proof: &GrokReplayProof) -> Option<usize> {
     if proof.calls.is_empty() || proof.calls.len() > MAX_CALLS {
         return None;
     }
-    let bytes = serde_json::to_vec(proof).ok()?.len();
-    (bytes <= MAX_ENTRY_BYTES).then_some(bytes)
+    crate::infra::resident_memory::serialized_json_bytes(proof, MAX_ENTRY_BYTES)
 }
 
 #[derive(Debug)]
@@ -1067,6 +1123,120 @@ mod tests {
         assert_eq!(exact.snapshot().used_bytes, retained);
         drop(reservation);
         assert_eq!(exact.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn grok_r4_replay_cache_and_request_clone_have_independent_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = GrokReplayCache::with_parent(parent.clone());
+        let scope = GrokReplayScope("resident-scope".into());
+        let snapshot = cache.snapshot(&scope, 1).await;
+        let tombstone_bytes = parent.snapshot().used_bytes;
+        assert!(tombstone_bytes > 0);
+        let proof = proof();
+        let proof_bytes = proof.retained_bytes();
+        assert!(
+            cache
+                .replace_if_unchanged(scope.clone(), snapshot, proof, 2)
+                .await
+        );
+        let cache_bytes = parent.snapshot().used_bytes;
+        assert!(cache_bytes > tombstone_bytes);
+        let request = RequestMemoryBudget::with_parent(proof_bytes, parent.clone());
+        let (copy, _, memory) = cache
+            .get_accounted(&scope, 3, Some(&request))
+            .await
+            .unwrap();
+        assert!(copy.is_some());
+        assert_eq!(parent.snapshot().used_bytes, cache_bytes + proof_bytes);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, proof_bytes);
+        drop(copy);
+        drop(memory);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn grok_r4_replay_capacity_miss_cannot_install_an_unowned_generation() {
+        let parent = ResidentMemoryBudget::new(Some(0));
+        let cache = GrokReplayCache::with_parent(parent.clone());
+        let scope = GrokReplayScope("rejected-scope".into());
+        let rejected = cache.snapshot(&scope, 1).await;
+        assert_eq!(cache.entry_count().await, 0);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(cache
+            .get_accounted(&scope, 2, None)
+            .await
+            .unwrap()
+            .0
+            .is_none());
+        parent.configure_limit(None);
+        let current = cache.snapshot(&scope, 3).await;
+        assert_ne!(rejected.generation(), current.generation());
+        assert!(
+            !cache
+                .replace_if_unchanged(scope.clone(), rejected, proof(), 4)
+                .await
+        );
+        assert!(cache.replace_if_unchanged(scope, current, proof(), 5).await);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn grok_r4_replay_rejected_replacement_invalidates_the_old_proof() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = GrokReplayCache::with_parent(parent.clone());
+        let scope = GrokReplayScope("replacement-scope".into());
+        let initial = cache.snapshot(&scope, 1).await;
+        assert!(
+            cache
+                .replace_if_unchanged(scope.clone(), initial, proof(), 2)
+                .await
+        );
+        let old = cache.snapshot(&scope, 3).await;
+        parent.configure_limit(Some(0));
+        assert!(
+            !cache
+                .replace_if_unchanged(scope.clone(), old, proof(), 4)
+                .await
+        );
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(cache.proof_count().await, 0);
+        assert!(!cache.delete_if_unchanged(&scope, old, 5).await);
+    }
+
+    #[tokio::test]
+    async fn grok_r4_replay_expiry_eviction_and_delete_release_resident_owners() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = GrokReplayCache::with_parent(parent.clone());
+        let scope = GrokReplayScope("evicted-scope".into());
+        let old = cache.snapshot(&scope, 0).await;
+        let each = parent.snapshot().used_bytes;
+        for index in 0..MAX_ENTRIES {
+            cache
+                .snapshot(&GrokReplayScope(format!("entry-{index}")), 1)
+                .await;
+        }
+        assert_eq!(cache.entry_count().await, MAX_ENTRIES);
+        assert!(
+            !cache
+                .replace_if_unchanged(scope.clone(), old, proof(), 2)
+                .await
+        );
+        let current = cache.snapshot(&scope, TTL_MS + 2).await;
+        assert_eq!(cache.entry_count().await, 1);
+        assert_eq!(parent.snapshot().used_bytes, each);
+        assert!(cache.delete_if_unchanged(&scope, current, TTL_MS + 3).await);
+        assert_eq!(parent.snapshot().used_bytes, each);
+        assert!(
+            !cache
+                .replace_if_unchanged(scope, current, proof(), TTL_MS + 4)
+                .await
+        );
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert_eq!(parent.snapshot().active_reservations, 0);
     }
 
     #[test]

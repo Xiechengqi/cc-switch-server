@@ -212,6 +212,7 @@ URL 模式不会返回伪造或上游私有 URL。Server 将解码后的图片�
 - payload 先以 `0600` 数据文件原子落盘，随后才提交带长度、MIME、SHA-256 和过期时间的元数据；所有读写通过同一锁文件串行化。因此同一目录中的 URL 可跨进程重启继续使用，也可由挂载该目录的其他副本读取。
 - 多副本共享目录必须支持跨进程 advisory file lock、同一文件系统内的 atomic rename 和目录同步，并让所有副本以兼容的文件权限访问。无法满足这些条件时，每个副本使用独立 store，并对生成请求及后续 GET/HEAD 配置粘性回源。
 - 下载响应带 `private, no-store`、`nosniff`、准确 Content-Type/Length，不应被 Cloudflare Cache、浏览器或下游代理持久化。
+- GET 在读取 payload 前向进程父预算准入；分配大小取已校验 metadata 长度，并核对文件长度、读取末端和 SHA-256。返回 Bytes 的最后一个 clone/slice 释放才归还 payload owner。HEAD 也完整验证 SHA，但只使用最多 64 KiB 的可复用 buffer，返回原始 Content-Length 与空 body。容量拒绝返回本地 503，不删除仍有效的文件；256 MiB 是磁盘总量上限，不是进程内存阈值。
 - public origin 固定使用 Router 签名 ingress context 中的 Share host，并生成 HTTPS URL；普通 Host、forwarded header 和环境变量都不能改写它。
 
 ### Cloudflare Proxy
@@ -237,8 +238,13 @@ Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provid
 - fallback 复用原 `ProviderExecution`、账号、workspace、session、request body 和 in-flight lease，不重新进入 Router。
 - 首次握手/HTTP 401 只强刷原账号一次；不会借 fallback 获得额外的 refresh 或 Provider failover 次数。
 - `response.create` 一旦成功发送到上游，后续失败只终止当前 lifecycle，不重放整个请求。
-- 一个上游写入尚未完成时，writer actor 使用容量 8 的有界队列，只接受顶层 `type=response.steer`，或带非空字符串 `response_id` 的 `type=response.interrupt` Text/Binary 帧，并保持原始 wire bytes；控制帧计入同一请求内存预算。队列满、第二个 `response.create`、嵌套伪装及 Grok/其他 Provider 数据帧仍按原有规则拒绝，不阻塞 WebSocket Ping/Pong 或下游取消。
-- 当前 WebSocket 桥接只向活动上游连接转发 `response.interrupt`；同一物理连接内已观测终态的响应 ID，其迟到中断幂等忽略，未知空闲 ID 则收到不含 ID 的本地错误帧。终态 ID 记录有界且不跨连接复用。HTTP fallback 的发送、退避及 SSE 读取期间收到顶层 `response.interrupt` 时，会返回不回显客户端 ID 的本地错误帧并继续当前 HTTP 轮次；无效 ID 也只返回本地错误。此路径尚不能通过 WebSocket 数据帧取消本地 HTTP 请求，不是完整的跨传输中断实现。
+- 一个上游写入尚未完成时，writer actor 使用容量 8 的有界队列，只接受顶层 `type=response.steer`，或带非空且至多 512 bytes 的 `response_id`、精确 `mode=discard_partial_items` 的 `type=response.interrupt` Text/Binary 帧（中断还须匹配当前物理连接和活动 response），并保持原始 wire bytes；控制帧计入同一请求内存预算。队列满、第二个 `response.create`、嵌套伪装及 Grok/其他 Provider 数据帧仍按原有规则拒绝，不阻塞 WebSocket Ping/Pong 或下游取消。
+- 原生中断只发送到同一物理连接、精确活动 response；重复请求不再次发网，同连接已结束 ID 的迟到请求幂等忽略，未知/错 ID 或非法 mode 只返回不回显请求 ID 的本地错误。已结束 ID 最多 32 条且不跨连接。
+- 原生 `response.interrupt.accepted/failed` 是控制结果，保留上游原始 ACK 内容；`failed.error` 不能改记为生成失败，ACK 也不计首 token、生成终态或 idle 进展。未请求、重复、错 ID/连接的 ACK 不交给其他轮次；真实生成错误仍独立终止生成。
+- 中断排队后最多等待真实 ACK 30 秒。生成终态先到仍等待 ACK，并拒绝下一轮 create；ACK 到齐前的连接不能回池。ACK 缺失返回本地 `response.interrupt.failed/error.code=interrupt_acknowledgement_missing`（`error.source=proxy`）并丢弃连接，不重连、不重放。已结束的生成不再制造第二个终态或 usage。
+- HTTP fallback 的发送/退避阶段收到中断时保持本地拒绝；SSE 读取阶段只有精确匹配的有效中断才收到本地 `response.interrupt.failed/error.code=interrupt_not_supported`（`error.source=proxy`），原生成继续。HTTP 无法确认厂商停止或履行 `discard_partial_items`，因此不伪造 accepted/incomplete，不丢弃部分 output。实际关闭客户端连接仍走现有取消和 usage 路径。
+- 精确闭集及形状的 `response.metadata`、`codex.response.metadata`、`codex.rate_limits`、`rate_limits.updated` 独立于业务内容：不推进首 token、业务提交或 first/idle deadline；活动响应前置帧仍有界缓冲，空闲期迟到 metadata 不交给下一轮。未知类型/字段保留原有保守业务语义，错误优先。账户额度观察与本次 token 用量仍是不同入口；R4-CX-02 的方言和异步发布合同见下文。
+- SSE 可见集合没有扩大：普通客户端仍过滤私有 metadata，native Codex SSE 的额外允许项仍只有 `codex.response.metadata`；SSE event 名和 payload.type 冲突继续拒绝。metadata 不计首内容并不撤销已发出 create 的 transport 提交。
 - 上游 Text/Binary 业务帧必须是顶层 JSON object；坏 JSON、scalar 和 array 都按协议错误终止，即使 `CC_SWITCH_PROXY_SEMANTIC_GUARD_ENABLED=0` 也不会绕过这项 transport 校验。WebSocket Ping/Pong/Close 控制帧仍按协议独立处理。
 - `codexWebsocketEnabled=false` 可关闭 WS，但不影响 POST Responses HTTP/SSE。
 
@@ -317,9 +323,11 @@ OAuth refresh 在账号单飞锁内完成，并在发布新 token 前持久化�
 
 本地 Responses SSE 检查器一旦在 `push` 或 `finish` 拒绝协议、容量或缺失终态错误，后续调用不能将同一条流恢复为成功，已记录的成功终态也不再对外可见。首次错误保留原有分类，后续错误使用固定本地文字；正常 `response.completed`、失败/不完整终态和可选唯一 `[DONE]` 的处理不变。此规则不修改 Codex OAuth 出站 wire，也不能替代五项真实 operation receipt。
 
-## WebSocket 降级 HTTP 后的中断（2026-10-13）
+## WebSocket 降级 HTTP 后的中断（R4，2026-10-27）
 
-Codex WebSocket 转 HTTP 流式回退后，只有当前 HTTP 响应已发出带非空、有界 `response.id` 的 `response.created`，且下游 `response.interrupt.response_id` 与它精确相等，才在本地停止读取该轮 HTTP 流。若上游尚未报错，桥接先补发尚未提交的生命周期帧，再发送 `response.incomplete`（`incomplete_details.reason=interrupted`），保留已完成的输出项；用量记录为 499/`client_cancelled`。若上游 `error` 已先到达，即使随后收到匹配 ID 的中断，也以 `response.failed` 和 Provider 失败结算，不把既有错误改记为客户端取消。同一客户端 WebSocket 可开始下一轮。未知、非法或未观测 ID 继续收到不回显 ID 的本地错误，原 HTTP 轮次不受影响；普通并发请求仍禁止。合成终态不声称包含上游最终 usage，也不保证私有上游接受以该响应 ID 续链；真实账号验收不在当前实施 goal 内，相关 rail 仍为 `live_pending`。
+此前按匹配 ID 在本地停止读取并合成 `response.incomplete`，不能证明上游接受中断，也不能保证已完成/部分 item、previous-response 和最终 usage 的一致性。R4 改为上述明确 unsupported 合同，保留已输出数据并继续当前生成。若真实生成 error 已先到达，后续有效匹配中断仍先收口该真实 `response.failed`；不能把它改记为客户端取消或控制成功。
+
+当前工作树的 metadata/control 分类与中断状态是本仓离线协议修复。phase 采用下述标准文本降级合同；独立缓存及下述临时工作集已接入父预算；统一性能里程碑及回退 WS 写入观测已实现，实际 Server 小样本已通过，正式测量与本类 review 仍在进行；五项真实 operation receipt 保持 `live_pending`。参考源码和 loopback 测试不证明厂商接受性，也不证明当前工作树具有 implementation commit。
 
 ## 非目标
 
@@ -327,3 +335,79 @@ Codex WebSocket 转 HTTP 流式回退后，只有当前 HTTP 响应已发出带�
 - 不实现 quota spillover、cooldown 换号、401 换号或跨 Provider 自动故障转移。
 - 不允许用 Provider endpoint override、环境变量或请求 header 改写 OAuth/JWKS/ChatGPT 生产 trust boundary。
 - 不保证上游账号自身的订阅、风控、地域和模型 entitlement。
+
+
+## 被动额度观察与进程父预算（R4，2026-10-27）
+
+`rate_limits.primary/secondary`（`window_minutes`）及旧 `rate_limit.primary_window/secondary_window`（`limit_window_seconds`）映射为同一稀疏快照；`response.metadata` / `codex.response.metadata` 只采用额度头白名单。绝对 reset 优先于相对值，乘法、加法和窗口边界均检查；无效/溢出值不成为期限。每个显式 bucket selector 都必须是默认 `codex`，额外 metered/Spark bucket 和混合方言不覆盖主窗口。missing 不变成零，显式 `0`、`false` 保留；credits 只有同时存在两个合法布尔标志才更新，未提供 balance 时保留旧值。每字段按观察时间合并，时间相同的冲突保留先前值，重复帧幂等。
+
+HTTP 和 WS 入口提取有界快照后立即返回；最多 64 个排队身份，每项向进程父预算保守预留 8 KiB，100ms 合并批次，数据库失败最多尝试三次。队列满、预算拒绝、关闭观察或持久化失败不影响当前生成，也不请求额外生成/刷新/试号；既有权威 quota 查询负责恢复。`CC_SWITCH_CODEX_QUOTA_OBSERVER=0` 可关闭新入口；该环境项在 ServerState 加载时固定，更改需重启。队列不保留原始帧、请求、credentials 或 routing headers。
+
+发布由 state 域方法完成，核对 Provider revision/绑定、账号 incarnation、auth/token generation 及权威查询时间；旧 token、删除重建账号及乱序字段不能污染新快照。`Account.codexPassiveQuota` 是带时间的被动观察，不修改本次 token 统计、权威 quota 查询结果或账号 cooldown。只有经过审核的 weekly duration/reset 才进入既有 quota-cycle 观察，仍有精确身份和 token 栅栏；不能把 metadata 当成新的 Share 消耗。重启保留已持久化快照，不恢复进行中的队列；过期观察不能作为新周期的 fresh 证据。
+
+现有 request reservations 共用进程父账本，默认 `CC_SWITCH_PROCESS_MEMORY_BUDGET_MB=0` 仅观测，可按部署测量配置硬上限。父预算不足时子预算不增加，当前请求保持 sticky exhausted；缩容和 RAII 释放不受阈值下降或 exhaustion 阻挡，Bytes 的共享 owner 只记一次。指标 `cc_switch_process_resident_memory_*` 是逻辑保留字节及 owners/rejections，不代表 RSS，配置、运行库内存和尚未接入的独立缓存不在这个口径内。各 Provider 的缓存归属和容量验收仍需逐类 review。
+
+Codex 独立缓存也使用同一父账本：模型目录按模型/能力字符串及固定容量索引保留 owner；previous-response 缓存另计 JSON 分配容量、完整 scope、索引估值与 tombstone。其原有 64 MiB/8 MiB 上限继续指编码字节，新 `current_retained_bytes` / `high_water_retained_bytes` 指标与之区分。缓存容量拒绝不会改变账号健康或触发重放；所需 previous-response 上下文缺失仍沿用原有严格拒绝合同，不能退化成新会话。
+
+previous-response 注入的临时工作集与长期缓存分开核算。state 在持锁回调中借用缓存，proxy 先准入再复制工具项，不再深拷贝整个缓存或当前 input。JSON 解析前使用有界结构估值准入，成功后以 retained capacity 加工具配对索引估值调整；lookup 完整 scope 临时 key 也在克隆前预留。去重/清理/合并与精确长度的再序列化都有请求/父预留。HTTP 输出接回现有 Bytes owner；WS 输出预留移交到 turn normalized owner。当前处理容量不足时保留 capacity 错误，不伪装成 required-context miss、不处罚 Provider，也不触发 HTTP replay；真正身份隔离或缺失上下文仍保留原有严格合同。解析器/集合索引仍是逻辑估值，不能等同 RSS。
+
+WS reader 在活动 turn 使用原请求 reservation，在空闲期使用父 reservation；帧排队后切换 turn 不改写其 owner，也不重复计费。完整读消息随 owner 一起移交，最后释放时才归还；读队列满时等待中的帧也被核算。连接 wrapper、队列槽位和连接池索引使用有界逻辑估值，reader/writer 任务持有共享 owner，abort 后任务真正退出才全部释放。空闲帧超过父预算时丢连接、走本地 capacity 错误，不重放生成；缓存索引无法准入时仅不缓存连接。
+
+referral 的会话 key/entry/索引 owner 随缓存和进行中的客户端 clone 保留，淘汰不提前释放仍在使用的 owner。原有 64 会话、每 host 最多 2 个 idle 连接继续生效。Reqwest 的 cookie、TLS、HTTP 池和 Tokio/Tungstenite 内部占用不在直接可核算范围内；索引估值也不是精确 allocator 数字，仍需结合实际 Server RSS 采样决定部署硬阈值。
+
+
+## 压缩候选的初始测量（R4-CX-05，未启用新 wire）
+
+独立探针 `scripts/bench/codex-request-compression.py` 只用宿主 libzstd 3级压缩合成 JSON，不启动 Server、不发请求、不执行参考项目；冻结数据见 `assets/contract/codex-r4-compression-probe.json`。本次每组51次、libzstd 1.4.8，背景有 Rust 编译与后端测试；输入和探针 SHA-256 已记录，解压逐字节一致。下表是编码器 CPU 与 body 字节，不能解释为真实传输、Rust Server RSS、TTFT、取消释放或厂商接受性。
+
+| 合成样本 | 原始 body | zstd body | 编码 CPU p50 / p95 / p99（ms） |
+| --- | ---: | ---: | --- |
+| short | 55 | 64 | 0.004349 / 0.004489 / 0.00547 |
+| long_history | 976896 | 4138 | 0.187492 / 0.222197 / 0.33589 |
+| tool_history | 1467494 | 400524 | 7.519249 / 7.588899 / 7.672596 |
+| base64_entropy | 1048625 | 786942 | 1.402079 / 1.538795 / 1.608276 |
+
+短请求出现体积增大，工具历史有明显 CPU 成本；高度重复的长历史压缩率不能代表所有真实请求。各 worker 的峰值 RSS 增量约 0.4～4.0 MB，只反映此 Python/libzstd 探针的构造、压缩和回环校验。当前继续保持原有出站编码，未新增 Content-Encoding、协商式下游压缩或 WS 压缩。同输入实际Server的四路径时间/取消/慢读与整进程RSS已独立冻结，见下文；该基线没有启用压缩，也不能证明压缩后网络收益或真实端点接受性。本轮决定维持当前编码并关闭候选；未来启用仍需端点/rail接受回执、codec scratch预算及flush/重试合同，不采用通用400/415后明文重发。
+
+
+## message phase 的映射与回放边界（R4-CX-01）
+
+| 路径 | phase 合同 |
+| --- | --- |
+| 原生 Responses 请求、JSON 与 SSE | 保留原 message item 的 phase；工具和真实 reasoning 走各自原有路径 |
+| Responses → Messages | commentary/final_answer 均为公开 text；每个 message item 独立文本块，保留顺序。标准 Messages 无 phase 字段，回放只能恢复普通 assistant 文本 |
+| Responses → Chat | commentary/final_answer 按顺序合并为标准 content；真实 reasoning 仍独立，标准 Chat 无 phase 字段，不能从 content 反推原阶段 |
+| Responses 历史 → 其他协议 | 明确降级为普通 assistant 文本；不制造 phase、thinking 签名或 encrypted_content，也不增加依赖私有 marker 的旁路协议 |
+
+流式转换按 item identity 捕获 commentary/final_answer；稀疏 done 缺 phase 时保留已捕获值，冲突或未知值归为固定 unrecognized 分类，不保留任意原字符串。原有每 item 的 delta 去重继续使用；独立 completed 集合保证 done-only 的最终回答仍输出一次，重复旧 item 的快照不能关闭更新的文本块。缺 phase 的旧请求继续使用普通文本规则。
+
+`cc_switch_responses_phase_downgrade_total` 仅使用有界 target、direction、phase 标签，每次转换对每种显式阶段最多记录一次，区分请求历史降级和响应降级。没有以公开 commentary 冒充 reasoning；真正的 encrypted reasoning 仍使用既有带认证封装回放，文本与工具不借用其签名。转换状态中的 phase、item identity、去重集合、工具参数及 usage 保留量计入单请求预算和进程父账本；没有新增跨请求 phase cache。此合同有意保留文本，不承诺在缺少标准载体的协议上无损恢复阶段。
+
+
+## 转发时间观测（R4-CORE-03）
+
+`cc_switch_forward_milestone_seconds` 记录本地单调时钟里程碑；`scope=request/attempt` 分开统计。HTTP request 的起点是进入转发器，已经过 API 入口鉴权和 body 接收；WS 每个 `response.create` 从收到数据帧开始，连接握手前的入口处理不在该 turn 内。attempt 从本次准备开始，重试等待另计，不重置 request 起点。原有 `first_token_ms` 起点和用量合同保持不变。
+
+| phase | 含义与适用范围 |
+| --- | --- |
+| admission / send_started / headers | 已通过 Share/账号转发准入、开始发请求、收到 HTTP 或新 WS 握手响应头；复用 WS 连接不虚构新响应头 |
+| first_semantic | 沿已有审核分类观察到首个 Business；metadata、control、心跳、空启动和单独终态不制造内容，未知事件仍按既有保守分类 |
+| http_body_handoff | 非空 data frame 交给 HTTP Body 的调用方；不证明 socket 写完或客户端已读 |
+| upstream_write_completed / downstream_write_completed | 本地 WS sink 的发送操作返回成功；队列项绑定入队时的 attempt，保守 `Sent` 返回不代替 writer 成功 |
+| terminal | attempt 的语义终态；request 只发布最终接受 attempt 的终态时间，失败后恢复的中间 attempt 不提前结束 request |
+| owner_released | 最后一个已核算的 request budget owner 销毁；尚存 Bytes clone/slice 或 actor 持有者时不提前报告，不能解释为全进程 RSS 已归还 |
+
+`cc_switch_forward_wait_seconds` 区分 retry、headers、upstream_read、upstream_write、downstream_write、downstream_demand、cancel_drain。读取区间限于实际等待调用，不跨 HTTP yield 把下游暂停算成上游读取；downstream_demand 是两次取 body 之间的时间，不是 socket 写耗时。cancel_drain 只表示明确取消至已核算 owner 的末次释放，不代替异步用量结算完成。并行区间可能重叠，不得相加成 request 总耗时。
+
+`cc_switch_forward_timelines_total` 和 `cc_switch_forward_duration_seconds` 使用 complete/incomplete/failed/cancelled/retried/unfinished 有界结果；未归类异常及没有受审核终态的路径保留 unfinished，不推断成功。所有新标签仅含固定 Provider 类型、surface、scope、phase、result，不含账号、用户、session、response ID、模型名或工具参数。这些观测不驱动重试、终态、token、Share 限额或 Provider 健康策略。部分功能关闭时可缺少相应里程碑。
+
+本切片只证明上述观测与既有转发/资源语义的离线合同。同输入实际Rust Server的p50/p95/p99、取消、阻塞与整进程RSS已完成下文的离线测量；它不证明生产提速或厂商接受。本类选择本轮保持现有HTTP/下游/WS编码，真实接受性继续live_pending。
+
+
+## 实际 Server 测量与本轮压缩决定
+
+`scripts/bench/codex-server-probe.py` 显式运行 Linux 下的独立 ignored 测试，装配真实 API router 和正常签名 Share ingress，只使用固定合成绑定和启动前核对过的回环 HTTP/WS runtime plan。子进程清除显式出站代理并固定进程父预算为0（仅观测），不改变正常 Server 的配置。四种输入复用 codec 探针生成器；native WS、WS HTTP fallback、HTTP SSE、HTTP JSON 与取消/8 MiB慢读共22行，小样本已全部通过。正式报告已冻结在`assets/contract/codex-r4-server-probe.json`：19条普通/取消行各101次、三条慢读行各31次，合计2012次measured generation，另排除110次warmup；每次恰好一次上游生成，全部request owner及high-water回调达到预期。分位数按nearest-rank计算，31次慢读的p99等于该行最大值，完整数字见计划§20.4。
+
+每项5次warmup在最后request owner释放和high-water回调后排除；Server首语义内容、客户端首到达、终态、WS实际sink完成、取消drain和最后已核算owner释放分别统计，操作等待可以重叠。WS turn延迟不含连接握手，HTTP转发时钟不含先前API接收/鉴权。准备输入字节先于WS envelope，实际上游规范化应用字节另计，均不包含传输封装。
+
+慢读采用16个已完成512 KiB message item和稀疏终态重建，每个SSE未完成事件保持现有2 MiB上限；客户端每chunk/frame延迟5ms，HTTP分块仍由传输决定。RSS包含同一debug测试进程内Server、假上游、客户端、collector、sampler和allocator retention，不是隔离生产Server RSS或容量依据。仅观测默认值保持不变，未新增HTTP出站、下游或WS压缩。全部行的整进程采样RSS峰值为318.34 MiB；请求owner释放后，物理socket/actor owner仍可短暂保留，不能等同全进程逻辑量或RSS归零。本轮压缩候选以keep_current_encoding关闭，未来启用需独立端点接受、scratch预算、协商/flush/重试合同及传输收益。完整方法、数字、失败试运行边界和本类review见计划§20.4。

@@ -1,0 +1,122 @@
+{
+  "format": "cc-switch-codex-compression-codec-probe",
+  "schemaVersion": 1,
+  "capturedAt": "2026-10-27T10:09:37.421750+00:00",
+  "evidenceState": "offline_synthetic_codec_measurement",
+  "scriptSha256": "a274de853f304677baa524b38b44e965a92adf1588995b5f9f5182d1a71893ff",
+  "environment": {
+    "python": "3.10.12",
+    "system": "Linux",
+    "architecture": "x86_64",
+    "cpuCount": 16,
+    "backgroundLoad": "concurrent_rust_validation_and_backend_tests"
+  },
+  "networkRequests": 0,
+  "serverStarted": false,
+  "limits": [
+    "body_bytes_only_excludes_transport_headers_and_TLS",
+    "host_libzstd_is_not_the_Rust_server_build",
+    "worker_RSS_is_not_server_RSS_or_request_budget",
+    "does_not_measure_TTFT_cancellation_or_upstream_acceptance",
+    "not_a_production_performance_threshold"
+  ],
+  "results": [
+    {
+      "case": "short",
+      "inputSha256": "d6fea9d73fac1af837cbb2c5ba294d0d1e7d81e53db3d2a5610bc19ca0dfba95",
+      "plainBodyBytes": 55,
+      "zstdBodyBytes": 64,
+      "bodyBytesSavedPercent": -16.3636,
+      "samples": 51,
+      "level": 3,
+      "encoder": "one_shot_ZSTD_compress",
+      "libzstd": "1.4.8",
+      "encodingCpuMs": {
+        "p50": 0.004349,
+        "p95": 0.004489,
+        "p99": 0.00547
+      },
+      "encodingWallMs": {
+        "p50": 0.003697,
+        "p95": 0.003818,
+        "p99": 0.004699
+      },
+      "workerPeakRssBytes": 17379328,
+      "workerPeakRssIncreaseBytes": 417792,
+      "roundTripExact": true
+    },
+    {
+      "case": "long_history",
+      "inputSha256": "640dac0ab71b6b4ffab21476c3dd94322a457193ac065607b7e50dd3efda2d63",
+      "plainBodyBytes": 976896,
+      "zstdBodyBytes": 4138,
+      "bodyBytesSavedPercent": 99.5764,
+      "samples": 51,
+      "level": 3,
+      "encoder": "one_shot_ZSTD_compress",
+      "libzstd": "1.4.8",
+      "encodingCpuMs": {
+        "p50": 0.187492,
+        "p95": 0.222197,
+        "p99": 0.33589
+      },
+      "encodingWallMs": {
+        "p50": 0.186488,
+        "p95": 0.221122,
+        "p99": 0.334874
+      },
+      "workerPeakRssBytes": 22519808,
+      "workerPeakRssIncreaseBytes": 2179072,
+      "roundTripExact": true
+    },
+    {
+      "case": "tool_history",
+      "inputSha256": "25f070dee57ad1daedd7b0a138db3cccbd1c20411bc5b9e2f534b476a9c2629d",
+      "plainBodyBytes": 1467494,
+      "zstdBodyBytes": 400524,
+      "bodyBytesSavedPercent": 72.7069,
+      "samples": 51,
+      "level": 3,
+      "encoder": "one_shot_ZSTD_compress",
+      "libzstd": "1.4.8",
+      "encodingCpuMs": {
+        "p50": 7.519249,
+        "p95": 7.588899,
+        "p99": 7.672596
+      },
+      "encodingWallMs": {
+        "p50": 7.528124,
+        "p95": 7.587835,
+        "p99": 7.671542
+      },
+      "workerPeakRssBytes": 25710592,
+      "workerPeakRssIncreaseBytes": 3981312,
+      "roundTripExact": true
+    },
+    {
+      "case": "base64_entropy",
+      "inputSha256": "131f748a0937f377a1b067e20a553fd804b4e0d7f00eaa1b73f082ef94c5e496",
+      "plainBodyBytes": 1048625,
+      "zstdBodyBytes": 786942,
+      "bodyBytesSavedPercent": 24.9549,
+      "samples": 51,
+      "level": 3,
+      "encoder": "one_shot_ZSTD_compress",
+      "libzstd": "1.4.8",
+      "encodingCpuMs": {
+        "p50": 1.402079,
+        "p95": 1.538795,
+        "p99": 1.608276
+      },
+      "encodingWallMs": {
+        "p50": 1.401094,
+        "p95": 1.5377,
+        "p99": 1.607208
+      },
+      "workerPeakRssBytes": 22654976,
+      "workerPeakRssIncreaseBytes": 1740800,
+      "roundTripExact": true
+    }
+  ],
+  "decision": "keep_current_outbound_encoding_pending_transport_and_endpoint_evidence"
+}

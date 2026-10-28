@@ -1,6 +1,7 @@
 pub mod capability_evidence;
 pub mod claude_quota;
 pub mod claude_subscription;
+pub mod codex_quota;
 pub mod cursor_import;
 pub mod grok_subscription;
 pub mod login;

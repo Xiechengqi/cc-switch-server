@@ -30,6 +30,24 @@ const objectDigest = (value) => sha256(JSON.stringify(canonical(value)));
 const commitPattern = /^[a-f0-9]{40}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 
+// Immutable observations describe their recorded Git objects. Current local
+// capabilities and R4 contracts are checked separately against the worktree.
+const targetObjectCache = new Map();
+function targetGitObject(kind, commit, filePath) {
+  const key = `${kind}:${commit}:${filePath ?? ""}`;
+  if (!targetObjectCache.has(key)) {
+    const args = kind === "tree"
+      ? ["rev-parse", `${commit}^{tree}`]
+      : ["show", `${commit}:${filePath}`];
+    const content = execFileSync("git", ["-C", root, ...args], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    targetObjectCache.set(key, kind === "tree" ? content.trim() : content);
+  }
+  return targetObjectCache.get(key);
+}
+
 assert(
   baseline.format === "cc-switch-antigravity-reference-delta" &&
     baseline.schemaVersion === 2 &&
@@ -202,20 +220,25 @@ for (const observation of baseline.observations ?? []) {
     `${observation.id} has an invalid target commit or tree`,
   );
   assert(target.baselineCommit !== target.implementationCommit, `${observation.id} has no target baseline delta`);
+  assert(
+    targetGitObject("tree", target.baselineCommit) === target.baselineTree &&
+      targetGitObject("tree", target.implementationCommit) === target.implementationTree,
+    `${observation.id} committed target tree drifted`,
+  );
   const targetSources = [];
   for (const contract of target.contracts ?? []) {
-    const localPath = path.resolve(root, contract.path || "");
     assert(
-      contract.path && localPath.startsWith(`${root}${path.sep}`) && fs.existsSync(localPath),
-      `${observation.id} target path is unavailable`,
+      typeof contract.path === "string" && contract.path &&
+        !path.isAbsolute(contract.path) && !contract.path.split("/").includes(".."),
+      `${observation.id} committed target path is unsafe`,
     );
-    const source = fs.readFileSync(localPath, "utf8");
+    const source = targetGitObject("file", target.implementationCommit, contract.path);
     targetSources.push(source);
     assert(
       Array.isArray(contract.anchors) &&
         contract.anchors.length > 0 &&
         contract.anchors.every((anchor) => source.includes(anchor)),
-      `${observation.id} target anchor is unavailable`,
+      `${observation.id} committed target anchor is unavailable`,
     );
   }
   assert(targetSources.length > 0, `${observation.id} has no implementation contracts`);
@@ -374,8 +397,105 @@ assert(
   "Antigravity current receipt extension or live gate changed",
 );
 
+const r4Ids = new Set(["R4-AG-01", "R4-AG-02", "R4-CL-02-DELEGATED"]);
+for (const review of baseline.r4Reviews ?? []) {
+  assert(r4Ids.delete(review.id), `unexpected or duplicate Antigravity R4 review ${review.id}`);
+  assert(
+    review.status === "working_tree_fixture_verified" &&
+      review.liveAcceptance === "live_pending" &&
+      ["adapt", "keep_delegated_contract"].includes(review.decision) &&
+      Number.isFinite(Date.parse(review.reviewedAt)),
+    `${review.id} claims an unsupported R4 evidence state`,
+  );
+  assert(Array.isArray(review.sources) && review.sources.length > 0, `${review.id} has no frozen sources`);
+  for (const source of review.sources) {
+    assert(
+      sourceById.has(source.sourceId) &&
+        commitPattern.test(source.snapshotCommit) && commitPattern.test(source.snapshotTree) &&
+        source.readMode === "read_only_committed_git_objects" &&
+        Array.isArray(source.files) && source.files.length > 0,
+      `${review.id} has an invalid R4 source snapshot`,
+    );
+    const sourceRoot = sourceRootById.get(source.sourceId);
+    if (checkSources) {
+      const tree = execFileSync("git", ["-C", sourceRoot, "rev-parse", `${source.snapshotCommit}^{tree}`], { encoding: "utf8" }).trim();
+      assert(tree === source.snapshotTree, `${review.id} source tree drifted`);
+    }
+    for (const file of source.files) {
+      assert(file.path && !path.isAbsolute(file.path) && !file.path.split("/").includes("..") && digestPattern.test(file.sha256), `${review.id} has an unsafe source file`);
+      if (checkSources) {
+        const content = execFileSync("git", ["-C", sourceRoot, "show", `${source.snapshotCommit}:${file.path}`], { encoding: null, maxBuffer: 64 * 1024 * 1024 });
+        assert(sha256(content) === file.sha256, `${review.id}:${file.path} source drifted`);
+      }
+    }
+  }
+  assert(
+    commitPattern.test(review.target?.baselineCommit) &&
+      review.target.implementationCommit === null && review.target.readMode === "working_tree" &&
+      Array.isArray(review.target.contracts) && review.target.contracts.length > 0,
+    `${review.id} must distinguish working-tree fixtures from committed implementation`,
+  );
+  assert(
+    review.validationScope?.execution === "isolated_working_tree_snapshot" &&
+      review.validationScope.baselineCommit === review.target.baselineCommit &&
+      JSON.stringify(review.validationScope.providerSlices) === JSON.stringify(["Claude", "Qoder", "Antigravity"]) &&
+      Number.isSafeInteger(review.validationScope.targetedAntigravityTests) &&
+      review.validationScope.targetedAntigravityTests > 0 &&
+      typeof review.validationScope.excludedConcurrentChanges === "string" &&
+      review.validationScope.excludedConcurrentChanges.includes("Share Market") &&
+      review.validationScope.liveAcceptance === "live_pending",
+    `${review.id} must preserve the isolated validation and concurrent-change boundary`,
+  );
+  for (const contract of review.target.contracts) {
+    assert(contract.path && !path.isAbsolute(contract.path) && !contract.path.split("/").includes(".."), `${review.id} target path is unsafe`);
+    const content = fs.readFileSync(path.join(root, contract.path), "utf8");
+    assert(Array.isArray(contract.anchors) && contract.anchors.length > 0 && contract.anchors.every((anchor) => content.includes(anchor)), `${review.id} fixture anchor is unavailable`);
+  }
+}
+assert(r4Ids.size === 0, "Antigravity R4 fixture coverage is incomplete");
+
+// The relocation of replay admission must retain current regression coverage;
+// successful verification of an old commit cannot satisfy these contracts.
+const residentReviewContracts = [
+  ["src/proxy/providers/antigravity/mod.rs", [".get_accounted(&scope, now_ms, request_memory)"]],
+  ["src/proxy/antigravity_replay/resident_tests.rs", [
+    "antigravity_r4_review_unadmitted_miss_cannot_publish_after_capacity_returns",
+    "antigravity_r4_review_request_copy_is_admitted_and_outlives_cache_entry",
+    "antigravity_r4_review_replacement_refusal_removes_old_proof_and_fences_late_writer",
+    "antigravity_r4_review_tombstone_count_expiry_and_drop_release_owners",
+    "antigravity_r4_review_wire_limit_counts_escapes_while_resident_counts_capacity",
+  ]],
+  ["src/clients/oauth/antigravity_models/resident_tests.rs", [
+    "antigravity_r4_review_catalog_snapshot_shares_payload_and_last_owner",
+    "antigravity_r4_review_catalog_refusal_is_uncached_current_and_fences_older_republication",
+    "antigravity_r4_review_catalog_revision_supersession_is_distinct_from_capacity_refusal",
+  ]],
+];
+for (const [filePath, anchors] of residentReviewContracts) {
+  const content = fs.readFileSync(path.join(root, filePath), "utf8");
+  assert(
+    anchors.every((anchor) => content.includes(anchor)),
+    `Antigravity resident review current contract is unavailable: ${filePath}`,
+  );
+}
+const r4Wire = JSON.parse(fs.readFileSync(path.join(root, "assets/contract/antigravity-r4-wire-delta.json"), "utf8"));
+assert(
+  r4Wire.format === "cc-switch-antigravity-r4-wire-delta" && r4Wire.schemaVersion === 1 &&
+    r4Wire.evidenceState === "local_fixture_expectations" &&
+    r4Wire.referenceExecution === "not_executed_read_only_committed_source_observations" &&
+    JSON.stringify(r4Wire.rails) === JSON.stringify(["antigravity_oauth", "agy_oauth"]),
+  "Antigravity R4 wire fixture evidence boundary changed",
+);
+assert(
+  ["thought", "carrier", "call_text_call"].every((shape) => r4Wire.cases?.[shape]?.expectedFunctionCalls?.length === 2) &&
+    r4Wire.currentToolPolicy?.mode === "NONE" && r4Wire.currentToolPolicy?.historyDoesNotAuthorizeCurrentCalls === true &&
+    JSON.stringify(r4Wire.streamIdentity?.expectedGlobalIndexes) === "[0,1,2]" &&
+    r4Wire.delegatedClaude?.liveAcceptance === "live_pending",
+  "Antigravity R4 wire matrix is incomplete",
+);
+
 console.log(
-  `antigravity reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations${
+  `antigravity reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${baseline.r4Reviews.length} R4 working-tree reviews${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

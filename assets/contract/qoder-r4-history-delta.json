@@ -1,0 +1,44 @@
+{
+  "format": "cc-switch-qoder-r4-history-delta",
+  "schemaVersion": 1,
+  "liveAcceptance": "live_pending",
+  "decision": "Preserve declared history independently of tool_choice; keep retired-history filtering until the corresponding Qoder rail accepts complete paired history in a real receipt.",
+  "referenceObservation": {
+    "commit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+    "path": "backend/internal/upstream/qoder/payload.go",
+    "anchors": ["QoderMessagesFromChatCompletions", "NormalizeQoderResponsesToolPairing", "NormalizeQoderToolCalls"],
+    "behavior": "Complete paired historical tool calls are not filtered by the current callable declaration list.",
+    "evidence": "read_only_source_observation_not_an_executed_reference_payload_or_live_receipt"
+  },
+  "cases": [
+    {
+      "id": "retired_namespace_cannot_acquire_current_flat_identity",
+      "responsesRequest": {
+        "model": "fixture-model",
+        "tools": [{"type": "function", "name": "a__b__c", "parameters": {"type": "object"}}],
+        "tool_choice": "none",
+        "input": [
+          {"type": "function_call", "call_id": "retired-call", "namespace": "a", "name": "b__c", "arguments": "{ \"path\" : \"original\" }"},
+          {"type": "function_call_output", "call_id": "retired-call", "output": "retired result"},
+          {"role": "user", "content": "continue"}
+        ]
+      },
+      "expectedPayloadProjection": {"toolNames": [], "historicalCallNames": [], "toolResults": [], "userText": "continue"}
+    },
+    {
+      "id": "explicit_reset_does_not_promote_historical_discovery",
+      "responsesRequest": {
+        "model": "fixture-model",
+        "tools": [],
+        "tool_choice": "none",
+        "input": [
+          {"type": "additional_tools", "tools": [{"type": "function", "name": "retired", "parameters": {"type": "object"}}]},
+          {"type": "function_call", "call_id": "retired-call", "name": "retired", "arguments": "{}"},
+          {"type": "function_call_output", "call_id": "retired-call", "output": "retired result"},
+          {"role": "user", "content": "continue"}
+        ]
+      },
+      "expectedPayloadProjection": {"toolNames": [], "historicalCallNames": [], "toolResults": [], "userText": "continue"}
+    }
+  ]
+}

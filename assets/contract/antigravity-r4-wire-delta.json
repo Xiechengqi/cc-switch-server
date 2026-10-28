@@ -1,0 +1,131 @@
+{
+  "format": "cc-switch-antigravity-r4-wire-delta",
+  "schemaVersion": 1,
+  "evidenceState": "local_fixture_expectations",
+  "referenceExecution": "not_executed_read_only_committed_source_observations",
+  "rails": [
+    "antigravity_oauth",
+    "agy_oauth"
+  ],
+  "projectionBoundary": "target fixture observes the full final v1internal HTTP request; compares tool declaration, NONE policy, ordered calls, IDs, arguments and signatures; dynamic request/session IDs are excluded from this projection",
+  "cases": {
+    "thought": {
+      "sourceShape": "signed thought followed by two unsigned parallel calls; caller omits private thought",
+      "expectedFunctionCalls": [
+        {
+          "functionCall": {
+            "id": "call-a",
+            "name": "lookup",
+            "args": {
+              "q": 1
+            }
+          },
+          "thoughtSignature": "opaque-r4-preceding-tool-signature"
+        },
+        {
+          "functionCall": {
+            "id": "call-b",
+            "name": "lookup",
+            "args": {
+              "q": 2
+            }
+          }
+        }
+      ]
+    },
+    "carrier": {
+      "sourceShape": "empty signed thought carrier followed by two unsigned parallel calls",
+      "expectedFunctionCalls": [
+        {
+          "functionCall": {
+            "id": "call-a",
+            "name": "lookup",
+            "args": {
+              "q": 1
+            }
+          },
+          "thoughtSignature": "opaque-r4-preceding-tool-signature"
+        },
+        {
+          "functionCall": {
+            "id": "call-b",
+            "name": "lookup",
+            "args": {
+              "q": 2
+            }
+          }
+        }
+      ]
+    },
+    "call_text_call": {
+      "sourceShape": "signed call, visible separator text, second independently signed call",
+      "expectedFunctionCalls": [
+        {
+          "functionCall": {
+            "id": "call-a",
+            "name": "lookup",
+            "args": {
+              "q": 1
+            }
+          },
+          "thoughtSignature": "opaque-r4-preceding-tool-signature"
+        },
+        {
+          "functionCall": {
+            "id": "call-b",
+            "name": "lookup",
+            "args": {
+              "q": 2
+            }
+          },
+          "thoughtSignature": "opaque-r4-second-tool-signature"
+        }
+      ]
+    }
+  },
+  "currentToolPolicy": {
+    "mode": "NONE",
+    "declaredTool": "lookup",
+    "historyDoesNotAuthorizeCurrentCalls": true
+  },
+  "continuation": {
+    "firstDownstream": "nonstream",
+    "secondDownstream": "stream",
+    "sameCallerRequired": true,
+    "sameAccountGenerationRequired": true
+  },
+  "streamIdentity": {
+    "explicitDistinctIds": [
+      "call-a",
+      "call-b",
+      "call-c"
+    ],
+    "expectedGlobalIndexes": [
+      0,
+      1,
+      2
+    ],
+    "idlessFragmentMerge": "retain_existing_contract_pending_disambiguating_wire_evidence"
+  },
+  "delegatedClaude": {
+    "model": "claude-opus-5-5",
+    "thinkingBudget": 1024,
+    "toolChoices": {
+      "any": "ANY",
+      "tool:lookup": "ANY",
+      "none": "NONE"
+    },
+    "nativeClaudePolicy": "not_inherited_by_delegated_Gemini_transport",
+    "liveAcceptance": "live_pending"
+  },
+  "notAdopted": [
+    "Manager auto_heal continuation prompt and second generation",
+    "wholesale Gemini canonical IR replacement",
+    "silent forced-tool downgrade to AUTO",
+    "new model or compact enablement from local fixtures"
+  ],
+  "surfaces": [
+    "claude",
+    "gemini"
+  ]
+}

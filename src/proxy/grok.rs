@@ -3168,7 +3168,23 @@ mod tests {
                 "tool_choice":choice,
             });
             let mut body = json_body(request.clone());
-            patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+            let http_result = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses);
+            if !keep {
+                // The shared bridge rejects an undeclared forced identity;
+                // dropping the selector would silently relax its semantics.
+                let error = http_result.unwrap_err();
+                assert_eq!(
+                    error.status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "http/{name}"
+                );
+                assert!(error.message.contains("undeclared tool identity"));
+                let error = ws_request_body(request, Some("session-1")).unwrap_err();
+                assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY, "ws/{name}");
+                assert!(error.message.contains("undeclared tool identity"));
+                continue;
+            }
+            http_result.unwrap();
             let http: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(
                 http.get("tool_choice").is_some(),

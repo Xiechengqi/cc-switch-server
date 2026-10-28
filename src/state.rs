@@ -169,7 +169,12 @@ use crate::proxy::cursor::session::CursorSessionManager;
 
 mod account_reset;
 mod background;
+mod codex_quota;
+mod grok_media_resident;
 mod in_flight;
+
+pub(crate) use grok_media_resident::GrokMediaMemoryCapacity;
+use grok_media_resident::GrokMediaResidentSnapshot;
 
 pub(crate) use account_reset::QuotaPreviewConflict;
 
@@ -553,6 +558,10 @@ trait PersistedStateSnapshot: Clone + Send + 'static {
     fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()>;
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self>;
     fn reconciliation_value(&self) -> Option<Value>;
+
+    fn load_reconciliation_value(config_dir: &Path) -> anyhow::Result<Option<Value>> {
+        Self::load_snapshot(config_dir).map(|snapshot| snapshot.reconciliation_value())
+    }
 }
 
 impl PersistedStateSnapshot for ServerConfig {
@@ -671,13 +680,14 @@ async fn persist_state_snapshot<T: PersistedStateSnapshot>(
         .with_context(|| format!("{} persistence task panicked", T::NAME))?;
     if let Err(error) = result {
         let load_dir = config_dir.to_path_buf();
-        let disk_matches = tokio::task::spawn_blocking(move || T::load_snapshot(&load_dir))
-            .await
-            .with_context(|| format!("{} reconciliation task panicked", T::NAME))?
-            .ok()
-            .and_then(|store| store.reconciliation_value())
-            .zip(expected)
-            .is_some_and(|(disk, expected)| disk == expected);
+        let disk_matches =
+            tokio::task::spawn_blocking(move || T::load_reconciliation_value(&load_dir))
+                .await
+                .with_context(|| format!("{} reconciliation task panicked", T::NAME))?
+                .ok()
+                .flatten()
+                .zip(expected)
+                .is_some_and(|(disk, expected)| disk == expected);
         if !disk_matches {
             return Err(error);
         }
@@ -981,6 +991,7 @@ pub struct ServerStateInner {
     /// 启动时定格的本地请求体上限。路由层的 `DefaultBodyLimit` 是静态 layer，
     /// 因此这份快照不跟随 `config` 热更新；改动需要重启进程。
     pub request_body_limits: RequestBodyLimits,
+    codex_quota_observer: codex_quota::CodexQuotaObserver,
     // Serializes every filesystem operation under backups/ before persistent
     // store locks are acquired for a consistent snapshot or restore.
     backup_operations: AsyncMutex<()>,
@@ -1027,7 +1038,7 @@ pub struct ServerStateInner {
         Mutex<BTreeMap<CursorAccountCacheKey, Weak<CursorAccountRefreshFlight>>>,
     #[cfg(test)]
     ollama_cloud_post_commit_refresh_enabled: std::sync::atomic::AtomicBool,
-    grok_media_tasks: Mutex<GrokMediaTaskStore>,
+    grok_media_tasks: Mutex<Arc<GrokMediaResidentSnapshot>>,
     grok_media_task_persistence: AsyncMutex<()>,
     image_capabilities: Arc<crate::image_store::ImageCapabilityStore>,
     grok_device_flows: RwLock<GrokDeviceFlowStore>,
@@ -1770,6 +1781,7 @@ pub enum CopilotModelCatalogError {
 pub(crate) enum QoderRuntimeError {
     NotFound,
     IdentityChanged,
+    MemoryCapacity,
     CredentialPersistenceDegraded,
     InvalidAccount(String),
     Refresh(ManagedAccountRefreshError),
@@ -1804,6 +1816,7 @@ pub(crate) enum CodeBuddyRuntimeError {
     IdentityChanged,
     CredentialPersistenceDegraded,
     InvalidAccount(String),
+    MemoryCapacity,
     Refresh(ManagedAccountRefreshError),
     Upstream {
         status_code: u16,
@@ -6018,33 +6031,52 @@ impl ServerStateInner {
             );
     }
 
+    #[cfg(test)]
     pub(crate) fn previous_response_context_lookup(
         &self,
         scope: &PreviousResponseCacheScope,
         response_id: &str,
         now_ms: i64,
     ) -> PreviousResponseCacheLookup {
+        self.previous_response_context_lookup_with(scope, response_id, now_ms, <[Value]>::to_vec)
+    }
+
+    pub(crate) fn previous_response_context_lookup_with<T>(
+        &self,
+        scope: &PreviousResponseCacheScope,
+        response_id: &str,
+        now_ms: i64,
+        prepare: impl FnOnce(&[Value]) -> T,
+    ) -> PreviousResponseCacheLookup<T> {
         let mut cache = self
             .previous_response_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let result = cache.lookup(scope, response_id, now_ms);
+        let result = cache.lookup_with(scope, response_id, now_ms, prepare);
         crate::metrics::set_previous_response_cache_stats(&cache.stats());
         result
     }
 
-    pub(crate) fn claude_thread_alias_lookup(
+    pub(crate) fn claude_thread_alias_lookup_with<T>(
         &self,
         scope: &crate::proxy::claude_thread_alias::ClaudeThreadAliasScope,
         message_id: &str,
-    ) -> crate::proxy::claude_thread_alias::ClaudeThreadAliasLookup {
+        prepare: impl FnOnce(usize) -> Result<T, crate::proxy::ProxyError>,
+    ) -> Result<
+        (
+            crate::proxy::claude_thread_alias::ClaudeThreadAliasLookup,
+            T,
+        ),
+        crate::proxy::ProxyError,
+    > {
         self.claude_thread_aliases
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lookup(
+            .lookup_with(
                 scope,
                 message_id,
                 crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+                prepare,
             )
     }
 
@@ -6488,6 +6520,9 @@ impl ServerStateInner {
         ) {
             anyhow::bail!("model catalog observations require Antigravity or Agy");
         }
+        if !catalog.client_identity.is_current() {
+            return Ok(false);
+        }
         let account_id = snapshot.id.as_str();
         let auth_identity_generation = snapshot.auth_identity_generation;
         let token_refresh_generation = snapshot.token_refresh_generation;
@@ -6501,6 +6536,7 @@ impl ServerStateInner {
             let current = accounts.find_for_provider(provider_type, Some(account_id));
             return Ok(
                 accounts.account_incarnation(account_id) == Some(account_incarnation)
+                    && catalog.client_identity.is_current()
                     && current.is_some_and(|current| {
                         current.auth_identity_generation == auth_identity_generation
                             && current.token_refresh_generation == token_refresh_generation
@@ -6594,7 +6630,11 @@ impl ServerStateInner {
                 ));
             }
         }
+        for observation in &mut observations {
+            observation.antigravity_client_identity = Some(catalog.client_identity.clone());
+        }
         let account_id = account_id.to_string();
+        let client_identity = catalog.client_identity.clone();
         let publication_key = (
             provider_type.as_str().to_string(),
             account_id.clone(),
@@ -6608,6 +6648,9 @@ impl ServerStateInner {
             return Ok(false);
         }
         let applied = self.try_mutate_accounts_immediate(move |accounts| {
+            if !client_identity.is_current() {
+                return Err("bound Antigravity client identity changed");
+            }
             if accounts.account_incarnation(&account_id) != Some(account_incarnation) {
                 return Err("bound Antigravity account incarnation changed");
             }
@@ -6636,6 +6679,9 @@ impl ServerStateInner {
         })
         .await?
         .map_err(anyhow::Error::msg);
+        if !catalog.client_identity.is_current() {
+            return Ok(false);
+        }
         if applied.is_ok() {
             let active_incarnations = self.accounts.read().await.account_incarnations.clone();
             publications.retain(|(stored_provider, stored_account, stored_incarnation), _| {
@@ -6646,7 +6692,7 @@ impl ServerStateInner {
             });
             publications.insert(publication_key, catalog.request_revision);
         }
-        applied.map(|()| true)
+        applied.map(|()| catalog.client_identity.is_current())
     }
 
     pub(crate) async fn refresh_codex_quota_for_account(
@@ -6841,7 +6887,7 @@ impl ServerStateInner {
             crate::domain::health::ProviderHealthStore::load_rebuildable(&config_dir);
         remove_obsolete_model_pricing_file(&config_dir)?;
         let grok_media_tasks =
-            GrokMediaTaskStore::load_or_default(&config_dir, crate::infra::time::now_ms() as i64)
+            GrokMediaResidentSnapshot::load(&config_dir, crate::infra::time::now_ms() as i64)
                 .context("load Grok media task store")?;
         let mut shares = match authoritative.as_ref() {
             Some(stores) => stores.shares.clone(),
@@ -7041,6 +7087,7 @@ impl ServerStateInner {
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
             request_body_limits,
+            codex_quota_observer: codex_quota::CodexQuotaObserver::default(),
             backup_operations: AsyncMutex::new(()),
             config_persistence: StorePersistenceCoordinator::default(),
             config: RwLock::new(config),
@@ -7272,9 +7319,10 @@ impl ServerStateInner {
     pub(crate) async fn image_capability(
         &self,
         token: String,
+        mode: crate::image_store::ImageCapabilityRead,
     ) -> anyhow::Result<Option<crate::image_store::ImageCapability>> {
         let store = Arc::clone(&self.image_capabilities);
-        tokio::task::spawn_blocking(move || store.get(&token))
+        tokio::task::spawn_blocking(move || store.get(&token, mode))
             .await
             .context("join image capability read task")?
     }
@@ -8206,10 +8254,8 @@ impl ServerStateInner {
         usage.provider_health =
             crate::domain::health::ProviderHealthStore::load_rebuildable(&self.config_dir);
         remove_obsolete_model_pricing_file(&self.config_dir)?;
-        let grok_media_tasks = GrokMediaTaskStore::load_or_default(
-            &self.config_dir,
-            crate::infra::time::now_ms() as i64,
-        )?;
+        let grok_media_tasks =
+            GrokMediaResidentSnapshot::load(&self.config_dir, crate::infra::time::now_ms() as i64)?;
         let mut shares = match authoritative.as_ref() {
             Some(stores) => stores.shares.clone(),
             None => {
@@ -12404,6 +12450,90 @@ impl ServerStateInner {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_codex_quota_commits_for_test(&self, count: u64) {
+        self.codex_quota_observer
+            .commit_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_codex_quota_persist_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.accounts_persistence.gate.lock().await
+    }
+
+    async fn commit_codex_quota_batch(
+        self: &Arc<Self>,
+        jobs: &[codex_quota::CodexQuotaJob],
+    ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        if self
+            .codex_quota_observer
+            .commit_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected passive Codex quota persistence failure");
+        }
+        let _references = self.reference_mutations.lock().await;
+        let providers = self.providers.read().await.clone();
+        let result = self
+            .try_mutate_accounts_immediate_under_reference_guard(|accounts| {
+                let mut changed = false;
+                for job in jobs {
+                    let target = &job.target;
+                    let valid = providers
+                        .providers
+                        .iter()
+                        .find(|stored| {
+                            stored.app == target.provider_key.app
+                                && stored.provider.id == target.provider_key.provider_id
+                                && stored.resource.revision == target.provider_revision
+                        })
+                        .and_then(|stored| {
+                            crate::domain::providers::runtime::authoritative_managed_account(
+                                stored, accounts,
+                            )
+                        })
+                        .is_some_and(|account| account.id == target.account_id);
+                    if valid {
+                        changed |= accounts.record_codex_passive_quota(target, &job.snapshot);
+                    }
+                }
+                changed.then_some(()).ok_or(())
+            })
+            .await?;
+        drop(_references);
+        // The existing weekly-cycle observer remains separate from token
+        // accounting. It must also reject an old token's delayed frames.
+        for job in jobs {
+            if let Some(observation) = job.snapshot.weekly_observation() {
+                let target = &job.target;
+                let fence = crate::domain::sharing::quota_cycle::QuotaSourceFence {
+                    account_incarnation: target.account_incarnation,
+                    identity_generation: target.auth_identity_generation,
+                    ..Default::default()
+                };
+                self.record_passive_quota_window_for_token(
+                    &target.provider_key,
+                    target.provider_revision,
+                    &target.account_id,
+                    &fence,
+                    &observation,
+                    Some(target.token_refresh_generation),
+                )
+                .await?;
+            }
+        }
+        Ok(result.is_ok())
+    }
+
     pub async fn mutate_accounts<R>(&self, mutate: impl FnOnce(&mut AccountStore) -> R) -> R {
         let _commit = self.accounts_persistence.gate.lock().await;
         let mut accounts = self.accounts.write().await;
@@ -15412,6 +15542,7 @@ impl ServerStateInner {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_antigravity_capability_observation_if_current(
         &self,
         snapshot: &Account,
@@ -15419,6 +15550,28 @@ impl ServerStateInner {
         dimension: &'static str,
         observation: CurrentAccountCapabilityObservation,
     ) -> anyhow::Result<bool> {
+        let identity = crate::domain::antigravity_identity::antigravity_client_identity();
+        self.record_antigravity_capability_observation_for_client_if_current(
+            snapshot,
+            account_incarnation,
+            dimension,
+            observation,
+            &identity,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_antigravity_capability_observation_for_client_if_current(
+        &self,
+        snapshot: &Account,
+        account_incarnation: u64,
+        dimension: &'static str,
+        observation: CurrentAccountCapabilityObservation,
+        client_identity: &crate::domain::antigravity_identity::AntigravityClientIdentity,
+    ) -> anyhow::Result<bool> {
+        if !client_identity.is_current() {
+            return Ok(false);
+        }
         let provider_type = observation.provider_type;
         if !matches!(
             provider_type,
@@ -15439,7 +15592,11 @@ impl ServerStateInner {
         let observed_at_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         let account_id = snapshot.id.clone();
         let token_refresh_generation = snapshot.token_refresh_generation;
+        let client_identity = client_identity.clone();
         self.mutate_accounts_immediate(move |accounts| {
+            if !client_identity.is_current() {
+                return false;
+            }
             let current = accounts.find_for_provider(provider_type, Some(&account_id));
             if accounts.account_incarnation(&account_id) != Some(account_incarnation)
                 || current.is_none_or(|account| {
@@ -15463,7 +15620,7 @@ impl ServerStateInner {
                     observation.reason,
                     observed_at_ms,
                     observation.expires_at_ms,
-                )],
+                ).with_antigravity_client_identity(&client_identity)],
             )
         })
         .await
@@ -15602,29 +15759,32 @@ impl ServerStateInner {
         let key = grok_media_task_owner_key(&binding);
         validate_grok_media_task_binding(&key, &binding)?;
 
-        let mut candidate = self
+        let previous = self
             .grok_media_tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        candidate.cleanup(now_ms);
-        if let Some(existing) = candidate.bindings.values().find(|existing| {
-            grok_media_task_matches_owner_scope(
-                existing,
-                &binding.share_id,
-                &binding.user_namespace,
-                binding.task_kind,
-                &binding.task_id,
-            )
-        }) {
+        if let Some(existing) = previous
+            .bindings
+            .values()
+            .filter(|existing| existing.expires_at_ms > now_ms)
+            .find(|existing| {
+                grok_media_task_matches_owner_scope(
+                    existing,
+                    &binding.share_id,
+                    &binding.user_namespace,
+                    binding.task_kind,
+                    &binding.task_id,
+                )
+            })
+        {
             if grok_media_task_owner_key(existing) != key {
                 anyhow::bail!(
                     "Grok media task is already owned by a different Provider/account identity"
                 );
             }
         }
-        candidate.bindings.insert(key, binding.clone());
-        candidate.enforce_capacity();
+        let candidate = previous.candidate(now_ms, Some((key, binding.clone())))?;
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
         *self
             .grok_media_tasks
@@ -15648,9 +15808,12 @@ impl ServerStateInner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let previous_len = candidate.bindings.len();
-        candidate.cleanup(now_ms);
-        if candidate.bindings.len() != previous_len {
+        if candidate
+            .bindings
+            .values()
+            .any(|binding| binding.expires_at_ms <= now_ms)
+        {
+            candidate = candidate.candidate(now_ms, None)?;
             persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
             *self
                 .grok_media_tasks
@@ -17085,7 +17248,11 @@ impl ServerStateInner {
         let session = if let Some(session) = self.qoder_runtime.session(&scope, now_ms).await {
             session
         } else {
-            let _session_guard = self.qoder_runtime.session_lock(&scope).await;
+            let _session_guard = self
+                .qoder_runtime
+                .session_lock(&scope)
+                .await
+                .ok_or(QoderRuntimeError::MemoryCapacity)?;
             now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(session) = self.qoder_runtime.session(&scope, now_ms).await {
                 session
@@ -17194,7 +17361,8 @@ impl ServerStateInner {
                 }
                 self.qoder_runtime
                     .insert_session(scope.clone(), cached.clone())
-                    .await;
+                    .await
+                    .map_err(|()| QoderRuntimeError::MemoryCapacity)?;
                 cached
             }
         };
@@ -17202,7 +17370,11 @@ impl ServerStateInner {
         let catalog = if let Some(catalog) = self.qoder_runtime.catalog(&scope, now_ms).await {
             catalog
         } else {
-            let _catalog_guard = self.qoder_runtime.catalog_lock(&scope).await;
+            let _catalog_guard = self
+                .qoder_runtime
+                .catalog_lock(&scope)
+                .await
+                .ok_or(QoderRuntimeError::MemoryCapacity)?;
             now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(catalog) = self.qoder_runtime.catalog(&scope, now_ms).await {
                 catalog
@@ -17661,7 +17833,11 @@ impl ServerStateInner {
         let catalog = if let Some(catalog) = self.codebuddy_runtime.catalog(&scope, now_ms).await {
             catalog
         } else {
-            let _catalog_guard = self.codebuddy_runtime.catalog_lock(&scope).await;
+            let _catalog_guard = self
+                .codebuddy_runtime
+                .catalog_lock(&scope)
+                .await
+                .ok_or(CodeBuddyRuntimeError::MemoryCapacity)?;
             now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(catalog) = self.codebuddy_runtime.catalog(&scope, now_ms).await {
                 catalog
@@ -23217,6 +23393,7 @@ mod tests {
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
             quota_window_observations: Default::default(),
+            codex_passive_quota: None,
         }
     }
 
@@ -32210,7 +32387,7 @@ mod tests {
         )
     }
 
-    fn grok_media_task_binding_for_test(
+    pub(super) fn grok_media_task_binding_for_test(
         task_id: &str,
         created_at_ms: i64,
     ) -> (String, GrokMediaTaskBinding) {

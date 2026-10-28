@@ -2127,3 +2127,271 @@ Server 独立扩展 `PreviousResponseCacheScope`：加入 Provider ID/revision�
 按 `Codex/AGENTS.md` 只读复核干净的 `CLIProxyAPI@ae3ee3be303fb07fb8173279923413005bf32177` 与 `codex2api@5ee6c29273773a2398531d061d23f199ca8c25f7`。前者 `codex_executor_request.go::normalizeCodexParallelToolCalls` 先判 Lite 并显式写 `parallel_tool_calls=false`，普通请求才根据顶层工具是否存在删除该字段；后者 `executor.go::normalizeCodexResponsesLiteBody` 同时强制该布尔值及 `reasoning.context=all_turns`。公开 [Responses create 文档](https://developers.openai.com/api/reference/resources/responses/methods/create) 仅描述 `parallel_tool_calls` 为可选的并行工具调用参数；私有 Lite 必须显式为 `false` 的直接证据是本次上游 `unsupported_value` 错误与两个参考项目的出站实现，不将其冒充公开 API 保证。
 
 纠正本文件 2026-10-13「Codex 无工具请求的并行调用标志」条目和 `docs/provider/codex-oauth.md` 的过宽表述：目标当时声称 Lite 保持强制 `false`，实际 `normalize_codex_responses_lite_body` 先写 `false` 又调用通用无工具清理，顶层工具为空时删掉该字段；原生 WS 末端重复清理，Compact 带 Lite header 时甚至跳过 Lite body normalizer。固定的最终合同测试在旧实现先红，出站 Lite body 有 `reasoning.context=all_turns` 却缺 `parallel_tool_calls`。现按最终模型能力门控的布尔决策，在普通 HTTP、Compact、原生 WS 和 WS→HTTP fallback 的最终请求策略/工具清洗后再次归一：Lite 总显式 `false`，即使顶层工具缺失、为空、仅有 `input[].additional_tools` 或图片工具剔除后为空；非 Lite 无工具继续删字段，非空工具保留原设置。Compact 同时补齐 Lite body 约束而不改变其单个 `compaction_trigger` 和上游 `/responses` 路径。Codex OAuth Account extra header 不能覆盖服务端 Lite 信号。未改模型能力判定、Account/Provider/Share 单绑定、SSE/WS 响应协议或 receipt schema。`cargo fmt --check`、`cargo check`、全量 Rust 测试（library 3637 passed / 1 ignored、API 124 passed、两项集成各 1 passed）、严格 Clippy、静态审计和本地 smoke 均通过；`RUN_TESTS=0 RUN_REAL=0` 离线 readiness 因显式跳过其内部测试、缺真实凭据和未测部署而报告 `blocked`，不是本地测试失败。离线夹具和本地回环不能证明真实 OAuth 上游已接受，真实收据仍为 `live_pending`。
+
+
+## 2026-10-27 Claude R4 用量方言与强制工具边界
+
+按 `Claude/AGENTS.md` 只读核对 `CLIProxyAPI@1f917e77c4562623aa49e9804d999524151a2f96`：`43f5386b` 的 `claudeUsageTokens.Merge/applyReasoningTokens` 将 Anthropic thinking 明细映射成 OpenAI reasoning，区分未出现和显式 0；`1d45a5f3` 的 `NormalizeClaudeToolChoice` 按 routed 5.5 模型将 any/tool 降为 auto。本仓不采纳放宽强制工具约束的策略，改为对精确已审核的 `claude-opus-5-5` 生成请求在发网前返回明确 400，保留其他模型策略和 count_tokens 字段过滤。检查在最终模型映射之后、身份/工具/签名改写之前；Antigravity 委托路径留在其独立切片核对。`pause_turn` 继续为 Responses incomplete/null，不依据参考 completed 策略改变本仓终态。
+
+三个新用例在旧实现上分别复现 JSON thinking 明细没有 reasoning 别名、SSE 稀疏 details 覆盖旧计数，以及 Opus 5.5 forced choice 被接受。共享 JSON/SSE 转换现只将合法非负整数映射为 reasoning，Anthropic 名称优先，显式 0 保留；稀疏细项合并，非法晚到计数不抹去合法值，不向总 output/total 额外累加。cache/provider metering 和原生 Anthropic 字段不变。固定 Account/Provider/Share、刷新和重放边界未变。
+
+本轮 R4 证据单独追加在 `assets/contract/claude-reference-delta.json::r4Reviews`，历史 observations/snapshots 不变；实现仍在工作树，`implementationCommit=null`，不能称为提交态证据。验证结果与剩余项记录在计划第 20 节。五个真实 operation 入口均以 RUN_REAL=0 检查到缺少 Server/Router/账号/Provider/Share/模型/receipt 输入，继续 blocked_inputs/live_pending，未发出真实请求，也不提升模型、工具或续线程接受性。
+
+## R4 Qoder / shared tool identity review (2026-10-27)
+
+Read-only committed-object comparison uses TokenRouter `d15137eb59d4d85bdc27ae563c37fcf9b0edebcd` / tree `df18b022d78c4760a89f5d0c372b5467bbc4c60f`, following its available project-doc and code-comments instructions. `assets/contract/qoder-reference-delta.json.r4Reviews` pins the bridge identity/history implementations and fixtures, Qoder payload conversion, and CN PAT credential/OAuth/status/site files by SHA-256. Eight pre-existing evidence sections, including all source snapshots and observations, retain their original content; the working-tree implementation has no implementation commit yet.
+
+R4-CORE-01 rejects different active `(kind, namespace, name)` identities sharing one converted name before upstream access. Completed input history has a separate sorted, ASCII, bounded alias table with component-separated hashes and active/internal/bare-name reservations. It cannot authorize a selector or response mapping. Only direct discovery items may add declarations; explicit empty/null tools resets suppress that behavior, and parameter/result JSON remains opaque. Native Responses payloads remain native. Alias/error retained bytes are included in the existing request-memory estimate.
+
+R4-QD-01 separates historical identity from next-call visibility. Declared completed history survives none or another named tool; Gemini source declarations are captured before allowedFunctionNames filtering as typed internal metadata, reserved and counted under the request budget. The next-call tool subset, exact batch pairing, continuation checks and unknown-history filtering stay enforced. `assets/contract/qoder-r4-history-delta.json` records final target COSY payload projections for retired namespace/reset cases and labels the differing reference behavior as source observation, not an executed external payload. Full retired-history acceptance still needs independent real Global OAuth, Global PAT and CN OAuth receipts.
+
+R4-QD-02 remains researched/live_pending. The reference CN PAT flow posts `personal_token` to CN OpenAPI `/api/v1/jobToken/exchange`, then completes userinfo/Gateway identity and retains refresh/expiry. Its 1.24.2 identity does not supersede the independently frozen official 1.1.32 oracle. No CN PAT Registry/import/rail is enabled without an independent official package digest, wire oracle/mutations, identity/rotation contract and private real receipt. No external source is a build/test/release/runtime dependency, and no UI automation or deployment testing was performed.
+
+## 2026-10-27 Antigravity R4 目录身份与两轮签名差分
+
+按 `Antigravity/AGENTS.md` 只读核对 CLIProxyAPI `1f917e77c4562623aa49e9804d999524151a2f96` / tree `00273ce1709eac116a12932c5337ed41a9d449f6` 和 Antigravity-Manager `b601f5e7375343343922ccab5e50653bc3450c3b` / tree `9211a067165c376775c98ecf3d522b5562380ffa`。业务源码只通过提交对象研究，未写入、构建、测试或运行外仓。独立追加的 `assets/contract/antigravity-reference-delta.json::r4Reviews` 冻结来源文件 SHA-256、目标 fixture 入口及采纳/拒绝决定；原有十三个顶级证据字段保持不变，实现仍是工作树、`implementationCommit=null`。
+
+R4-AG-01 将版本、完整 UA 和客户端 generation 作为一个不可变快照，贯穿 catalog 缓存、实际 HTTP 头、stale 回退、持久观察、发布 CAS 和能力消费。有效版本变化、A→B→A 与进程重启均使旧目录证据失效；旧或未带版本的目录不能作为当前身份的 fresh 能力。保留 Bearer、账号 incarnation/auth/token generation、project、endpoint、rail 隔离，以及成功空目录、128 项容量和同身份 stale 不延长证据的合同。ProviderExecution 共用快照选择搜索能力及实际 UA，旧请求的容量错误不能发布成新客户端观察。
+
+R4-AG-02 的旧实现反例确认两种丢失：客户端省略前置 signed thought/carrier 而保留 unsigned calls 时丢签名；不同 chunk 的同名工具复用 part 位置但显式 ID 不同时被合并。现在只对同轮匹配调用回填前置签名，不把签名复制给并行调用，保留原思考段优先、已有签名冲突拒绝和历史/身份隔离；不同显式 ID 分开，同 ID 参数分片仍合并。`antigravity-r4-wire-delta.json` 只描述本地 fixture 期待，完整 HTTP 用例核对两条 rail、Claude/Gemini Surface、三种形状及 nonstream→stream 续接的最终报文。Claude Surface 的测试须显式绑定 Gemini 模型，不能把默认映射到 Claude 模型、未进入 Gemini replay 的请求误判成签名缺陷。具体执行结果与余项见计划 §20.3。
+
+`tool_choice=none` 保留 Gemini `NONE` 和历史声明，不授权本轮调用。原生 Claude Opus 5.5 策略不直接套用到 Antigravity 委托合同；委托 any/named/none 与 thinking 仅作本地 wire 保真验证。无 ID 的完整调用/分片歧义待独立证据；不迁入 Manager 的追加“继续”、二次生成与拼接终态/usage，也不整体替换本仓 IR。Compact、未验证模型和两条 rail 的厂商接受性不因 fixture 提升；RUN_REAL=0 输入核对继续 blocked_inputs/live_pending，未发真实请求。未运行 UI 自动化或部署测试。
+
+本轮验证使用相同 HEAD 的隔离工作树，带入 Claude/Qoder/Antigravity 改动，对 state.rs 仅带入本类十个 hunk，排除验证期间正在写入的 Share Market 改动。十四项定向及完整后端回归、严格 Clippy、构建通过；原 smoke 脚本改用已验证的构建产物启动后十项 HTTP 检查通过。来源审计保留 working_tree/implementationCommit=null 和隔离范围，不能据此声称含并行 Market 改动的整体根工作树已验证；readiness 本次仍 not-ready，详情见计划 §20.3。
+
+
+## 2026-10-27 Codex R4 控制、被动额度与父预算入口（工作树切片）
+
+按 Codex/AGENTS 推荐，以提交对象只读研究 CLIProxyAPI `1f917e77c4562623aa49e9804d999524151a2f96` / tree `00273ce1709eac116a12932c5337ed41a9d449f6` 与 codex2api `3c6adfda702efed67931b2d98a491d72bd9d91b5` / tree `6630ed69c78dd11dfd8bbbc3220155f3df4bfefb`。不执行外仓构建/测试/运行时，旧 sourceSnapshots/observations 及其摘要保持不变；五份独立 r4Reviews 冻结实际使用的来源文件摘要和本仓用例入口，implementationCommit=null、readMode=working_tree，不能当作提交态或厂商真实接受证据。
+
+R4-CX-03 参照 CLI bootstrap metadata 与 codex2api preflight/idle 分类，只对闭集名称及审核形状引入 Metadata/Control。合法 metadata 不满足首语义内容或生成成功，不更新 first/idle deadline；SSE public/native 各自原有可见集合保留。活动轮次的前置 metadata 使用有界缓冲，空闲 metadata 不流入下一轮；错误先于 metadata，未知事件/字段保持保守语义。既有 SSE event/type 冲突拒绝不是本轮新增修复；Codex response.create 已发送后仍禁止透明 HTTP 重放，不采用参考更宽的恢复窗口或宽前缀丢帧。
+
+R4-CX-04 的 control.rs 使用精确活动 response ID、物理连接身份、mode=discard_partial_items、去重、pending ACK 与已结束状态。原生 accepted/failed ACK 原字段透传，独立于生成业务和错误，不能取消另一轮或双结算；生成终态不能制造 ACK，默认等待30秒后丢连接且不重连/重放。HTTP fallback 明确返回 proxy-sourced interrupt_not_supported，保留已有输出并继续同一生成；若真实生成错误已经到达，先按该错误收口。它不合成 accepted/incomplete、不把所有 output 清空，也不宣称 HTTP 能完整履行 discard_partial_items。活动 response 身份变化沿用本地 error + Close 和一次 interrupted/502 usage，不能作为正常完成。
+
+R4-CX-02 从审核过的新旧 rate-limit 方言及额度 headers 白名单提取稀疏快照，保留零与false、primary/secondary、plan 和完整 credits 布尔对，balance 有独立时间戳。每个显式 bucket selector 都必须匹配默认codex；metered/Spark、混合方言、未知routing/model/Authorization headers不能污染主窗口。reset乘加与期限有界，逐字段时间/权威查询时间和 Provider revision、账号 incarnation/auth/token generation 共同拒绝旧观察。读取帧时不等待DB，最多64个排队身份、每项向父预算保守预留8KiB、100ms合并、提交最多三次尝试。发布走state域方法；关闭/溢出/本地容量/提交失败不影响生成，权威额度查询负责恢复。被动观察不写推理token、Share消耗或Account cooldown，weekly-cycle仍走单独的、带token栅栏的既有观察入口。
+
+R4-CORE-02 先把现有 request reservations 与 Codex观察队列接入进程父账本，默认只观测；CC_SWITCH_PROCESS_MEMORY_BUDGET_MB 可显式设置部署硬阈值。增长失败不改变父/子已占用量，子预算保持sticky exhausted，缩容和RAII释放不受exhaustion或上限下降阻挡；共享Bytes owner只记一次。aggregate used/high-water/limit/active reservations/rejections是逻辑保留量，不代表RSS或所有独立缓存已审核。跨类别cache/session owner切片及部署阈值测量仍是未完成项目；没有复制参考的128MiB默认值。
+
+R4-CX-05 的独立 scripts/bench/codex-request-compression.py 只测宿主libzstd与合成JSON，51次/组的四种输入及脚本摘要冻结在codex-r4-compression-probe.json。短请求55→64字节、工具历史约1.47MB→401KB且编码CPU中位约7.5ms，说明需要大小/收益门槛；不证明Rust Server的TTFT、取消、并发RSS或上游接受。未启用新的HTTP/下游/WS压缩，也不采纳任意400后重发或仅为模仿身份默认开启的策略。
+
+本切片的离线检查在带入前序Claude/Qoder/Antigravity变更的隔离工作树中执行，排除并行Share Market修改；具体结果与剩余事项见计划§20.4。统一性能里程碑、各类资源归属的完整验收及最终八类review尚未完成。五项真实operation仍live_pending，RUN_REAL=0不发真实请求；未做UI自动化、部署测试、提交或推送。
+
+### Codex R4 message phase 与独立缓存归属（后续工作树切片）
+
+R4-CX-01 的冻结参考是同一 CLIProxyAPI 提交中的 `codex_claude_response.go` 及 commentary phase/replay/cross-format 测试。本 Server 选择标准文本有损映射：原生 Responses 保留 phase；Messages 保留每个 message item 的文本 block 边界，Chat 顺序合并文本，历史再入只能恢复普通 assistant text。内部按 item 捕获 phase，稀疏 done 不抹已知阶段，冲突/未知值进入固定 Unrecognized；有界降级指标不记录原始未知字符串。公开 commentary 不冒充 thinking 或 encrypted reasoning，也不采用参考的 `cpa:commentary:v1` 私有签名协议；真实 encrypted reasoning 仍按现有认证封装回放。补齐 done-only 最后一条回答及所有 Responses→Messages/Gemini 中间状态的 retained bytes，不把已有 per-item delta 去重说成新建能力。
+
+R4-CORE-02 的 Codex 后续入口覆盖 manifest 模型/能力字符串、previous-response JSON/scope/索引/tombstones、活动/空闲 WS 读帧、连接 wrapper/通道槽位/池索引及 referral 会话 key/entry。模型目录容量拒绝保留最近有效身份快照；previous-response 缓存拒绝维持严格 required-context miss，tombstone 预算不足可省略诊断而不放宽续接。原编码字节上限保留，JSON 分配容量与索引逻辑估值另计；编码大小计算使用无额外完整序列化副本的 counting writer。WS 消息携带其原 owner 跨 turn 移交，缓存 acquire 释放索引 owner，取消/淘汰通过 RAII 和 actor 退出释放；父容量不足不换账号、不重开生成。referral 进行中 clone 在缓存淘汰后继续持有同一个 owner。
+
+这些是本 Server 独立设计的生命周期核算，不声称参考已实现相同缓存结构；库内部 cookie/TLS/HTTP、runtime、allocator slack 及精确 B-tree node RSS 仍不在逻辑账本内。具体专项与完整回归结果写入计划 §20.4；尚未完成的实际 Server 性能测量和跨类别 owner review 不因这段协议记录而判定完成。
+
+本 phase/owner 切片在上述隔离树的最终源码上完成严格全目标 Clippy、格式/check/build 与完整 Rust 回归（3880通过、1忽略），后端 Node 1910通过；核对独立构建产物后，本地后端 smoke 10项HTTP检查通过。该结果不覆盖并行 Share Market 修改。离线 readiness 仍 not-ready：外部 Router 四处合同审计失败、真实输入缺失及按约束未做部署测试分别保留；不把本地 fixture 提升为厂商或部署接受证据。图片下载和 previous-response 注入临时副本、统一时间里程碑及实际 Server 性能测量仍需在当前 Codex 类别继续处理，详见计划 §20.4。
+
+本切片已按实施前快照→隔离树的49文件增量同步主仓，四个并行Share Market重叠文件按hunk保留，其他838文件未变；Phase0摘要从主仓源重新生成。隔离验证范围和所有live_pending状态不因同步而扩大。
+
+
+### Codex R4 图片下载与 previous-response 临时工作集（续接切片）
+
+继续使用上述冻结 codex2api request_memory.go/test.go 的进程账本/共享 owner 原则，由本 Server 独立设计文件读取和 JSON 工作集归属；不声称参考已经实现相同的 Rust 缓存结构或图片合同。GET 在固定长度 payload 分配前准入父预算，保留文件长度、末端与 SHA 校验；Bytes 的最后一个 clone/slice drop 才释放。HEAD 分块验证全图 SHA，最多64KiB scratch，保留 Content-Length 与空body。容量拒绝保持本地503且不删有效文件。跨进程锁与磁盘256MiB总量仍独立，启动的 blocking 读在取消后自行完成并释放被丢弃结果。
+
+previous-response 通过 domain/state 同步借用回调先准入再按白名单复制，保留 opaque call ID、类型配对、scope fencing、敏感字段清理及去重。当前input直接移动，解析/选择复制/合并/序列化按临时工作集核算；HTTP输出接现有Bytes owner，WS输出预留转入turn normalized owner。当前容量失败与真正required-context miss分开，不增miss计数、不扩大Provider处罚或重放边界。新增7项用例的最终验证见计划§20.4；统一时间里程碑、实际Server性能/RSS测量和Codex本类完整review仍单独待做。
+
+
+图片/临时工作集续接切片的最终版本已重新完成格式/check、严格全目标Clippy、build、46项Codex定向、完整Rust3887通过/1忽略和后端Node1910通过。lookup scope key及配对检查索引都有临时allowance，容量拒绝不变成上下文miss。313个Rust文件冻结后未在编译过程中修改。原本地smoke10项HTTP检查通过；为节省构建磁盘，独立执行副本只去除调试信息，全部ELF SHF_ALLOC节地址/大小/类型/内容摘要保持一致，原文件和副本SHA分别保留。厂商接受性、统一性能里程碑、实际Server性能/RSS测量、Codex本类完整review与跨类别owner review仍不因这些绿灯提升；没有UI自动化或部署测试。
+
+
+### Codex R4 单调时间里程碑与请求副本（续接切片）
+
+本 Server 独立实现 request/attempt 单调时钟，复用此前冻结的 codex2api `security/request_memory.go` / `_test.go` 仅作为最后 owner 释放原则的参考；没有声称参考已提供同一 Rust 计时模型，也没有在本切片新增 TokenRouter 计时代码审计。HTTP 从转发入口计时，API 接收/鉴权耗时仍在外；WS 按数据帧建立 turn。metadata/control/heartbeat 不计首语义内容，attempt 终态与最终接受 attempt 的 request 终态分离。HTTP body handoff 不等于 socket 写入；WS 只在实际 sink 发送成功后记完成，并绑定入队时的 attempt，不将保守 Sent 当写入成功。最后已核算 owner 的 release 与终态、交付、异步 usage 结算分开，取消及迟到关闭不改写已经完成的结果。
+
+新里程碑、operation wait 和结果指标只有固定标签；未归类异常保留 unfinished。读取等待不跨下游 body yield，重试等待及明确取消至末次 owner 释放分别记录，并行区间不相加为总延迟。既有 first_token_ms、wire、token、重试/提交和 Provider 健康逻辑未改变。HTTP 注入的 opaque previous_response_id 副本先准入，WS 借用原 ID；嵌套请求体及 active body 改为移动，保持精确 ID、required-context miss 和嵌套/平面 JSON 合同。周边 policy normalization、解析器/库 scratch 和其他类别缓存不因此宣称全部核算。
+
+最终源码上56项 Codex R4 专项、完整Rust3897通过/1忽略、后端Node1910通过，格式/check、严格全目标Clippy和build通过。314个Rust文件格式化后冻结，有效编译期间无源码变动；原本地smoke10项HTTP检查通过，独立去调试副本的全部ELF SHF_ALLOC节保持一致，临时listener/config/launcher清理完毕。该验证仅覆盖隔离树，不包含主仓并行Share Market修改，细节见计划§20.4。实际 Rust Server 同负载的延迟/取消/阻塞/RSS 测量、R4-CX-05 压缩决策及 Codex 本类完整 review 仍未完成；五项真实 operation 保持 live_pending。未做 UI 自动化、部署测试、提交或推送。
+
+
+## 2026-10-27 Codex R4 Server 测量装配与回退写入观测（正式采样中）
+
+生产时间观测仍是本Server独立设计，未在本切片增加TokenRouter计时代码审计。新增根test_support下的Linux ignored测试装配真实api::app_router与正常v2签名Share ingress，不引入proxy→api/clients依赖或生产endpoint开关。固定合成CodexOAuth绑定使用既有cfg(test)端点覆盖，并在API listener前核对HTTP/WS runtime plan的精确回环scheme/host/port和URL形状。driver清除子进程显式出站代理、固定父预算仅观测，冻结源码及输入摘要；四路径与取消/慢读共22行，最终小样本全部通过。
+
+实际小样本暴露fallback_ws缺下游写入时间；relay_codex_http_fallback_event已补实际sink等待与仅Ok后的完成标记，错误返回、重试、提交、token及健康判定不变。普通回归证明发送观察不制造first_semantic/terminal/result。最终格式/严格Clippy/check/build及完整Rust3898通过/2忽略（57项Codex R4）通过；10项本地后端smoke使用独立去调试副本，全部SHF_ALLOC节保持一致，临时listener/config/launcher清理、日志0600。315个Rust文件格式化后冻结，编译期间未变。上述结果仍限隔离树，不包含主仓并行Share Market修改。
+
+正式101/31次采样尚未完成；不得使用小样本或先前codec数字声称正式性能、生产容量或厂商接受。RSS口径是整个debug测试进程，包含Server、假上游、客户端、collector、sampler及allocator retention；顺序负载和logical bytes都不能冒充分配计数或部署压测。前期错误的WS override装配可能回退默认地址，该轮已停止并排除，不能声明其零可能厂商连接；最终回环装配单独验证。五项真实operation保持live_pending，没有UI自动化、部署测试、提交或推送。
+
+
+## 2026-10-27 Codex R4 正式Server测量与编码决策收口
+
+`assets/contract/codex-r4-server-probe.json`冻结真实API router、v2签名Share入口和固定合成绑定的四路径22行loopback测量。19行各101次、慢读三行各31次，共2012次measured generation，排除110次warmup；每请求一次上游生成，request owner release/high-water及两条WS的实际sink等待/完成观测齐全。输入复用codec生成器且原始bytes/hash一致；prepared字节先于WS envelope，实际上游规范化应用字节另计。315个Rust文件及driver冻结的源码/构建输入测量期间未变，listener和输入目录清理已核对。最终资产及方法/数字见计划§20.4。
+
+延迟是顺序debug测试装配的nearest-rank分位数；HTTP入口、WS握手、first_semantic、body handoff、sink成功、终态及最后逻辑owner各有明确起点/边界，操作等待可重叠，取消drain不代表异步usage完成。整进程采样RSS峰值318.34 MiB包含Server、假上游、客户端、collector/sampler及allocator retention；物理socket/actor保留量与request释放不同。该结果不证明独立生产RSS、并发容量、allocator分配数或前后提速；不据此选择进程硬阈值。
+
+R4-CX-05独立复核冻结的CLIProxyAPI/codex2api压缩来源后，决定本轮keep_current_encoding并关闭候选，不新增HTTP出站、下游或WS压缩。codec和当前未压缩Server基线不能证明相同端点/rail的真实接受、网络收益、flush/协商安全或scratch预算；不采用任意400/415后明文重发。新增第七份R4 review和Codex离线category review，18条source delta、22条旧observation及历史codec资产不变，implementationCommit=null。五项真实operation仍live_pending；其他类别缓存/计时范围、部署硬阈值和最终跨类review继续待做。隔离树完整Rust3898通过/2忽略、57项R4专项与本地smoke10项不覆盖主仓并行Share Market集成；没有UI自动化、部署测试、提交或推送。
+
+
+正式冻结后的当前后端Node为1917/1917，纯数据合同5/5，Codex冻结源码及14项后端/静态检查通过；状态写入/分层五项检查通过。曾有一次1914/1的产品边界误报：外置测试模块未继承crate root的cfg(test)。审计现仅对可证明的声明式root测试模块继承排除，生产引用或路径/include引用撤销排除，注释/字符串/path属性不豁免，并有两项新增反例回归；Rust与已冻结探针源码未改。全部22行prepared JSON另经独立重建核对bytes/hash，未混用WS envelope或上游规范化字节。主仓增量及并行改动的验证边界继续分别记录。
+
+
+Codex本类17文件增量已同步主仓，876个无关文件保持不变，Phase0从主仓重生；主仓格式及12项相关静态/源码/文档检查通过，Rust在核验期间未变。完整Rust3898/Node1917/smoke10的范围仍为隔离树，不覆盖主仓并行Share Market。离线readiness以RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0实际退出1/not-ready，原因保留为外部Router四处合同问题、八项真实输入缺失、local-contracts-unverified与deployment-not-tested。Codex离线切片收口，真实五operation仍live_pending，implementationCommit=null；下一类Cursor及最终跨类review仍待推进。
+
+
+## 2026-10-27 Cursor R4：长期资源父预算与 h2 生命周期
+
+按 Cursor/AGENTS.md 只读复核 OmniRoute@443d66996d69d7ecf887fd61158404a3cca1b192 的已提交 executor、agentEndpoint、builtinToolBridge 和 cursorSessionManager，排除 21 项 tracked 和 1 项 untracked 变更。参考的同一 h2 工具续接、五分钟 TTL、100 会话容量与关闭清理继续作为生命周期证据，不推断新的厂商 wire 或复制单账号查找规则。
+
+目标原有 running/parked request reservation 已接父预算，但 completed Responses、token/cooldown、model/endpoint cache、single-flight 和冷续接 claims 未独立归属。现以独立 RAII owner 接入同一进程账本；缓存有界 B-tree 避免空 HashMap capacity 在条目释放后滞留，稀疏索引采用保守逻辑估算。计数不冒充 RSS/allocator。completed-cache 的 serialized size 改为有上限的计数 writer，不先分配完整 JSON 副本；独立缓存仍是惰性过期，parked h2 保留既有主动 timer。
+
+新 flight 容量拒绝发生在发网前；claims 全批预留后才发布，父预算失败返回既有 cc_switch_request_memory_exhausted，不消费半批 ID。替换失败移除同 key 旧目录/endpoint/token/context，避免旧授权复活；已到达的本次目录/endpoint/token 结果可以交还调用者而不缓存，未伪造跨 rail fallback。关闭 session 释放 Vec/String/HashMap 的实际容量并在移除索引后缩容；仍存活的 Arc 外壳直到最后 drop 才归还费用，不能把 registry 删除当所有内存归零。首次定向测试 360 通过/1 失败揭示旧“关闭即归零”断言仍持 Arc，记录保留并改为最后 owner 释放后归零；h2 夹具首编的 Unpin 类型错误另已修正。
+
+16 项 R4 用例覆盖父预算压力、独立请求 clone、替换/淘汰/惰性到期、原子 claim、parked 转移失败和外壳释放。纯回环 h2 夹具实际观察取消/首内容超时、两 rail 的停放到期/容量淘汰后上游 request 关闭及 response owner drop；新 token 代际的迟到结果不能获取旧 stream。它不是 TLS/厂商接受性、生产 RSS/并发容量或独立进程性能测量；已有 firstTokenMs 仍从 native driver 入口计时，只接受非终态批次的渐进业务输出，没有新增成功 socket write 计量。协议、身份与 receipt schema 不变，八条旧 observation 不改，implementationCommit=null，两条 rail 继续独立 live_pending。最终离线检查范围与主仓同步见计划 §20.5；未做 UI 自动化、部署测试、提交或推送。
+
+
+Cursor R4 最终隔离树验证：fmt/check/严格全目标 Clippy/build 通过，完整 Rust 3914 通过/2 忽略，其中16项 R4 用例通过；后端 Node1917/1917、另12项相关静态/源码/文档检查及新构建本地后端 smoke10项通过，冻结输入未变。strip-debug副本的全部SHF_ALLOC节保持一致，临时listener/config/launcher已清理，含临时token的完整smoke日志不公开。这些成绩不覆盖主仓并行Share Market；主仓同步和离线readiness另行记录，真实两rail仍live_pending。
+
+Cursor R4 主仓收口：18 文件无重叠增量已应用，876 个无关文件未变，coverage/Phase0 从主仓重生；主仓格式及12项相关检查通过，Rust 核验期间不变。3914/1917/10 完整成绩仍限隔离树，不覆盖主仓并行 Share Market 集成。离线 readiness 以 RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 实际退出1 / not-ready，保留外部 Router 四处合同问题、八项真实输入缺失与 local-contracts-unverified / deployment-not-tested；两个 rail 独立 live_pending，implementationCommit=null。
+
+
+## 2026-10-27 Grok R4：重提交差分与独立 resident owner
+
+按 Grok/AGENTS.md 对 grok2api@e2fd7ab481a30a1965bb61395d437154cf247c92 与 sub2api@ab99d56e9626e6cd731592dae8553c9758a0efa2 仅读取已提交 Git objects，分别排除0/6项工作树变更；7份来源文件的 tree/hash 追加在 r4Sources，不覆盖旧 observation。参考 transient counter 与生成一次的 Idempotency-Key 属于 Build selector 重提交合同，不能授权本 Server 扩大恢复或更新版本。目标回环验证500/503/525/526各一次POST、无新两个header；保留401/proof明确拒绝与WS fallback的同绑定/提交边界，Web/SSO与95%soft quota gate不采纳。既有GroK凭据CAS反例保留，新header接受性继续live_pending。
+
+本片独立实现 replay/CAS占位、媒体快照与持久化owner、Grok目录及OIDC/JWKS缓存的父预算；新增有限JSON计数writer。媒体候选先预留后复制，Arc共享同表，写盘/容量失败不覆盖实时归属；新容量分支经回环确认记capacity shed而非Provider失败，且不重放已生成任务。目录Arc payload/代际门槛保留；可选OIDC缓存压力不等于认证失败。稀疏元数据为保守逻辑估计，不是RSS，控制面scratch和全部持久化状态不属于已覆盖声明；本类未增加全里程碑或真实socket-write计量。首轮生产cargo check通过，新夹具因未引入uuid而编译失败；改用现有opaque_id后严格全目标Clippy和Grok定向281/281通过，其中16项R4用例通过。当前完整回归/主仓同步待完成，三个operation仍live_pending、implementationCommit=null；不做UI自动化、部署测试、提交或推送。
+
+
+Grok R4媒体快照的提交后错误对账采用临时plain store/value读取，不再为确认已提交数据申请第三份resident快照。新增预算已由live/candidate占满的提交后错误回归；临时对账/序列化scratch仍不属于完整父预算覆盖。此前完整Rust编译主动中断，不计为通过，修复后的最新验证范围见计划§20.6。
+
+
+Grok 修复后完整离线检查：fmt/check、严格全目标Clippy、cargo build通过；完整Rust为3931通过/2忽略，其中17项新增R4全部通过。后端Node1917/1917及另外12项相关源码/合同/文档检查通过，另核对五项状态写入/分层约束。全部385份冻结构建输入在各Rust阶段及后端检查期间不变。新构建本地后端smoke10/10，strip-debug副本全部SHF_ALLOC节一致，临时listener/config/launcher已清理，日志0600且未公开token日志。成绩范围是隔离树，不包含主仓并行Share Market完整集成。媒体提交后对账不申请第三份resident owner，容量错误不罚账号；review保留固定绑定、commit/CAS、可选缓存miss及未覆盖scratch边界。下一步只同步本类16文件增量并核验主仓，不将新实现冒充提交态或厂商真实接受。
+
+
+Grok 主仓同步与收口：16个源/文档文件按Cursor收口基线增量应用，src/state.rs与并行主仓有差异但hunk预检/应用均无冲突，880个无关文件摘要不变、无新增无关文件，coverage和Phase0三份生成件从主仓重生。主仓fmt及12项相关源码/合同/文档检查通过，核验期间Rust源码不变；不替代并行Share Market的完整Rust集成。实际RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 readiness退出1/not-ready：外部Router两处退役Market端点、缺Share Contract v8 reader constant及缺retained Market能力四处问题仍在，八项真实输入、local-contracts-unverified和deployment-not-tested保持阻塞。未修改外仓或放宽门禁。Grok离线切片收口，三个operation仍live_pending，implementationCommit=null；下一类Kiro，随后CodeBuddy与最终整体review。无提交、推送、子代理、UI自动化或部署测试。
+
+
+## 2026-10-27 Kiro R4：保留 usage 权威并补缓存/批次 owner
+
+按 Kiro/AGENTS.md 推荐，只读研究干净 kiro.rs@9066e9c4fe90c7e97d241900a6ce8eb52cc46903 / tree 5d22f040f0e4b0aa775e61547540b3c040293cd8 的七份 committed objects：token、frame、CLI/IDE endpoint、cache metering 和 stream。其 contextUsage 减输出说明并非本 Server 的八个 auth-kind×region 真实回执；R4-KI-01 保持 metadata.tokenUsage > metrics > context/fallback、显式零、已审输入估算和 shadow-only 扣减，不迁入账号池、跨区域恢复、Redis/shared cache 或 remote compaction。r4Sources/r4Reviews独立追加，旧来源/observation不覆盖，implementationCommit=null。
+
+本地原有 EventStream/图片/请求 reservation 已接父预算，Prompt Cache 的 entries/pending/writer 则未独立归属；原 pending tombstone 可在长期写盘失败或无 writer 时积累。现缓存/dirty index 改有界 B-tree，每个条目和待写 mutation 持独立owner，detach/失败合并移动owner，pending与in-flight共享8192项上限，通知队列仍为2。整次 TTL/条目/dirty发布先准入；拒绝只回退为无本地缓存估算，原state和删除记录保持，vendor权威usage仍优先。无writer不创建dirty队列，启动未获准条目不进内存、不删除磁盘数据。请求中的expiry/eviction计划scratch也先计入父预算；SQLite/legacy启动解析和连接内部scratch未声称全覆盖。
+
+新增十三项R4回归覆盖内存only、原子拒绝、TTL/代际保留、in-flight计数、持久化tombstone、新旧batch合并、到期/容量owner、启动压力，以及真实adapter的取消/EOF/截断/idle timeout与输出Bytes最后释放。它们不证明厂商socket关闭、账号健康取消分类、RSS或生产提速。原 firstTokenMs 继续沿用尝试起点，完整frame/idle deadline不改；没有新增统一milestone或socket写成功计量。八个RUN_REAL=0 scope均blocked_inputs/live_pending，无真实请求。验证与同步进度见计划§20.7。
+
+
+Kiro 资源清单复核补入独立模型目录与IDE版本缓存：原模型HashMap没有计数上限/统一惰性清理；现B-tree最多128目录，5分钟fresh/24小时最大stale不变，cache snapshot的Arc payload/owner共享直到最后释放。发布前预留，压力下移除被替代旧目录，当前已获取结果继续返回且不缓存；IDE仅一份可选保留值。四项新增回归核对最后owner、替换拒绝、淘汰/到期、IDE压力。控制面返回Vec/String投影及解析scratch未因此全覆盖。原有跨区域discovery候选只在既定条件下保留，不扩大推理的区域/认证rail恢复。第一轮fmt/check/严格Clippy通过后，在Rust定向测试编译阶段主动中断（exit130）补齐此遗漏，完整测试未获结果；旧报告保存，新输入须重新验证。
+
+
+Kiro 修复后完整离线检查：最终fmt/check、完整Rust3944通过/2忽略及cargo build通过，其中十三项R4全部通过；严格全目标Clippy引用第二轮相同321份Rust源码的通过记录，之后只更新review状态JSON，未改变Rust实现。387份最终冻结输入在Rust步骤与后端审计中不变。后端Node1917/1917及12项相关源码/合同/文档审计通过，另核对七项状态写入/依赖方向约束。本地后端smoke10/10，strip-debug副本全部SHF_ALLOC节一致，临时listener/config/launcher清理完成、日志0600。review核对dirty与in-flight owner移动、批量准入原子性、旧generation不能覆盖新状态、目录压力不复活旧授权及EventStream输出Bytes末次释放；计量优先级、CRC/截断和固定身份仍保持。逻辑保留量不等于RSS，不声称解析/SQLite内部scratch已全覆盖，也不证明厂商socket、八路真实接受或取消健康分类。结果范围是隔离树，未包含主仓并行Share Market完整集成；八路继续live_pending，implementationCommit=null，下一步按本类增量同步主仓。
+
+
+Kiro 主仓同步与收口：13个源/文档文件按Grok收口基线增量应用，hunk预检及应用无冲突，885个无关文件摘要不变、无新增无关文件；coverage及Phase0三份生成件从主仓重生。主仓fmt及12项相关源码/合同/文档检查通过，核验期间Rust源码不变；不替代主仓并行Share Market完整Rust集成。实际RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 readiness退出1/not-ready：外部Router四处合同问题、八项真实输入缺失、local-contracts-unverified及deployment-not-tested仍在，未修改外仓或放宽门禁。Kiro离线切片收口，八路真实验收仍live_pending，contextUsage减输出仍shadow-only，implementationCommit=null。下一类CodeBuddy，之后做最终跨类review；无提交、推送、子代理、UI自动化或部署测试。
+
+
+## 2026-10-27 CodeBuddy R4：保留受审身份并接目录父预算
+
+只读研究cli2api@c7e4e73f/tree06520c39的客户端身份、refresh、response-head deadline和WAF相关实现/测试，共11份committed对象及明确函数锚点；排除未跟踪proxy.html/proxy.md，未执行外仓。本仓已有超时、非认证refresh分类、11128诊断、11148历史修复、终态usage和取消guard，不重复从零开发。参考CLI2.161.0、Global/CN Desktop5.8.4/5.8.3、IDE2.168.2及chat-only IDE/Product/Session组合只构成差分候选。没有本仓两站真实接受证据，保持现有2.142.0整套身份与目录来源，不单独升UA，不把Global desktop目录更多模型外推到生成。个人CLI X-Private-Data=false保持；企业不随此项开放。WAF正文重写不采纳。
+
+本地目录改为最多128项B-tree，保留8分钟fresh/24小时最大stale，查询或发布惰性清理。不可变Arc payload与resident reservation共享到最后snapshot释放；同key新目录无法缓存时移除旧授权，当前新结果仍可用且不缓存。新single-flight发目录请求前准入父预算，最多128个活跃/保留注册；等待者与guard共享owner。容量拒绝经state/API/forwarder映射为本地503 memory-capacity，不刷新、不重放、不计Provider NetworkFailure。索引/旧snapshot保留量为逻辑估算，控制面fetch/parse及不缓存结果scratch不宣称全覆盖。
+
+八项R4回归已写入：六项目录/flight owner合同、两站×三入口的目录准入拒绝零请求/无lease泄漏、提示词/思考/工具结果正文保真；尚待编译通过。现有两站三入口报文、固定账号401及取消/终态尾部usage夹具继续复用，未伪造新身份接受。firstTokenMs仍是现有尝试起点至第一个非空下游transform输出，header与body/idle deadline保留各自范围；没有新增milestone、socket-write或性能结论。两站RUN_REAL=0均blocked_inputs/live_pending，implementationCommit=null；完整验证及主仓同步待做，最终跨类review仍未完成。
+
+
+CodeBuddy 修复后完整离线检查：最终fmt/check、完整Rust3952通过/2忽略及cargo build通过，八项R4均通过；严格全目标Clippy引用首轮相同322份Rust源码的通过记录，之后只更新review状态JSON。388份最终冻结输入在Rust步骤与后端审计期间不变；后端Node1917/1917、12项相关源码/合同/文档审计和七项状态写入/依赖方向检查通过。新构建的本地后端smoke10/10，strip-debug副本全部SHF_ALLOC节一致，临时listener/config/launcher已清理，日志0600。review确认目录snapshot直到最后Arc释放才退账，替换拒绝不复活旧授权，single-flight waiter/guard保留owner，容量拒绝在两站三入口零出站且不刷新或罚账号；提示词、思考与工具正文保持。逻辑索引估算不代表RSS，控制面获取/解析及不缓存结果scratch不在全覆盖声明。成绩范围为隔离树，不含主仓并行Share Market完整集成；两站真实接受仍live_pending，保留2.142.0整套身份和目录来源，implementationCommit=null。下一步仅同步本类增量并核验主仓。
+
+
+CodeBuddy 主仓同步与收口：14个源/文档文件按Kiro收口基线增量应用，hunk预检及应用无冲突，885个无关文件摘要不变、无新增无关文件；coverage及Phase0三份生成件从主仓重生。主仓fmt及12项相关源码/合同/文档检查通过，核验期间Rust源码不变；不替代主仓并行Share Market完整Rust集成。实际RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 readiness退出1/not-ready：Router四处合同问题、八项真实输入缺失、local-contracts-unverified及deployment-not-tested保持，未修改外仓或放宽门禁。CodeBuddy离线切片收口，Intl/CN两站仍live_pending，保留2.142.0身份及原目录来源，CB-N4保持禁用，implementationCommit=null。随后进行最终跨类review，包括早期独立缓存和Cursor取消分类的复核；无提交、推送、子代理、UI自动化或部署测试。
+
+R4 最终跨类资源 review：Antigravity replay/CAS与目录补独立owner、clone前准入及拒绝后防旧发布；Qoder session、目录、两类flight和continuation共享实际owner，本地容量503不走auth恢复；Claude线程别名缓存/请求分开计量，冲突栅栏保持；Cursor下游drop记client_cancelled，不写Provider成功或失败样本，原metrics问题不夸大为直接账号处罚。Antigravity历史审计修正为读取声明的提交对象并核对tree，历史22条观察及摘要不变，当前R4/资源准入合同仍检查工作树；四项Node反例验证两者不能互相替代。无新厂商header/payload/能力门禁，四类本地fixture不等于真实接受。CORE03/CX05测量、可选扩展和预算边界见计划§20.9。
+
+最终跨类 review 完整离线检查：fmt/check、严格全目标Clippy及cargo build通过；完整Rust为3977通过/2忽略、零失败，包含25项新增review回归。后端Node为1921/1921，其中四项新增审计回归通过；另27项相关检查（八类reference-delta默认与显式source审计、conformance、产品边界、Provider/Phase0/coverage、transform/bridge、文档、静态UI矩阵、脱敏和diff）及七项状态写入/依赖方向检查通过。Rust的391份冻结构建输入在各阶段不变，后端审计另冻结脚本输入。新构建本地后端smoke10/10；strip-debug副本全部SHF_ALLOC节一致，日志0600、临时listener/config/launcher已清理。完整后端成绩属于隔离树，未包含主仓并行Share Market的完整Rust集成；厂商真实receipt继续live_pending、implementationCommit=null，未做UI自动化或部署测试，也未提交或推送。
+
+最终主仓同步与整体 review 收口：19个源/文档文件按CodeBuddy收口后的review基线增量应用，hunk预检/应用无冲突；884个无关文件摘要不变，无新增无关文件。src/state.rs保留主仓并行差异，coverage和Phase0三份生成件从主仓源重生。主仓fmt及另外27项相关合同/来源/文档检查通过，期间Rust源码不变；隔离完整Rust/Node/smoke成绩不替代主仓并行Share Market完整Rust集成。实际RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 readiness退出1/not-ready：只读Router合同仍报4处问题（frontend/components/i18n/locale-provider.tsx、src/market_fx.rs、src/models.rs、src/market_billing.rs），缺8项真实输入，local-contracts-unverified、deployment-not-tested保持；不以独立通过的后端检查改写该命令结果，不修改外仓或放宽门禁。八类离线实施及最终整体review收口，全部真实rail/operation仍live_pending，明确的可选扩展保留于上文；未提交、推送、调用子代理、做UI自动化或部署测试。
+
+## 2026-10-27 CORE-03 完成性复核：Claude 统一时间观察
+
+按计划§20.10继续补齐跨类request/attempt观察器，当前切片仅扩展ClaudeOAuth。此前Codex的实现与总体进度不再被当作其他七类均已接入的证据。本次是Server独立观测设计，没有新增厂商wire事实或参考仓计时代码来源；既有Claude引用、冻结fixture和真实receipt状态保持。
+
+三类App的Messages/Chat/Responses/Gemini流非流路径与count_tokens共用有限静态标签，起点仍是本地转发入口；原first_token_ms、deadline、用量、提交和恢复规则保持。SSE复用原terminal detector已经解析的Value，原生JSON复用语义验证，桥接JSON复用usage解析；只为计时做的校验失败不改变桥接或guard关闭时的响应判定。首内容排除空block、ping、签名、usage和停止原因；有效零count_tokens结果可观察。max_tokens/pause_turn/model_context_window_exceeded记为本attempt的incomplete，后续attempt不继承。pending forward取消先记cancelled，再释放其future/预算owner；流终态沿既有验证路径观察，body handoff与最后已核算owner释放分别记录，均不宣称HTTP成功socket写入或远端已消费。
+
+回环夹具覆盖九种成功请求形状、headers取消、提交后取消/error不重放与owner释放，另核对控制事件和attempt隔离；最终验证与主仓同步状态见计划§20.10.1。真实Claudeoperation仍分别live_pending；其他类别CORE-03和当前主仓全量集成继续待做。未做UI自动化或部署测试，未提交、推送或调用子代理。
+
+Claude CORE-03 主仓同步与本类收口：10个源/文档文件以冻结主仓为基线增量应用，预检与应用无冲突，897个无关文件摘要不变且无无关新增。主仓393份构建输入与本轮已验证树逐份摘要一致；主仓fmt、include单独格式、10项相关源码/合同/文档审计及diff检查全部通过，验证期间输入不变。本类574项相关Rust回归与严格lib/tests Clippy的范围保持，不冒充当前主仓最终全量Rust/Node/smoke集成。未改变registry/API或手改生成件。下一类仅推进Antigravity CORE-03；其余类别及最终全量集成/review仍待完成，总目标继续进行。全部真实operation/rail仍live_pending，未做UI自动化或部署测试，未提交、推送或调用子代理。
+
+
+## 2026-10-27 CORE-03 完成性复核：Antigravity 双 rail 时间观察
+
+本切片由Server独立实现时间观察，沿既有Antigravity/Agy冻结wire合同接入两条rail，不增加外部参考源码、厂商字段或接受性事实。两条rail各用固定Provider标签，只覆盖当前登记的Claude/Gemini App与Gemini countTokens；Gemini CLI和未登记的Codex App不因此获得计时覆盖或能力。起点仍是本地转发入口，不包含API收包/鉴权，原first_token_ms、deadline、用量、提交、账号健康和恢复规则保持。
+
+非流式的首内容在既有SSE聚合器处理已解析事件时观察，成功finish后再记录聚合终态；流式复用terminal detector解析与既有最终结算。JSON生成/计数复用现有embedded-error检查的Value，没有为指标另建完整响应树。空文本、纯签名carrier、usage、停止原因和心跳排除；有效零totalTokens算结果，MAX_TOKENS的incomplete提示仅属于本attempt。blocked prompt可以有完整终态而无首内容。原两处Google RPC短延迟sleep补独立Retry wait，不增加重试或缩短延迟。HTTP只记录body handoff，末次已核算request owner释放与取消/语义终态分开，不宣称socket成功写入。
+
+新增六项本地回环/语义用例覆盖两rail、两App、流非流、零计数、聚合未EOF的首内容、headers/聚合/提交后取消、提交后error零重放及短延迟恢复的attempt隔离；相关Rust回归528通过、零失败，fmt/check及全目标严格Clippy通过，394份冻结构建输入不变，11项相关源码/合同/文档审计通过，主仓同步结果见计划§20.10.2。快照带入冻结时的主仓Share Market修改，定向成绩不替代最终全量集成。两rail真实receipt、Compact与其他能力门禁保持live_pending/disabled，implementationCommit不提升；未提交、推送、做UI自动化或部署测试。
+
+Antigravity CORE-03 主仓同步与本类收口：8个源/文档文件以冻结主仓为基线增量应用，预检与应用无冲突，900个无关文件摘要不变且无无关新增。主仓394份构建输入与本轮已验证树逐份摘要一致；主仓fmt、include单独格式、11项相关源码/合同/文档审计及diff检查全部通过，验证期间输入不变。本类528项相关Rust回归与严格全目标Clippy的范围保持，不冒充当前主仓最终全量Rust/Node/smoke集成。未改变registry/API或手改生成件。下一类仅推进Cursor CORE-03；其余类别及最终全量集成/review仍待完成，总目标继续进行。全部真实operation/rail仍live_pending，未做UI自动化或部署测试，未提交、推送或调用子代理。
+
+## 2026-10-27 CORE-03 完成性复核：Cursor h2 与请求/会话边界
+
+本切片只读核对Cursor导航约定，沿已有OmniRoute冻结wire证据独立设计Server计时，没有新增参考源码、厂商字段、模型能力或真实接受事实。CursorOAuth/CursorApiKey接入共享request/attempt起点；新建h2观察原发送/headers及逐次body读取，工具结果发送仅作入队观察，不宣称socket写成功。经过既有解码、marker处理和工具校验的实际业务内容才产生FirstSemantic；原firstTokenMs、deadline、usage、健康及恢复规则保持。
+
+共享Body观察器在内部poll可能重试后读取当前attempt，上一帧DownstreamDemand仍绑定上一attempt；终态和HTTP交付/取消保持分离。工具turn完成后parked会话继续持有实际预算，续接转移到新request并保留同一h2，不伪造新headers或提前宣称owner已释放。Auth/工具约束只观察原恢复准备，未增加重试或跨身份回退。回环覆盖与验证/同步见计划§20.10.3；相关Rust回归667通过、零失败，fmt/check及全目标严格Clippy通过，395份构建输入全程不变，12项相关源码/合同/文档审计通过。夹具曾错误提前要求部分移动后仍持有的独立响应owner释放，已改为验证其存活和丢弃两个边界，不改生产释放语义。未使用厂商凭据或执行外仓代码，两rail真实receipt仍live_pending，implementationCommit不提升，未做UI自动化或部署测试。
+
+Cursor CORE-03 主仓同步与本类收口：10个源/文档文件按Antigravity收口基线增量应用，预检与应用无冲突，899个无关文件摘要不变且无无关新增。主仓395份构建输入与本轮已验证树逐份摘要一致；主仓fmt、include单独格式、12项相关源码/合同/文档审计及diff共15项检查通过，验证期间输入不变。本类667项相关Rust回归与严格全目标Clippy的范围保持，不冒充当前主仓最终全量Rust/Node/smoke集成。共享Body观察器已随Claude/Antigravity/Codex定向回归核对，未改变registry/API或手改生成件。下一类仅推进Grok CORE-03；其余类别与最终全量集成/review仍待完成，总目标继续进行。真实rail/operation仍live_pending，未做UI自动化或部署测试，未提交、推送或调用子代理。
+
+## 2026-10-27 CORE-03 完成性复核：Grok HTTP、WS 与媒体
+
+本次仅作只读参考核对：grok2api@e2fd7ab481a30a1965bb61395d437154cf247c92的gateway/timing.go（SHA-256 `8b5cc24c164dea7b62b25d93716a8fc5fded85724dca768b443a3d1ad73c2748`）、cli/semantic_streamidle.go（`6c798b00f949278cf28940431f78a31b1f13de4eea32ca31826606c87c7c597e`）、cli/video.go（`e0278bb89a356e960945ac213b286f891be20e95808d3fe6f02e8f4a8fdbe405`）；sub2api@ab99d56e9626e6cd731592dae8553c9758a0efa2的service/openai_gateway_grok_sse_filter.go（`e00567f12c8dc0cbad594992899d4d44e35e31930e6b524214de40f467d8eb7a`）、service/grok_media.go（`25564d5c4549315e7b827f12c50b9718cffe9e5a318c3d34fd757d519cf27718`）。完整路径、基线缺口和实现边界见计划§20.10.4；五份文件与对应Git对象逐字节一致，未构建或执行外仓。参考的first body、语义idle与本仓首语义内容口径不同，不混作同一性能指标。
+
+Server独立计时补齐GrokOAuth的三App HTTP、每回合原生WS/HTTP回退与独立图片/视频入口。复用原JSON/SSE解析观察真正内容、原发送/headers/读取/本地writer完成，以及同账号刷新或proof恢复的独立attempt与retry wait；私有control/ping、connected/heartbeat和纯progress不冒充首内容。图片SSE的附加观察借用RawValue，不构造第二棵含大图/base64的完整Value树；普通JSON复用已有解析。媒体计时失败与既有HTTP/JSON成功决策独立，EOF不能覆盖已观察failure。HTTP只报告body handoff，最后已核算owner释放与终态/取消分开，视频status HTTP请求结束不代表后台任务完成。
+
+本轮冻结验证完成：相关Rust 664项及补跑websocket 76项均通过（范围重叠），fmt/check、严格全目标Clippy及13项相关审计通过，397份构建输入不变，具体失败纠正与边界见计划§20.10.4；主仓同步与最终集成仍待完成。原first_token_ms、deadline、usage、健康、固定身份及恢复资格保持。没有新增remote compaction执行路径或任何厂商接受性事实；inference、media、remote_compaction均仍live_pending，implementationCommit=null。禁止的UI自动化和部署测试未执行。
+
+Grok媒体观察scratch以同一请求/进程父预算可选预留：不足时只省略本帧计时，不能污染转发exhausted标志或改变既有恢复/响应；必需预留合同不变。完整JSON错误、后续完成帧/EOF后的媒体failure保持、multiline CRLF及预算拒绝/共享owner边界已加入回归，上述边界回归全部通过，详见计划。
+
+WS每turn观察槽仅保留当前计时，取消保护先于pending future与其owner析构；异常退出补failed，已完成turn不因后续连接错误改写。共享WS回归另行完整覆盖。Grok普通输出及两种尾帧把既有预留转交实际Bytes owner，不重复准入或持有account lease。三项初始夹具/owner失败及修复已如实保留于计划，未放宽normalizer或启用Grok非流SSE聚合。
+
+Grok CORE-03 主仓同步与本类收口：10个源/文档文件按Cursor收口基线增量应用，预检与应用无冲突，901个无关文件摘要不变且无无关新增。主仓397份构建输入与本轮已验证树逐份摘要一致；主仓fmt、include单独格式、13项相关源码/合同/文档审计及diff共16项检查通过，验证期间输入不变。本类664项相关Rust回归与严格全目标Clippy的范围保持，不冒充当前主仓最终全量Rust/Node/smoke集成。共享WS/Responses观察器已随Codex等定向回归核对，未改变registry/API或手改生成件。下一类仅推进Kiro CORE-03；其余类别与最终全量集成/review仍待完成，总目标继续进行。真实rail/operation仍live_pending，未做UI自动化或部署测试，未提交、推送或调用子代理。
+
+## 2026-10-27 CORE-03 完成性复核：Kiro/AmazonQ EventStream
+
+按Kiro导航只读核对kiro.rs@9066e9c4fe90c7e97d241900a6ce8eb52cc46903的已提交文件：
+
+- `src/anthropic/stream.rs` SHA-256 `1c2168d5f67ab8ce8cbcc1e2b7a97c5bdafb6ba598f179e1e169e86abdc6c1b0`。
+- `src/kiro/parser/frame.rs` SHA-256 `0c3a13d6da5d527dae0a9721a593a4d599572dd98794f9c5107b8f586ee1d035`。
+- `src/token.rs` SHA-256 `b3d8c4bc99f4b08864fbc63c4f265f5195ef72b12488d2f3b3267935b5bfd860`。
+
+均与工作树逐字节一致，未构建或执行外仓。参考仅支持初始/内容/metadata/最终事件区分；本仓在既有Value构造及完整EventStream边界独立观察。KiroOAuth/AmazonQOAuth加入有限静态标签，独立send/headers与原刷新attempt/wait接线；count_tokens保持本地，无虚构上游阶段。流式内容在builder规范化后观察，非流仅在既有完整缓冲解析后观察，不修改原first_token_ms、CRC/EOF合同、deadline、用量或健康。末owner仍由实际预算与Bytes析构报告，HTTP只记录body handoff。本轮398份冻结输入的fmt/include格式、check、636项相关Rust和严格全目标Clippy通过，14项相关审计通过；首次测试编译及第二轮Clippy夹具问题如实记录于计划§20.10.5。七文件差异已review，主仓增量同步待做；真实八路及Compact等门禁保持。
+
+Kiro CORE-03 主仓同步与本类收口：7个源/文档文件按上一类收口基线增量应用，预检/应用无冲突；905个无关文件摘要不变，无无关新增。主仓398份构建输入逐份匹配已验证树；fmt/include单独格式、14项相关审计及diff共17项主仓检查全部通过，期间输入不变。本类636项定向Rust与严格全目标Clippy成绩保持原范围，当前主仓最终完整集成仍待完成。下一步仅推进Qoder；总目标继续进行。真实rail/operation继续live_pending，未做UI自动化、部署测试、提交、推送或子代理调用。
+
+
+## 2026-10-27 CORE-03 完成性复核：Qoder COSY
+
+按Qoder导航，对TokenRouter先加载project-doc、完整读取docs/index.md及相关架构/接口导航与Qoder章节，再按code-comments核对输出观察和执行边界。只读核对TokenRouter@d15137eb59d4d85bdc27ae563c37fcf9b0edebcd：
+
+- `docs/interfaces/qoder_upstream.md` SHA-256 `ff94767f2ee23c5cc2d45ce69d86c3bc8d8482ecc78dd659abd7efe7af4365fc`，工作树等于Git对象。
+- `docs/architecture/gateway_request_lifecycle.md` SHA-256 `8de3e93680867c42d523fd990ae88f50e195391ad26aac13841b1372badb3850`，工作树等于Git对象。
+- `backend/internal/upstream/qoder/output_observation.go` SHA-256 `396c53c5d8d7113713c569ba957d60e6578700ab45eabcc40cd9c0b40862db61`，工作树等于Git对象。
+- `backend/internal/upstream/qoder/execute.go` SHA-256 `31f6bcbdbadbdb2bc7e423af0d23b65ad87858293c46c577c4171816b569c1d9`，工作树等于Git对象。
+
+参考区分转换内容、终态与sink写入错误；它的流式取消后继续收集及跨Provider调度不迁入Server。目标独立接线既有COSY send/headers/read、原同账号认证恢复attempt/wait，在现有canonical Value观察文本、reasoning及实际工具字段；role/空块/usage/finish-only不记首内容。终态仅原唯一终态+EOF通过后观察，转换/发布错误仍记failed；HTTP只报告body handoff，不声称socket成功写入。398份输入冻结下fmt/include、check、661项相关Rust和严格全目标Clippy通过，15项审计通过；新回环path误注册及修正已如实记录，主仓增量同步待做。三rail真实验收及CN PAT候选门禁保持。外仓未修改、构建、测试或执行。
+
+Qoder CORE-03 主仓同步与本类收口：7个源/文档文件按上一类收口基线增量应用，预检/应用无冲突；905个无关文件摘要不变，无无关新增。主仓398份构建输入逐份匹配已验证树；fmt/include单独格式、15项相关审计及diff共18项主仓检查全部通过，期间输入不变。本类661项定向Rust与严格全目标Clippy成绩保持原范围，当前主仓最终完整集成仍待完成。下一步仅推进CodeBuddy；总目标继续进行。真实rail/operation继续live_pending，未做UI自动化、部署测试、提交、推送或子代理调用。
+
+
+## 2026-10-27 CORE-03 完成性复核：CodeBuddy两站
+
+按CodeBuddy导航只读核对cli2api@c7e4e73f64e661028a235e71306dba54ece48435，先读取其AGENTS与架构摘要；三份文件均与已提交Git对象一致：
+
+- `internal/providers/workbuddy/ttfb.go` SHA-256 `429bf5bc9d42a770b088dcb073dc69e4a479cd387263d0c57eef88cfc2c3eb6a`。
+- `internal/providers/workbuddy/ttfb_test.go` SHA-256 `c588d19b33d6298657c7b35ffd93fd279f54e9d993f065d96f96f15ba82d4111`。
+- `internal/providers/workbuddy/sse.go` SHA-256 `39ab1fd31ea78b9c4f6f0455a85b33b7b75f81f9869c0993885d0d50c4f578a3`。
+
+参考区分head等待与body生命周期，并清理空thinking/tool字段。本仓只吸收这些边界证据；继续以既有sanitize后的Chat Value观察文本/推理/实际工具，空字段、role和usage不记首内容。唯一DONE+EOF、错误锁存和原账号恢复比参考宽松聚合更严格，保持不变；没有迁入其timeout值、failover、扫描容错或遇DONE提前成功。独立send/headers/read与原三处认证恢复attempt/wait已接线，转换失败可记failed，HTTP仅body handoff，末owner与终态分开。398份冻结输入下fmt/include、check、665项相关Rust和严格全目标Clippy通过，16项审计通过；七文件差异review未发现待修问题，主仓增量同步及最终完整集成仍待做。两站live_pending，implementationCommit不提升；外仓未修改、构建、测试或执行。
+
+CodeBuddy CORE-03 主仓同步与本类收口：7个源/文档文件按上一类收口基线增量应用，预检/应用无冲突；905个无关文件摘要不变，无无关新增。主仓398份构建输入逐份匹配已验证树；fmt/include单独格式、16项相关审计及diff共19项主仓检查全部通过，期间输入不变。本类665项定向Rust与严格全目标Clippy成绩保持原范围，当前主仓最终完整集成仍待完成。下一步仅推进最终主仓集成与整体review；总目标继续进行。真实rail/operation继续live_pending，未做UI自动化、部署测试、提交、推送或子代理调用。
+
+## 2026-10-27 R4 当前主仓完整集成与最终review
+
+最终验证范围为/data/projects/cc-switch-server当前未提交工作树，HEAD=075924cb3730eca0a300648a9d4c87e83c2c8dea。398份构建输入（332份Rust）已包含冻结时保留的并行Share Market修改，全部Rust步骤间摘要不变；后端审计连同脚本共冻结484份输入。include/fmt明确退出后依次check、完整cargo test、build、严格全目标Clippy全部通过：Rust4028通过/2忽略/零失败；后端Node1921/1921、另28项来源/合同/静态/脱敏检查均通过。本次成绩来自当前主仓，不以旧隔离树结果替代。八类reference-delta各自默认及--check-sources通过，仅证明已声明冻结来源范围，不等于外仓全HEAD审计。
+
+当前主仓新构建二进制的本地后端smoke10/10通过；strip-debug副本与构建产物全部SHF_ALLOC节一致，临时listener/config/launcher清理完成，日志0600。CodeBuddy收口至全部验证结束，仓库文件清单和摘要未变。最终文档收口只更新本计划及本证据文件，不改Rust、fixture或构建输入。
+
+CORE-03现已覆盖本轮八类声明的Provider白名单与协议入口，具体rail、语义首内容、retry wait、EOF、取消及末owner合同见增强计划§20.10～11。HTTP只记body handoff；WS本地writer完成与保守提交不同；语义终态、下游交付和最后实际owner释放不合并。原first_token_ms、usage、deadline、健康、固定绑定及恢复资格保持。新增观测不代表普通API-key路径、所有scratch/RSS或厂商成功socket写入已覆盖，也不产生新的性能提升或真实接受性结论。
+
+原readiness以RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0、空EVIDENCE_FILE执行，实际退出1、not-ready。当前Router四处合同问题仍为locale-provider.tsx/market_fx.rs退役端点、models.rs缺Share Contract v8 reader constant、market_billing.rs缺保留Market能力；八项真实输入缺失，local-contracts-unverified和deployment-not-tested保持。未修改外仓或削弱门禁；本地独立全量通过不能改写readiness结果。
+
+全部R4编号的实现/差分决定及风险回退已在增强计划§20.11逐项复核，离线交付完成；所有真实rail/site/operation继续live_pending，候选能力仍按原disabled/conditional门禁，implementationCommit=null。没有覆盖历史observation或伪造提交态，也未提交、推送、调用子代理、执行外仓代码、做UI自动化或部署测试。

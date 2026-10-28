@@ -77,6 +77,7 @@ pub struct GeminiV1InternalSseAggregator {
     last_response: Option<Value>,
     candidates: BTreeMap<i64, GeminiV1InternalCandidate>,
     retained_bytes: usize,
+    timing: Option<super::request_timing::ForwardTiming>,
 }
 
 #[derive(Debug)]
@@ -771,7 +772,12 @@ impl GeminiV1InternalSseAggregator {
             last_response: None,
             candidates: BTreeMap::new(),
             retained_bytes: 0,
+            timing: None,
         }
+    }
+
+    pub(super) fn set_timing(&mut self, timing: Option<super::request_timing::ForwardTiming>) {
+        self.timing = timing;
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
@@ -855,6 +861,9 @@ impl GeminiV1InternalSseAggregator {
             let response_object = response.as_object().ok_or_else(|| {
                 ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
             })?;
+            if let Some(timing) = &self.timing {
+                timing.observe_gemini_value(&response);
+            }
             self.retained_bytes = self
                 .retained_bytes
                 .saturating_add(serde_json::to_vec(&response).map_or(0, |bytes| bytes.len()));

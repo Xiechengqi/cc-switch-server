@@ -928,6 +928,60 @@ assert(
   "Grok normal-path probe claimed live acceptance",
 );
 
+const r4Sources = new Map((contract.r4Sources ?? []).map((source) => [source.sourceId, source]));
+assert(r4Sources.size === 2, "Grok R4 requires both recommended source snapshots");
+for (const [id, commit, tree, excluded] of [
+  ["grok2api", "e2fd7ab481a30a1965bb61395d437154cf247c92", "79e1aa786df9cca9d38cb8a457a560b7edf56f2f", 0],
+  ["sub2api", "ab99d56e9626e6cd731592dae8553c9758a0efa2", "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a", 6],
+]) {
+  const source = r4Sources.get(id);
+  assert(source?.snapshotCommit === commit && source.snapshotTree === tree &&
+    source.excludedWorktreeEntries === excluded && source.readMode === "read_only_committed_git_objects",
+    `Grok R4 source identity changed: ${id}`);
+  assert(source.files?.length === (id === "grok2api" ? 4 : 3), `Grok R4 source files missing: ${id}`);
+  for (const file of source.files) {
+    safeRelative(file.path, "Grok R4 source");
+    assert(digestPattern.test(file.sha256), "Grok R4 source hash is invalid");
+    if (checkSources) {
+      const directory = sourceRootById.get(id);
+      assert(gitTree(directory, commit) === tree && sha256(gitFile(directory, commit, file.path, null)) === file.sha256,
+        `Grok R4 committed object changed: ${id}:${file.path}`);
+    }
+  }
+}
+const r4 = new Map((contract.r4Reviews ?? []).map((review) => [review.id, review]));
+assert(r4.size === 2, "Grok R4 review set changed");
+for (const id of ["R4-GR-01", "R4-GR-RESIDENT"]) {
+  const review = r4.get(id);
+  assert(review?.status === "working_tree_fixture_verified" && review.vendorWireChanged === false &&
+    review.liveAcceptance === "live_pending" && Number.isFinite(Date.parse(review.reviewedAt)),
+    `Grok R4 review must preserve offline/live separation: ${id}`);
+  assert(commitPattern.test(review.target?.baselineCommit) && review.target.implementationCommit === null &&
+    review.target.readMode === "working_tree" && review.target.validationScope?.includes("excluding_concurrent_Share_Market"),
+    `Grok R4 target scope changed: ${id}`);
+  assert(review.target.contracts?.length === 7, `Grok R4 local evidence missing: ${id}`);
+  for (const local of review.target.contracts) {
+    safeRelative(local.path, "Grok R4 local path");
+    const source = fs.readFileSync(path.join(repoRoot, local.path), "utf8");
+    assert(local.anchors?.length > 0 && local.anchors.every((anchor) => source.includes(anchor)),
+      `Grok R4 local evidence missing: ${local.path}`);
+  }
+}
+const retryReview = r4.get("R4-GR-01");
+assert(retryReview.decision === "keep_current_retry_contract" && retryReview.comparison?.length === 5 &&
+  retryReview.transientHeaderEnabled === false && retryReview.generatedIdempotencyHeaderEnabled === false &&
+  retryReview.crossAccountRetryEnabled === false && retryReview.quotaSoftGateAdopted === false,
+  "Grok R4 must not enable unverified retry, identity, pool or quota policy");
+const resource = r4.get("R4-GR-RESIDENT");
+assert(resource.sharedWork?.includes("R4-CORE-02") && resource.owners?.length === 5 &&
+  resource.capacity?.defaultProcessMode === "observe_only" && resource.capacity.mediaSchemaVersion === 4 &&
+  resource.capacity.replayEntries === 2048 && resource.capacity.mediaBindings === 4096 &&
+  resource.capacity.modelCatalogEntries === 128 && resource.capacity.oidcEntriesPerCache === 8 &&
+  resource.capacity.mediaArcSnapshotsShareOneCharge === true && resource.capacity.mediaCandidatesReserveBeforeCloning === true &&
+  resource.capacity.serializedSizeAllocatesCopy === false && resource.timingInventory?.newMilestoneInstrumentation === false &&
+  resource.timingInventory.performanceClaim === null && resource.limitations?.length === 4,
+  "Grok R4 resource and measurement scope changed");
+
 console.log(
   `grok reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} source snapshots, ${observationIds.size} immutable observations, ${fixtureChecks.length} fixture checks, ${[...operations.values()].reduce((total, entry) => total + entry.requiredChecks.length, 0)} operation checks${
     checkSources ? ", external objects verified" : ", external check optional"

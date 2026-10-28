@@ -287,3 +287,21 @@ GR-N4 的历史记录保留当时默认 `0.2.111` 与参考 Build `1.0.40` 的�
 - 本地 mock 测试不能证明真实 xAI OAuth、订阅权限、模型、媒体、WebSocket 和限流语义可用。
 - Capability evidence 证明某账号曾成功使用能力，不保证其订阅未来始终保有该能力；真实 403/429 和 entitlement 变化仍需告警与人工处理。
 - persistence degraded 期间若宿主机在重试成功前崩溃，内存中的最新旋转 token 可能丢失；fail-closed readiness 和数据面门禁只能缩短风险窗口，不能替代可靠磁盘。
+
+
+## R4：重提交差分与进程资源归属（2026-10-27）
+
+已只读复核推荐 grok2api 的 `e2fd7ab4` 与 sub2api 的 `ab99d56e` 提交态，后者六项未提交修改排除。参考 Build gateway 在逻辑请求外生成 Idempotency-Key，turn transient counter 可跨 selector 尝试；525/526 是排除项。目标维持当前固定绑定恢复合同：不新增自动 Idempotency-Key 或 x-grok-transient-retry，不把 5xx 转成新的生成重放。回环反例覆盖 500/503/525/526 各一次 POST，也拒绝把客户端自报的两个 header 当成受信任计数。401、明确 proof 拒绝与 WS→HTTP fallback 保留原预算和提交边界。Web/SSO consent/Imagine、质量重试/封号与本地 95% 额度 gate 未迁入；新 header 的同 rail 接受性仍缺真实回执。
+
+原请求预算继续覆盖媒体/流/重放临时工作集；进程父预算另接入 replay proof/CAS 占位、媒体任务共享与候选快照、模型目录和 OIDC/JWKS 缓存。replay 使用有界 B-tree；新 scope 无法预留时按可选 cache miss 处理，失败的替换移除旧 proof。缓存与请求 proof clone 是两个 owner。JSON 编码大小用有限计数 writer，不先创建整份序列化副本。
+
+媒体归属仍是 schema 4、最多 4096 项；实时读取和持久化任务共享不可变 Arc 快照，候选表在复制条目前独立预留。最后 Arc drop 才释放对应账目；容量或写盘失败保留原表，本地容量故障按 capacity shed 记录，不罚账号、不重新生成。若上游已创建任务而本地归属提交失败，仍返回失败且不透明重放；这不是上游/磁盘的原子事务。模型目录 payload 共享 Arc，保留原 128 项/身份代际门槛；拒绝新目录时返回非认证、不可自动重试的本地 503，旧授权不复活。OIDC/JWKS 各最多 8 项，父预算不足只跳过新缓存，当前文档仍须通过原有验证；不把容量当作凭据撤销。
+
+默认父预算仍只观测。稀疏树/JWK 元数据按保守逻辑字节估算，缓存惰性过期；控制面解析/持久化序列化 scratch 和一般账号/config 存储并未因此全部计入，也无本类 RSS、生产容量或提速测量。HTTP firstTokenMs 从本次 attempt 完成绑定/并发准入后、adapter/auth refresh 前计时；WS 从 UsageTurn 开始计时，晚于 HTTP 鉴权及物理连接准备；媒体另从执行入口计时。本类未增加完整 milestone 或成功 socket-write 计量。三个 operation 的真实 receipt 仍独立 live_pending，未提交实现仍 implementationCommit=null。完整检查和同步范围见增强计划 §20.6。
+
+
+Grok R4媒体快照的提交后错误对账采用临时plain store/value读取，不再为确认已提交数据申请第三份resident快照。新增预算已由live/candidate占满的提交后错误回归；临时对账/序列化scratch仍不属于完整父预算覆盖。此前完整Rust编译主动中断，不计为通过，修复后的最新验证范围见计划§20.6。
+
+CORE-03统一时间观察已接入Grok HTTP、每回合原生WS/HTTP回退及图片/视频独立入口，当前验证状态见计划§20.10.4。HTTP从转发入口计时，媒体从请求预算建立后计时，WS从response.create数据帧计时；均不包含此前API收包和鉴权。Provider/surface/phase/result标签有限且静态，不使用账号、会话、任意path或模型文本。
+
+ping/private control、空delta、图片connected/heartbeat和纯progress不记为首内容；完整Responses终态中的有效内容、图片结果及有效视频提交task id可单独观察。视频status响应结束仅表示本次查询完成。统一计时不改变既有first_token_ms、usage、成功、健康、deadline或恢复策略；图片带内错误的计时failed不重写原HTTP/JSON决策。HTTP body handoff不等于socket写成功；WS仅把本地sink的成功完成记为writer完成，语义终态、取消及最后已核算owner释放分别记录。新观察不放宽三项operation的live_pending或remote compaction设计门禁。

@@ -7,7 +7,13 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::request_memory::retained_json_bytes;
+use super::request_memory::{
+    retained_json_bytes, RequestMemoryBudget, RequestMemoryComponent, RequestMemoryError,
+    RequestMemoryReservation,
+};
+use crate::infra::resident_memory::{
+    process_resident_memory, serialized_json_bytes, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 const MAX_ENTRIES: usize = 2_048;
 const MAX_TURNS_PER_ENTRY: usize = 256;
@@ -18,7 +24,7 @@ const MAX_SIGNATURE_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const REPLAY_TTL_MS: i64 = 60 * 60 * 1_000;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct AntigravityReplayScope(String);
 
 impl fmt::Debug for AntigravityReplayScope {
@@ -173,13 +179,13 @@ impl ReplayItem {
     }
 }
 
-#[derive(Clone)]
 struct ReplayEntry {
     chain: Option<AntigravityReplayChain>,
     recorded_at_ms: i64,
     expires_at_ms: i64,
     generation: u64,
     bytes: usize,
+    _memory: ResidentMemoryReservation,
 }
 
 impl fmt::Debug for ReplayEntry {
@@ -213,13 +219,14 @@ impl AntigravityReplaySnapshot {
 
 #[derive(Default)]
 struct ReplayStore {
-    entries: HashMap<AntigravityReplayScope, ReplayEntry>,
+    entries: BTreeMap<AntigravityReplayScope, ReplayEntry>,
     next_generation: u64,
     total_bytes: usize,
 }
 
 pub(crate) struct AntigravityReplayCache {
     store: Mutex<ReplayStore>,
+    parent: ResidentMemoryBudget,
 }
 
 impl fmt::Debug for AntigravityReplayCache {
@@ -230,22 +237,45 @@ impl fmt::Debug for AntigravityReplayCache {
 
 impl Default for AntigravityReplayCache {
     fn default() -> Self {
-        Self {
-            store: Mutex::new(ReplayStore::default()),
-        }
+        Self::with_parent(process_resident_memory())
     }
 }
 
 impl AntigravityReplayCache {
-    pub(crate) async fn get(
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            store: Mutex::new(ReplayStore::default()),
+            parent,
+        }
+    }
+
+    pub(crate) async fn get_accounted(
         &self,
         scope: &AntigravityReplayScope,
         now_ms: i64,
-    ) -> (Option<AntigravityReplayChain>, AntigravityReplaySnapshot) {
+        request_memory: Option<&RequestMemoryBudget>,
+    ) -> Result<
+        (
+            Option<AntigravityReplayChain>,
+            AntigravityReplaySnapshot,
+            Option<RequestMemoryReservation>,
+        ),
+        RequestMemoryError,
+    > {
         let mut store = self.store.lock().await;
         prune_expired(&mut store, now_ms);
-        if !store.entries.contains_key(scope) {
-            reserve_tombstone(&mut store, scope.clone(), now_ms);
+        if !store.entries.contains_key(scope)
+            && !reserve_tombstone(&mut store, scope.clone(), now_ms, &self.parent)
+        {
+            // No admitted CAS owner means this optional miss cannot publish.
+            return Ok((
+                None,
+                AntigravityReplaySnapshot {
+                    generation: next_generation(&mut store),
+                    bytes: 0,
+                },
+                None,
+            ));
         }
         let entry = store
             .entries
@@ -253,13 +283,36 @@ impl AntigravityReplayCache {
             .expect("replay miss must be fenced by a tombstone");
         entry.recorded_at_ms = now_ms;
         entry.expires_at_ms = now_ms.saturating_add(REPLAY_TTL_MS);
-        (
-            entry.chain.clone(),
-            AntigravityReplaySnapshot {
-                generation: entry.generation,
-                bytes: entry.bytes,
-            },
-        )
+        let snapshot = AntigravityReplaySnapshot {
+            generation: entry.generation,
+            bytes: entry
+                .chain
+                .as_ref()
+                .map_or(0, AntigravityReplayChain::retained_bytes),
+        };
+        // Admit the independent request copy while still borrowing the entry.
+        let memory = request_memory
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::ReasoningReplay,
+                    snapshot.retained_bytes(),
+                )
+            })
+            .transpose()?;
+        Ok((entry.chain.clone(), snapshot, memory))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get(
+        &self,
+        scope: &AntigravityReplayScope,
+        now_ms: i64,
+    ) -> (Option<AntigravityReplayChain>, AntigravityReplaySnapshot) {
+        let (chain, snapshot, _) = self
+            .get_accounted(scope, now_ms, None)
+            .await
+            .expect("unbudgeted fixture read cannot fail");
+        (chain, snapshot)
     }
 
     pub(crate) async fn replace_if_unchanged(
@@ -278,6 +331,13 @@ impl AntigravityReplayCache {
             return false;
         }
         remove_entry(&mut store, &scope);
+        let Some(memory) = self
+            .parent
+            .reserve(entry_retained_bytes(&scope, chain.retained_bytes()))
+        else {
+            // A failed replacement must not make the old proof visible again.
+            return false;
+        };
         let generation = next_generation(&mut store);
         store.total_bytes = store.total_bytes.saturating_add(bytes);
         store.entries.insert(
@@ -288,6 +348,7 @@ impl AntigravityReplayCache {
                 expires_at_ms: now_ms.saturating_add(REPLAY_TTL_MS),
                 generation,
                 bytes,
+                _memory: memory,
             },
         );
         enforce_limits(&mut store);
@@ -305,7 +366,7 @@ impl AntigravityReplayCache {
             return false;
         }
         remove_entry(&mut store, scope);
-        reserve_tombstone(&mut store, scope.clone(), now_ms);
+        reserve_tombstone(&mut store, scope.clone(), now_ms, &self.parent);
         true
     }
 }
@@ -315,7 +376,23 @@ fn next_generation(store: &mut ReplayStore) -> u64 {
     store.next_generation
 }
 
-fn reserve_tombstone(store: &mut ReplayStore, scope: AntigravityReplayScope, now_ms: i64) {
+fn entry_retained_bytes(scope: &AntigravityReplayScope, chain_bytes: usize) -> usize {
+    std::mem::size_of::<(AntigravityReplayScope, ReplayEntry)>()
+        .saturating_add(std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12)
+        .saturating_add(scope.0.capacity())
+        .saturating_add(chain_bytes)
+}
+
+fn reserve_tombstone(
+    store: &mut ReplayStore,
+    scope: AntigravityReplayScope,
+    now_ms: i64,
+    parent: &ResidentMemoryBudget,
+) -> bool {
+    let Some(memory) = parent.reserve(entry_retained_bytes(&scope, 0)) else {
+        return false;
+    };
     let generation = next_generation(store);
     store.entries.insert(
         scope,
@@ -325,9 +402,11 @@ fn reserve_tombstone(store: &mut ReplayStore, scope: AntigravityReplayScope, now
             expires_at_ms: now_ms.saturating_add(REPLAY_TTL_MS),
             generation,
             bytes: 0,
+            _memory: memory,
         },
     );
     enforce_limits(store);
+    true
 }
 
 fn remove_entry(store: &mut ReplayStore, scope: &AntigravityReplayScope) {
@@ -337,15 +416,10 @@ fn remove_entry(store: &mut ReplayStore, scope: &AntigravityReplayScope) {
 }
 
 fn prune_expired(store: &mut ReplayStore, now_ms: i64) {
-    let expired = store
+    store
         .entries
-        .iter()
-        .filter(|(_, entry)| entry.expires_at_ms <= now_ms)
-        .map(|(scope, _)| scope.clone())
-        .collect::<Vec<_>>();
-    for scope in expired {
-        remove_entry(store, &scope);
-    }
+        .retain(|_, entry| entry.expires_at_ms > now_ms);
+    store.total_bytes = store.entries.values().map(|entry| entry.bytes).sum();
 }
 
 fn enforce_limits(store: &mut ReplayStore) {
@@ -374,13 +448,56 @@ fn valid_chain_bytes(chain: &AntigravityReplayChain) -> Option<usize> {
     if item_count == 0 || item_count > MAX_ITEMS_PER_ENTRY {
         return None;
     }
-    let bytes = serde_json::to_vec(chain).ok()?.len();
-    (bytes <= MAX_BYTES_PER_ENTRY).then_some(bytes)
+    serialized_json_bytes(chain, MAX_BYTES_PER_ENTRY)
 }
 
 impl AntigravityReplayChain {
     pub(crate) fn retained_bytes(&self) -> usize {
-        valid_chain_bytes(self).unwrap_or(0)
+        self.turns.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.turns
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ReplayTurn>()),
+            ),
+            |bytes, turn| {
+                turn.items.iter().fold(
+                    bytes
+                        .saturating_add(turn.base_history_hash.capacity())
+                        .saturating_add(
+                            turn.items
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ReplayItem>()),
+                        ),
+                    |bytes, item| {
+                        bytes.saturating_add(match item {
+                            ReplayItem::FunctionCall {
+                                id,
+                                name,
+                                args,
+                                thought_signature,
+                                ..
+                            } => id
+                                .as_ref()
+                                .map_or(0, String::capacity)
+                                .saturating_add(name.capacity())
+                                .saturating_add(retained_json_bytes(args))
+                                .saturating_add(
+                                    thought_signature.as_ref().map_or(0, String::capacity),
+                                ),
+                            ReplayItem::SignedPart {
+                                target_kind,
+                                target_hash,
+                                thought_signature,
+                                ..
+                            } => target_kind
+                                .capacity()
+                                .saturating_add(target_hash.as_ref().map_or(0, String::capacity))
+                                .saturating_add(thought_signature.capacity()),
+                        })
+                    },
+                )
+            },
+        )
     }
 }
 
@@ -727,6 +844,8 @@ fn patch_model_content(content: &Value, items: &[ReplayItem]) -> Option<Value> {
     let mut patched = content.clone();
     let parts = patched.get_mut("parts")?.as_array_mut()?;
     let mut matched_functions = 0usize;
+    let mut preceding_signature = None;
+    let mut signed_call_seen = false;
     for item in items {
         match item {
             ReplayItem::FunctionCall {
@@ -775,16 +894,20 @@ fn patch_model_content(content: &Value, items: &[ReplayItem]) -> Option<Value> {
                 }
                 let index = matched?;
                 let part = &mut parts[index];
+                let replay_signature = thought_signature.as_ref().or_else(|| {
+                    (!signed_call_seen)
+                        .then_some(preceding_signature.as_ref())
+                        .flatten()
+                });
                 if let Some(existing) = native_signature(part) {
-                    if thought_signature
-                        .as_deref()
-                        .is_some_and(|cached| cached != existing)
-                    {
+                    if replay_signature.is_some_and(|cached| cached != existing) {
                         return None;
                     }
-                } else if let Some(signature) = thought_signature {
+                } else if let Some(signature) = replay_signature {
                     part["thoughtSignature"] = Value::String(signature.clone());
                 }
+                signed_call_seen |= native_signature(part).is_some();
+                preceding_signature = None;
                 if let Some(id) = id {
                     let call = part.get_mut("functionCall")?.as_object_mut()?;
                     match call.get("id").and_then(Value::as_str) {
@@ -804,6 +927,7 @@ fn patch_model_content(content: &Value, items: &[ReplayItem]) -> Option<Value> {
                 occurrence,
             } => {
                 let mut seen = 0usize;
+                let mut found = false;
                 for part in parts.iter_mut() {
                     let Some((kind, hash)) = part_target(part) else {
                         continue;
@@ -822,12 +946,20 @@ fn patch_model_content(content: &Value, items: &[ReplayItem]) -> Option<Value> {
                         }
                         _ => {}
                     }
+                    found = true;
                     break;
+                }
+                if target_kind == "thought" {
+                    preceding_signature = (!found).then(|| thought_signature.clone());
                 }
             }
             ReplayItem::SignedPart {
-                target_hash: None, ..
-            } => {}
+                target_hash: None,
+                thought_signature,
+                ..
+            } => {
+                preceding_signature = Some(thought_signature.clone());
+            }
         }
     }
     let required_functions = function_call_items(items).len();
@@ -1243,11 +1375,89 @@ fn merge_stream_content(target: &mut Value, source: &Value) {
 }
 
 #[cfg(test)]
+#[path = "antigravity_replay/resident_tests.rs"]
+mod resident_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const SIG_A: &str = "opaque-thought-signature-a";
     const SIG_B: &str = "opaque-thought-signature-b";
+
+    #[test]
+    fn antigravity_r4_preceding_signed_thought_survives_existing_unsigned_calls() {
+        let seed = request(json!([{"role":"user","parts":[{"text":"lookup"}]}]));
+        for carrier in [
+            json!({"thought":true,"text":"plan","thoughtSignature":SIG_A}),
+            json!({"thought":true,"text":"","thoughtSignature":SIG_A}),
+        ] {
+            let calls = json!([
+                {"functionCall":{"id":"call-a","name":"lookup","args":{"q":1}}},
+                {"functionCall":{"id":"call-b","name":"lookup","args":{"q":2}}}
+            ]);
+            let mut returned = vec![carrier];
+            returned.extend(calls.as_array().unwrap().clone());
+            let chain = capture_response(
+                &seed,
+                &response(json!({"role":"model","parts":returned})),
+                None,
+            )
+            .unwrap();
+            let next = request(json!([
+                {"role":"user","parts":[{"text":"lookup"}]},
+                {"role":"model","parts":calls},
+                {"role":"user","parts":[
+                    {"functionResponse":{"id":"call-a","name":"lookup","response":{"ok":1}}},
+                    {"functionResponse":{"id":"call-b","name":"lookup","response":{"ok":2}}}
+                ]}
+            ]));
+            let patched = apply_replay(&next, &chain);
+            let patched: Value = serde_json::from_slice(&patched.body).unwrap();
+            assert!(
+                patched["request"]["contents"][1]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| native_signature(part) == Some(SIG_A)),
+                "the caller may retain calls while omitting private thought content"
+            );
+            assert_eq!(
+                patched["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+                SIG_A
+            );
+            assert!(patched["request"]["contents"][1]["parts"][1]
+                .get("thoughtSignature")
+                .is_none());
+            for (pointer, value) in [
+                ("/request/contents/0/parts/0/text", json!("edited history")),
+                (
+                    "/request/contents/1/parts/0/functionCall/args/q",
+                    json!(999),
+                ),
+                (
+                    "/request/contents/1/parts/0/functionCall/id",
+                    json!("different-call"),
+                ),
+            ] {
+                let mut edited: Value = serde_json::from_slice(&next).unwrap();
+                *edited.pointer_mut(pointer).unwrap() = value;
+                let encoded = serde_json::to_vec(&edited).unwrap();
+                let result = apply_replay(&encoded, &chain);
+                assert!(
+                    !result.applied,
+                    "changed {pointer} must not borrow signatures"
+                );
+                assert_eq!(result.body.as_ref(), encoded.as_slice());
+            }
+            let mut conflict: Value = serde_json::from_slice(&next).unwrap();
+            conflict["request"]["contents"][1]["parts"][0]["thoughtSignature"] = json!(SIG_B);
+            let encoded = serde_json::to_vec(&conflict).unwrap();
+            let result = apply_replay(&encoded, &chain);
+            assert!(!result.applied);
+            assert_eq!(result.body.as_ref(), encoded.as_slice());
+        }
+    }
 
     fn scope(suffix: &str) -> AntigravityReplayScope {
         AntigravityReplayScope::derive(

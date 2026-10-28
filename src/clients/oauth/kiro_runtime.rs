@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::LazyLock;
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::domain::accounts::store::Account;
+use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
 use crate::infra::time::now_ms;
+
+mod resident;
 
 pub const FALLBACK_IDE_VERSION: &str = "0.9.2";
 #[cfg(not(test))]
@@ -29,11 +32,12 @@ pub struct KiroModelCatalog {
 
 #[derive(Debug, Clone)]
 struct CachedModels {
-    descriptors: Vec<KiroModelDescriptor>,
+    descriptors: Arc<Vec<KiroModelDescriptor>>,
     fetched_at_ms: i64,
+    _memory: ResidentMemoryReservation,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct ModelCacheKey {
     app: String,
     provider_id: String,
@@ -86,10 +90,11 @@ impl KiroModelCatalogScope {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RuntimeCache {
-    ide_version: Option<(String, i64)>,
-    models: HashMap<ModelCacheKey, CachedModels>,
+    ide_version: Option<(String, i64, ResidentMemoryReservation)>,
+    models: BTreeMap<ModelCacheKey, CachedModels>,
+    parent: ResidentMemoryBudget,
 }
 
 static CACHE: LazyLock<Mutex<RuntimeCache>> = LazyLock::new(|| Mutex::new(RuntimeCache::default()));
@@ -241,8 +246,8 @@ pub async fn effective_ide_version(http: &reqwest::Client) -> String {
         .await
         .ide_version
         .as_ref()
-        .filter(|(_, fetched)| now.saturating_sub(*fetched) < 6 * 60 * 60 * 1000)
-        .map(|(version, _)| version.clone())
+        .filter(|(_, fetched, _)| now.saturating_sub(*fetched) < 6 * 60 * 60 * 1000)
+        .map(|(version, _, _)| version.clone())
     {
         return version;
     }
@@ -267,7 +272,7 @@ pub async fn effective_ide_version(http: &reqwest::Client) -> String {
             _ => None,
         };
         if let Some(version) = version {
-            CACHE.lock().await.ide_version = Some((version.clone(), now));
+            CACHE.lock().await.publish_ide(&version, now);
             version
         } else {
             CACHE
@@ -275,7 +280,7 @@ pub async fn effective_ide_version(http: &reqwest::Client) -> String {
                 .await
                 .ide_version
                 .as_ref()
-                .map(|(version, _)| version.clone())
+                .map(|(version, _, _)| version.clone())
                 .unwrap_or_else(|| FALLBACK_IDE_VERSION.to_string())
         }
     }
@@ -362,13 +367,10 @@ pub async fn model_catalog_scoped(
     if let Some(cached) = CACHE
         .lock()
         .await
-        .models
-        .get(&cache_key)
-        .filter(|cached| now.saturating_sub(cached.fetched_at_ms) < MODEL_CACHE_TTL_MS)
-        .cloned()
+        .models_snapshot(&cache_key, now, MODEL_CACHE_TTL_MS)
     {
         return KiroModelCatalog {
-            descriptors: cached.descriptors,
+            descriptors: cached.descriptors.as_ref().clone(),
             source: "kiro_account_cache",
             stale: false,
             fetched_at_ms: Some(cached.fetched_at_ms),
@@ -387,13 +389,10 @@ pub async fn model_catalog_scoped(
     .await;
     match fetched {
         Ok(descriptors) => {
-            CACHE.lock().await.models.insert(
-                cache_key,
-                CachedModels {
-                    descriptors: descriptors.clone(),
-                    fetched_at_ms: now,
-                },
-            );
+            CACHE
+                .lock()
+                .await
+                .publish_models(cache_key, &descriptors, now);
             KiroModelCatalog {
                 descriptors,
                 source: "kiro_list_available_models",
@@ -408,18 +407,14 @@ pub async fn model_catalog_scoped(
         }
         Err(error) => {
             tracing::warn!(account_id = %account.id, error = %error, "Kiro model discovery failed transiently");
-            if let Some(cached) = CACHE
-                .lock()
-                .await
-                .models
-                .get(&cache_key)
-                .filter(|cached| {
-                    now.saturating_sub(cached.fetched_at_ms) < STALE_MODEL_CACHE_TTL_MS
-                })
-                .cloned()
+            if let Some(cached) =
+                CACHE
+                    .lock()
+                    .await
+                    .models_snapshot(&cache_key, now, STALE_MODEL_CACHE_TTL_MS)
             {
                 KiroModelCatalog {
-                    descriptors: cached.descriptors,
+                    descriptors: cached.descriptors.as_ref().clone(),
                     source: "kiro_account_cache",
                     stale: true,
                     fetched_at_ms: Some(cached.fetched_at_ms),
@@ -465,9 +460,7 @@ async fn cached_model_descriptor(
     CACHE
         .lock()
         .await
-        .models
-        .get(&cache_key)
-        .filter(|cached| now.saturating_sub(cached.fetched_at_ms) < STALE_MODEL_CACHE_TTL_MS)
+        .models_snapshot(&cache_key, now, STALE_MODEL_CACHE_TTL_MS)
         .map(|cached| {
             cached
                 .descriptors
@@ -1865,13 +1858,10 @@ mod tests {
             max_input_tokens: None,
             max_output_tokens: None,
         };
-        CACHE.lock().await.models.insert(
+        CACHE.lock().await.publish_models(
             key,
-            CachedModels {
-                descriptors: vec![descriptor],
-                fetched_at_ms: (now_ms().min(i64::MAX as u128) as i64)
-                    .saturating_sub(STALE_MODEL_CACHE_TTL_MS),
-            },
+            &[descriptor],
+            (now_ms().min(i64::MAX as u128) as i64).saturating_sub(STALE_MODEL_CACHE_TTL_MS),
         );
 
         assert_eq!(

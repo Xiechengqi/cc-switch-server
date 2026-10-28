@@ -686,8 +686,57 @@ assert(
   "Claude probe must stay redacted and subordinate to private receipts",
 );
 
+const r4Ids = new Set(["R4-CL-01", "R4-CL-02"]);
+for (const review of baseline.r4Reviews ?? []) {
+  assert(r4Ids.delete(review.id), `unexpected or duplicate Claude R4 review ${review.id}`);
+  assert(
+    Number.isFinite(Date.parse(review.reviewedAt)) &&
+      review.status === "working_tree_fixture_verified" &&
+      ["adopt", "adapt"].includes(review.decision) &&
+      review.liveAcceptance === "live_pending",
+    `${review.id} claims an unsupported R4 evidence state`,
+  );
+  const source = review.source;
+  assert(
+    sourceById.has(source?.sourceId) &&
+      commitPattern.test(source.snapshotCommit) &&
+      commitPattern.test(source.deltaCommit) &&
+      commitPattern.test(source.deltaTree) &&
+      Array.isArray(source.files) && source.files.length >= 2,
+    `${review.id} must pin source implementation and fixtures`,
+  );
+  for (const file of source.files) {
+    assertSafePath(file.path, `${review.id} source`);
+    assert(digestPattern.test(file.sha256), `${review.id} source digest is invalid`);
+    if (checkSources) {
+      const sourceRoot = sourceRootById.get(source.sourceId);
+      assert(
+        gitTree(sourceRoot, source.deltaCommit) === source.deltaTree &&
+          sha256(gitFile(sourceRoot, source.deltaCommit, file.path, null)) === file.sha256,
+        `${review.id} source object drifted`,
+      );
+    }
+  }
+  assert(
+    commitPattern.test(review.target?.baselineCommit) &&
+      review.target.implementationCommit === null && review.target.readMode === "working_tree" &&
+      Array.isArray(review.target.contracts) && review.target.contracts.length > 0,
+    `${review.id} must distinguish working-tree fixtures from committed implementation`,
+  );
+  for (const contract of review.target.contracts) {
+    assertSafePath(contract.path, `${review.id} target`);
+    const content = fs.readFileSync(path.join(root, contract.path), "utf8");
+    assert(
+      Array.isArray(contract.anchors) && contract.anchors.length > 0 &&
+        contract.anchors.every((anchor) => content.includes(anchor)),
+      `${review.id} has an unavailable local fixture anchor`,
+    );
+  }
+}
+assert(r4Ids.size === 0, "Claude R4 fixture coverage is incomplete");
+
 console.log(
-  `claude reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${expectedOperations.length} live-pending operations${
+  `claude reference delta audit ok (${sourceDeltaIds.size} deltas, ${observationIds.size} immutable observations, ${baseline.r4Reviews.length} R4 working-tree reviews, ${expectedOperations.length} live-pending operations${
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );

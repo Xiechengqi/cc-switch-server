@@ -11,6 +11,7 @@
 
 use axum::http::StatusCode;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::domain::providers::model::ProviderType;
 use crate::domain::usage::store::UsageLogContext;
@@ -78,6 +79,9 @@ pub(crate) struct CanonicalRequest {
     pub(crate) downstream_session_id: String,
     pub(crate) requested_model: String,
     pub(crate) body: Value,
+    /// Declarations captured before Gemini's callable subset is narrowed.
+    /// This set is internal metadata, never a field read from canonical Chat.
+    pub(crate) declared_history_names: BTreeSet<String>,
 }
 
 impl CanonicalRequest {
@@ -88,6 +92,7 @@ impl CanonicalRequest {
             .saturating_add(self.downstream_session_id.capacity())
             .saturating_add(self.requested_model.capacity())
             .saturating_add(retained_json_bytes(&self.body))
+            .saturating_add(retained_history_names(&self.declared_history_names))
     }
 }
 
@@ -115,6 +120,36 @@ pub(crate) fn responses_previous_id(body: &Value) -> Result<Option<String>, Prox
         ));
     }
     Ok(Some(previous.to_string()))
+}
+
+pub(crate) fn gemini_declared_history_names(body: &[u8]) -> Result<BTreeSet<String>, ProxyError> {
+    let input: Value = serde_json::from_slice(body)
+        .map_err(|_| ProxyError::bad_request("invalid Qoder Gemini request"))?;
+    Ok(input
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            tool.get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array)
+        })
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+pub(crate) fn retained_history_names(names: &BTreeSet<String>) -> usize {
+    names.iter().fold(0usize, |bytes, name| {
+        bytes
+            .saturating_add(name.capacity())
+            .saturating_add(std::mem::size_of::<String>())
+            .saturating_add(std::mem::size_of::<usize>() * 3)
+    })
 }
 
 pub(crate) fn prepare_canonical_request(
@@ -173,6 +208,7 @@ pub(crate) fn prepare_canonical_request(
         downstream_session_id,
         requested_model,
         body,
+        declared_history_names: BTreeSet::new(),
     })
 }
 
@@ -308,6 +344,7 @@ pub(crate) fn prepare_generation(
         &prepared_runtime.session.session.identity.user_type,
         now_ms,
         continuation,
+        Some(&canonical.declared_history_names),
     )
     .map_err(ProxyError::bad_request)?;
     let model_source = exact_model_config
@@ -472,7 +509,27 @@ mod tests {
                 "messages": [{"role": "user", "content": "fixture"}],
                 "stream": true
             }),
+            declared_history_names: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn qoder_r4_gemini_history_metadata_uses_only_direct_source_declarations() {
+        let input = serde_json::json!({
+            "tools":[{"functionDeclarations":[{"name":"read"}]},{"function_declarations":[{"name":"write"}]}],
+            "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["write"]}},
+            "declared_history_names":["injected"],
+            "contents":[{"role":"user","parts":[{"text":"{\"functionDeclarations\":[{\"name\":\"nested\"}]}"}]}]
+        });
+        let names = gemini_declared_history_names(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            names,
+            BTreeSet::from(["read".to_string(), "write".to_string()])
+        );
+        let mut request = canonical("fixture-model");
+        let bytes = request.retained_bytes();
+        request.declared_history_names = names;
+        assert!(request.retained_bytes() > bytes);
     }
 
     #[test]

@@ -101,3 +101,17 @@ EventStream 的 16 MiB 帧/待解码缓冲上限约束单个未完成帧，不�
 ## 只读来源
 
 差异证据冻结在 `assets/contract/kiro-reference-delta.json`：append-only schema v2 保留 `kiro.rs@22d2c2d0695ba350890072c19990f54782827ae5` 的 committed prompt-cache 对象、`f2cc574` / `19b7f4b` / `47633a4` 历史对象，以及 `f413e7de` / `3194bb29` / `0b8c7dec` / `d62054f5` / `13763b69` 的 tool/profile/compact 增量；同时固定干净的 `kiro.rs@be0c04219d9d1b93b7fe5c3d7b9e7c9cf0d05863` committed-object snapshot、原 schema-v1 十字段摘要和 14 条不可变处置记录。第 14 条只把参考的 16 MiB EventStream frame/buffer ceiling 作为 retained-state 差分信号，`CORE-N2-KIRO=fixture_verified` 由本仓库独立实现支持。外部工作树不是构建、测试、发布或运行时依赖；默认审计只验证本仓库合同，显式 `--check-sources` 才按 commit/tree 与 SHA-256 读取这些 Git objects。
+
+
+## R4：进程父预算与在写批次（2026-10-27）
+
+缓存表仍最多4096条，TTL/断点/身份及SQLite schema保持。缓存条目和dirty mutation使用独立RAII父预算owner，writer拿走批次时owner随之移动；失败合并无需再次申请长期预算，已有更新版本优先。待写与in-flight合计最多8192项；通知队列仍是2。无writer的内存模式不创建dirty map。
+
+更新前先为计划scratch、新条目与新mutation全部预留。预算或mutation容量不足，整次保持原表、TTL/generation及待持久化删除记录，并返回`local_capacity`的无缓存估算；推理继续，vendor权威usage（含零）仍优先。不能把可选本地估算压力当成账号失败。启动条目未获准时只跳过内存缓存，不删除磁盘证据。默认父预算只观测，可按部署测量启用硬上限。
+
+缓存惰性过期。逻辑稀疏索引估算不是RSS；SQLite/legacy启动解析与连接内部scratch未全部计入。EventStream取消/EOF/截断/idle-timeout测试只观察本地adapter和Bytes所有权，不证明厂商socket或健康分类。contextUsage减输出继续shadow-only，四种认证×两区域的真实receipt继续独立live_pending，shared cache与remote compaction仍禁用。验证范围见计划§20.7。
+
+
+独立模型目录也接父预算：最多128条，原5分钟fresh/24小时最大stale保持，惰性过期；内部Arc快照共享同一payload和owner。容量压力只跳过缓存，移除同key被替代目录，当前已获取结果仍可返回；控制面Vec/String投影与解析scratch没有完整覆盖。IDE版本只保留一份可选owner，不在压力下复用被取代旧版本。本类十三项新回归包含目录/IDE资源；既定discovery候选不等于允许推理跨区域重放。
+
+CORE-03的Kiro/AmazonQ计时边界见增强计划§20.10.5：流式观察既有builder产生的规范化内容和完整endEvent，初始空块、用量/签名、未知metadata及部分wire不冒充首内容；非流仍在完整缓冲成功解析后才观察。计时不参与Prompt Cache命中、usage优先级、context减输出shadow候选、deadline、恢复或能力决策。本地count_tokens不发上游阶段，HTTP只报告body handoff；取消与末次已核算owner释放独立。真实八路和Compact/shared cache门禁保持原状。

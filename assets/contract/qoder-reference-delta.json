@@ -966,5 +966,232 @@
       "upgradeWorkflow": "1c12f1ea9a89fe2161c016ded746614ee24222e8b3e33864ed40d72a52331364",
       "realAcceptance": "40b4266efb714b7bb9c62284c3c96ed18168b4d8f8431928702bef23c9f6d80a"
     }
-  }
+  },
+  "r4Reviews": [
+    {
+      "id": "R4-CORE-01",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "source": {
+        "sourceId": "tokenrouter",
+        "snapshotCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaTree": "df18b022d78c4760a89f5d0c372b5467bbc4c60f",
+        "readMode": "read_only_committed_git_objects",
+        "files": [
+          {
+            "path": "backend/internal/protocol/bridge/responses_tool_identity.go",
+            "sha256": "ff4493a14bcf439047843b201be890bc8be9d8a6d7fea6560e2d7cb969ef0316"
+          },
+          {
+            "path": "backend/internal/protocol/bridge/responses_tool_identity_test.go",
+            "sha256": "f165d5ddf34c3c6dc8a022259c6c952bf11b4ab0b8f1cef50abcf41abaa57446"
+          },
+          {
+            "path": "backend/internal/protocol/bridge/responses_tool_history.go",
+            "sha256": "b3ed62b104d78b7a855568b5b82564c370c9e37c838ff3ae46b0979be8a1e41a"
+          },
+          {
+            "path": "backend/internal/protocol/bridge/responses_tool_history_test.go",
+            "sha256": "e760dbd480087ba9038c86c83eb7c094132f95482d4c89a62f57cef80adc5055"
+          }
+        ]
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/proxy/responses_tool_identity.rs",
+            "anchors": [
+              "struct ResponsesToolIdentity",
+              "struct HistoricalToolNames",
+              "fn hashed_name",
+              "fn retained_bytes"
+            ]
+          },
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "validate_bridge_request",
+              "selected_chat_name",
+              "qoder_r4_active_response_tool_identity_collisions_fail_in_both_bridges",
+              "qoder_r4_retired_history_names_are_distinct_stable_and_not_callable",
+              "qoder_r4_history_preserves_raw_arguments_and_reserves_kind_and_bare_names",
+              "qoder_r4_explicit_tool_reset_and_opaque_results_do_not_add_declarations",
+              "qoder_r4_invalid_history_does_not_get_an_invented_tool_name"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/qoder_http_tests.rs",
+            "anchors": [
+              "qoder_r4_ambiguous_or_history_only_selectors_fail_before_any_upstream_request"
+            ]
+          },
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "qoder_r4_bridge_identity_checks_leave_native_responses_unchanged"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "anthropic_stream_restores_namespace_and_tool_search_items",
+              "chat_stream_restores_namespace_and_tool_search_items"
+            ]
+          },
+          {
+            "path": "src/proxy/grok.rs",
+            "anchors": [
+              "forced_function_choice_must_name_a_retained_tool_on_http_and_websocket"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Reject conflicting active identities before conversion reaches any upstream; allocate sorted bounded history aliases separately from declarations, exact-kind selectors and response restoration. Preserve raw historical argument strings, direct discovery/reset boundaries, native Responses and request-memory accounting."
+    },
+    {
+      "id": "R4-QD-01",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "partial_adapt",
+      "source": {
+        "sourceId": "tokenrouter",
+        "snapshotCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaTree": "df18b022d78c4760a89f5d0c372b5467bbc4c60f",
+        "readMode": "read_only_committed_git_objects",
+        "files": [
+          {
+            "path": "backend/internal/upstream/qoder/payload.go",
+            "sha256": "3223bc0cfee384a779ed35443d3d909f7ae49a419209142ae0739027cbac66d0"
+          },
+          {
+            "path": "backend/internal/upstream/qoder/payload_test.go",
+            "sha256": "45f71755ebf48e7fbf16e2380e537c6e3df95c6ad2ecaa3e7d4dc484176e8cd1"
+          }
+        ]
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/proxy/qoder_runtime.rs",
+            "anchors": [
+              "qoder_r4_tool_choice_does_not_erase_declared_completed_history",
+              "qoder_r4_retired_history_final_payload_delta_remains_live_gated"
+            ]
+          },
+          {
+            "path": "src/proxy/providers/qoder/mod.rs",
+            "anchors": [
+              "gemini_declared_history_names",
+              "retained_history_names",
+              "qoder_r4_gemini_history_metadata_uses_only_direct_source_declarations"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder/qoder_http_tests.rs",
+            "anchors": [
+              "qoder_r4_declared_history_survives_choice_on_every_rail_and_surface"
+            ]
+          },
+          {
+            "path": "assets/contract/qoder-r4-history-delta.json",
+            "anchors": [
+              "expectedPayloadProjection",
+              "read_only_source_observation_not_an_executed_reference_payload_or_live_receipt"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Match completed history using current declarations before tool-choice filtering. Capture Gemini declaration names before allowedFunctionNames narrowing as internal bounded metadata. Preserve the existing unknown-history gate and batch/continuation pairing until each real rail accepts retired history.",
+      "declaredHistory": "fixture_verified",
+      "retiredHistory": "live_pending",
+      "rails": [
+        "global_oauth",
+        "global_pat",
+        "cn_oauth"
+      ],
+      "surfaces": [
+        "claude",
+        "codex",
+        "gemini"
+      ]
+    },
+    {
+      "id": "R4-QD-02",
+      "reviewedAt": "2026-10-27T00:00:00Z",
+      "status": "researched_live_pending",
+      "decision": "defer_missing_official_oracle",
+      "source": {
+        "sourceId": "tokenrouter",
+        "snapshotCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaCommit": "d15137eb59d4d85bdc27ae563c37fcf9b0edebcd",
+        "deltaTree": "df18b022d78c4760a89f5d0c372b5467bbc4c60f",
+        "readMode": "read_only_committed_git_objects",
+        "files": [
+          {
+            "path": "backend/internal/upstream/qoder/credential_builder.go",
+            "sha256": "fcb0b1bcbe082d5c51b13bd1da910c0b1d1c53ebb23bd69499299a1a9038afac"
+          },
+          {
+            "path": "backend/internal/upstream/qoder/oauth.go",
+            "sha256": "80072324e7adbd1728464061645954b84e42fff99db7e6973ef894a66689f33b"
+          },
+          {
+            "path": "backend/internal/upstream/qoder/oauth_test.go",
+            "sha256": "a839aa76b6c362e6ad879d4dcfcfdea95ba505e9f9f1c03837994102cb2445c2"
+          },
+          {
+            "path": "backend/internal/upstream/qoder/auth_status.go",
+            "sha256": "41342f71b233738a5da511664cca545588708602827681f4dfd893182c126e77"
+          },
+          {
+            "path": "backend/internal/upstream/qoder/site.go",
+            "sha256": "3b128bd43c46a83359515dbb87774b325229af656771b9403e53a3be4cd0b36d"
+          }
+        ]
+      },
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/domain/qoder.rs",
+            "anchors": [
+              "pub enum QoderCredentialRail",
+              "if site == QoderSite::Global"
+            ]
+          },
+          {
+            "path": "docs/provider/qoder-cosy.md",
+            "anchors": [
+              "R4-QD-02 暂不开放 CN PAT",
+              "personal_token",
+              "独立 Registry rail"
+            ]
+          }
+        ]
+      },
+      "liveAcceptance": "live_pending",
+      "reason": "Reference CN PAT exchanges personal_token at the CN OpenAPI jobToken endpoint, then completes userinfo and Gateway identity with refresh/expiry. Do not reuse Global PAT or replace the official 1.1.32 oracle with reference 1.24.2 headers.",
+      "missingEvidence": [
+        "independent_official_cn_pat_bundle_and_digest",
+        "cn_pat_wire_oracle_and_mutations",
+        "independent_registry_import_rotation_contract",
+        "cn_pat_private_real_receipt"
+      ],
+      "productionCodeChanged": false,
+      "cnPatEnabled": false
+    }
+  ]
 }

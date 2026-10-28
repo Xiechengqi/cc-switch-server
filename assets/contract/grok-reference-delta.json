@@ -217,7 +217,11 @@
     }
   ],
   "fixtureAcceptance": {
-    "transportRails": ["http", "sse", "websocket"],
+    "transportRails": [
+      "http",
+      "sse",
+      "websocket"
+    ],
     "checks": [
       "reasoning_capture",
       "reasoning_replay",
@@ -378,7 +382,7 @@
     ]
   },
   "legacySchemaVersion": 1,
-  "updatedAt": "2026-10-25T00:00:00Z",
+  "updatedAt": "2026-10-27T16:50:46.476541+00:00",
   "cliIdentityUpdate": {
     "recordedAt": "2026-10-25T00:00:00Z",
     "basis": "user_reported_upstream_version_rejection",
@@ -1498,6 +1502,269 @@
             "Grok receipt file must stay outside the repository"
           ]
         }
+      ]
+    }
+  ],
+  "r4Sources": [
+    {
+      "sourceId": "grok2api",
+      "snapshotCommit": "e2fd7ab481a30a1965bb61395d437154cf247c92",
+      "snapshotTree": "79e1aa786df9cca9d38cb8a457a560b7edf56f2f",
+      "readMode": "read_only_committed_git_objects",
+      "excludedWorktreeEntries": 0,
+      "files": [
+        {
+          "path": "backend/internal/infra/provider/cli/adapter.go",
+          "sha256": "4bffffb891d2c022533b8241fb72b32dbe92cb82c94131014aebf0bd12838fc6"
+        },
+        {
+          "path": "backend/internal/application/gateway/service.go",
+          "sha256": "9fe6ac547a451120de02bb1968ea959d05d110b49329fe429251e35f4c64ad6e"
+        },
+        {
+          "path": "backend/internal/infra/provider/web/sso_build.go",
+          "sha256": "c94c7cb444fd16a7a4d90b0c8aabc1c696522f142c26a5137b2b73f96919b914"
+        },
+        {
+          "path": "backend/internal/infra/provider/web/image.go",
+          "sha256": "b012ba641ac10d8bc5c2b21abc228ba896702a32c5e6d798602b48e54eea2237"
+        }
+      ]
+    },
+    {
+      "sourceId": "sub2api",
+      "snapshotCommit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+      "snapshotTree": "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a",
+      "readMode": "read_only_committed_git_objects",
+      "excludedWorktreeEntries": 6,
+      "files": [
+        {
+          "path": "backend/internal/service/grok_credential_failure.go",
+          "sha256": "b8b3c8e4374728505994ed92bff267b1fae52aa819d324d238293c86f086be7c"
+        },
+        {
+          "path": "backend/internal/service/grok_free_quota_gate.go",
+          "sha256": "1c2122f0d2a79d7fd53e4e3ba2cf6c7e585abfc04682ca4c6ebcf5f052f70769"
+        },
+        {
+          "path": "backend/internal/pkg/xai/cli_identity.go",
+          "sha256": "fc2768cfcca65763adbfe26ccbdb2b75880a802ec7d896ab389588417a428e9f"
+        }
+      ]
+    }
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-GR-01",
+      "reviewedAt": "2026-10-27T16:50:46.476541+00:00",
+      "status": "working_tree_fixture_verified",
+      "decision": "keep_current_retry_contract",
+      "vendorWireChanged": false,
+      "newConfirmedProviderWireGap": false,
+      "liveAcceptance": "live_pending",
+      "sourceIds": [
+        "grok2api",
+        "sub2api"
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_worktree_excluding_concurrent_Share_Market",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder/grok_r4_tests.rs",
+            "anchors": [
+              "grok_r4_5xx_is_returned_once_without_new_transient_or_idempotency_headers",
+              "grok_r4_video_owner_capacity_failure_does_not_penalize_the_account_or_retry"
+            ]
+          },
+          {
+            "path": "src/proxy/grok_replay.rs",
+            "anchors": [
+              "grok_r4_replay_cache_and_request_clone_have_independent_owners",
+              "grok_r4_replay_rejected_replacement_invalidates_the_old_proof",
+              "grok_r4_replay_expiry_eviction_and_delete_release_resident_owners"
+            ]
+          },
+          {
+            "path": "src/state/grok_media_resident.rs",
+            "anchors": [
+              "grok_r4_media_arc_clones_share_one_charge_until_the_last_drop",
+              "grok_r4_media_persistence_failure_drops_only_the_candidate_owner",
+              "grok_r4_media_post_commit_reconciliation_needs_no_third_resident_owner"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/grok_models.rs",
+            "anchors": [
+              "grok_r4_catalog_snapshot_shares_payload_and_retains_its_resident_owner",
+              "grok_r4_catalog_capacity_rejection_removes_superseded_authorization"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/grok_jwks.rs",
+            "anchors": [
+              "grok_r4_oidc_caches_are_budgeted_bounded_and_optional_under_pressure",
+              "grok_r4_jwks_replacement_and_expiry_release_old_owners"
+            ]
+          },
+          {
+            "path": "src/infra/resident_memory.rs",
+            "anchors": [
+              "serialized_json_bytes",
+              "grok_r4_json_size_count_obeys_escaped_wire_bytes_without_a_copy"
+            ]
+          },
+          {
+            "path": "src/state.rs",
+            "anchors": [
+              "stale_refresh_success_and_failure_cannot_overwrite_reauthorization",
+              "GrokMediaResidentSnapshot::load"
+            ]
+          }
+        ]
+      },
+      "comparison": [
+        {
+          "case": "initial_send",
+          "reference": "one generated Idempotency-Key per logical gateway request; transient header absent at zero",
+          "target": "no new automatic Idempotency-Key or transient header"
+        },
+        {
+          "case": "5xx_resubmission",
+          "reference": "turn counter can span selector attempts; 5xx except 525/526 are transient",
+          "target": "500/503/525/526 each produce one loopback upstream POST; no new retry contract"
+        },
+        {
+          "case": "auth_refresh_and_reasoning_rejection",
+          "reference": "separate credential and reasoning recovery stages exist",
+          "target": "retain same-binding bounded 401 and explicit proof-rejection recovery; turn index stays client-owned"
+        },
+        {
+          "case": "web_sso",
+          "reference": "consent_token and Imagine requestId filtering belong to Web/SSO",
+          "target": "not adopted into OAuth CLI"
+        },
+        {
+          "case": "credential_cas",
+          "reference": "conditional credential mutations reject stale snapshots",
+          "target": "existing stale-refresh success/failure and bearer-change tests preserve the current identity"
+        }
+      ],
+      "transientHeaderEnabled": false,
+      "generatedIdempotencyHeaderEnabled": false,
+      "crossAccountRetryEnabled": false,
+      "quotaSoftGateAdopted": false
+    },
+    {
+      "id": "R4-GR-RESIDENT",
+      "sharedWork": [
+        "R4-CORE-02"
+      ],
+      "reviewedAt": "2026-10-27T16:50:46.476541+00:00",
+      "status": "working_tree_fixture_verified",
+      "decision": "extend_resource_ownership_keep_vendor_protocol",
+      "vendorWireChanged": false,
+      "liveAcceptance": "live_pending",
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_worktree_excluding_concurrent_Share_Market",
+        "contracts": [
+          {
+            "path": "src/proxy/forwarder/grok_r4_tests.rs",
+            "anchors": [
+              "grok_r4_5xx_is_returned_once_without_new_transient_or_idempotency_headers",
+              "grok_r4_video_owner_capacity_failure_does_not_penalize_the_account_or_retry"
+            ]
+          },
+          {
+            "path": "src/proxy/grok_replay.rs",
+            "anchors": [
+              "grok_r4_replay_cache_and_request_clone_have_independent_owners",
+              "grok_r4_replay_rejected_replacement_invalidates_the_old_proof",
+              "grok_r4_replay_expiry_eviction_and_delete_release_resident_owners"
+            ]
+          },
+          {
+            "path": "src/state/grok_media_resident.rs",
+            "anchors": [
+              "grok_r4_media_arc_clones_share_one_charge_until_the_last_drop",
+              "grok_r4_media_persistence_failure_drops_only_the_candidate_owner",
+              "grok_r4_media_post_commit_reconciliation_needs_no_third_resident_owner"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/grok_models.rs",
+            "anchors": [
+              "grok_r4_catalog_snapshot_shares_payload_and_retains_its_resident_owner",
+              "grok_r4_catalog_capacity_rejection_removes_superseded_authorization"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/grok_jwks.rs",
+            "anchors": [
+              "grok_r4_oidc_caches_are_budgeted_bounded_and_optional_under_pressure",
+              "grok_r4_jwks_replacement_and_expiry_release_old_owners"
+            ]
+          },
+          {
+            "path": "src/infra/resident_memory.rs",
+            "anchors": [
+              "serialized_json_bytes",
+              "grok_r4_json_size_count_obeys_escaped_wire_bytes_without_a_copy"
+            ]
+          },
+          {
+            "path": "src/state.rs",
+            "anchors": [
+              "stale_refresh_success_and_failure_cannot_overwrite_reauthorization",
+              "GrokMediaResidentSnapshot::load"
+            ]
+          }
+        ]
+      },
+      "owners": [
+        "replay proofs and CAS placeholders",
+        "media-task live/candidate/persistence snapshots",
+        "model catalog payloads and index scopes",
+        "OIDC discovery metadata",
+        "JWKS documents"
+      ],
+      "capacity": {
+        "defaultProcessMode": "observe_only",
+        "replayEntries": 2048,
+        "replayProofBytes": 67108864,
+        "replayTtlMs": 1800000,
+        "mediaBindings": 4096,
+        "mediaSchemaVersion": 4,
+        "modelCatalogEntries": 128,
+        "oidcEntriesPerCache": 8,
+        "oidcExpiry": "lazy_on_access_or_insert",
+        "cacheReadCloneIsSeparateRequestOwner": true,
+        "mediaArcSnapshotsShareOneCharge": true,
+        "mediaCandidatesReserveBeforeCloning": true,
+        "oldProofRemovedOnReplacementRejection": true,
+        "oidcAdmissionFailure": "verify_current_document_without_caching",
+        "catalogAdmissionFailure": "local_503_non_auth_non_retryable_discovery_failure",
+        "mediaAdmissionFailure": "local_capacity_shed_keep_previous_snapshot",
+        "serializedSizeAllocatesCopy": false
+      },
+      "timingInventory": {
+        "httpFirstTokenOrigin": "per-attempt Instant after binding/account admission, before adapter preparation and managed-auth refresh",
+        "websocketFirstTokenOrigin": "ResponsesWebsocketUsageTurn::begin, after HTTP authorization/physical connection setup",
+        "mediaOrigin": "forward_grok_media_with_execution entry",
+        "newMilestoneInstrumentation": false,
+        "deliveryMeasurement": "no_new_successful_socket_write_measurement",
+        "performanceClaim": null
+      },
+      "limitations": [
+        "logical retained bytes and conservative sparse-tree/JWK estimates are not RSS or allocator measurements",
+        "control-plane response/parse/serialization scratch and general persistent account/config data are not fully covered by these cache owners",
+        "lazy expiry is not a background sweep",
+        "a media task may already exist upstream when local ownership persistence/admission fails; never transparently replay generation"
       ]
     }
   ]

@@ -16,6 +16,14 @@ pub struct ClaudeModelCapability {
     pub web_search: bool,
 }
 
+impl ClaudeModelCapability {
+    /// The reviewed 5.5 protocol rejects forced tools even without an explicit
+    /// thinking setting. Preserve the caller's constraint by rejecting it.
+    pub fn supports_forced_tool_choice(&self) -> bool {
+        self.id != "claude-opus-5-5"
+    }
+}
+
 const TEXT_IMAGE: &[&str] = &["text", "image"];
 const NO_EFFORT: &[&str] = &[];
 const STANDARD_EFFORT: &[&str] = &["low", "medium", "high", "max"];

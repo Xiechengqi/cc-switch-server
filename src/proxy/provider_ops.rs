@@ -36,6 +36,9 @@ pub(crate) struct ProviderExecution {
     pub stored: StoredProvider,
     pub plan: Arc<ProviderRuntimePlan>,
     pub quota_source_fence: Option<crate::domain::sharing::quota_cycle::QuotaSourceFence>,
+    pub codex_quota_target: Option<crate::domain::accounts::codex_quota::CodexQuotaTarget>,
+    pub antigravity_client_identity:
+        Option<crate::domain::antigravity_identity::AntigravityClientIdentity>,
 }
 
 pub(crate) struct PreparedProviderRequest {
@@ -108,13 +111,41 @@ impl ProviderExecution {
                 ),
             })?;
         Ok(Self {
+            antigravity_client_identity: matches!(
+                stored.provider_type,
+                ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+            )
+            .then(crate::domain::antigravity_identity::antigravity_client_identity),
             stored,
             plan,
             quota_source_fence: None,
+            codex_quota_target: None,
         })
     }
 
     pub fn with_quota_source_fence(mut self, accounts: &AccountStore) -> Self {
+        self.codex_quota_target = (self.stored.provider_type == ProviderType::CodexOAuth)
+            .then(|| self.managed_account_identity_target())
+            .flatten()
+            .and_then(|(provider_type, id, generation)| {
+                let account = accounts.find_for_provider(provider_type, Some(id))?;
+                (account.auth_identity_generation == generation)
+                    .then(|| {
+                        Some(crate::domain::accounts::codex_quota::CodexQuotaTarget {
+                            provider_key: crate::domain::providers::registry::ProviderKey::new(
+                                self.stored.app,
+                                &self.stored.provider.id,
+                            )
+                            .ok()?,
+                            provider_revision: self.stored.resource.revision,
+                            account_id: id.to_string(),
+                            account_incarnation: accounts.account_incarnation(id)?,
+                            auth_identity_generation: generation,
+                            token_refresh_generation: account.token_refresh_generation,
+                        })
+                    })
+                    .flatten()
+            });
         self.quota_source_fence =
             self.managed_account_identity_target()
                 .and_then(|(provider_type, id, generation)| {
@@ -657,7 +688,11 @@ impl ProviderExecution {
         &self,
         headers: &mut Vec<(String, String)>,
     ) -> Result<(), ProxyError> {
-        super::outbound_identity::finalize_headers(&self.plan, headers)
+        super::outbound_identity::finalize_headers_for_antigravity_identity(
+            &self.plan,
+            headers,
+            self.antigravity_client_identity.as_ref(),
+        )
     }
 
     pub fn enforce_model_policy(&self, request: &mut AdapterRequest) -> Result<(), ProxyError> {
@@ -706,13 +741,14 @@ impl ProviderExecution {
         endpoint: &mut String,
         headers: &mut Vec<(String, String)>,
     ) -> Result<(), ProxyError> {
-        adapters::finalize_runtime_protocol_auth(
+        adapters::finalize_runtime_protocol_auth_for_antigravity_identity(
             &self.plan,
             &self.stored,
             accounts,
             request,
             endpoint,
             headers,
+            self.antigravity_client_identity.as_ref(),
         )
     }
 
@@ -1433,6 +1469,8 @@ mod tests {
         };
         ProviderExecution {
             quota_source_fence: None,
+            codex_quota_target: None,
+            antigravity_client_identity: None,
             stored: StoredProvider {
                 app: AppKind::Codex,
                 provider: Provider {
@@ -1517,6 +1555,8 @@ mod tests {
         assert_eq!(plan.profile_id.as_str(), profile_id);
         ProviderExecution {
             quota_source_fence: None,
+            codex_quota_target: None,
+            antigravity_client_identity: None,
             stored,
             plan: Arc::new(plan),
         }
@@ -1551,6 +1591,8 @@ mod tests {
     fn single_model_policy_rewrites_body_and_preserves_requested_model() {
         let execution = ProviderExecution {
             quota_source_fence: None,
+            codex_quota_target: None,
+            antigravity_client_identity: None,
             stored: StoredProvider {
                 app: AppKind::Codex,
                 provider: Provider {

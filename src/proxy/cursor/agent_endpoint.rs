@@ -1,10 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+
+use super::resident::{CursorFlights, ResidentEntry};
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{OwnedMutexGuard, RwLock};
 
 use crate::cursor_client_contract::{CLIENT_TYPE_HEADER, CLIENT_VERSION_HEADER, SDK_CLIENT_TYPE};
 use crate::proxy::ProxyError;
@@ -24,7 +28,7 @@ const AGENT_URL_CONFIG_FIELD: u64 = 27;
 const AGENT_URL_FIELD: u64 = 1;
 const AGENTN_URL_FIELD: u64 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CursorAgentEndpointScope(String);
 
 impl CursorAgentEndpointScope {
@@ -59,26 +63,41 @@ impl CursorAgentEndpointScope {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedCursorAgentEndpoint {
     value: String,
     fetched_at_ms: i64,
     expires_at_ms: i64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CursorAgentEndpointCache {
-    endpoints: RwLock<HashMap<CursorAgentEndpointScope, CachedCursorAgentEndpoint>>,
-    flights: Mutex<HashMap<CursorAgentEndpointScope, Arc<Mutex<()>>>>,
+    endpoints: RwLock<BTreeMap<CursorAgentEndpointScope, ResidentEntry<CachedCursorAgentEndpoint>>>,
+    flights: CursorFlights<CursorAgentEndpointScope>,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for CursorAgentEndpointCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl CursorAgentEndpointCache {
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            endpoints: RwLock::new(BTreeMap::new()),
+            flights: CursorFlights::new(parent.clone()),
+            parent,
+        }
+    }
+
     async fn fresh(&self, scope: &CursorAgentEndpointScope, now_ms: i64) -> Option<String> {
         let mut endpoints = self.endpoints.write().await;
         let value = endpoints
             .get(scope)
-            .filter(|entry| entry.expires_at_ms > now_ms)
-            .map(|entry| entry.value.clone());
+            .filter(|entry| entry.value.expires_at_ms > now_ms)
+            .map(|entry| entry.value.value.clone());
         if value.is_none() {
             endpoints.remove(scope);
         }
@@ -87,18 +106,25 @@ impl CursorAgentEndpointCache {
 
     async fn insert(&self, scope: CursorAgentEndpointScope, value: String, now_ms: i64) {
         let mut endpoints = self.endpoints.write().await;
-        endpoints.insert(
-            scope,
+        endpoints.retain(|_, entry| entry.value.expires_at_ms > now_ms);
+        endpoints.remove(&scope);
+        let dynamic = scope.0.capacity().saturating_add(value.capacity());
+        let Some(entry) = ResidentEntry::new::<CursorAgentEndpointScope>(
+            &self.parent,
             CachedCursorAgentEndpoint {
                 value,
                 fetched_at_ms: now_ms,
                 expires_at_ms: now_ms.saturating_add(CURSOR_AGENT_ENDPOINT_TTL_MS),
             },
-        );
+            dynamic,
+        ) else {
+            return;
+        };
+        endpoints.insert(scope, entry);
         while endpoints.len() > MAX_CURSOR_AGENT_ENDPOINT_ENTRIES {
             let Some(oldest) = endpoints
                 .iter()
-                .min_by_key(|(_, entry)| entry.fetched_at_ms)
+                .min_by_key(|(_, entry)| entry.value.fetched_at_ms)
                 .map(|(scope, _)| scope.clone())
             else {
                 break;
@@ -107,16 +133,11 @@ impl CursorAgentEndpointCache {
         }
     }
 
-    async fn lock(&self, scope: &CursorAgentEndpointScope) -> OwnedMutexGuard<()> {
-        let flight = {
-            let mut flights = self.flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-            flights
-                .entry(scope.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        flight.lock_owned().await
+    async fn lock(
+        &self,
+        scope: &CursorAgentEndpointScope,
+    ) -> Result<OwnedMutexGuard<ResidentMemoryReservation>, ProxyError> {
+        self.flights.lock(scope, scope.0.capacity()).await
     }
 }
 
@@ -152,7 +173,7 @@ pub async fn resolve_cursor_agent_endpoint(
     if let Some(endpoint) = cache.fresh(&scope, now_ms).await {
         return Ok(endpoint);
     }
-    let _flight = cache.lock(&scope).await;
+    let _flight = cache.lock(&scope).await?;
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     if let Some(endpoint) = cache.fresh(&scope, now_ms).await {
         return Ok(endpoint);
@@ -402,6 +423,74 @@ mod tests {
             ],
         );
         assert!(parse_cursor_agent_urls(&duplicate_agent_url).is_err());
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_endpoint_owners_expire_and_pressure_cannot_retain_stale_endpoint() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = CursorAgentEndpointCache::with_parent(parent.clone());
+        let scope = CursorAgentEndpointScope("scope-a".to_string());
+        cache
+            .insert(
+                scope.clone(),
+                "https://agent.api5.cursor.sh/agent.v1.AgentService/Run".to_string(),
+                1_000,
+            )
+            .await;
+        assert!(parent.snapshot().used_bytes > 0);
+        parent.configure_limit(Some(0));
+        cache
+            .insert(
+                scope.clone(),
+                "https://new.api5.cursor.sh/agent.v1.AgentService/Run".to_string(),
+                2_000,
+            )
+            .await;
+        assert!(cache.fresh(&scope, 2_001).await.is_none());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(cache
+            .lock(&scope)
+            .await
+            .unwrap_err()
+            .is_request_memory_exhausted());
+        parent.configure_limit(None);
+        cache
+            .insert(
+                scope.clone(),
+                "https://agent.api5.cursor.sh/agent.v1.AgentService/Run".to_string(),
+                3_000,
+            )
+            .await;
+        assert!(cache
+            .fresh(&scope, 3_000 + CURSOR_AGENT_ENDPOINT_TTL_MS)
+            .await
+            .is_none());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_r4_endpoint_capacity_evicts_and_drop_releases_parent() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = CursorAgentEndpointCache::with_parent(parent.clone());
+        for index in 0..=MAX_CURSOR_AGENT_ENDPOINT_ENTRIES {
+            cache
+                .insert(
+                    CursorAgentEndpointScope(format!("scope-{index}")),
+                    "https://agent.api5.cursor.sh/agent.v1.AgentService/Run".to_string(),
+                    index as i64,
+                )
+                .await;
+        }
+        assert!(cache
+            .fresh(&CursorAgentEndpointScope("scope-0".to_string()), 100)
+            .await
+            .is_none());
+        assert_eq!(
+            parent.snapshot().active_reservations,
+            MAX_CURSOR_AGENT_ENDPOINT_ENTRIES
+        );
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
     #[tokio::test]

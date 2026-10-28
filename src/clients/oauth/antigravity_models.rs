@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::domain::accounts::store::{gemini_v1internal_project_id, Account};
+use crate::domain::antigravity_identity::{antigravity_client_identity, AntigravityClientIdentity};
 use crate::domain::providers::model::ProviderType;
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 pub const ANTIGRAVITY_MODELS_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
@@ -43,6 +47,7 @@ pub struct AntigravityModelCatalog {
     pub stale: bool,
     pub fetched_at_ms: i64,
     pub request_revision: u64,
+    pub client_identity: AntigravityClientIdentity,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -92,14 +97,16 @@ struct CacheKey {
     request_identity_fingerprint: [u8; 32],
     project_id: String,
     source_url: String,
+    client_identity: AntigravityClientIdentity,
 }
 
 #[derive(Debug, Clone)]
 struct CachedCatalog {
-    descriptors: Vec<AntigravityModelDescriptor>,
+    descriptors: Arc<Vec<AntigravityModelDescriptor>>,
     source_url: String,
     fetched_at_ms: i64,
     request_revision: u64,
+    _memory: Option<ResidentMemoryReservation>,
 }
 
 static REQUEST_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -117,15 +124,38 @@ pub(crate) fn request_identity_fingerprint(account: &Account) -> Option<[u8; 32]
     Some(digest.finalize().into())
 }
 
-fn cache() -> &'static Mutex<BTreeMap<CacheKey, CachedCatalog>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<CacheKey, CachedCatalog>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+#[derive(Default)]
+struct CatalogCache {
+    entries: BTreeMap<CacheKey, CachedCatalog>,
+    // After a refusal, older in-flight results may still be used by their
+    // original callers (whose state publication has its own revision fence),
+    // but cannot reinstall a stale cache authorization. Fixed-size metadata
+    // avoids an unaccounted negative-entry registry under memory pressure.
+    admission_floor: u64,
 }
 
-fn publish_catalog(
-    entries: &mut BTreeMap<CacheKey, CachedCatalog>,
+impl std::ops::Deref for CatalogCache {
+    type Target = BTreeMap<CacheKey, CachedCatalog>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl std::ops::DerefMut for CatalogCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+fn cache() -> &'static Mutex<CatalogCache> {
+    static CACHE: OnceLock<Mutex<CatalogCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CatalogCache::default()))
+}
+
+fn publish_catalog_with_parent(
+    entries: &mut CatalogCache,
     key: CacheKey,
-    catalog: CachedCatalog,
+    catalog: &mut CachedCatalog,
+    parent: &ResidentMemoryBudget,
 ) -> bool {
     let newer_published = entries.iter().any(|(candidate, cached)| {
         let same_account =
@@ -165,7 +195,17 @@ fn publish_catalog(
         );
         candidate_epoch > key_epoch || (candidate_epoch == key_epoch && candidate != &key)
     });
-    entries.insert(key, catalog);
+    // `false` exclusively means identity/revision supersession. Optional
+    // admission failure still returns the current fetched result to its caller.
+    if catalog.request_revision < entries.admission_floor {
+        return true;
+    }
+    let Some(memory) = parent.reserve(catalog_retained_bytes(&key, catalog)) else {
+        entries.admission_floor = entries.admission_floor.max(catalog.request_revision);
+        return true;
+    };
+    catalog._memory = Some(memory);
+    entries.insert(key, catalog.clone());
     while entries.len() > MAX_CACHED_CATALOGS {
         let Some(oldest) = entries
             .iter()
@@ -179,12 +219,99 @@ fn publish_catalog(
     true
 }
 
+#[cfg(test)]
+fn publish_catalog(entries: &mut CatalogCache, key: CacheKey, mut catalog: CachedCatalog) -> bool {
+    publish_catalog_with_parent(entries, key, &mut catalog, &process_resident_memory())
+}
+
+fn prune_catalogs(entries: &mut BTreeMap<CacheKey, CachedCatalog>, now_ms: i64) {
+    entries.retain(|_, cached| {
+        now_ms.saturating_sub(cached.fetched_at_ms) <= MAX_STALE_CATALOG_AGE_MS
+    });
+}
+
+fn catalog_retained_bytes(key: &CacheKey, catalog: &CachedCatalog) -> usize {
+    let text = [
+        &key.provider_type,
+        &key.account_id,
+        &key.project_id,
+        &key.source_url,
+        &key.client_identity.version,
+        &key.client_identity.user_agent,
+        &key.client_identity.generation,
+        &catalog.source_url,
+    ]
+    .iter()
+    .fold(0_usize, |bytes, value| {
+        bytes.saturating_add(value.capacity())
+    });
+    let descriptors = catalog.descriptors.iter().fold(
+        catalog
+            .descriptors
+            .capacity()
+            .saturating_mul(std::mem::size_of::<AntigravityModelDescriptor>()),
+        |bytes, descriptor| {
+            bytes
+                .saturating_add(descriptor.model_id.capacity())
+                .saturating_add(descriptor.display_name.as_ref().map_or(0, String::capacity))
+                .saturating_add(descriptor.reset_time.as_ref().map_or(0, String::capacity))
+                .saturating_add(descriptor.supported_mime_types.iter().fold(
+                    0_usize,
+                    |bytes, (mime, _)| {
+                        bytes.saturating_add(mime.capacity()).saturating_add(
+                            (std::mem::size_of::<(String, bool)>()
+                                + std::mem::size_of::<usize>() * 2)
+                                * 12,
+                        )
+                    },
+                ))
+                .saturating_add(
+                    descriptor.deprecated_aliases.iter().fold(
+                        descriptor
+                            .deprecated_aliases
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<String>()),
+                        |bytes, alias| bytes.saturating_add(alias.capacity()),
+                    ),
+                )
+        },
+    );
+    (std::mem::size_of::<(CacheKey, CachedCatalog)>() + std::mem::size_of::<usize>() * 2)
+        .saturating_mul(12)
+        .saturating_add(text)
+        .saturating_add(descriptors)
+        .saturating_add(
+            std::mem::size_of::<Vec<AntigravityModelDescriptor>>()
+                + std::mem::size_of::<usize>() * 2,
+        )
+}
+
 pub async fn model_catalog(
     http: &reqwest::Client,
     account: &Account,
     account_incarnation: u64,
     timeout: Duration,
     endpoint_override: Option<&str>,
+) -> Result<AntigravityModelCatalog, AntigravityModelCatalogFailure> {
+    let client_identity = antigravity_client_identity();
+    model_catalog_for_identity(
+        http,
+        account,
+        account_incarnation,
+        timeout,
+        endpoint_override,
+        client_identity,
+    )
+    .await
+}
+
+async fn model_catalog_for_identity(
+    http: &reqwest::Client,
+    account: &Account,
+    account_incarnation: u64,
+    timeout: Duration,
+    endpoint_override: Option<&str>,
+    client_identity: AntigravityClientIdentity,
 ) -> Result<AntigravityModelCatalog, AntigravityModelCatalogFailure> {
     if !matches!(
         account.provider_type,
@@ -226,16 +353,14 @@ pub async fn model_catalog(
         })?,
         project_id: project_id.clone(),
         source_url: source_url.to_string(),
+        client_identity,
     };
     let request_revision = REQUEST_REVISION.fetch_add(1, Ordering::Relaxed);
     let request = http
         .post(source_url.clone())
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
-        .header(
-            USER_AGENT,
-            crate::provider_identity::antigravity_user_agent(),
-        )
+        .header(USER_AGENT, &key.client_identity.user_agent)
         .timeout(timeout)
         .json(&json!({"project": project_id}));
     let response = match request.send().await {
@@ -276,6 +401,9 @@ pub async fn model_catalog(
             ));
         }
     };
+    if !key.client_identity.is_current() {
+        return Err(AntigravityModelCatalogFailure::superseded_identity());
+    }
     if !status.is_success() {
         let status_code = status.as_u16();
         let retryable = status_code == 408 || status_code == 429 || status_code >= 500;
@@ -300,17 +428,24 @@ pub async fn model_catalog(
         .map_err(|message| AntigravityModelCatalogFailure::new(502, false, message))?;
     let fetched_at_ms = chrono::Utc::now().timestamp_millis();
     let source_url = source_url.to_string();
+    let mut current = CachedCatalog {
+        descriptors: Arc::new(descriptors),
+        source_url,
+        fetched_at_ms,
+        request_revision,
+        _memory: None,
+    };
     let replacement = {
         let mut entries = cache().lock().await;
-        let published = publish_catalog(
+        if !key.client_identity.is_current() {
+            return Err(AntigravityModelCatalogFailure::superseded_identity());
+        }
+        prune_catalogs(&mut entries, fetched_at_ms);
+        let published = publish_catalog_with_parent(
             &mut entries,
             key.clone(),
-            CachedCatalog {
-                descriptors: descriptors.clone(),
-                source_url: source_url.clone(),
-                fetched_at_ms,
-                request_revision,
-            },
+            &mut current,
+            &process_resident_memory(),
         );
         if published {
             Ok(None)
@@ -324,21 +459,23 @@ pub async fn model_catalog(
     };
     if let Some(cached) = replacement? {
         return Ok(AntigravityModelCatalog {
-            descriptors: cached.descriptors,
+            descriptors: cached.descriptors.as_ref().clone(),
             source: "authenticated_fetch_available_models",
             source_url: cached.source_url,
             stale: false,
             fetched_at_ms: cached.fetched_at_ms,
             request_revision: cached.request_revision,
+            client_identity: key.client_identity,
         });
     }
     Ok(AntigravityModelCatalog {
-        descriptors,
+        descriptors: current.descriptors.as_ref().clone(),
         source: "authenticated_fetch_available_models",
-        source_url,
+        source_url: current.source_url,
         stale: false,
         fetched_at_ms,
         request_revision,
+        client_identity: key.client_identity,
     })
 }
 
@@ -348,9 +485,13 @@ async fn stale_or_failure(
     retryable: bool,
     message: String,
 ) -> Result<AntigravityModelCatalog, AntigravityModelCatalogFailure> {
+    if !key.client_identity.is_current() {
+        return Err(AntigravityModelCatalogFailure::superseded_identity());
+    }
     if retryable {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut entries = cache().lock().await;
+        prune_catalogs(&mut entries, now_ms);
         let cached = entries.get(key).cloned().filter(|cached| {
             now_ms.saturating_sub(cached.fetched_at_ms) <= MAX_STALE_CATALOG_AGE_MS
         });
@@ -359,13 +500,17 @@ async fn stale_or_failure(
         }
         drop(entries);
         if let Some(cached) = cached {
+            if !key.client_identity.is_current() {
+                return Err(AntigravityModelCatalogFailure::superseded_identity());
+            }
             return Ok(AntigravityModelCatalog {
-                descriptors: cached.descriptors,
+                descriptors: cached.descriptors.as_ref().clone(),
                 source: "same_identity_cached_fetch_available_models",
                 source_url: cached.source_url,
                 stale: true,
                 fetched_at_ms: cached.fetched_at_ms,
                 request_revision: cached.request_revision,
+                client_identity: key.client_identity.clone(),
             });
         }
     }
@@ -527,6 +672,10 @@ fn optional_u64(object: Option<&serde_json::Map<String, Value>>, field: &str) ->
 }
 
 #[cfg(test)]
+#[path = "antigravity_models/resident_tests.rs"]
+mod resident_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -535,15 +684,26 @@ mod tests {
 
     #[tokio::test]
     async fn late_same_scope_success_returns_newer_published_catalog() {
-        run_late_catalog_race(false).await;
+        run_late_catalog_race(false, None).await;
     }
 
     #[tokio::test]
     async fn late_old_generation_success_fails_closed() {
-        run_late_catalog_race(true).await;
+        run_late_catalog_race(true, None).await;
     }
 
-    async fn run_late_catalog_race(newer_epoch: bool) {
+    #[tokio::test]
+    async fn antigravity_r4_late_old_client_cannot_publish_into_new_generation() {
+        let versions = crate::domain::antigravity_identity::TestAntigravityIdentity::new("2.2.1");
+        versions
+            .scope(run_late_catalog_race(false, Some(versions.clone())))
+            .await;
+    }
+
+    async fn run_late_catalog_race(
+        newer_epoch: bool,
+        versions: Option<crate::domain::antigravity_identity::TestAntigravityIdentity>,
+    ) {
         let first_seen = Arc::new(tokio::sync::Notify::new());
         let release_first = Arc::new(tokio::sync::Notify::new());
         let sequence = Arc::new(AtomicUsize::new(0));
@@ -584,15 +744,21 @@ mod tests {
         let first = tokio::spawn({
             let account = account.clone();
             let source_url = source_url.clone();
+            let versions = versions.clone();
             async move {
-                model_catalog(
-                    &reqwest::Client::new(),
+                let http = reqwest::Client::new();
+                let request = model_catalog(
+                    &http,
                     &account,
                     1,
                     Duration::from_secs(10),
                     Some(&source_url),
-                )
-                .await
+                );
+                if let Some(versions) = versions {
+                    versions.scope(request).await
+                } else {
+                    request.await
+                }
             }
         });
         first_seen.notified().await;
@@ -600,6 +766,9 @@ mod tests {
         if newer_epoch {
             newer_account.token_refresh_generation += 1;
             newer_account.access_token = Some("new-token".to_string());
+        }
+        if let Some(versions) = &versions {
+            assert!(versions.update("2.3.4"));
         }
         let newer = model_catalog(
             &reqwest::Client::new(),
@@ -613,7 +782,7 @@ mod tests {
         release_first.notify_one();
         assert_eq!(newer.descriptors[0].model_id, "gemini-new");
         let late = first.await.unwrap();
-        if newer_epoch {
+        if newer_epoch || versions.is_some() {
             let error = late.unwrap_err();
             assert_eq!(error.status_code, 409);
             assert!(!error.retryable);
@@ -626,6 +795,131 @@ mod tests {
             assert!(!late.stale);
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_r4_catalog_snapshot_stale_and_empty_are_exactly_scoped() {
+        use crate::domain::antigravity_identity::TestAntigravityIdentity;
+        for rail in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let versions = TestAntigravityIdentity::new("2.2.1");
+            let failure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let user_agents = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let app = axum::Router::new().fallback(axum::routing::post({
+                let failure = Arc::clone(&failure);
+                let user_agents = Arc::clone(&user_agents);
+                move |headers: axum::http::HeaderMap| {
+                    let failure = Arc::clone(&failure);
+                    let user_agents = Arc::clone(&user_agents);
+                    async move {
+                        let ua = headers
+                            .get(USER_AGENT)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string();
+                        user_agents.lock().unwrap().push(ua.clone());
+                        let status = if failure.load(Ordering::SeqCst) {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            axum::http::StatusCode::OK
+                        };
+                        let models = if ua.contains("/2.2.1 ") {
+                            json!({"gemini-version-a":{}})
+                        } else {
+                            json!({})
+                        };
+                        (status, axum::Json(json!({"models":models})))
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let source_url = format!("http://{address}/models");
+            let account: Account = serde_json::from_value(json!({
+                "id":format!("r4-version-{}-{address}",rail.as_str()),"providerType":rail.as_str(),
+                "accessToken":"same-version-token","authIdentityGeneration":1,
+                "tokenRefreshGeneration":1,"raw":{"projectId":"same-project"}
+            }))
+            .unwrap();
+            versions
+                .scope(async {
+                    let http = reqwest::Client::new();
+                    let fetch = |account: Account, url: String| {
+                        let http = http.clone();
+                        async move {
+                            model_catalog(&http, &account, 1, Duration::from_secs(2), Some(&url))
+                                .await
+                        }
+                    };
+                    let first = fetch(account.clone(), source_url.clone()).await.unwrap();
+                    assert!(!first.stale);
+                    failure.store(true, Ordering::SeqCst);
+                    assert!(
+                        fetch(account.clone(), source_url.clone())
+                            .await
+                            .unwrap()
+                            .stale
+                    );
+                    assert!(!versions.update("invalid version"));
+                    assert!(
+                        fetch(account.clone(), source_url.clone())
+                            .await
+                            .unwrap()
+                            .stale
+                    );
+                    versions.update("2.3.4");
+                    assert!(fetch(account.clone(), source_url.clone()).await.is_err());
+                    let obsolete = model_catalog_for_identity(
+                        &http,
+                        &account,
+                        1,
+                        Duration::from_secs(2),
+                        Some(&source_url),
+                        first.client_identity.clone(),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(obsolete.is_superseded_identity());
+                    assert_eq!(
+                        user_agents.lock().unwrap().last(),
+                        Some(&first.client_identity.user_agent)
+                    );
+                    failure.store(false, Ordering::SeqCst);
+                    let empty = fetch(account.clone(), source_url.clone()).await.unwrap();
+                    assert!(!empty.stale);
+                    assert!(empty.descriptors.is_empty());
+                    assert_eq!(empty.client_identity, antigravity_client_identity());
+                    failure.store(true, Ordering::SeqCst);
+                    let stale = fetch(account.clone(), source_url.clone()).await.unwrap();
+                    assert!(stale.stale && stale.descriptors.is_empty());
+                    assert_eq!(stale.client_identity, empty.client_identity);
+                    let mut other_project = account.clone();
+                    other_project.raw = Some(json!({"projectId":"other-project"}));
+                    assert!(fetch(other_project, source_url.clone()).await.is_err());
+                    assert!(
+                        fetch(account.clone(), format!("http://{address}/other-models"))
+                            .await
+                            .is_err()
+                    );
+                    let mut other_rail = account.clone();
+                    other_rail.provider_type = if rail == ProviderType::AntigravityOAuth {
+                        ProviderType::AgyOAuth
+                    } else {
+                        ProviderType::AntigravityOAuth
+                    };
+                    assert!(fetch(other_rail, source_url.clone()).await.is_err());
+                    versions.update("2.2.1");
+                    assert!(
+                        fetch(account.clone(), source_url.clone()).await.is_err(),
+                        "returning to version A must not resurrect its old generation"
+                    );
+                })
+                .await;
+            server.abort();
+        }
     }
 
     #[test]
@@ -713,18 +1007,20 @@ mod tests {
             request_identity_fingerprint: [1; 32],
             project_id: "project".to_string(),
             source_url: "https://example.test/models".to_string(),
+            client_identity: antigravity_client_identity(),
         };
         let new = CacheKey {
             token_refresh_generation: 2,
             ..old.clone()
         };
         let cached = |revision| CachedCatalog {
-            descriptors: Vec::new(),
+            descriptors: Arc::new(Vec::new()),
+            _memory: None,
             source_url: old.source_url.clone(),
             fetched_at_ms: 1,
             request_revision: revision,
         };
-        let mut entries = BTreeMap::new();
+        let mut entries = CatalogCache::default();
         assert!(publish_catalog(&mut entries, old.clone(), cached(20)));
         assert!(publish_catalog(&mut entries, new.clone(), cached(10)));
         assert!(!publish_catalog(&mut entries, old.clone(), cached(30)));
@@ -764,18 +1060,20 @@ mod tests {
             request_identity_fingerprint: [1; 32],
             project_id: "project".to_string(),
             source_url: "https://example.test/models".to_string(),
+            client_identity: antigravity_client_identity(),
         };
         let new = CacheKey {
             request_identity_fingerprint: [2; 32],
             ..old.clone()
         };
         let cached = |request_revision| CachedCatalog {
-            descriptors: Vec::new(),
+            descriptors: Arc::new(Vec::new()),
+            _memory: None,
             source_url: old.source_url.clone(),
             fetched_at_ms: 1,
             request_revision,
         };
-        let mut entries = BTreeMap::new();
+        let mut entries = CatalogCache::default();
         assert!(publish_catalog(&mut entries, old.clone(), cached(10)));
         assert!(publish_catalog(&mut entries, new.clone(), cached(11)));
         assert_eq!(entries.len(), 2);
@@ -797,8 +1095,9 @@ mod tests {
             request_identity_fingerprint: [0; 32],
             project_id: "project".to_string(),
             source_url: "https://example.test/models".to_string(),
+            client_identity: antigravity_client_identity(),
         };
-        let mut entries = BTreeMap::new();
+        let mut entries = CatalogCache::default();
         for index in 0..=MAX_CACHED_CATALOGS {
             let variant = CacheKey {
                 request_identity_fingerprint: [index as u8; 32],
@@ -808,7 +1107,8 @@ mod tests {
                 &mut entries,
                 variant,
                 CachedCatalog {
-                    descriptors: Vec::new(),
+                    descriptors: Arc::new(Vec::new()),
+                    _memory: None,
                     source_url: key.source_url.clone(),
                     fetched_at_ms: index as i64,
                     request_revision: index as u64,
@@ -838,6 +1138,7 @@ mod tests {
             request_identity_fingerprint: [1; 32],
             project_id: "project".to_string(),
             source_url: "https://example.test/models".to_string(),
+            client_identity: antigravity_client_identity(),
         };
         let new = CacheKey {
             auth_identity_generation: 2,
@@ -847,7 +1148,8 @@ mod tests {
         cache().lock().await.insert(
             new.clone(),
             CachedCatalog {
-                descriptors: Vec::new(),
+                descriptors: Arc::new(Vec::new()),
+                _memory: None,
                 source_url: new.source_url.clone(),
                 fetched_at_ms: chrono::Utc::now().timestamp_millis(),
                 request_revision: REQUEST_REVISION.fetch_add(1, Ordering::Relaxed),

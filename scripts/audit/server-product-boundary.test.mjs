@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   auditServerProductBoundary,
+  cfgTestExternalSourcePaths,
   contractBoundaryViolations,
   providerEditorBoundaryViolations,
   sourceBoundaryViolations,
@@ -46,6 +47,48 @@ pub fn production() {}
   assert.match(stripped, /test_url: Option<String>/);
   assert.match(stripped, /pub fn production/);
   assert.doesNotMatch(stripped, /reqwest::Client::new/);
+});
+
+test("out-of-line test sources require a crate root gate, not a directory name", () => {
+  const sources = {
+    "src/lib.rs": "#[cfg(test)]\npub(crate) mod test_support;\n",
+    "src/test_support.rs": "mod local_probe;\n",
+    "src/test_support/local_probe.rs": "fn local() { let _ = reqwest::Client::builder(); }\n",
+    "src/main.rs": "fn main() {}\n",
+  };
+  assert.deepEqual([...cfgTestExternalSourcePaths(sources)].sort(), [
+    "src/test_support.rs", "src/test_support/local_probe.rs",
+  ]);
+  sources["src/lib.rs"] = "pub(crate) mod test_support;\n";
+  assert.equal(cfgTestExternalSourcePaths(sources).size, 0);
+  assert.match(sourceBoundaryViolations(
+    "src/test_support/local_probe.rs", sources["src/test_support/local_probe.rs"],
+  ).join("\n"), /bypasses direct_client builder/);
+  for (const root of [
+    "/*\n#[cfg(test)]\nmod test_support;\n*/\n",
+    'const EXAMPLE: &str = r#"\n#[cfg(test)]\nmod test_support;\n"#;\n',
+    '#[cfg(test)]\n#[path = "other.rs"]\nmod test_support;\n',
+  ]) {
+    sources["src/lib.rs"] = root;
+    assert.equal(cfgTestExternalSourcePaths(sources).size, 0);
+  }
+});
+
+test("production references and path imports revoke external test source exclusions", () => {
+  const sources = {
+    "src/lib.rs": "#[cfg(test)]\nmod test_support;\n",
+    "src/test_support.rs": "mod local_probe;\n",
+    "src/test_support/local_probe.rs": "fn local() { let _ = reqwest::Client::new(); }\n",
+    "src/main.rs": "fn main() {}\n",
+  };
+  sources["src/main.rs"] = "mod test_support;\nfn main() {}\n";
+  assert.equal(cfgTestExternalSourcePaths(sources).size, 0);
+  sources["src/main.rs"] = '#[path = "test_support/local_probe.rs"]\nmod alternate;\nfn main() {}\n';
+  assert.equal(cfgTestExternalSourcePaths(sources).size, 0);
+  sources["src/main.rs"] = 'include!("test_support/local_probe.rs");\n';
+  assert.equal(cfgTestExternalSourcePaths(sources).size, 0);
+  sources["src/main.rs"] = "#[cfg(test)]\nmod tests { fn local() { crate::test_support::run(); } }\nfn main() {}\n";
+  assert.equal(cfgTestExternalSourcePaths(sources).size, 2);
 });
 
 test("only the shared HTTP transport may construct an outbound proxy", () => {

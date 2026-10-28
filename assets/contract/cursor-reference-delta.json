@@ -127,17 +127,34 @@
       "facts": [
         {
           "disposition": "reviewed_no_wire_delta",
-          "paths": ["package.json", "package-lock.json", "electron/package.json", "electron/package-lock.json", "config/quality/eslint-suppressions.json", "vitest.config.ts"],
+          "paths": [
+            "package.json",
+            "package-lock.json",
+            "electron/package.json",
+            "electron/package-lock.json",
+            "config/quality/eslint-suppressions.json",
+            "vitest.config.ts"
+          ],
           "contract": "dependency, lockfile, lint and test-runner maintenance does not change Cursor OAuth or API-key wire behavior"
         },
         {
           "disposition": "reviewed_no_wire_delta",
-          "paths": ["open-sse/utils/streamTiming.ts", "tests/unit/stream-timing.test.ts", "changelog.d/fixes/stream-timing-clock.md"],
+          "paths": [
+            "open-sse/utils/streamTiming.ts",
+            "tests/unit/stream-timing.test.ts",
+            "changelog.d/fixes/stream-timing-clock.md"
+          ],
           "contract": "shared stream timing uses a monotonic clock but does not change Cursor request, protobuf, auth, catalog, tool, session or terminal contracts"
         },
         {
           "disposition": "reviewed_no_wire_delta",
-          "paths": ["src/lib/memory/embedding/transformersLocal.ts", "src/lib/memory/__tests__/optionalTransformers.test.ts", "tests/_setup/transformersUnavailable.ts", "tests/unit/build/optional-transformers-dependency.test.ts", "changelog.d/fixes/transformers-webpack-ignore.md"],
+          "paths": [
+            "src/lib/memory/embedding/transformersLocal.ts",
+            "src/lib/memory/__tests__/optionalTransformers.test.ts",
+            "tests/_setup/transformersUnavailable.ts",
+            "tests/unit/build/optional-transformers-dependency.test.ts",
+            "changelog.d/fixes/transformers-webpack-ignore.md"
+          ],
           "contract": "optional local embedding dependency handling is outside the Cursor Provider data plane"
         }
       ]
@@ -164,26 +181,35 @@
       "id": "CUR-01",
       "status": "fixture_verified",
       "path": "assets/contract/provider-registry.json",
-      "anchors": ["\"driverId\":\"special.cursor\",\"driverContractRevision\":4"]
+      "anchors": [
+        "\"driverId\":\"special.cursor\",\"driverContractRevision\":4"
+      ]
     },
     {
       "id": "CUR-02",
       "status": "live_pending",
       "path": "scripts/smoke/cursor-real.mjs",
-      "anchors": ["cursor dual-rail evidence remains live_pending"]
+      "anchors": [
+        "cursor dual-rail evidence remains live_pending"
+      ]
     },
     {
       "id": "CUR-03",
       "status": "fixture_verified",
       "path": "src/proxy/cursor/agent_proto.rs",
-      "anchors": ["cursor_reference_fixture_preserves_known_semantics_around_unknown_fields"]
+      "anchors": [
+        "cursor_reference_fixture_preserves_known_semantics_around_unknown_fields"
+      ]
     }
   ],
   "enhancements": [
     {
       "id": "CUR-N1",
       "status": "live_pending",
-      "rails": ["oauth", "api_key"],
+      "rails": [
+        "oauth",
+        "api_key"
+      ],
       "receiptsIndependent": true
     },
     {
@@ -351,7 +377,13 @@
     },
     "connectFrame": {
       "hex": "000000001b0a199a06066f70617175650a0e0a0c666978747572652074657874",
-      "splitOffsets": [1, 4, 5, 17, 31],
+      "splitOffsets": [
+        1,
+        4,
+        5,
+        17,
+        31
+      ],
       "expectedPayloadHex": "0a199a06066f70617175650a0e0a0c666978747572652074657874",
       "partialEof": "fail_closed"
     },
@@ -902,5 +934,150 @@
         }
       ]
     }
-  ]
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-CUR-01",
+      "sharedWork": [
+        "R4-CORE-02"
+      ],
+      "reviewedAt": "2026-10-27T16:02:21.728299+00:00",
+      "status": "working_tree_fixture_verified",
+      "decision": "keep_protocol_extend_resource_ownership",
+      "liveAcceptance": "live_pending",
+      "wireChanged": false,
+      "newProviderWireGap": false,
+      "sources": [
+        {
+          "sourceId": "omniroute",
+          "snapshotCommit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+          "snapshotTree": "8d1c312f61d115767c9478416cb039750eaf113a",
+          "readMode": "read_only_committed_git_objects",
+          "excludedWorktreeEntries": 22,
+          "files": [
+            {
+              "path": "open-sse/executors/cursor.ts",
+              "sha256": "76d8b4c5b148d52a34b49932bdf819f098323b59d37c2e79fb65470ff28ff546"
+            },
+            {
+              "path": "open-sse/executors/cursor/agentEndpoint.ts",
+              "sha256": "5ff6c5ec33db4a65524b9d92937d40793d138d896d151210b20f0ec31dade6b1"
+            },
+            {
+              "path": "open-sse/executors/cursor/builtinToolBridge.ts",
+              "sha256": "c7dfcf1783496051fc1ed234297a22057753a9e3356fc0c9fceffef353a4ffea"
+            },
+            {
+              "path": "open-sse/services/cursorSessionManager.ts",
+              "sha256": "f9e8809841680e0baec8db64ecaed5ced995e8b84922cc65ccab88e6b2a3d862"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "validationScope": "isolated_Cursor_slice_with_prior_Claude_Qoder_Antigravity_Codex_changes_excluding_concurrent_Share_Market",
+        "contracts": [
+          {
+            "path": "src/proxy/cursor/response_state.rs",
+            "anchors": [
+              "cursor_r4_completed_cache_and_request_copy_have_separate_parent_owners",
+              "cursor_r4_completed_cache_pressure_rejects_without_evicting_another_scope",
+              "cursor_r4_completed_cache_count_eviction_and_drop_release_parent",
+              "cursor_r4_completed_size_counter_bounds_escaped_json_before_admission"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/credential_cache.rs",
+            "anchors": [
+              "cursor_r4_credential_and_cooldown_owners_follow_invalidation_and_expiry",
+              "cursor_r4_catalog_pressure_never_restores_an_old_authorization",
+              "cursor_r4_rotated_caches_drop_all_process_owners"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/agent_endpoint.rs",
+            "anchors": [
+              "cursor_r4_endpoint_owners_expire_and_pressure_cannot_retain_stale_endpoint",
+              "cursor_r4_endpoint_capacity_evicts_and_drop_releases_parent"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/session.rs",
+            "anchors": [
+              "cursor_r4_continuation_claim_batch_rejects_atomically_and_expires_parent_owners",
+              "cursor_r4_closed_session_releases_bulk_capacity_but_charges_lingering_arc",
+              "cursor_r4_parent_pressure_during_parked_transfer_preserves_original_owner"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/resident.rs",
+            "anchors": [
+              "cursor_r4_flights_count_waiters_reject_new_scopes_and_release_last_owner"
+            ]
+          },
+          {
+            "path": "src/proxy/cursor/lifecycle_tests.rs",
+            "anchors": [
+              "cursor_r4_loopback_cancel_and_first_output_timeout_close_both_h2_halves",
+              "cursor_r4_loopback_parked_expiry_and_capacity_eviction_close_h2_on_both_rails",
+              "cursor_r4_loopback_late_tool_result_cannot_acquire_another_identity"
+            ]
+          }
+        ]
+      },
+      "processOwners": [
+        "completed_response_cache",
+        "api_key_token_cache",
+        "api_key_auth_cooldown",
+        "model_catalog_cache",
+        "agent_endpoint_cache",
+        "discovery_exchange_single_flights",
+        "continuation_claim_batches",
+        "running_parked_and_closed_session_request_reservations"
+      ],
+      "capacity": {
+        "batchClaimsAtomic": true,
+        "staleReplacementInvalidatedOnRejection": true,
+        "newFlightRejectedBeforeUpstream": true,
+        "completedEntryLimitBytes": 8388608,
+        "completedTotalLimitBytes": 67108864,
+        "completedCountLimit": 2000,
+        "sessionCountLimit": 100,
+        "logicalEstimateNotRss": true,
+        "closedShellChargedUntilLastArc": true,
+        "independentCachesLazyExpiry": true
+      },
+      "timingInventory": {
+        "requestOrigin": "native_AgentService_driver_entry_after_shared_preparation_and_managed_auth_refresh",
+        "firstToken": "progressive_business_output_in_non_terminal_batch",
+        "h2FirstOutputDeadline": "request_sent_and_rearmed_after_tool_resume",
+        "controlsCountAsFirstToken": false,
+        "deliveryMeasurement": "no_new_socket_write_measurement",
+        "newMilestoneInstrumentation": false
+      },
+      "rollback": "Disable optional process hard limit with 0 while retaining request budgets, scope fences, bounded caches and lifecycle cleanup; never reset existing owner charges.",
+      "outstanding": []
+    }
+  ],
+  "r4CategoryReview": {
+    "reviewedAt": "2026-10-27T16:02:21.728299+00:00",
+    "status": "offline_complete",
+    "implementationCommit": null,
+    "liveAcceptance": "live_pending",
+    "concurrentShareMarketValidated": false,
+    "completed": [
+      "R4-CUR-01",
+      "Cursor_R4-CORE-02_resident_owners"
+    ],
+    "retainedLimits": [
+      "oauth_and_api_key_receipts_independently_live_pending",
+      "no_new_milestone_or_socket_write_instrumentation",
+      "logical_retained_bytes_not_allocator_or_RSS",
+      "lazy_cache_expiry_does_not_promise_background_TTL_sweeps",
+      "closed_session_shell_may_outlive_registry_removal"
+    ]
+  }
 }

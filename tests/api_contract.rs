@@ -10177,7 +10177,38 @@ async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_withou
         .await
         .unwrap();
     let app = app_router(state.clone());
-    let token = setup_and_login(&app).await;
+    // This contract counts account-operation I/O. Setup must not start an
+    // unrelated Router tunnel using the same HTTP client after it returns.
+    cc_switch_server::setup::complete_setup(
+        &state,
+        serde_json::from_value(json!({
+            "password":"password123", "ownerEmail":"owner@example.com",
+            "routerUrl":"http://127.0.0.1:9", "clientTunnelSubdomain":"ownerabcde",
+            "options":{"allowOffline":true}
+        }))
+        .unwrap(),
+        cc_switch_server::setup::SetupExecution {
+            start_client_tunnel: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/auth/login",
+            json!({"method":"password","password":"password123"}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let token = json_body(login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -10185,11 +10216,20 @@ async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_withou
     let proxy_url = format!("http://{}", listener.local_addr().unwrap());
     let outbound_requests = Arc::new(AtomicUsize::new(0));
     let observed_requests = Arc::clone(&outbound_requests);
+    let request_lines = Arc::new(Mutex::new(Vec::new()));
+    let observed_lines = Arc::clone(&request_lines);
     let proxy_task = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             observed_requests.fetch_add(1, Ordering::SeqCst);
             let mut request = [0_u8; 2_048];
-            let _ = socket.read(&mut request).await;
+            let read = socket.read(&mut request).await.unwrap_or_default();
+            observed_lines.lock().unwrap().push(
+                String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
             let _ = socket
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
@@ -10251,7 +10291,12 @@ async fn codex_banked_reset_and_manual_refresh_reject_non_active_accounts_withou
         );
     }
 
-    assert_eq!(outbound_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outbound_requests.load(Ordering::SeqCst),
+        0,
+        "observed targets: {:?}",
+        request_lines.lock().unwrap()
+    );
     proxy_task.abort();
 }
 

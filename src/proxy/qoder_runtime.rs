@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -6,6 +6,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::domain::qoder::{QoderCosySession, QoderCredentialRail, QoderSite};
+
+mod resident;
+use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
+pub use resident::QoderResidentSession;
+use resident::{QoderResidentCatalog, ResidentSessionEntry, RuntimeFlights};
 
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
@@ -50,7 +55,7 @@ const QODER_CN_MODEL_ALIASES: &[(&str, &str)] = &[
     ("minimax-m2.7", "mmodel"),
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QoderRuntimeScope(String);
 
 impl QoderRuntimeScope {
@@ -114,7 +119,7 @@ fn scoped_digest<const N: usize>(domain: &[u8], values: [&str; N], prefix: &str)
 
 #[derive(Clone)]
 pub struct QoderCachedSession {
-    pub session: Arc<QoderCosySession>,
+    pub session: Arc<QoderResidentSession>,
     pub gateway_base_url: String,
     pub expires_at_ms: Option<i64>,
     cached_at_ms: i64,
@@ -132,7 +137,7 @@ impl QoderCachedSession {
             return Err("Qoder session gateway URL is empty".to_string());
         }
         Ok(Self {
-            session: Arc::new(session),
+            session: Arc::new(QoderResidentSession::new(session)),
             gateway_base_url,
             expires_at_ms,
             cached_at_ms,
@@ -158,13 +163,26 @@ impl std::fmt::Debug for QoderCachedSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct QoderModelCatalog {
-    pub enabled_models: Vec<String>,
-    pub raw_configs: BTreeMap<String, Value>,
-    pub capabilities: BTreeMap<String, QoderModelCapability>,
+    data: Arc<QoderResidentCatalog>,
     pub fetched_at_ms: i64,
     expires_at_ms: i64,
+}
+
+impl std::ops::Deref for QoderModelCatalog {
+    type Target = FetchedQoderModelCatalog;
+    fn deref(&self) -> &Self::Target {
+        &self.data.value
+    }
+}
+
+impl PartialEq for QoderModelCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.value == other.data.value
+            && self.fetched_at_ms == other.fetched_at_ms
+            && self.expires_at_ms == other.expires_at_ms
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +224,12 @@ impl PreparedQoderRuntime {
             .0
             .capacity()
             .saturating_add(self.session.gateway_base_url.capacity())
-            .saturating_add(self.catalog.retained_bytes())
+            .saturating_add(self.session.session.unaccounted_bytes())
+            .saturating_add(if self.catalog.data._memory.is_none() {
+                self.catalog.retained_bytes()
+            } else {
+                0
+            })
             .saturating_add(self.account_id.capacity())
     }
 }
@@ -414,30 +437,51 @@ fn scoped_fingerprint(domain: &[u8], value: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-#[derive(Debug, Clone)]
-struct QoderResponseAlias {
+#[derive(Debug)]
+pub(crate) struct QoderResponseAlias {
     scope: QoderRuntimeScope,
     continuation: QoderResponseContinuation,
     inserted_at_ms: i64,
     expires_at_ms: i64,
+    _memory: ResidentMemoryReservation,
 }
 
 impl QoderResponseAlias {
     fn retained_bytes(&self) -> usize {
+        Self::payload_bytes(&self.scope, &self.continuation)
+    }
+
+    fn payload_bytes(scope: &QoderRuntimeScope, continuation: &QoderResponseContinuation) -> usize {
         std::mem::size_of::<Self>()
-            .saturating_add(self.scope.0.capacity())
-            .saturating_add(self.continuation.retained_bytes())
+            .saturating_add(scope.0.capacity())
+            .saturating_add(continuation.retained_bytes())
             .saturating_add(128)
     }
 }
 
-#[derive(Default)]
+impl std::ops::Deref for QoderResponseAlias {
+    type Target = QoderResponseContinuation;
+    fn deref(&self) -> &Self::Target {
+        &self.continuation
+    }
+}
+
+impl PartialEq for QoderResponseAlias {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.continuation == other.continuation
+            && self.inserted_at_ms == other.inserted_at_ms
+            && self.expires_at_ms == other.expires_at_ms
+    }
+}
+
 pub struct QoderRuntimeCache {
-    sessions: RwLock<HashMap<QoderRuntimeScope, QoderCachedSession>>,
-    session_flights: Mutex<HashMap<QoderRuntimeScope, Arc<Mutex<()>>>>,
-    catalogs: RwLock<HashMap<QoderRuntimeScope, QoderModelCatalog>>,
-    catalog_flights: Mutex<HashMap<QoderRuntimeScope, Arc<Mutex<()>>>>,
-    response_aliases: RwLock<HashMap<String, QoderResponseAlias>>,
+    sessions: RwLock<BTreeMap<QoderRuntimeScope, ResidentSessionEntry>>,
+    session_flights: Mutex<RuntimeFlights>,
+    catalogs: RwLock<BTreeMap<QoderRuntimeScope, QoderModelCatalog>>,
+    catalog_flights: Mutex<RuntimeFlights>,
+    response_aliases: RwLock<BTreeMap<String, Arc<QoderResponseAlias>>>,
+    parent: ResidentMemoryBudget,
 }
 
 impl std::fmt::Debug for QoderRuntimeCache {
@@ -445,196 +489,6 @@ impl std::fmt::Debug for QoderRuntimeCache {
         formatter
             .debug_struct("QoderRuntimeCache")
             .finish_non_exhaustive()
-    }
-}
-
-impl QoderRuntimeCache {
-    pub async fn session(
-        &self,
-        scope: &QoderRuntimeScope,
-        now_ms: i64,
-    ) -> Option<QoderCachedSession> {
-        self.sessions
-            .read()
-            .await
-            .get(scope)
-            .filter(|entry| entry.is_fresh(now_ms))
-            .cloned()
-    }
-
-    pub async fn insert_session(&self, scope: QoderRuntimeScope, session: QoderCachedSession) {
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(scope, session);
-        while sessions.len() > MAX_RUNTIME_ENTRIES {
-            let Some(oldest) = sessions
-                .iter()
-                .min_by_key(|(_, session)| session.cached_at_ms)
-                .map(|(scope, _)| scope.clone())
-            else {
-                break;
-            };
-            sessions.remove(&oldest);
-        }
-    }
-
-    pub async fn invalidate_session(&self, scope: &QoderRuntimeScope) {
-        self.sessions.write().await.remove(scope);
-    }
-
-    pub async fn session_lock(&self, scope: &QoderRuntimeScope) -> OwnedMutexGuard<()> {
-        flight_lock(&self.session_flights, scope).await
-    }
-
-    pub async fn catalog(
-        &self,
-        scope: &QoderRuntimeScope,
-        now_ms: i64,
-    ) -> Option<QoderModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(scope)
-            .filter(|catalog| catalog.is_fresh(now_ms))
-            .cloned()
-    }
-
-    pub async fn insert_catalog(
-        &self,
-        scope: QoderRuntimeScope,
-        fetched: FetchedQoderModelCatalog,
-        fetched_at_ms: i64,
-    ) -> QoderModelCatalog {
-        let catalog = QoderModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
-            fetched_at_ms,
-            expires_at_ms: fetched_at_ms.saturating_add(QODER_MODEL_CATALOG_TTL_MS),
-        };
-        let mut catalogs = self.catalogs.write().await;
-        catalogs.insert(scope, catalog.clone());
-        while catalogs.len() > MAX_RUNTIME_ENTRIES {
-            let Some(oldest) = catalogs
-                .iter()
-                .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
-                .map(|(scope, _)| scope.clone())
-            else {
-                break;
-            };
-            catalogs.remove(&oldest);
-        }
-        catalog
-    }
-
-    pub async fn invalidate_catalog(&self, scope: &QoderRuntimeScope) {
-        self.catalogs.write().await.remove(scope);
-    }
-
-    pub async fn invalidate_scope(&self, scope: &QoderRuntimeScope) {
-        self.invalidate_session(scope).await;
-        self.invalidate_catalog(scope).await;
-        self.response_aliases
-            .write()
-            .await
-            .retain(|_, alias| &alias.scope != scope);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn response_continuation(
-        &self,
-        scope: &QoderRuntimeScope,
-        share_id: &str,
-        user_namespace: &str,
-        model_key: &str,
-        response_id: &str,
-        now_ms: i64,
-    ) -> Option<QoderResponseContinuation> {
-        let key = response_alias_key(scope, share_id, user_namespace, model_key, response_id)?;
-        let mut aliases = self.response_aliases.write().await;
-        aliases.retain(|_, alias| alias.expires_at_ms > now_ms);
-        aliases.get(&key).map(|alias| alias.continuation.clone())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn claim_response_continuation(
-        &self,
-        scope: &QoderRuntimeScope,
-        share_id: &str,
-        user_namespace: &str,
-        model_key: &str,
-        response_id: &str,
-        now_ms: i64,
-    ) -> Option<QoderResponseContinuation> {
-        let key = response_alias_key(scope, share_id, user_namespace, model_key, response_id)?;
-        let mut aliases = self.response_aliases.write().await;
-        aliases.retain(|_, alias| alias.expires_at_ms > now_ms);
-        aliases.remove(&key).map(|alias| alias.continuation)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn insert_response_alias(
-        &self,
-        scope: QoderRuntimeScope,
-        share_id: &str,
-        user_namespace: &str,
-        model_key: &str,
-        response_id: &str,
-        continuation: QoderResponseContinuation,
-        now_ms: i64,
-    ) -> Result<(), String> {
-        let key = response_alias_key(&scope, share_id, user_namespace, model_key, response_id)
-            .ok_or_else(|| "Qoder response alias identity is invalid".to_string())?;
-        if continuation.session_id.trim().is_empty()
-            || continuation.session_id.len() > 128
-            || continuation.downstream_model.is_empty()
-            || continuation.downstream_model.len() > 256
-            || continuation.tool_names.len() > 128
-            || continuation.pending_tool_calls.len() > 128
-            || continuation
-                .tool_names
-                .iter()
-                .any(|name| name.is_empty() || name.trim() != name || name.len() > 256)
-        {
-            return Err("Qoder response continuation exceeds identity limits".to_string());
-        }
-        let alias = QoderResponseAlias {
-            scope,
-            continuation,
-            inserted_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(RESPONSE_ALIAS_TTL_MS),
-        };
-        if alias.retained_bytes() > MAX_RESPONSE_ALIAS_ENTRY_BYTES {
-            return Err("Qoder response continuation exceeds entry limit".to_string());
-        }
-        let mut aliases = self.response_aliases.write().await;
-        aliases.retain(|_, value| value.expires_at_ms > now_ms);
-        if aliases.contains_key(&key) {
-            return Err("Qoder response identifier is already bound".to_string());
-        }
-        let mut retained_bytes = aliases
-            .values()
-            .map(QoderResponseAlias::retained_bytes)
-            .sum::<usize>();
-        while aliases.len() >= MAX_RESPONSE_ALIASES
-            || retained_bytes.saturating_add(alias.retained_bytes()) > MAX_RESPONSE_ALIAS_BYTES
-        {
-            let Some(oldest_key) = aliases
-                .iter()
-                .min_by_key(|(key, value)| (value.inserted_at_ms, *key))
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(removed) = aliases.remove(&oldest_key) {
-                retained_bytes = retained_bytes.saturating_sub(removed.retained_bytes());
-            }
-        }
-        aliases.insert(key, alias);
-        Ok(())
-    }
-
-    pub async fn catalog_lock(&self, scope: &QoderRuntimeScope) -> OwnedMutexGuard<()> {
-        flight_lock(&self.catalog_flights, scope).await
     }
 }
 
@@ -657,21 +511,6 @@ fn response_alias_key(
         [scope.key(), values[0], values[1], values[2], values[3]],
         "qoder-response",
     ))
-}
-
-async fn flight_lock(
-    flights: &Mutex<HashMap<QoderRuntimeScope, Arc<Mutex<()>>>>,
-    scope: &QoderRuntimeScope,
-) -> OwnedMutexGuard<()> {
-    let flight = {
-        let mut flights = flights.lock().await;
-        flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-        flights
-            .entry(scope.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    flight.lock_owned().await
 }
 
 pub fn parse_qoder_model_catalog(
@@ -852,6 +691,7 @@ pub fn build_qoder_payload(
         user_type,
         now_ms,
         None,
+        None,
     )
 }
 
@@ -865,6 +705,7 @@ pub(crate) fn build_qoder_payload_with_continuation(
     user_type: &str,
     now_ms: i64,
     continuation: Option<&QoderResponseContinuation>,
+    declared_history_names: Option<&BTreeSet<String>>,
 ) -> Result<PreparedQoderPayload, String> {
     let request = canonical_chat_request
         .as_object()
@@ -889,12 +730,16 @@ pub(crate) fn build_qoder_payload_with_continuation(
         ));
     }
 
-    let tools = normalized_tools(request)?;
-    let normalized_history = if continuation.is_some() {
-        normalize_tool_history_with_continuation(request.get("messages"), &tools, continuation)?
-    } else {
-        normalize_tool_history(request.get("messages"), &tools)?
-    };
+    let declared_tools = declared_tools(request)?;
+    let tools = tools_for_choice(request, declared_tools.to_vec())?;
+    // Tool choice limits the next call, not the identity of completed history.
+    // Unknown/retired declarations still follow the separate acceptance gate.
+    let normalized_history = normalize_tool_history_with_continuation(
+        request.get("messages"),
+        declared_tools,
+        continuation,
+        declared_history_names,
+    )?;
     let normalized_history = Value::Array(normalized_history);
     let (system, mut messages, last_user_text) =
         normalize_chat_messages(Some(&normalized_history))?;
@@ -999,13 +844,14 @@ pub(crate) fn build_qoder_payload_with_continuation(
 }
 
 fn normalize_tool_history(value: Option<&Value>, tools: &[Value]) -> Result<Vec<Value>, String> {
-    normalize_tool_history_with_continuation(value, tools, None)
+    normalize_tool_history_with_continuation(value, tools, None, None)
 }
 
 fn normalize_tool_history_with_continuation(
     value: Option<&Value>,
     tools: &[Value],
     continuation: Option<&QoderResponseContinuation>,
+    declared_history_names: Option<&BTreeSet<String>>,
 ) -> Result<Vec<Value>, String> {
     let messages = value
         .and_then(Value::as_array)
@@ -1018,6 +864,9 @@ fn normalize_tool_history_with_continuation(
         .collect::<HashSet<_>>();
     if let Some(continuation) = continuation {
         defined_names.extend(continuation.tool_names.iter().map(String::as_str));
+    }
+    if let Some(names) = declared_history_names {
+        defined_names.extend(names.iter().map(String::as_str));
     }
     let mut used_ids = HashSet::new();
     let mut batch_source_ids = HashMap::<String, Vec<String>>::new();
@@ -1431,11 +1280,36 @@ fn normalized_tool_calls(value: Option<&Value>) -> Result<Vec<Value>, String> {
 }
 
 fn normalized_tools(request: &Map<String, Value>) -> Result<Vec<Value>, String> {
-    let mut tools = request
+    tools_for_choice(request, declared_tools(request)?.to_vec())
+}
+
+fn declared_tools(request: &Map<String, Value>) -> Result<&[Value], String> {
+    let tools = request
         .get("tools")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
+    for tool in tools {
+        let function = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "Qoder tool must contain a function object".to_string())?;
+        if function
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err("Qoder tool function is missing name".to_string());
+        }
+    }
+    Ok(tools)
+}
+
+fn tools_for_choice(
+    request: &Map<String, Value>,
+    mut tools: Vec<Value>,
+) -> Result<Vec<Value>, String> {
     let choice = match request.get("tool_choice") {
         None | Some(Value::Null) => None,
         Some(Value::String(mode)) => Some((mode.as_str(), None)),
@@ -1456,20 +1330,6 @@ fn normalized_tools(request: &Map<String, Value>) -> Result<Vec<Value>, String> 
     };
     if choice.is_some_and(|(mode, _)| mode == "none") {
         return Ok(Vec::new());
-    }
-    for tool in &tools {
-        let function = tool
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| "Qoder tool must contain a function object".to_string())?;
-        if function
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            return Err("Qoder tool function is missing name".to_string());
-        }
     }
     match choice {
         None | Some(("auto", _)) => Ok(tools),
@@ -1756,7 +1616,8 @@ mod tests {
         assert_eq!(
             cache
                 .response_continuation(&bound, "share-a", "user-a", "auto", "resp_a", 1_001)
-                .await,
+                .await
+                .map(|alias| alias.continuation.clone()),
             Some(first.clone())
         );
         for (scope, share, user, model, id) in [
@@ -1950,7 +1811,8 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
         assert!(cache.session(&current, 2_000).await.is_some());
         assert!(cache.session(&rotated, 2_000).await.is_none());
         assert!(cache.session(&pat, 2_000).await.is_none());
@@ -2000,7 +1862,8 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
         cache
             .insert_catalog(
                 original.clone(),
@@ -2246,6 +2109,100 @@ mod tests {
     }
 
     #[test]
+    fn qoder_r4_tool_choice_does_not_erase_declared_completed_history() {
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            for choice in [
+                json!("none"),
+                json!({"type":"function","function":{"name":"write"}}),
+            ] {
+                let request = json!({
+                    "messages":[
+                        {"role":"user","content":"read"},
+                        {"role":"assistant","tool_calls":[{"id":"read-old","type":"function","function":{"name":"read","arguments":"{\"path\":\"original\"}"}}]},
+                        {"role":"tool","tool_call_id":"read-old","content":"original result"},
+                        {"role":"user","content":"continue"}
+                    ],
+                    "tools":[
+                        {"type":"function","function":{"name":"read","parameters":{"type":"object"}}},
+                        {"type":"function","function":{"name":"write","parameters":{"type":"object"}}}
+                    ],
+                    "tool_choice":choice
+                });
+                let prepared = build_qoder_payload(
+                    &request,
+                    &json!({"key":"fixture-model","enable":true}),
+                    site,
+                    "fixture-model",
+                    "fixture-session",
+                    "personal_standard",
+                    1_700_000_000_000,
+                )
+                .unwrap();
+                let messages = prepared.body["messages"].as_array().unwrap();
+                let call = messages
+                    .iter()
+                    .find_map(|message| {
+                        message
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .and_then(|calls| calls.first())
+                    })
+                    .expect("tool_choice removed declared history");
+                assert_eq!(call["function"]["name"], "read");
+                assert_eq!(call["function"]["arguments"], r#"{"path":"original"}"#);
+                assert!(messages
+                    .iter()
+                    .any(|message| message["tool_call_call_id"] == "read-old"
+                        && message["contents"][0]["text"] == "original result"));
+                let active = prepared.body["tools"].as_array().unwrap();
+                if choice == "none" {
+                    assert!(active.is_empty());
+                } else {
+                    assert_eq!(active.len(), 1);
+                    assert_eq!(active[0]["function"]["name"], "write");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qoder_r4_retired_history_final_payload_delta_remains_live_gated() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/qoder-r4-history-delta.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let chat =
+                super::super::transforms::openai_responses_to_chat(&case["responsesRequest"])
+                    .unwrap();
+            for site in [QoderSite::Global, QoderSite::Cn] {
+                let prepared = build_qoder_payload(
+                    &chat,
+                    &json!({"key":"fixture-model","enable":true}),
+                    site,
+                    "fixture-model",
+                    "fixture-session",
+                    "personal_standard",
+                    1_700_000_000_000,
+                )
+                .unwrap();
+                let messages = prepared.body["messages"].as_array().unwrap();
+                let projection = json!({
+                    "toolNames":prepared.body["tools"].as_array().unwrap().iter().map(|tool| &tool["function"]["name"]).collect::<Vec<_>>(),
+                    "historicalCallNames":messages.iter().flat_map(|message| message.get("tool_calls").and_then(Value::as_array).into_iter().flatten()).map(|call| &call["function"]["name"]).collect::<Vec<_>>(),
+                    "toolResults":messages.iter().filter(|message| message["role"] == "tool").map(|message| &message["contents"]).collect::<Vec<_>>(),
+                    "userText":messages.iter().filter(|message| message["role"] == "user").filter_map(|message| message["contents"][0]["text"].as_str()).collect::<Vec<_>>().join("\n")
+                });
+                assert_eq!(
+                    projection, case["expectedPayloadProjection"],
+                    "{} {site:?}",
+                    case["id"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tool_history_repairs_missing_and_duplicate_ids_and_orders_parallel_results() {
         let tools = vec![json!({"type":"function","function":{"name":"shell"}})];
         let messages = json!([
@@ -2382,9 +2339,10 @@ mod tests {
         );
         assert_eq!(global.capabilities["future-route"].max_input_tokens, None);
         let cached = QoderModelCatalog {
-            enabled_models: global.enabled_models,
-            raw_configs: global.raw_configs,
-            capabilities: global.capabilities,
+            data: Arc::new(QoderResidentCatalog {
+                value: global,
+                _memory: None,
+            }),
             fetched_at_ms: 1,
             expires_at_ms: 2,
         };
@@ -2419,9 +2377,10 @@ mod tests {
                 )
                 .unwrap();
                 let catalog = QoderModelCatalog {
-                    enabled_models: fetched.enabled_models,
-                    raw_configs: fetched.raw_configs,
-                    capabilities: fetched.capabilities,
+                    data: Arc::new(QoderResidentCatalog {
+                        value: fetched,
+                        _memory: None,
+                    }),
                     fetched_at_ms: 1,
                     expires_at_ms: 2,
                 };
@@ -2444,9 +2403,10 @@ mod tests {
         )
         .unwrap();
         let catalog = QoderModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
+            data: Arc::new(QoderResidentCatalog {
+                value: fetched,
+                _memory: None,
+            }),
             fetched_at_ms: 1,
             expires_at_ms: 2,
         };
@@ -2831,9 +2791,10 @@ mod tests {
         );
         assert!(fetched.raw_configs.contains_key("hidden"));
         let public = QoderModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
+            data: Arc::new(QoderResidentCatalog {
+                value: fetched,
+                _memory: None,
+            }),
             fetched_at_ms: 1,
             expires_at_ms: 2,
         }

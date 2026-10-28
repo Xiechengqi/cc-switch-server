@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use serde_json::Value;
 
 use super::ProxyError;
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 const MAX_ENTRIES: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -34,7 +37,7 @@ struct Key {
 
 impl Key {
     fn retained_bytes(&self) -> usize {
-        let text_bytes = [
+        [
             &self.scope.share_id,
             &self.scope.principal,
             &self.scope.session_id,
@@ -44,12 +47,21 @@ impl Key {
             &self.message_id,
         ]
         .iter()
-        .fold(0usize, |bytes, text| bytes.saturating_add(text.capacity()));
-        // The map and FIFO queue each own a copy of the key.
-        text_bytes
-            .saturating_add(std::mem::size_of::<Key>())
-            .saturating_mul(2)
+        .fold(std::mem::size_of::<Key>(), |bytes, text| {
+            bytes.saturating_add(text.capacity())
+        })
     }
+}
+
+fn alias_bytes(aliases: &BTreeMap<String, String>) -> usize {
+    aliases.iter().fold(0_usize, |bytes, (wire, original)| {
+        bytes
+            .saturating_add(wire.capacity())
+            .saturating_add(original.capacity())
+            .saturating_add(
+                (std::mem::size_of::<(String, String)>() + std::mem::size_of::<usize>() * 2) * 12,
+            )
+    })
 }
 
 #[derive(Debug)]
@@ -58,6 +70,8 @@ struct Entry {
     conflicted: bool,
     bytes: usize,
     expires_at_ms: i64,
+    sequence: u64,
+    _memory: ResidentMemoryReservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,33 +81,72 @@ pub(crate) enum ClaudeThreadAliasLookup {
     Conflicted,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ClaudeThreadAliasCache {
     entries: BTreeMap<Key, Entry>,
-    order: VecDeque<Key>,
     bytes: usize,
+    sequence: u64,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for ClaudeThreadAliasCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl ClaudeThreadAliasCache {
-    pub(crate) fn lookup(
+    fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            bytes: 0,
+            sequence: 0,
+            parent,
+        }
+    }
+
+    pub(crate) fn lookup_with<T>(
         &mut self,
         scope: &ClaudeThreadAliasScope,
         message_id: &str,
         now_ms: i64,
-    ) -> ClaudeThreadAliasLookup {
+        prepare: impl FnOnce(usize) -> Result<T, ProxyError>,
+    ) -> Result<(ClaudeThreadAliasLookup, T), ProxyError> {
         self.expire(now_ms);
         let Some(message_id) = valid_message_id(message_id) else {
-            return ClaudeThreadAliasLookup::Missing;
+            return Ok((ClaudeThreadAliasLookup::Missing, prepare(0)?));
         };
         let key = Key {
             scope: scope.clone(),
             message_id: message_id.to_string(),
         };
         match self.entries.get(&key) {
-            Some(entry) if entry.conflicted => ClaudeThreadAliasLookup::Conflicted,
-            Some(entry) => ClaudeThreadAliasLookup::Ready(entry.aliases.clone()),
-            None => ClaudeThreadAliasLookup::Missing,
+            Some(entry) if entry.conflicted => {
+                Ok((ClaudeThreadAliasLookup::Conflicted, prepare(0)?))
+            }
+            Some(entry) => {
+                // The request clone must be admitted while the cache entry is
+                // borrowed; its reservation follows the caller's map lifetime.
+                let memory = prepare(alias_bytes(&entry.aliases))?;
+                Ok((
+                    ClaudeThreadAliasLookup::Ready(entry.aliases.clone()),
+                    memory,
+                ))
+            }
+            None => Ok((ClaudeThreadAliasLookup::Missing, prepare(0)?)),
         }
+    }
+
+    #[cfg(test)]
+    fn lookup(
+        &mut self,
+        scope: &ClaudeThreadAliasScope,
+        message_id: &str,
+        now_ms: i64,
+    ) -> ClaudeThreadAliasLookup {
+        self.lookup_with(scope, message_id, now_ms, |_| Ok(()))
+            .unwrap()
+            .0
     }
 
     #[cfg(test)]
@@ -124,6 +177,7 @@ impl ClaudeThreadAliasCache {
             scope,
             message_id: message_id.to_string(),
         };
+        self.sequence = self.sequence.saturating_add(1);
         if let Some(existing) = self.entries.get_mut(&key) {
             if existing.conflicted {
                 return false;
@@ -132,12 +186,20 @@ impl ClaudeThreadAliasCache {
                 existing.conflicted = true;
                 return false;
             }
+            // Identical publication grows neither payload nor index. Keeping
+            // the existing charge also preserves its conflict identity fence.
+            existing.expires_at_ms = now_ms.saturating_add(TTL_MS);
+            existing.sequence = self.sequence;
+            return true;
         }
+        // Keep the established entry/aggregate contract separate from the
+        // conservative sparse-node parent charge.
         let bytes = aliases.iter().fold(
             key.retained_bytes()
+                .saturating_mul(2)
                 .saturating_add(std::mem::size_of::<Entry>()),
-            |total, (wire, original)| {
-                total
+            |bytes, (wire, original)| {
+                bytes
                     .saturating_add(wire.len())
                     .saturating_add(original.len())
                     .saturating_add(std::mem::size_of::<(String, String)>())
@@ -146,25 +208,34 @@ impl ClaudeThreadAliasCache {
         if aliases.len() > 128 || bytes > MAX_ENTRY_BYTES {
             return false;
         }
-        if let Some(previous) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(previous.bytes);
-            self.order.retain(|existing| existing != &key);
-        }
+        let resident = key
+            .retained_bytes()
+            .saturating_add(alias_bytes(&aliases))
+            .saturating_add(
+                (std::mem::size_of::<(Key, Entry)>() + std::mem::size_of::<usize>() * 2) * 12,
+            );
+        let Some(memory) = self.parent.reserve(resident) else {
+            return false;
+        };
         self.bytes = self.bytes.saturating_add(bytes);
         self.entries.insert(
-            key.clone(),
+            key,
             Entry {
                 aliases,
                 conflicted: false,
                 bytes,
                 expires_at_ms: now_ms.saturating_add(TTL_MS),
+                sequence: self.sequence,
+                _memory: memory,
             },
         );
-        self.order.push_back(key);
         while self.entries.len() > MAX_ENTRIES || self.bytes > MAX_BYTES {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(key, entry)| (entry.sequence, *key))
+                .map(|(key, _)| key.clone())
+                .expect("nonempty alias cache");
             if let Some(entry) = self.entries.remove(&oldest) {
                 self.bytes = self.bytes.saturating_sub(entry.bytes);
             }
@@ -173,20 +244,8 @@ impl ClaudeThreadAliasCache {
     }
 
     fn expire(&mut self, now_ms: i64) {
-        self.order.retain(|key| {
-            if self
-                .entries
-                .get(key)
-                .is_some_and(|entry| entry.expires_at_ms <= now_ms)
-            {
-                if let Some(entry) = self.entries.remove(key) {
-                    self.bytes = self.bytes.saturating_sub(entry.bytes);
-                }
-                false
-            } else {
-                true
-            }
-        });
+        self.entries.retain(|_, entry| entry.expires_at_ms > now_ms);
+        self.bytes = self.entries.values().map(|entry| entry.bytes).sum();
     }
 }
 
@@ -419,6 +478,116 @@ mod tests {
             token_refresh_generation: 1,
             credential_fingerprint: [1; 32],
         }
+    }
+
+    #[test]
+    fn claude_r4_review_alias_request_copy_is_reserved_before_clone_and_outlives_cache() {
+        use super::super::request_memory::{RequestMemoryBudget, RequestMemoryComponent};
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ClaudeThreadAliasCache::with_parent(parent.clone());
+        let aliases = BTreeMap::from([("wire".into(), "original".into())]);
+        assert!(cache.save(scope("one"), "msg_1", aliases.clone(), 0));
+        let before = parent.snapshot().used_bytes;
+        let rejected = RequestMemoryBudget::with_parent(1, parent.clone());
+        let result = cache.lookup_with(&scope("one"), "msg_1", 1, |bytes| {
+            rejected
+                .reserve(RequestMemoryComponent::StreamRetainedState, bytes)
+                .map_err(|error| error.into_proxy_error())
+        });
+        assert!(result.unwrap_err().is_request_memory_exhausted());
+        assert_eq!(parent.snapshot().used_bytes, before);
+        let request = RequestMemoryBudget::with_parent(usize::MAX, parent.clone());
+        let (copy, memory) = cache
+            .lookup_with(&scope("one"), "msg_1", 2, |bytes| {
+                request
+                    .reserve(RequestMemoryComponent::StreamRetainedState, bytes)
+                    .map_err(|error| error.into_proxy_error())
+            })
+            .unwrap();
+        assert_eq!(copy, ClaudeThreadAliasLookup::Ready(aliases));
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, request.snapshot().used_bytes);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(copy);
+        drop(memory);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn claude_r4_review_alias_pressure_cannot_overwrite_conflict_identity() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ClaudeThreadAliasCache::with_parent(parent.clone());
+        let aliases = BTreeMap::from([("wire".into(), "original".into())]);
+        assert!(cache.save(scope("one"), "msg_1", aliases.clone(), 0));
+        let used = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(0));
+        assert!(cache.save(scope("one"), "msg_1", aliases.clone(), 2));
+        assert_eq!(parent.snapshot().used_bytes, used);
+        assert!(!cache.save(scope("one"), "msg_other", aliases, 3));
+        assert_eq!(
+            cache.lookup(&scope("one"), "msg_other", 4),
+            ClaudeThreadAliasLookup::Missing
+        );
+        assert!(!cache.save(
+            scope("one"),
+            "msg_1",
+            BTreeMap::from([("wire".into(), "different".into())]),
+            5
+        ));
+        assert_eq!(
+            cache.lookup(&scope("one"), "msg_1", 6),
+            ClaudeThreadAliasLookup::Conflicted
+        );
+        assert_eq!(parent.snapshot().used_bytes, used);
+        assert_eq!(
+            cache.lookup(&scope("one"), "msg_1", TTL_MS + 2),
+            ClaudeThreadAliasLookup::Missing
+        );
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn claude_r4_review_alias_sparse_count_expiry_and_drop_release_parent() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ClaudeThreadAliasCache::with_parent(parent.clone());
+        for index in 0..=MAX_ENTRIES {
+            assert!(cache.save(scope("one"), &format!("msg_{index}"), BTreeMap::new(), 0));
+        }
+        assert_eq!(parent.snapshot().active_reservations, MAX_ENTRIES);
+        assert_eq!(
+            cache.lookup(&scope("one"), "msg_0", 1),
+            ClaudeThreadAliasLookup::Missing
+        );
+        assert_eq!(
+            cache.lookup(&scope("one"), "msg_1", TTL_MS),
+            ClaudeThreadAliasLookup::Missing
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        assert!(cache.save(scope("one"), "new", BTreeMap::new(), TTL_MS));
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn claude_r4_review_alias_parent_counts_spare_string_capacity_and_keeps_128_limit() {
+        let parent = ResidentMemoryBudget::new(None);
+        let mut cache = ClaudeThreadAliasCache::with_parent(parent.clone());
+        let aliases = (0..128)
+            .map(|i| (format!("wire_{i}"), format!("original_{i}")))
+            .collect::<BTreeMap<_, _>>();
+        assert!(cache.save(scope("one"), "msg_1", aliases, 0));
+        let mut original = String::with_capacity(32 * 1024);
+        original.push('x');
+        assert!(cache.save(
+            scope("one"),
+            "msg_2",
+            BTreeMap::from([("wire".into(), original)]),
+            0
+        ));
+        assert!(parent.snapshot().used_bytes >= 32 * 1024);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
     #[test]

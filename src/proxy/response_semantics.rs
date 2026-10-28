@@ -252,6 +252,12 @@ impl SemanticFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SemanticObservation {
     Lifecycle,
+    /// Reviewed out-of-band information, independent of generation progress.
+    /// Visibility and transport commit remain the caller's responsibility.
+    Metadata,
+    /// A reviewed interrupt ACK is not a generation error or terminal. Its
+    /// delivery can still commit bytes on the transport.
+    Control,
     Business,
     ErrorFrame(SemanticFailure),
     SuccessTerminal,
@@ -263,6 +269,8 @@ impl SemanticObservation {
     pub(super) fn metric_kind(&self) -> &'static str {
         match self {
             Self::Lifecycle => "lifecycle",
+            Self::Metadata => "metadata",
+            Self::Control => "control",
             Self::Business => "business",
             Self::ErrorFrame(_) => "error_frame",
             Self::SuccessTerminal => "success_terminal",
@@ -276,7 +284,7 @@ impl SemanticObservation {
 
     pub(super) fn commits_downstream(&self) -> bool {
         match self {
-            Self::Lifecycle => false,
+            Self::Lifecycle | Self::Metadata | Self::Control => false,
             Self::ErrorFrame(failure) => !failure.retryable_error_frame(),
             _ => true,
         }
@@ -388,6 +396,13 @@ pub(super) fn responses_sse_normalizer_enabled() -> bool {
 pub(super) fn classify_json_document(
     body: &[u8],
 ) -> Result<SemanticObservation, SemanticProtocolError> {
+    classify_json_document_with_timing(body, None)
+}
+
+pub(super) fn classify_json_document_with_timing(
+    body: &[u8],
+    timing: Option<&super::request_timing::ForwardTiming>,
+) -> Result<SemanticObservation, SemanticProtocolError> {
     let value = serde_json::from_slice::<Value>(body).map_err(|error| {
         SemanticProtocolError::new(format!("Responses body is not valid JSON: {error}"))
     })?;
@@ -397,7 +412,11 @@ pub(super) fn classify_json_document(
         ));
     }
     reject_conflicting_completed_status(&value)?;
-    Ok(classify_value(&value))
+    let observation = classify_value(&value);
+    if let Some(timing) = timing {
+        timing.observe_responses_document(&value, &observation);
+    }
+    Ok(observation)
 }
 
 fn reject_conflicting_completed_status(value: &Value) -> Result<(), SemanticProtocolError> {
@@ -425,6 +444,10 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         .unwrap_or(value);
     let status = response.get("status").and_then(Value::as_str);
 
+    if super::providers::codex::control::is_interrupt_ack(value) {
+        return SemanticObservation::Control;
+    }
+
     if event_type == "error" {
         return SemanticObservation::ErrorFrame(failure_from_value(value, response, status));
     }
@@ -435,6 +458,10 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         || matches!(event_type, "response.cancelled" | "response.canceled")
     {
         return SemanticObservation::Failure(failure_from_value(value, response, status));
+    }
+
+    if is_reviewed_responses_metadata(value) {
+        return SemanticObservation::Metadata;
     }
 
     if event_type == "response.incomplete"
@@ -467,6 +494,57 @@ pub(super) fn classify_value(value: &Value) -> SemanticObservation {
         return SemanticObservation::Lifecycle;
     }
     SemanticObservation::Business
+}
+
+/// A closed envelope list, deliberately unrelated to the public SSE allowlist.
+/// Unknown events/fields may carry observable work and must remain business.
+fn is_reviewed_responses_metadata(value: &Value) -> bool {
+    reviewed_metadata_envelope(value.get("type").and_then(Value::as_str), value)
+}
+
+fn reviewed_metadata_envelope(kind: Option<&str>, value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(kind) = kind else {
+        return false;
+    };
+    let fields: &[&str] = match kind {
+        "response.metadata" | "codex.response.metadata" => &[
+            "type",
+            "response_id",
+            "sequence_number",
+            "metadata",
+            "headers",
+        ],
+        "codex.rate_limits" | "rate_limits.updated" => &[
+            "type",
+            "response_id",
+            "sequence_number",
+            "rate_limits",
+            "rate_limit",
+            "plan_type",
+            "credits",
+            "metered_limit_name",
+            "limit_id",
+            "limit_name",
+        ],
+        _ => return false,
+    };
+    object.iter().all(|(key, value)| {
+        fields.contains(&key.as_str())
+            && match key.as_str() {
+                "type" => true,
+                "sequence_number" => value.as_u64().is_some(),
+                "response_id" => value
+                    .as_str()
+                    .is_some_and(|id| !id.trim().is_empty() && id.len() <= 512),
+                "metadata" | "headers" | "rate_limits" | "rate_limit" | "credits" => {
+                    value.is_object() || value.is_null()
+                }
+                _ => value.is_string() || value.is_null(),
+            }
+    })
 }
 
 pub(super) fn is_responses_terminal_event(declared_event: Option<&str>, value: &Value) -> bool {
@@ -724,6 +802,7 @@ pub(super) struct ResponsesSseInspector {
     event_visibility: ResponsesEventVisibility,
     reported_model: ReportedResponseModelObserver,
     started: bool,
+    timing: Option<super::request_timing::ForwardTiming>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -770,11 +849,15 @@ impl Default for ResponsesSseInspector {
             event_visibility: ResponsesEventVisibility::Unfiltered,
             reported_model: ReportedResponseModelObserver::default(),
             started: false,
+            timing: None,
         }
     }
 }
 
 impl ResponsesSseInspector {
+    pub(super) fn set_timing(&mut self, timing: Option<super::request_timing::ForwardTiming>) {
+        self.timing = timing;
+    }
     pub(super) fn with_repeat_guard(enabled: bool) -> Self {
         Self {
             repeat_guard_enabled: enabled,
@@ -962,7 +1045,16 @@ impl ResponsesSseInspector {
                         continue;
                     }
                     self.observe_repeat(&value)?;
-                    let observation = classify_value(&value);
+                    let mut observation = classify_value(&value);
+                    // SSE may supply the event name without a payload type.
+                    // The decoder already rejects conflicting explicit names.
+                    // Do not clone the metadata document or change its wire.
+                    if observation == SemanticObservation::Business
+                        && value.get("type").is_none()
+                        && reviewed_metadata_envelope(declared_event.as_deref(), &value)
+                    {
+                        observation = SemanticObservation::Metadata;
+                    }
                     if matches!(
                         observation,
                         SemanticObservation::SuccessTerminal
@@ -973,6 +1065,13 @@ impl ResponsesSseInspector {
                             observations.push(SemanticObservation::Failure(failure));
                         }
                         continue;
+                    }
+                    if let Some(timing) = &self.timing {
+                        timing.observe_responses_value(
+                            &value,
+                            declared_event.as_deref(),
+                            &observation,
+                        );
                     }
                     self.record(&observation);
                     normalized.extend_from_slice(&encode_canonical_json_sse(
@@ -1010,7 +1109,9 @@ impl ResponsesSseInspector {
 
     fn record(&mut self, observation: &SemanticObservation) {
         match observation {
-            SemanticObservation::Lifecycle => {}
+            SemanticObservation::Lifecycle
+            | SemanticObservation::Metadata
+            | SemanticObservation::Control => {}
             SemanticObservation::ErrorFrame(failure) => {
                 self.pending_error = Some(failure.clone());
             }
@@ -1033,6 +1134,9 @@ impl ResponsesSseInspector {
         if self.terminal.is_none() {
             self.terminal = Some(SemanticTerminal::Failure(failure.clone()));
             self.terminal_from_error_frame = true;
+            if let Some(timing) = &self.timing {
+                timing.observe(&SemanticObservation::Failure(failure.clone()));
+            }
         }
         Some(failure)
     }
@@ -2031,6 +2135,110 @@ mod tests {
         assert!(!normalized.contains("codex."));
         assert!(!normalized.contains("anonymous_private_payload"));
         assert!(!normalized.contains("response.future.delta"));
+    }
+
+    #[test]
+    fn codex_r4_metadata_has_no_business_or_terminal_semantics() {
+        for event in [
+            json!({"type":"response.metadata","response_id":"r","sequence_number":2,
+                "metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{}}}}),
+            json!({"type":"codex.response.metadata","headers":{"x-codex-primary-used-percent":"0"}}),
+            json!({"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":0}}}),
+            json!({"type":"rate_limits.updated","rate_limit":{"primary_window":{"used_percent":0}}}),
+        ] {
+            let observation = classify_value(&event);
+            assert!(!observation.counts_as_business_output(), "{event}");
+            assert!(!observation.commits_downstream(), "{event}");
+            assert!(!is_responses_terminal_event(None, &event), "{event}");
+            assert_eq!(observation.metric_kind(), "metadata");
+        }
+    }
+
+    #[test]
+    fn codex_r4_metadata_never_masks_generation_errors_or_unknown_content() {
+        for event in [
+            json!({"type":"response.metadata","error":{"code":"server_error","message":"failed"}}),
+            json!({"type":"codex.response.metadata","response":{"status":"failed","error":{"code":"server_error"}}}),
+        ] {
+            assert!(matches!(
+                classify_value(&event),
+                SemanticObservation::Failure(_)
+            ));
+        }
+        for event in [
+            json!({"type":"response.future.delta","delta":"unknown content"}),
+            json!({"type":"codex.future.metadata","metadata":{}}),
+            json!({"type":"response.metadata","delta":"real output"}),
+            json!({"type":"response.metadata","item":{"type":"web_search_call"}}),
+            json!({"type":"response.metadata","new_field":"unreviewed"}),
+        ] {
+            assert_eq!(
+                classify_value(&event),
+                SemanticObservation::Business,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_r4_native_sse_metadata_does_not_satisfy_content_or_eof() {
+        let mut inspector = ResponsesSseInspector::with_repeat_guard_and_visibility(
+            false,
+            ResponsesEventVisibility::NativeCodexClient,
+        );
+        let batch = inspector
+            .push_normalized(
+                b"data: {\"type\":\"codex.response.metadata\",\"response_id\":\"r\"}\n\n",
+            )
+            .unwrap();
+        assert!(!batch.normalized.is_empty());
+        assert!(!inspector.saw_business());
+        assert!(batch.observations.iter().all(|o| !o.commits_downstream()));
+        assert!(inspector.finish().is_err());
+    }
+
+    #[test]
+    fn codex_r4_sse_metadata_visibility_and_overload_are_separate() {
+        for visibility in [
+            ResponsesEventVisibility::Unfiltered,
+            ResponsesEventVisibility::StandardClient,
+            ResponsesEventVisibility::NativeCodexClient,
+        ] {
+            let mut inspector =
+                ResponsesSseInspector::with_repeat_guard_and_visibility(false, visibility);
+            let metadata = inspector.push_normalized(concat!(
+                "event: codex.response.metadata\ndata: {\"headers\":{\"x-codex-primary-used-percent\":\"0\"}}\n\n",
+                "data: {\"type\":\"response.metadata\",\"metadata\":{}}\n\n",
+                "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{}}\n\n"
+            ).as_bytes()).unwrap();
+            assert!(!inspector.saw_business());
+            assert!(metadata
+                .observations
+                .iter()
+                .all(|observation| observation.metric_kind() == "metadata"));
+            if visibility == ResponsesEventVisibility::StandardClient {
+                assert!(metadata.normalized.is_empty());
+            }
+            let failed = inspector.push_normalized(b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}}\n\n").unwrap();
+            assert!(matches!(
+                failed.observations.as_slice(),
+                [SemanticObservation::Failure(_)]
+            ));
+            inspector.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_r4_sse_names_cannot_relabel_content_as_metadata() {
+        for stream in [
+            "event: codex.response.metadata\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"codex.response.metadata\",\"metadata\":{}}\n\n",
+        ] {
+            let mut inspector = ResponsesSseInspector::with_repeat_guard_and_visibility(
+                false, ResponsesEventVisibility::NativeCodexClient,
+            );
+            assert!(inspector.push_normalized(stream.as_bytes()).is_err());
+        }
     }
 
     #[test]

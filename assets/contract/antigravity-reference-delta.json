@@ -56,112 +56,178 @@
           "id": "reasoning_replay",
           "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
           "files": [
-            {"path": "internal/cache/antigravity_reasoning_replay_cache.go", "sha256": "76498bed74e737f02aa708567942301131ff3c163270a4d575ee31fc87ee452f"},
-            {"path": "internal/runtime/executor/antigravity_reasoning_replay.go", "sha256": "9c62466b0ba8e8435341f127953076406fd302dbf2e90428dc9f752db5381975"}
+            {
+              "path": "internal/cache/antigravity_reasoning_replay_cache.go",
+              "sha256": "76498bed74e737f02aa708567942301131ff3c163270a4d575ee31fc87ee452f"
+            },
+            {
+              "path": "internal/runtime/executor/antigravity_reasoning_replay.go",
+              "sha256": "9c62466b0ba8e8435341f127953076406fd302dbf2e90428dc9f752db5381975"
+            }
           ]
         },
         {
           "id": "schema_subset",
           "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
           "files": [
-            {"path": "internal/runtime/executor/antigravity_executor_request.go", "sha256": "6f3a0e28045944b807ca2cf92c0e503bd15ca9636d8cf6183387c7344aa468a6"},
-            {"path": "internal/util/gemini_schema.go", "sha256": "a824f1f36b0b3b5bbf16e5a629b4f37ba8a67e868645a1a1d7d554b70b0f4f74"}
+            {
+              "path": "internal/runtime/executor/antigravity_executor_request.go",
+              "sha256": "6f3a0e28045944b807ca2cf92c0e503bd15ca9636d8cf6183387c7344aa468a6"
+            },
+            {
+              "path": "internal/util/gemini_schema.go",
+              "sha256": "a824f1f36b0b3b5bbf16e5a629b4f37ba8a67e868645a1a1d7d554b70b0f4f74"
+            }
           ]
         },
         {
           "id": "transport_scope",
           "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
           "files": [
-            {"path": "internal/runtime/executor/antigravity_executor.go", "sha256": "99eb8c72a7c75bbeebde6f483d9926362c4965bbd0eb15b1ac52db523e406116"},
-            {"path": "internal/runtime/executor/antigravity_executor_transport_test.go", "sha256": "735698a04454c70fadcb5c3f996a847ff7d23a9339a73139f4e2eaebe6779e0e"}
+            {
+              "path": "internal/runtime/executor/antigravity_executor.go",
+              "sha256": "99eb8c72a7c75bbeebde6f483d9926362c4965bbd0eb15b1ac52db523e406116"
+            },
+            {
+              "path": "internal/runtime/executor/antigravity_executor_transport_test.go",
+              "sha256": "735698a04454c70fadcb5c3f996a847ff7d23a9339a73139f4e2eaebe6779e0e"
+            }
           ]
         },
         {
           "id": "compaction_risk_only",
           "commit": "70f45604522282965247add17f6cce619876919b",
           "files": [
-            {"path": "internal/runtime/executor/helps/antigravity_compaction.go", "sha256": "7455c7720fb5eb2fa69984bcd168e21bf81627e0ad37cae5450fb30f6d872ef8"},
-            {"path": "internal/runtime/executor/helps/antigravity_compaction_test.go", "sha256": "796a0f5ca125394f4dc9a78d88b156d3f2eaa5af6d1be61ea0d0ae9651c282ee"}
+            {
+              "path": "internal/runtime/executor/helps/antigravity_compaction.go",
+              "sha256": "7455c7720fb5eb2fa69984bcd168e21bf81627e0ad37cae5450fb30f6d872ef8"
+            },
+            {
+              "path": "internal/runtime/executor/helps/antigravity_compaction_test.go",
+              "sha256": "796a0f5ca125394f4dc9a78d88b156d3f2eaa5af6d1be61ea0d0ae9651c282ee"
+            }
           ]
         },
         {
           "id": "grounding_responses_initial",
           "commit": "ef63d2e7fa8adfab8e6b29860e719028567e2226",
           "files": [
-            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go", "sha256": "82de8fda7c185047e0c99bef1c7d9db56a9c311be9d12ebcefa1d1a144a240eb"}
+            {
+              "path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go",
+              "sha256": "82de8fda7c185047e0c99bef1c7d9db56a9c311be9d12ebcefa1d1a144a240eb"
+            }
           ]
         },
         {
           "id": "grounding_responses_stream_order",
           "commit": "7fcbdf8896753d7af60f75c6c20d27bf0473f195",
           "files": [
-            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go", "sha256": "cba60b7f720c84d4b2f208e284927e6adc2e5b0a6225b5b1d5126b5fd6795e1e"}
+            {
+              "path": "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go",
+              "sha256": "cba60b7f720c84d4b2f208e284927e6adc2e5b0a6225b5b1d5126b5fd6795e1e"
+            }
           ]
         },
         {
           "id": "request_model_metadata",
           "commit": "a9e92b81453f1e23eccb2c7a9b6d1669aa733b9b",
           "files": [
-            {"path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go", "sha256": "f10026cec60b5d299f002e9db08e90d2de20b6e26e1bdc48dd8668761b76e2b1"}
+            {
+              "path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go",
+              "sha256": "f10026cec60b5d299f002e9db08e90d2de20b6e26e1bdc48dd8668761b76e2b1"
+            }
           ]
         },
         {
           "id": "mid_session_system_order",
           "commit": "b681a1e0f7b89d26814f788b60bf84feaf72e912",
           "files": [
-            {"path": "internal/translator/common/claude_system.go", "sha256": "ed2e0669c64e32b873de2e9113f2183a96f7ce2e29253a7935a58866ece71174"}
+            {
+              "path": "internal/translator/common/claude_system.go",
+              "sha256": "ed2e0669c64e32b873de2e9113f2183a96f7ce2e29253a7935a58866ece71174"
+            }
           ]
         },
         {
           "id": "orphan_function_output",
           "commit": "8c984672a66ab824f96aace243248ec2a67403d5",
           "files": [
-            {"path": "internal/translator/gemini/openai/responses/gemini_openai-responses_request.go", "sha256": "d112b2b8e1eef9ee1e95af6eb2cb1bbf1a9df65ce5e8293570e98021aeb4f4ad"}
+            {
+              "path": "internal/translator/gemini/openai/responses/gemini_openai-responses_request.go",
+              "sha256": "d112b2b8e1eef9ee1e95af6eb2cb1bbf1a9df65ce5e8293570e98021aeb4f4ad"
+            }
           ]
         },
         {
           "id": "empty_text_part_lifecycle",
           "commit": "fd3e6623761d0d276f5ee6c5dbaf0996d4c6cd3f",
           "files": [
-            {"path": "internal/translator/antigravity/claude/antigravity_claude_response.go", "sha256": "259bcdd33344a17aa8b14557ea97d3c457cce17c3a6652bab395ef732ee4f25a"}
+            {
+              "path": "internal/translator/antigravity/claude/antigravity_claude_response.go",
+              "sha256": "259bcdd33344a17aa8b14557ea97d3c457cce17c3a6652bab395ef732ee4f25a"
+            }
           ]
         },
         {
           "id": "responses_reasoning_summary_visibility",
           "commit": "6dea3dfa13a906a06f575f411d15c41ad032b595",
           "files": [
-            {"path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go", "sha256": "7610fe3db0179d8ccf894f51b9793f9b6096b3fdd5ae73dc6203cc7d14b45b79"}
+            {
+              "path": "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go",
+              "sha256": "7610fe3db0179d8ccf894f51b9793f9b6096b3fdd5ae73dc6203cc7d14b45b79"
+            }
           ]
         },
         {
           "id": "function_response_turn_adjacency",
           "commit": "3de5709db14c43e147025bcc27ae61ff4821fc0d",
           "files": [
-            {"path": "internal/translator/antigravity/claude/antigravity_claude_request.go", "sha256": "c70553dabee6703babf3793a2548641655e12a17edb4a5c5d9359007525bd6bc"},
-            {"path": "internal/translator/common/gemini.go", "sha256": "e53f3bc92e63f58abb363bd89f3e7646d27a08d9edca5a80f98fe91d95dfd994"}
+            {
+              "path": "internal/translator/antigravity/claude/antigravity_claude_request.go",
+              "sha256": "c70553dabee6703babf3793a2548641655e12a17edb4a5c5d9359007525bd6bc"
+            },
+            {
+              "path": "internal/translator/common/gemini.go",
+              "sha256": "e53f3bc92e63f58abb363bd89f3e7646d27a08d9edca5a80f98fe91d95dfd994"
+            }
           ]
         },
         {
           "id": "function_response_json_ref",
           "commit": "5af6cd7582ee7c15d60c8672ea709c6be05c89b2",
           "files": [
-            {"path": "internal/translator/common/gemini.go", "sha256": "4f7eb84fe4c8b29ed9403caf2783ad881951740b85c730975ee6a7fe3b11642f"},
-            {"path": "internal/translator/antigravity/claude/antigravity_claude_request.go", "sha256": "062aa7bb126ab1d3df6eb914d5eed5b6e5813113747cc7481132861bbc7154f0"}
+            {
+              "path": "internal/translator/common/gemini.go",
+              "sha256": "4f7eb84fe4c8b29ed9403caf2783ad881951740b85c730975ee6a7fe3b11642f"
+            },
+            {
+              "path": "internal/translator/antigravity/claude/antigravity_claude_request.go",
+              "sha256": "062aa7bb126ab1d3df6eb914d5eed5b6e5813113747cc7481132861bbc7154f0"
+            }
           ]
         },
         {
           "id": "tool_choice_fail_closed",
           "commit": "49eec664f419f891d365908383a6ef8582433eef",
           "files": [
-            {"path": "internal/translator/gemini/openai/chat-completions/gemini_openai_request.go", "sha256": "5b6470bdda355723e8527218edc75b115b6939700c85950ab73c534c9e7742a4"}
+            {
+              "path": "internal/translator/gemini/openai/chat-completions/gemini_openai_request.go",
+              "sha256": "5b6470bdda355723e8527218edc75b115b6939700c85950ab73c534c9e7742a4"
+            }
           ]
         },
         {
           "id": "tool_call_id_collision_map",
           "commit": "580df95a946b05d9171ced80667bf13cb0b60edf",
           "files": [
-            {"path": "internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go", "sha256": "e36e2e957729eb584b4da8adae2ca7ca827d725b209339e39dd27788699d9141"},
-            {"path": "internal/util/claude_tool_id.go", "sha256": "df45309755d299bc4f6e48a2f8a26b39cadd6b5f92c778304e824a6c936407e3"}
+            {
+              "path": "internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go",
+              "sha256": "e36e2e957729eb584b4da8adae2ca7ca827d725b209339e39dd27788699d9141"
+            },
+            {
+              "path": "internal/util/claude_tool_id.go",
+              "sha256": "df45309755d299bc4f6e48a2f8a26b39cadd6b5f92c778304e824a6c936407e3"
+            }
           ]
         }
       ]
@@ -175,21 +241,30 @@
           "id": "conversation_session",
           "commit": "85fb4fe688997d3a0c2930b7a202cf22f617b092",
           "files": [
-            {"path": "src-tauri/src/proxy/common/session.rs", "sha256": "7c4fb3c753b6c0ba85e7c0e79ed0e5faecc6d786f698f1649506d2e76c0abccc"}
+            {
+              "path": "src-tauri/src/proxy/common/session.rs",
+              "sha256": "7c4fb3c753b6c0ba85e7c0e79ed0e5faecc6d786f698f1649506d2e76c0abccc"
+            }
           ]
         },
         {
           "id": "dynamic_request_type_conflicting_signal",
           "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
           "files": [
-            {"path": "src-tauri/src/proxy/mappers/gemini/wrapper.rs", "sha256": "5c24b5f58fe8dbfe85299369cc33645f1453840c7c05adc57966b2be11681c05"}
+            {
+              "path": "src-tauri/src/proxy/mappers/gemini/wrapper.rs",
+              "sha256": "5c24b5f58fe8dbfe85299369cc33645f1453840c7c05adc57966b2be11681c05"
+            }
           ]
         },
         {
           "id": "claude_billing_metadata",
           "commit": "9fd7798932146aee7eab38e1053843f8a512a2f5",
           "files": [
-            {"path": "src-tauri/src/proxy/mappers/claude/request.rs", "sha256": "57eb5d011d4b8f268baf7a2d0e24cf362017b8861c36bca1fba42290655ad317"}
+            {
+              "path": "src-tauri/src/proxy/mappers/claude/request.rs",
+              "sha256": "57eb5d011d4b8f268baf7a2d0e24cf362017b8861c36bca1fba42290655ad317"
+            }
           ]
         }
       ]
@@ -207,19 +282,37 @@
         "deltaId": "reasoning_replay",
         "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
         "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
-        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
-        "symbols": ["AntigravityReasoningReplaySnapshot", "CacheAntigravityReasoningReplayItemsBestEffort"],
+        "paths": [
+          "internal/cache/antigravity_reasoning_replay_cache.go",
+          "internal/runtime/executor/antigravity_reasoning_replay.go"
+        ],
+        "symbols": [
+          "AntigravityReasoningReplaySnapshot",
+          "CacheAntigravityReasoningReplayItemsBestEffort"
+        ],
         "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-01"],
+      "capabilityIds": [
+        "AG-01"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
         "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
-        "contracts": [{"path": "src/proxy/antigravity_replay.rs", "anchors": ["AntigravityReplayScope", "miss_tombstone_and_snapshot_cas_fence_concurrent_writers"]}],
-        "fixtureIds": ["miss_tombstone_and_snapshot_cas_fence_concurrent_writers"]
+        "contracts": [
+          {
+            "path": "src/proxy/antigravity_replay.rs",
+            "anchors": [
+              "AntigravityReplayScope",
+              "miss_tombstone_and_snapshot_cas_fence_concurrent_writers"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "miss_tombstone_and_snapshot_cas_fence_concurrent_writers"
+        ]
       },
       "reason": "Adopt only generation-fenced, bounded replay semantics under the selected Account and Share binding."
     },
@@ -234,19 +327,37 @@
         "deltaId": "schema_subset",
         "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
         "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
-        "paths": ["internal/runtime/executor/antigravity_executor_request.go", "internal/util/gemini_schema.go"],
-        "symbols": ["sanitizeAntigravityRequestSchemas", "cleanNestedSchema"],
+        "paths": [
+          "internal/runtime/executor/antigravity_executor_request.go",
+          "internal/util/gemini_schema.go"
+        ],
+        "symbols": [
+          "sanitizeAntigravityRequestSchemas",
+          "cleanNestedSchema"
+        ],
         "sourceDigest": "89884e976735923c657f878b3eab93f9fd991588db98268494b2fda8ebe19026"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-03"],
+      "capabilityIds": [
+        "AG-03"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
         "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
-        "contracts": [{"path": "src/proxy/tool_schema.rs", "anchors": ["normalize_antigravity_request_schemas", "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]}],
-        "fixtureIds": ["antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]
+        "contracts": [
+          {
+            "path": "src/proxy/tool_schema.rs",
+            "anchors": [
+              "normalize_antigravity_request_schemas",
+              "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"
+        ]
       },
       "reason": "Adopt the narrow Gemini-compatible schema projection without copying unrelated request mutation."
     },
@@ -261,19 +372,38 @@
         "deltaId": "transport_scope",
         "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
         "tree": "e62788156c2afff0d31391dbd390035ec15168f4",
-        "paths": ["internal/runtime/executor/antigravity_executor.go", "internal/runtime/executor/antigravity_executor_transport_test.go"],
-        "symbols": ["resolveAntigravityPoolSettings", "antigravityTransportKey"],
+        "paths": [
+          "internal/runtime/executor/antigravity_executor.go",
+          "internal/runtime/executor/antigravity_executor_transport_test.go"
+        ],
+        "symbols": [
+          "resolveAntigravityPoolSettings",
+          "antigravityTransportKey"
+        ],
         "sourceDigest": "7795e6619aa29ba3a07eb8c9bcae4e6d8dea3a1e0b3d20ed555e07c4c9ef2afd"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-03"],
+      "capabilityIds": [
+        "AG-03"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
         "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
-        "contracts": [{"path": "src/proxy/antigravity_transport.rs", "anchors": ["AntigravityTransportKey", "cache_key_fences_runtime_account_generation_and_resolved_settings"]}],
-        "fixtureIds": ["cache_key_fences_runtime_account_generation_and_resolved_settings", "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"]
+        "contracts": [
+          {
+            "path": "src/proxy/antigravity_transport.rs",
+            "anchors": [
+              "AntigravityTransportKey",
+              "cache_key_fences_runtime_account_generation_and_resolved_settings"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "cache_key_fences_runtime_account_generation_and_resolved_settings",
+          "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"
+        ]
       },
       "reason": "Adopt an opt-in pool keyed by Provider revision, runtime fingerprint, Account and auth generation."
     },
@@ -288,19 +418,37 @@
         "deltaId": "compaction_risk_only",
         "commit": "70f45604522282965247add17f6cce619876919b",
         "tree": "99e6ae1c29ac8e55bb418a5e4a17415e4e2bd0d6",
-        "paths": ["internal/runtime/executor/helps/antigravity_compaction.go", "internal/runtime/executor/helps/antigravity_compaction_test.go"],
-        "symbols": ["PrepareAntigravityCompactionSummaryPayload", "SealAntigravityCompaction"],
+        "paths": [
+          "internal/runtime/executor/helps/antigravity_compaction.go",
+          "internal/runtime/executor/helps/antigravity_compaction_test.go"
+        ],
+        "symbols": [
+          "PrepareAntigravityCompactionSummaryPayload",
+          "SealAntigravityCompaction"
+        ],
         "sourceDigest": "e5e44269a0753a8e166145ba56f6f9e6dc3a85bf553928631de7fda4e7bc44e2"
       },
       "disposition": "live_gate",
-      "capabilityIds": ["AG-04"],
+      "capabilityIds": [
+        "AG-04"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
         "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
-        "contracts": [{"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]}],
-        "fixtureIds": ["antigravity_compaction_is_fail_closed_without_a_receipt"]
+        "contracts": [
+          {
+            "path": "src/proxy/antigravity_compaction.rs",
+            "anchors": [
+              "Antigravity conversation compaction is disabled pending a verified provider receipt",
+              "antigravity_compaction_is_fail_closed_without_a_receipt"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_compaction_is_fail_closed_without_a_receipt"
+        ]
       },
       "reason": "Reference behavior is not entitlement evidence; runtime remains disabled until a private current-commit receipt exists."
     },
@@ -315,19 +463,36 @@
         "deltaId": "grounding_responses_initial",
         "commit": "ef63d2e7fa8adfab8e6b29860e719028567e2226",
         "tree": "365c07612035534278297848a226c9d0e96dbf46",
-        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"],
-        "symbols": ["ExtractGroundingMetadata", "BuildResponsesWebSearchCallItem"],
+        "paths": [
+          "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"
+        ],
+        "symbols": [
+          "ExtractGroundingMetadata",
+          "BuildResponsesWebSearchCallItem"
+        ],
         "sourceDigest": "92d21762ead9fa8b7e1d8d125cb0a3760eaee7d2069389e655815d3b9e57395b"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N1"],
+      "capabilityIds": [
+        "AG-N1"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/gemini_grounding.rs", "anchors": ["GroundingAccumulator", "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"]}],
-        "fixtureIds": ["citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"]
+        "contracts": [
+          {
+            "path": "src/proxy/gemini_grounding.rs",
+            "anchors": [
+              "GroundingAccumulator",
+              "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks"
+        ]
       },
       "reason": "Adopt grounding metadata as typed citations while keeping raw URLs and titles out of logs and labels."
     },
@@ -342,19 +507,37 @@
         "deltaId": "grounding_responses_stream_order",
         "commit": "7fcbdf8896753d7af60f75c6c20d27bf0473f195",
         "tree": "11d840f47c6c950ea255440530437a11ac781870",
-        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"],
-        "symbols": ["MergeCitationAnnotations", "BuildResponsesURLCitations"],
+        "paths": [
+          "internal/translator/gemini/openai/responses/gemini_openai-responses_web_search.go"
+        ],
+        "symbols": [
+          "MergeCitationAnnotations",
+          "BuildResponsesURLCitations"
+        ],
         "sourceDigest": "62e77f9f2553c1a16704a2ba4656882b1b13c28731cc7ccc72eae2ab9c9f860e"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N1"],
+      "capabilityIds": [
+        "AG-N1"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal"]}],
-        "fixtureIds": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal"]
+        "contracts": [
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal",
+              "gemini_late_grounding_is_emitted_before_anthropic_terminal"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal",
+          "gemini_late_grounding_is_emitted_before_anthropic_terminal"
+        ]
       },
       "reason": "Adopt citation ordering so annotations are emitted before terminal events on every streaming Surface."
     },
@@ -369,19 +552,37 @@
         "deltaId": "request_model_metadata",
         "commit": "a9e92b81453f1e23eccb2c7a9b6d1669aa733b9b",
         "tree": "2b0f832d4ad46025b3e215a942cecd120ea22c9e",
-        "paths": ["internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"],
-        "symbols": ["antigravitySupportsNativeResponsesWebSearch", "requestType"],
+        "paths": [
+          "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"
+        ],
+        "symbols": [
+          "antigravitySupportsNativeResponsesWebSearch",
+          "requestType"
+        ],
         "sourceDigest": "32d07d67981dbb4b73b17087dd860316c59f3ebeee0d211c0d490fb612e0f8ef"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N2"],
+      "capabilityIds": [
+        "AG-N2"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/adapters.rs", "anchors": ["select_antigravity_web_search_model", "antigravity_web_search_model_selection_uses_fresh_per_model_evidence"]}],
-        "fixtureIds": ["antigravity_web_search_model_selection_uses_fresh_per_model_evidence", "gemini_v1internal_rejects_runtime_auth_generation_drift"]
+        "contracts": [
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "select_antigravity_web_search_model",
+              "antigravity_web_search_model_selection_uses_fresh_per_model_evidence"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_web_search_model_selection_uses_fresh_per_model_evidence",
+          "gemini_v1internal_rejects_runtime_auth_generation_drift"
+        ]
       },
       "reason": "Adopt request-scoped catalog capability snapshots and reject Account generation drift before send."
     },
@@ -396,19 +597,36 @@
         "deltaId": "mid_session_system_order",
         "commit": "b681a1e0f7b89d26814f788b60bf84feaf72e912",
         "tree": "83e6f25e48ce8f0021b1da92a51fa1019b081dbd",
-        "paths": ["internal/translator/common/claude_system.go"],
-        "symbols": ["SystemReminderText", "ClaudeMessageSystemReminderText"],
+        "paths": [
+          "internal/translator/common/claude_system.go"
+        ],
+        "symbols": [
+          "SystemReminderText",
+          "ClaudeMessageSystemReminderText"
+        ],
         "sourceDigest": "a264e9d33040dadd0da049cba8557c8115cb208f1b642d7522a1766a62c80e48"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N4"],
+      "capabilityIds": [
+        "AG-N4"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["demoted_system_message", "openai_requests_demote_mid_session_system_messages_without_reordering_them"]}],
-        "fixtureIds": ["openai_requests_demote_mid_session_system_messages_without_reordering_them"]
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "demoted_system_message",
+              "openai_requests_demote_mid_session_system_messages_without_reordering_them"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "openai_requests_demote_mid_session_system_messages_without_reordering_them"
+        ]
       },
       "reason": "Adopt stable reversible system-reminder demotion without reordering conversation turns."
     },
@@ -423,19 +641,36 @@
         "deltaId": "orphan_function_output",
         "commit": "8c984672a66ab824f96aace243248ec2a67403d5",
         "tree": "812ea6134f62585fba9122b6089ebb36660fa95e",
-        "paths": ["internal/translator/gemini/openai/responses/gemini_openai-responses_request.go"],
-        "symbols": ["ConvertOpenAIResponsesRequestToGemini", "functionResponse"],
+        "paths": [
+          "internal/translator/gemini/openai/responses/gemini_openai-responses_request.go"
+        ],
+        "symbols": [
+          "ConvertOpenAIResponsesRequestToGemini",
+          "functionResponse"
+        ],
         "sourceDigest": "70f0a1c600bf7cda4e5feec80037a3a378fa9c20cd66883a01eacf5dfde3a16b"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N4"],
+      "capabilityIds": [
+        "AG-N4"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["cc-switch-server-orphan-tool-output-v1", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]}],
-        "fixtureIds": ["openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "cc-switch-server-orphan-tool-output-v1",
+              "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"
+        ]
       },
       "reason": "Adopt lossless orphan output demotion and never synthesize a false tool-call pairing."
     },
@@ -450,19 +685,35 @@
         "deltaId": "empty_text_part_lifecycle",
         "commit": "fd3e6623761d0d276f5ee6c5dbaf0996d4c6cd3f",
         "tree": "6518d987387dee9bfa8aace025249f5dbb0506d9",
-        "paths": ["internal/translator/antigravity/claude/antigravity_claude_response.go"],
-        "symbols": ["appendFinalEvents", "content_block_stop"],
+        "paths": [
+          "internal/translator/antigravity/claude/antigravity_claude_response.go"
+        ],
+        "symbols": [
+          "appendFinalEvents",
+          "content_block_stop"
+        ],
         "sourceDigest": "7055571f03e66d59b9b3826ff4f5d9a1315ed2f1bc9755cbed2e817227a5efe1"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N5"],
+      "capabilityIds": [
+        "AG-N5"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_empty_text_part_does_not_close_the_active_text_block"]}],
-        "fixtureIds": ["gemini_empty_text_part_does_not_close_the_active_text_block"]
+        "contracts": [
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "gemini_empty_text_part_does_not_close_the_active_text_block"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "gemini_empty_text_part_does_not_close_the_active_text_block"
+        ]
       },
       "reason": "Adopt active-block lifecycle handling so an empty part cannot close a still-live text block."
     },
@@ -477,19 +728,43 @@
         "deltaId": "conversation_session",
         "commit": "85fb4fe688997d3a0c2930b7a202cf22f617b092",
         "tree": "3cadaa4743b0e828b6609ec87bff06325d08f5d6",
-        "paths": ["src-tauri/src/proxy/common/session.rs"],
-        "symbols": ["derive_session_id", "bump_session"],
+        "paths": [
+          "src-tauri/src/proxy/common/session.rs"
+        ],
+        "symbols": [
+          "derive_session_id",
+          "bump_session"
+        ],
         "sourceDigest": "e479d2a7b25d76736a815569c4eb05918f5d2305198507783f6645a720ed73ed"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-02"],
+      "capabilityIds": [
+        "AG-02"
+      ],
       "target": {
         "baselineCommit": "993fca19a6c2d39ccd421d06f0b771f91289be64",
         "baselineTree": "3beddfbe14ef9fb60e07ef75908533ef7edaca6c",
         "implementationCommit": "9c128d21ba7f58d2276e55b238f46690e4489eda",
         "implementationTree": "ff5a94b815242e79c4eda8e7fb9a30e4e34e9443",
-        "contracts": [{"path": "src/proxy/antigravity_replay.rs", "anchors": ["derive_session_id", "session_id_is_conversation_scoped_and_rollover_error_is_exact"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_session_accumulation_rolls_over_once_on_the_same_binding"]}],
-        "fixtureIds": ["session_id_is_conversation_scoped_and_rollover_error_is_exact", "antigravity_session_accumulation_rolls_over_once_on_the_same_binding"]
+        "contracts": [
+          {
+            "path": "src/proxy/antigravity_replay.rs",
+            "anchors": [
+              "derive_session_id",
+              "session_id_is_conversation_scoped_and_rollover_error_is_exact"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "antigravity_session_accumulation_rolls_over_once_on_the_same_binding"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "session_id_is_conversation_scoped_and_rollover_error_is_exact",
+          "antigravity_session_accumulation_rolls_over_once_on_the_same_binding"
+        ]
       },
       "reason": "Adopt conversation-scoped session generations with a single same-binding rollover."
     },
@@ -504,19 +779,35 @@
         "deltaId": "dynamic_request_type_conflicting_signal",
         "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
         "tree": "9f53336b0e106383155a59b0adce0270b7f9a9b9",
-        "paths": ["src-tauri/src/proxy/mappers/gemini/wrapper.rs"],
-        "symbols": ["wrap_request_v2", "config.request_type"],
+        "paths": [
+          "src-tauri/src/proxy/mappers/gemini/wrapper.rs"
+        ],
+        "symbols": [
+          "wrap_request_v2",
+          "config.request_type"
+        ],
         "sourceDigest": "f37332f9cfd46e2b881c028b25e2a43bc024ea407cdbbd51a8ace4e8318d6370"
       },
       "disposition": "differential",
-      "capabilityIds": ["AG-N6"],
+      "capabilityIds": [
+        "AG-N6"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]}],
-        "fixtureIds": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]
+        "contracts": [
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"
+        ]
       },
       "reason": "The reference conflicts with another mature implementation, so no runtime change is allowed without a bound live receipt."
     },
@@ -531,19 +822,36 @@
         "deltaId": "claude_billing_metadata",
         "commit": "9fd7798932146aee7eab38e1053843f8a512a2f5",
         "tree": "51944a5948f744b2b1fe43cf0546b86e5e9315a1",
-        "paths": ["src-tauri/src/proxy/mappers/claude/request.rs"],
-        "symbols": ["is_gemini_client_billing_metadata", "x-anthropic-billing-header"],
+        "paths": [
+          "src-tauri/src/proxy/mappers/claude/request.rs"
+        ],
+        "symbols": [
+          "is_gemini_client_billing_metadata",
+          "x-anthropic-billing-header"
+        ],
         "sourceDigest": "4c3e3848f4095917b61e26d598024f5e8253e0ccf7c03e46093e5f46b2a961e9"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N3"],
+      "capabilityIds": [
+        "AG-N3"
+      ],
       "target": {
         "baselineCommit": "7c9ef354948545d95ac32b399a7e434457b1a577",
         "baselineTree": "c8a33360204f3987cca256d0e0ab0dab436fc19c",
         "implementationCommit": "407a5e3fd8d9e30ff16c30bbac53b85471541be3",
         "implementationTree": "501e297e4b360c50d4e9840a84b09f1d1ea51b5e",
-        "contracts": [{"path": "src/proxy/transforms.rs", "anchors": ["is_anthropic_billing_metadata_block", "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]}],
-        "fixtureIds": ["anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]
+        "contracts": [
+          {
+            "path": "src/proxy/transforms.rs",
+            "anchors": [
+              "is_anthropic_billing_metadata_block",
+              "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"
+        ]
       },
       "reason": "Adopt only the exact standalone billing metadata matcher on Gemini-bound transformations."
     },
@@ -558,19 +866,48 @@
         "deltaId": "reasoning_replay",
         "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
         "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
-        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
-        "symbols": ["AntigravityReasoningReplaySnapshot", "CacheAntigravityReasoningReplayItemsBestEffort"],
+        "paths": [
+          "internal/cache/antigravity_reasoning_replay_cache.go",
+          "internal/runtime/executor/antigravity_reasoning_replay.go"
+        ],
+        "symbols": [
+          "AntigravityReasoningReplaySnapshot",
+          "CacheAntigravityReasoningReplayItemsBestEffort"
+        ],
         "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-01", "AG-02"],
+      "capabilityIds": [
+        "AG-01",
+        "AG-02"
+      ],
       "target": {
         "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
         "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
         "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
         "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
-        "contracts": [{"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "commit_complete_stream", "reasoning_replay_binding_is_current", "apply_session_contract"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}],
-        "fixtureIds": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]
+        "contracts": [
+          {
+            "path": "src/proxy/providers/antigravity/mod.rs",
+            "anchors": [
+              "prepare_reasoning_replay",
+              "commit_complete_stream",
+              "reasoning_replay_binding_is_current",
+              "apply_session_contract"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated",
+              "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated",
+          "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+        ]
       },
       "reason": "Move replay and session orchestration behind the Antigravity Provider boundary without changing wire, terminal or CAS behavior."
     },
@@ -585,19 +922,47 @@
         "deltaId": "transport_scope",
         "commit": "68dd99d56f6867062547f80acf6e2b22f0766b58",
         "tree": "e62788156c2afff0d31391dbd390035ec15168f4",
-        "paths": ["internal/runtime/executor/antigravity_executor.go", "internal/runtime/executor/antigravity_executor_transport_test.go"],
-        "symbols": ["resolveAntigravityPoolSettings", "antigravityTransportKey"],
+        "paths": [
+          "internal/runtime/executor/antigravity_executor.go",
+          "internal/runtime/executor/antigravity_executor_transport_test.go"
+        ],
+        "symbols": [
+          "resolveAntigravityPoolSettings",
+          "antigravityTransportKey"
+        ],
         "sourceDigest": "7795e6619aa29ba3a07eb8c9bcae4e6d8dea3a1e0b3d20ed555e07c4c9ef2afd"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-03"],
+      "capabilityIds": [
+        "AG-03"
+      ],
       "target": {
         "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
         "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
         "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
         "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
-        "contracts": [{"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["record_limit_evidence", "mark_limit_cooldown", "http_client", "limit_retry_source"]}, {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_long_limit_cools_only_the_structured_share_runtime_model", "antigravity_retry_rechecks_identity_generation_before_second_send"]}],
-        "fixtureIds": ["antigravity_long_limit_cools_only_the_structured_share_runtime_model", "antigravity_retry_rechecks_identity_generation_before_second_send"]
+        "contracts": [
+          {
+            "path": "src/proxy/providers/antigravity/mod.rs",
+            "anchors": [
+              "record_limit_evidence",
+              "mark_limit_cooldown",
+              "http_client",
+              "limit_retry_source"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "antigravity_long_limit_cools_only_the_structured_share_runtime_model",
+              "antigravity_retry_rechecks_identity_generation_before_second_send"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "antigravity_long_limit_cools_only_the_structured_share_runtime_model",
+          "antigravity_retry_rechecks_identity_generation_before_second_send"
+        ]
       },
       "reason": "Move transport and structured limit decisions behind the Provider boundary while preserving same-binding recovery."
     },
@@ -612,19 +977,45 @@
         "deltaId": "dynamic_request_type_conflicting_signal",
         "commit": "734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e",
         "tree": "9f53336b0e106383155a59b0adce0270b7f9a9b9",
-        "paths": ["src-tauri/src/proxy/mappers/gemini/wrapper.rs"],
-        "symbols": ["wrap_request_v2", "config.request_type"],
+        "paths": [
+          "src-tauri/src/proxy/mappers/gemini/wrapper.rs"
+        ],
+        "symbols": [
+          "wrap_request_v2",
+          "config.request_type"
+        ],
         "sourceDigest": "f37332f9cfd46e2b881c028b25e2a43bc024ea407cdbbd51a8ace4e8318d6370"
       },
       "disposition": "live_gate",
-      "capabilityIds": ["AG-N6"],
+      "capabilityIds": [
+        "AG-N6"
+      ],
       "target": {
         "baselineCommit": "e9dd5bd91e260715974447d10c70813400e9629a",
         "baselineTree": "9de70bf436aaa320618605855c33d304d7ff8b9a",
         "implementationCommit": "e5bfc3436110e117c6bff644cc9a8cc584195064",
         "implementationTree": "2fa46c7c9c4186815423feb9e97e55542817fdad",
-        "contracts": [{"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\"", "receipt.decisions?.compaction !== \"runtime_disabled\""]}, {"path": "scripts/audit/antigravity-real.test.mjs", "anchors": ["Antigravity real harness keeps Antigravity and Agy receipts independent", "Antigravity real harness rejects a cross-rail receipt"]}],
-        "fixtureIds": ["Antigravity real harness keeps Antigravity and Agy receipts independent", "Antigravity real harness rejects a cross-rail receipt"]
+        "contracts": [
+          {
+            "path": "scripts/smoke/antigravity-real.mjs",
+            "anchors": [
+              "requestTypeDecision?.ordinary !== \"agent\"",
+              "requestTypeDecision?.webSearch !== \"web_search\"",
+              "receipt.decisions?.compaction !== \"runtime_disabled\""
+            ]
+          },
+          {
+            "path": "scripts/audit/antigravity-real.test.mjs",
+            "anchors": [
+              "Antigravity real harness keeps Antigravity and Agy receipts independent",
+              "Antigravity real harness rejects a cross-rail receipt"
+            ]
+          }
+        ],
+        "fixtureIds": [
+          "Antigravity real harness keeps Antigravity and Agy receipts independent",
+          "Antigravity real harness rejects a cross-rail receipt"
+        ]
       },
       "reason": "Add a current-commit private-receipt gate; both rails and compaction remain live_pending without real inputs."
     },
@@ -639,24 +1030,68 @@
         "deltaId": "reasoning_replay",
         "commit": "09a29bd345bc44c473abe7fd07859e32df2ea543",
         "tree": "0b407c0c70c9c2f8a771d5126b028b9afe79bf2a",
-        "paths": ["internal/cache/antigravity_reasoning_replay_cache.go", "internal/runtime/executor/antigravity_reasoning_replay.go"],
-        "symbols": ["AntigravityReasoningReplayCacheMaxBytesPerEntry", "antigravityReasoningReplayAccumulator"],
+        "paths": [
+          "internal/cache/antigravity_reasoning_replay_cache.go",
+          "internal/runtime/executor/antigravity_reasoning_replay.go"
+        ],
+        "symbols": [
+          "AntigravityReasoningReplayCacheMaxBytesPerEntry",
+          "antigravityReasoningReplayAccumulator"
+        ],
         "sourceDigest": "c8c443d1337d45870d7389025128c7c767c2fdb6b189ccfbb9dd249035367cb5"
       },
       "disposition": "differential",
-      "capabilityIds": ["CORE-N2-ANTIGRAVITY"],
+      "capabilityIds": [
+        "CORE-N2-ANTIGRAVITY"
+      ],
       "target": {
         "baselineCommit": "a7c5c91a248657212996ca82e3ebb19738bb3f3a",
         "baselineTree": "a07638e507dee9d8b7aa570d32acbf9c8aadaec0",
         "implementationCommit": "4ad229329fff6d39cd6b859c4e34f05396c4d7b9",
         "implementationTree": "5d22258fa25b8cb22b2ca1c1e7bbb3628ba093a7",
         "contracts": [
-          {"path": "src/proxy/request_memory.rs", "anchors": ["ReasoningReplay", "GroundingCitation", "existing_reservation_can_follow_the_accounted_bytes"]},
-          {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["snapshot.retained_bytes()", "replay_stream_budget_is_sticky_and_releases_on_cancel", "replay_stream_accounting_follows_accumulator_lifetime"]},
-          {"path": "src/proxy/stream_transforms.rs", "anchors": ["retained_antigravity_bytes", "antigravity_transform_reports_buffered_web_search_state"]},
-          {"path": "src/proxy/forwarder.rs", "anchors": ["request_memory_provider_type_for_request", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]}
+          {
+            "path": "src/proxy/request_memory.rs",
+            "anchors": [
+              "ReasoningReplay",
+              "GroundingCitation",
+              "existing_reservation_can_follow_the_accounted_bytes"
+            ]
+          },
+          {
+            "path": "src/proxy/providers/antigravity/mod.rs",
+            "anchors": [
+              "snapshot.retained_bytes()",
+              "replay_stream_budget_is_sticky_and_releases_on_cancel",
+              "replay_stream_accounting_follows_accumulator_lifetime"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "retained_antigravity_bytes",
+              "antigravity_transform_reports_buffered_web_search_state"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "request_memory_provider_type_for_request",
+              "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion",
+              "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies",
+              "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"
+            ]
+          }
         ],
-        "fixtureIds": ["existing_reservation_can_follow_the_accounted_bytes", "replay_stream_budget_is_sticky_and_releases_on_cancel", "replay_stream_accounting_follows_accumulator_lifetime", "antigravity_transform_reports_buffered_web_search_state", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]
+        "fixtureIds": [
+          "existing_reservation_can_follow_the_accounted_bytes",
+          "replay_stream_budget_is_sticky_and_releases_on_cancel",
+          "replay_stream_accounting_follows_accumulator_lifetime",
+          "antigravity_transform_reports_buffered_web_search_state",
+          "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion",
+          "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies",
+          "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"
+        ]
       },
       "reason": "The reference proves bounded replay cache and accumulator state, but not a unified request lifecycle budget. Adopt the bounds as a signal while accounting raw/decoded/normalized bodies, replay clones and accumulators, and grounding/citation bridge state under one sticky Provider-scoped budget."
     },
@@ -671,22 +1106,43 @@
         "deltaId": "responses_reasoning_summary_visibility",
         "commit": "6dea3dfa13a906a06f575f411d15c41ad032b595",
         "tree": "2179b71e67167bcaa7690611227242ece8b31854",
-        "paths": ["internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"],
-        "symbols": ["enableAntigravityResponsesThinkingSummary", "includeThoughts"],
+        "paths": [
+          "internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go"
+        ],
+        "symbols": [
+          "enableAntigravityResponsesThinkingSummary",
+          "includeThoughts"
+        ],
         "sourceDigest": "fb67a899653924e8a8fa930f05bf64eedec87926551acb24e28912a962f21a0b"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N7"],
+      "capabilityIds": [
+        "AG-N7"
+      ],
       "target": {
         "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
         "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
         "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
         "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
         "contracts": [
-          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["apply_responses_reasoning_summary", "responses_reasoning_summary_is_independent_from_reasoning_effort"]},
-          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]}
+          {
+            "path": "src/proxy/providers/antigravity/wire.rs",
+            "anchors": [
+              "apply_responses_reasoning_summary",
+              "responses_reasoning_summary_is_independent_from_reasoning_effort"
+            ]
+          },
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"
+            ]
+          }
         ],
-        "fixtureIds": ["responses_reasoning_summary_is_independent_from_reasoning_effort", "antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]
+        "fixtureIds": [
+          "responses_reasoning_summary_is_independent_from_reasoning_effort",
+          "antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"
+        ]
       },
       "reason": "Adopt separate Responses reasoning-effort and summary-visibility semantics so explicit none/null suppress visible thoughts without disabling the thinking budget."
     },
@@ -701,22 +1157,45 @@
         "deltaId": "function_response_turn_adjacency",
         "commit": "3de5709db14c43e147025bcc27ae61ff4821fc0d",
         "tree": "077d21fe871b53b8756eda4ed21faff7fd30c6f5",
-        "paths": ["internal/translator/antigravity/claude/antigravity_claude_request.go", "internal/translator/common/gemini.go"],
-        "symbols": ["SplitGeminiFunctionResponseTurns", "ContentHasGeminiFunctionResponse"],
+        "paths": [
+          "internal/translator/antigravity/claude/antigravity_claude_request.go",
+          "internal/translator/common/gemini.go"
+        ],
+        "symbols": [
+          "SplitGeminiFunctionResponseTurns",
+          "ContentHasGeminiFunctionResponse"
+        ],
         "sourceDigest": "0ef5cb3f37e40087eb05d44f835c0ac048b666b1437c7829a904ae0dfab664dc"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N8"],
+      "capabilityIds": [
+        "AG-N8"
+      ],
       "target": {
         "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
         "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
         "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
         "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
         "contracts": [
-          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["preserve_function_response_adjacency", "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"]},
-          {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_replay_mixed_continuation_request", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+          {
+            "path": "src/proxy/providers/antigravity/wire.rs",
+            "anchors": [
+              "preserve_function_response_adjacency",
+              "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "antigravity_replay_mixed_continuation_request",
+              "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+            ]
+          }
         ],
-        "fixtureIds": ["wire_normalization_preserves_adjacency_refs_and_collision_safe_ids", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]
+        "fixtureIds": [
+          "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids",
+          "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+        ]
       },
       "reason": "Adopt request-local function response splitting and ordering so matched results immediately follow their model calls while text and media retain their relative order."
     },
@@ -731,22 +1210,45 @@
         "deltaId": "function_response_json_ref",
         "commit": "5af6cd7582ee7c15d60c8672ea709c6be05c89b2",
         "tree": "9714002384412502cb391a995c578b2c78dd4493",
-        "paths": ["internal/translator/common/gemini.go", "internal/translator/antigravity/claude/antigravity_claude_request.go"],
-        "symbols": ["ContainsJSONRef", "SetGeminiFunctionResponseResult"],
+        "paths": [
+          "internal/translator/common/gemini.go",
+          "internal/translator/antigravity/claude/antigravity_claude_request.go"
+        ],
+        "symbols": [
+          "ContainsJSONRef",
+          "SetGeminiFunctionResponseResult"
+        ],
         "sourceDigest": "9a48fb6cc86c96c20d6bc61555a7cec57f8e4989118f27ed17f1cd0b17b0eb60"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N9"],
+      "capabilityIds": [
+        "AG-N9"
+      ],
       "target": {
         "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
         "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
         "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
         "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
         "contracts": [
-          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["stringify_ref_function_responses", "contains_string_json_ref", "wire_normalization_rejects_name_collisions_and_preserves_decoys"]},
-          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]}
+          {
+            "path": "src/proxy/providers/antigravity/wire.rs",
+            "anchors": [
+              "stringify_ref_function_responses",
+              "contains_string_json_ref",
+              "wire_normalization_rejects_name_collisions_and_preserves_decoys"
+            ]
+          },
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"
+            ]
+          }
         ],
-        "fixtureIds": ["wire_normalization_rejects_name_collisions_and_preserves_decoys", "antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]
+        "fixtureIds": [
+          "wire_normalization_rejects_name_collisions_and_preserves_decoys",
+          "antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"
+        ]
       },
       "reason": "Adopt bounded recursive $ref detection only at Gemini functionResponse response boundaries and encode matching results as opaque JSON strings."
     },
@@ -761,22 +1263,46 @@
         "deltaId": "tool_choice_fail_closed",
         "commit": "49eec664f419f891d365908383a6ef8582433eef",
         "tree": "5fd4028f5d852ac1143b4a6f1db5ec53d2650628",
-        "paths": ["internal/translator/gemini/openai/chat-completions/gemini_openai_request.go"],
-        "symbols": ["tool_choice mapping", "Unrecognized tool_choice type: fail-closed"],
+        "paths": [
+          "internal/translator/gemini/openai/chat-completions/gemini_openai_request.go"
+        ],
+        "symbols": [
+          "tool_choice mapping",
+          "Unrecognized tool_choice type: fail-closed"
+        ],
         "sourceDigest": "7d9aa583ee3f0e7041e472d81140943365fd5f4e50c59ec21cf2aa1842123e1a"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N10"],
+      "capabilityIds": [
+        "AG-N10"
+      ],
       "target": {
         "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
         "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
         "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
         "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
         "contracts": [
-          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["validate_source_tool_choice", "validate_gemini_tool_choice", "source_tool_choice_rejects_unknown_empty_and_undeclared_names"]},
-          {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]}
+          {
+            "path": "src/proxy/providers/antigravity/wire.rs",
+            "anchors": [
+              "validate_source_tool_choice",
+              "validate_gemini_tool_choice",
+              "source_tool_choice_rejects_unknown_empty_and_undeclared_names"
+            ]
+          },
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_unknown_tool_choice_fails_before_wire_finalization",
+              "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"
+            ]
+          }
         ],
-        "fixtureIds": ["source_tool_choice_rejects_unknown_empty_and_undeclared_names", "antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]
+        "fixtureIds": [
+          "source_tool_choice_rejects_unknown_empty_and_undeclared_names",
+          "antigravity_unknown_tool_choice_fails_before_wire_finalization",
+          "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"
+        ]
       },
       "reason": "Adopt a stricter boundary than the reference fallback: malformed, unknown, empty, undeclared, or colliding tool restrictions return 400 and never silently widen to auto."
     },
@@ -791,22 +1317,47 @@
         "deltaId": "tool_call_id_collision_map",
         "commit": "580df95a946b05d9171ced80667bf13cb0b60edf",
         "tree": "a2e2b10e26602aba454af6a1debede8e6cfd24cc",
-        "paths": ["internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go", "internal/util/claude_tool_id.go"],
-        "symbols": ["SanitizeClaudeToolID", "usedToolCallIDs", "turnToolResponses[call.rawID]"],
+        "paths": [
+          "internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go",
+          "internal/util/claude_tool_id.go"
+        ],
+        "symbols": [
+          "SanitizeClaudeToolID",
+          "usedToolCallIDs",
+          "turnToolResponses[call.rawID]"
+        ],
         "sourceDigest": "f7d34e4a4777fe139bc8d094a5f2be20fd24e9df62b668d4e285d6c71b41bb55"
       },
       "disposition": "adopt",
-      "capabilityIds": ["AG-N11"],
+      "capabilityIds": [
+        "AG-N11"
+      ],
       "target": {
         "baselineCommit": "8b81555425b1f0e32577f568e81de3324b3623e7",
         "baselineTree": "f5e125ce8daa706c3ba4f19130708b7e6d7da0b4",
         "implementationCommit": "aeeaf1a61e20d8e55c0569c67894fb31dfd54feb",
         "implementationTree": "80784c56b02fd565dae0795463d24861397fba60",
         "contracts": [
-          {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["normalize_tool_call_ids", "response_binding_candidates", "wire_normalization_uses_only_unique_compatibility_ids"]},
-          {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["Antigravity replay produced invalid JSON", "wire::normalize_wire_request"]}
+          {
+            "path": "src/proxy/providers/antigravity/wire.rs",
+            "anchors": [
+              "normalize_tool_call_ids",
+              "response_binding_candidates",
+              "wire_normalization_uses_only_unique_compatibility_ids"
+            ]
+          },
+          {
+            "path": "src/proxy/providers/antigravity/mod.rs",
+            "anchors": [
+              "Antigravity replay produced invalid JSON",
+              "wire::normalize_wire_request"
+            ]
+          }
         ],
-        "fixtureIds": ["wire_normalization_preserves_adjacency_refs_and_collision_safe_ids", "wire_normalization_uses_only_unique_compatibility_ids"]
+        "fixtureIds": [
+          "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids",
+          "wire_normalization_uses_only_unique_compatibility_ids"
+        ]
       },
       "reason": "Adopt a request-scoped raw-to-wire ID map with deterministic collision suffixes, raw-first result lookup, unique-only compatibility matching, and a second pass after replay restoration."
     }
@@ -816,29 +1367,100 @@
       "id": "AG-01",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/antigravity_replay.rs", "anchors": ["AntigravityReplayScope", "miss_tombstone_and_snapshot_cas_fence_concurrent_writers", "inserts_parallel_signed_calls_before_tool_results", "expired_snapshot_cannot_delete_newer_value"]},
-        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "commit_complete_stream", "reasoning_replay_binding_is_current"]},
-        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+        {
+          "path": "src/proxy/antigravity_replay.rs",
+          "anchors": [
+            "AntigravityReplayScope",
+            "miss_tombstone_and_snapshot_cas_fence_concurrent_writers",
+            "inserts_parallel_signed_calls_before_tool_results",
+            "expired_snapshot_cannot_delete_newer_value"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/antigravity/mod.rs",
+          "anchors": [
+            "prepare_reasoning_replay",
+            "commit_complete_stream",
+            "reasoning_replay_binding_is_current"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated",
+            "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+          ]
+        }
       ]
     },
     {
       "id": "AG-02",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/antigravity_replay.rs", "anchors": ["derive_session_id", "is_session_accumulation_error", "session_id_is_conversation_scoped_and_rollover_error_is_exact"]},
-        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["apply_session_contract", "session_rollover_source"]},
-        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_session_accumulation_rolls_over_once_on_the_same_binding", "antigravity_session_contract_skips_count_tokens_and_web_search"]}
+        {
+          "path": "src/proxy/antigravity_replay.rs",
+          "anchors": [
+            "derive_session_id",
+            "is_session_accumulation_error",
+            "session_id_is_conversation_scoped_and_rollover_error_is_exact"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/antigravity/mod.rs",
+          "anchors": [
+            "apply_session_contract",
+            "session_rollover_source"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "antigravity_session_accumulation_rolls_over_once_on_the_same_binding",
+            "antigravity_session_contract_skips_count_tokens_and_web_search"
+          ]
+        }
       ]
     },
     {
       "id": "AG-03",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/tool_schema.rs", "anchors": ["normalize_antigravity_request_schemas", "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"]},
-        {"path": "src/proxy/antigravity_transport.rs", "anchors": ["defaults_to_short_connections_and_bounds_pool_settings", "cache_key_fences_runtime_account_generation_and_resolved_settings", "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"]},
-        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["record_limit_evidence", "mark_limit_cooldown", "http_client"]},
-        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_retry_after_is_rounded_up_bounded_and_preserves_upstream", "antigravity_long_limit_cools_only_the_structured_share_runtime_model"]},
-        {"path": "src/clients/oauth/quota.rs", "anchors": ["antigravity_missing_family_and_non_model_capacity_remain_unknown"]}
+        {
+          "path": "src/proxy/tool_schema.rs",
+          "anchors": [
+            "normalize_antigravity_request_schemas",
+            "antigravity_response_schema_resolves_refs_projects_unions_and_is_idempotent"
+          ]
+        },
+        {
+          "path": "src/proxy/antigravity_transport.rs",
+          "anchors": [
+            "defaults_to_short_connections_and_bounds_pool_settings",
+            "cache_key_fences_runtime_account_generation_and_resolved_settings",
+            "short_mode_rotates_connections_while_opt_in_pool_reuses_http11"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/antigravity/mod.rs",
+          "anchors": [
+            "record_limit_evidence",
+            "mark_limit_cooldown",
+            "http_client"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "antigravity_retry_after_is_rounded_up_bounded_and_preserves_upstream",
+            "antigravity_long_limit_cools_only_the_structured_share_runtime_model"
+          ]
+        },
+        {
+          "path": "src/clients/oauth/quota.rs",
+          "anchors": [
+            "antigravity_missing_family_and_non_model_capacity_remain_unknown"
+          ]
+        }
       ]
     },
     {
@@ -846,47 +1468,116 @@
       "status": "live_pending",
       "runtimeEnabled": false,
       "contracts": [
-        {"path": "src/proxy/antigravity_compaction.rs", "anchors": ["Antigravity conversation compaction is disabled pending a verified provider receipt", "antigravity_compaction_is_fail_closed_without_a_receipt"]},
-        {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["receipt.decisions?.compaction !== \"runtime_disabled\""]}
+        {
+          "path": "src/proxy/antigravity_compaction.rs",
+          "anchors": [
+            "Antigravity conversation compaction is disabled pending a verified provider receipt",
+            "antigravity_compaction_is_fail_closed_without_a_receipt"
+          ]
+        },
+        {
+          "path": "scripts/smoke/antigravity-real.mjs",
+          "anchors": [
+            "receipt.decisions?.compaction !== \"runtime_disabled\""
+          ]
+        }
       ]
     },
     {
       "id": "AG-N1",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/gemini_grounding.rs", "anchors": ["GroundingAccumulator", "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks", "citation_ranges_can_span_incremental_mappings"]},
-        {"path": "src/proxy/transforms.rs", "anchors": ["gemini_grounding_maps_to_all_snapshot_surfaces_with_scalar_offsets"]},
-        {"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal", "gemini_late_grounding_is_emitted_before_anthropic_terminal", "gemini_responses_late_grounding_buffers_until_search_precedes_text", "gemini_expected_search_without_grounding_flushes_at_terminal"]}
+        {
+          "path": "src/proxy/gemini_grounding.rs",
+          "anchors": [
+            "GroundingAccumulator",
+            "citations_use_unicode_scalar_offsets_and_ignore_bad_or_duplicate_chunks",
+            "citation_ranges_can_span_incremental_mappings"
+          ]
+        },
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "gemini_grounding_maps_to_all_snapshot_surfaces_with_scalar_offsets"
+          ]
+        },
+        {
+          "path": "src/proxy/stream_transforms.rs",
+          "anchors": [
+            "gemini_grounding_stream_emits_search_citations_and_completed_annotations_before_terminal",
+            "gemini_late_grounding_is_emitted_before_anthropic_terminal",
+            "gemini_responses_late_grounding_buffers_until_search_precedes_text",
+            "gemini_expected_search_without_grounding_flushes_at_terminal"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N2",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/clients/oauth/antigravity_models.rs", "anchors": ["supports_web_search", "web_search_capability_accepts_trusted_aliases_and_rejects_conflicts"]},
-        {"path": "src/domain/accounts/capability_evidence.rs", "anchors": ["antigravity_model_search_dimension", "antigravity_model_search_dimensions_are_canonical_and_bounded"]},
-        {"path": "src/proxy/adapters.rs", "anchors": ["select_antigravity_web_search_model", "antigravity_web_search_model_selection_uses_fresh_per_model_evidence", "gemini_v1internal_rejects_runtime_auth_generation_drift"]}
+        {
+          "path": "src/clients/oauth/antigravity_models.rs",
+          "anchors": [
+            "supports_web_search",
+            "web_search_capability_accepts_trusted_aliases_and_rejects_conflicts"
+          ]
+        },
+        {
+          "path": "src/domain/accounts/capability_evidence.rs",
+          "anchors": [
+            "antigravity_model_search_dimension",
+            "antigravity_model_search_dimensions_are_canonical_and_bounded"
+          ]
+        },
+        {
+          "path": "src/proxy/adapters.rs",
+          "anchors": [
+            "select_antigravity_web_search_model",
+            "antigravity_web_search_model_selection_uses_fresh_per_model_evidence",
+            "gemini_v1internal_rejects_runtime_auth_generation_drift"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N3",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/transforms.rs", "anchors": ["is_anthropic_billing_metadata_block", "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"]}
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "is_anthropic_billing_metadata_block",
+            "anthropic_billing_metadata_filter_is_block_scoped_and_shared_with_gemini"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N4",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/transforms.rs", "anchors": ["demoted_system_message", "cc-switch-server-orphan-tool-output-v1", "openai_requests_demote_mid_session_system_messages_without_reordering_them", "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"]}
+        {
+          "path": "src/proxy/transforms.rs",
+          "anchors": [
+            "demoted_system_message",
+            "cc-switch-server-orphan-tool-output-v1",
+            "openai_requests_demote_mid_session_system_messages_without_reordering_them",
+            "openai_responses_to_anthropic_demotes_orphan_and_mismatched_results_to_user_text"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N5",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/stream_transforms.rs", "anchors": ["gemini_empty_text_part_does_not_close_the_active_text_block"]}
+        {
+          "path": "src/proxy/stream_transforms.rs",
+          "anchors": [
+            "gemini_empty_text_part_does_not_close_the_active_text_block"
+          ]
+        }
       ]
     },
     {
@@ -894,58 +1585,158 @@
       "status": "live_pending",
       "runtimeChange": false,
       "contracts": [
-        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"]},
-        {"path": "scripts/smoke/antigravity-real.mjs", "anchors": ["requestTypeDecision?.ordinary !== \"agent\"", "requestTypeDecision?.webSearch !== \"web_search\""]}
+        {
+          "path": "src/proxy/adapters.rs",
+          "anchors": [
+            "antigravity_request_type_matrix_keeps_current_wire_without_live_receipt"
+          ]
+        },
+        {
+          "path": "scripts/smoke/antigravity-real.mjs",
+          "anchors": [
+            "requestTypeDecision?.ordinary !== \"agent\"",
+            "requestTypeDecision?.webSearch !== \"web_search\""
+          ]
+        }
       ]
     },
     {
       "id": "AG-N7",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["apply_responses_reasoning_summary", "responses_reasoning_summary_is_independent_from_reasoning_effort"]},
-        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"]}
+        {
+          "path": "src/proxy/providers/antigravity/wire.rs",
+          "anchors": [
+            "apply_responses_reasoning_summary",
+            "responses_reasoning_summary_is_independent_from_reasoning_effort"
+          ]
+        },
+        {
+          "path": "src/proxy/adapters.rs",
+          "anchors": [
+            "antigravity_responses_reasoning_summary_controls_visibility_without_disabling_effort"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N8",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["preserve_function_response_adjacency", "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"]},
-        {"path": "src/proxy/forwarder.rs", "anchors": ["antigravity_replay_mixed_continuation_request", "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"]}
+        {
+          "path": "src/proxy/providers/antigravity/wire.rs",
+          "anchors": [
+            "preserve_function_response_adjacency",
+            "wire_normalization_preserves_adjacency_refs_and_collision_safe_ids"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "antigravity_replay_mixed_continuation_request",
+            "antigravity_stream_commits_replay_at_terminal_before_upstream_eof"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N9",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["stringify_ref_function_responses", "contains_string_json_ref", "wire_normalization_rejects_name_collisions_and_preserves_decoys"]},
-        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"]}
+        {
+          "path": "src/proxy/providers/antigravity/wire.rs",
+          "anchors": [
+            "stringify_ref_function_responses",
+            "contains_string_json_ref",
+            "wire_normalization_rejects_name_collisions_and_preserves_decoys"
+          ]
+        },
+        {
+          "path": "src/proxy/adapters.rs",
+          "anchors": [
+            "antigravity_claude_tool_results_are_normalized_at_the_final_wire_boundary"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N10",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["validate_source_tool_choice", "validate_gemini_tool_choice", "source_tool_choice_rejects_unknown_empty_and_undeclared_names"]},
-        {"path": "src/proxy/adapters.rs", "anchors": ["antigravity_unknown_tool_choice_fails_before_wire_finalization", "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"]}
+        {
+          "path": "src/proxy/providers/antigravity/wire.rs",
+          "anchors": [
+            "validate_source_tool_choice",
+            "validate_gemini_tool_choice",
+            "source_tool_choice_rejects_unknown_empty_and_undeclared_names"
+          ]
+        },
+        {
+          "path": "src/proxy/adapters.rs",
+          "anchors": [
+            "antigravity_unknown_tool_choice_fails_before_wire_finalization",
+            "antigravity_gemini_tool_choice_fails_closed_at_the_final_wire_boundary"
+          ]
+        }
       ]
     },
     {
       "id": "AG-N11",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/providers/antigravity/wire.rs", "anchors": ["normalize_tool_call_ids", "response_binding_candidates", "wire_normalization_uses_only_unique_compatibility_ids"]},
-        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["Antigravity replay produced invalid JSON", "wire::normalize_wire_request"]}
+        {
+          "path": "src/proxy/providers/antigravity/wire.rs",
+          "anchors": [
+            "normalize_tool_call_ids",
+            "response_binding_candidates",
+            "wire_normalization_uses_only_unique_compatibility_ids"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/antigravity/mod.rs",
+          "anchors": [
+            "Antigravity replay produced invalid JSON",
+            "wire::normalize_wire_request"
+          ]
+        }
       ]
     },
     {
       "id": "CORE-N2-ANTIGRAVITY",
       "status": "fixture_verified",
       "contracts": [
-        {"path": "src/proxy/request_memory.rs", "anchors": ["ReasoningReplay", "GroundingCitation", "retained_json_bytes"]},
-        {"path": "src/proxy/providers/antigravity/mod.rs", "anchors": ["prepare_reasoning_replay", "ReplayStreamWrite", "replay_stream_budget_is_sticky_and_releases_on_cancel"]},
-        {"path": "src/proxy/stream_transforms.rs", "anchors": ["retained_antigravity_bytes", "antigravity_transform_reports_buffered_web_search_state"]},
-        {"path": "src/proxy/forwarder.rs", "anchors": ["request_memory_provider_type_for_request", "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion", "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies", "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"]}
+        {
+          "path": "src/proxy/request_memory.rs",
+          "anchors": [
+            "ReasoningReplay",
+            "GroundingCitation",
+            "retained_json_bytes"
+          ]
+        },
+        {
+          "path": "src/proxy/providers/antigravity/mod.rs",
+          "anchors": [
+            "prepare_reasoning_replay",
+            "ReplayStreamWrite",
+            "replay_stream_budget_is_sticky_and_releases_on_cancel"
+          ]
+        },
+        {
+          "path": "src/proxy/stream_transforms.rs",
+          "anchors": [
+            "retained_antigravity_bytes",
+            "antigravity_transform_reports_buffered_web_search_state"
+          ]
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "anchors": [
+            "request_memory_provider_type_for_request",
+            "antigravity_share_and_pinned_provider_test_fail_before_network_on_memory_exhaustion",
+            "antigravity_request_memory_combines_raw_decoded_and_normalized_bodies",
+            "antigravity_grounding_state_exhaustion_terminates_stream_without_retry"
+          ]
+        }
       ]
     }
   ],
@@ -987,10 +1778,22 @@
       "mixed_tools_request"
     ],
     "rails": [
-      {"rail": "antigravity_oauth", "status": "live_pending", "receipt": null},
-      {"rail": "agy_oauth", "status": "live_pending", "receipt": null}
+      {
+        "rail": "antigravity_oauth",
+        "status": "live_pending",
+        "receipt": null
+      },
+      {
+        "rail": "agy_oauth",
+        "status": "live_pending",
+        "receipt": null
+      }
     ],
-    "compaction": {"status": "live_pending", "runtimeEnabled": false, "receipt": null}
+    "compaction": {
+      "status": "live_pending",
+      "runtimeEnabled": false,
+      "receipt": null
+    }
   },
   "realAcceptanceExtensions": [
     {
@@ -1002,12 +1805,296 @@
       "catalogMaxAgeMs": 7200000,
       "receiptMaxAgeMs": 86400000,
       "clockSkewMs": 300000,
-      "catalogSnapshotFields": ["app", "model", "source", "stale", "fetchedAtMs", "digest"],
+      "catalogSnapshotFields": [
+        "app",
+        "model",
+        "source",
+        "stale",
+        "fetchedAtMs",
+        "digest"
+      ],
       "rails": [
-        {"rail": "antigravity_oauth", "status": "live_pending", "receipt": null},
-        {"rail": "agy_oauth", "status": "live_pending", "receipt": null}
+        {
+          "rail": "antigravity_oauth",
+          "status": "live_pending",
+          "receipt": null
+        },
+        {
+          "rail": "agy_oauth",
+          "status": "live_pending",
+          "receipt": null
+        }
       ],
       "compactionAutoEnable": false
+    }
+  ],
+  "r4Reviews": [
+    {
+      "id": "R4-AG-01",
+      "reviewedAt": "2026-10-27T08:58:46Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "liveAcceptance": "live_pending",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "readMode": "read_only_committed_git_objects",
+          "files": [
+            {
+              "path": "sdk/cliproxy/antigravity_models.go",
+              "sha256": "9ad205cb67f5ff349fa851e0d96b08dd4ff8e893edb5b7e6dce72254f0a4421b"
+            },
+            {
+              "path": "sdk/cliproxy/antigravity_models_version_test.go",
+              "sha256": "7ffb8d67a0a79c755f56412f138741f9c3164cb7fc94fbc8542020eab8bc6bb7"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/domain/antigravity_identity.rs",
+            "anchors": [
+              "antigravity_r4_identity_rotates_only_after_successful_effective_version_changes",
+              "antigravity_r4_configured_version_and_restart_cannot_relabel_old_generations"
+            ]
+          },
+          {
+            "path": "src/clients/oauth/antigravity_models.rs",
+            "anchors": [
+              "antigravity_r4_late_old_client_cannot_publish_into_new_generation",
+              "antigravity_r4_catalog_snapshot_stale_and_empty_are_exactly_scoped"
+            ]
+          },
+          {
+            "path": "src/domain/accounts/capability_evidence.rs",
+            "anchors": [
+              "antigravity_r4_unversioned_catalog_evidence_cannot_authorize_current_client",
+              "antigravity_r4_persisted_evidence_is_superseded_after_client_change"
+            ]
+          },
+          {
+            "path": "src/api/providers.rs",
+            "anchors": [
+              "antigravity_r4_publication_fences_client_changes_and_persisted_observations"
+            ]
+          },
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_r4_search_consumes_only_the_captured_client_generation"
+            ]
+          },
+          {
+            "path": "src/proxy/outbound_identity.rs",
+            "anchors": [
+              "antigravity_r4_outbound_headers_keep_the_captured_client_generation"
+            ]
+          }
+        ]
+      },
+      "notes": [
+        "Adapt the captured UA/cache/publication principle from CLIProxyAPI delta 02e9e85204052dfed9bf73b7075c7b414111a4b3; retain the target strict Bearer/token/incarnation/rail/project/endpoint fences.",
+        "Persist version, full UA and opaque process generation on catalog/capacity observations; version changes, A-B-A and restart supersede old or unversioned catalog evidence.",
+        "No cross-version stale fallback: network/408/429/5xx may use only the exact captured identity cache. Successful empty catalogs remain authoritative; stale reads never refresh durable evidence.",
+        "ProviderExecution pins capability selection and inference headers to one identity; old capacity errors and catalog responses cannot publish as current-client observations."
+      ],
+      "validationScope": {
+        "execution": "isolated_working_tree_snapshot",
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "providerSlices": [
+          "Claude",
+          "Qoder",
+          "Antigravity"
+        ],
+        "excludedConcurrentChanges": "in-progress Share Market changes; state.rs includes only the ten Antigravity hunks",
+        "targetedAntigravityTests": 14,
+        "liveAcceptance": "live_pending"
+      }
+    },
+    {
+      "id": "R4-AG-02",
+      "reviewedAt": "2026-10-27T08:58:46Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "adapt",
+      "liveAcceptance": "live_pending",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "readMode": "read_only_committed_git_objects",
+          "files": [
+            {
+              "path": "internal/cache/antigravity_reasoning_replay_cache.go",
+              "sha256": "2a62f2282130f0c87819b8b00bc4f56555ca8c06038db2f7bd1a968d323ad83a"
+            },
+            {
+              "path": "internal/cache/antigravity_reasoning_replay_cache_test.go",
+              "sha256": "a3a1f9b48b0e03916e603ac7373008620b8a8ae243dc08ad01c0303c015d4818"
+            },
+            {
+              "path": "internal/runtime/executor/antigravity_reasoning_replay.go",
+              "sha256": "515dd543227bc9183944d004f07d190e364ec679e4fed44c18ee096493830dae"
+            },
+            {
+              "path": "internal/runtime/executor/antigravity_reasoning_replay_test.go",
+              "sha256": "84a83ff209bcf1fc580dac3fe30e08a718394de1a2ca901c75df53763f4bd64c"
+            },
+            {
+              "path": "internal/runtime/executor/antigravity_issue6825_test.go",
+              "sha256": "93ecf1ca9435bc8528f20d804cb8b5077c1527adba964547edd35cd3721eedbe"
+            }
+          ]
+        },
+        {
+          "sourceId": "antigravity_manager",
+          "snapshotCommit": "b601f5e7375343343922ccab5e50653bc3450c3b",
+          "snapshotTree": "9211a067165c376775c98ecf3d522b5562380ffa",
+          "readMode": "read_only_committed_git_objects",
+          "files": [
+            {
+              "path": "src-tauri/src/proxy/pipeline/mod.rs",
+              "sha256": "02f80a0ec6f81feea64c90f559a4b293db1f71c48ebf54ebade5e07b7543cda4"
+            },
+            {
+              "path": "src-tauri/src/proxy/pipeline/policy.rs",
+              "sha256": "500ecab7f64b95de26119c6cbcebc17c59e4aca6dc4ae2f44d1c00b5cd1a4f1b"
+            },
+            {
+              "path": "src-tauri/src/proxy/pipeline/inbound.rs",
+              "sha256": "5d8dcb5dd39a26f1f0b3588ba411f2d1a89955181be443ea77f1c846f8ecb62c"
+            },
+            {
+              "path": "src-tauri/src/proxy/pipeline/usage.rs",
+              "sha256": "3e965ebd5df66df7a89612e4fa6717a96cefe284a691f7a00551fa236e3fba85"
+            },
+            {
+              "path": "src-tauri/src/proxy/pipeline/auto_heal.rs",
+              "sha256": "f56ca4fbb461e017e4577145e6466508e09ec271fd48652f37cba616ed0a2950"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/proxy/antigravity_replay.rs",
+            "anchors": [
+              "antigravity_r4_preceding_signed_thought_survives_existing_unsigned_calls"
+            ]
+          },
+          {
+            "path": "src/proxy/forwarder.rs",
+            "anchors": [
+              "antigravity_r4_two_turn_final_wire_preserves_preceding_signature",
+              "antigravity_non_stream_reasoning_replay_is_session_scoped_and_cas_invalidated"
+            ]
+          },
+          {
+            "path": "src/proxy/stream_transforms.rs",
+            "anchors": [
+              "antigravity_r4_stream_distinct_calls_keep_global_tool_identity",
+              "gemini_anthropic_tracks_same_name_idless_tools_and_merges_nested_arguments",
+              "antigravity_r4_stream_same_explicit_id_keeps_argument_fragments"
+            ]
+          },
+          {
+            "path": "assets/contract/antigravity-r4-wire-delta.json",
+            "anchors": [
+              "expectedFunctionCalls",
+              "call_text_call",
+              "local_fixture_expectations"
+            ]
+          }
+        ]
+      },
+      "notes": [
+        "Read-only executor tests at 80aa2b1d17a6abe07d9ade3d12a53af73c055bd2 and da21f1e58ed5551426bd41f12db9d655e146415a motivated complete two-turn target HTTP fixtures; external source was not executed.",
+        "Confirmed missing preceding thought/carrier signature when client retains unsigned calls but omits reasoning. Repair only the first matching call; preserve existing signatures and history/caller/account-generation gates.",
+        "Confirmed three distinct explicit IDs at repeated stream-local part positions collapse to one call. Separate explicit identities and keep dense global downstream indexes. Repeated same-ID fragments and existing idless argument-fragment semantics remain compatible.",
+        "Idless complete-call versus partial-fragment ambiguity requires independent wire evidence before changing the existing merge contract.",
+        "Manager pipeline module roles were reviewed. Do not adopt auto_heal prompt injection, a second generation, stitched terminal/usage behavior, or replace the target IR. Compact and model live gates remain unchanged."
+      ],
+      "validationScope": {
+        "execution": "isolated_working_tree_snapshot",
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "providerSlices": [
+          "Claude",
+          "Qoder",
+          "Antigravity"
+        ],
+        "excludedConcurrentChanges": "in-progress Share Market changes; state.rs includes only the ten Antigravity hunks",
+        "targetedAntigravityTests": 14,
+        "liveAcceptance": "live_pending"
+      }
+    },
+    {
+      "id": "R4-CL-02-DELEGATED",
+      "reviewedAt": "2026-10-27T08:58:46Z",
+      "status": "working_tree_fixture_verified",
+      "decision": "keep_delegated_contract",
+      "liveAcceptance": "live_pending",
+      "sources": [
+        {
+          "sourceId": "cliproxyapi",
+          "snapshotCommit": "1f917e77c4562623aa49e9804d999524151a2f96",
+          "snapshotTree": "00273ce1709eac116a12932c5337ed41a9d449f6",
+          "readMode": "read_only_committed_git_objects",
+          "files": [
+            {
+              "path": "internal/runtime/executor/helps/claude_tool_choice.go",
+              "sha256": "d998d6c9ef908467a1ef1e7db40c94ee428dce227a03d573b5c4fc8a8e8ec8d2"
+            }
+          ]
+        }
+      ],
+      "target": {
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "implementationCommit": null,
+        "readMode": "working_tree",
+        "contracts": [
+          {
+            "path": "src/proxy/adapters.rs",
+            "anchors": [
+              "antigravity_r4_delegated_claude_keeps_its_gemini_tool_contract"
+            ]
+          },
+          {
+            "path": "docs/provider/antigravity-oauth.md",
+            "anchors": [
+              "Claude 模型委托",
+              "真实目录"
+            ]
+          }
+        ]
+      },
+      "notes": [
+        "The reference helper expressly limits native Claude 5.5 tool-choice rewriting to provider=claude and leaves delegated providers to their own contracts.",
+        "Both Antigravity OAuth rails retain final Gemini ANY/named/NONE, declarations and thinking budget for the reviewed delegated fixture. Do not inherit native Claude OAuth rejection or silently downgrade required to AUTO.",
+        "This is a wire-preservation differential, not evidence of Antigravity Opus 5.5 entitlement or real acceptance. Unknown models and compaction are not enabled."
+      ],
+      "validationScope": {
+        "execution": "isolated_working_tree_snapshot",
+        "baselineCommit": "e5b9e83ad488448473ad604fb855fbe28dd5f456",
+        "providerSlices": [
+          "Claude",
+          "Qoder",
+          "Antigravity"
+        ],
+        "excludedConcurrentChanges": "in-progress Share Market changes; state.rs includes only the ten Antigravity hunks",
+        "targetedAntigravityTests": 14,
+        "liveAcceptance": "live_pending"
+      }
     }
   ]
 }

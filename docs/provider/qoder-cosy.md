@@ -59,7 +59,7 @@ Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发�
 - 工具调用 `index` 另有独立校验：OpenAI Chat `delta.tool_calls[]`、直接进入非流聚合器的工具分片，以及兼容的工具事件外层索引，缺失时沿用原有位置/0；显式提供时必须是可解析的非负整数且小于 128。`null`、非法字符串、负数或越界值不能被回退为 0 或数组位置，以免把不同工具分片合并。数值及数字字符串的合法索引仍可用；此项不推断新的 COSY wire。
 - 工具调用 ID 是不透明身份：非空 ID 在 Chat/兼容工具事件规范化时保留原始字符串，包括首尾空白；只有全空白 ID 按原有缺失规则处理。非流聚合器对同一工具索引的后续 ID 仍做精确比较，不能把 `" call-a "` 与 `"call-a"` 合并。工具名称的既有兼容裁剪不变；这只修本地身份保真，不证明上游会发送带空白 ID。
 - 同一工具调用的兼容别名也必须一致：`id`、`tool_call_id`、`call_id` 是同一不透明身份，`function.name`、`name`、`tool_name` 是同一工具名。并存的非空值若冲突，或显式值不是字符串/null，在转发前固定以本地协议错误拒绝；相同别名及单一别名继续可用，ID 不因名称裁剪规则而去掉首尾空白。此项不扩展 COSY wire，仅防止兼容归一化静默改写工具身份。
-- 历史工具调用只在当前 assistant batch 内关联：missing/duplicate call id 确定性修复，未知历史工具及其结果成对过滤，orphan/重复 result 丢弃，parallel result 按调用顺序输出；result 缺 id 时仅在唯一未消费 call 场景推断，多义输入直接 400，不猜测也不跨 batch 绑定。
+- 历史工具调用只在当前 assistant batch 内关联：missing/duplicate call id 确定性修复，未知历史工具及其结果成对过滤，orphan/重复 result 丢弃，parallel result 按调用顺序输出；result 缺 id 时仅在唯一未消费 call 场景推断，多义输入直接 400，不猜测也不跨 batch 绑定。历史名称匹配使用当前完整声明与既有 continuation 身份，不受 `tool_choice=none` 或指定其他函数影响；当前出站 `tools` 仍按选择限制。Gemini 的声明名称在 `allowedFunctionNames` 过滤前捕获为内部元数据，并计入请求预算；客户端 JSON 中的同名字段不能注入该集合。
 - authoritative finish reason 或上游 `[DONE]` 只标记候选终态，不能单靠 `[DONE]` 把空心跳、空 delta 或内容缺结束理由的流洗成成功。decoder 仅转发有文本、reasoning、工具、usage 或明确结束理由的规范 chunk；已有有意义内容的 Anthropic `message_stop` 可生成对应 `stop`/`tool_calls`，原生 Chat 缺结束理由仍失败。decoder 必须继续读取到上游 EOF，期间第二个 terminal、任何业务数据或 auth error 都失败；只有有效输出、明确结束理由和 EOF 全部验证通过后才向下游输出唯一一次完成事件。非流聚合也不把仅 `[DONE]` 补成空 `stop`。
 - 流格式转换器可能从上游的候选 `finish_reason` 提前生成下游完成事件，因此 Qoder 专属流会暂存候选终态开始的输出；之前的正文仍可流出，暂存计入同一请求内存预算。唯一终态、EOF、身份和转换均通过后才交付最终事件，并在最终 chunk 交付前记录成功账务。客户端取得最终 chunk 后立即断连不反记为取消；Codex Responses 别名在同一交付边界已发布，可直接续接。候选终态后错误不能先泄漏成功事件，终态前取消也不发布别名；不据此开启断连后的后台上游收集。
 - decoder 和非流 Chat 聚合器一旦在 `push` 拒绝任何数据，后续空块、其他数据与 `finish` 都保持失败；decoder 的完成状态也不再可见。第一次错误仍保留原有上游/本地协议分类，之后只返回固定的本地协议错误，避免已拒绝的终态后数据被最终聚合洗白。
@@ -111,3 +111,18 @@ CORE-N2 精确启用 `qoder_cosy`：Global OAuth、Global PAT、CN OAuth 和 Cla
 升级 Global 或 CN CLI 时必须保持以下顺序：先冻结包名、版本、npm integrity 与 bundle digest；再从不可变官方包独立提取稳定 wire，并用只读第二来源交叉核对；随后先更新 oracle 和使旧合同失败的 mutation，再改 Rust；最后重新生成合同映射与 coverage，运行离线和 loopback 门禁。任何 rail 都只能由自身独立 receipt 从 `live_pending` 提升。
 
 外部仓库和 npm bundle 永远不是构建或运行时依赖。禁止在缺少独立 digest 的情况下让 fixture 与 Rust 同步“自洽”更新，禁止跨站复用包证据，也禁止用一条 rail 的真实成功外推另一条 rail。精确阶段与禁止项由 `qoder-reference-delta.json` 固定并由审计脚本校验。
+
+## R4 工具身份与待补证能力（2026-10-27）
+
+共享 Responses bridge 以 `(kind, namespace, original_name)` 区分活动身份。两个声明压平后同名，或与 custom、tool_search、内部模拟工具名称冲突时，Chat/Anthropic 转换在发网前返回本地 400，Grok 兼容入口返回 422 协议不兼容；完全相同身份的重复声明沿用兼容行为。指定工具必须匹配当前声明及 kind，完整历史不增加选择权限。合法退役历史的名称独立分配，预留活动、内部和裸历史名称，排序分配 ASCII、最多 64 字节的别名；需要 hash 时按原始组件分别编码，避免 `a/b__c` 与 `a__b/c` 再次混淆。该表只服务输入历史，保留字节纳入预算，不参与响应回映或未来调用授权；原生无需转换的 Responses 保持其 wire。
+
+只有直接输入项中的 `additional_tools` 和成功或未标状态的 `tool_search_output` 可沿既有发现合同增加声明。`tools=[]` 或 `null` 明确重置后，历史发现不再激活工具；参数、工具结果及普通内容中的同形 JSON 不作为声明。正常动态发现、namespace JSON/SSE 回映继续沿共享活动身份表处理。
+
+R4-QD-01 已修复“工具仍声明，仅因本轮选择不同而删除历史”的分支。完全撤销声明的完整历史仍有接受性差异：TokenRouter 的 Qoder payload 转换不按当前声明筛选，目标继续保留未知历史过滤门槛，直到对应站点/rail 的真实回执证明接受。`assets/contract/qoder-r4-history-delta.json` 冻结 Responses→Chat→COSY 的最终 payload 投影；它区分实际目标 fixture 与只读参考源码观察，没有执行外仓 payload，也不代表真实上游接受退役历史。
+
+R4-QD-02 暂不开放 CN PAT。TokenRouter `d15137eb59d4d85bdc27ae563c37fcf9b0edebcd` 的 CN 标准 `QODER_PAT` 路径为 CN OpenAPI `POST /api/v1/jobToken/exchange`、JSON `personal_token`，随后读取 userinfo 并完成 CN Gateway auth-status；它还保留 OpenAPI token/refresh/expiry，与 Global PAT 的会话建立方式不同。参考采用 1.24.2 身份组合，不能覆盖本仓已冻结的官方 1.1.32 device/refresh oracle。后续须先独立冻结官方 CN PAT 包、integrity/bundle digest、交换及刷新/用户/状态/quota/目录的 wire，再新增独立 Registry rail、导入与持久化/轮换合同、身份 fencing、离线 mutation 和私有 receipt；企业 `PERSONAL_TOKEN`、组织/AK-SK 不随此扩展。
+
+本轮参考只读取冻结提交对象；根 AGENTS 要求的 project-doc 与 code-comments 已加载用于只读核对。新 R4 证据追加在 `qoder-reference-delta.json.r4Reviews`，不改历史 snapshot/observation 或官方 oracle 的基线计数。三条已有 rail 的真实状态继续分别为 `live_pending`，CN PAT 也不能由其中任一条替代验收。用户禁止的 UI 自动化与部署测试不在本轮检查范围。
+
+
+CORE-03统一计时见增强计划§20.10.6：COSY send/headers/read与既有同账号恢复分attempt观察；canonical文本/推理/实际工具字段可记首内容，usage、角色、空值和终止原因单独不算内容。终态仍需唯一终态及EOF，取消/失败和末次Bytes owner释放独立；HTTP只记录body handoff。计时不改变用量、站点/rail、历史筛选、续接及恢复门禁，三rail真实验收继续live_pending。

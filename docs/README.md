@@ -42,6 +42,7 @@
 | [regression-matrix.json](provider/regression-matrix.json) | 数据 | 矩阵**真值来源**；`MATRIX_PATH` 默认值，被 `scripts/smoke/code-agent-matrix-summary.mjs`、`scripts/smoke/code-agent-regression.sh`、`scripts/static-checks.sh` 与 `scripts/release-readiness.sh` 消费 |
 | [transform-coverage.md](provider/transform-coverage.md) | 权威 | 跨协议 transform 覆盖 |
 | [claude-oauth.md](provider/claude-oauth.md) | 权威 | Claude OAuth 单账号反代 |
+| [antigravity-oauth.md](provider/antigravity-oauth.md) | 权威 | Antigravity/Agy 固定绑定、客户端版本目录证据、签名回放与委托工具合同 |
 | [codex-oauth.md](provider/codex-oauth.md) | 权威 | Codex OAuth 单账号反代 |
 | [grok-oauth.md](provider/grok-oauth.md) | 权威 | Grok OAuth 单账号反代 |
 | [kiro-prompt-cache.md](provider/kiro-prompt-cache.md) | 权威 | Kiro Prompt Caching 语义、usage 来源与 SQLite 持久化边界 |
