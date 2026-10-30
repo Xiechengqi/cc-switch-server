@@ -8,6 +8,19 @@ const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROVIDER_MEDIA_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+pub(in crate::api) async fn provider_bundle_share_preflight(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<crate::domain::sharing::credential_source::BundleSharePreflight>, ApiError> {
+    require_session(&state, &headers).await?;
+    state
+        .provider_bundle_share_preflight(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Provider Bundle not found"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::api) struct ProviderInferenceTestRequest {
@@ -228,6 +241,57 @@ pub(in crate::api) async fn update_provider_bundle(
         .map_err(ApiError::internal)?
         .map_err(map_provider_command_error)?;
     Ok(Json(ProviderBundleResponse { ok: true, bundle }))
+}
+
+pub(in crate::api) async fn rebind_custom_provider_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<RebindCustomProviderBundleRequest>,
+) -> Result<Json<ProviderBundleRebindResponse>, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    if input.bundle.id != id {
+        return Err(ApiError::bad_request(
+            "Provider Bundle id in body must match resource path",
+        ));
+    }
+    rebind_custom_provider_bundle_action(&state, input)
+        .await
+        .map(Json)
+}
+
+pub(in crate::api) async fn rebind_custom_provider_bundle_action(
+    state: &ServerState,
+    input: RebindCustomProviderBundleRequest,
+) -> Result<ProviderBundleRebindResponse, ApiError> {
+    let mode = input.mode;
+    let (preview, bundle) = match mode {
+        ProviderActionMode::Preview => (
+            state
+                .preview_rebind_custom_provider_bundle_command(input.bundle)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?,
+            None,
+        ),
+        ProviderActionMode::Apply => {
+            let token = required_provider_action_preview_token(input.preview_token)?;
+            let preview = state
+                .apply_rebind_custom_provider_bundle_command(input.bundle, token)
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(map_provider_command_error)?;
+            let bundle = Some(preview.target.clone());
+            (preview, bundle)
+        }
+    };
+    Ok(ProviderBundleRebindResponse {
+        ok: true,
+        mode,
+        preview,
+        bundle,
+    })
 }
 
 pub(in crate::api) async fn delete_provider_bundle(

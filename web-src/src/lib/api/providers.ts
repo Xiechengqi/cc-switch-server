@@ -358,6 +358,23 @@ export interface ProviderBundleReferencePreview {
   blocked: boolean;
 }
 
+export interface ProviderBundleRebindPreview {
+  previewToken: string;
+  bundleId: string;
+  sourceRevision: number;
+  target: ProviderBundleView;
+  changes: Array<{
+    app: CoreProviderApp;
+    before: ProviderCustomBinding;
+    after: ProviderCustomBinding;
+  }>;
+  runtimes: Partial<Record<CoreProviderApp, {
+    beforeFingerprint: string | null;
+    afterFingerprint: string | null;
+  }>>;
+  shareIds: string[];
+}
+
 export type ProviderCredentialPatch =
   | { action: "keep" }
   | { action: "replace"; value: string }
@@ -398,6 +415,24 @@ export const providersApi = {
 
   async getBundles(): Promise<ProviderBundleView[]> {
     return await invokeCommand("get_provider_bundles");
+  },
+
+  async getBundle(id: string): Promise<ProviderBundleView> {
+    return await invokeCommand("get_provider_bundle", { id }, { cache: "no-store" });
+  },
+
+  async previewBundleRebind(bundle: ProviderBundleWriteDraft): Promise<ProviderBundleRebindPreview> {
+    const response = await invokeCommand<{ preview: ProviderBundleRebindPreview }>(
+      "rebind_custom_provider_bundle", { mode: "preview", bundle }, { cache: "no-store" },
+    );
+    return response.preview;
+  },
+
+  async applyBundleRebind(bundle: ProviderBundleWriteDraft, previewToken: string): Promise<ProviderBundleView> {
+    const response = await invokeCommand<{ bundle: ProviderBundleView }>(
+      "rebind_custom_provider_bundle", { mode: "apply", bundle, previewToken }, { cache: "no-store" },
+    );
+    return response.bundle;
   },
 
   async updateBundleSortOrder(updates: ProviderSortUpdate[]): Promise<boolean> {

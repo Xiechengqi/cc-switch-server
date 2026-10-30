@@ -9,6 +9,15 @@ export type ShareBindings = Partial<
   Record<"claude" | "codex" | "gemini", string>
 >;
 
+export type BundleSharePreflight = {
+  bundleId: string;
+  bundleRevision: number;
+  enabledApps: Array<keyof ShareBindings>;
+  canShare: boolean;
+  reason?: "source_unverifiable" | "credential_mismatch" | "endpoint_mismatch" | "auth_mismatch" | "no_enabled_apps" | "resolution_failed";
+  message?: string;
+};
+
 export type ShareTokenPeriod =
   "lifetime" | "day" | "week" | "sevenDays" | "calendarMonth" | "thirtyDays" | "accountReset";
 
@@ -698,6 +707,8 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 export const shareApi = {
   previewAccountReset: (shareId: string, expectedConfigRevision: number, policies?: Record<string, ShareUserPolicy>) =>
     invokeCommand<AccountResetPreview>("preview_share_account_reset", { shareId, expectedConfigRevision, policies }),
+  preflightProviderBundleShare: (bundleId: string) =>
+    invokeCommand<BundleSharePreflight>("get_provider_bundle_share_preflight", { bundleId }, { cache: "no-store" }),
   create,
   listReuseCandidates,
   addBinding,

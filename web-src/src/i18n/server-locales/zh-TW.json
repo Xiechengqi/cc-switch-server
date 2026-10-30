@@ -396,6 +396,21 @@
     }
   },
   "providerBundle": {
+    "sharePreflight": {
+      "source_unverifiable": "無法驗證多個 App 使用同一憑據來源。請檢查服務位址、驗證方式和 Key；無法確認同源時，請拆分為獨立供應商。",
+      "credential_mismatch": "多個 App 的 Key 或附加驗證資訊不一致，無法合併分享。請統一憑據，或拆分為獨立供應商。",
+      "endpoint_mismatch": "多個 App 的上游服務或租戶路徑不一致，無法合併分享。請核對服務位址。",
+      "auth_mismatch": "多個 App 的驗證載體不一致，無法確認使用同一憑據來源。請核對驗證方式及欄位。",
+      "no_enabled_apps": "請至少啟用一個 App 後再開啟分享。",
+      "resolution_failed": "暫時無法驗證供應商憑據來源。請檢查伺服器狀態後重試。"
+    },
+    "rebindTitle": "確認修改協議與驗證方式",
+    "rebindConfirm": "確認並儲存",
+    "rebindShares": "關聯分享：{{count}} 個。儲存後，新請求將使用新設定。",
+    "shareSaveFailed": "供應商已儲存，但分享設定儲存失敗：{{error}}。可保留目前頁面重試。",
+    "saveUncertainReadBack": "未收到儲存結果，已回查伺服器設定，目前填寫內容已保留。請核對後重試；若提示版本衝突，請先保留輸入，再重新開啟供應商確認最新設定。",
+    "saveUncertain": "無法確認儲存結果，且未能讀取最新設定。目前填寫內容已保留，請恢復連線並核對伺服器狀態後重試。",
+    "saveConflict": "設定或預覽已發生變化，請重新整理核對後再次儲存：{{error}}",
     "apiKey": "API Key",
     "apiUrlUnavailable": "尚未設定 API 位址",
     "appFilterAll": "全部 App",

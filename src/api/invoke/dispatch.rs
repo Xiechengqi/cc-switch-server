@@ -333,6 +333,12 @@ async fn web_invoke_dispatch(
                 .map_err(map_provider_command_error)?;
             Ok(json!(bundle))
         }
+        "rebind_custom_provider_bundle" => {
+            require_provider_write_contract(state, headers)?;
+            let input: RebindCustomProviderBundleRequest =
+                serde_json::from_value(args.clone()).map_err(ApiError::bad_request)?;
+            Ok(json!(rebind_custom_provider_bundle_action(state, input).await?))
+        }
         "delete_provider_bundle" => {
             require_provider_write_contract(state, headers)?;
             let id = web_arg_string_any(&args, &["id", "bundleId"])?;
@@ -839,6 +845,12 @@ async fn web_invoke_dispatch(
             let operator = share_usage_operator(state, headers).await;
             let share = Box::pin(web_save_provider_share(state, &args, operator)).await?;
             Ok(json!(share))
+        }
+        "get_provider_bundle_share_preflight" => {
+            let id = web_arg_string_any(&args, &["id", "bundleId"])?;
+            let preflight = state.provider_bundle_share_preflight(&id).await
+                .ok_or_else(|| ApiError::not_found("Provider Bundle not found"))?;
+            Ok(json!(preflight))
         }
         "save_provider_bundle_share" => {
             let operator = share_usage_operator(state, headers).await;

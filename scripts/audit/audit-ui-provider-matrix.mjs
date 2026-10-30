@@ -28,6 +28,10 @@ const files = {
     repoRoot,
     "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx",
   ),
+  providerBundleSave: path.join(
+    repoRoot,
+    "web-src/src/server/providers/bundles/bundleSave.ts",
+  ),
   familyPicker: path.join(
     repoRoot,
     "web-src/src/server/providers/bundles/FamilyPicker.tsx",
@@ -154,6 +158,7 @@ function audit() {
   const providerRegistryModule = read(files.providerRegistryModule);
   const providerBundlePage = read(files.providerBundlePage);
   const providerBundleEditor = read(files.providerBundleEditor);
+  const providerBundleSave = read(files.providerBundleSave);
   const familyPicker = read(files.familyPicker);
   const providerBundleCard = read(files.providerBundleCard);
   const providerMeta = read(files.providerMeta);
@@ -202,7 +207,10 @@ function audit() {
     [familyPicker, "filterFamilies(providerRegistry.families", "Registry-backed family picker"],
     [providerBundleEditor, "<FamilyPicker", "Bundle family selection"],
     [providerBundleEditor, "createDraftForSelectedFamily", "Registry-backed bundle draft"],
-    [providerBundleEditor, "toProviderBundleWriteDraft", "typed bundle writer"],
+    [providerBundleEditor, "prepareBundleProviderSave", "Bundle save orchestration"],
+    [providerBundleSave, "toProviderBundleWriteDraft", "typed bundle writer"],
+    [providerBundleSave, "previewBundleRebind", "Custom Bundle rebind preview"],
+    [providerBundleSave, "applyBundleRebind", "Custom Bundle rebind apply"],
     [providerBundlePage, "<ProviderBundleEditor", "Bundle editor route"],
     [providerBundlePage, "<ProviderBundleCard", "Bundle card route"],
   ]) {

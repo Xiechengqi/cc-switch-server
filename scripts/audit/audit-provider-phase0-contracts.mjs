@@ -675,6 +675,7 @@ const writerSourcePaths = Object.freeze([
   "src/infra/backup.rs",
   "src/infra/credentials.rs",
   "src/state.rs",
+  "src/state/provider_bundle.rs",
 ]);
 
 function workingTreeSources(paths) {
@@ -791,6 +792,38 @@ function buildWriterInventory() {
         [
           "src/api/invoke/dispatch.rs::update_providers_sort_order",
           "src/domain/providers/store.rs::update_sort_order",
+        ],
+      ),
+      writer(
+        "bundle-upsert",
+        "src/api/providers.rs::create_provider_bundle|update_provider_bundle|src/api/invoke/dispatch.rs::upsert_provider_bundle",
+        "REST and Web runtime saves validate complete typed Bundle drafts and commit all Surfaces through one coordinator; ordinary updates reject binding changes, and creation retries preserve request identity and content checks",
+        "retain provider_commands::upsert_provider_bundle over the shared commit coordinator",
+        "phase-3",
+        "closed",
+        "a Bundle writer could split Surface revisions, accept an implicit protocol/auth rebind, or overwrite concurrent edits",
+        [
+          "src/api/providers.rs::create_provider_bundle",
+          "src/api/providers.rs::update_provider_bundle",
+          "src/api/invoke/dispatch.rs::upsert_provider_bundle",
+          "src/state/provider_bundle.rs::upsert_provider_bundle_command",
+          "src/state/provider_bundle.rs::apply_bundle_candidate",
+        ],
+      ),
+      writer(
+        "bundle-rebind-custom",
+        "src/api/providers.rs::rebind_custom_provider_bundle|src/api/invoke/dispatch.rs::rebind_custom_provider_bundle",
+        "requires the Provider write contract and an existing Custom Bundle; read-only preview binds the full draft and reference revisions to an HMAC token, and apply validates it inside one atomic Provider commit while returning only redacted views",
+        "retain provider_commands::preview_rebind_custom_provider_bundle|apply_rebind_custom_provider_bundle",
+        "phase-3",
+        "closed",
+        "a rebind could bypass identity protection, expose credentials, apply a stale preview, or partially update multi-App runtime bindings",
+        [
+          "src/api/providers.rs::rebind_custom_provider_bundle_action",
+          "src/api/invoke/dispatch.rs::rebind_custom_provider_bundle",
+          "src/state/provider_bundle.rs::preview_rebind_custom_provider_bundle_command",
+          "src/state/provider_bundle.rs::apply_rebind_custom_provider_bundle_command",
+          "src/state/provider_bundle.rs::validate_provider_action_preview_token",
         ],
       ),
       writer(
@@ -1297,6 +1330,8 @@ export function validatePhase0Contracts(contracts) {
     "universal-startup-migration",
     "model-discovery-merge",
     "invoke-sort",
+    "bundle-upsert",
+    "bundle-rebind-custom",
     "bundle-sort",
     "rest-import",
     "rest-preset-create",

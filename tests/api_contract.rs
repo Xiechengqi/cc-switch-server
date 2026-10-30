@@ -8856,6 +8856,1040 @@ async fn disabled_custom_bundle_surfaces_do_not_require_credentials_or_runtime_p
 }
 
 #[tokio::test]
+async fn custom_bundle_rebind_is_previewed_atomic_and_persistent() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let draft = custom_rebind_bundle_draft("custom-rebind");
+    for attempt in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/provider-bundles",
+                draft.clone(),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "create attempt {attempt}: {body}");
+        assert_eq!(body["bundle"]["revision"], 1);
+    }
+    for field in ["name", "credential"] {
+        let mut replay = draft.clone();
+        if field == "name" {
+            replay["name"] = json!("Different request content");
+        } else {
+            replay["surfaces"][1]["credentialPatches"]["/settingsConfig/apiKey"]["value"] =
+                json!("different-custom-secret");
+        }
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/provider-bundles",
+                replay,
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(response).await["code"],
+            "cc_switch_provider_idempotency_conflict"
+        );
+    }
+    state
+        .mutate_shares_immediate(|shares| {
+            let mut input =
+                test_share_input("custom-rebind-share", "custom-rebind", ProviderType::Codex);
+            input.enabled = Some(false);
+            input.user_grants = serde_json::from_value(json!({"friend@example.com": {
+                "email":"friend@example.com", "revision":3,
+                "policy":{"tokenLimit":10000,"parallelLimit":2},
+                "usage":{"lifetime":{"tokensUsed":42,"requestsCount":2}}
+            }}))
+            .unwrap();
+            shares.upsert(input).unwrap();
+        })
+        .await
+        .unwrap();
+    let share_before = state
+        .mutate_shares(|shares| shares.get("custom-rebind-share").cloned().unwrap())
+        .await;
+    let mut changed = custom_rebind_bundle_update("custom-rebind");
+    changed["surfaces"][0]["customBinding"]["authScheme"] = json!("api_key");
+    changed["surfaces"][1]["customBinding"]["authScheme"] = json!("custom_header");
+    changed["surfaces"][1]["driverOptions"] = json!({"apiKeyField":"x-vendor-key"});
+    changed["surfaces"][1]["endpoint"] = json!("https://changed.example/v1");
+    let ordinary = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/provider-bundles/custom-rebind",
+            changed.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(ordinary).await["code"],
+        "cc_switch_provider_bundle_custom_binding_conflict"
+    );
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/custom-rebind/rebind-custom",
+            json!({"mode":"preview","bundle":changed}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await["preview"].clone();
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 2);
+    assert_eq!(preview["shareIds"], json!(["custom-rebind-share"]));
+    assert_eq!(
+        preview["runtimes"]["claude"]["afterFingerprint"],
+        Value::Null
+    );
+    assert_ne!(
+        preview["runtimes"]["codex"]["beforeFingerprint"],
+        preview["runtimes"]["codex"]["afterFingerprint"]
+    );
+    assert!(!preview.to_string().contains("original-custom-secret"));
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|p| p.resource.revision == 1));
+    state
+        .mutate_shares(|shares| {
+            let share = shares
+                .shares
+                .iter_mut()
+                .find(|share| share.id == "custom-rebind-share")
+                .unwrap();
+            share.tokens_used += 7;
+            share.requests_count += 1;
+        })
+        .await;
+    let applied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/rebind_custom_provider_bundle",
+            json!({"mode":"apply","bundle":changed,"previewToken":preview["previewToken"]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), StatusCode::OK);
+    let applied = json_body(applied).await;
+    assert_eq!(applied["bundle"]["revision"], 2);
+    assert_eq!(
+        applied["bundle"]["surfaces"]["codex"]["provider"]["meta"]["apiFormat"],
+        "openai_chat"
+    );
+    assert_eq!(
+        applied["bundle"]["surfaces"]["codex"]["provider"]["meta"]["apiKeyField"],
+        "x-vendor-key"
+    );
+    let providers = providers_snapshot(&state).await;
+    assert!(providers.providers.iter().all(|p| p.resource.revision == 2));
+    let codex = providers
+        .providers
+        .iter()
+        .find(|p| p.app == AppKind::Codex)
+        .unwrap();
+    assert_eq!(codex.resource.credential_generation, 1);
+    let key = cc_switch_server::domain::providers::registry::ProviderKey::new(
+        AppKind::Codex,
+        "custom-rebind",
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .reveal_provider_credential_command(&key, "/settingsConfig/apiKey")
+            .await
+            .unwrap()
+            .unwrap(),
+        "original-custom-secret"
+    );
+    let share_after = state
+        .mutate_shares(|shares| shares.get("custom-rebind-share").cloned().unwrap())
+        .await;
+    // Provider commits may refresh capacity projections; grants and usage stay intact.
+    assert_eq!(
+        serde_json::to_value(&share_before.user_grants).unwrap(),
+        serde_json::to_value(&share_after.user_grants).unwrap()
+    );
+    assert_eq!(share_before.id, share_after.id);
+    assert_eq!(share_after.tokens_used, share_before.tokens_used + 7);
+    assert_eq!(share_after.requests_count, share_before.requests_count + 1);
+
+    let mut rotated = changed.clone();
+    rotated["expectedRevision"] = json!(2);
+    rotated["surfaces"][1]["customBinding"]["authScheme"] = json!("bearer");
+    rotated["surfaces"][1]["driverOptions"] = json!({});
+    rotated["surfaces"][1]["extraHeaders"] = json!(["x-vendor-extra"]);
+    rotated["surfaces"][1]["credentialPatches"] = json!({
+        "/settingsConfig/apiKey":{"action":"replace","value":"rotated-custom-secret"},
+        "/settingsConfig/extraHeaders/x-vendor-extra":{"action":"replace","value":"vendor-header-secret"}
+    });
+    let preview = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/custom-rebind/rebind-custom",
+            json!({"mode":"preview","bundle":rotated}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    let status = preview.status();
+    let body = json_body(preview).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let preview = body["preview"].clone();
+    for secret in ["rotated-custom-secret", "vendor-header-secret"] {
+        assert!(!preview.to_string().contains(secret));
+    }
+    for attempt in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/provider-bundles/custom-rebind/rebind-custom",
+                json!({"mode":"apply","bundle":rotated,"previewToken":preview["previewToken"]}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if attempt == 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+    }
+    let providers = providers_snapshot(&state).await;
+    assert!(providers.providers.iter().all(|p| p.resource.revision == 3));
+    assert_eq!(
+        providers
+            .providers
+            .iter()
+            .find(|p| p.app == AppKind::Codex)
+            .unwrap()
+            .resource
+            .credential_generation,
+        2
+    );
+    let config_dir = state.config_dir.clone();
+    cc_switch_server::state::stop_client_tunnel(&state).await;
+    let stopped = Arc::downgrade(&state);
+    drop(app);
+    drop(state);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stopped.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old test instance must release its data directory before restarting");
+    let reloaded = ServerStateInner::load(
+        Cli {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: Some(config_dir),
+            web_dist_dir: None,
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        Arc::new(cc_switch_server::logging::LogCapture::new(
+            cc_switch_server::logging::RING_BUFFER_CAPACITY,
+        )),
+    )
+    .unwrap();
+    let plan = reloaded
+        .provider_runtime_plan(AppKind::Codex, "custom-rebind")
+        .await
+        .unwrap();
+    assert_eq!(plan.endpoint, "https://changed.example/v1");
+    assert_eq!(
+        plan.runtime_fingerprint,
+        preview["runtimes"]["codex"]["afterFingerprint"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        reloaded
+            .reveal_provider_credential_command(&key, "/settingsConfig/apiKey")
+            .await
+            .unwrap()
+            .unwrap(),
+        "rotated-custom-secret"
+    );
+    assert_eq!(
+        reloaded
+            .reveal_provider_credential_command(&key, "/settingsConfig/extraHeaders/x-vendor-extra")
+            .await
+            .unwrap()
+            .unwrap(),
+        "vendor-header-secret"
+    );
+}
+
+fn custom_rebind_bundle_draft(id: &str) -> Value {
+    json!({
+        "id":id,"familyId":"family.custom_http","name":"Custom rebind","modelPolicy":"passthrough","testApp":"codex",
+        "surfaces":[
+            {"app":"claude","enabled":false,"profileId":"claude.custom_http","customBinding":{"upstreamProtocol":"anthropic_messages","authScheme":"bearer"}},
+            {"app":"codex","enabled":true,"profileId":"codex.custom_http","endpoint":"https://original.example/v1","customBinding":{"upstreamProtocol":"open_ai_responses","authScheme":"bearer"},"credentialPatches":{"/settingsConfig/apiKey":{"action":"replace","value":"original-custom-secret"}}},
+            {"app":"gemini","enabled":false,"profileId":"gemini.custom_http","customBinding":{"upstreamProtocol":"gemini_native","authScheme":"api_key"}}
+        ],"clientRequestId":format!("{id}-create-request")
+    })
+}
+
+fn custom_rebind_bundle_update(id: &str) -> Value {
+    let mut draft = custom_rebind_bundle_draft(id);
+    draft.as_object_mut().unwrap().remove("clientRequestId");
+    draft["expectedRevision"] = json!(1);
+    draft["surfaces"][1]["customBinding"]["upstreamProtocol"] = json!("open_ai_chat");
+    draft["surfaces"][1]["credentialPatches"] = json!({"/settingsConfig/apiKey":{"action":"keep"}});
+    draft
+}
+
+fn custom_shared_bundle_draft(id: &str) -> Value {
+    let mut draft = custom_rebind_bundle_draft(id);
+    draft["name"] = json!("Custom shared service");
+    draft["surfaces"][0]["enabled"] = json!(true);
+    draft["surfaces"][0]["endpoint"] = json!("https://custom-shared.invalid");
+    draft["surfaces"][0]["credentialPatches"] =
+        json!({"/settingsConfig/apiKey":{"action":"replace","value":"custom-shared-key"}});
+    draft["surfaces"][1]["endpoint"] = json!("https://custom-shared.invalid/v1");
+    draft["surfaces"][1]["credentialPatches"] = draft["surfaces"][0]["credentialPatches"].clone();
+    draft
+}
+
+async fn custom_share_api(
+    app: &Router,
+    token: &str,
+    method: Method,
+    path: &str,
+    input: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(json_request(method, path, input, Some(token)))
+        .await
+        .unwrap();
+    (response.status(), json_body(response).await)
+}
+
+fn custom_bundle_share_input(id: &str) -> Value {
+    json!({"params":{
+        "bundleId":id,"enabled":true,"subdomain":format!("{id}-url"),
+        "description":"Custom share retained", "tokenLimit":500,"parallelLimit":3,
+        "expiresAt":"2099-01-01T00:00:00Z",
+        "userGrants":{"friend@example.com":{"email":"friend@example.com","role":"shareto","active":true,
+            "policy":{"tokenLimit":120,"tokenPeriod":"day"}}}
+    }})
+}
+
+#[tokio::test]
+async fn custom_shared_bundle_routes_each_app_with_the_verified_key() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let claude_calls = Arc::clone(&calls);
+    let codex_calls = Arc::clone(&calls);
+    let upstream = Router::new()
+        .route("/v1/messages", post(move |headers: HeaderMap| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer custom-shared-key");
+            claude_calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"id":"msg-custom","type":"message","role":"assistant","model":"custom-model",
+                "content":[{"type":"text","text":"Claude route"}],"stop_reason":"end_turn","stop_sequence":null,
+                "usage":{"input_tokens":4,"output_tokens":2}}))
+        }))
+        .route("/v1/responses", post(move |headers: HeaderMap| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer custom-shared-key");
+            codex_calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"id":"resp-custom","object":"response","created_at":1,"status":"completed","model":"custom-model",
+                "output":[{"id":"msg-custom-codex","type":"message","role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":"Codex route","annotations":[]}]}],
+                "usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}))
+        }));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let id = "custom-loopback";
+    let mut draft = custom_shared_bundle_draft(id);
+    draft["surfaces"][0]["endpoint"] = json!(format!("http://{address}"));
+    draft["surfaces"][1]["endpoint"] = json!(format!("http://{address}/v1"));
+    let (status, body) =
+        custom_share_api(&app, &token, Method::POST, "/api/provider-bundles", draft).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/web-api/invoke/save_provider_bundle_share",
+        custom_bundle_share_input(id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let share_id = body["id"].as_str().unwrap();
+    configure_share_router_identity(&state).await;
+    for (path, input, expected) in [
+        (
+            "/v1/messages",
+            json!({"model":"custom-model","max_tokens":100,"messages":[{"role":"user","content":"hello"}],"stream":false}),
+            "Claude route",
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"custom-model","input":"hello","stream":false}),
+            "Codex route",
+        ),
+    ] {
+        let request = router_ingress_request(
+            json_request(Method::POST, path, input, None),
+            Some(share_id),
+            expected,
+        )
+        .await;
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let response = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(response.to_string().contains(expected));
+    }
+    let unsupported = router_ingress_request(
+        json_request(
+            Method::POST,
+            "/v1beta/models/custom-model:generateContent",
+            json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}]}),
+            None,
+        ),
+        Some(share_id),
+        "disabled-gemini",
+    )
+    .await;
+    assert!(!app
+        .clone()
+        .oneshot(unsupported)
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    cc_switch_server::state::stop_share_tunnel(&state, share_id).await;
+    cc_switch_server::state::stop_client_tunnel(&state).await;
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn custom_shared_bundle_preflight_save_rotation_rebind_and_restart() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let id = "custom-sharing";
+    let draft = custom_shared_bundle_draft(id);
+    let (status, body) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles",
+        draft.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let providers_file = state.config_dir.join("providers.json");
+    let before = std::fs::read(&providers_file).unwrap();
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/provider-bundles/{id}/share-preflight"),
+            Value::Null,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let (status, preflight) = custom_share_api(
+        &app,
+        &token,
+        Method::GET,
+        &format!("/api/provider-bundles/{id}/share-preflight"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preflight}");
+    assert_eq!(preflight["canShare"], true);
+    assert_eq!(preflight["enabledApps"], json!(["claude", "codex"]));
+    assert_eq!(preflight["bundleRevision"], 1);
+    assert_eq!(preflight.as_object().unwrap().len(), 4);
+    assert!(!preflight.to_string().contains("custom-shared-key"));
+    assert_eq!(before, std::fs::read(&providers_file).unwrap());
+    let (status, invoked) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/web-api/invoke/get_provider_bundle_share_preflight",
+        json!({"bundleId":id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preflight, invoked);
+    let (status, missing) = custom_share_api(
+        &app,
+        &token,
+        Method::GET,
+        "/api/provider-bundles/missing/share-preflight",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+
+    let (status, share) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/web-api/invoke/save_provider_bundle_share",
+        custom_bundle_share_input(id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{share}");
+    let share_id = share["id"].as_str().unwrap().to_string();
+    let original_pool = share["capacityPoolId"].clone();
+    assert!(original_pool.as_str().unwrap().starts_with("cp_"));
+    assert_eq!(share["bindings"].as_array().unwrap().len(), 3);
+    state
+        .mutate_shares_immediate(|store| {
+            let share = store
+                .shares
+                .iter_mut()
+                .find(|share| share.id == share_id)
+                .unwrap();
+            share.tokens_used = 37;
+            share.requests_count = 3;
+        })
+        .await
+        .unwrap();
+    let before_share = state
+        .mutate_shares(|store| store.get(&share_id).cloned().unwrap())
+        .await;
+
+    let mut update = draft.clone();
+    update.as_object_mut().unwrap().remove("clientRequestId");
+    update["expectedRevision"] = json!(1);
+    update["surfaces"][0]["credentialPatches"] =
+        json!({"/settingsConfig/apiKey":{"action":"keep"}});
+    update["surfaces"][1]["credentialPatches"] =
+        json!({"/settingsConfig/apiKey":{"action":"replace","value":"rotated-custom-shared-key"}});
+    let bytes_before_rejection = std::fs::read(&providers_file).unwrap();
+    let (status, rejected) = custom_share_api(
+        &app,
+        &token,
+        Method::PATCH,
+        &format!("/api/provider-bundles/{id}"),
+        update.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(
+        bytes_before_rejection,
+        std::fs::read(&providers_file).unwrap()
+    );
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|stored| stored.resource.revision == 1));
+
+    update["surfaces"][0]["credentialPatches"] = update["surfaces"][1]["credentialPatches"].clone();
+    let (status, updated) = custom_share_api(
+        &app,
+        &token,
+        Method::PATCH,
+        &format!("/api/provider-bundles/{id}"),
+        update.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["bundle"]["revision"], 2);
+    let after_rotation = state
+        .mutate_shares(|store| store.get(&share_id).cloned().unwrap())
+        .await;
+    assert_ne!(json!(after_rotation.capacity_pool_id), original_pool);
+    assert_eq!(after_rotation.tokens_used, 37);
+    assert_eq!(after_rotation.requests_count, 3);
+    assert_eq!(
+        serde_json::to_value(&after_rotation.user_grants).unwrap(),
+        serde_json::to_value(&before_share.user_grants).unwrap()
+    );
+    assert_eq!(
+        after_rotation.tunnel_subdomain,
+        before_share.tunnel_subdomain
+    );
+    assert_eq!(after_rotation.description, before_share.description);
+
+    update["expectedRevision"] = json!(2);
+    for surface in update["surfaces"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .take(2)
+    {
+        surface["credentialPatches"] = json!({"/settingsConfig/apiKey":{"action":"keep"}});
+        surface["customBinding"]["authScheme"] = json!("api_key");
+    }
+    // Claude Bearer -> ApiKey also changes its compatibility ProviderType.
+    // Explicit rebind must not silently replace the existing Share binding.
+    let before_type_change = std::fs::read(&providers_file).unwrap();
+    let shares_file = state.config_dir.join("shares.json");
+    let shares_before_type_change = std::fs::read(&shares_file).unwrap();
+    let (status, rejected) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        &format!("/api/provider-bundles/{id}/rebind-custom"),
+        json!({"mode":"preview","bundle":update}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(
+        rejected["code"],
+        "cc_switch_provider_account_binding_in_use"
+    );
+    assert_eq!(before_type_change, std::fs::read(&providers_file).unwrap());
+    assert_eq!(
+        shares_before_type_change,
+        std::fs::read(&shares_file).unwrap()
+    );
+
+    // A same-identity protocol rebind remains supported while sharing. Protocol
+    // changes alone must not manufacture a new credential-source capacity pool.
+    for surface in update["surfaces"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .take(2)
+    {
+        surface["customBinding"]["authScheme"] = json!("bearer");
+    }
+    update["surfaces"][1]["customBinding"]["upstreamProtocol"] = json!("open_ai_chat");
+    let (status, preview) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        &format!("/api/provider-bundles/{id}/rebind-custom"),
+        json!({"mode":"preview","bundle":update}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_ne!(
+        preview["preview"]["runtimes"]["codex"]["beforeFingerprint"],
+        preview["preview"]["runtimes"]["codex"]["afterFingerprint"]
+    );
+    let (status, rebound) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        &format!("/api/provider-bundles/{id}/rebind-custom"),
+        json!({"mode":"apply","bundle":update,"previewToken":preview["preview"]["previewToken"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rebound}");
+    let after_rebind = state
+        .mutate_shares(|store| store.get(&share_id).cloned().unwrap())
+        .await;
+    assert_eq!(
+        after_rebind.capacity_pool_id,
+        after_rotation.capacity_pool_id
+    );
+    assert_eq!(after_rebind.tokens_used, 37);
+    assert_eq!(after_rebind.requests_count, 3);
+    assert_eq!(
+        serde_json::to_value(&after_rebind.user_grants).unwrap(),
+        serde_json::to_value(&before_share.user_grants).unwrap()
+    );
+
+    let config_dir = state.config_dir.clone();
+    cc_switch_server::state::stop_share_tunnel(&state, &share_id).await;
+    cc_switch_server::state::stop_client_tunnel(&state).await;
+    let stopped = Arc::downgrade(&state);
+    drop(app);
+    drop(state);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stopped.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old instance must release its data directory before restarting");
+    let reloaded = ServerStateInner::load(
+        Cli {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: Some(config_dir),
+            web_dist_dir: None,
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        Arc::new(cc_switch_server::logging::LogCapture::new(
+            cc_switch_server::logging::RING_BUFFER_CAPACITY,
+        )),
+    )
+    .unwrap();
+    assert!(
+        reloaded
+            .provider_bundle_share_preflight(id)
+            .await
+            .unwrap()
+            .can_share
+    );
+    let reloaded_share = reloaded
+        .mutate_shares(|store| store.get(&share_id).cloned().unwrap())
+        .await;
+    assert_eq!(
+        reloaded_share.capacity_pool_id,
+        after_rebind.capacity_pool_id
+    );
+    assert!(reloaded_share.enabled);
+    assert!(reloaded_share.integrity_error.is_none());
+    assert_eq!(reloaded_share.tokens_used, 37);
+}
+
+#[tokio::test]
+async fn custom_shared_bundle_preflight_and_save_reject_mismatches_without_writes() {
+    for (suffix, reason) in [
+        ("keys", "credential_mismatch"),
+        ("endpoint", "endpoint_mismatch"),
+        ("auth", "auth_mismatch"),
+        ("query", "source_unverifiable"),
+    ] {
+        let state = test_state();
+        let app = app_router(state.clone());
+        let token = setup_and_login(&app).await;
+        let id = format!("custom-reject-{suffix}");
+        let mut draft = custom_shared_bundle_draft(&id);
+        match suffix {
+            "keys" => {
+                draft["surfaces"][1]["credentialPatches"]["/settingsConfig/apiKey"]["value"] =
+                    json!("different-key")
+            }
+            "endpoint" => {
+                draft["surfaces"][1]["endpoint"] =
+                    json!("https://custom-shared.invalid/other-tenant/v1")
+            }
+            "auth" => draft["surfaces"][0]["customBinding"]["authScheme"] = json!("api_key"),
+            _ => {
+                draft["surfaces"][1]["endpoint"] =
+                    json!("https://custom-shared.invalid/v1?tenant=other")
+            }
+        }
+        let (status, body) =
+            custom_share_api(&app, &token, Method::POST, "/api/provider-bundles", draft).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, preflight) = custom_share_api(
+            &app,
+            &token,
+            Method::POST,
+            "/web-api/invoke/get_provider_bundle_share_preflight",
+            json!({"bundleId":id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preflight["canShare"], false);
+        assert_eq!(preflight["reason"], reason);
+        for forbidden in [
+            "different-key",
+            "custom-shared-key",
+            "capacityPoolId",
+            "digest",
+        ] {
+            assert!(!preflight.to_string().contains(forbidden));
+        }
+        let before = std::fs::read(state.config_dir.join("providers.json")).unwrap();
+        let (status, rejected) = custom_share_api(
+            &app,
+            &token,
+            Method::POST,
+            "/web-api/invoke/save_provider_bundle_share",
+            custom_bundle_share_input(&id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert_eq!(
+            before,
+            std::fs::read(state.config_dir.join("providers.json")).unwrap()
+        );
+        assert!(state.mutate_shares(|store| store.shares.is_empty()).await);
+        cc_switch_server::state::stop_client_tunnel(&state).await;
+    }
+}
+
+#[tokio::test]
+async fn custom_bundle_rebind_fences_draft_share_and_provider_changes() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let id = "custom-rebind-fenced";
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            custom_rebind_bundle_draft(id),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changed = custom_rebind_bundle_update(id);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/rebind_custom_provider_bundle",
+            json!({"mode":"preview","bundle":changed}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = json_body(response).await["preview"].clone();
+    let mut tampered = changed.clone();
+    tampered["surfaces"][1]["credentialPatches"] =
+        json!({"/settingsConfig/apiKey":{"action":"replace","value":"tampered-custom-secret"}});
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/provider-bundles/{id}/rebind-custom"),
+            json!({"mode":"apply","bundle":tampered,"previewToken":preview["previewToken"]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_provider_preview_conflict"
+    );
+    state
+        .mutate_shares_immediate(|shares| {
+            shares
+                .upsert(test_share_input(
+                    "new-custom-reference",
+                    id,
+                    ProviderType::Codex,
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/rebind_custom_provider_bundle",
+            json!({"mode":"apply","bundle":changed,"previewToken":preview["previewToken"]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_provider_preview_conflict"
+    );
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|p| p.resource.revision == 1));
+    let mut ordinary = changed.clone();
+    ordinary["surfaces"][1]["customBinding"]["upstreamProtocol"] = json!("open_ai_responses");
+    ordinary["name"] = json!("Concurrent update");
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            &format!("/api/provider-bundles/{id}"),
+            ordinary,
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/web-api/invoke/rebind_custom_provider_bundle",
+            json!({"mode":"apply","bundle":changed,"previewToken":preview["previewToken"]}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_provider_revision_conflict"
+    );
+}
+
+#[tokio::test]
+async fn custom_bundle_rebind_rejects_invalid_or_implicit_actions_without_writes() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let id = "custom-rebind-invalid";
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            custom_rebind_bundle_draft(id),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let changed = custom_rebind_bundle_update(id);
+    for variant in [
+        "noRevision",
+        "createKey",
+        "sameBinding",
+        "missingCredential",
+        "invalidDisabledApp",
+    ] {
+        let mut invalid = changed.clone();
+        match variant {
+            "noRevision" => {
+                invalid.as_object_mut().unwrap().remove("expectedRevision");
+            }
+            "createKey" => invalid["clientRequestId"] = json!("not-an-update"),
+            "sameBinding" => {
+                invalid["surfaces"][1]["customBinding"]["upstreamProtocol"] =
+                    json!("open_ai_responses")
+            }
+            "missingCredential" => {
+                invalid["surfaces"][1]["credentialPatches"] =
+                    json!({"/settingsConfig/apiKey":{"action":"clear"}})
+            }
+            _ => invalid["surfaces"][2]["customBinding"]["authScheme"] = json!("aws_sig_v4"),
+        }
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/web-api/invoke/rebind_custom_provider_bundle",
+                json!({"mode":"preview","bundle":invalid}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error(), "{variant}");
+        assert!(providers_snapshot(&state)
+            .await
+            .providers
+            .iter()
+            .all(|p| p.resource.revision == 1));
+    }
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/different-id/rebind-custom",
+            json!({"mode":"preview","bundle":changed}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app.clone().oneshot(json_request(Method::POST, &format!("/api/providers/{id}/rebind-custom?app=codex"), json!({"mode":"preview","expectedRevision":1,"customBinding":{"upstreamProtocol":"open_ai_chat","authScheme":"bearer"}}), Some(&token))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["code"],
+        "cc_switch_provider_bundle_surface_managed"
+    );
+
+    for path in [
+        format!("/api/provider-bundles/{id}/rebind-custom"),
+        "/web-api/invoke/rebind_custom_provider_bundle".to_string(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &path,
+                json!({"mode":"preview","bundle":changed}),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &path,
+                json!({"mode":"apply","bundle":changed}),
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let mut fixed =
+        nvidia_provider_bundle_draft("fixed-cannot-rebind", "fixed-cannot-rebind-request");
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles",
+            fixed.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    fixed.as_object_mut().unwrap().remove("clientRequestId");
+    fixed["expectedRevision"] = json!(1);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/fixed-cannot-rebind/rebind-custom",
+            json!({"mode":"preview","bundle":fixed}),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(providers_snapshot(&state)
+        .await
+        .providers
+        .iter()
+        .all(|p| p.resource.revision == 1));
+}
+
+#[tokio::test]
 async fn provider_bundle_share_save_is_atomic_and_server_derived() {
     let state = test_state();
     state

@@ -97,7 +97,7 @@ pub enum SubscriptionBindingError {
         existing_share_id: String,
         conflicting_share_id: String,
     },
-    #[error("Provider {app}/{provider_id} is referenced by Share {share_id}; its account binding is immutable")]
+    #[error("Provider {app}/{provider_id} is referenced by Share {share_id}; its Provider type or account binding cannot be changed by this operation")]
     SharedProviderIdentityChanged {
         app: &'static str,
         provider_id: String,

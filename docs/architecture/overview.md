@@ -125,6 +125,8 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
   `config → providers → accounts → usage → shares → ui_settings → sessions → oauth_logins`。
 - shares 写路径已收敛到 `mutate_shares_immediate` / `try_mutate_shares_immediate` / `mutate_shares_debounced` / `mutate_share` / `replace_shares` / `validate_share_invocation`；调用方不得再感知立即保存或 debounce 落盘细节。
 - Share 用户配置通过 `userGrantEdits` 增量提交，并与显式 `userUsageEdits` 在同一 quota mutation 中完整校验、原子提交；未修改用户不推进 revision。Router 同步 RPC 与异步队列共用 `editContext`，成功回执和 Share 一同持久化，重试不得重复执行用量校准。Provider Bundle 编辑器冻结 Share 基线版本，未编辑到期项时保留原始绝对到期时间。
+- Custom Provider Bundle 的协议/认证绑定修改走 `POST /api/provider-bundles/:id/rebind-custom` 或同义 Web invoke 的 preview/apply；完整草稿、Provider 版本与关联 Share 配置版本绑定到预览令牌。普通保存与显式重绑定共用候选校验和 Provider 提交协调器，多 App 原子提交；单 Provider 重绑定不能绕过 Bundle 边界。停用 App 不要求凭据或运行时。Web 编辑器在供应商已保存、分享保存失败时保留两个阶段各自的基线；网络写入结果不确定时先只读回查，不自动重复写入。
+- Custom 的 `credentialSourceScope=surface` 只决定凭据独立存储，不禁止验证同源分享。分享域按有效服务/租户地址、认证载体、唯一主凭据和具名附加认证头判断同源；与转发共用唯一凭据解析规则，不按 App、Bundle ID、裸域名或无标签密钥集合猜测。仅规范化当前协议的终端版本后缀与尾斜杠；含查询、fragment、userinfo 或编码路径的模糊地址不参与复用。只读 `GET /api/provider-bundles/:id/share-preflight` 和 `get_provider_bundle_share_preflight` 不返回密钥或容量指纹，写路径仍在引用锁下重新验证。凭据变更沿用提交协调器刷新 HMAC 容量池，保留用量和用户授权；旧单 App 隔离池在完整性修复时重派生。显式重绑定也不得悄悄更换已被 Share 引用的兼容 Provider 类型；只改协议而不改有效凭据来源时容量池保持稳定。无法复用的单 App 隔离回退使用实际启用绑定，不取任意首项。
 
 ### 4.3 UI 独立性
 

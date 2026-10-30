@@ -396,6 +396,21 @@
     }
   },
   "providerBundle": {
+    "sharePreflight": {
+      "source_unverifiable": "Cannot verify a shared credential source. Check the enabled Apps' endpoints, authentication, and keys, or use separate Providers.",
+      "credential_mismatch": "The Apps use different keys or additional authentication values. Use matching credentials or separate Providers.",
+      "endpoint_mismatch": "The Apps use different upstream services or tenant paths. Check their endpoints before sharing.",
+      "auth_mismatch": "The Apps use different authentication carriers. Check their authentication methods and fields.",
+      "no_enabled_apps": "Enable at least one App before sharing.",
+      "resolution_failed": "The Provider credential source could not be verified. Check the server status and retry."
+    },
+    "rebindTitle": "Confirm protocol and authentication changes",
+    "rebindConfirm": "Confirm and save",
+    "rebindShares": "Affected shares: {{count}}. New requests will use the new configuration after saving.",
+    "shareSaveFailed": "Provider saved, but share settings could not be saved: {{error}}. Keep this page open to retry.",
+    "saveUncertainReadBack": "The save response was lost. Server configuration was read back and your draft preserved. Check before retrying; if a revision conflict occurs, keep your input and reopen the Provider to review the latest configuration.",
+    "saveUncertain": "The save result and latest configuration could not be confirmed. Your draft is preserved. Reconnect and check the server state before retrying.",
+    "saveConflict": "The configuration or preview has changed. Reload, review, and save again: {{error}}",
     "apiKey": "API Key",
     "apiUrlUnavailable": "API URL not configured",
     "appFilterAll": "All Apps",

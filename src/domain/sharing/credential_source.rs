@@ -1,4 +1,5 @@
 use hmac::{Hmac, Mac};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::AccountStore;
@@ -12,6 +13,8 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
 use super::shares::{Share, ShareBinding};
 
+mod custom;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialSourceError {
     #[error("Share must have between one and three bindings (found {count})")]
@@ -22,7 +25,7 @@ pub enum CredentialSourceError {
         provider_id: String,
         message: String,
     },
-    #[error("Provider {app}/{provider_id} does not support credential-source reuse")]
+    #[error("Provider {app}/{provider_id} has no verifiable shared credential source; check its endpoint, authentication and key, or use a separate Provider")]
     ReuseUnsupported {
         app: &'static str,
         provider_id: String,
@@ -36,6 +39,20 @@ pub enum CredentialSourceError {
         app: &'static str,
         provider_id: String,
     },
+    #[error("Custom Share bindings must use the same service and tenant endpoint scope; {app}/{provider_id} does not match {first_app}/{first_provider_id}")]
+    EndpointMismatch {
+        first_app: &'static str,
+        first_provider_id: String,
+        app: &'static str,
+        provider_id: String,
+    },
+    #[error("Custom Share bindings must use equivalent authentication carriers; {app}/{provider_id} does not match {first_app}/{first_provider_id}")]
+    AuthMismatch {
+        first_app: &'static str,
+        first_provider_id: String,
+        app: &'static str,
+        provider_id: String,
+    },
     #[error("derive anonymous capacity pool id: {message}")]
     CapacityPoolDerivation { message: String },
 }
@@ -43,13 +60,25 @@ pub enum CredentialSourceError {
 impl CredentialSourceError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::ReuseUnsupported { .. } | Self::SourceMismatch { .. } => {
-                "cc_switch_share_credential_source_mismatch"
-            }
+            Self::ReuseUnsupported { .. }
+            | Self::SourceMismatch { .. }
+            | Self::EndpointMismatch { .. }
+            | Self::AuthMismatch { .. } => "cc_switch_share_credential_source_mismatch",
             Self::InvalidBindingCount { .. } => "cc_switch_share_binding_integrity_failed",
             Self::Resolution { .. } | Self::CapacityPoolDerivation { .. } => {
                 "cc_switch_share_capacity_pool_derivation_failed"
             }
+        }
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::ReuseUnsupported { .. } => "source_unverifiable",
+            Self::SourceMismatch { .. } => "credential_mismatch",
+            Self::EndpointMismatch { .. } => "endpoint_mismatch",
+            Self::AuthMismatch { .. } => "auth_mismatch",
+            Self::InvalidBindingCount { .. } => "no_enabled_apps",
+            _ => "resolution_failed",
         }
     }
 }
@@ -72,6 +101,79 @@ impl ShareCredentialSourceError {
 pub struct CredentialSourceIdentity {
     family: &'static str,
     digest: [u8; 32],
+    custom_scope: Option<CustomSourceScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CustomSourceScope {
+    endpoint_digest: [u8; 32],
+    auth_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleSharePreflight {
+    pub bundle_id: String,
+    pub bundle_revision: u64,
+    pub enabled_apps: Vec<AppKind>,
+    pub can_share: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+pub fn bundle_share_preflight(
+    providers: &ProviderStore,
+    accounts: &AccountStore,
+    bundle_id: &str,
+) -> Option<BundleSharePreflight> {
+    use crate::domain::providers::bundle::{
+        bundle_id as stored_bundle_id, is_explicit_bundle_surface,
+    };
+    let surfaces = providers
+        .providers
+        .iter()
+        .filter(|stored| {
+            is_explicit_bundle_surface(&stored.provider)
+                && stored_bundle_id(&stored.provider) == Some(bundle_id)
+        })
+        .collect::<Vec<_>>();
+    if surfaces.is_empty() {
+        return None;
+    }
+    let bindings = surfaces
+        .iter()
+        .map(|stored| ShareBinding {
+            app: stored.app,
+            provider_id: stored.provider.id.clone(),
+            provider_type: stored.provider_type,
+        })
+        .collect::<Vec<_>>();
+    let result = shared_credential_source_for_bindings(providers, accounts, &bindings);
+    let error = result.err();
+    Some(BundleSharePreflight {
+        bundle_id: bundle_id.to_string(),
+        bundle_revision: surfaces
+            .iter()
+            .map(|stored| stored.resource.revision)
+            .max()
+            .unwrap_or_default(),
+        enabled_apps: surfaces
+            .iter()
+            .filter(|stored| surface_enabled(&stored.provider))
+            .map(|stored| stored.app)
+            .collect(),
+        can_share: error.is_none(),
+        reason: error.as_ref().map(CredentialSourceError::reason),
+        message: error.map(|error| match error {
+            CredentialSourceError::Resolution { .. }
+            | CredentialSourceError::CapacityPoolDerivation { .. } => {
+                "Unable to verify the Provider credential source".to_string()
+            }
+            _ => error.to_string(),
+        }),
+    })
 }
 
 impl CredentialSourceIdentity {
@@ -152,6 +254,17 @@ pub fn shared_credential_source_for_bindings(
 
     let mut source: Option<(CredentialSourceIdentity, &ShareBinding)> = None;
     for binding in &enabled_bindings {
+        if !providers
+            .providers
+            .iter()
+            .any(|stored| stored.app == binding.app && stored.provider.id == binding.provider_id)
+        {
+            return Err(CredentialSourceError::Resolution {
+                app: binding.app.as_str(),
+                provider_id: binding.provider_id.clone(),
+                message: "Provider is missing".to_string(),
+            });
+        }
         let candidate = resolve_provider_credential_source(
             providers,
             accounts,
@@ -172,6 +285,26 @@ pub fn shared_credential_source_for_bindings(
         if let Some(candidate) = candidate {
             if let Some((current, first_binding)) = source.as_ref() {
                 if current != &candidate {
+                    if let (Some(first), Some(next)) =
+                        (&current.custom_scope, &candidate.custom_scope)
+                    {
+                        if first.endpoint_digest != next.endpoint_digest {
+                            return Err(CredentialSourceError::EndpointMismatch {
+                                first_app: first_binding.app.as_str(),
+                                first_provider_id: first_binding.provider_id.clone(),
+                                app: binding.app.as_str(),
+                                provider_id: binding.provider_id.clone(),
+                            });
+                        }
+                        if first.auth_digest != next.auth_digest {
+                            return Err(CredentialSourceError::AuthMismatch {
+                                first_app: first_binding.app.as_str(),
+                                first_provider_id: first_binding.provider_id.clone(),
+                                app: binding.app.as_str(),
+                                provider_id: binding.provider_id.clone(),
+                            });
+                        }
+                    }
                     return Err(CredentialSourceError::SourceMismatch {
                         first_app: first_binding.app.as_str(),
                         first_provider_id: first_binding.provider_id.clone(),
@@ -198,7 +331,14 @@ pub fn capacity_pool_id_for_bindings(
         Some(source) => source.capacity_pool_id(root_key),
         None => {
             let binding = bindings
-                .first()
+                .iter()
+                .find(|binding| {
+                    providers.providers.iter().any(|stored| {
+                        stored.app == binding.app
+                            && stored.provider.id == binding.provider_id
+                            && surface_enabled(&stored.provider)
+                    })
+                })
                 .expect("binding count was validated before isolated capacity derivation");
             isolated_capacity_pool_id(root_key, binding.app, &binding.provider_id)
         }
@@ -233,12 +373,15 @@ pub fn resolve_stored_provider_credential_source(
     let Some(family) = family_for_profile(profile_id.as_str()) else {
         return Ok(None);
     };
-    if family.credential_source_scope == CredentialSourceScope::Surface {
-        return Ok(None);
-    }
     let Some(profile) = profile_by_id(profile_id.as_str()) else {
         return Ok(None);
     };
+    if matches!(profile.credential_policy, CredentialPolicy::Custom) {
+        return custom::resolve(providers, accounts, stored, family.family_id.as_str());
+    }
+    if family.credential_source_scope == CredentialSourceScope::Surface {
+        return Ok(None);
+    }
 
     let material = match &profile.credential_policy {
         CredentialPolicy::ManagedAccount {
@@ -306,6 +449,7 @@ pub fn resolve_stored_provider_credential_source(
     Ok(Some(CredentialSourceIdentity {
         family: family.family_id.as_str(),
         digest: digest.finalize().into(),
+        custom_scope: None,
     }))
 }
 
@@ -318,7 +462,9 @@ mod tests {
     use super::*;
     use crate::domain::accounts::store::Account;
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
-    use crate::domain::providers::registry::{provider_registry, ProfileId};
+    use crate::domain::providers::registry::{
+        provider_registry, AuthScheme, CustomBindingInput, ProfileId, UpstreamProtocol,
+    };
     use crate::domain::providers::store::ProviderResourceMetadata;
 
     fn account(id: &str) -> Account {
@@ -429,13 +575,30 @@ mod tests {
     }
 
     fn custom_provider(app: AppKind, id: &str, secret: &str) -> StoredProvider {
+        let (base_key, endpoint, upstream_protocol) = match app {
+            AppKind::Claude => (
+                "ANTHROPIC_BASE_URL",
+                "https://custom.example",
+                UpstreamProtocol::AnthropicMessages,
+            ),
+            AppKind::Codex => (
+                "OPENAI_BASE_URL",
+                "https://custom.example/v1",
+                UpstreamProtocol::OpenAiResponses,
+            ),
+            AppKind::Gemini => (
+                "GEMINI_BASE_URL",
+                "https://custom.example/v1beta",
+                UpstreamProtocol::GeminiNative,
+            ),
+        };
         let mut store = ProviderStore::default();
         store.upsert_with_resource(
             app,
             Provider {
                 id: id.to_string(),
                 name: id.to_string(),
-                settings_config: json!({"apiKey": secret}),
+                settings_config: json!({"apiKey": secret, "env": {base_key: endpoint}, "modelMapping": {"mode":"passthrough"}}),
                 category: Some("custom".to_string()),
                 meta: None,
                 extra: BTreeMap::new(),
@@ -444,6 +607,7 @@ mod tests {
                 profile_id: Some(
                     ProfileId::parse(format!("{}.custom_http", app.as_str())).unwrap(),
                 ),
+                custom_binding: Some(CustomBindingInput { upstream_protocol, auth_scheme: AuthScheme::Bearer }),
                 ..ProviderResourceMetadata::default()
             },
         )
@@ -638,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_scoped_custom_http_rejects_multi_surface_reuse() {
+    fn surface_scoped_custom_http_rejects_different_credentials() {
         let providers = ProviderStore {
             providers: vec![
                 custom_provider(AppKind::Claude, "custom-bundle", "claude-key"),
@@ -661,7 +825,7 @@ mod tests {
 
         assert!(matches!(
             shared_credential_source_for_bindings(&providers, &AccountStore::default(), &bindings),
-            Err(CredentialSourceError::ReuseUnsupported { .. })
+            Err(CredentialSourceError::SourceMismatch { .. })
         ));
         assert!(resolve_provider_credential_source(
             &providers,
@@ -670,7 +834,306 @@ mod tests {
             "custom-bundle"
         )
         .unwrap()
-        .is_none());
+        .is_some());
+    }
+
+    fn custom_bindings() -> Vec<ShareBinding> {
+        [AppKind::Claude, AppKind::Codex]
+            .into_iter()
+            .map(|app| ShareBinding {
+                app,
+                provider_id: "custom-bundle".to_string(),
+                provider_type: match app {
+                    AppKind::Claude => ProviderType::Claude,
+                    _ => ProviderType::Codex,
+                },
+            })
+            .collect()
+    }
+
+    fn custom_store() -> ProviderStore {
+        ProviderStore {
+            providers: vec![
+                custom_provider(AppKind::Claude, "custom-bundle", "shared-custom-secret"),
+                custom_provider(AppKind::Codex, "custom-bundle", "shared-custom-secret"),
+            ],
+            ..ProviderStore::default()
+        }
+    }
+
+    #[test]
+    fn custom_sources_compare_effective_auth_not_app_profile_or_slot_names() {
+        let mut store = custom_store();
+        store.providers[0].provider.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"] =
+            json!("shared-custom-secret");
+        store.providers[0]
+            .provider
+            .settings_config
+            .as_object_mut()
+            .unwrap()
+            .remove("apiKey");
+        let source = shared_credential_source_for_bindings(
+            &store,
+            &AccountStore::default(),
+            &custom_bindings(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(source
+            .capacity_pool_id(&[7; 32])
+            .unwrap()
+            .starts_with("cp_"));
+        let mut other = store.clone();
+        for stored in &mut other.providers {
+            stored.provider.id = "independent-bundle".to_string();
+        }
+        let other_source = resolve_stored_provider_credential_source(
+            &other,
+            &AccountStore::default(),
+            &other.providers[1],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, other_source);
+        store.providers[0].provider.settings_config["apiKey"] = json!("conflicting-alias-secret");
+        assert!(matches!(
+            shared_credential_source_for_bindings(
+                &store,
+                &AccountStore::default(),
+                &custom_bindings()
+            ),
+            Err(CredentialSourceError::ReuseUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn custom_sources_reject_other_hosts_tenant_paths_and_authentication_carriers() {
+        for endpoint in [
+            "https://other.example/v1",
+            "https://custom.example/tenant/v1",
+            "http://custom.example/v1",
+            "https://custom.example:8443/v1",
+        ] {
+            let mut store = custom_store();
+            store.providers[1].provider.settings_config["env"]["OPENAI_BASE_URL"] = json!(endpoint);
+            assert!(matches!(
+                shared_credential_source_for_bindings(
+                    &store,
+                    &AccountStore::default(),
+                    &custom_bindings()
+                ),
+                Err(CredentialSourceError::EndpointMismatch { .. })
+            ));
+        }
+        let mut store = custom_store();
+        store.providers[0]
+            .resource
+            .custom_binding
+            .as_mut()
+            .unwrap()
+            .auth_scheme = AuthScheme::ApiKey;
+        assert!(matches!(
+            shared_credential_source_for_bindings(
+                &store,
+                &AccountStore::default(),
+                &custom_bindings()
+            ),
+            Err(CredentialSourceError::AuthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn custom_sources_include_named_extra_headers_and_ignore_inactive_surfaces() {
+        let mut store = custom_store();
+        store.providers[0].provider.settings_config["extraHeaders"] =
+            json!({"X-Tenant":"tenant-a", "x-role":"role-b"});
+        store.providers[1].provider.settings_config["extraHeaders"] =
+            json!({"x-tenant":"tenant-a", "X-Role":"role-b"});
+        assert!(shared_credential_source_for_bindings(
+            &store,
+            &AccountStore::default(),
+            &custom_bindings()
+        )
+        .is_ok());
+        store.providers[1].provider.settings_config["extraHeaders"] =
+            json!({"x-tenant":"role-b", "x-role":"tenant-a"});
+        assert!(matches!(
+            shared_credential_source_for_bindings(
+                &store,
+                &AccountStore::default(),
+                &custom_bindings()
+            ),
+            Err(CredentialSourceError::SourceMismatch { .. })
+        ));
+        store.providers[1]
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+        store.providers[1].provider.settings_config = json!({});
+        assert!(shared_credential_source_for_bindings(
+            &store,
+            &AccountStore::default(),
+            &custom_bindings()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn isolated_custom_pool_uses_the_enabled_binding_not_the_first_disabled_one() {
+        let mut store = custom_store();
+        store.providers[0]
+            .provider
+            .extra
+            .insert("surfaceEnabled".to_string(), json!(false));
+        store.providers[1].provider.settings_config["env"]["OPENAI_BASE_URL"] =
+            json!("https://custom.example/v1?tenant=a");
+        let pool = capacity_pool_id_for_bindings(
+            &store,
+            &AccountStore::default(),
+            &custom_bindings(),
+            &[7; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            pool,
+            isolated_capacity_pool_id(&[7; 32], AppKind::Codex, "custom-bundle").unwrap()
+        );
+    }
+
+    #[test]
+    fn custom_header_and_query_names_are_identity_significant() {
+        let mut store = custom_store();
+        for (index, name) in ["X-Vendor-Key", "x-vendor-key"].into_iter().enumerate() {
+            store.providers[index]
+                .resource
+                .custom_binding
+                .as_mut()
+                .unwrap()
+                .auth_scheme = AuthScheme::CustomHeader;
+            store.providers[index].provider.meta = Some(ProviderMeta {
+                api_key_field: Some(name.to_string()),
+                ..ProviderMeta::default()
+            });
+        }
+        assert!(shared_credential_source_for_bindings(
+            &store,
+            &AccountStore::default(),
+            &custom_bindings()
+        )
+        .is_ok());
+        store.providers[1]
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .api_key_field = Some("x-other-key".to_string());
+        assert!(matches!(
+            shared_credential_source_for_bindings(
+                &store,
+                &AccountStore::default(),
+                &custom_bindings()
+            ),
+            Err(CredentialSourceError::AuthMismatch { .. })
+        ));
+        // Both Custom App Profiles can use the Gemini-native Query rail. The
+        // Anthropic/OpenAI drivers themselves do not accept Query authentication.
+        let mut gemini = custom_provider(AppKind::Gemini, "custom-bundle", "shared-custom-secret");
+        gemini.resource.custom_binding.as_mut().unwrap().auth_scheme = AuthScheme::Query;
+        gemini.provider.meta = Some(ProviderMeta {
+            api_key_field: Some("key".to_string()),
+            ..ProviderMeta::default()
+        });
+        store.providers[0]
+            .resource
+            .custom_binding
+            .as_mut()
+            .unwrap()
+            .auth_scheme = AuthScheme::Query;
+        store.providers[0]
+            .resource
+            .custom_binding
+            .as_mut()
+            .unwrap()
+            .upstream_protocol = UpstreamProtocol::GeminiNative;
+        store.providers[0].provider.settings_config["env"]["ANTHROPIC_BASE_URL"] =
+            json!("https://custom.example/v1beta");
+        store.providers[0]
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .api_key_field = Some("key".to_string());
+        store.providers[1] = gemini;
+        let mut bindings = custom_bindings();
+        bindings[1].app = AppKind::Gemini;
+        for (stored, binding) in store.providers.iter_mut().zip(&mut bindings) {
+            let canonical = crate::domain::providers::store::canonical_provider_type(
+                stored.app,
+                &stored.provider,
+                &stored.resource,
+            )
+            .unwrap();
+            stored.provider_type = canonical;
+            stored.provider_type_id = canonical.as_str().to_string();
+            binding.provider_type = canonical;
+        }
+        assert!(
+            shared_credential_source_for_bindings(&store, &AccountStore::default(), &bindings)
+                .is_ok()
+        );
+        store.providers[1]
+            .provider
+            .meta
+            .as_mut()
+            .unwrap()
+            .api_key_field = Some("Key".to_string());
+        assert!(matches!(
+            shared_credential_source_for_bindings(&store, &AccountStore::default(), &bindings),
+            Err(CredentialSourceError::AuthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_single_custom_pool_is_repaired_without_resetting_share_data() {
+        use crate::domain::sharing::shares::{ShareStore, UpsertShareInput};
+        let mut providers = custom_store();
+        providers.providers.truncate(1);
+        let stored = &providers.providers[0];
+        let input: UpsertShareInput = serde_json::from_value(json!({
+            "id":"legacy-custom-share","ownerEmail":"owner@example.com","app":"claude",
+            "providerId":"custom-bundle","providerType":stored.provider_type,
+            "enabled":true,"status":"active","tokenLimit":123,"parallelLimit":4,
+            "description":"keep description","tunnelSubdomain":"customlegacy",
+            "userGrants":{"friend@example.com":{"email":"friend@example.com","role":"shareto","active":true,"policy":{"tokenLimit":99,"tokenPeriod":"day"}}}
+        })).unwrap();
+        let root_key = [7; 32];
+        let old_pool =
+            isolated_capacity_pool_id(&root_key, AppKind::Claude, "custom-bundle").unwrap();
+        let mut shares = ShareStore::default();
+        shares
+            .upsert_with_capacity(input, Some(old_pool.clone()))
+            .unwrap();
+        shares.shares[0].tokens_used = 42;
+        shares.shares[0].requests_count = 5;
+        let original = shares.shares[0].clone();
+        let outcomes = shares.repair_integrity(&providers, &AccountStore::default(), &root_key);
+        assert!(outcomes[0].changed());
+        let repaired = &shares.shares[0];
+        assert_ne!(repaired.capacity_pool_id, old_pool);
+        assert!(repaired.enabled);
+        assert!(repaired.integrity_error.is_none());
+        assert_eq!(repaired.tokens_used, 42);
+        assert_eq!(repaired.requests_count, 5);
+        assert_eq!(repaired.token_limit, original.token_limit);
+        assert_eq!(repaired.parallel_limit, original.parallel_limit);
+        assert_eq!(repaired.tunnel_subdomain, original.tunnel_subdomain);
+        assert_eq!(
+            serde_json::to_value(&repaired.user_grants).unwrap(),
+            serde_json::to_value(&original.user_grants).unwrap()
+        );
+        assert!(
+            !shares.repair_integrity(&providers, &AccountStore::default(), &root_key)[0].changed()
+        );
     }
 
     #[test]

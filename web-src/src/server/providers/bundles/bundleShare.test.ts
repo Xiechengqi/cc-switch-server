@@ -8,6 +8,7 @@ const shareApiMock = vi.hoisted(() => ({
   disable: vi.fn(),
   saveProviderBundleShare: vi.fn(),
   suggestShareSlug: vi.fn(),
+  preflightProviderBundleShare: vi.fn(),
 }));
 
 vi.mock("@/lib/api/share", async (importOriginal) => {
@@ -89,6 +90,22 @@ describe("Provider Bundle sharing", () => {
   });
   beforeEach(() => {
     vi.clearAllMocks();
+    shareApiMock.preflightProviderBundleShare.mockResolvedValue({ canShare: true });
+  });
+
+  it("checks server-owned eligibility before enabling, without writing a rejected Share", async () => {
+    shareApiMock.preflightProviderBundleShare.mockResolvedValue({ canShare: false, reason: "credential_mismatch" });
+    const draft = createBundleShareDraft();
+    draft.enabled = true;
+    draft.subdomain = "custom-share";
+    await expect(saveBundleShare("custom-bundle", draft)).rejects.toThrow();
+    expect(shareApiMock.preflightProviderBundleShare).toHaveBeenCalledWith("custom-bundle");
+    expect(shareApiMock.saveProviderBundleShare).not.toHaveBeenCalled();
+    // Disabling must not be prevented by an enable-only advisory preflight.
+    draft.enabled = false;
+    await saveBundleShare("custom-bundle", draft);
+    expect(shareApiMock.preflightProviderBundleShare).toHaveBeenCalledTimes(1);
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledTimes(1);
   });
 
   afterEach(() => {

@@ -172,6 +172,7 @@ mod background;
 mod codex_quota;
 mod grok_media_resident;
 mod in_flight;
+mod provider_bundle;
 
 pub(crate) use grok_media_resident::GrokMediaMemoryCapacity;
 use grok_media_resident::GrokMediaResidentSnapshot;
@@ -4324,6 +4325,26 @@ fn apply_provider_write_drafts(
     drafts: Vec<ProviderWriteDraft>,
     accounts: &AccountStore,
 ) -> Result<(Vec<StoredProvider>, bool), ProviderCommandError> {
+    apply_provider_write_drafts_with_binding_mode(
+        store,
+        drafts,
+        accounts,
+        ProviderBindingWriteMode::Ordinary,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderBindingWriteMode {
+    Ordinary,
+    CustomBundleRebind,
+}
+
+fn apply_provider_write_drafts_with_binding_mode(
+    store: &mut ProviderStore,
+    drafts: Vec<ProviderWriteDraft>,
+    accounts: &AccountStore,
+    binding_mode: ProviderBindingWriteMode,
+) -> Result<(Vec<StoredProvider>, bool), ProviderCommandError> {
     let mut stored = Vec::with_capacity(drafts.len());
     let mut any_changed = false;
     for draft in drafts {
@@ -4396,6 +4417,7 @@ fn apply_provider_write_drafts(
             draft.custom_binding,
             draft.client_request_id,
             existing.as_ref(),
+            binding_mode,
         )?;
         let profile = resource
             .profile_id
@@ -4418,15 +4440,15 @@ fn apply_provider_write_drafts(
                     .configured,
             ),
         };
+        let provider_type = crate::domain::providers::store::canonical_provider_type(
+            draft.app, &provider, &resource,
+        )
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
         let mut candidate = StoredProvider {
             app: draft.app,
             provider: provider.clone(),
-            provider_type: crate::domain::providers::model::classify_provider(draft.app, &provider),
-            provider_type_id: crate::domain::providers::model::classify_provider(
-                draft.app, &provider,
-            )
-            .as_str()
-            .to_string(),
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
             resource: resource.clone(),
         };
         validate_and_resolve_provider_binding(&mut candidate, existing.as_ref(), accounts)?;
@@ -4792,6 +4814,7 @@ fn resolve_provider_resource_metadata(
     requested_custom_binding: Option<crate::domain::providers::registry::CustomBindingInput>,
     client_request_id: Option<String>,
     existing: Option<&StoredProvider>,
+    binding_mode: ProviderBindingWriteMode,
 ) -> Result<ProviderResourceMetadata, ProviderCommandError> {
     let existing_profile_id = existing.and_then(|item| item.resource.profile_id.as_ref());
     if let (Some(existing_profile_id), Some(requested_profile_id)) =
@@ -4848,7 +4871,7 @@ fn resolve_provider_resource_metadata(
                     existing.and_then(|item| item.resource.custom_binding.as_ref()),
                     requested_custom_binding.as_ref(),
                 ) {
-                    if existing != requested {
+                    if existing != requested && binding_mode == ProviderBindingWriteMode::Ordinary {
                         return Err(ProviderCommandError::Conflict {
                             code: "cc_switch_provider_custom_binding_conflict",
                             message: "custom Provider protocol/auth binding is immutable in ordinary updates; use the explicit rebind-custom command".to_string(),
@@ -10441,242 +10464,6 @@ impl ServerStateInner {
             expected_revision,
             client_request_id,
             credential_patches,
-        })
-        .await
-    }
-
-    pub async fn upsert_provider_bundle_command(
-        self: &Arc<Self>,
-        draft: ProviderBundleWriteDraft,
-    ) -> anyhow::Result<Result<ProviderBundleView, ProviderCommandError>> {
-        let family = match draft.validate() {
-            Ok(family) => family,
-            Err(error) => return Ok(Err(ProviderCommandError::Invalid(error.to_string()))),
-        };
-        let credential_profile = profile_by_id(family.credential_profile_id.as_str())
-            .expect("Provider family credential profile is registry-validated");
-        let shared_static_credentials = family.surfaces.len() > 1
-            && matches!(
-                credential_profile.credential_policy,
-                CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. }
-            );
-        if matches!(
-            credential_profile.credential_policy,
-            CredentialPolicy::Custom
-                | CredentialPolicy::ManagedAccount { .. }
-                | CredentialPolicy::Legacy
-        ) && !draft.credential_patches.is_empty()
-        {
-            return Ok(Err(ProviderCommandError::Invalid(
-                "bundle credentialPatches are not supported by this Provider family".to_string(),
-            )));
-        }
-        if shared_static_credentials
-            && draft
-                .surfaces
-                .iter()
-                .any(|surface| !surface.credential_patches.is_empty())
-        {
-            return Ok(Err(ProviderCommandError::Invalid(
-                "shared Provider credentials must be submitted at Bundle scope".to_string(),
-            )));
-        }
-        let credential_source = match credential_source_app(family) {
-            Ok(app) => app,
-            Err(error) => return Ok(Err(ProviderCommandError::Invalid(error.to_string()))),
-        };
-        if !draft
-            .surfaces
-            .iter()
-            .any(|surface| surface.app == credential_source)
-        {
-            return Ok(Err(ProviderCommandError::Invalid(
-                "Provider Bundle credential source Surface is missing".to_string(),
-            )));
-        }
-
-        let mut provider_drafts = Vec::with_capacity(draft.surfaces.len());
-        for surface in &draft.surfaces {
-            let mut credential_patches = surface.credential_patches.clone();
-            if shared_static_credentials || family.surfaces.len() == 1 {
-                for (slot, patch) in &draft.credential_patches {
-                    if credential_patches
-                        .insert(slot.clone(), patch.clone())
-                        .is_some()
-                    {
-                        return Ok(Err(ProviderCommandError::Invalid(format!(
-                            "credential patch slot {slot} is repeated at Bundle and Surface scope"
-                        ))));
-                    }
-                }
-            }
-            let provider = match draft.provider_for_surface(surface) {
-                Ok(provider) => provider,
-                Err(error) => {
-                    return Ok(Err(ProviderCommandError::Invalid(error.to_string())));
-                }
-            };
-            provider_drafts.push(ProviderWriteDraft {
-                app: surface.app,
-                provider,
-                profile_id: Some(surface.profile_id.clone()),
-                custom_binding: surface.custom_binding.clone(),
-                expected_revision: None,
-                client_request_id: draft
-                    .client_request_id
-                    .as_ref()
-                    .map(|request_id| format!("{request_id}:{}", surface.app.as_str())),
-                credential_patches,
-            });
-        }
-        let cursor_verified_identities = match self
-            .validate_cursor_api_key_provider_drafts(&provider_drafts, true)
-            .await
-        {
-            Ok(identities) => identities,
-            Err(error) => return Ok(Err(error)),
-        };
-        let bundle_id = draft.id.clone();
-        let family_id = draft.family_id.clone();
-        let expected_revision = draft.expected_revision;
-        let reference_guard = self.reference_mutations.clone().lock_owned().await;
-        let accounts = self.accounts.read().await.clone();
-        let shares = self.shares.read().await.clone();
-        self.commit_provider_change_under_reference_guard(reference_guard, move |store| {
-            if store.providers.iter().any(|stored| {
-                !is_explicit_bundle_surface(&stored.provider) && stored.provider.id == bundle_id
-            }) {
-                return Err(provider_management_id_conflict(&bundle_id));
-            }
-            let existing = store
-                .providers
-                .iter()
-                .filter(|stored| {
-                    is_explicit_bundle_surface(&stored.provider)
-                        && provider_bundle_id(&stored.provider) == Some(bundle_id.as_str())
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let actual_revision = existing
-                .iter()
-                .map(|stored| stored.resource.revision)
-                .max()
-                .unwrap_or_default();
-            let is_create_replay = !existing.is_empty()
-                && expected_revision.is_none()
-                && provider_drafts.iter().all(|draft| {
-                    draft
-                        .client_request_id
-                        .as_deref()
-                        .is_some_and(|request_id| {
-                            existing.iter().any(|stored| {
-                                stored.app == draft.app
-                                    && stored.resource.create_request_id.as_deref()
-                                        == Some(request_id)
-                            })
-                        })
-                });
-            match (existing.is_empty(), expected_revision) {
-                (true, Some(expected)) if expected != 0 => {
-                    return Err(provider_revision_conflict(expected, 0));
-                }
-                (false, None) if !is_create_replay => {
-                    return Err(ProviderCommandError::Conflict {
-                        code: "cc_switch_provider_revision_conflict",
-                        message: "expectedRevision is required when updating a Provider Bundle"
-                            .to_string(),
-                    });
-                }
-                (false, Some(expected)) if expected != actual_revision => {
-                    return Err(provider_revision_conflict(expected, actual_revision));
-                }
-                _ => {}
-            }
-            if existing.iter().any(|stored| {
-                stored
-                    .provider
-                    .extra
-                    .get("familyId")
-                    .and_then(Value::as_str)
-                    != Some(family_id.as_str())
-            }) {
-                return Err(ProviderCommandError::Conflict {
-                    code: "cc_switch_provider_bundle_family_conflict",
-                    message: "Provider Bundle family is immutable".to_string(),
-                });
-            }
-            let existing_apps = existing
-                .iter()
-                .map(|stored| stored.app)
-                .collect::<BTreeSet<_>>();
-            let requested_apps = provider_drafts
-                .iter()
-                .map(|provider| provider.app)
-                .collect::<BTreeSet<_>>();
-            if !existing.is_empty() && existing_apps != requested_apps {
-                return Err(ProviderCommandError::Conflict {
-                    code: "cc_switch_provider_bundle_surface_conflict",
-                    message: "Provider Bundle Surface set is immutable".to_string(),
-                });
-            }
-            for provider_draft in &mut provider_drafts {
-                provider_draft.expected_revision = existing
-                    .iter()
-                    .find(|stored| stored.app == provider_draft.app)
-                    .map(|stored| stored.resource.revision);
-            }
-            let current = store.clone();
-            let mut result = apply_provider_write_drafts(store, provider_drafts, &accounts)?;
-            result.1 |= apply_cursor_verified_identities(
-                store,
-                &mut result.0,
-                &current,
-                &cursor_verified_identities,
-            );
-            if result.1 {
-                let bundle_revision = actual_revision.saturating_add(1);
-                for surface in &mut result.0 {
-                    if surface.resource.revision == bundle_revision {
-                        continue;
-                    }
-                    surface.resource.revision = bundle_revision;
-                    *surface = store.upsert_with_resource(
-                        surface.app,
-                        surface.provider.clone(),
-                        surface.resource.clone(),
-                    );
-                }
-            }
-            validate_provider_bundle_field_scopes(
-                family,
-                &result.0,
-                &accounts,
-                store.runtime_defaults(),
-            )?;
-            if result.1 {
-                validate_ordinary_provider_subscription_change(
-                    &current, store, &accounts, &shares,
-                )?;
-            }
-            let views = result
-                .0
-                .iter()
-                .map(|stored| {
-                    ProviderView::from_stored_with_order_and_runtime(
-                        stored,
-                        store.provider_order_index(stored),
-                        compile_runtime_plan_with_defaults(
-                            stored,
-                            &accounts,
-                            store.runtime_defaults(),
-                        )
-                        .ok(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let bundle = ProviderBundleView::from_surface_views(views)
-                .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
-            Ok((bundle, result.1))
         })
         .await
     }

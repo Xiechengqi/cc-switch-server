@@ -9,19 +9,19 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "9fd57d318aac941a4b2aeb36c6e155d6a0710be117cd620033d2d17f0bc61315"
+      "sha256": "189b697d43a66c6b8f0524d2fed0fd772c41afaa49137765dc3d9e312a7260b0"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "6e045254d1b1049ed6d2ab92d6027e5eb481f980f69445d39b1ad1d6fae24114"
+      "sha256": "5140099eb116263e5a0f268bd9498ab68aa63856cb3468749db72ec64b2e0f7f"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "0d70a7cd75db4b08ba1becba1e956adf938485354fd19aa5b371b68c8f02a431"
+      "sha256": "6a37fbd63936d665b8715b2a98278fce9a975c13978594404cf3f5872cebd1c3"
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "3013f78d45b67c06a7122a1d766c63f3678d687a7c75927ad1cdf6e9b5e93017"
+      "sha256": "b116d22b966c759845b87547fc02bcb31218828428c44e5b4841dd24d95d2653"
     },
     {
       "path": "src/domain/providers/migrate.rs",
@@ -49,7 +49,11 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "56090234faf56c53bd37ecfde9bf9ea370755f08bae3355362a6483cfd36fbdb"
+      "sha256": "b41c9a813531bad67871a00c50abbb32d9ab1003647d23e68a64bb6fbabc8daf"
+    },
+    {
+      "path": "src/state/provider_bundle.rs",
+      "sha256": "13c03ca9cd3bb79676434df3ffcd9b70199708477802140b4555537ee5084f29"
     }
   ],
   "entries": [
@@ -134,6 +138,38 @@
       "evidence": [
         "src/api/invoke/dispatch.rs::update_providers_sort_order",
         "src/domain/providers/store.rs::update_sort_order"
+      ]
+    },
+    {
+      "id": "bundle-upsert",
+      "source": "src/api/providers.rs::create_provider_bundle|update_provider_bundle|src/api/invoke/dispatch.rs::upsert_provider_bundle",
+      "currentBehavior": "REST and Web runtime saves validate complete typed Bundle drafts and commit all Surfaces through one coordinator; ordinary updates reject binding changes, and creation retries preserve request identity and content checks",
+      "targetCommand": "retain provider_commands::upsert_provider_bundle over the shared commit coordinator",
+      "closePhase": "phase-3",
+      "closureStatus": "closed",
+      "risk": "a Bundle writer could split Surface revisions, accept an implicit protocol/auth rebind, or overwrite concurrent edits",
+      "evidence": [
+        "src/api/providers.rs::create_provider_bundle",
+        "src/api/providers.rs::update_provider_bundle",
+        "src/api/invoke/dispatch.rs::upsert_provider_bundle",
+        "src/state/provider_bundle.rs::upsert_provider_bundle_command",
+        "src/state/provider_bundle.rs::apply_bundle_candidate"
+      ]
+    },
+    {
+      "id": "bundle-rebind-custom",
+      "source": "src/api/providers.rs::rebind_custom_provider_bundle|src/api/invoke/dispatch.rs::rebind_custom_provider_bundle",
+      "currentBehavior": "requires the Provider write contract and an existing Custom Bundle; read-only preview binds the full draft and reference revisions to an HMAC token, and apply validates it inside one atomic Provider commit while returning only redacted views",
+      "targetCommand": "retain provider_commands::preview_rebind_custom_provider_bundle|apply_rebind_custom_provider_bundle",
+      "closePhase": "phase-3",
+      "closureStatus": "closed",
+      "risk": "a rebind could bypass identity protection, expose credentials, apply a stale preview, or partially update multi-App runtime bindings",
+      "evidence": [
+        "src/api/providers.rs::rebind_custom_provider_bundle_action",
+        "src/api/invoke/dispatch.rs::rebind_custom_provider_bundle",
+        "src/state/provider_bundle.rs::preview_rebind_custom_provider_bundle_command",
+        "src/state/provider_bundle.rs::apply_rebind_custom_provider_bundle_command",
+        "src/state/provider_bundle.rs::validate_provider_action_preview_token"
       ]
     },
     {

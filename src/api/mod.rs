@@ -351,6 +351,14 @@ pub fn app_router(state: ServerState) -> Router {
             "/api/provider-bundles/:id/delete-preview",
             get(provider_bundle_delete_preview),
         )
+        .route(
+            "/api/provider-bundles/:id/rebind-custom",
+            post(rebind_custom_provider_bundle),
+        )
+        .route(
+            "/api/provider-bundles/:id/share-preflight",
+            get(provider_bundle_share_preflight),
+        )
         .route("/api/providers", get(list_providers).post(create_provider))
         .route(
             "/api/providers/:id",

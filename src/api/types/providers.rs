@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::domain::health::ProviderHealth;
-use crate::domain::providers::bundle::{ProviderBundleReferencePreview, ProviderBundleView};
+use crate::domain::providers::bundle::{
+    ProviderBundleRebindPreview, ProviderBundleReferencePreview, ProviderBundleView,
+    ProviderBundleWriteDraft,
+};
 use crate::domain::providers::credentials::ProviderImportPreview;
 use crate::domain::providers::credentials::{
     CredentialPatch, ProviderAccountBindingMigrationPreview, ProviderIdentityChangePreview,
@@ -227,6 +230,25 @@ pub(in crate::api) struct RebindCustomProviderRequest {
     pub(in crate::api) credential_patches: BTreeMap<String, CredentialPatch>,
     #[serde(default)]
     pub(in crate::api) preview_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct RebindCustomProviderBundleRequest {
+    pub(in crate::api) mode: ProviderActionMode,
+    pub(in crate::api) bundle: ProviderBundleWriteDraft,
+    #[serde(default)]
+    pub(in crate::api) preview_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ProviderBundleRebindResponse {
+    pub(in crate::api) ok: bool,
+    pub(in crate::api) mode: ProviderActionMode,
+    pub(in crate::api) preview: ProviderBundleRebindPreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) bundle: Option<ProviderBundleView>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -15,6 +15,7 @@ import {
   UNLIMITED_PARALLEL_LIMIT,
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
+import i18n from "@/i18n";
 
 export interface ProviderBundleShareDraft {
   baseline?: {
@@ -254,6 +255,14 @@ export async function saveBundleShare(
     throw new Error(
       "Banked Reset lead time must be between 10 and 10080 minutes",
     );
+  }
+  if (draft.enabled) {
+    const preflight = await shareApi.preflightProviderBundleShare(bundleId);
+    if (!preflight.canShare) {
+      throw new Error(i18n.t(`providerBundle.sharePreflight.${preflight.reason ?? "resolution_failed"}`, {
+        defaultValue: "Unable to verify a common credential source. Check the enabled Apps' endpoints and credentials before sharing.",
+      }));
+    }
   }
   return shareApi.saveProviderBundleShare({
     expectedAccountCycle: Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle,

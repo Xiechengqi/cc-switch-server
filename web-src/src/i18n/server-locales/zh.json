@@ -396,6 +396,21 @@
     }
   },
   "providerBundle": {
+    "sharePreflight": {
+      "source_unverifiable": "无法验证多个 App 使用同一凭据源。请检查服务地址、认证方式和 Key；不能确认同源时，请拆分为独立供应商。",
+      "credential_mismatch": "多个 App 的 Key 或附加认证信息不一致，不能合并分享。请统一凭据，或拆分为独立供应商。",
+      "endpoint_mismatch": "多个 App 的上游服务或租户路径不一致，不能合并分享。请核对服务地址。",
+      "auth_mismatch": "多个 App 的认证载体不一致，不能确认使用同一凭据源。请核对认证方式和认证字段。",
+      "no_enabled_apps": "请至少启用一个 App 后再开启分享。",
+      "resolution_failed": "暂时无法验证供应商凭据源。请检查服务端状态后重试。"
+    },
+    "rebindTitle": "确认修改协议与认证方式",
+    "rebindConfirm": "确认并保存",
+    "rebindShares": "关联分享：{{count}} 个。保存后，新请求将使用新配置。",
+    "shareSaveFailed": "供应商已保存，但分享设置保存失败：{{error}}。可保留当前页面重试。",
+    "saveUncertainReadBack": "未收到保存结果，已回查服务端配置，当前填写内容已保留。请核对后重试；若提示版本冲突，请先保留输入，再重新打开供应商确认最新配置。",
+    "saveUncertain": "无法确认保存结果，且未能读取最新配置。当前填写内容已保留，请恢复连接并核对服务端状态后重试。",
+    "saveConflict": "配置或预览已发生变化，请刷新核对后重新保存：{{error}}",
     "apiKey": "API Key",
     "apiUrlUnavailable": "API 地址未配置",
     "appFilterAll": "全部 App",

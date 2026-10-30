@@ -13,7 +13,7 @@ use crate::domain::accounts::managers::{
 };
 use crate::domain::accounts::store::{effective_codex_workspace_id, Account, AccountStore};
 use crate::domain::providers::coding_plan::CodingPlanRoute;
-use crate::domain::providers::credentials::reveal_provider_credential;
+use crate::domain::providers::credentials::unique_runtime_credential;
 use crate::domain::providers::model::{AppKind, CodexImageToolStripPolicy, ProviderType};
 use crate::domain::providers::registry::{
     provider_registry, AuthScheme, OperationSupport, UpstreamProtocol,
@@ -540,49 +540,23 @@ impl ProviderExecution {
         slots: &[String],
         custom: bool,
     ) -> Result<String, ProxyError> {
-        let mut candidates = Vec::new();
-        for slot in slots {
-            if !slot.starts_with('/')
-                || self
-                    .plan
-                    .extra_headers
-                    .iter()
-                    .any(|header| header.credential_slot == *slot)
-                || (!custom && !static_credential_slot_allowed(self, slot))
-            {
-                continue;
-            }
-            if let Ok(value) = reveal_provider_credential(&self.stored.provider, slot) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    candidates.push((slot.as_str(), value.to_string()));
-                }
-            }
-        }
-
-        candidates.sort_by_key(|(slot, _)| credential_slot_priority(slot));
-        let mut unique = Vec::new();
-        for candidate in candidates {
-            if !unique.iter().any(|(_, value)| value == &candidate.1) {
-                unique.push(candidate);
-            }
-        }
-        match unique.as_slice() {
-            [] => Err(ProxyError::bad_request(if custom {
-                "custom Provider credential is not configured"
-            } else {
-                "Provider credential is not configured"
-            })),
-            [(_, value)] => Ok(value.clone()),
-            _ => Err(ProxyError::bad_request(format!(
-                "Provider has conflicting credentials in runtime slots: {}",
-                unique
-                    .iter()
-                    .map(|(slot, _)| *slot)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))),
-        }
+        let slots = slots.iter().filter(|slot| {
+            !self
+                .plan
+                .extra_headers
+                .iter()
+                .any(|header| header.credential_slot == **slot)
+                && (custom || static_credential_slot_allowed(self, slot))
+        });
+        unique_runtime_credential(&self.stored.provider, slots.map(String::as_str))
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?
+            .ok_or_else(|| {
+                ProxyError::bad_request(if custom {
+                    "custom Provider credential is not configured"
+                } else {
+                    "Provider credential is not configured"
+                })
+            })
     }
 
     fn append_extra_headers(&self, auth: &mut MaterializedAuth) -> Result<(), ProxyError> {
@@ -1268,15 +1242,6 @@ fn static_credential_slot_allowed(execution: &ProviderExecution, slot: &str) -> 
                 | "/settingsConfig/env/API_KEY"
         ),
     }
-}
-
-fn credential_slot_priority(slot: &str) -> (u8, &str) {
-    let priority = match slot {
-        "/settingsConfig/apiKey" => 0,
-        "/settingsConfig/auth/OPENAI_API_KEY" => 1,
-        _ => 2,
-    };
-    (priority, slot)
 }
 
 fn validate_custom_auth_header(name: &str) -> Result<(), ProxyError> {

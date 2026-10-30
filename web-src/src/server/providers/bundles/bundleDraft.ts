@@ -504,7 +504,7 @@ function surfaceFromResource(
         configuredMeta.codexRoutingHintEnabled,
     },
     customBinding:
-      resource?.customBinding ??
+      (resource?.customBinding ? { ...resource.customBinding } : undefined) ??
       (profile.formComposition === "custom"
         ? clone(DEFAULT_CUSTOM_BINDINGS[app])
         : undefined),

@@ -102,6 +102,34 @@ pub struct ProviderBundleReferencePreview {
     pub blocked: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBundleBindingChange {
+    pub app: AppKind,
+    pub before: CustomBindingInput,
+    pub after: CustomBindingInput,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBundleRuntimeChange {
+    pub before_fingerprint: Option<String>,
+    pub after_fingerprint: Option<String>,
+}
+
+/// Contains only redacted Provider views; credential patches never leave the command input.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBundleRebindPreview {
+    pub preview_token: String,
+    pub bundle_id: String,
+    pub source_revision: u64,
+    pub target: ProviderBundleView,
+    pub changes: Vec<ProviderBundleBindingChange>,
+    pub runtimes: BTreeMap<AppKind, ProviderBundleRuntimeChange>,
+    pub share_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderBundleWriteDraft {

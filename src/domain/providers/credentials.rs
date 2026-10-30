@@ -373,6 +373,51 @@ pub fn reveal_provider_credential(provider: &Provider, slot: &str) -> anyhow::Re
         .with_context(|| format!("Provider credential slot is not a string: {slot}"))
 }
 
+/// Resolve the single effective secret in an explicitly selected set of runtime
+/// slots. Aliases may repeat the same value; conflicting values fail closed.
+/// Sharing and inference must use this same rule, not choose different keys.
+pub fn unique_runtime_credential<'a>(
+    provider: &Provider,
+    slots: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<Option<String>> {
+    let mut candidates = slots
+        .into_iter()
+        .filter(|slot| slot.starts_with('/'))
+        .filter_map(|slot| {
+            reveal_provider_credential(provider, slot)
+                .ok()
+                .map(|value| (slot, value.trim().to_string()))
+        })
+        .filter(|(_, value)| !value.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(slot, _)| {
+        let priority = match *slot {
+            "/settingsConfig/apiKey" => 0,
+            "/settingsConfig/auth/OPENAI_API_KEY" => 1,
+            _ => 2,
+        };
+        (priority, *slot)
+    });
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.iter().any(|(_, value)| value == &candidate.1) {
+            unique.push(candidate);
+        }
+    }
+    match unique.as_slice() {
+        [] => Ok(None),
+        [(_, value)] => Ok(Some(value.clone())),
+        _ => anyhow::bail!(
+            "Provider has conflicting credentials in runtime slots: {}",
+            unique
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Splits a Provider into a committed redacted record and its credential slots.
 /// The returned slot values are still plaintext and must only be held while sealing
 /// or materializing one operation.

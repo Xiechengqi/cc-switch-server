@@ -53,6 +53,19 @@ beforeEach(() => {
 });
 
 describe("providersApi coding-plan quota", () => {
+  it("uses preview and apply commands that work through client tunnels", async () => {
+    const bundle = { id: "custom", expectedRevision: 1 } as Parameters<typeof providersApi.upsertBundle>[0];
+    runtimeMocks.invokeCommand.mockResolvedValueOnce({ preview: { previewToken: "preview" } });
+    await expect(providersApi.previewBundleRebind(bundle)).resolves.toEqual({ previewToken: "preview" });
+    expect(runtimeMocks.invokeCommand).toHaveBeenLastCalledWith(
+      "rebind_custom_provider_bundle", { mode: "preview", bundle }, { cache: "no-store" },
+    );
+    runtimeMocks.invokeCommand.mockResolvedValueOnce({ bundle });
+    await expect(providersApi.applyBundleRebind(bundle, "preview")).resolves.toBe(bundle);
+    expect(runtimeMocks.invokeCommand).toHaveBeenLastCalledWith(
+      "rebind_custom_provider_bundle", { mode: "apply", bundle, previewToken: "preview" }, { cache: "no-store" },
+    );
+  });
   it("reads quota through the client-tunnel-compatible invoke command", async () => {
     await expect(
       providersApi.getCodingPlanQuota("codex", "coding-plan"),

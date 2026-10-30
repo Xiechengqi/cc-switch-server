@@ -1,5 +1,11 @@
 # Protocol evidence policy
 
+## 2026-10-30 Custom 多 App 分享凭据来源
+
+本次依据目标 Server 的只读版本和脱敏 S2 Provider 配置，以及本仓库既有分享校验、转发认证和 URL 拼接规则；没有研究或运行外部 Provider 项目，也没有解密生产 Key、发起真实推理或部署服务。故障配置启用了两个 Custom Surface、停用了第三个，两个启用项分别使用服务根地址和标准 `/v1` 地址、均采用 Bearer；旧解析器在比较实际凭据前就因 Surface 存储作用域返回不可复用，不能据此推断生产两端 Key 一致或上游实际支持所有协议。
+
+Server 现将独立存储与来源验证分离：仅在服务/租户范围、实际认证载体、唯一主凭据及具名附加认证头都相符时允许多 App 分享。终端协议版本和尾斜杠做有限规范化，未知路径语义与 query/fragment/userinfo/编码路径不当作同源证据；不增加厂商域名特例。转发与分享共用唯一凭据解析规则，冲突别名拒绝。公开预检只返回可用性和固定原因，匿名容量仍使用本地根密钥 HMAC；既有官方来源算法和 Router 线格式不变。本地正负例、原子轮换、重绑定和重启测试不等于真实 Router 或自定义上游验收。
+
 ## 2026-10-26 账号重置周期：实现与证据门槛
 
 核对既有quota parser与生成`docs/provider/coverage.md`，展示resets_at还可能是账期/包到期，不能通用触发。实现只使用Codex明确604800秒共享窗（绝对优先、缺失才相对秒）、Claude共享seven_day（含同身份被动头），不将短窗/review/模型桶混为账号主周期。Codex HTTP/WS被动观测带provider revision/account incarnation/identity generation fence；WS仅接受当前WHAM风格形状，离线fixture不证明全部真实WS schema。

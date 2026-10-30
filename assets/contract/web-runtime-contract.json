@@ -367,6 +367,14 @@
       "notes": "Previews or applies a custom Provider protocol/auth binding change through the typed credential contract."
     },
     {
+      "name": "rebind_custom_provider_bundle",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/provider-bundles/:id/rebind-custom",
+      "notes": "Previews or atomically applies Custom Bundle protocol/auth changes with the full draft, revision and preview token."
+    },
+    {
       "name": "clone_provider_as_custom",
       "support": "native",
       "implemented": true,
@@ -1849,6 +1857,14 @@
       "implemented": true,
       "feature": "settings",
       "notes": "Server web runtime shim."
+    },
+    {
+      "name": "get_provider_bundle_share_preflight",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "GET /api/provider-bundles/:id/share-preflight",
+      "notes": "Read-only credential-source eligibility for enabled Bundle Surfaces; never returns credentials or capacity fingerprints. The save path revalidates under its reference mutation guard."
     },
     {
       "name": "save_provider_bundle_share",

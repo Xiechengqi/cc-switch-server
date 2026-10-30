@@ -70,6 +70,7 @@ import { normalizeManagedAuthProvider } from "@/lib/authBinding";
 import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
+import { HttpResponseError } from "@/lib/runtime";
 import {
   managedAccountKeys,
   shareKeys,
@@ -135,7 +136,6 @@ import {
   requiresPerAppModelPolicy,
   resolvePersistedCodexControlTarget,
   supportsPerAppModelPolicy,
-  toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
   updateSurfaceModel,
@@ -147,6 +147,13 @@ import {
   type ProviderBundleEditorDraft,
 } from "./bundleDraft";
 import { createDraftForSelectedFamily } from "./bundleDefaults";
+import {
+  applyBundleProviderSave,
+  BundleSaveUncertainError,
+  prepareBundleProviderSave,
+  reconcileBundleSaveDraft,
+  type BundleRebindConfirmation,
+} from "./bundleSave";
 import {
   bundleValidationFieldId,
   firstBundleValidationIssue,
@@ -1316,6 +1323,12 @@ export function ProviderBundleEditor({
   );
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
+  const savedBundleRef = useRef<ProviderBundleView | undefined>(
+    bundle && !duplicate ? bundle : undefined,
+  );
+  const [rebindConfirmation, setRebindConfirmation] =
+    useState<BundleRebindConfirmation | null>(null);
+  const [shareSavePending, setShareSavePending] = useState(false);
   const [requestDefaults, setRequestDefaults] =
     useState<ProviderRequestDefaults | null>(null);
   const [healthCheckConfig, setHealthCheckConfig] =
@@ -1349,9 +1362,11 @@ export function ProviderBundleEditor({
   const shareBaselineRef = useRef(stableStringify(shareDraft));
   const shareDirtyRef = useRef(false);
   const shareDirty = stableStringify(shareDraft) !== shareBaselineRef.current;
-  shareDirtyRef.current = shareDirty;
+  shareDirtyRef.current = shareDirty || shareSavePending;
   const dirty =
-    stableStringify(draft) !== draftBaselineRef.current || shareDirty;
+    stableStringify(draft) !== draftBaselineRef.current ||
+    shareDirty ||
+    shareSavePending;
   const closeGuard = useUnsavedChangesGuard({
     active: true,
     dirty: dirty && !saving,
@@ -1710,7 +1725,7 @@ export function ProviderBundleEditor({
       }),
     }));
 
-  const submit = async () => {
+  const submit = async (confirmation?: BundleRebindConfirmation) => {
     if (savingRef.current) return;
     const nextValidation = firstBundleValidationIssue(draft);
     setValidation(nextValidation);
@@ -1748,14 +1763,26 @@ export function ProviderBundleEditor({
     }
     savingRef.current = true;
     setSaving(true);
+    let providerSaved = false;
     try {
-      const saved = bundle && !duplicate && stableStringify(draft) === draftBaselineRef.current
-        ? bundle : await providersApi.upsertBundle(
-        toProviderBundleWriteDraft(draft),
-      );
+      const result = confirmation
+        ? {
+            kind: "saved" as const,
+            bundle: await applyBundleProviderSave(draft, confirmation),
+          }
+        : await prepareBundleProviderSave(draft, savedBundleRef.current);
+      if (result.kind === "confirm") {
+        setRebindConfirmation(result.confirmation);
+        return;
+      }
+      const saved = result.bundle;
+      providerSaved = true;
+      savedBundleRef.current = saved;
+      setRebindConfirmation(null);
       const savedDraft = editProviderBundleDraft(saved);
       setDraft(savedDraft);
       draftBaselineRef.current = stableStringify(savedDraft);
+      setShareSavePending(true);
       const savedShare = await saveBundleShare(
         saved.id,
         shareDraft,
@@ -1765,7 +1792,9 @@ export function ProviderBundleEditor({
         ? createBundleShareDraft(savedShare)
         : shareDraft;
       shareBaselineRef.current = stableStringify(savedShareDraft);
-      await Promise.all([
+      setShareDraft(savedShareDraft);
+      setShareSavePending(false);
+      await Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
         queryClient.invalidateQueries({ queryKey: managedAccountKeys.all }),
@@ -1775,12 +1804,38 @@ export function ProviderBundleEditor({
       );
       onSaved(saved);
     } catch (error) {
+      setRebindConfirmation(null);
+      if (error instanceof BundleSaveUncertainError && error.latest) {
+        const latest = error.latest;
+        const recovered = reconcileBundleSaveDraft(draft, latest);
+        if (recovered) {
+          savedBundleRef.current = latest;
+          draftBaselineRef.current = stableStringify(
+            editProviderBundleDraft(latest),
+          );
+          setDraft(recovered);
+          setShareSavePending(true);
+        }
+      }
       await Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
         queryClient.invalidateQueries({ queryKey: managedAccountKeys.all }),
       ]);
-      toast.error(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      toast.error(
+        providerSaved
+          ? t("providerBundle.shareSaveFailed", { error: message })
+          : error instanceof BundleSaveUncertainError
+            ? t(
+                error.latest
+                  ? "providerBundle.saveUncertainReadBack"
+                  : "providerBundle.saveUncertain",
+              )
+            : error instanceof HttpResponseError && error.status === 409
+              ? t("providerBundle.saveConflict", { error: message })
+              : message,
+      );
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -3004,6 +3059,23 @@ export function ProviderBundleEditor({
           </Button>
         )}
       </div>
+      <ConfirmDialog
+        isOpen={rebindConfirmation !== null}
+        title={t("providerBundle.rebindTitle")}
+        message={rebindConfirmation ? [
+          ...rebindConfirmation.preview.changes.map((change) =>
+            `${APP_LABELS[change.app]}: ${protocolLabel(change.before.upstreamProtocol)} / ${authSchemeLabel(change.before.authScheme)} → ${protocolLabel(change.after.upstreamProtocol)} / ${authSchemeLabel(change.after.authScheme)}`,
+          ),
+          t("providerBundle.rebindShares", { count: rebindConfirmation.preview.shareIds.length }),
+        ].join("\n\n") : ""}
+        confirmText={t("providerBundle.rebindConfirm")}
+        cancelText={t("common.cancel")}
+        confirmDisabled={saving}
+        variant="info"
+        zIndex="top"
+        onConfirm={() => rebindConfirmation ? submit(rebindConfirmation) : undefined}
+        onCancel={() => setRebindConfirmation(null)}
+      />
       <ConfirmDialog
         isOpen={modelScopeConfirmOpen}
         title={t("providerBundle.modelScopeMergeTitle")}
