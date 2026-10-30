@@ -121,6 +121,7 @@ import {
 } from "./bundleShare";
 import {
   applyCustomRecipeToBundleDraft,
+  automaticBundleProbeApp,
   BUNDLE_TEST_APP_ORDER,
   changeModelPolicyScope,
   customRecipeMatchesBundleDraft,
@@ -1987,12 +1988,13 @@ export function ProviderBundleEditor({
       .filter((surface) => surface.enabled)
       .map((surface) => APP_LABELS[surface.app])
       .join(" · ") || t("providerBundle.surfaceOff", { defaultValue: "关" });
-  const diagnosticsSummary = [
+  const automaticProbeApp = automaticBundleProbeApp(draft.surfaces);
+  const diagnosticsSummary = automaticProbeApp ? [
     APP_LABELS[draft.testApp],
     draft.testModel.trim() || healthCheckConfig?.testModels[draft.testApp],
   ]
     .filter(Boolean)
-    .join(" · ");
+    .join(" · ") : t("health.unsupported");
   const surfaceTestModelOverrides = enabledTestApps.filter((app) =>
     draft.surfaceTestModels[app]?.trim(),
   ).length;
@@ -2868,36 +2870,11 @@ export function ProviderBundleEditor({
                   <Label className="shrink-0">
                     {t("providerBundle.testApp")}
                   </Label>
-                  {enabledTestApps.length > 1 ? (
-                    <Tabs
-                      value={draft.testApp}
-                      onValueChange={(value) =>
-                        setDraft((current) => ({
-                          ...current,
-                          testApp: value as CoreProviderApp,
-                        }))
-                      }
-                    >
-                      <TabsList className="h-9 gap-1 border bg-muted/40 p-1">
-                        {enabledTestApps.map((app) => (
-                          <TabsTrigger
-                            key={app}
-                            value={app}
-                            className="h-7 gap-1.5 rounded-sm px-3 text-xs"
-                          >
-                            <AppLogo app={app} size={14} />
-                            {APP_LABELS[app]}
-                          </TabsTrigger>
-                        ))}
-                      </TabsList>
-                    </Tabs>
-                  ) : (
-                    <span className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-muted/40 px-3 text-xs font-medium">
-                      <AppLogo app={draft.testApp} size={14} />
-                      {APP_LABELS[draft.testApp]}
-                    </span>
-                  )}
+                  <span className="inline-flex h-9 items-center gap-1.5 rounded-md border bg-muted/40 px-3 text-xs font-medium">
+                    {automaticProbeApp ? <><AppLogo app={automaticProbeApp} size={14} />{APP_LABELS[automaticProbeApp]}</> : t("health.unsupported")}
+                  </span>
                 </div>
+                <p className="text-xs text-muted-foreground">{t("providerBundle.automaticProbeHint")}</p>
 
                 <div className="space-y-1.5">
                   <Label htmlFor="provider-bundle-test-model">
@@ -2907,6 +2884,7 @@ export function ProviderBundleEditor({
                   </Label>
                   <Input
                     id="provider-bundle-test-model"
+                    disabled={!automaticProbeApp}
                     value={draft.testModel}
                     placeholder={healthCheckConfig?.testModels[draft.testApp]}
                     className="focus:placeholder:text-transparent"

@@ -8167,8 +8167,10 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
         json!(["claude", "codex", "gemini"])
     );
     assert_eq!(created["enabledApps"], created["supportedApps"]);
-    assert_eq!(created["testApp"], "claude");
-    assert_eq!(created["testModel"], "grok-4.6");
+    // The legacy draft's manual Claude choice cannot override the automatic
+    // Codex priority or carry its model override across interfaces.
+    assert_eq!(created["testApp"], "codex");
+    assert!(created["testModel"].is_null());
     assert_eq!(created["credentialConfigured"], true);
     assert_eq!(
         created["surfaces"].as_object().map(|value| value.len()),
@@ -8186,9 +8188,19 @@ async fn provider_bundle_contract_is_atomic_idempotent_revisioned_and_shareable(
             created["surfaces"][provider_app]["runtime"]["modelPolicy"],
             json!({"mode": "single", "upstreamModel": "grok-4.6"})
         );
+        let defaults = state
+            .config_snapshot()
+            .await
+            .provider_health_check
+            .test_models;
+        let app = match provider_app {
+            "claude" => AppKind::Claude,
+            "codex" => AppKind::Codex,
+            _ => AppKind::Gemini,
+        };
         assert_eq!(
             created["surfaces"][provider_app]["runtime"]["testModel"],
-            "grok-4.6"
+            defaults.for_app(app)
         );
         assert!(
             !serde_json::to_string(&created["surfaces"][provider_app]["runtime"])

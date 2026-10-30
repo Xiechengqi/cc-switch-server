@@ -232,17 +232,36 @@ export const BUNDLE_TEST_APP_ORDER: CoreProviderApp[] = [
   "gemini",
 ];
 
+export function automaticBundleProbeApp(
+  surfaces: BundleSurfaceEditorDraft[],
+): CoreProviderApp | undefined {
+  return BUNDLE_TEST_APP_ORDER.find((app) =>
+    surfaces.some((surface) => {
+      if (surface.app !== app || !surface.enabled) return false;
+      const profile = profileById(surface.profileId);
+      if (!profile) return false;
+      const fixed = driverForProfile(profile);
+      if (fixed) return fixed.operations.test === "supported";
+      const policy = customPolicyForProfile(profile);
+      const binding = surface.customBinding;
+      return !!binding && !!policy && providerRegistry.drivers.some((driver) =>
+        policy.allowedDriverIds.includes(driver.driverId) &&
+        driver.upstreamProtocol === binding.upstreamProtocol &&
+        driver.acceptedAuthSchemes.includes(binding.authScheme) &&
+        driver.operations.test === "supported");
+    }),
+  );
+}
+
 export function defaultBundleTestApp(
-  family: ProviderFamilySpec,
+  _family: ProviderFamilySpec,
   surfaces: BundleSurfaceEditorDraft[],
 ): CoreProviderApp {
   const enabledApps = new Set(
     surfaces.filter((surface) => surface.enabled).map((surface) => surface.app),
   );
-  if (family.familyId === "family.openai_oauth" && enabledApps.has("codex")) {
-    return "codex";
-  }
   return (
+    automaticBundleProbeApp(surfaces) ??
     BUNDLE_TEST_APP_ORDER.find((app) => enabledApps.has(app)) ??
     BUNDLE_TEST_APP_ORDER.find((app) =>
       surfaces.some((surface) => surface.app === app),
@@ -254,17 +273,10 @@ export function defaultBundleTestApp(
 export function normalizeBundleTestApp(
   draft: ProviderBundleEditorDraft,
 ): ProviderBundleEditorDraft {
-  if (
-    draft.surfaces.some(
-      (surface) => surface.app === draft.testApp && surface.enabled,
-    )
-  ) {
-    return draft;
-  }
   const family = familyById(draft.familyId);
-  return family
-    ? { ...draft, testApp: defaultBundleTestApp(family, draft.surfaces) }
-    : draft;
+  if (!family) return draft;
+  const testApp = defaultBundleTestApp(family, draft.surfaces);
+  return testApp === draft.testApp ? draft : { ...draft, testApp, testModel: "" };
 }
 
 function sourceSurface(
@@ -759,8 +771,8 @@ export function editProviderBundleDraft(
       : bundle.modelPolicyScope,
     modelPolicy: model.policy,
     upstreamModel: model.upstreamModel,
-    testApp: bundle.testApp,
-    testModel: bundle.testModel ?? "",
+    testApp: defaultBundleTestApp(family, surfaces),
+    testModel: bundle.testApp === defaultBundleTestApp(family, surfaces) ? bundle.testModel ?? "" : "",
     surfaceTestModels: {
       claude: bundle.surfaceTestModels.claude ?? "",
       codex: bundle.surfaceTestModels.codex ?? "",
@@ -1163,13 +1175,6 @@ export function validateProviderBundleDraftIssue(
       "Enable at least one API Surface",
     );
   }
-  if (
-    !draft.surfaces.some(
-      (surface) => surface.app === draft.testApp && surface.enabled,
-    )
-  ) {
-    return issue("testAppDisabled", "testApp", "Test App must be enabled");
-  }
   if (draft.testModel.trim().length > 256) {
     return issue("testModelTooLong", "testModel", "Test model is too long");
   }
@@ -1444,6 +1449,7 @@ export function validateProviderBundleDraft(
 export function toProviderBundleWriteDraft(
   draft: ProviderBundleEditorDraft,
 ): ProviderBundleWriteDraft {
+  draft = normalizeBundleTestApp(draft);
   const family = familyById(draft.familyId);
   if (!family) throw new Error(`Unknown family ${draft.familyId}`);
   const identity = providerBundleIdentityEditable(family)

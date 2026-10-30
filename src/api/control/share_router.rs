@@ -245,6 +245,16 @@ async fn share_router_model_health_batch_inner(
             );
             continue;
         };
+        if !crate::domain::sharing::model_health::automatic_share_probe(&share, &providers)
+            .is_some_and(|selected| selected.app == app && selected.provider.id == provider_id)
+        {
+            tracing::warn!(
+                share_id,
+                app = app.as_str(),
+                "omitted non-canonical automatic Share probe target"
+            );
+            continue;
+        }
         targets.push(
             crate::api::provider_health_scheduler::BatchShareBindingTarget { share, provider },
         );

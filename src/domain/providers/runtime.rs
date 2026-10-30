@@ -1257,7 +1257,18 @@ fn runtime_test_model(
     defaults: &ProviderRuntimeDefaults,
 ) -> Option<String> {
     let model = non_empty_value(stored.provider.settings_config.get("testModel"))
-        .or_else(|| super::bundle::bundle_test_model_override(&stored.provider).map(str::to_string))
+        .or_else(|| {
+            // Bundle overrides belong to the App that originally authored them.
+            (super::bundle::bundle_id(&stored.provider).is_none()
+                || super::bundle::bundle_test_app(&stored.provider)
+                    .ok()
+                    .flatten()
+                    == Some(stored.app))
+            .then(|| {
+                super::bundle::bundle_test_model_override(&stored.provider).map(str::to_string)
+            })
+            .flatten()
+        })
         .or_else(|| {
             (!profiled)
                 .then(|| {
@@ -2102,6 +2113,27 @@ mod tests {
         assert_ne!(
             inherited.health_fingerprint(),
             provider_override.health_fingerprint()
+        );
+
+        stored
+            .provider
+            .extra
+            .insert("bundleId".to_string(), json!("bundle"));
+        stored
+            .provider
+            .extra
+            .insert("testApp".to_string(), json!("claude"));
+        assert_eq!(
+            runtime_test_model(&stored, true, &defaults).as_deref(),
+            Some("server-codex")
+        );
+        stored
+            .provider
+            .extra
+            .insert("testApp".to_string(), json!("codex"));
+        assert_eq!(
+            runtime_test_model(&stored, true, &defaults).as_deref(),
+            Some("provider-codex")
         );
 
         stored.provider.settings_config["testModel"] = json!("surface-codex");

@@ -5193,11 +5193,10 @@ fn provider_share_projection_signature(
     let model_policy_source = bundle_model_policy_source(&stored.provider, profile)
         .map(|source| source.as_str().to_string())
         .unwrap_or_else(|error| format!("invalid:{error}"));
-    let test_app = match bundle_test_app(&stored.provider) {
-        Ok(Some(app)) => app.as_str().to_string(),
-        Ok(None) => "none".to_string(),
-        Err(error) => format!("invalid:{error}"),
-    };
+    let test_app = provider_bundle_id(&stored.provider)
+        .and_then(|id| crate::domain::providers::probe::bundle_probe_app(store, id))
+        .map(|app| app.as_str().to_string())
+        .unwrap_or_else(|| "none".to_string());
     Some((
         stored.resource.revision,
         runtime_fingerprint,
@@ -5265,17 +5264,24 @@ fn apply_bundle_surface_support(
             .then(|| bundle_family_id(&stored.provider).map(str::to_string))
             .flatten()
     });
-    let current_test_app = store.providers.iter().find_map(|stored| {
-        (provider_bundle_id(&stored.provider) == Some(bundle_id))
-            .then(|| bundle_test_app(&stored.provider).ok().flatten())
-            .flatten()
-    });
-    let next_test_app = match current_test_app {
-        Some(app) if enabled.contains(&app) => Some(app),
-        _ => family_id.as_deref().and_then(|family_id| {
+    let next_test_app = crate::domain::providers::probe::automatic_probe_app(|app| {
+        enabled.contains(&app)
+            && store.providers.iter().any(|stored| {
+                stored.app == app
+                    && provider_bundle_id(&stored.provider) == Some(bundle_id)
+                    && stored.resource.profile_id.as_ref().is_some_and(|id| {
+                        crate::domain::providers::probe::profile_id_supports_probe(
+                            id.as_str(),
+                            stored.resource.custom_binding.as_ref(),
+                        )
+                    })
+            })
+    })
+    .or_else(|| {
+        family_id.as_deref().and_then(|family_id| {
             default_enabled_test_app(family_id, &enabled.iter().copied().collect::<Vec<_>>())
-        }),
-    };
+        })
+    });
     let mut next_revision = 0u64;
     let mut needs_write = false;
     for stored in &store.providers {
@@ -27767,10 +27773,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             provider_share_projection_changes(&before, &test_app_changed),
-            BTreeSet::from([
-                (AppKind::Claude, "scope-change-bundle".to_string()),
-                (AppKind::Codex, "scope-change-bundle".to_string()),
-            ])
+            BTreeSet::new()
         );
 
         let mut test_model_changed = before.clone();
@@ -27789,10 +27792,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             provider_share_projection_changes(&before, &test_model_changed),
-            BTreeSet::from([
-                (AppKind::Claude, "scope-change-bundle".to_string()),
-                (AppKind::Codex, "scope-change-bundle".to_string()),
-            ])
+            BTreeSet::from([(AppKind::Claude, "scope-change-bundle".to_string())])
         );
     }
 

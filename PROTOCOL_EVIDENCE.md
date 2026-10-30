@@ -2415,3 +2415,13 @@ CORE-03现已覆盖本轮八类声明的Provider白名单与协议入口，具�
 原readiness以RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0、空EVIDENCE_FILE执行，实际退出1、not-ready。当前Router四处合同问题仍为locale-provider.tsx/market_fx.rs退役端点、models.rs缺Share Contract v8 reader constant、market_billing.rs缺保留Market能力；八项真实输入缺失，local-contracts-unverified和deployment-not-tested保持。未修改外仓或削弱门禁；本地独立全量通过不能改写readiness结果。
 
 全部R4编号的实现/差分决定及风险回退已在增强计划§20.11逐项复核，离线交付完成；所有真实rail/site/operation继续live_pending，候选能力仍按原disabled/conditional门禁，implementationCommit=null。没有覆盖历史observation或伪造提交态，也未提交、推送、调用子代理、执行外仓代码、做UI自动化或部署测试。
+
+## 2026-10-30 自动健康检查统一代表接口
+
+本次依据 Server/Router 当前实现和远程只读配置、健康记录排查：旧 Bundle 保存 `testApp=claude` 时，Server 本地 scheduler 检查 Claude，而 Router 按固定优先级检查 Codex；原 `(App, Provider ID)` 覆盖去重无法跨接口消除这两次请求。健康结果列表同时接收本地与 Router 来源，不能等同于半小时日历存在两个槽。上游 `free_campaign_global_limit` 为真实 429 限流，统一监测不能证明该上游限制消失。未新增外部 Provider 仓库依赖。
+
+Server 与 Router 统一 Codex → Claude → Gemini，按 Share 自身启用、有效绑定与探针能力选一个 App，不以健康失败触发降级。旧 `testApp` 保留兼容但只读派生；原接口的测试模型不跨 App 迁移。Provider 锁内重校验排队目标并持久化结果，同 UTC 半小时和 health fingerprint 的原始本地 scheduled 结果可供 Router 复用，手动/确认结果不冒充 canonical cycle。保留真实来源、旧健康历史、同接口重试和瞬态确认。覆盖文档由本仓审计脚本生成。验证范围限本地代码、回环请求和离线契约，不代表远程部署或上游真实验收。
+
+最终验证针对当前两个未提交工作树：Server `cargo fmt --check`、`cargo check`、完整 `cargo test`（4,080 通过、3 忽略）、`cargo build`、严格全目标 Clippy 和 `scripts/static-checks.sh` 均通过；后者含 Node 审计 1,914 项及 smoke 脚本测试 13 项。Web 全量 267 项、类型检查与生产构建通过，已更新内嵌资产。Router 格式、编译、健康检查契约审计及完整 Rust 1,684 项均通过。新二进制本地 smoke 通过，临时配置和监听端口已清理。
+
+整体 review 核对固定顺序、Share 范围、同运行时/同槽复用、指纹隔离、执行锁与持久化顺序、旧模型归属和非 Bundle 兼容；已纠正排队目标失效及不支持探测的展示边界，并用本地先执行、Router 先执行、并发、重放、模型/槽变化回归验证。Provider 源码摘要由生成器更新，没有放宽审计。Router 原有四处前端及未跟踪文件改动保持不变。本轮未提交、推送或部署；离线 readiness 为 `failures=0`、`blocked_inputs`，真实凭据、真实部署和人工 UI 验收仍不宣称通过。

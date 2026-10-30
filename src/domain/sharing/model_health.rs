@@ -6,9 +6,9 @@ use crate::domain::accounts::store::{
     AccountUsageBlock,
 };
 use crate::domain::health::ProviderHealthStatus;
-use crate::domain::providers::bundle::bundle_test_app;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
+use crate::domain::providers::probe::{automatic_probe_app, provider_has_probe};
 use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
@@ -58,7 +58,11 @@ pub fn summary_for_share(
     usage: Option<&UsageStore>,
 ) -> ShareModelHealthSummary {
     let mut summary = ShareModelHealthSummary::default();
+    let selected = automatic_share_probe(share, providers).map(|provider| provider.app);
     for (app, provider_id) in share_bindings(share) {
+        if selected != Some(app) {
+            continue;
+        }
         let Some(provider) = providers
             .providers
             .iter()
@@ -66,21 +70,6 @@ pub fn summary_for_share(
         else {
             continue;
         };
-        match bundle_test_app(&provider.provider) {
-            Ok(Some(test_app)) if test_app != app => continue,
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    share_id = %share.id,
-                    app = app.as_str(),
-                    provider_id = %provider.provider.id,
-                    error = %error,
-                    "skipped malformed Provider Bundle model health summary"
-                );
-                continue;
-            }
-        }
-
         let result = if let Some(block) = quota_block_for_share_provider(share, provider, accounts)
         {
             Some(quota_blocked_result(
@@ -101,6 +90,32 @@ pub fn summary_for_share(
         }
     }
     summary
+}
+
+/// The same eligibility used by Router's fixed-priority selection. Health and
+/// quota failures are observations, not reasons to switch to another App.
+pub fn automatic_share_probe<'a>(
+    share: &Share,
+    providers: &'a ProviderStore,
+) -> Option<&'a StoredProvider> {
+    let bindings = share_bindings(share);
+    let app = automatic_probe_app(|app| {
+        crate::domain::sharing::shares::share_app_api_enabled(share, app)
+            && bindings.iter().any(|(bound_app, id)| {
+                *bound_app == app
+                    && providers.providers.iter().any(|provider| {
+                        provider.app == app
+                            && provider.provider.id == *id
+                            && provider_has_probe(providers, provider)
+                    })
+            })
+    })?;
+    providers.providers.iter().find(|provider| {
+        provider.app == app
+            && bindings
+                .iter()
+                .any(|(bound_app, id)| *bound_app == app && provider.provider.id == *id)
+    })
 }
 
 fn provider_snapshot_result(

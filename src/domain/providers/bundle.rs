@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 use super::credentials::{CredentialPatch, ProviderView};
 use super::model::{AppKind, Provider, ProviderMeta};
 use super::model_routing::normalize_and_validate_provider_model_routing;
+use super::probe::{automatic_probe_app, profile_id_supports_probe};
 use super::registry::{
     family_by_id, family_for_profile, profile_by_id, provider_registry, resolve_custom_binding,
     AuthScheme, CredentialPolicy, CredentialSourceScope, CustomBindingInput, DriverBinding,
@@ -169,6 +170,8 @@ pub struct ProviderBundleWriteDraft {
     pub model_policy: Option<ModelPolicyKind>,
     #[serde(default)]
     pub upstream_model: Option<String>,
+    /// Legacy wire field. Automatic selection is derived from enabled Surfaces.
+    #[serde(default = "default_legacy_test_app")]
     pub test_app: AppKind,
     #[serde(default)]
     pub test_model: Option<String>,
@@ -264,6 +267,26 @@ pub struct ProviderBundleSurfaceWriteDraft {
 }
 
 impl ProviderBundleWriteDraft {
+    pub fn automatic_test_app(&self) -> Option<AppKind> {
+        automatic_probe_app(|app| {
+            self.surfaces.iter().any(|surface| {
+                surface.app == app
+                    && surface.enabled
+                    && profile_id_supports_probe(
+                        surface.profile_id.as_str(),
+                        surface.custom_binding.as_ref(),
+                    )
+            })
+        })
+        .or_else(|| {
+            automatic_probe_app(|app| {
+                self.surfaces
+                    .iter()
+                    .any(|surface| surface.app == app && surface.enabled)
+            })
+        })
+    }
+
     pub fn validate(&self) -> anyhow::Result<&'static ProviderFamilySpec> {
         validate_bundle_id(&self.id)?;
         if self.name.trim().is_empty() || self.name != self.name.trim() {
@@ -350,9 +373,18 @@ impl ProviderBundleWriteDraft {
         );
         extra.insert(
             TEST_APP_FIELD.to_string(),
-            Value::String(self.test_app.as_str().to_string()),
+            Value::String(
+                self.automatic_test_app()
+                    .context("Provider Bundle has no enabled Surface")?
+                    .as_str()
+                    .to_string(),
+            ),
         );
-        insert_optional_string(&mut extra, TEST_MODEL_FIELD, self.test_model.as_deref());
+        // An old client may still submit its manually chosen App. Never move
+        // that App's model override to a different automatically selected App.
+        if self.automatic_test_app() == Some(self.test_app) {
+            insert_optional_string(&mut extra, TEST_MODEL_FIELD, self.test_model.as_deref());
+        }
         let mut settings = Map::new();
         settings.insert(
             "modelMapping".to_string(),
@@ -484,24 +516,6 @@ impl ProviderBundleWriteDraft {
     }
 
     fn validate_test_configuration(&self, family: &ProviderFamilySpec) -> anyhow::Result<()> {
-        if !family
-            .surfaces
-            .iter()
-            .any(|surface| surface.app == self.test_app)
-        {
-            bail!(
-                "Provider family {} does not support the selected test App {}",
-                family.family_id,
-                self.test_app.as_str()
-            );
-        }
-        if !self
-            .surfaces
-            .iter()
-            .any(|surface| surface.app == self.test_app && surface.enabled)
-        {
-            bail!("Provider Bundle test App must be enabled");
-        }
         if normalized_optional_string(self.test_model.as_deref())
             .is_some_and(|test_model| test_model.len() > 256)
         {
@@ -979,8 +993,7 @@ impl ProviderBundleView {
         let name = first.provider.name.clone();
         let model_policy_scope = bundle_model_policy_scope(&first.provider)?
             .context("Provider Bundle Surface has no model policy scope")?;
-        let test_app =
-            bundle_test_app(&first.provider)?.context("Provider Bundle Surface has no test App")?;
+        let legacy_test_app = bundle_test_app(&first.provider).ok().flatten();
         let test_model = bundle_test_model_override(&first.provider).map(str::to_string);
         let transport = provider_transport_override(&first.provider)?;
         let mut revision = 0u64;
@@ -993,7 +1006,6 @@ impl ProviderBundleView {
                 || family_id_for_view(&view)? != family_id
                 || view.provider.name != name
                 || bundle_model_policy_scope(&view.provider)? != Some(model_policy_scope)
-                || bundle_test_app(&view.provider)? != Some(test_app)
                 || bundle_test_model_override(&view.provider) != test_model.as_deref()
                 || provider_transport_override(&view.provider)? != transport
             {
@@ -1020,9 +1032,23 @@ impl ProviderBundleView {
         if actual_apps != expected_apps {
             bail!("Provider Bundle does not contain its complete Surface set");
         }
-        if !enabled_apps.contains(&test_app) {
-            bail!("Provider Bundle test App is not enabled");
-        }
+        let test_app = automatic_probe_app(|app| {
+            surfaces.get(&app).is_some_and(|view| {
+                enabled_apps.contains(&app)
+                    && profile_id_supports_probe(
+                        view.profile_id
+                            .as_ref()
+                            .map(|id| id.as_str())
+                            .unwrap_or_default(),
+                        view.custom_binding.as_ref(),
+                    )
+            })
+        })
+        .or_else(|| automatic_probe_app(|app| enabled_apps.contains(&app)))
+        .context("Provider Bundle has no enabled Surface")?;
+        let test_model = (legacy_test_app == Some(test_app))
+            .then_some(test_model)
+            .flatten();
         let supported_apps = family.surfaces.iter().map(|surface| surface.app).collect();
         let credential_profile = profile_by_id(family.credential_profile_id.as_str())
             .with_context(|| {
@@ -1189,19 +1215,21 @@ pub fn set_surface_enabled(provider: &mut Provider, enabled: bool) {
 }
 
 pub fn set_bundle_test_app(provider: &mut Provider, app: AppKind) {
+    if bundle_test_app(provider).ok().flatten() != Some(app) {
+        provider.extra.remove(TEST_MODEL_FIELD);
+    }
     provider.extra.insert(
         TEST_APP_FIELD.to_string(),
         Value::String(app.as_str().to_string()),
     );
 }
 
-pub fn default_enabled_test_app(family_id: &str, enabled: &[AppKind]) -> Option<AppKind> {
-    if family_id == "family.openai_oauth" && enabled.contains(&AppKind::Codex) {
-        return Some(AppKind::Codex);
-    }
-    [AppKind::Codex, AppKind::Claude, AppKind::Gemini]
-        .into_iter()
-        .find(|app| enabled.contains(app))
+pub fn default_enabled_test_app(_family_id: &str, enabled: &[AppKind]) -> Option<AppKind> {
+    automatic_probe_app(|app| enabled.contains(&app))
+}
+
+fn default_legacy_test_app() -> AppKind {
+    AppKind::Codex
 }
 
 pub fn credential_source_app(family: &ProviderFamilySpec) -> anyhow::Result<AppKind> {
@@ -1414,15 +1442,18 @@ mod tests {
     }
 
     #[test]
-    fn bundle_rejects_a_disabled_test_app() {
+    fn bundle_ignores_legacy_test_app_and_derives_an_enabled_app() {
         let mut draft = grok_bundle();
         draft.surfaces[0].enabled = false;
 
-        assert!(draft
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("test App must be enabled"));
+        assert!(draft.validate().is_ok());
+        assert_eq!(draft.automatic_test_app(), Some(AppKind::Codex));
+        for surface in &draft.surfaces {
+            assert_eq!(
+                draft.provider_for_surface(surface).unwrap().extra[TEST_APP_FIELD],
+                "codex"
+            );
+        }
     }
 
     #[test]

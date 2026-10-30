@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
@@ -8,17 +8,16 @@ use crate::domain::health::{
     provider_probe_support, ProviderHealthObservation, ProviderHealthSnapshot,
     ProviderHealthStatus, ProviderProbeSupport, PROVIDER_HEALTH_TRANSIENT_CONFIRM_AFTER_MS,
 };
-use crate::domain::providers::bundle::{
-    bundle_test_app, is_explicit_bundle_surface, surface_enabled,
-};
+use crate::domain::providers::bundle::{bundle_id, surface_enabled};
 use crate::domain::providers::model::AppKind;
+use crate::domain::providers::probe::{bundle_probe_app, provider_has_probe};
 use crate::domain::providers::runtime::{
     build_provider_model_probe, ProviderHealthCheckConfig, ProviderModelProbe, RuntimeModelPolicy,
     PROVIDER_MODEL_PROBE_PROMPT,
 };
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::model_health::{
-    quota_block_for_provider, quota_block_message, share_bindings,
+    automatic_share_probe, quota_block_for_provider, quota_block_message, share_bindings,
 };
 use crate::domain::sharing::shares::{share_app_api_enabled, Share};
 use crate::domain::stream_check::{HealthStatus, StreamCheckResult};
@@ -167,12 +166,47 @@ fn health_targets(
     providers: &ProviderStore,
 ) -> BTreeMap<(AppKind, String), HealthTarget> {
     let mut targets = BTreeMap::<(AppKind, String), HealthTarget>::new();
+    let mut shared_bundles = BTreeSet::new();
+    let mut shared_providers = BTreeSet::new();
+    for share in shares
+        .iter()
+        .filter(|share| share.enabled && share.status == "active")
+    {
+        for (app, id) in share_bindings(share) {
+            if !share_app_api_enabled(share, app) {
+                continue;
+            }
+            shared_providers.insert((app, id.clone()));
+            if let Some(provider) = providers
+                .providers
+                .iter()
+                .find(|p| p.app == app && p.provider.id == id)
+            {
+                if let Some(id) = bundle_id(&provider.provider) {
+                    shared_bundles.insert(id.to_string());
+                }
+            }
+        }
+        if let Some(provider) = automatic_share_probe(share, providers) {
+            targets
+                .entry((provider.app, provider.provider.id.clone()))
+                .or_insert_with(|| HealthTarget {
+                    provider: provider.clone(),
+                    shares: Vec::new(),
+                })
+                .shares
+                .push(share.clone());
+        }
+    }
     for provider in providers
         .providers
         .iter()
         .filter(|provider| surface_enabled(&provider.provider))
     {
-        if !is_health_target_surface(provider) {
+        if shared_providers.contains(&(provider.app, provider.provider.id.clone()))
+            || bundle_id(&provider.provider).is_some_and(|id| shared_bundles.contains(id))
+            || !is_health_target_surface(provider, providers)
+        {
             continue;
         }
         let provider = provider.clone();
@@ -184,57 +218,24 @@ fn health_targets(
             },
         );
     }
-    for share in shares
-        .iter()
-        .filter(|share| share.enabled && share.status == "active")
-    {
-        for (app, provider_id) in share_bindings(share) {
-            if !share_app_api_enabled(share, app) {
-                continue;
-            }
-            let provider_exists = providers
-                .providers
-                .iter()
-                .find(|provider| provider.app == app && provider.provider.id == provider_id)
-                .is_some();
-            if !provider_exists {
-                tracing::warn!(
-                    share_id = %share.id,
-                    app = app.as_str(),
-                    provider_id,
-                    "share model health binding Provider was not found"
-                );
-                continue;
-            }
-            let Some(target) = targets.get_mut(&(app, provider_id)) else {
-                continue;
-            };
-            if !target.shares.iter().any(|existing| existing.id == share.id) {
-                target.shares.push(share.clone());
-            }
-        }
-    }
-
     targets
 }
 
-fn is_health_target_surface(provider: &StoredProvider) -> bool {
-    if !is_explicit_bundle_surface(&provider.provider) {
-        return true;
-    }
-    match bundle_test_app(&provider.provider) {
-        Ok(Some(test_app)) => provider.app == test_app,
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(
-                app = provider.app.as_str(),
-                provider_id = %provider.provider.id,
-                error = %error,
-                "skipped malformed Provider Bundle health target"
-            );
-            false
-        }
-    }
+fn is_health_target_surface(provider: &StoredProvider, providers: &ProviderStore) -> bool {
+    provider_has_probe(providers, provider)
+        && bundle_id(&provider.provider)
+            .is_none_or(|id| bundle_probe_app(providers, id) == Some(provider.app))
+}
+
+async fn current_health_target(
+    state: &ServerState,
+    provider: &StoredProvider,
+) -> Option<HealthTarget> {
+    let shares = state.shares.read().await.shares.clone();
+    let providers = state.providers_snapshot().await;
+    health_targets(&shares, &providers)
+        .remove(&(provider.app, provider.provider.id.clone()))
+        .filter(|target| target.provider.resource.revision == provider.resource.revision)
 }
 
 async fn process_initial_health_target(
@@ -253,6 +254,9 @@ async fn process_initial_health_target(
     let probe_guard = state
         .lock_provider_health_probe(target.provider.app, &target.provider.provider.id)
         .await;
+    let Some(target) = current_health_target(state, &target.provider).await else {
+        return Ok(None);
+    };
     if recent_router_cycle_covers_provider(state, &target.provider).await {
         tracing::debug!(
             app = target.provider.app.as_str(),
@@ -269,6 +273,20 @@ async fn process_initial_health_target(
         return Ok(None);
     };
     let accounts = state.accounts_snapshot().await;
+    // A Router batch and the local fallback share the Provider lock and the
+    // persisted UTC-slot result, whichever scheduler gets there first.
+    let cycle_source = router_cycle_source(now_ms());
+    if existing_cycle_result(
+        state,
+        &target.provider,
+        &cycle_source,
+        &plan.health_fingerprint(),
+    )
+    .await
+    .is_some()
+    {
+        return Ok(None);
+    }
     if let Some(block) = quota_block_for_provider(&target.provider, Some(&accounts)) {
         let active_shares = current_active_shares_for_provider(state, &target.provider).await;
         let model = plan.test_model.clone().unwrap_or_else(|| {
@@ -297,7 +315,6 @@ async fn process_initial_health_target(
 
     let probe =
         probe_provider_and_record_locked(state, &target.provider, config, SCHEDULED_SOURCE).await?;
-    drop(probe_guard);
     if probe.probe_support == ProviderProbeSupport::Unsupported {
         tracing::debug!(
             app = target.provider.app.as_str(),
@@ -315,15 +332,20 @@ async fn process_initial_health_target(
         return Ok(None);
     };
     let active_shares = current_active_shares_for_provider(state, &target.provider).await;
-    project_probe_to_shares(
-        state,
-        &active_shares,
-        &target.provider,
-        &probe.result,
-        SCHEDULED_SOURCE,
-        &snapshot.runtime_fingerprint,
-    )
-    .await?;
+    for share in &active_shares {
+        state
+            .push_usage_log(health_usage_log(
+                share,
+                &target.provider,
+                &probe.result,
+                SCHEDULED_SOURCE,
+                true,
+                Some(&snapshot.runtime_fingerprint),
+            ))
+            .await?;
+    }
+    drop(probe_guard);
+    notify_runtime_refreshes(state, active_shares).await;
 
     if !snapshot.confirmation_pending {
         return Ok(None);
@@ -342,12 +364,27 @@ async fn recent_router_cycle_covers_provider(
     let plan = providers.runtime_plan(provider.app, &provider.provider.id);
     let usage = state.usage.read().await;
     let health = crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref());
-    health
+    let recent_snapshot = health
         .source
         .as_deref()
         .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
         && health.checked_at_ms.is_some_and(|checked_at| {
             now_ms().saturating_sub(checked_at) < ROUTER_PROBE_FALLBACK_AFTER_MS
+        });
+    recent_snapshot
+        || plan.as_ref().is_some_and(|plan| {
+            let fingerprint = plan.health_fingerprint();
+            usage.logs.iter().any(|log| {
+                log.is_health_check
+                    && log.app == provider.app
+                    && log.provider_id == provider.provider.id
+                    && log
+                        .data_source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
+                    && log.provider_health_fingerprint.as_deref() == Some(fingerprint.as_str())
+                    && now_ms().saturating_sub(log.created_at_ms) < ROUTER_PROBE_FALLBACK_AFTER_MS
+            })
         })
 }
 
@@ -359,19 +396,10 @@ async fn confirm_health_target(
     let probe_guard = state
         .lock_provider_health_probe(target.provider.app, &target.provider.provider.id)
         .await;
-    let providers = state.providers_snapshot().await;
-    let Some(current) = providers
-        .providers
-        .iter()
-        .find(|provider| {
-            provider.app == target.provider.app
-                && provider.provider.id == target.provider.provider.id
-                && provider.resource.revision == target.provider.resource.revision
-        })
-        .cloned()
-    else {
+    let Some(target) = current_health_target(state, &target.provider).await else {
         return Ok(());
     };
+    let current = target.provider;
     if recent_router_cycle_covers_provider(state, &current).await {
         tracing::debug!(
             app = current.app.as_str(),
@@ -380,7 +408,9 @@ async fn confirm_health_target(
         );
         return Ok(());
     }
-    let runtime_plan = providers.runtime_plan(current.app, &current.provider.id);
+    let runtime_plan = state
+        .provider_runtime_plan(current.app, &current.provider.id)
+        .await;
     let still_pending = {
         let usage = state.usage.read().await;
         crate::domain::health::provider_health_for_plan(&current, &usage, runtime_plan.as_deref())
@@ -718,6 +748,7 @@ async fn check_share_binding_group(
         .lock_provider_health_probe(provider.app, &provider.provider.id)
         .await;
     let current_shares = state.shares.read().await.shares.clone();
+    let providers = state.providers_snapshot().await;
     let group = group
         .into_iter()
         .filter_map(|target| {
@@ -728,6 +759,10 @@ async fn check_share_binding_group(
                         && share.enabled
                         && share.status == "active"
                         && share_app_api_enabled(share, provider.app)
+                        && automatic_share_probe(share, &providers).is_some_and(|selected| {
+                            selected.app == provider.app
+                                && selected.provider.id == provider.provider.id
+                        })
                         && share_bindings(share).iter().any(|(app, provider_id)| {
                             *app == provider.app && provider_id == &provider.provider.id
                         })
@@ -927,7 +962,54 @@ async fn existing_cycle_result(
     expected_health_fingerprint: &str,
 ) -> Option<StreamCheckResult> {
     let usage = state.usage.read().await;
-    existing_cycle_result_from_usage(&usage, provider, source, expected_health_fingerprint)
+    existing_cycle_result_from_usage(&usage, provider, source, expected_health_fingerprint).or_else(
+        || local_result_for_router_cycle(&usage, provider, source, expected_health_fingerprint),
+    )
+}
+
+fn router_cycle_source(at_ms: u128) -> String {
+    format!(
+        "cc-switch-router-cycle:utc-{}",
+        (at_ms / 1_000 / 1_800) * 1_800
+    )
+}
+
+fn local_result_for_router_cycle(
+    usage: &UsageStore,
+    provider: &StoredProvider,
+    source: &str,
+    fingerprint: &str,
+) -> Option<StreamCheckResult> {
+    let slot: u128 = source
+        .strip_prefix("cc-switch-router-cycle:utc-")?
+        .parse()
+        .ok()?;
+    let in_slot = |at: u128| at / 1_000 / 1_800 * 1_800 == slot;
+    let log = usage
+        .logs
+        .iter()
+        .filter(|log| {
+            log.is_health_check
+                && log.app == provider.app
+                && log.provider_id == provider.provider.id
+                && log.data_source.as_deref() == Some(SCHEDULED_SOURCE)
+                && log.provider_health_fingerprint.as_deref() == Some(fingerprint)
+                && in_slot(log.created_at_ms)
+        })
+        .min_by_key(|log| log.created_at_ms);
+    if let Some(result) = log.and_then(|log| exact_cycle_result_from_log(log, provider)) {
+        return Some(result);
+    }
+    let snapshot = usage
+        .provider_health
+        .get(provider.app, &provider.provider.id)?;
+    if snapshot.source != SCHEDULED_SOURCE
+        || snapshot.runtime_fingerprint != fingerprint
+        || !in_slot(snapshot.checked_at_ms)
+    {
+        return None;
+    }
+    existing_cycle_result_from_usage(usage, provider, SCHEDULED_SOURCE, fingerprint)
 }
 
 fn existing_cycle_result_from_usage(
@@ -1144,7 +1226,15 @@ async fn current_active_shares_for_provider(
     provider: &StoredProvider,
 ) -> Vec<Share> {
     let shares = state.shares.read().await.shares.clone();
+    let providers = state.providers_snapshot().await;
     active_shares_for_provider(&shares, provider.app, &provider.provider.id)
+        .into_iter()
+        .filter(|share| {
+            automatic_share_probe(share, &providers).is_some_and(|selected| {
+                selected.app == provider.app && selected.provider.id == provider.provider.id
+            })
+        })
+        .collect()
 }
 
 fn active_shares_for_provider(shares: &[Share], app: AppKind, provider_id: &str) -> Vec<Share> {
@@ -1504,6 +1594,12 @@ fn seconds_from_ms(value: u128) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{routing::post, Router};
     use serde_json::json;
 
     use super::*;
@@ -1559,6 +1655,251 @@ mod tests {
             "status": status
         }))
         .unwrap()
+    }
+
+    fn scheduler_test_state() -> ServerState {
+        crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::Ipv4Addr::LOCALHOST.into(),
+                port: 0,
+                config_dir: Some(std::env::temp_dir().join(format!(
+                    "cc-switch-health-scheduler-{:016x}",
+                    rand::random::<u64>()
+                ))),
+                web_dist_dir: None,
+                log_level: "warn".into(),
+                command: None,
+            },
+            Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap()
+    }
+
+    async fn network_fixture() -> (ServerState, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let state = scheduler_test_state();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream_calls = calls.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let calls = upstream_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        state
+            .mutate_providers_immediate(move |providers| {
+                let mut provider = provider().provider;
+                provider.settings_config = json!({
+                    "env": {"OPENAI_BASE_URL": endpoint, "OPENAI_API_KEY": "local-fixture"},
+                    "testModel": "gpt-test"
+                });
+                providers.upsert(AppKind::Codex, provider);
+            })
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|shares| {
+                let mut share = share("share-1", "p1", true, "active");
+                share
+                    .bindings
+                    .push(crate::domain::sharing::shares::ShareBinding {
+                        app: AppKind::Codex,
+                        provider_id: "p1".into(),
+                        provider_type: ProviderType::Codex,
+                    });
+                shares.shares.push(share);
+            })
+            .await
+            .unwrap();
+        (state, calls, server)
+    }
+
+    #[tokio::test]
+    async fn local_and_router_schedulers_share_one_network_result_in_either_order() {
+        for order in ["local-first", "router-first", "concurrent"] {
+            let (state, calls, server) = network_fixture().await;
+            let providers = state.providers_snapshot().await;
+            let shares = state.shares.read().await.shares.clone();
+            let target = health_targets(&shares, &providers)
+                .into_values()
+                .next()
+                .unwrap();
+            let batch = vec![BatchShareBindingTarget {
+                share: shares[0].clone(),
+                provider: target.provider.clone(),
+            }];
+            let config = ProviderHealthCheckConfig {
+                max_retries: 0,
+                ..Default::default()
+            };
+            let source = router_cycle_source(now_ms());
+            let checked = match order {
+                "local-first" => {
+                    assert!(process_initial_health_target(&state, target, &config)
+                        .await
+                        .unwrap()
+                        .is_none());
+                    // Use the slot at completion, including a possible UTC boundary.
+                    check_share_bindings_batch(
+                        &state,
+                        batch,
+                        &config,
+                        &router_cycle_source(now_ms()),
+                    )
+                    .await
+                    .unwrap()
+                }
+                "router-first" => {
+                    let checked = check_share_bindings_batch(&state, batch, &config, &source)
+                        .await
+                        .unwrap();
+                    assert!(process_initial_health_target(&state, target, &config)
+                        .await
+                        .unwrap()
+                        .is_none());
+                    checked
+                }
+                _ => {
+                    let (local, batch) = tokio::join!(
+                        process_initial_health_target(&state, target, &config),
+                        check_share_bindings_batch(&state, batch, &config, &source),
+                    );
+                    assert!(local.unwrap().is_none());
+                    batch.unwrap()
+                }
+            };
+            server.abort();
+            assert_eq!(checked.len(), 1, "{order}");
+            assert!(
+                checked[0].check.result.success,
+                "{order}: {:?}",
+                checked[0].check.result
+            );
+            let usage = state.usage_snapshot().await;
+            let scheduled = usage
+                .logs
+                .iter()
+                .find(|log| log.data_source.as_deref() == Some(SCHEDULED_SOURCE));
+            if let Some(log) = scheduled {
+                assert_eq!(
+                    checked[0].check.result.tested_at,
+                    seconds_from_ms(log.created_at_ms)
+                );
+            }
+            if order != "concurrent" || router_cycle_source(now_ms()) == source {
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{order}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_cycle_replay_is_stable_and_runtime_or_slot_changes_reprobe() {
+        let (state, calls, server) = network_fixture().await;
+        let config = ProviderHealthCheckConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let source = "cc-switch-router-cycle:utc-1800";
+        let make_batch = || async {
+            let provider = state.providers_snapshot().await.providers[0].clone();
+            vec![BatchShareBindingTarget {
+                share: state.shares.read().await.shares[0].clone(),
+                provider,
+            }]
+        };
+        let first = check_share_bindings_batch(&state, make_batch().await, &config, source)
+            .await
+            .unwrap();
+        let replay = check_share_bindings_batch(&state, make_batch().await, &config, source)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&first[0].check.result).unwrap(),
+            serde_json::to_value(&replay[0].check.result).unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        state
+            .mutate_providers_immediate(|providers| {
+                providers.providers[0].provider.settings_config["testModel"] = json!("gpt-next");
+            })
+            .await
+            .unwrap();
+        let changed = check_share_bindings_batch(&state, make_batch().await, &config, source)
+            .await
+            .unwrap();
+        assert_eq!(changed[0].check.result.model_used, "gpt-next");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        check_share_bindings_batch(
+            &state,
+            make_batch().await,
+            &config,
+            "cc-switch-router-cycle:utc-3600",
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn queued_local_target_is_discarded_when_share_selection_changes() {
+        let state = scheduler_test_state();
+        let providers = ProviderStore {
+            providers: [AppKind::Claude, AppKind::Codex]
+                .into_iter()
+                .map(|app| {
+                    bundle_provider_with(app, "bundle-1", "family.grok_oauth", AppKind::Codex, true)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        state
+            .replace_provider_store_for_test(providers.clone())
+            .await;
+        let mut share = share("share-1", "bundle-1", true, "active");
+        state
+            .mutate_shares_immediate(|shares| shares.shares.push(share.clone()))
+            .await
+            .unwrap();
+        let target = health_targets(&[share.clone()], &providers)
+            .into_values()
+            .next()
+            .unwrap();
+        assert_eq!(target.provider.app, AppKind::Codex);
+        assert!(current_health_target(&state, &target.provider)
+            .await
+            .is_some());
+        share.app = AppKind::Claude;
+        state
+            .mutate_shares_immediate(|shares| shares.shares = vec![share])
+            .await
+            .unwrap();
+        assert!(current_health_target(&state, &target.provider)
+            .await
+            .is_none());
+        assert!(
+            process_initial_health_target(&state, target.clone(), &Default::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        confirm_health_target(&state, target, &Default::default())
+            .await
+            .unwrap();
+        assert!(state.usage_snapshot().await.logs.is_empty());
     }
 
     #[test]
@@ -1787,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle_targets_only_include_the_selected_test_app() {
+    fn bundle_targets_use_fixed_priority_despite_legacy_manual_selection() {
         let providers = ProviderStore {
             providers: vec![
                 bundle_provider_with(
@@ -1818,7 +2159,7 @@ mod tests {
         let targets = health_targets(&[], &providers);
 
         assert_eq!(targets.len(), 1);
-        assert!(targets.contains_key(&(AppKind::Claude, "bundle-1".to_string())));
+        assert!(targets.contains_key(&(AppKind::Codex, "bundle-1".to_string())));
     }
 
     #[test]
@@ -1850,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn share_binding_does_not_restore_a_non_selected_bundle_surface() {
+    fn share_binding_uses_its_own_enabled_apps_not_legacy_test_app() {
         let providers = ProviderStore {
             providers: vec![
                 bundle_provider_with(
@@ -1875,8 +2216,95 @@ mod tests {
         let targets = health_targets(&shares, &providers);
 
         assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key(&(AppKind::Codex, "bundle-1".to_string())));
+        assert!(!targets.contains_key(&(AppKind::Claude, "bundle-1".to_string())));
+    }
+
+    #[test]
+    fn share_subset_suppresses_the_unused_bundle_primary_probe() {
+        let providers = ProviderStore {
+            providers: vec![
+                bundle_provider_with(
+                    AppKind::Claude,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Codex,
+                    true,
+                ),
+                bundle_provider_with(
+                    AppKind::Codex,
+                    "bundle-1",
+                    "family.grok_oauth",
+                    AppKind::Codex,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut share = share("claude-only", "bundle-1", true, "active");
+        share.app = AppKind::Claude;
+        share.bindings.clear();
+        let targets = health_targets(&[share], &providers);
+        assert_eq!(targets.len(), 1);
         assert!(targets.contains_key(&(AppKind::Claude, "bundle-1".to_string())));
-        assert!(!targets.contains_key(&(AppKind::Codex, "bundle-1".to_string())));
+    }
+
+    #[test]
+    fn local_slot_reuse_is_exact_and_rejects_other_slots_and_fingerprints() {
+        let provider = provider();
+        let share = share("share-1", "p1", true, "active");
+        let mut result = failed_probe_result(
+            &provider,
+            "gpt-test".into(),
+            "limited".into(),
+            "rateLimit",
+            Some(429),
+            2,
+        );
+        result.tested_at = 3_610;
+        result.response_time_ms = Some(50);
+        let mut usage = UsageStore::default();
+        usage.logs.push(health_usage_log(
+            &share,
+            &provider,
+            &result,
+            SCHEDULED_SOURCE,
+            true,
+            Some("fp"),
+        ));
+        let recovered = local_result_for_router_cycle(
+            &usage,
+            &provider,
+            "cc-switch-router-cycle:utc-3600",
+            "fp",
+        )
+        .unwrap();
+        assert!(!recovered.success);
+        assert_eq!(recovered.http_status, Some(429));
+        assert_eq!(recovered.retry_count, 2);
+        assert_eq!(recovered.tested_at, 3_610);
+        assert!(local_result_for_router_cycle(
+            &usage,
+            &provider,
+            "cc-switch-router-cycle:utc-5400",
+            "fp"
+        )
+        .is_none());
+        assert!(local_result_for_router_cycle(
+            &usage,
+            &provider,
+            "cc-switch-router-cycle:utc-3600",
+            "changed"
+        )
+        .is_none());
+        usage.logs[0].data_source = Some(CONFIRMATION_SOURCE.into());
+        assert!(local_result_for_router_cycle(
+            &usage,
+            &provider,
+            "cc-switch-router-cycle:utc-3600",
+            "fp"
+        )
+        .is_none());
     }
 
     #[test]

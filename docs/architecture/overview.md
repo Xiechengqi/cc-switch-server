@@ -136,6 +136,14 @@ Custom 认证推荐由 Registry 的 `defaultProtocol` / `defaultAuthSchemes` 权
 
 Web UI 只以本仓库产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为实现依据；禁止从 cc-switch 或其他外部项目批量复制组件、样式、locale 与页面结构。
 
+### 4.4 自动模型健康检查
+
+Server 与 Router 的自动监测固定使用 **Codex → Claude → Gemini**，仅跳过未启用、无有效绑定或不支持可执行探针的 App；不按最近成功、失败、限流或额度切换接口。Share 按自己的启用范围选择一个代表 App。存在活跃 Share 的 Bundle 只检查这些 Share 的代表目标；没有活跃 Share 的 Bundle 则选一个 Bundle 代表 App，普通独立 Provider 仍按自身探测能力检查。
+
+Router 主调度 UTC 半小时槽，Server 本地 scheduler 兜底：同一 App/Provider 最近 45 分钟已有相同 health fingerprint 的 Router cycle 结果时不主动探测。两者使用同一 Provider 执行锁；本地先检查时，Router 可复用同 UTC 半小时、同 health fingerprint 的原始 scheduled 结果，保留原测试时间、状态和重试次数，持久化后才通知 Router。手动测试和后续确认不替换已固定的周期结果；等待执行的本地目标和 Router batch 在持锁后重新核对当前选择。既有同接口重试和瞬态失败确认仍可能消耗额外请求，单代表接口不等于强制每槽一次网络调用。
+
+旧 `testApp` 字段只保留 wire/storage 兼容，不再允许人工指定自动检查接口；Web UI 只读显示自动结果，无探针时显示不支持。旧接口的 Bundle 测试模型不自动迁到新的代表 App；模型优先级为本 App override → 属于本 App 的 Bundle override → 本 App Server 默认值。每 App 的 `modelProbe` 仍服务手动诊断，手动连接测试可逐接口执行，不改变自动调度策略。历史其他接口记录保持真实，不删除或重写为新策略的结果。代表性探测不证明其他未测接口可用；本策略减少重复探测，不消除上游免费模型的全局限流。
+
 ## 5. 相关文档
 
 - 协议与 Router 契约：[`router-contract.md`](router-contract.md)

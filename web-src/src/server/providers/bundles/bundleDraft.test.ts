@@ -8,6 +8,7 @@ import type {
 import { customAuthSchemesForProtocol, familyById, profileById, providerRegistry } from "@/server/providerRegistry";
 import {
   applyCustomRecipeToBundleDraft,
+  automaticBundleProbeApp,
   changeModelPolicyScope,
   createProviderBundleDraft,
   customRecipeMatchesBundleDraft,
@@ -234,6 +235,25 @@ describe("Provider Bundle drafts", () => {
       familyById("family.openai_oauth")!,
     );
     expect(openai.testApp).toBe("codex");
+  });
+
+  it("ignores legacy manual App choices and clears an override owned by another App", () => {
+    const draft = createProviderBundleDraft(familyById("family.grok_oauth")!);
+    draft.testApp = "claude";
+    draft.testModel = "claude-only-test-model";
+    expect(normalizeBundleTestApp(draft)).toMatchObject({ testApp: "codex", testModel: "" });
+    expect(toProviderBundleWriteDraft(draft)).toMatchObject({ testApp: "codex", testModel: undefined });
+  });
+
+  it("does not claim an automatic probe for unsupported Drivers", () => {
+    const copilot = createProviderBundleDraft(familyById("family.github_copilot")!);
+    expect(automaticBundleProbeApp(copilot.surfaces)).toBeUndefined();
+    const grok = createProviderBundleDraft(familyById("family.grok_oauth")!);
+    expect(automaticBundleProbeApp(grok.surfaces)).toBe("codex");
+    grok.surfaces.find((surface) => surface.app === "codex")!.enabled = false;
+    expect(automaticBundleProbeApp(grok.surfaces)).toBe("claude");
+    grok.surfaces.find((surface) => surface.app === "claude")!.enabled = false;
+    expect(automaticBundleProbeApp(grok.surfaces)).toBe("gemini");
   });
 
   it("creates all Copilot surfaces with one managed-account binding", () => {
@@ -708,8 +728,8 @@ describe("Provider Bundle drafts", () => {
     const write = toProviderBundleWriteDraft(draft);
     expect(write.credentialPatches).toEqual({});
     expect(write).toMatchObject({
-      testApp: "claude",
-      testModel: "claude-health-model",
+      testApp: "codex",
+      testModel: undefined,
       transport: {
         timeoutMs: 60000,
         streamFirstByteTimeoutMs: 15000,
@@ -989,8 +1009,8 @@ describe("Provider Bundle drafts", () => {
       [pointer]: { action: "keep" },
     });
     expect(edited.surfaces[0]?.runtime?.runtimeFingerprint).toBe("fixture");
-    expect(edited.testApp).toBe("claude");
-    expect(edited.testModel).toBe("health-model");
+    expect(edited.testApp).toBe("codex");
+    expect(edited.testModel).toBe("");
     expect(edited.transport.timeoutSeconds).toBe("");
 
     const duplicate = duplicateProviderBundleDraft(view);
