@@ -70,6 +70,12 @@ pub enum ProviderCommandError {
     Invalid(String),
     #[error("{message}")]
     Conflict { code: &'static str, message: String },
+    #[error("{source}")]
+    CredentialSource {
+        share_id: Option<String>,
+        #[source]
+        source: Box<crate::domain::sharing::credential_source::CredentialSourceError>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

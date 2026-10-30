@@ -1,5 +1,11 @@
 # Protocol evidence policy
 
+## 2026-10-30 Custom 认证推荐与草稿预检
+
+本次只核对本仓库 Registry、Custom 转发和分享代码，不引入外部项目或域名特例。Registry v9 为每个 Custom policy 声明初始协议及各协议推荐认证，推荐必须唯一解析到允许的 Driver；OpenAI Chat/Responses 推荐 Bearer、Anthropic/Gemini 推荐各自 API-key header。推荐是编辑意图，落盘仍为明确的协议/认证绑定，重新打开配置时保留已保存方式，不新增运行时猜测或 S2 数据格式迁移。
+
+`domain/providers/static_auth.rs` 统一转发、分享和诊断的认证位置/字段/前缀描述，并保留原 v1 凭据来源摘要和 HMAC 容量池算法。只读草稿预检接收完整候选及分享意图，不写盘、不请求上游、不申请隧道；已有 Share 引用仍受保护，提交重新校验。认证、地址、主凭据及具名附加认证头冲突返回脱敏结构化原因；不能将所有 409 归为版本过期。本地回环/单测证据不代表 QNAI 或真实 Router 验收，未读取生产 Key，也未部署远程。
+
 ## 2026-10-30 Custom 多 App 分享凭据来源
 
 本次依据目标 Server 的只读版本和脱敏 S2 Provider 配置，以及本仓库既有分享校验、转发认证和 URL 拼接规则；没有研究或运行外部 Provider 项目，也没有解密生产 Key、发起真实推理或部署服务。故障配置启用了两个 Custom Surface、停用了第三个，两个启用项分别使用服务根地址和标准 `/v1` 地址、均采用 Bearer；旧解析器在比较实际凭据前就因 Surface 存储作用域返回不可复用，不能据此推断生产两端 Key 一致或上游实际支持所有协议。

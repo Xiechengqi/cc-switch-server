@@ -7673,7 +7673,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 8);
+    assert_eq!(registry["registry"]["schemaVersion"], 9);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
@@ -9192,6 +9192,245 @@ async fn custom_share_api(
         .await
         .unwrap();
     (response.status(), json_body(response).await)
+}
+
+#[tokio::test]
+async fn custom_bundle_draft_validation_is_authenticated_read_only_and_tunnel_compatible() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let draft = custom_shared_bundle_draft("draft-preflight");
+    let file = state.config_dir.join("providers.json");
+    let before = std::fs::read(&file).ok();
+    let input = json!({"bundle":draft,"shareEnabled":true});
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/validate-draft",
+            input.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/provider-bundles/validate-draft",
+            input.clone(),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let validated = json_body(response).await;
+    assert_eq!(validated["requiresRebind"], false);
+    assert_eq!(validated["sourceRevision"], 0);
+    for app in ["claude", "codex"] {
+        assert_eq!(
+            validated["authentication"][app],
+            json!({"location":"header","name":"authorization","prefix":"Bearer "})
+        );
+    }
+    assert!(!validated.to_string().contains("custom-shared-key"));
+    assert!(!validated.to_string().contains("fingerprint"));
+    assert!(!validated.to_string().contains("cp_"));
+    let (status, invoked) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/web-api/invoke/validate_provider_bundle_draft",
+        input,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{invoked}");
+    assert_eq!(validated, invoked);
+    assert_eq!(before, std::fs::read(&file).ok());
+    assert!(providers_snapshot(&state).await.providers.is_empty());
+
+    // A preflight does not consume create idempotency keys or rotate credentials.
+    let (status, saved) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles",
+        draft.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["bundle"]["revision"], 1);
+    // Revalidating an idempotent create reports the observed revision, not 0.
+    let (status, replay) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles/validate-draft",
+        json!({"bundle":draft,"shareEnabled":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["sourceRevision"], 1);
+}
+
+#[tokio::test]
+async fn custom_bundle_draft_validation_reports_unsaved_share_conflicts_without_writes() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let file = state.config_dir.join("providers.json");
+    let before = std::fs::read(&file).ok();
+    for (reason, field, value) in [
+        ("auth_mismatch", "auth", json!("api_key")),
+        (
+            "endpoint_mismatch",
+            "endpoint",
+            json!("https://other-tenant.invalid/v1"),
+        ),
+        ("credential_mismatch", "key", json!("different-secret")),
+        (
+            "extra_headers_mismatch",
+            "headers",
+            json!("private-tenant-secret"),
+        ),
+    ] {
+        let mut draft = custom_shared_bundle_draft("draft-conflicts");
+        match field {
+            "auth" => draft["surfaces"][1]["customBinding"]["authScheme"] = value,
+            "endpoint" => draft["surfaces"][1]["endpoint"] = value,
+            "headers" => {
+                draft["surfaces"][1]["extraHeaders"] = json!(["x-tenant"]);
+                draft["surfaces"][1]["credentialPatches"]
+                    ["/settingsConfig/extraHeaders/x-tenant"] =
+                    json!({"action":"replace","value":value});
+            }
+            _ => {
+                draft["surfaces"][1]["credentialPatches"]["/settingsConfig/apiKey"]["value"] = value
+            }
+        }
+        let (status, error) = custom_share_api(
+            &app,
+            &token,
+            Method::POST,
+            "/api/provider-bundles/validate-draft",
+            json!({"bundle":draft,"shareEnabled":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(error["code"], "cc_switch_share_credential_source_mismatch");
+        assert_eq!(error["details"]["reason"], reason);
+        assert_eq!(error["details"]["firstApp"], "claude");
+        assert_eq!(error["details"]["app"], "codex");
+        if reason == "auth_mismatch" {
+            assert_eq!(
+                error["details"]["firstAuthentication"],
+                json!({"location":"header","name":"authorization","prefix":"Bearer "}),
+            );
+            assert_eq!(
+                error["details"]["authentication"],
+                json!({"location":"header","name":"x-api-key","prefix":""}),
+            );
+        }
+        assert!(!error.to_string().contains("different-secret"));
+        assert!(!error.to_string().contains("custom-shared-key"));
+        assert!(!error.to_string().contains("private-tenant-secret"));
+        assert_eq!(before, std::fs::read(&file).ok());
+    }
+}
+
+#[tokio::test]
+async fn custom_bundle_draft_validation_fences_existing_shares_and_rebinds() {
+    let state = test_state();
+    let app = app_router(state.clone());
+    let token = setup_and_login(&app).await;
+    let id = "draft-shared";
+    let mut draft = custom_shared_bundle_draft(id);
+    let (status, saved) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles",
+        draft.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, share) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/web-api/invoke/save_provider_bundle_share",
+        custom_bundle_share_input(id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{share}");
+    let providers_file = state.config_dir.join("providers.json");
+    let shares_file = state.config_dir.join("shares.json");
+    let before_providers = std::fs::read(&providers_file).unwrap();
+    let before_shares = std::fs::read(&shares_file).unwrap();
+    draft.as_object_mut().unwrap().remove("clientRequestId");
+    draft["expectedRevision"] = json!(1);
+    for surface in draft["surfaces"].as_array_mut().unwrap().iter_mut().take(2) {
+        surface["credentialPatches"] = json!({"/settingsConfig/apiKey":{"action":"keep"}});
+    }
+    draft["surfaces"][1]["customBinding"]["authScheme"] = json!("api_key");
+    for path in [
+        "/api/provider-bundles/validate-draft",
+        "/web-api/invoke/validate_provider_bundle_draft",
+    ] {
+        // Turning sharing off in the form cannot bypass an existing reference.
+        let (status, error) = custom_share_api(
+            &app,
+            &token,
+            Method::POST,
+            path,
+            json!({"bundle":draft,"shareEnabled":false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(error["details"]["reason"], "auth_mismatch");
+        assert_eq!(error["details"]["shareId"], share["id"]);
+    }
+    let (status, error) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        &format!("/api/provider-bundles/{id}/rebind-custom"),
+        json!({"mode":"preview","bundle":draft}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["details"]["reason"], "auth_mismatch");
+    assert_eq!(before_providers, std::fs::read(&providers_file).unwrap());
+    assert_eq!(before_shares, std::fs::read(&shares_file).unwrap());
+
+    draft["surfaces"][1]["customBinding"]["authScheme"] = json!("bearer");
+    draft["surfaces"][1]["customBinding"]["upstreamProtocol"] = json!("open_ai_chat");
+    let (status, validated) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles/validate-draft",
+        json!({"bundle":draft,"shareEnabled":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{validated}");
+    assert_eq!(validated["requiresRebind"], true);
+    assert_eq!(validated["shareIds"], json!([share["id"]]));
+    draft["expectedRevision"] = json!(0);
+    let (status, error) = custom_share_api(
+        &app,
+        &token,
+        Method::POST,
+        "/api/provider-bundles/validate-draft",
+        json!({"bundle":draft,"shareEnabled":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["code"], "cc_switch_provider_revision_conflict");
+    assert_eq!(before_providers, std::fs::read(&providers_file).unwrap());
+    assert_eq!(before_shares, std::fs::read(&shares_file).unwrap());
 }
 
 fn custom_bundle_share_input(id: &str) -> Value {

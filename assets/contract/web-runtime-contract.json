@@ -1883,6 +1883,14 @@
       "notes": "Server web runtime shim."
     },
     {
+      "name": "validate_provider_bundle_draft",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "endpoint": "POST /api/provider-bundles/validate-draft",
+      "notes": "Authenticated read-only validation of a complete unsaved Bundle and optional sharing intent. No writes, upstream probes, credential fingerprints or quota changes; real writes revalidate under the reference guard."
+    },
+    {
       "name": "get_provider_bundle_share_preflight",
       "support": "native",
       "implemented": true,

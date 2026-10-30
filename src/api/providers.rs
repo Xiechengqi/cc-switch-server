@@ -8,6 +8,21 @@ const PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const PROVIDER_MODELS_RESPONSE_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROVIDER_MEDIA_TEST_RESPONSE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+pub(in crate::api) async fn validate_provider_bundle_draft(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::domain::providers::bundle::ProviderBundleDraftValidationRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_session(&state, &headers).await?;
+    require_provider_write_contract(&state, &headers)?;
+    let result = state
+        .validate_provider_bundle_draft(input)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(map_provider_command_error)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
 pub(in crate::api) async fn provider_bundle_share_preflight(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -5100,6 +5115,16 @@ pub(in crate::api) fn map_provider_command_error(
         }
         crate::domain::providers::credentials::ProviderCommandError::Conflict { code, message } => {
             ApiError::conflict_code(code, message)
+        }
+        crate::domain::providers::credentials::ProviderCommandError::CredentialSource {
+            share_id,
+            source,
+        } => {
+            let mut details = source.details();
+            if let Some(id) = share_id {
+                details["shareId"] = json!(id);
+            }
+            ApiError::conflict_code(source.code(), source.public_message()).with_details(details)
         }
     }
 }

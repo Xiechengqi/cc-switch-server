@@ -15,6 +15,12 @@ use super::shares::{Share, ShareBinding};
 
 mod custom;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationMismatch {
+    pub first: crate::domain::providers::static_auth::StaticAuthCarrier,
+    pub current: crate::domain::providers::static_auth::StaticAuthCarrier,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialSourceError {
     #[error("Share must have between one and three bindings (found {count})")]
@@ -52,6 +58,14 @@ pub enum CredentialSourceError {
         first_provider_id: String,
         app: &'static str,
         provider_id: String,
+        authentication: Box<AuthenticationMismatch>,
+    },
+    #[error("Custom Share bindings must use the same named extra authentication headers; {app}/{provider_id} does not match {first_app}/{first_provider_id}")]
+    ExtraHeadersMismatch {
+        first_app: &'static str,
+        first_provider_id: String,
+        app: &'static str,
+        provider_id: String,
     },
     #[error("derive anonymous capacity pool id: {message}")]
     CapacityPoolDerivation { message: String },
@@ -63,6 +77,7 @@ impl CredentialSourceError {
             Self::ReuseUnsupported { .. }
             | Self::SourceMismatch { .. }
             | Self::EndpointMismatch { .. }
+            | Self::ExtraHeadersMismatch { .. }
             | Self::AuthMismatch { .. } => "cc_switch_share_credential_source_mismatch",
             Self::InvalidBindingCount { .. } => "cc_switch_share_binding_integrity_failed",
             Self::Resolution { .. } | Self::CapacityPoolDerivation { .. } => {
@@ -77,8 +92,74 @@ impl CredentialSourceError {
             Self::SourceMismatch { .. } => "credential_mismatch",
             Self::EndpointMismatch { .. } => "endpoint_mismatch",
             Self::AuthMismatch { .. } => "auth_mismatch",
+            Self::ExtraHeadersMismatch { .. } => "extra_headers_mismatch",
             Self::InvalidBindingCount { .. } => "no_enabled_apps",
             _ => "resolution_failed",
+        }
+    }
+
+    /// Safe, structured diagnostics. Never include credentials or source digests.
+    pub fn details(&self) -> serde_json::Value {
+        let mut details = serde_json::json!({ "reason": self.reason() });
+        let (app, provider_id, first) = match self {
+            Self::SourceMismatch {
+                app,
+                provider_id,
+                first_app,
+                first_provider_id,
+            }
+            | Self::EndpointMismatch {
+                app,
+                provider_id,
+                first_app,
+                first_provider_id,
+            }
+            | Self::AuthMismatch {
+                app,
+                provider_id,
+                first_app,
+                first_provider_id,
+                ..
+            }
+            | Self::ExtraHeadersMismatch {
+                app,
+                provider_id,
+                first_app,
+                first_provider_id,
+            } => (
+                Some(*app),
+                Some(provider_id),
+                Some((*first_app, first_provider_id)),
+            ),
+            Self::ReuseUnsupported { app, provider_id }
+            | Self::Resolution {
+                app, provider_id, ..
+            } => (Some(*app), Some(provider_id), None),
+            _ => (None, None, None),
+        };
+        if let Some(app) = app {
+            details["app"] = serde_json::json!(app);
+        }
+        if let Some(id) = provider_id {
+            details["providerId"] = serde_json::json!(id);
+        }
+        if let Some((app, id)) = first {
+            details["firstApp"] = serde_json::json!(app);
+            details["firstProviderId"] = serde_json::json!(id);
+        }
+        if let Self::AuthMismatch { authentication, .. } = self {
+            details["firstAuthentication"] = serde_json::json!(authentication.first);
+            details["authentication"] = serde_json::json!(authentication.current);
+        }
+        details
+    }
+
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Resolution { .. } | Self::CapacityPoolDerivation { .. } => {
+                "Unable to verify the Provider credential source".to_string()
+            }
+            _ => self.to_string(),
         }
     }
 }
@@ -108,6 +189,9 @@ pub struct CredentialSourceIdentity {
 struct CustomSourceScope {
     endpoint_digest: [u8; 32],
     auth_digest: [u8; 32],
+    authentication: crate::domain::providers::static_auth::StaticAuthCarrier,
+    primary_digest: [u8; 32],
+    extra_headers_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +205,8 @@ pub struct BundleSharePreflight {
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 pub fn bundle_share_preflight(
@@ -166,6 +252,7 @@ pub fn bundle_share_preflight(
             .collect(),
         can_share: error.is_none(),
         reason: error.as_ref().map(CredentialSourceError::reason),
+        details: error.as_ref().map(CredentialSourceError::details),
         message: error.map(|error| match error {
             CredentialSourceError::Resolution { .. }
             | CredentialSourceError::CapacityPoolDerivation { .. } => {
@@ -298,6 +385,20 @@ pub fn shared_credential_source_for_bindings(
                         }
                         if first.auth_digest != next.auth_digest {
                             return Err(CredentialSourceError::AuthMismatch {
+                                first_app: first_binding.app.as_str(),
+                                first_provider_id: first_binding.provider_id.clone(),
+                                app: binding.app.as_str(),
+                                provider_id: binding.provider_id.clone(),
+                                authentication: Box::new(AuthenticationMismatch {
+                                    first: first.authentication.clone(),
+                                    current: next.authentication.clone(),
+                                }),
+                            });
+                        }
+                        if first.primary_digest == next.primary_digest
+                            && first.extra_headers_digest != next.extra_headers_digest
+                        {
+                            return Err(CredentialSourceError::ExtraHeadersMismatch {
                                 first_app: first_binding.app.as_str(),
                                 first_provider_id: first_binding.provider_id.clone(),
                                 app: binding.app.as_str(),
@@ -466,6 +567,16 @@ mod tests {
         provider_registry, AuthScheme, CustomBindingInput, ProfileId, UpstreamProtocol,
     };
     use crate::domain::providers::store::ProviderResourceMetadata;
+
+    #[test]
+    fn structured_diagnostics_keep_common_error_results_small() {
+        assert!(std::mem::size_of::<CredentialSourceError>() < 128);
+        assert!(std::mem::size_of::<ShareCredentialSourceError>() < 128);
+        assert!(
+            std::mem::size_of::<crate::domain::providers::credentials::ProviderCommandError>()
+                < 128
+        );
+    }
 
     fn account(id: &str) -> Account {
         serde_json::from_value(json!({
@@ -879,6 +990,19 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let original_v1 = serde_json::to_vec(&(
+            "cc-switch-custom-credential-source-v1",
+            "https://custom.example/",
+            ("header", "authorization", "Bearer "),
+            "shared-custom-secret",
+            BTreeMap::<String, String>::new(),
+        ))
+        .unwrap();
+        assert_eq!(
+            source.digest,
+            <[u8; 32]>::from(Sha256::digest(original_v1)),
+            "existing source digests must not change"
+        );
         assert!(source
             .capacity_pool_id(&[7; 32])
             .unwrap()
@@ -963,7 +1087,7 @@ mod tests {
                 &AccountStore::default(),
                 &custom_bindings()
             ),
-            Err(CredentialSourceError::SourceMismatch { .. })
+            Err(CredentialSourceError::ExtraHeadersMismatch { .. })
         ));
         store.providers[1]
             .provider

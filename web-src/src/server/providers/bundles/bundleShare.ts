@@ -16,6 +16,7 @@ import {
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
 import i18n from "@/i18n";
+import { HttpResponseError } from "@/lib/runtime";
 
 export interface ProviderBundleShareDraft {
   baseline?: {
@@ -259,9 +260,9 @@ export async function saveBundleShare(
   if (draft.enabled) {
     const preflight = await shareApi.preflightProviderBundleShare(bundleId);
     if (!preflight.canShare) {
-      throw new Error(i18n.t(`providerBundle.sharePreflight.${preflight.reason ?? "resolution_failed"}`, {
+      throw new HttpResponseError(i18n.t(`providerBundle.sharePreflight.${preflight.reason ?? "resolution_failed"}`, {
         defaultValue: "Unable to verify a common credential source. Check the enabled Apps' endpoints and credentials before sharing.",
-      }));
+      }), 400, { code: "cc_switch_share_credential_source_mismatch", details: preflight.details ?? { reason: preflight.reason } });
     }
   }
   return shareApi.saveProviderBundleShare({

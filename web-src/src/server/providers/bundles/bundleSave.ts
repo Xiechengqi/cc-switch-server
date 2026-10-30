@@ -72,10 +72,17 @@ export function reconcileBundleSaveDraft(
     };
   };
   const observed = toProviderBundleWriteDraft(editProviderBundleDraft(latest));
-  if (stableStringify(projection(requested)) !== stableStringify(projection(observed))) {
+  if (
+    stableStringify(projection(requested)) !==
+    stableStringify(projection(observed))
+  ) {
     return;
   }
-  return { ...draft, expectedRevision: latest.revision, clientRequestId: undefined };
+  return {
+    ...draft,
+    expectedRevision: latest.revision,
+    clientRequestId: undefined,
+  };
 }
 
 // A lost response is not proof of failure. Read back, preserve the user's draft,
@@ -108,7 +115,8 @@ export async function prepareBundleProviderSave(
 > {
   if (
     baseline &&
-    stableStringify(draft) === stableStringify(editProviderBundleDraft(baseline))
+    stableStringify(draft) ===
+      stableStringify(editProviderBundleDraft(baseline))
   ) {
     return { kind: "saved", bundle: baseline };
   }
@@ -117,7 +125,10 @@ export async function prepareBundleProviderSave(
     baseline &&
     writeDraft.surfaces.some((surface) => {
       const before = baseline.surfaces[surface.app]?.customBinding;
-      return before && stableStringify(before) !== stableStringify(surface.customBinding);
+      return (
+        before &&
+        stableStringify(before) !== stableStringify(surface.customBinding)
+      );
     });
   if (changesBinding) {
     const preview = await providersApi.previewBundleRebind(writeDraft);
@@ -125,7 +136,9 @@ export async function prepareBundleProviderSave(
   }
   return {
     kind: "saved",
-    bundle: await writeProvider(draft.id, () => providersApi.upsertBundle(writeDraft)),
+    bundle: await writeProvider(draft.id, () =>
+      providersApi.upsertBundle(writeDraft),
+    ),
   };
 }
 
@@ -140,6 +153,7 @@ export async function applyBundleProviderSave(
     throw new HttpResponseError(
       "Provider draft changed; preview the binding changes again",
       409,
+      { code: "cc_switch_provider_preview_conflict" },
     );
   }
   return writeProvider(draft.id, () =>

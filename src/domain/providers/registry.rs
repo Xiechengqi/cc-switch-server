@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::coding_plan::CodingPlanProfileSpec;
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 8;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 9;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -435,7 +435,9 @@ pub struct CustomPolicySpec {
     pub custom_policy_id: String,
     pub app: AppKind,
     pub protocols: Vec<UpstreamProtocol>,
+    pub default_protocol: UpstreamProtocol,
     pub auth_schemes: Vec<AuthScheme>,
+    pub default_auth_schemes: BTreeMap<UpstreamProtocol, AuthScheme>,
     pub allowed_driver_ids: Vec<DriverId>,
     pub outbound_identity_policy: OutboundIdentityPolicy,
 }
@@ -607,6 +609,31 @@ pub fn resolve_custom_binding(
     input: &CustomBindingInput,
 ) -> anyhow::Result<ResolvedCustomBinding> {
     resolve_custom_binding_in_registry(provider_registry(), profile, input)
+}
+
+/// Resolve a recommendation once. Loading stored bindings never reapplies defaults.
+pub fn recommended_custom_binding(
+    profile: &ProfileSpec,
+    upstream_protocol: UpstreamProtocol,
+) -> anyhow::Result<CustomBindingInput> {
+    let DriverBinding::Custom { custom_policy_id } = &profile.driver_binding else {
+        bail!("profile {} is not a custom Profile", profile.profile_id);
+    };
+    let policy = provider_registry()
+        .custom_policies
+        .iter()
+        .find(|policy| policy.custom_policy_id == *custom_policy_id)
+        .context("custom policy is not registered")?;
+    let auth_scheme = *policy
+        .default_auth_schemes
+        .get(&upstream_protocol)
+        .context("custom protocol has no recommended authentication")?;
+    let binding = CustomBindingInput {
+        upstream_protocol,
+        auth_scheme,
+    };
+    resolve_custom_binding(profile, &binding)?;
+    Ok(binding)
 }
 
 fn resolve_custom_binding_in_registry(
@@ -797,6 +824,40 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
                     "custom policy {} references unknown driver {}",
                     policy.custom_policy_id,
                     driver_id
+                );
+            }
+        }
+    }
+    for policy in &registry.custom_policies {
+        if !policy.protocols.contains(&policy.default_protocol)
+            || policy.default_auth_schemes.len() != policy.protocols.len()
+        {
+            bail!(
+                "custom policy {} must recommend authentication for every protocol",
+                policy.custom_policy_id
+            );
+        }
+        for (protocol, scheme) in &policy.default_auth_schemes {
+            if !policy.protocols.contains(protocol)
+                || !policy.auth_schemes.contains(scheme)
+                || matches!(
+                    scheme,
+                    AuthScheme::Query | AuthScheme::CustomHeader | AuthScheme::None
+                )
+                || registry
+                    .drivers
+                    .iter()
+                    .filter(|driver| {
+                        policy.allowed_driver_ids.contains(&driver.driver_id)
+                            && driver.upstream_protocol == *protocol
+                            && driver.accepted_auth_schemes.contains(scheme)
+                    })
+                    .count()
+                    != 1
+            {
+                bail!(
+                    "custom policy {} has an invalid authentication recommendation",
+                    policy.custom_policy_id
                 );
             }
         }
@@ -1558,6 +1619,36 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn custom_authentication_defaults_are_protocol_owned_and_driver_validated() {
+        for profile in &provider_registry().profiles {
+            let DriverBinding::Custom { custom_policy_id } = &profile.driver_binding else {
+                continue;
+            };
+            let policy = provider_registry()
+                .custom_policies
+                .iter()
+                .find(|policy| policy.custom_policy_id == *custom_policy_id)
+                .unwrap();
+            for protocol in &policy.protocols {
+                let binding = recommended_custom_binding(profile, *protocol).unwrap();
+                assert_eq!(
+                    binding.auth_scheme,
+                    match protocol {
+                        UpstreamProtocol::OpenAiChat | UpstreamProtocol::OpenAiResponses =>
+                            AuthScheme::Bearer,
+                        _ => AuthScheme::ApiKey,
+                    }
+                );
+            }
+        }
+        let mut invalid = provider_registry().clone();
+        invalid.custom_policies[0]
+            .default_auth_schemes
+            .insert(UpstreamProtocol::OpenAiChat, AuthScheme::Query);
+        assert!(validate_registry(&invalid).is_err());
     }
 
     #[test]

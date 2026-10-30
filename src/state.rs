@@ -4499,15 +4499,33 @@ fn validate_ordinary_provider_subscription_change(
         .shares
         .iter()
         .filter(|share| share.status != "deleted" && share.bindings.len() > 1)
+        .filter(|share| {
+            share.bindings.iter().any(|binding| {
+                let find = |store: &ProviderStore| {
+                    store
+                        .providers
+                        .iter()
+                        .find(|stored| {
+                            stored.app == binding.app && stored.provider.id == binding.provider_id
+                        })
+                        .cloned()
+                };
+                match (find(current), find(candidate)) {
+                    (Some(before), Some(after)) => !provider_resource_content_eq(&before, &after),
+                    (None, None) => false,
+                    _ => true,
+                }
+            })
+        })
     {
         crate::domain::sharing::credential_source::shared_credential_source_for_bindings(
             candidate,
             accounts,
             &share.bindings,
         )
-        .map_err(|error| ProviderCommandError::Conflict {
-            code: error.code(),
-            message: error.to_string(),
+        .map_err(|source| ProviderCommandError::CredentialSource {
+            share_id: Some(share.id.clone()),
+            source: Box::new(source),
         })?;
     }
 
@@ -27879,11 +27897,22 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ProviderCommandError::Conflict {
-                code: "cc_switch_share_credential_source_mismatch",
-                ..
-            }
+            ProviderCommandError::CredentialSource { .. }
         ));
+        // A historical broken Share must not block writes to unrelated Providers.
+        let broken = candidate.clone();
+        candidate.providers.push(openrouter_provider(
+            AppKind::Gemini,
+            "unrelated",
+            "other-key",
+        ));
+        validate_ordinary_provider_subscription_change(
+            &broken,
+            &candidate,
+            &AccountStore::default(),
+            &shares,
+        )
+        .unwrap();
     }
 
     fn healthy_provider_observation(

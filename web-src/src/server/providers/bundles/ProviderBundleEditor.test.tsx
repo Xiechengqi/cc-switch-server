@@ -5,15 +5,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ProviderBundleView } from "@/lib/api/providers";
 import { familyById } from "@/server/providerRegistry";
 import i18n from "@/i18n";
+import { HttpResponseError } from "@/lib/runtime";
 import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
 const mocks = vi.hoisted(() => ({
   upsertBundle: vi.fn(), getBundle: vi.fn(), shareSave: vi.fn(), toastError: vi.fn(), onSaved: vi.fn(),
+  validateBundleDraft: vi.fn(),
 }));
 vi.mock("sonner", () => ({ toast: { error: mocks.toastError, success: vi.fn() } }));
 vi.mock("@/lib/api/providers", () => ({ providersApi: {
   upsertBundle: mocks.upsertBundle,
   getBundle: mocks.getBundle,
+  validateBundleDraft: mocks.validateBundleDraft,
   getRequestDefaults: async () => ({ requestTimeoutSeconds: 300, streamFirstByteTimeoutSeconds: 120, streamIdleTimeoutSeconds: 300 }),
   getHealthCheckConfig: async () => ({ timeoutSeconds: 30, maxRetries: 0, degradedThresholdSeconds: 10, testModels: { claude: "test", codex: "test", gemini: "test" } }),
 } }));
@@ -57,9 +60,64 @@ function saveButton(): HTMLButtonElement {
   return button;
 }
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.validateBundleDraft.mockResolvedValue({ requiresRebind: false });
+});
 
 describe("Provider Bundle editor save stages", () => {
+  it("hides authentication controls, keeps API Key visible and preserves stored Bearer", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}>
+        <ProviderBundleEditor bundle={fixture()} onSaved={mocks.onSaved} onCancel={() => {}} />
+      </QueryClientProvider>));
+      expect(container.textContent).not.toContain(i18n.t("serverProviderForm.binding.authScheme"));
+      expect(container.textContent).toContain(i18n.t("providerBundle.apiKey"));
+      const advanced = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find(button => button.textContent === i18n.t("providerBundle.authAdvanced"))!;
+      expect(advanced).toBeDefined();
+      await act(async () => advanced.click());
+      expect(container.textContent).toContain(i18n.t("serverProviderForm.binding.authScheme"));
+      expect(container.textContent).toContain("Authorization: Bearer");
+      expect(mocks.upsertBundle).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount()); client.clear(); container.remove();
+    }
+  });
+
+  it("stops before any writes on a typed draft conflict and does not ask for refresh", async () => {
+    mocks.validateBundleDraft.mockRejectedValue(new HttpResponseError("carrier mismatch", 409, {
+      code: "cc_switch_share_credential_source_mismatch",
+      details: { reason: "auth_mismatch", app: "codex", firstApp: "claude" },
+    }));
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}>
+        <ProviderBundleEditor bundle={fixture()} onSaved={mocks.onSaved} onCancel={() => {}} />
+      </QueryClientProvider>));
+      await act(async () => {
+        const input = container.querySelector<HTMLInputElement>("#bundle-field-name")!;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Renamed");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => saveButton().click());
+      expect(mocks.validateBundleDraft).toHaveBeenCalledTimes(1);
+      expect(mocks.upsertBundle).not.toHaveBeenCalled();
+      expect(mocks.shareSave).not.toHaveBeenCalled();
+      expect(mocks.toastError).toHaveBeenCalledWith(expect.stringContaining(i18n.t("providerBundle.sharePreflight.auth_mismatch")));
+      expect(container.textContent).toContain(i18n.t("serverProviderForm.binding.authScheme"));
+      expect(container.querySelector("#bundle-field-customBinding-codex")).not.toBeNull();
+    } finally {
+      await act(async () => root.unmount()); client.clear(); container.remove();
+    }
+  });
   it("keeps Share retry enabled after Provider saves, without writing Provider twice", async () => {
     const bundle = fixture();
     const saved = { ...bundle, name: "Renamed", revision: 2 };

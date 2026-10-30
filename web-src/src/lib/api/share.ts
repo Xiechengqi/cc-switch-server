@@ -10,6 +10,7 @@ export type ShareBindings = Partial<
 >;
 
 export type BundleSharePreflight = {
+  details?: unknown;
   bundleId: string;
   bundleRevision: number;
   enabledApps: Array<keyof ShareBindings>;

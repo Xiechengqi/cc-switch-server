@@ -70,7 +70,6 @@ import { normalizeManagedAuthProvider } from "@/lib/authBinding";
 import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
-import { HttpResponseError } from "@/lib/runtime";
 import {
   managedAccountKeys,
   shareKeys,
@@ -80,6 +79,7 @@ import {
 } from "@/lib/query";
 import {
   customPolicyForProfile,
+  customAuthSchemesForProtocol,
   customRecipesForFamily,
   driverForProfile,
   familyById,
@@ -139,6 +139,9 @@ import {
   updateBundleModel,
   updateSurfaceEndpoint,
   updateSurfaceModel,
+  toProviderBundleWriteDraft,
+  updateCustomProtocol,
+  useRecommendedCustomAuth,
   type BundleHeaderDraft,
   type BundleSecretDraft,
   type BundleSurfaceEditorDraft,
@@ -154,6 +157,10 @@ import {
   reconcileBundleSaveDraft,
   type BundleRebindConfirmation,
 } from "./bundleSave";
+import {
+  bundleCredentialConflict,
+  isBundleRefreshConflict,
+} from "./bundleErrors";
 import {
   bundleValidationFieldId,
   firstBundleValidationIssue,
@@ -298,12 +305,12 @@ function protocolLabel(protocol: string): string {
   }
 }
 
-function authSchemeLabel(scheme: string): string {
+function authSchemeLabel(scheme: string, protocol: string): string {
   switch (scheme) {
     case "api_key":
-      return "API Key";
+      return protocol === "gemini_native" ? "x-goog-api-key" : "x-api-key";
     case "bearer":
-      return "Bearer Token";
+      return "Authorization: Bearer";
     case "custom_header":
       return "Custom Header";
     case "query":
@@ -519,31 +526,11 @@ function SurfaceEditor({
 }) {
   const { t } = useTranslation();
   const [showRuntimeJson, setShowRuntimeJson] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const profile = profileById(surface.profileId);
   if (!profile) return null;
   const customPolicy = customPolicyForProfile(profile);
-  const customCredentialLabel = (() => {
-    switch (surface.customBinding?.authScheme) {
-      case "bearer":
-        return t("providerBundle.bearerToken", {
-          defaultValue: "Bearer Token",
-        });
-      case "api_key":
-        return t("providerBundle.apiKey", { defaultValue: "API Key" });
-      case "custom_header":
-        return t("providerBundle.headerCredential", {
-          defaultValue: "Header value",
-        });
-      case "query":
-        return t("providerBundle.queryCredential", {
-          defaultValue: "Query value",
-        });
-      default:
-        return t("providerBundle.surfaceCredential", {
-          defaultValue: "Authentication credential",
-        });
-    }
-  })();
+  const customCredentialLabel = t("providerBundle.apiKey");
   const headers = surface.headers.filter((header) => !header.removed);
   const updateDriverOptions = (
     patch: Partial<BundleSurfaceEditorDraft["driverOptions"]>,
@@ -580,7 +567,7 @@ function SurfaceEditor({
         <div className="space-y-4">
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2 md:col-span-2">
-              <Label htmlFor={`surface-${surface.app}-endpoint`}>
+              <Label htmlFor={`bundle-field-endpoint-${surface.app}`}>
                 {t("serverProviderForm.endpoint.url")}
               </Label>
               <Input
@@ -610,17 +597,12 @@ function SurfaceEditor({
               <Select
                 value={surface.customBinding?.upstreamProtocol}
                 onValueChange={(upstreamProtocol) =>
-                  onChange({
-                    ...surface,
-                    customBinding: {
-                      ...(surface.customBinding ?? {
-                        authScheme: customPolicy
-                          .authSchemes[0]! as ProviderCustomBinding["authScheme"],
-                      }),
-                      upstreamProtocol:
-                        upstreamProtocol as ProviderCustomBinding["upstreamProtocol"],
-                    },
-                  })
+                  onChange(
+                    updateCustomProtocol(
+                      surface,
+                      upstreamProtocol as ProviderCustomBinding["upstreamProtocol"],
+                    ),
+                  )
                 }
               >
                 <SelectTrigger>
@@ -635,73 +617,6 @@ function SurfaceEditor({
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-2">
-              <Label>{t("serverProviderForm.binding.authScheme")}</Label>
-              <Select
-                value={surface.customBinding?.authScheme}
-                onValueChange={(authScheme) => {
-                  const typedAuthScheme =
-                    authScheme as ProviderCustomBinding["authScheme"];
-                  const requiresField =
-                    typedAuthScheme === "custom_header" ||
-                    typedAuthScheme === "query";
-                  onChange({
-                    ...surface,
-                    customBinding: {
-                      ...(surface.customBinding ?? {
-                        upstreamProtocol: customPolicy
-                          .protocols[0]! as ProviderCustomBinding["upstreamProtocol"],
-                      }),
-                      authScheme: typedAuthScheme,
-                    },
-                    driverOptions: {
-                      ...surface.driverOptions,
-                      apiKeyField: requiresField
-                        ? surface.driverOptions.apiKeyField ||
-                          (typedAuthScheme === "query" ? "key" : "x-api-key")
-                        : undefined,
-                    },
-                  });
-                }}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {customPolicy.authSchemes.map((scheme) => (
-                    <SelectItem key={scheme} value={scheme}>
-                      {authSchemeLabel(scheme)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            {surface.customBinding?.authScheme === "custom_header" ||
-            surface.customBinding?.authScheme === "query" ? (
-              <div className="space-y-2">
-                <Label htmlFor={`surface-${surface.app}-auth-field`}>
-                  {surface.customBinding.authScheme === "query"
-                    ? t("providerBundle.queryParameter", {
-                        defaultValue: "API Key 查询参数名",
-                      })
-                    : t("providerBundle.authHeader", {
-                        defaultValue: "API Key Header 名称",
-                      })}
-                </Label>
-                <Input
-                  id={`surface-${surface.app}-auth-field`}
-                  value={surface.driverOptions.apiKeyField ?? ""}
-                  placeholder={
-                    surface.customBinding.authScheme === "query"
-                      ? "key"
-                      : "x-api-key"
-                  }
-                  onChange={(event) =>
-                    updateDriverOptions({ apiKeyField: event.target.value })
-                  }
-                />
-              </div>
-            ) : null}
             <div
               className={cn(
                 "space-y-2",
@@ -710,7 +625,7 @@ function SurfaceEditor({
                   "md:col-span-2",
               )}
             >
-              <Label htmlFor={`surface-${surface.app}-secret`}>
+              <Label htmlFor={`bundle-field-surfaceSecret-${surface.app}`}>
                 {customCredentialLabel}
               </Label>
               <SecretInput
@@ -743,116 +658,287 @@ function SurfaceEditor({
             </div>
           </div>
 
-          {/* A table, not a stack of loose input pairs: header rows are two columns of
-              the same shape repeated, and a header row makes that readable at a glance. */}
-          <div className="space-y-2">
-            <Label>{t("serverProviderForm.headers.title")}</Label>
-            <div className="overflow-hidden rounded-md border">
-              {headers.length ? (
-                <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
-                  <span>
-                    {t("providerBundle.headerName", { defaultValue: "名称" })}
-                  </span>
-                  <span>
-                    {t("providerBundle.headerValue", { defaultValue: "值" })}
-                  </span>
-                  <span />
-                </div>
-              ) : null}
-              {headers.map((header) => (
-                <div
-                  key={header.id}
-                  className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b px-2 py-2"
-                >
-                  <Input
-                    className="h-9"
-                    value={header.name}
-                    placeholder="x-header-name"
-                    aria-label={t("providerBundle.headerName", {
-                      defaultValue: "名称",
-                    })}
-                    onChange={(event) =>
-                      updateHeader(header.id, { name: event.target.value })
-                    }
-                  />
-                  <SecretInput
-                    className="h-9"
-                    value={header.value}
-                    placeholder={header.configured ? "••••••••" : undefined}
-                    aria-label={t("providerBundle.headerValue", {
-                      defaultValue: "值",
-                    })}
-                    onChange={(event) =>
-                      updateHeader(header.id, { value: event.target.value })
-                    }
-                  />
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="ghost"
-                    className="h-9 w-9"
-                    title={t("common.delete")}
-                    aria-label={t("common.delete")}
-                    onClick={() => updateHeader(header.id, { removed: true })}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-              <button
-                type="button"
-                className="flex w-full items-center gap-2 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                onClick={() =>
-                  onChange({
-                    ...surface,
-                    headers: [
-                      ...surface.headers,
-                      {
-                        id: crypto.randomUUID(),
-                        name: "",
-                        configured: false,
-                        value: "",
-                        removed: false,
-                      },
-                    ],
-                  })
-                }
-              >
-                <Plus className="h-3.5 w-3.5" />
-                {headers.length
-                  ? t("common.add")
-                  : t("providerBundle.headersEmpty", {
-                      defaultValue: "添加自定义请求头",
-                    })}
-              </button>
-            </div>
-          </div>
-
-          <Collapsible>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              surface.authMode === "recommended"
+                ? "providerBundle.authAutomatic"
+                : "providerBundle.authPreserved",
+            )}
+          </p>
+          <Collapsible
+            open={
+              advancedOpen ||
+              (validation?.surface === surface.app &&
+                ["customBinding", "authField", "headers"].includes(
+                  validation.field,
+                ))
+            }
+            onOpenChange={setAdvancedOpen}
+          >
             <CollapsibleTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-8 px-2 text-xs"
-              >
+              <Button type="button" variant="ghost" size="sm">
                 <ChevronDown className="mr-1.5 h-3.5 w-3.5" />
-                {t("providerBundle.moreOptions", { defaultValue: "更多选项" })}
+                {t("providerBundle.authAdvanced")}
               </Button>
             </CollapsibleTrigger>
-            <CollapsibleContent className="pt-3">
-              <div className="space-y-2">
-                <Label htmlFor={`surface-${surface.app}-user-agent`}>
-                  {t("serverProviderForm.usage.customUserAgent")}
-                </Label>
-                <Input
-                  id={`surface-${surface.app}-user-agent`}
-                  value={surface.driverOptions.customUserAgent ?? ""}
-                  onChange={(event) =>
-                    updateDriverOptions({ customUserAgent: event.target.value })
-                  }
-                />
+            <CollapsibleContent className="space-y-4 pt-3">
+              <p className="text-xs text-muted-foreground">
+                {t("providerBundle.authAdvancedHint")}
+              </p>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor={`bundle-field-customBinding-${surface.app}`}>
+                    {t("serverProviderForm.binding.authScheme")}
+                  </Label>
+                  <Select
+                    value={
+                      surface.authMode === "recommended"
+                        ? "recommended"
+                        : surface.customBinding?.authScheme
+                    }
+                    onValueChange={(authScheme) => {
+                      if (authScheme === "recommended") {
+                        onChange(useRecommendedCustomAuth(surface));
+                        return;
+                      }
+                      const typedAuthScheme =
+                        authScheme as ProviderCustomBinding["authScheme"];
+                      const requiresField =
+                        typedAuthScheme === "custom_header" ||
+                        typedAuthScheme === "query";
+                      onChange({
+                        ...surface,
+                        authMode: "manual",
+                        customBinding: {
+                          ...(surface.customBinding ?? {
+                            upstreamProtocol: customPolicy
+                              .protocols[0]! as ProviderCustomBinding["upstreamProtocol"],
+                          }),
+                          authScheme: typedAuthScheme,
+                        },
+                        driverOptions: {
+                          ...surface.driverOptions,
+                          apiKeyField: requiresField
+                            ? surface.driverOptions.apiKeyField ||
+                              (typedAuthScheme === "query"
+                                ? "key"
+                                : "x-api-key")
+                            : undefined,
+                        },
+                      });
+                    }}
+                  >
+                    <SelectTrigger
+                      id={bundleValidationFieldId({
+                        code: "customBindingInvalid",
+                        field: "customBinding",
+                        message: "",
+                        surface: surface.app,
+                      })}
+                      className={fieldErrorClass(
+                        matchesBundleValidationIssue(
+                          validation,
+                          "customBinding",
+                          surface.app,
+                        ),
+                      )}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="recommended">
+                        {t("providerBundle.authRecommended")}
+                      </SelectItem>
+                      {customAuthSchemesForProtocol(
+                        profile,
+                        surface.customBinding!.upstreamProtocol,
+                      ).map((scheme) => (
+                        <SelectItem key={scheme} value={scheme}>
+                          {authSchemeLabel(
+                            scheme,
+                            surface.customBinding!.upstreamProtocol,
+                          )}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                {surface.customBinding?.authScheme === "custom_header" ||
+                surface.customBinding?.authScheme === "query" ? (
+                  <div className="space-y-2">
+                    <Label htmlFor={`bundle-field-authField-${surface.app}`}>
+                      {surface.customBinding.authScheme === "query"
+                        ? t("providerBundle.queryParameter", {
+                            defaultValue: "API Key 查询参数名",
+                          })
+                        : t("providerBundle.authHeader", {
+                            defaultValue: "API Key Header 名称",
+                          })}
+                    </Label>
+                    <Input
+                      id={bundleValidationFieldId({
+                        code: "authFieldRequired",
+                        field: "authField",
+                        message: "",
+                        surface: surface.app,
+                      })}
+                      value={surface.driverOptions.apiKeyField ?? ""}
+                      placeholder={
+                        surface.customBinding.authScheme === "query"
+                          ? "key"
+                          : "x-api-key"
+                      }
+                      onChange={(event) =>
+                        updateDriverOptions({ apiKeyField: event.target.value })
+                      }
+                    />
+                  </div>
+                ) : null}
               </div>
+              {surface.customBinding?.authScheme === "query" ? (
+                <p className="text-xs text-amber-600">
+                  {t("providerBundle.authQueryWarning")}
+                </p>
+              ) : null}
+              {/* A table, not a stack of loose input pairs: header rows are two columns of
+              the same shape repeated, and a header row makes that readable at a glance. */}
+              <div
+                id={bundleValidationFieldId({
+                  code: "shareCredentialConflict",
+                  field: "headers",
+                  message: "",
+                  surface: surface.app,
+                })}
+                className={cn(
+                  "space-y-2 rounded-md",
+                  fieldErrorClass(
+                    matchesBundleValidationIssue(
+                      validation,
+                      "headers",
+                      surface.app,
+                    ),
+                  ),
+                )}
+              >
+                <Label>{t("serverProviderForm.headers.title")}</Label>
+                <div className="overflow-hidden rounded-md border">
+                  {headers.length ? (
+                    <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground">
+                      <span>
+                        {t("providerBundle.headerName", {
+                          defaultValue: "名称",
+                        })}
+                      </span>
+                      <span>
+                        {t("providerBundle.headerValue", {
+                          defaultValue: "值",
+                        })}
+                      </span>
+                      <span />
+                    </div>
+                  ) : null}
+                  {headers.map((header) => (
+                    <div
+                      key={header.id}
+                      className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.25rem] items-center gap-2 border-b px-2 py-2"
+                    >
+                      <Input
+                        className="h-9"
+                        value={header.name}
+                        placeholder="x-header-name"
+                        aria-label={t("providerBundle.headerName", {
+                          defaultValue: "名称",
+                        })}
+                        onChange={(event) =>
+                          updateHeader(header.id, { name: event.target.value })
+                        }
+                      />
+                      <SecretInput
+                        className="h-9"
+                        value={header.value}
+                        placeholder={header.configured ? "••••••••" : undefined}
+                        aria-label={t("providerBundle.headerValue", {
+                          defaultValue: "值",
+                        })}
+                        onChange={(event) =>
+                          updateHeader(header.id, { value: event.target.value })
+                        }
+                      />
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-9 w-9"
+                        title={t("common.delete")}
+                        aria-label={t("common.delete")}
+                        onClick={() =>
+                          updateHeader(header.id, { removed: true })
+                        }
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    onClick={() =>
+                      onChange({
+                        ...surface,
+                        headers: [
+                          ...surface.headers,
+                          {
+                            id: crypto.randomUUID(),
+                            name: "",
+                            configured: false,
+                            value: "",
+                            removed: false,
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    {headers.length
+                      ? t("common.add")
+                      : t("providerBundle.headersEmpty", {
+                          defaultValue: "添加自定义请求头",
+                        })}
+                  </button>
+                </div>
+              </div>
+
+              <Collapsible>
+                <CollapsibleTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2 text-xs"
+                  >
+                    <ChevronDown className="mr-1.5 h-3.5 w-3.5" />
+                    {t("providerBundle.moreOptions", {
+                      defaultValue: "更多选项",
+                    })}
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="pt-3">
+                  <div className="space-y-2">
+                    <Label htmlFor={`surface-${surface.app}-user-agent`}>
+                      {t("serverProviderForm.usage.customUserAgent")}
+                    </Label>
+                    <Input
+                      id={`surface-${surface.app}-user-agent`}
+                      value={surface.driverOptions.customUserAgent ?? ""}
+                      onChange={(event) =>
+                        updateDriverOptions({
+                          customUserAgent: event.target.value,
+                        })
+                      }
+                    />
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
             </CollapsibleContent>
           </Collapsible>
         </div>
@@ -1765,6 +1851,12 @@ export function ProviderBundleEditor({
     setSaving(true);
     let providerSaved = false;
     try {
+      if (family.familyId === "family.custom_http") {
+        await providersApi.validateBundleDraft(
+          toProviderBundleWriteDraft(draft),
+          shareDraft.enabled,
+        );
+      }
       const result = confirmation
         ? {
             kind: "saved" as const,
@@ -1822,7 +1914,14 @@ export function ProviderBundleEditor({
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
         queryClient.invalidateQueries({ queryKey: managedAccountKeys.all }),
       ]);
-      const message = error instanceof Error ? error.message : String(error);
+      const conflict = bundleCredentialConflict(error, t);
+      if (conflict) {
+        setValidation(conflict);
+        focusIssue(conflict);
+      }
+      const message =
+        conflict?.message ??
+        (error instanceof Error ? error.message : String(error));
       toast.error(
         providerSaved
           ? t("providerBundle.shareSaveFailed", { error: message })
@@ -1832,7 +1931,7 @@ export function ProviderBundleEditor({
                   ? "providerBundle.saveUncertainReadBack"
                   : "providerBundle.saveUncertain",
               )
-            : error instanceof HttpResponseError && error.status === 409
+            : isBundleRefreshConflict(error)
               ? t("providerBundle.saveConflict", { error: message })
               : message,
       );
@@ -1920,7 +2019,10 @@ export function ProviderBundleEditor({
     : t("providerBundle.featuresAllOff", { defaultValue: "全部关闭" });
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 pb-24">
+    <fieldset
+      disabled={saving}
+      className="mx-auto m-0 flex min-w-0 w-full max-w-5xl flex-col gap-6 border-0 p-0 pb-24"
+    >
       <div className="flex items-center gap-3">
         <Button
           type="button"
@@ -2997,14 +3099,27 @@ export function ProviderBundleEditor({
             aria-labelledby="bundle-tab-share"
             ref={shareSectionRef}
           >
-            {shareDirty && existingShare && shareDraft.baseline?.configRevision !== existingShare.configRevision ? (
-              <div role="alert" className="mb-3 flex items-center gap-3 text-sm text-amber-700">
+            {shareDirty &&
+            existingShare &&
+            shareDraft.baseline?.configRevision !==
+              existingShare.configRevision ? (
+              <div
+                role="alert"
+                className="mb-3 flex items-center gap-3 text-sm text-amber-700"
+              >
                 <span>{t("share.userLimit.remoteChanged")}</span>
-                <Button type="button" variant="outline" disabled={saving} onClick={() => {
-                  const next = createBundleShareDraft(existingShare);
-                  shareBaselineRef.current = stableStringify(next);
-                  setShareDraft(next);
-                }}>{t("share.userLimit.reloadShare")}</Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={saving}
+                  onClick={() => {
+                    const next = createBundleShareDraft(existingShare);
+                    shareBaselineRef.current = stableStringify(next);
+                    setShareDraft(next);
+                  }}
+                >
+                  {t("share.userLimit.reloadShare")}
+                </Button>
               </div>
             ) : null}
             <fieldset disabled={saving} className="min-w-0">
@@ -3062,18 +3177,27 @@ export function ProviderBundleEditor({
       <ConfirmDialog
         isOpen={rebindConfirmation !== null}
         title={t("providerBundle.rebindTitle")}
-        message={rebindConfirmation ? [
-          ...rebindConfirmation.preview.changes.map((change) =>
-            `${APP_LABELS[change.app]}: ${protocolLabel(change.before.upstreamProtocol)} / ${authSchemeLabel(change.before.authScheme)} → ${protocolLabel(change.after.upstreamProtocol)} / ${authSchemeLabel(change.after.authScheme)}`,
-          ),
-          t("providerBundle.rebindShares", { count: rebindConfirmation.preview.shareIds.length }),
-        ].join("\n\n") : ""}
+        message={
+          rebindConfirmation
+            ? [
+                ...rebindConfirmation.preview.changes.map(
+                  (change) =>
+                    `${APP_LABELS[change.app]}: ${protocolLabel(change.before.upstreamProtocol)} / ${authSchemeLabel(change.before.authScheme, change.before.upstreamProtocol)} → ${protocolLabel(change.after.upstreamProtocol)} / ${authSchemeLabel(change.after.authScheme, change.after.upstreamProtocol)}`,
+                ),
+                t("providerBundle.rebindShares", {
+                  count: rebindConfirmation.preview.shareIds.length,
+                }),
+              ].join("\n\n")
+            : ""
+        }
         confirmText={t("providerBundle.rebindConfirm")}
         cancelText={t("common.cancel")}
         confirmDisabled={saving}
         variant="info"
         zIndex="top"
-        onConfirm={() => rebindConfirmation ? submit(rebindConfirmation) : undefined}
+        onConfirm={() =>
+          rebindConfirmation ? submit(rebindConfirmation) : undefined
+        }
         onCancel={() => setRebindConfirmation(null)}
       />
       <ConfirmDialog
@@ -3101,6 +3225,6 @@ export function ProviderBundleEditor({
         onConfirm={closeGuard.discardAndClose}
         onCancel={closeGuard.keepEditing}
       />
-    </div>
+    </fieldset>
   );
 }

@@ -396,11 +396,19 @@
     }
   },
   "providerBundle": {
+    "authAdvanced": "進階相容設定（通常無需修改）",
+    "authRecommended": "使用協定建議設定",
+    "authAutomatic": "已依上游協定自動設定驗證，無需手動選擇。",
+    "authPreserved": "保留目前驗證設定；僅在上游有特殊要求時修改進階設定。",
+    "authAdvancedHint": "這些選項決定同一把 API Key 如何傳送至上游，不是不同的金鑰類型。修改可能影響關聯分享。",
+    "authQueryWarning": "URL 參數中的金鑰可能進入存取日誌，僅在上游明確要求時使用。",
+    "conflictApps": "涉及 {{firstApp}} / {{app}}，請檢查對應 App 的設定。",
     "sharePreflight": {
+      "extra_headers_mismatch": "多個 App 的附加驗證標頭不一致，無法合併分享。請檢查進階相容設定中的標頭名稱與值。",
       "source_unverifiable": "無法驗證多個 App 使用同一憑據來源。請檢查服務位址、驗證方式和 Key；無法確認同源時，請拆分為獨立供應商。",
       "credential_mismatch": "多個 App 的 Key 或附加驗證資訊不一致，無法合併分享。請統一憑據，或拆分為獨立供應商。",
       "endpoint_mismatch": "多個 App 的上游服務或租戶路徑不一致，無法合併分享。請核對服務位址。",
-      "auth_mismatch": "多個 App 的驗證載體不一致，無法確認使用同一憑據來源。請核對驗證方式及欄位。",
+      "auth_mismatch": "多個 App 傳送 API Key 的方式不一致，無法確認使用同一憑證來源。請檢查進階相容設定；重新整理無法解決此問題。",
       "no_enabled_apps": "請至少啟用一個 App 後再開啟分享。",
       "resolution_failed": "暫時無法驗證供應商憑據來源。請檢查伺服器狀態後重試。"
     },

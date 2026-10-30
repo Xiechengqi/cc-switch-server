@@ -1,6 +1,6 @@
 {
   "format": "cc-switch-provider-registry",
-  "schemaVersion": 8,
+  "schemaVersion": 9,
   "optionSchemas": [
     {"optionSchemaId":"oauth.claude.v1","fields":[]},
     {"optionSchemaId":"http.anthropic.v1","fields":["apiKeyField","customUserAgent"]},
@@ -185,9 +185,9 @@
     {"recipeId":"claude.anthropic_bearer_relay","label":"Anthropic Bearer Relay","labelKey":"providerBundle.recipeAnthropicBearerRelay","profileId":"claude.custom_http","compatibilityProviderType":"claude_auth","binding":{"upstreamProtocol":"anthropic_messages","authScheme":"bearer"},"modelPolicy":"passthrough","icon":"anthropic","iconColor":"#D4915D"}
   ],
   "customPolicies": [
-    {"customPolicyId":"claude.custom_http.v1","app":"claude","protocols":["anthropic_messages","open_ai_chat","open_ai_responses","gemini_native"],"authSchemes":["api_key","bearer","custom_header","query"],"allowedDriverIds":["http.anthropic_messages","http.openai_chat","http.openai_responses","http.gemini_native"],"outboundIdentityPolicy":{"kind":"custom_override"}},
-    {"customPolicyId":"codex.custom_http.v1","app":"codex","protocols":["open_ai_chat","open_ai_responses","anthropic_messages"],"authSchemes":["api_key","bearer","custom_header"],"allowedDriverIds":["http.openai_chat","http.openai_responses","http.anthropic_messages"],"outboundIdentityPolicy":{"kind":"custom_override"}},
-    {"customPolicyId":"gemini.custom_http.v1","app":"gemini","protocols":["gemini_native","open_ai_chat","open_ai_responses","anthropic_messages"],"authSchemes":["api_key","bearer","custom_header","query"],"allowedDriverIds":["http.gemini_native","http.openai_chat","http.openai_responses","http.anthropic_messages"],"outboundIdentityPolicy":{"kind":"custom_override"}}
+    {"customPolicyId":"claude.custom_http.v1","app":"claude","protocols":["anthropic_messages","open_ai_chat","open_ai_responses","gemini_native"],"defaultProtocol":"anthropic_messages","authSchemes":["api_key","bearer","custom_header","query"],"defaultAuthSchemes":{"anthropic_messages":"api_key","open_ai_chat":"bearer","open_ai_responses":"bearer","gemini_native":"api_key"},"allowedDriverIds":["http.anthropic_messages","http.openai_chat","http.openai_responses","http.gemini_native"],"outboundIdentityPolicy":{"kind":"custom_override"}},
+    {"customPolicyId":"codex.custom_http.v1","app":"codex","protocols":["open_ai_chat","open_ai_responses","anthropic_messages"],"defaultProtocol":"open_ai_responses","authSchemes":["api_key","bearer","custom_header"],"defaultAuthSchemes":{"open_ai_chat":"bearer","open_ai_responses":"bearer","anthropic_messages":"api_key"},"allowedDriverIds":["http.openai_chat","http.openai_responses","http.anthropic_messages"],"outboundIdentityPolicy":{"kind":"custom_override"}},
+    {"customPolicyId":"gemini.custom_http.v1","app":"gemini","protocols":["gemini_native","open_ai_chat","open_ai_responses","anthropic_messages"],"defaultProtocol":"gemini_native","authSchemes":["api_key","bearer","custom_header","query"],"defaultAuthSchemes":{"gemini_native":"api_key","open_ai_chat":"bearer","open_ai_responses":"bearer","anthropic_messages":"api_key"},"allowedDriverIds":["http.gemini_native","http.openai_chat","http.openai_responses","http.anthropic_messages"],"outboundIdentityPolicy":{"kind":"custom_override"}}
   ],
   "legacyPresetMappings": [
     {"app":"claude","legacyName":"Claude Official","profileId":"claude.official_oauth"},

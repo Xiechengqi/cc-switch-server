@@ -5,7 +5,11 @@ export type ProviderModelPolicy = "passthrough" | "single";
 export type ProviderFieldScope = "bundle" | "surface";
 
 export type ProviderFormComposition =
-  "managed_account" | "static_secret" | "aws" | "custom" | "legacy";
+  | "managed_account"
+  | "static_secret"
+  | "aws"
+  | "custom"
+  | "legacy";
 
 export type ProviderUpstreamProtocol =
   | "anthropic_messages"
@@ -70,7 +74,11 @@ export interface ProviderRegistryProfile {
   compatibilityProviderType?: string;
   formComposition: ProviderFormComposition;
   endpointPolicy:
-    "fixed" | "override_allowed" | "template" | "custom" | "frozen_legacy";
+    | "fixed"
+    | "override_allowed"
+    | "template"
+    | "custom"
+    | "frozen_legacy";
   credentialPolicy: ProviderCredentialPolicy;
   modelPolicy: ProviderModelPolicy;
   allowedModelPolicies?: ProviderModelPolicy[];
@@ -131,7 +139,11 @@ export interface ProviderCustomPolicy {
   customPolicyId: string;
   app: CoreProviderApp;
   protocols: ProviderUpstreamProtocol[];
+  defaultProtocol: ProviderUpstreamProtocol;
   authSchemes: ProviderAuthScheme[];
+  defaultAuthSchemes: Partial<
+    Record<ProviderUpstreamProtocol, ProviderAuthScheme>
+  >;
   allowedDriverIds: string[];
   outboundIdentityPolicy: ProviderOutboundIdentityPolicy;
 }
@@ -257,6 +269,34 @@ export function customPolicyForProfile(
   return providerRegistry.customPolicies.find(
     (policy) => policy.customPolicyId === binding.customPolicyId,
   );
+}
+
+export function customAuthSchemesForProtocol(
+  profile: ProviderRegistryProfile,
+  protocol: ProviderUpstreamProtocol,
+): ProviderAuthScheme[] {
+  const policy = customPolicyForProfile(profile);
+  if (!policy?.protocols.includes(protocol)) return [];
+  return policy.authSchemes.filter(
+    (scheme) =>
+      providerRegistry.drivers.filter(
+        (driver) =>
+          policy.allowedDriverIds.includes(driver.driverId) &&
+          driver.upstreamProtocol === protocol &&
+          driver.acceptedAuthSchemes.includes(scheme),
+      ).length === 1,
+  );
+}
+
+export function recommendedCustomAuth(
+  profile: ProviderRegistryProfile,
+  protocol: ProviderUpstreamProtocol,
+): ProviderAuthScheme | undefined {
+  const scheme = customPolicyForProfile(profile)?.defaultAuthSchemes[protocol];
+  return scheme &&
+    customAuthSchemesForProtocol(profile, protocol).includes(scheme)
+    ? scheme
+    : undefined;
 }
 
 export function customRecipeById(

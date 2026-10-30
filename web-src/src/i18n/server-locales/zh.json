@@ -396,11 +396,19 @@
     }
   },
   "providerBundle": {
+    "authAdvanced": "高级兼容设置（通常无需修改）",
+    "authRecommended": "使用协议推荐配置",
+    "authAutomatic": "认证已按上游协议自动配置，无需手动选择。",
+    "authPreserved": "保留当前认证配置；仅在上游有特殊要求时修改高级设置。",
+    "authAdvancedHint": "这些选项决定同一把 API Key 如何发送给上游，不是不同的密钥类型。修改可能影响关联分享。",
+    "authQueryWarning": "URL 参数中的密钥可能进入访问日志，仅在上游明确要求时使用。",
+    "conflictApps": "涉及 {{firstApp}} / {{app}}，请检查对应 App 的配置。",
     "sharePreflight": {
+      "extra_headers_mismatch": "多个 App 的附加认证请求头不一致，不能合并分享。请检查高级兼容设置中的请求头名称和值。",
       "source_unverifiable": "无法验证多个 App 使用同一凭据源。请检查服务地址、认证方式和 Key；不能确认同源时，请拆分为独立供应商。",
       "credential_mismatch": "多个 App 的 Key 或附加认证信息不一致，不能合并分享。请统一凭据，或拆分为独立供应商。",
       "endpoint_mismatch": "多个 App 的上游服务或租户路径不一致，不能合并分享。请核对服务地址。",
-      "auth_mismatch": "多个 App 的认证载体不一致，不能确认使用同一凭据源。请核对认证方式和认证字段。",
+      "auth_mismatch": "多个 App 发送 API Key 的方式不一致，不能确认使用同一凭据源。请检查高级兼容设置；刷新页面不能解决此问题。",
       "no_enabled_apps": "请至少启用一个 App 后再开启分享。",
       "resolution_failed": "暂时无法验证供应商凭据源。请检查服务端状态后重试。"
     },

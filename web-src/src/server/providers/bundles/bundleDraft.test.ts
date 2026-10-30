@@ -5,7 +5,7 @@ import type {
   ProviderResource,
   ProviderRuntimePlan,
 } from "@/lib/api/providers";
-import { familyById, providerRegistry } from "@/server/providerRegistry";
+import { customAuthSchemesForProtocol, familyById, profileById, providerRegistry } from "@/server/providerRegistry";
 import {
   applyCustomRecipeToBundleDraft,
   changeModelPolicyScope,
@@ -24,10 +24,41 @@ import {
   toProviderBundleWriteDraft,
   updateBundleModel,
   updateSurfaceEndpoint,
+  updateCustomProtocol,
+  useRecommendedCustomAuth,
   validateProviderBundleDraft,
   validateProviderBundleDraftIssue,
 } from "./bundleDraft";
 import { createDraftForSelectedFamily } from "./bundleDefaults";
+
+describe("Custom authentication recommendations", () => {
+  it("uses protocol defaults for every allowed App/protocol and never recommends query auth", () => {
+    const draft = createProviderBundleDraft(familyById("family.custom_http")!);
+    for (const surface of draft.surfaces) {
+      const policy = providerRegistry.customPolicies.find(policy => policy.app === surface.app)!;
+      for (const protocol of policy.protocols) {
+        const updated = updateCustomProtocol(surface, protocol as NonNullable<typeof surface.customBinding>["upstreamProtocol"]);
+        expect(updated.customBinding?.authScheme).toBe(protocol.startsWith("open_ai_") ? "bearer" : "api_key");
+        expect(updated.authMode).toBe("recommended");
+      }
+    }
+    const profile = profileById("claude.custom_http")!;
+    expect(customAuthSchemesForProtocol(profile, "gemini_native")).toEqual(["api_key", "query"]);
+    expect(customAuthSchemesForProtocol(profile, "open_ai_chat")).not.toContain("query");
+  });
+
+  it("keeps existing/manual Bearer until the user explicitly chooses recommendations", () => {
+    const surface = createProviderBundleDraft(familyById("family.custom_http")!).surfaces[0]!;
+    surface.authMode = "preserve";
+    surface.customBinding = { upstreamProtocol: "anthropic_messages", authScheme: "bearer" };
+    expect(updateCustomProtocol(surface, "open_ai_chat").customBinding?.authScheme).toBe("bearer");
+    expect(useRecommendedCustomAuth(surface).customBinding?.authScheme).toBe("api_key");
+    surface.authMode = "manual";
+    surface.customBinding.authScheme = "custom_header";
+    expect(updateCustomProtocol(surface, "open_ai_chat").customBinding?.authScheme).toBe("custom_header");
+    expect(surface.customBinding.authScheme).toBe("custom_header");
+  });
+});
 
 function runtime(
   resource: Pick<ProviderResource, "app" | "profileId" | "revision">,

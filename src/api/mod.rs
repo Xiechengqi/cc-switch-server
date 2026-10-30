@@ -348,6 +348,10 @@ pub fn app_router(state: ServerState) -> Router {
             put(update_provider_bundle_order),
         )
         .route(
+            "/api/provider-bundles/validate-draft",
+            post(validate_provider_bundle_draft),
+        )
+        .route(
             "/api/provider-bundles/:id",
             get(get_provider_bundle)
                 .patch(update_provider_bundle)

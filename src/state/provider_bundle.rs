@@ -1,9 +1,119 @@
 use super::*;
 use crate::domain::providers::bundle::{
-    ProviderBundleBindingChange, ProviderBundleRebindPreview, ProviderBundleRuntimeChange,
+    ProviderBundleBindingChange, ProviderBundleDraftValidation,
+    ProviderBundleDraftValidationRequest, ProviderBundleRebindPreview, ProviderBundleRuntimeChange,
 };
 
 impl ServerStateInner {
+    /// No disk writes, outbound calls, tunnel leases, credential rotation or quotas.
+    /// Apply always reconstructs its candidate under the same reference guard.
+    pub async fn validate_provider_bundle_draft(
+        &self,
+        request: ProviderBundleDraftValidationRequest,
+    ) -> anyhow::Result<Result<ProviderBundleDraftValidation, ProviderCommandError>> {
+        let _guard = self.lock_reference_mutations().await;
+        let current = self.providers.read().await.materialized_clone()?;
+        let accounts = self.accounts.read().await.clone();
+        let shares = self.shares.read().await.clone();
+        Ok((|| {
+            let draft = &request.bundle;
+            let drafts = bundle_surface_drafts(draft)?;
+            // Network-owned identity verification remains in the real write path.
+            let existing = current
+                .providers
+                .iter()
+                .filter(|stored| {
+                    is_explicit_bundle_surface(&stored.provider)
+                        && provider_bundle_id(&stored.provider) == Some(draft.id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let source_revision = existing
+                .iter()
+                .map(|stored| stored.resource.revision)
+                .max()
+                .unwrap_or_default();
+            let requires_rebind = !binding_changes(&existing, &drafts).is_empty();
+            let mut candidate = current.clone();
+            let identities = vec![None; drafts.len()];
+            apply_bundle_candidate(
+                &mut candidate,
+                draft,
+                drafts,
+                &accounts,
+                &shares,
+                &identities,
+                if requires_rebind {
+                    ProviderBindingWriteMode::CustomBundleRebind
+                } else {
+                    ProviderBindingWriteMode::Ordinary
+                },
+            )?;
+            let surfaces = candidate
+                .providers
+                .iter()
+                .filter(|stored| {
+                    is_explicit_bundle_surface(&stored.provider)
+                        && provider_bundle_id(&stored.provider) == Some(draft.id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if request.share_enabled {
+                let bindings = surfaces
+                    .iter()
+                    .map(|stored| ShareBinding {
+                        app: stored.app,
+                        provider_id: stored.provider.id.clone(),
+                        provider_type: stored.provider_type,
+                    })
+                    .collect::<Vec<_>>();
+                crate::domain::sharing::credential_source::shared_credential_source_for_bindings(
+                    &candidate, &accounts, &bindings,
+                )
+                .map_err(|source| ProviderCommandError::CredentialSource {
+                    share_id: None,
+                    source: Box::new(source),
+                })?;
+            }
+            let mut authentication = BTreeMap::new();
+            for surface in surfaces
+                .iter()
+                .filter(|stored| surface_enabled(&stored.provider))
+            {
+                if let Some(binding) = &surface.resource.custom_binding {
+                    let plan = compile_runtime_plan_with_defaults(
+                        surface,
+                        &accounts,
+                        candidate.runtime_defaults(),
+                    )
+                    .map_err(bundle_invalid)?;
+                    if let Some(carrier) =
+                        crate::domain::providers::static_auth::static_auth_carrier(
+                            binding.upstream_protocol,
+                            binding.auth_scheme,
+                            &plan.driver_options,
+                        )
+                        .map_err(bundle_invalid)?
+                    {
+                        authentication.insert(surface.app, carrier);
+                    }
+                }
+            }
+            let share_ids = existing
+                .iter()
+                .flat_map(|stored| shares.share_ids_for_provider(stored.app, &stored.provider.id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Ok(ProviderBundleDraftValidation {
+                bundle_id: draft.id.clone(),
+                source_revision,
+                requires_rebind,
+                share_ids,
+                authentication,
+            })
+        })())
+    }
+
     /// Read-only snapshot. The write path always revalidates; a preflight is
     /// information for the administrator, not an authorization token.
     pub async fn provider_bundle_share_preflight(
@@ -333,7 +443,8 @@ fn rebind_preview(
         b"cc-switch-provider-bundle-rebind-custom-v1",
         current,
         accounts,
-        &serde_json::json!({"bundle": draft, "references": references}),
+        &serde_json::json!({"bundle": draft, "references": references,
+            "registrySchemaVersion": crate::domain::providers::registry::PROVIDER_REGISTRY_SCHEMA_VERSION}),
     )?;
     let mut runtimes = BTreeMap::new();
     for before in &existing {

@@ -94,13 +94,42 @@ export interface WebRuntimeContext {
 }
 
 export class HttpResponseError extends Error {
+  public readonly code?: string;
+  public readonly details?: unknown;
+  public readonly retryable?: boolean;
   constructor(
     message: string,
     public readonly status: number,
+    metadata: { code?: string; details?: unknown; retryable?: boolean } = {},
   ) {
     super(message);
     this.name = "HttpResponseError";
+    this.code = metadata.code;
+    this.details = metadata.details;
+    this.retryable = metadata.retryable;
   }
+}
+
+function httpResponseError(data: unknown, status: number): HttpResponseError {
+  const body =
+    data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+  const nested =
+    body.error && typeof body.error === "object"
+      ? (body.error as Record<string, unknown>)
+      : body;
+  const message = [body.error, nested.message, body.message].find(
+    (value) => typeof value === "string",
+  );
+  return new HttpResponseError(
+    typeof message === "string" ? message : `HTTP ${status}`,
+    status,
+    {
+      code: typeof nested.code === "string" ? nested.code : undefined,
+      details: nested.details,
+      retryable:
+        typeof nested.retryable === "boolean" ? nested.retryable : undefined,
+    },
+  );
 }
 
 const TOKEN_KEY = "cc_switch_server_token";
@@ -135,10 +164,7 @@ export async function loginWithPassword(password: string): Promise<string> {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new HttpResponseError(
-      data?.error || data?.message || `HTTP ${response.status}`,
-      response.status,
-    );
+    throw httpResponseError(data, response.status);
   }
   const token = String(data?.token ?? "");
   if (!token) {
@@ -196,10 +222,7 @@ export async function jsonFetch<T>(
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new HttpResponseError(
-      data?.error || data?.message || `HTTP ${response.status}`,
-      response.status,
-    );
+    throw httpResponseError(data, response.status);
   }
   return data as T;
 }

@@ -10,6 +10,8 @@ import type {
 } from "@/lib/api/providers";
 import {
   customPolicyForProfile,
+  customAuthSchemesForProtocol,
+  recommendedCustomAuth,
   driverForProfile,
   familyById,
   modelPoliciesForProfile,
@@ -109,6 +111,8 @@ export interface BundleSurfaceEditorDraft {
     codexRoutingHintEnabled?: boolean;
   };
   customBinding?: ProviderCustomBinding;
+  // Editing intent only. Persisted bindings stay concrete and pinned on reload.
+  authMode?: "recommended" | "preserve" | "manual";
   secret: BundleSecretDraft;
   headers: BundleHeaderDraft[];
   runtime?: ProviderRuntimePlan;
@@ -181,12 +185,42 @@ export function resolvePersistedCodexControlTarget(
   };
 }
 
-const DEFAULT_CUSTOM_BINDINGS: Record<CoreProviderApp, ProviderCustomBinding> =
-  {
-    claude: { upstreamProtocol: "anthropic_messages", authScheme: "api_key" },
-    codex: { upstreamProtocol: "open_ai_responses", authScheme: "bearer" },
-    gemini: { upstreamProtocol: "gemini_native", authScheme: "api_key" },
+function initialCustomBinding(
+  profile: ProviderRegistryProfile,
+): ProviderCustomBinding {
+  const protocol = customPolicyForProfile(profile)?.defaultProtocol as
+    | ProviderCustomBinding["upstreamProtocol"]
+    | undefined;
+  const authScheme = protocol && recommendedCustomAuth(profile, protocol);
+  if (!protocol || !authScheme)
+    throw new Error(`Missing Custom recommendation for ${profile.profileId}`);
+  return { upstreamProtocol: protocol, authScheme };
+}
+
+export function updateCustomProtocol(
+  surface: BundleSurfaceEditorDraft,
+  protocol: ProviderCustomBinding["upstreamProtocol"],
+): BundleSurfaceEditorDraft {
+  const profile = profileById(surface.profileId);
+  const authScheme =
+    surface.authMode === "recommended" && profile
+      ? recommendedCustomAuth(profile, protocol)
+      : surface.customBinding?.authScheme;
+  if (!authScheme) return surface;
+  return {
+    ...surface,
+    customBinding: { upstreamProtocol: protocol, authScheme },
   };
+}
+
+export function useRecommendedCustomAuth(
+  surface: BundleSurfaceEditorDraft,
+): BundleSurfaceEditorDraft {
+  return updateCustomProtocol(
+    { ...surface, authMode: "recommended" },
+    surface.customBinding!.upstreamProtocol,
+  );
+}
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -319,7 +353,9 @@ function defaultsToPerAppModelPolicy(family: ProviderFamilySpec): boolean {
   const defaultModels = new Set(
     profiles.map((profile) => profile.defaultUpstreamModel ?? ""),
   );
-  const defaultPolicies = new Set(profiles.map((profile) => profile.modelPolicy));
+  const defaultPolicies = new Set(
+    profiles.map((profile) => profile.modelPolicy),
+  );
   return defaultModels.size > 1 || defaultPolicies.size > 1;
 }
 
@@ -506,8 +542,9 @@ function surfaceFromResource(
     customBinding:
       (resource?.customBinding ? { ...resource.customBinding } : undefined) ??
       (profile.formComposition === "custom"
-        ? clone(DEFAULT_CUSTOM_BINDINGS[app])
+        ? initialCustomBinding(profile)
         : undefined),
+    authMode: resource?.customBinding ? "preserve" : "recommended",
     secret: {
       configured: Boolean(
         resource?.credentialSlots.some(
@@ -631,6 +668,7 @@ export function applyCustomRecipeToBundleDraft(
             ? defaultModel
             : surface.upstreamModel,
         customBinding: { ...recipe.binding },
+        authMode: "manual",
         driverOptions: {
           ...surface.driverOptions,
           apiKeyField: undefined,
@@ -649,12 +687,14 @@ export function customRecipeMatchesBundleDraft(
   );
   return Boolean(
     target?.enabled &&
-    draft.surfaces.every((surface) => surface === target || !surface.enabled) &&
-    draft.modelPolicyScope === "global" &&
-    draft.modelPolicy === recipe.modelPolicy &&
-    target.customBinding?.upstreamProtocol ===
-      recipe.binding.upstreamProtocol &&
-    target.customBinding.authScheme === recipe.binding.authScheme,
+      draft.surfaces.every(
+        (surface) => surface === target || !surface.enabled,
+      ) &&
+      draft.modelPolicyScope === "global" &&
+      draft.modelPolicy === recipe.modelPolicy &&
+      target.customBinding?.upstreamProtocol ===
+        recipe.binding.upstreamProtocol &&
+      target.customBinding.authScheme === recipe.binding.authScheme,
   );
 }
 
@@ -1303,7 +1343,10 @@ export function validateProviderBundleDraftIssue(
       if (
         !surface.customBinding ||
         !policy?.protocols.includes(surface.customBinding.upstreamProtocol) ||
-        !policy.authSchemes.includes(surface.customBinding.authScheme)
+        !customAuthSchemesForProtocol(
+          profile,
+          surface.customBinding.upstreamProtocol,
+        ).includes(surface.customBinding.authScheme)
       ) {
         return issue(
           "customBindingInvalid",

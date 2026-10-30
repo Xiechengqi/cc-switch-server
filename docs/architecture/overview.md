@@ -128,7 +128,11 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
 - Custom Provider Bundle 的协议/认证绑定修改走 `POST /api/provider-bundles/:id/rebind-custom` 或同义 Web invoke 的 preview/apply；完整草稿、Provider 版本与关联 Share 配置版本绑定到预览令牌。普通保存与显式重绑定共用候选校验和 Provider 提交协调器，多 App 原子提交；单 Provider 重绑定不能绕过 Bundle 边界。停用 App 不要求凭据或运行时。Web 编辑器在供应商已保存、分享保存失败时保留两个阶段各自的基线；网络写入结果不确定时先只读回查，不自动重复写入。
 - Custom 的 `credentialSourceScope=surface` 只决定凭据独立存储，不禁止验证同源分享。分享域按有效服务/租户地址、认证载体、唯一主凭据和具名附加认证头判断同源；与转发共用唯一凭据解析规则，不按 App、Bundle ID、裸域名或无标签密钥集合猜测。仅规范化当前协议的终端版本后缀与尾斜杠；含查询、fragment、userinfo 或编码路径的模糊地址不参与复用。只读 `GET /api/provider-bundles/:id/share-preflight` 和 `get_provider_bundle_share_preflight` 不返回密钥或容量指纹，写路径仍在引用锁下重新验证。凭据变更沿用提交协调器刷新 HMAC 容量池，保留用量和用户授权；旧单 App 隔离池在完整性修复时重派生。显式重绑定也不得悄悄更换已被 Share 引用的兼容 Provider 类型；只改协议而不改有效凭据来源时容量池保持稳定。无法复用的单 App 隔离回退使用实际启用绑定，不取任意首项。
 
+认证的完整草稿预检为 `POST /api/provider-bundles/validate-draft` / `validate_provider_bundle_draft`，要求管理员会话和 Provider 契约，使用与保存相同的候选校验；`shareEnabled` 表示待开启分享的意图，不允许绕过已存在的 Share 引用。该操作没有持久化或上游调用，不验证真实上游接受性，也不代替 apply 的版本/引用锁校验。Provider 修改只重新检查受影响 Share 的 Custom 来源约束，无关历史异常不阻塞其他 Provider。冲突细节使用固定 reason 和 App/Share 标识及无密钥认证描述；前端仅对真正的 revision/preview conflict 提示刷新。
+
 ### 4.3 UI 独立性
+
+Custom 认证推荐由 Registry 的 `defaultProtocol` / `defaultAuthSchemes` 权威声明，前端仅在新建或明确选择推荐时解析；保存的是具体 `customBinding`，编辑已保存记录时固定保留，不在运行时跟随新默认值切换。高级兼容设置默认折叠，普通密钥输入统一称为 API Key。纯 domain 的 `static_auth_carrier` 同时服务转发、分享同源校验及脱敏诊断，既有 v1 source digest 和容量池算法不变。
 
 Web UI 只以本仓库产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为实现依据；禁止从 cc-switch 或其他外部项目批量复制组件、样式、locale 与页面结构。
 

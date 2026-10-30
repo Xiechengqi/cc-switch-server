@@ -102,6 +102,25 @@ pub struct ProviderBundleReferencePreview {
     pub blocked: bool,
 }
 
+/// Authenticated, read-only validation of an entire unsaved Bundle candidate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderBundleDraftValidationRequest {
+    pub bundle: ProviderBundleWriteDraft,
+    #[serde(default)]
+    pub share_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBundleDraftValidation {
+    pub bundle_id: String,
+    pub source_revision: u64,
+    pub requires_rebind: bool,
+    pub share_ids: Vec<String>,
+    pub authentication: BTreeMap<AppKind, super::static_auth::StaticAuthCarrier>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderBundleBindingChange {

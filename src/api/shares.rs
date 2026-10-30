@@ -386,10 +386,13 @@ pub(in crate::api) fn map_credential_source_error(
 ) -> ApiError {
     use crate::domain::sharing::credential_source::CredentialSourceError;
 
+    let details = error.details();
     match error {
         CredentialSourceError::Resolution { .. }
-        | CredentialSourceError::CapacityPoolDerivation { .. } => ApiError::internal(error),
-        _ => ApiError::bad_request_code(error.code(), error.to_string()),
+        | CredentialSourceError::CapacityPoolDerivation { .. } => {
+            ApiError::internal(error).with_details(details)
+        }
+        _ => ApiError::bad_request_code(error.code(), error.public_message()).with_details(details),
     }
 }
 

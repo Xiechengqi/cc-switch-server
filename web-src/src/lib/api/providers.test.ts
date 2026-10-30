@@ -53,6 +53,13 @@ beforeEach(() => {
 });
 
 describe("providersApi coding-plan quota", () => {
+  it("validates an unsaved Bundle through the authenticated no-store tunnel command", async () => {
+    const bundle = { id: "custom" } as Parameters<typeof providersApi.upsertBundle>[0];
+    await providersApi.validateBundleDraft(bundle, true);
+    expect(runtimeMocks.invokeCommand).toHaveBeenLastCalledWith(
+      "validate_provider_bundle_draft", { bundle, shareEnabled: true }, { cache: "no-store" },
+    );
+  });
   it("uses preview and apply commands that work through client tunnels", async () => {
     const bundle = { id: "custom", expectedRevision: 1 } as Parameters<typeof providersApi.upsertBundle>[0];
     runtimeMocks.invokeCommand.mockResolvedValueOnce({ preview: { previewToken: "preview" } });

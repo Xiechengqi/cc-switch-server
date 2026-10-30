@@ -18,7 +18,10 @@ export interface ProviderInferenceTestResponse {
 }
 
 export type ProviderUpstreamProtocol =
-  "anthropic_messages" | "open_ai_chat" | "open_ai_responses" | "gemini_native";
+  | "anthropic_messages"
+  | "open_ai_chat"
+  | "open_ai_responses"
+  | "gemini_native";
 
 export type ProviderAuthScheme =
   | "none"
@@ -32,7 +35,9 @@ export type ProviderAuthScheme =
 export type ProviderModelPolicy = "passthrough" | "single";
 export type ProviderModelPolicyScope = "global" | "per_app";
 export type ProviderModelPolicySource =
-  "bundle_global" | "app_independent" | "profile_fixed";
+  | "bundle_global"
+  | "app_independent"
+  | "profile_fixed";
 
 export interface ProviderTransportOverrides {
   timeoutMs?: number;
@@ -71,7 +76,11 @@ export interface ProviderIdentityView {
 }
 
 export type CodingPlanQuotaAdapter =
-  "kimi" | "zhipu" | "minimax" | "volcengine" | "unavailable";
+  | "kimi"
+  | "zhipu"
+  | "minimax"
+  | "volcengine"
+  | "unavailable";
 
 export interface ProviderRuntimeCodingPlan {
   contractRevision: number;
@@ -134,7 +143,8 @@ export interface ProviderRuntimePlan {
   outboundIdentityPolicy: unknown;
   authRef: unknown;
   modelPolicy:
-    { mode: "passthrough" } | { mode: "single"; upstreamModel: string };
+    | { mode: "passthrough" }
+    | { mode: "single"; upstreamModel: string };
   codingPlan?: ProviderRuntimeCodingPlan;
   testModel?: string;
   probePolicyFingerprint: string;
@@ -155,7 +165,10 @@ export interface ProviderRuntimePlan {
 }
 
 export type CodingPlanQuotaState =
-  "supported" | "stale" | "unknown" | "unavailable";
+  | "supported"
+  | "stale"
+  | "unknown"
+  | "unavailable";
 
 export interface CodingPlanQuotaWindow {
   kind: "five_hour" | "weekly" | "monthly";
@@ -185,11 +198,21 @@ export interface CodingPlanQuotaSnapshot {
 }
 
 export type OllamaCloudSnapshotSource =
-  "live" | "fresh_cache" | "stale_cache" | "configuration";
+  | "live"
+  | "fresh_cache"
+  | "stale_cache"
+  | "configuration";
 export type OllamaCloudSnapshotStatus =
-  "complete" | "partial" | "stale" | "error" | "unconfigured";
+  | "complete"
+  | "partial"
+  | "stale"
+  | "error"
+  | "unconfigured";
 export type OllamaCloudSectionState =
-  "available" | "stale" | "error" | "unavailable";
+  | "available"
+  | "stale"
+  | "error"
+  | "unavailable";
 export type OllamaCloudErrorKind =
   | "authentication"
   | "rate_limited"
@@ -368,11 +391,33 @@ export interface ProviderBundleRebindPreview {
     before: ProviderCustomBinding;
     after: ProviderCustomBinding;
   }>;
-  runtimes: Partial<Record<CoreProviderApp, {
-    beforeFingerprint: string | null;
-    afterFingerprint: string | null;
-  }>>;
+  runtimes: Partial<
+    Record<
+      CoreProviderApp,
+      {
+        beforeFingerprint: string | null;
+        afterFingerprint: string | null;
+      }
+    >
+  >;
   shareIds: string[];
+}
+
+export interface ProviderBundleDraftValidation {
+  bundleId: string;
+  sourceRevision: number;
+  requiresRebind: boolean;
+  shareIds: string[];
+  authentication: Partial<
+    Record<
+      CoreProviderApp,
+      {
+        location: "header" | "query";
+        name: string;
+        prefix: string;
+      }
+    >
+  >;
 }
 
 export type ProviderCredentialPatch =
@@ -387,11 +432,14 @@ export const providersApi = {
     providerId: string,
     operation: ProviderInferenceTestResponse["operation"],
   ): Promise<ProviderInferenceTestResponse> {
-    return jsonFetch(`/api/providers/${encodeURIComponent(providerId)}/inference-test`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ operation }),
-    });
+    return jsonFetch(
+      `/api/providers/${encodeURIComponent(providerId)}/inference-test`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operation }),
+      },
+    );
   },
   async getRequestDefaults(): Promise<ProviderRequestDefaults> {
     return await invokeCommand("get_provider_request_defaults");
@@ -418,19 +466,45 @@ export const providersApi = {
   },
 
   async getBundle(id: string): Promise<ProviderBundleView> {
-    return await invokeCommand("get_provider_bundle", { id }, { cache: "no-store" });
+    return await invokeCommand(
+      "get_provider_bundle",
+      { id },
+      { cache: "no-store" },
+    );
   },
 
-  async previewBundleRebind(bundle: ProviderBundleWriteDraft): Promise<ProviderBundleRebindPreview> {
-    const response = await invokeCommand<{ preview: ProviderBundleRebindPreview }>(
-      "rebind_custom_provider_bundle", { mode: "preview", bundle }, { cache: "no-store" },
+  async previewBundleRebind(
+    bundle: ProviderBundleWriteDraft,
+  ): Promise<ProviderBundleRebindPreview> {
+    const response = await invokeCommand<{
+      preview: ProviderBundleRebindPreview;
+    }>(
+      "rebind_custom_provider_bundle",
+      { mode: "preview", bundle },
+      { cache: "no-store" },
     );
     return response.preview;
   },
 
-  async applyBundleRebind(bundle: ProviderBundleWriteDraft, previewToken: string): Promise<ProviderBundleView> {
+  async validateBundleDraft(
+    bundle: ProviderBundleWriteDraft,
+    shareEnabled: boolean,
+  ): Promise<ProviderBundleDraftValidation> {
+    return await invokeCommand(
+      "validate_provider_bundle_draft",
+      { bundle, shareEnabled },
+      { cache: "no-store" },
+    );
+  },
+
+  async applyBundleRebind(
+    bundle: ProviderBundleWriteDraft,
+    previewToken: string,
+  ): Promise<ProviderBundleView> {
     const response = await invokeCommand<{ bundle: ProviderBundleView }>(
-      "rebind_custom_provider_bundle", { mode: "apply", bundle, previewToken }, { cache: "no-store" },
+      "rebind_custom_provider_bundle",
+      { mode: "apply", bundle, previewToken },
+      { cache: "no-store" },
     );
     return response.bundle;
   },
@@ -522,5 +596,4 @@ export const providersApi = {
       { cache: "no-store" },
     );
   },
-
 };

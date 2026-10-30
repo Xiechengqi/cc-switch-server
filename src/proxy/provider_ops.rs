@@ -1162,50 +1162,20 @@ fn static_auth(
     secret: String,
 ) -> Result<AuthApplication, ProxyError> {
     let mut auth = MaterializedAuth::default();
-    match scheme {
-        AuthScheme::None => return Ok(AuthApplication::NoAuth(auth)),
-        AuthScheme::ApiKey => {
-            let header = if execution.plan.upstream_protocol == UpstreamProtocol::GeminiNative {
-                "x-goog-api-key"
-            } else {
-                "x-api-key"
-            };
-            auth.headers.push((header.to_string(), secret));
-        }
-        AuthScheme::Bearer => auth
-            .headers
-            .push(("authorization".to_string(), format!("Bearer {secret}"))),
-        AuthScheme::CustomHeader => {
-            let name = execution
-                .plan
-                .driver_options
-                .get("apiKeyField")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::bad_request("custom_header auth requires apiKeyField")
-                })?;
-            validate_custom_auth_header(name)?;
-            auth.headers.push((name.to_string(), secret));
-        }
-        AuthScheme::Query => {
-            let name = execution
-                .plan
-                .driver_options
-                .get("apiKeyField")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("key");
-            auth.query.push((name.to_string(), secret));
-        }
-        AuthScheme::OAuth | AuthScheme::AwsSigV4 => {
-            return Err(ProxyError::bad_request(format!(
-                "static Provider cannot materialize {:?} authentication",
-                scheme
-            )));
-        }
+    let carrier = crate::domain::providers::static_auth::static_auth_carrier(
+        execution.plan.upstream_protocol,
+        scheme,
+        &execution.plan.driver_options,
+    )
+    .map_err(|error| ProxyError::bad_request(error.to_string()))?;
+    let Some(carrier) = carrier else {
+        return Ok(AuthApplication::NoAuth(auth));
+    };
+    let value = format!("{}{secret}", carrier.prefix);
+    if carrier.location == "header" {
+        auth.headers.push((carrier.name, value));
+    } else {
+        auth.query.push((carrier.name, value));
     }
     Ok(AuthApplication::Inject(auth))
 }
@@ -1242,12 +1212,6 @@ fn static_credential_slot_allowed(execution: &ProviderExecution, slot: &str) -> 
                 | "/settingsConfig/env/API_KEY"
         ),
     }
-}
-
-fn validate_custom_auth_header(name: &str) -> Result<(), ProxyError> {
-    crate::domain::providers::runtime::validate_custom_auth_header_name(name)
-        .map(|_| ())
-        .map_err(|error| ProxyError::bad_request(error.to_string()))
 }
 
 fn provider_secret(stored: &StoredProvider) -> Option<String> {

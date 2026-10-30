@@ -13,11 +13,11 @@ use crate::domain::accounts::store::AccountStore;
 use crate::domain::providers::credentials::{
     reveal_provider_credential, unique_runtime_credential,
 };
-use crate::domain::providers::registry::{AuthScheme, UpstreamProtocol};
+use crate::domain::providers::registry::UpstreamProtocol;
 use crate::domain::providers::runtime::{
-    compile_runtime_plan, validate_custom_auth_header_name, RuntimeAuthRef,
-    RuntimeConfigurationState,
+    compile_runtime_plan, RuntimeAuthRef, RuntimeConfigurationState,
 };
+use crate::domain::providers::static_auth::static_auth_carrier;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
 use super::{CredentialSourceIdentity, CustomSourceScope};
@@ -46,44 +46,13 @@ pub(super) fn resolve(
     };
     // Carrier names and prefixes are identity-significant. Do not assume that
     // the same string sent through different authentication rails is one key.
-    let carrier = match auth_scheme {
-        AuthScheme::Bearer => ("header", "authorization".to_string(), "Bearer "),
-        AuthScheme::ApiKey => (
-            "header",
-            if plan.upstream_protocol == UpstreamProtocol::GeminiNative {
-                "x-goog-api-key"
-            } else {
-                "x-api-key"
-            }
-            .to_string(),
-            "",
-        ),
-        AuthScheme::CustomHeader => {
-            let Some(name) = plan
-                .driver_options
-                .get("apiKeyField")
-                .and_then(|value| value.as_str())
-            else {
-                return Ok(None);
-            };
-            let Ok(name) = validate_custom_auth_header_name(name) else {
-                return Ok(None);
-            };
-            ("header", name, "")
-        }
-        AuthScheme::Query => (
-            "query",
-            plan.driver_options
-                .get("apiKeyField")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("key")
-                .to_string(),
-            "",
-        ),
-        _ => return Ok(None),
+    let Ok(Some(carrier)) =
+        static_auth_carrier(plan.upstream_protocol, *auth_scheme, &plan.driver_options)
+    else {
+        return Ok(None);
     };
+    let authentication = carrier;
+    let carrier = authentication.identity_tuple();
     let slots = slots.iter().filter(|slot| {
         !plan
             .extra_headers
@@ -114,6 +83,7 @@ pub(super) fn resolve(
     let endpoint_digest = Sha256::digest(endpoint.as_bytes()).into();
     let carrier_material = serde_json::to_vec(&carrier)?;
     let auth_digest = Sha256::digest(&carrier_material).into();
+    let extra_headers_material = Zeroizing::new(serde_json::to_vec(&headers)?);
     // Named and length-framed fields prevent alias-slot and swapped-value
     // collisions. Provider ids, app names and models are deliberately absent.
     let material = Zeroizing::new(serde_json::to_vec(&(
@@ -129,6 +99,9 @@ pub(super) fn resolve(
         custom_scope: Some(CustomSourceScope {
             endpoint_digest,
             auth_digest,
+            authentication,
+            primary_digest: Sha256::digest(secret.as_bytes()).into(),
+            extra_headers_digest: Sha256::digest(&extra_headers_material).into(),
         }),
     }))
 }

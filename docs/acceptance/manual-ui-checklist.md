@@ -30,6 +30,11 @@ Run the checks manually at:
 
 ## Providers
 
+- New Custom Surfaces show API URL, upstream protocol and API Key without requiring a choice of authentication headers. Advanced compatibility starts collapsed; selecting another protocol updates recommended authentication from the Registry, independent of the client App. Only Driver-supported combinations appear in advanced settings, and URL-parameter authentication carries a key-exposure warning.
+- Existing Custom Bearer relays keep their stored authentication when opened, when advanced settings are expanded, and when unrelated fields are saved. Choosing protocol recommendations is explicit and any actual binding change still requires the rebind preview/confirmation. Saved bindings stay pinned across restart; no authentication probing or automatic inference retry occurs.
+- Saving a Custom draft first validates the unsaved endpoints, credential patches and sharing intent. A mismatch identifies the affected App and opens its relevant field/advanced settings without writing a partial Provider. Authentication or tenant conflicts never show the generic refresh message reserved for actual revision/preview expiry. The editor is disabled while saving.
+- Protocol-only rebinds with unchanged credential source preserve capacity pools; Provider saves/rebinds preserve Share URLs, grants, Token/USD-equivalent usage, pending quota policies and manual corrections. No production upstream or Router acceptance is implied by a local validation success.
+
 - The page lists Provider Bundles rather than separate per-App Provider records. Each Bundle title shows the logos for every supported Claude, Codex, and Gemini Surface.
 - Create a Custom Bundle with only Codex enabled. After saving, change Responses to Chat or change authentication, save, and confirm the binding summary. Reopen and verify the protocol, auth field, endpoint, and retained credential; disabled Claude/Gemini must not require credentials. Cancelling confirmation leaves all server data unchanged.
 - If Share saving fails after Provider saving succeeds, the page must say which stage failed, retain the Share draft, and allow retry without writing the Provider again. A lost Provider response must trigger a read-back and preserve entered values; it must not silently report success or automatically repeat credential writes.

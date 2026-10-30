@@ -396,11 +396,19 @@
     }
   },
   "providerBundle": {
+    "authAdvanced": "Advanced compatibility (usually unnecessary)",
+    "authRecommended": "Use protocol recommendations",
+    "authAutomatic": "Authentication is configured automatically for the upstream protocol.",
+    "authPreserved": "Keeping the current authentication. Change advanced settings only if your upstream requires it.",
+    "authAdvancedHint": "These options control how the same API key is sent, not different types of keys. Changes may affect linked shares.",
+    "authQueryWarning": "Keys in URL parameters may appear in access logs. Use only when explicitly required by the upstream.",
+    "conflictApps": "Affected apps: {{firstApp}} / {{app}}. Check their configuration.",
     "sharePreflight": {
+      "extra_headers_mismatch": "Apps have different extra authentication headers and cannot share one credential source. Check header names and values in advanced compatibility settings.",
       "source_unverifiable": "Cannot verify a shared credential source. Check the enabled Apps' endpoints, authentication, and keys, or use separate Providers.",
       "credential_mismatch": "The Apps use different keys or additional authentication values. Use matching credentials or separate Providers.",
       "endpoint_mismatch": "The Apps use different upstream services or tenant paths. Check their endpoints before sharing.",
-      "auth_mismatch": "The Apps use different authentication carriers. Check their authentication methods and fields.",
+      "auth_mismatch": "Apps send the API key differently, so a shared credential source cannot be verified. Check advanced compatibility settings; refreshing will not resolve this.",
       "no_enabled_apps": "Enable at least one App before sharing.",
       "resolution_failed": "The Provider credential source could not be verified. Check the server status and retry."
     },

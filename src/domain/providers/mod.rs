@@ -11,6 +11,7 @@ pub mod model_routing;
 pub mod ollama_cloud;
 pub mod registry;
 pub mod runtime;
+pub mod static_auth;
 pub mod storage_migration;
 pub mod store;
 mod store_v2;

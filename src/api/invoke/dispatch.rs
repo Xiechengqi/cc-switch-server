@@ -865,6 +865,13 @@ async fn web_invoke_dispatch(
             let share = Box::pin(web_save_provider_share(state, &args, operator)).await?;
             Ok(json!(share))
         }
+        "validate_provider_bundle_draft" => {
+            require_provider_write_contract(state, headers)?;
+            let request = serde_json::from_value(args).map_err(ApiError::bad_request)?;
+            let validation = state.validate_provider_bundle_draft(request).await
+                .map_err(ApiError::internal)?.map_err(map_provider_command_error)?;
+            Ok(json!(validation))
+        }
         "get_provider_bundle_share_preflight" => {
             let id = web_arg_string_any(&args, &["id", "bundleId"])?;
             let preflight = state.provider_bundle_share_preflight(&id).await
