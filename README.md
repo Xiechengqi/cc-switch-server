@@ -52,7 +52,7 @@ Claude / Codex / Gemini client
 - **Server-native OAuth**：Claude / Codex（Device + CLI PKCE）/ Gemini / Antigravity / Cursor / Copilot / Kiro / Grok / Kimi / Qoder 的登录、刷新、profile 与 quota，全部在 Server 侧完成，无桌面依赖。
 - **显式绑定，不做故障转移**：Managed OAuth Provider Bundle 必须显式绑定账号；请求不按占用、quota、cooldown、并发或错误切换账号，首个 401 只在原账号强刷并重放一次。
 - **Router 集成**：installation register、client tunnel、share tunnel、share batch sync、Router Share request log sync、pending share edit pull/ack/事件监听；ingress 新鲜度采用非对称窗口（≤30s 前签发、≤5s 未来）。
-- **用量计量**：记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。**只统计 Token / 状态 / 延迟，不计算成本或 USD 金额**，也不保存外部 Token Market 用户、价格或账本。
+- **用量计量**：记录完整 request lifecycle、Provider Bundle/Surface、Share/用户、实际上游模型、重试、延迟与 Token 观测状态，通过 Server-native REST 提供聚合、筛选、明细和 cursor 分页。不计算 Provider 账单或操作钱包。显式协商 Share v10 后，可用 Router 冻结价目执行纯 USD 等值配额；必须使用已提交的 SQLite 权威库，缺价／缺用量拒绝金额模式。详见 [金额额度边界](docs/share/value-quotas.md)。
 - **持久化安全**：JSON 写入使用 temp file fsync + atomic rename + 父目录 fsync；凭据以 XChaCha20-Poly1305 加密；`/api/backup` 支持创建、列出、恢复，恢复前自动 pre-restore 快照。
 - **可观测**：`/web-api/events` 认证 SSE 推送 Usage/Share/tunnel 事件；`/metrics` 暴露 Prometheus 指标；`version --json` 与 `/version` 输出版本、commit、build time、target、profile、rustc 和 dirty 状态。
 

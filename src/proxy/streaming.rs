@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use serde_json::Value;
 
 use crate::domain::usage::store::{
-    usage_from_json_with_semantics, InputTokenSemantics, TokenUsage,
+    usage_from_json_with_semantics, InputTokenSemantics, ResponseModelEvidence, TokenUsage,
 };
 
 use super::responses_transport::{ResponsesTransportDecoder, ResponsesTransportItem};
@@ -56,13 +56,15 @@ pub struct StreamUsageAccumulator {
     input_semantics: InputTokenSemantics,
     parse_error: bool,
     usage_estimated: bool,
+    response_model: ResponseModelEvidence,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StreamUsageResult {
     pub usage: TokenUsage,
     pub parse_error: bool,
     pub usage_estimated: bool,
+    pub response_model: ResponseModelEvidence,
 }
 
 #[derive(Debug)]
@@ -488,6 +490,7 @@ impl StreamUsageAccumulator {
             input_semantics,
             parse_error: false,
             usage_estimated: false,
+            response_model: ResponseModelEvidence::default(),
         }
     }
 
@@ -505,6 +508,11 @@ impl StreamUsageAccumulator {
 
     pub fn retained_bytes(&self) -> usize {
         self.decoder.retained_bytes()
+            + self
+                .response_model
+                .model
+                .as_ref()
+                .map_or(0, String::capacity)
     }
 
     pub fn finish(self) -> TokenUsage {
@@ -527,11 +535,13 @@ impl StreamUsageAccumulator {
             usage: self.usage,
             parse_error: self.parse_error,
             usage_estimated: self.usage_estimated,
+            response_model: self.response_model,
         }
     }
 
     fn merge_events(&mut self, events: Vec<JsonStreamEvent>) {
         for event in events {
+            self.response_model.observe(&event.value);
             merge_usage(
                 &mut self.usage,
                 usage_from_json_with_semantics(&event.value, self.input_semantics),
@@ -1042,6 +1052,11 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage, input_semantics: Input
     }
     if next.cache_creation_tokens.is_some() {
         target.cache_creation_tokens = next.cache_creation_tokens;
+        // A new aggregate without matching TTL details must not retain stale
+        // detail from an earlier stream frame.
+        target.cache_creation_details = next.cache_creation_details;
+    } else if next.cache_creation_details.is_some() {
+        target.cache_creation_details = next.cache_creation_details;
     }
     if next.credit_usage.is_some() {
         target.credit_usage = next.credit_usage;
@@ -1108,6 +1123,21 @@ fn merge_usage(target: &mut TokenUsage, next: TokenUsage, input_semantics: Input
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_quota_stream_model_evidence_survives_fragmentation_and_conflicting_frames() {
+        let payload = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"model-a\",\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"modelVersion\":\"model-b\",\"usageMetadata\":{\"candidatesTokenCount\":5}}\n\n";
+        for width in [1, 3, 17, payload.len()] {
+            let mut accumulator = StreamUsageAccumulator::new(InputTokenSemantics::Exclusive);
+            for chunk in payload.chunks(width) {
+                accumulator.push(chunk);
+            }
+            let result = accumulator.finish_with_status();
+            assert_eq!(result.response_model.model.as_deref(), Some("model-a"));
+            assert!(result.response_model.conflict);
+            assert!(!result.parse_error);
+        }
+    }
 
     #[test]
     fn stream_usage_estimate_provenance_survives_finish() {

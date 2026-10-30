@@ -1,7 +1,7 @@
 use crate::domain::providers::store::StoredProvider;
 use crate::domain::usage::store::{
-    ImageUsageMetadata, TokenUsage, UsageLog, UsageLogContext, UsageModelMetadata, UsageOutcome,
-    UsageState,
+    ImageUsageMetadata, ResponseModelEvidence, TokenUsage, UsageLog, UsageLogContext,
+    UsageModelMetadata, UsageOutcome, UsageState,
 };
 use crate::logging::{opaque_ref, AuditEvent, AuditRequestDetails};
 use crate::state::{ServerEvent, ServerState};
@@ -131,6 +131,7 @@ pub(super) async fn update_stream_usage(
         usage,
         false,
         false,
+        None,
         stream_status,
     )
     .await;
@@ -157,6 +158,7 @@ pub(super) async fn update_stream_usage_result(
         result.usage,
         result.parse_error,
         result.usage_estimated,
+        Some(result.response_model),
         stream_status,
     )
     .await;
@@ -173,10 +175,14 @@ async fn update_stream_usage_with_parse_status(
     usage: TokenUsage,
     usage_parse_error: bool,
     usage_estimated: bool,
+    response_model: Option<ResponseModelEvidence>,
     stream_status: Option<&str>,
 ) {
     let persisted = state
         .update_usage_log(request_id, |log| {
+            if let Some(evidence) = &response_model {
+                evidence.apply(log);
+            }
             let router_visible_changed = apply_stream_usage_fields(
                 log,
                 status_code,
@@ -393,6 +399,8 @@ fn apply_stream_usage_fields(
     if let Some(cache_creation_tokens) = usage.cache_creation_tokens {
         router_visible_changed |= log.cache_creation_tokens != Some(cache_creation_tokens);
         log.cache_creation_tokens = Some(cache_creation_tokens);
+        router_visible_changed |= log.cache_creation_details != usage.cache_creation_details;
+        log.cache_creation_details = usage.cache_creation_details;
     }
     if let Some(total_tokens) = usage.total_tokens {
         router_visible_changed |= log.total_tokens != Some(total_tokens);

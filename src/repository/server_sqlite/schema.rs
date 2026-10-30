@@ -89,8 +89,13 @@ pub(super) fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
 /// v1 is immutable. This transaction can be retried after a crash before the
 /// separate authority marker was updated; it never reimports legacy files.
 pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let value_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
+    );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=2).contains(&version),
+    anyhow::ensure!((1..=3).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -137,6 +142,32 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         checksum == "sha256:server-store-schema-v2-quota",
         "Server SQLite v2 migration checksum mismatch"
     );
+    if version < 3 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("value_quota_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version,name,applied_at_ms,checksum)
+                 VALUES(3,'share_usd_equivalent_quota',0,?1)",
+                [&value_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=3; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v3 value quotas")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=3",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == value_checksum,
+        "Server SQLite v3 migration checksum mismatch"
+    );
     Ok(())
 }
 
@@ -148,7 +179,11 @@ mod tests {
     fn quota_v1_migration_is_idempotent_and_preserves_original_checksum() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("DROP TABLE quota_usage_entries; DELETE FROM schema_migrations WHERE version=2; PRAGMA user_version=1;").unwrap();
+        connection.execute_batch("DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
+            DROP TABLE value_quota_checkpoints;
+            DROP TABLE value_quota_adjustments; DROP TABLE value_quota_gaps; DROP TABLE value_quota_coverage; DROP TABLE value_pricing_snapshots;
+            DELETE FROM meta WHERE key='value_quota_watermark_v1';
+            DROP TABLE quota_usage_entries; DELETE FROM schema_migrations WHERE version>=2; PRAGMA user_version=1;").unwrap();
         connection
             .execute(
                 "INSERT INTO meta(key,value) VALUES('existing','preserved')",
@@ -161,14 +196,14 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             connection
@@ -183,7 +218,7 @@ mod tests {
     fn quota_higher_schema_or_changed_migration_is_never_downgraded() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("PRAGMA user_version=3;").unwrap();
+        connection.execute_batch("PRAGMA user_version=4;").unwrap();
         assert!(migrate_to_current(&connection)
             .unwrap_err()
             .to_string()
@@ -192,7 +227,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         connection.execute_batch("PRAGMA user_version=2; UPDATE schema_migrations SET checksum='modified' WHERE version=1;").unwrap();
         assert!(migrate_to_current(&connection).is_err());

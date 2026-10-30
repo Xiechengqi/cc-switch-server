@@ -33,6 +33,8 @@ Router 主动调用 Server 的 `/_ctl/*` 端点：
 | `/_ctl/apply_share_settings` | `APPLY_SHARE_SETTINGS_PATH` | 下发 Share 设置变更 |
 | `/_ctl/refresh_share_usage` | `REFRESH_SHARE_USAGE_PATH` | 触发 Share 用量刷新 |
 | `/_ctl/preview_account_reset` | — | 只读账号周期能力/逐用户用量预览，带config CAS，不修改policy或消费券 |
+| `/_ctl/preview_value_quota` | — | 只读 USD 额度生效／覆盖预览，带 config CAS，不创建计量起点 |
+| `/_ctl/edit_value_usage` | — | 独立金额 set／clear 校准，带 actor、理由、窗口和水位 CAS |
 | `/_ctl/client-subdomain-adoption/prepare` | `PREPARE_CLIENT_SUBDOMAIN_ADOPTION_PATH` | 子域接管：预备 |
 | `/_ctl/client-subdomain-adoption/commit` | `COMMIT_CLIENT_SUBDOMAIN_ADOPTION_PATH` | 子域接管：提交 |
 | `/_ctl/client-subdomain-adoption/abort` | `ABORT_CLIENT_SUBDOMAIN_ADOPTION_PATH` | 子域接管：回滚 |
@@ -73,9 +75,9 @@ Server 侧校验（`src/clients/router/ingress.rs`）：
 
 Router 通过**未签名**头 `x-cc-switch-ingress-body-limit` 声明其上限；Server 的生效值为 `min(本地 requestBodyLimits, Router 声明)`。本地值存于 `server.json` 的 `requestBodyLimits`。
 
-## 7. Share 契约 v7兼容与v8/v9协商
+## 7. Share 契约 v7 兼容与 v8/v9/v10 协商
 
-Server 普通未协商descriptor保持 Share Contract v7；accountReset及其只读投影须显式协商后写v8，一次性市场试用须 `marketTrialV1`＋reader≥9 后写 v9。Router滚动升级可读v2..v9，Share Market最低版本仍v5。各版本在v2的统一Share访问边界上逐步追加：
+Server 普通未协商 descriptor 保持 Share Contract v7；accountReset 及其只读投影须显式协商后写 v8，一次性市场试用须 `marketTrialV1`＋reader≥9 后写 v9，USD 等值配额须 `usdEquivalentQuotaV1`＋reader≥10 后写 v10。Router 滚动升级可读 v2..v10，Share Market 最低版本仍 v5。`cacheCreationTtlV1` 为独立日志能力。各版本在 v2 的统一 Share 访问边界上逐步追加：
 
 - v2：`freeAccess`（默认 `false`，即私有）、`userGrants`、`tokenLimit`、`parallelLimit`。
 - v4：不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
@@ -84,6 +86,7 @@ Server 普通未协商descriptor保持 Share Contract v7；accountReset及其只
 - v7：quota 中独立的 `unobservedTiers`（套餐已确认但尚无真实数值观测的容量池，只用于展示），以及仅 Codex OAuth 使用的 `bankedReset` 摘要。二者都不参与调度、限流、可用性或容量评分。
 - v8：`accountReset`、`accountQuotaCycle/accountResetCapability/accountUsageBaseline`和usageWatermark。heartbeat须同时声明shareContractVersion≥8与accountResetV1；Server能力缓存绑定Router URL/installation且300秒失效。普通v7省略新嵌套字段，市场合同不新增动态周期。
 - v9：一次性市场试用 `marketEntitlements` 与 managed operation 的 phase、scope、原始 Token allowance／本次剩余 cap。转发前持久化请求阶段，累计修订不能倒退或复活预算；正式额度不接收试用迟到用量。使用量变化不提升静态 generation，但持续进行完整 descriptor 同步。已有 v9 状态而 Router 不再声明能力时明确拒绝降级发布，不伪装成 v7。见 [市场试用](../share/market-trials.md)。
+- v10：普通 grant 的 `policy.valueQuota` 与 `tokenLimit` 互斥，Server-owned `valueMetering/pendingValueQuota` 定义 epoch、保留的计量起点、冻结价目和安全排期。动态金额不进入 descriptor 指纹，走独立带 ACK 的签名水位；能力丢失不降级为不限额，只隔离金额 Share 同步。执行快照 fetch／ack 均为 installation 签名 POST，不是公开 GET。详见 [双口径额度](../share/value-quotas.md)。
 
 账号周期动态视图不进入静态fingerprint/configRevision/generation；当前复用完整descriptor同步/ACK，Notify及30秒周期持续重放，并非独立精确quota水位ACK。Router按stream、source/epoch、cycle顺序/修订与usage水位合并，允许合法下降修正，不用历史max复活旧周期；恢复换stream全量握手并退休旧流。详情和运维限制见[账号重置周期](../share/account-reset.md)。
 

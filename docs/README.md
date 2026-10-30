@@ -18,7 +18,7 @@
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
 | [overview.md](architecture/overview.md) | 权威 | 三角色拓扑、资金边界、两条链路、模块分层与强约束。**架构叙述的真值来源** |
-| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧实现的 Router 协议：控制面、探针、IngressContext、Share v7兼容/v8与v9能力协商 |
+| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧 Router 协议：控制面、探针、IngressContext、Share v7 兼容与 v8/v9/v10 独立能力协商 |
 | [storage.md](architecture/storage.md) | 权威 | 数据目录、文件清单、凭据加密、用量存储、备份、写入锁序 |
 | [usage-accounting.md](architecture/usage-accounting.md) | 权威 | Usage token 计量口径 |
 
@@ -66,6 +66,7 @@
 | [user-usage-rebase.md](share/user-usage-rebase.md) | 权威 | Share 用户用量重基线 |
 | [account-reset.md](share/account-reset.md) | 权威 | 账号重置周期实现、全供应商门槛、53项离线映射、存储恢复和review；真实验收独立live_pending |
 | [market-trials.md](share/market-trials.md) | 权威 | v9 一次性市场试用、请求阶段归属、迟到用量、重启隔离与正式授权确认 |
+| [value-quotas.md](share/value-quotas.md) | 权威 | v10 Token／USD 等值额度、冻结价目、独立 SQLite 计量、预览与校准、恢复限制和 live_pending 门槛 |
 
 ## 验收 `docs/acceptance/`
 

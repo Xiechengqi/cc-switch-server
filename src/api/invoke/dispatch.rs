@@ -703,6 +703,25 @@ async fn web_invoke_dispatch(
             state.preview_share_account_reset(&id, revision, policies).await
                 .map_err(ApiError::account_quota_preview)
         }
+        "preview_share_value_quota" => {
+            let id=web_arg_share_id(&args)?;
+            let revision=web_optional_u64(&args,&["expectedConfigRevision"]).ok_or_else(||ApiError::bad_request("expectedConfigRevision is required"))?;
+            let policies=args.get("policies").map(|value|serde_json::from_value(value.clone())).transpose().map_err(ApiError::bad_request)?.unwrap_or_default();
+            state.preview_share_value_quota(&id,revision,policies).await.map_err(ApiError::internal)
+        }
+        "get_share_value_quota_status" => {
+            let id=web_arg_share_id(&args)?;
+            Ok(json!({"items":state.value_quota_statuses(&id).await.map_err(ApiError::internal)?,
+                "diagnostics":state.value_quota_diagnostics(&id).map_err(ApiError::internal)?}))
+        }
+        "edit_share_value_quota_usage" => {
+            let id=web_arg_share_id(&args)?;
+            let revision=web_optional_u64(&args,&["expectedConfigRevision"]).ok_or_else(||ApiError::bad_request("expectedConfigRevision is required"))?;
+            let edits=serde_json::from_value(args.get("edits").cloned().ok_or_else(||ApiError::bad_request("edits are required"))?).map_err(ApiError::bad_request)?;
+            let actor=state.config_snapshot().await.owner.email.unwrap_or_else(||"server-admin".into());
+            state.apply_share_value_usage_edits(&id,revision,edits,&actor).await.map_err(ApiError::internal)?;
+            Ok(json!({"ok":true,"items":state.value_quota_statuses(&id).await.map_err(ApiError::internal)?}))
+        }
         "get_share_detail" => {
             let id = web_arg_share_id(&args)?;
             state.refresh_share_account_quota(&id).await.map_err(ApiError::internal)?;

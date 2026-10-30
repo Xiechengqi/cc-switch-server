@@ -51,8 +51,8 @@ use crate::domain::sharing::previous_response_cache::PreviousResponseCacheScope;
 use crate::domain::sharing::shares::{ShareInvocationRejection, ShareRejectReason, ShareStore};
 use crate::domain::usage::store::{
     usage_from_json_with_semantics, ImageUsageMetadata, InferenceOperation, InputTokenSemantics,
-    RequestKind, TokenUsage, UsageLogContext, UsageModelMetadata, UsageOutcome, UsageRecordKind,
-    UsageState,
+    RequestKind, ResponseModelEvidence, TokenUsage, UsageLogContext, UsageModelMetadata,
+    UsageOutcome, UsageRecordKind, UsageState,
 };
 use crate::infra::time::now_ms as current_time_ms;
 use crate::logging::{
@@ -2346,13 +2346,17 @@ async fn forward_with_attempt_inner(
         request_context.attempt_count = Some(attempt_context.attempt().saturating_add(1));
         request_context.session_id = session_id_from_request(route, &headers, &body);
         let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-            let (share_name, guard) = validate_and_acquire_share_invocation(
-                &state,
-                &share_id,
-                app,
-                request_context.user_email.as_deref(),
-            )
-            .await?;
+            let (invocation, guard) = state
+                .validate_and_acquire_share_invocation_with_value_text(
+                    &share_id,
+                    app,
+                    request_context.user_email.as_deref(),
+                    crate::infra::time::now_ms() as i64,
+                    true,
+                )
+                .await
+                .map_err(share_rejection_to_proxy_error)?;
+            let share_name = invocation.share_name;
             request_context.share_name = Some(share_name);
             begin_share_quota_usage(&state, app, &mut request_context).await?;
             Some(guard)
@@ -2393,6 +2397,47 @@ async fn forward_with_attempt_inner(
                 ));
             }
         };
+        let value_metering = if let Some(share_id) = request_context.share_id.as_deref() {
+            state
+                .share_has_value_metering(share_id, request_context.user_email.as_deref())
+                .await
+        } else {
+            false
+        };
+        let value_text_capable =
+            matches!(
+                execution.stored.provider_type,
+                ProviderType::Claude | ProviderType::Codex | ProviderType::Gemini
+            ) && crate::domain::usage::value_pricing::supports_value_text_runtime(
+                execution.plan.profile_id.as_str(),
+                execution.plan.driver_id.as_str(),
+                execution.plan.coding_plan.is_some(),
+            ) && matches!(
+                route,
+                ProxyRoute::ClaudeMessages
+                    | ProxyRoute::CodexChatCompletions
+                    | ProxyRoute::CodexResponses
+                    | ProxyRoute::Gemini
+            ) && (route != ProxyRoute::Gemini
+                || gemini_path.as_deref().is_some_and(|path| {
+                    matches!(
+                        path.rsplit(':').next(),
+                        Some("generateContent" | "streamGenerateContent")
+                    )
+                }))
+                && attempt_context.attempt() == 0
+                && (!value_metering
+                    || crate::domain::usage::value_pricing::is_metered_text_payload(&body));
+        if let Some(share_id) = request_context.share_id.as_deref() {
+            if state
+                .share_uses_value_quota(share_id, request_context.user_email.as_deref())
+                .await
+                && !value_text_capable
+            {
+                return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
+                    message:"quota_unavailable: USD-equivalent quota requires a verified single-attempt text surface; media, built-in paid tools and transport retries are not covered".into()});
+            }
+        }
         if request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
             && attempt_context.request_memory().is_none()
         {
@@ -3138,6 +3183,33 @@ async fn forward_with_attempt_inner(
         }
 
         let http_client = forward_http_client(&state, &execution).await?;
+        {
+            let effective_tier = request_context.effective_service_tier.clone().or_else(|| {
+                serde_json::from_slice::<serde_json::Value>(&adapter_request.body)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("service_tier")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+            });
+            let effective_tier = match effective_tier.as_deref() {
+                None | Some("default") | Some("standard") => "standard",
+                Some("priority") => "priority",
+                Some("flex") => "flex",
+                _ => "unknown",
+            };
+            request_context.effective_service_tier = Some(effective_tier.into());
+            state.admit_share_value_text(&request_context,final_model.as_deref().unwrap_or(""),effective_tier,
+                value_text_capable && crate::domain::usage::value_pricing::is_metered_text_payload(&adapter_request.body))
+            .await.map_err(|error| {
+                let message=error.to_string();
+                ProxyError{status:if message.contains("EXHAUSTED"){StatusCode::TOO_MANY_REQUESTS}else{StatusCode::SERVICE_UNAVAILABLE},
+                    message:if message.contains("EXHAUSTED"){"value_quota_exhausted: API-equivalent usage limit reached".into()}
+                        else if message.contains("price_unavailable"){"price_unavailable: no verified tariff for this execution model/tier".into()}
+                        else {"quota_unavailable: USD-equivalent metering is not ready or needs recovery".into()}}
+            })?;
+        }
         let request = build_upstream_post_request(
             &http_client,
             &url,
@@ -6332,10 +6404,14 @@ async fn forward_with_attempt_inner(
             &bytes,
             status.is_success(),
         )?;
+        let mut response_model_evidence = ResponseModelEvidence::default();
         let usage = if is_count_tokens_request {
             TokenUsage::default()
         } else {
             adapter.parse_usage_observing(&bytes, &stored, route, |value| {
+                if value_text_capable {
+                    response_model_evidence.observe(value);
+                }
                 if status.is_success()
                     && stored.provider_type == ProviderType::GrokOAuth
                     && semantic_upstream_format == UpstreamFormat::OpenAiResponses
@@ -6362,6 +6438,9 @@ async fn forward_with_attempt_inner(
                 }
             })
         };
+        if value_text_capable {
+            request_context.response_model = Some(response_model_evidence);
+        }
         if status.is_success()
             && stored.provider_type == ProviderType::GrokOAuth
             && semantic_upstream_format == UpstreamFormat::OpenAiResponses
@@ -26859,6 +26938,7 @@ impl ResponsesImageJsonLifecycleGuard {
                 usage,
                 parse_error,
                 usage_estimated: false,
+                response_model: ResponseModelEvidence::default(),
             },
             Some(stream_status),
         )
@@ -31044,6 +31124,7 @@ mod tests {
     include!("forwarder/grok_r4_tests.rs");
     include!("forwarder/grok_timing_tests.rs");
     include!("forwarder/kiro_timing_tests.rs");
+    include!("forwarder/value_quota_tests.rs");
     use serde_json::{json, Value};
 
     use crate::domain::providers::model::{

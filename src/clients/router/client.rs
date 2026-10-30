@@ -969,6 +969,16 @@ pub struct RouterShareCapabilities {
 }
 
 impl RouterShareCapabilities {
+    pub fn cache_creation_ttl(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "cacheCreationTtlV1")
+    }
+    pub fn value_quotas(&self) -> bool {
+        self.share_contract_version >= 10
+            && self
+                .capabilities
+                .iter()
+                .any(|c| c == "usdEquivalentQuotaV1")
+    }
     pub fn market_trials(&self) -> bool {
         self.share_contract_version >= 9 && self.capabilities.iter().any(|c| c == "marketTrialV1")
     }

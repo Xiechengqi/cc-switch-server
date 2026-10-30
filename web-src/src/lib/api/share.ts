@@ -44,6 +44,7 @@ export type AccountResetPreview = {
 export type ShareUserPolicy = {
   parallelLimit?: number;
   tokenLimit?: number;
+  valueQuota?: {limitUsdMicros:string;tariffPolicyId:"api-equivalent-v1"};
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
@@ -133,6 +134,8 @@ export type ShareTotalUsageEdit = {
 };
 
 export type ShareUserGrant = {
+  valueMetering?: {quotaPolicyEpoch:string;valueMeteredFromMs:number;effectiveFromMs:number;pricingRevision:string};
+  pendingValueQuota?: {policy:ShareUserPolicy;effectiveFromMs:number;retainAccess:boolean};
   accountQuotaCycle?: AccountQuotaCycle;
   accountResetCapability?: AccountResetCapability;
   accountUsageBaseline?: { sourceRef: string; cycleId: string; targetTokens: number;
@@ -705,10 +708,15 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 }
 
 export const shareApi = {
-  previewAccountReset: (shareId: string, expectedConfigRevision: number, policies?: Record<string, ShareUserPolicy>) =>
-    invokeCommand<AccountResetPreview>("preview_share_account_reset", { shareId, expectedConfigRevision, policies }),
   preflightProviderBundleShare: (bundleId: string) =>
     invokeCommand<BundleSharePreflight>("get_provider_bundle_share_preflight", { bundleId }, { cache: "no-store" }),
+  editValueUsage:(shareId:string,expectedConfigRevision:number,edits:Record<string,import("../share-value-quota").ValueUsageEdit>) =>
+    invokeCommand<{items:import("../share-value-quota").ValueStatus[]}>("edit_share_value_quota_usage",{shareId,expectedConfigRevision,edits}),
+  previewValueQuota: (shareId:string,expectedConfigRevision:number,policies?:Record<string,ShareUserPolicy>) =>
+    invokeCommand<import("../share-value-quota").ValuePreview>("preview_share_value_quota",{shareId,expectedConfigRevision,policies}),
+  valueQuotaStatus: (shareId:string) => invokeCommand<{items:import("../share-value-quota").ValueStatus[];diagnostics?:import("../share-value-quota").ValueDiagnostics}>("get_share_value_quota_status",{shareId}),
+  previewAccountReset: (shareId: string, expectedConfigRevision: number, policies?: Record<string, ShareUserPolicy>) =>
+    invokeCommand<AccountResetPreview>("preview_share_account_reset", { shareId, expectedConfigRevision, policies }),
   create,
   listReuseCandidates,
   addBinding,

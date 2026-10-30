@@ -3,6 +3,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  retiredMarketEndpointPattern,
+  retainedRouterMarketFiles,
+  routerShareReaderErrors,
+} from "./token-market-decoupling-contract.mjs";
 
 const serverRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -377,7 +382,7 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     },
     {
       label: "retired Market endpoint outside the explicit 410 router",
-      pattern: /\/v1\/markets|\/v1\/market\/|\/_market\/proxy/,
+      pattern: retiredMarketEndpointPattern,
       allowedFiles: ["src/api.rs"],
     },
     {
@@ -414,12 +419,14 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     /retired_token_market_routes[\s\S]*StatusCode::GONE/,
     "explicit 410 retirement router",
   );
-  requireText(
-    routerRoot,
-    "src/models.rs",
-    /pub const SHARE_CONTRACT_VERSION: u16 = 8;/,
-    "Share Contract v8 reader constant",
-  );
+  const routerModels = path.join(routerRoot, "src/models.rs");
+  if (!fs.existsSync(routerModels)) {
+    fail("Share reader constants file is missing: src/models.rs");
+  } else {
+    for (const error of routerShareReaderErrors(fs.readFileSync(routerModels, "utf8"))) {
+      fail(`src/models.rs: ${error}`);
+    }
+  }
   requireBlock(
     routerRoot,
     "src/models.rs",
@@ -615,12 +622,7 @@ if (requireDirectory(routerRoot, "Router audit root")) {
     (fixture) => fixture.share,
   );
 
-  for (const retained of [
-    "src/share_market.rs",
-    "src/client_market.rs",
-    "src/market_access.rs",
-    "src/market_billing.rs",
-  ]) {
+  for (const retained of retainedRouterMarketFiles) {
     if (!fs.existsSync(path.join(routerRoot, retained))) {
       fail(`${retained}: retained Router market capability is missing`);
     }

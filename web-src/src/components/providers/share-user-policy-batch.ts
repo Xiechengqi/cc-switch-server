@@ -4,6 +4,7 @@ export type ShareUserPolicyBatchPatch = {
   parallelLimit?: { value?: number };
   tokenLimit?: {
     value?: number;
+    valueQuota?: import("@/lib/api/share").ShareUserPolicy["valueQuota"];
     period: ShareTokenPeriod;
     periodAnchorAtMs?: number;
   };
@@ -26,12 +27,14 @@ export function applyShareUserPolicyBatch(
     const email = grant.email.trim().toLowerCase();
     if (!normalizedEmails.has(email)) continue;
 
-    const policy = { ...grant.policy };
+    const policy = { ...(grant.pendingValueQuota?.policy ?? grant.policy) };
     if (patch.parallelLimit) {
       policy.parallelLimit = patch.parallelLimit.value;
     }
     if (patch.tokenLimit) {
       policy.tokenLimit = patch.tokenLimit.value;
+      if(patch.tokenLimit.valueQuota) policy.valueQuota=patch.tokenLimit.valueQuota;
+      else delete policy.valueQuota;
       policy.tokenPeriod = patch.tokenLimit.period;
       policy.tokenPeriodAnchorAtMs = patch.tokenLimit.periodAnchorAtMs;
     }

@@ -33,6 +33,7 @@ use crate::domain::sharing::shares::Share;
 pub const SHARE_CONTRACT_VERSION: u16 = 7;
 pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;
 pub const MARKET_TRIAL_CONTRACT_VERSION: u16 = 9;
+pub const VALUE_QUOTA_CONTRACT_VERSION: u16 = 10;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -273,6 +274,8 @@ pub struct ShareUserPolicy {
     pub parallel_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_quota: Option<crate::domain::usage::value_pricing::ValueQuota>,
     #[serde(default)]
     pub token_period: ShareTokenPeriod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +422,10 @@ pub struct ShareUserGrant {
     pub active: bool,
     #[serde(default)]
     pub policy: ShareUserPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_metering: Option<crate::domain::usage::value_pricing::ValueMeteringBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_value_quota: Option<PendingValueQuota>,
     #[serde(default)]
     pub usage: ShareUserUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,6 +457,16 @@ pub struct ShareUserGrant {
     pub manager: ShareGrantManager,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement_id: Option<String>,
+}
+
+/// Server-owned scheduled policy. The ordinary policy stays enforced until
+/// activation; a newly authorized user has no access before that activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingValueQuota {
+    pub policy: ShareUserPolicy,
+    pub effective_from_ms: i64,
+    pub retain_access: bool,
 }
 
 /// Derived per-grant quota view.
@@ -1025,6 +1042,10 @@ pub struct ShareRequestLogEntry {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
     /// Whether the upstream protocol reported a cache-token breakdown. False means the
     /// numeric cache fields are compatibility placeholders and must not be presented as zero.
     #[serde(default)]
@@ -1280,7 +1301,12 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         }
     }
     ShareDescriptor {
-        contract_version: if uses_account_reset {
+        contract_version: if user_grants
+            .values()
+            .any(|g| g.value_metering.is_some() || g.policy.value_quota.is_some())
+        {
+            VALUE_QUOTA_CONTRACT_VERSION
+        } else if uses_account_reset {
             ACCOUNT_RESET_CONTRACT_VERSION
         } else {
             SHARE_CONTRACT_VERSION
@@ -2467,6 +2493,56 @@ mod tests {
         let share = test_share(provider_type, Some(25.0));
         let descriptor = descriptor_for_share_with_usage(&share, &providers, None);
         let baseline = static_descriptor_fingerprint(&descriptor, &providers).unwrap();
+
+        let mut monetary = descriptor.clone();
+        let email = "user@example.test";
+        monetary.user_grants.insert(
+            email.into(),
+            ShareUserGrant {
+                email: email.into(),
+                active: true,
+                policy: ShareUserPolicy {
+                    value_quota: Some(crate::domain::usage::value_pricing::ValueQuota {
+                        limit_usd_micros: "1000000".into(),
+                        tariff_policy_id: "api-equivalent-v1".into(),
+                    }),
+                    ..Default::default()
+                },
+                value_metering: Some(crate::domain::usage::value_pricing::ValueMeteringBinding {
+                    quota_policy_epoch: "epoch".into(),
+                    value_metered_from_ms: 1,
+                    effective_from_ms: 1,
+                    pricing_revision: "revision".into(),
+                }),
+                ..Default::default()
+            },
+        );
+        let money_fingerprint = static_descriptor_fingerprint(&monetary, &providers).unwrap();
+        assert_ne!(baseline, money_fingerprint);
+        monetary
+            .user_grants
+            .get_mut(email)
+            .unwrap()
+            .usage
+            .lifetime
+            .tokens_used = 100;
+        assert_eq!(
+            money_fingerprint,
+            static_descriptor_fingerprint(&monetary, &providers).unwrap()
+        );
+        monetary
+            .user_grants
+            .get_mut(email)
+            .unwrap()
+            .pending_value_quota = Some(PendingValueQuota {
+            policy: monetary.user_grants[email].policy.clone(),
+            effective_from_ms: 5,
+            retain_access: true,
+        });
+        assert_ne!(
+            money_fingerprint,
+            static_descriptor_fingerprint(&monetary, &providers).unwrap()
+        );
 
         let mut display_provider = base_provider.clone();
         display_provider.provider.name = "renamed for display only".to_string();

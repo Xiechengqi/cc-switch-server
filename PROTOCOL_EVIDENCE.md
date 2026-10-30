@@ -6,6 +6,14 @@
 
 Server 现将独立存储与来源验证分离：仅在服务/租户范围、实际认证载体、唯一主凭据及具名附加认证头都相符时允许多 App 分享。终端协议版本和尾斜杠做有限规范化，未知路径语义与 query/fragment/userinfo/编码路径不当作同源证据；不增加厂商域名特例。转发与分享共用唯一凭据解析规则，冲突别名拒绝。公开预检只返回可用性和固定原因，匿名容量仍使用本地根密钥 HMAC；既有官方来源算法和 Router 线格式不变。本地正负例、原子轮换、重绑定和重启测试不等于真实 Router 或自定义上游验收。
 
+## 2026-10-30 Share v10 USD-equivalent quotas
+
+本轮未研究或执行外部项目，协议规范来自 Router 的双口径实施计划和现有 Share 合同。独立原生定点算法、canonical SHA-256、准确别名及互斥 Token 分类以两仓各自携带的 `tests/fixtures/share-value-pricing-v1.json` 黄金向量交叉约束。新增 API-key Claude/Codex/Gemini 单 attempt 文本面额度入口、committed SQLite 独立风险／修订／日检查点、静态策略与动态水位分离、installation 签名／ACK／私有读取、非阻塞 Token shadow、恢复栅栏和独立金额校准。现有用量 fixture 只证明解析和本地防护，不证明任何真实厂商完整计费语义。
+
+OAuth、媒体、内置收费工具、未知 tier/model 和不可归属重试不因零 Token 获得金额模式授权。原 Token、市场车位和钱包轨道不变。只有明确价格和互斥使用量证据才记 observed／conservative；缺量／中断保留风险，checkpoint 损坏与恢复水位领先不清零。UI 仅执行纯逻辑、类型和构建验证，不截图、不执行 UI 自动化；未部署远程。
+
+真实启用面仍须独立观察 7 个自然日、至少 100 条真实完成请求并逐条按开始窗口／价目／revision 对账。当前所有真实面保持 `live_pending`，不得从本地／夹具通过推导 `live_verified`。运维与恢复限制见 `docs/share/value-quotas.md`；最终本地测试结果另记 Router 实施计划，不修改既有 Provider 的真实证据状态。
+
 ## 2026-10-26 账号重置周期：实现与证据门槛
 
 核对既有quota parser与生成`docs/provider/coverage.md`，展示resets_at还可能是账期/包到期，不能通用触发。实现只使用Codex明确604800秒共享窗（绝对优先、缺失才相对秒）、Claude共享seven_day（含同身份被动头），不将短窗/review/模型桶混为账号主周期。Codex HTTP/WS被动观测带provider revision/account incarnation/identity generation fence；WS仅接受当前WHAM风格形状，离线fixture不证明全部真实WS schema。

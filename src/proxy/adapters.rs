@@ -359,6 +359,23 @@ impl GenericForwardingAdapter {
         gemini_path: Option<&str>,
     ) -> Result<(), ProxyError> {
         prepare_gemini_v1internal_route_request(request, stored, route, gemini_path)?;
+        if route == ProxyRoute::Gemini
+            && stored.provider_type == ProviderType::Gemini
+            && matches!(
+                upstream_format_for_route(stored, Some(route), &request.body),
+                None | Some(UpstreamFormat::GeminiNative)
+            )
+        {
+            // None is native passthrough (no protocol conversion).
+            // Native Gemini selects the real model in the URL, not JSON.
+            // Never inject a body model or trust a conflicting caller field.
+            if let Some(model) = gemini_model_from_path(gemini_path) {
+                request.requested_model = Some(model.clone());
+                request.model = Some(model.clone());
+                request.actual_model = Some(model);
+                request.actual_model_source = Some("route.model".into());
+            }
+        }
         if route_implies_stream(route, gemini_path) {
             request.stream_requested = true;
             request.upstream_stream_requested = true;
@@ -7072,7 +7089,7 @@ mod tests {
         let stored = stored_provider(AppKind::Gemini, ProviderType::Gemini, json!({}));
         let adapter = adapter_for(AppKind::Gemini, ProviderType::Gemini);
 
-        for action in ["generateContent", "countTokens"] {
+        for action in ["generateContent", "streamGenerateContent", "countTokens"] {
             let path = format!("models/gemini-2.5-pro:{action}");
             let request = adapter
                 .transform_request_for_route(
@@ -7087,8 +7104,17 @@ mod tests {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
 
             assert!(body.get("model").is_none(), "action={action}");
-            assert!(request.requested_model.is_none(), "action={action}");
-            assert!(request.actual_model.is_none(), "action={action}");
+            assert_eq!(
+                request.requested_model.as_deref(),
+                Some("gemini-2.5-pro"),
+                "action={action}"
+            );
+            assert_eq!(
+                request.actual_model.as_deref(),
+                Some("gemini-2.5-pro"),
+                "action={action}"
+            );
+            assert_eq!(request.actual_model_source.as_deref(), Some("route.model"));
         }
     }
 
@@ -7431,7 +7457,7 @@ mod tests {
     }
 
     #[test]
-    fn model_mapping_catalog_maps_gemini_route_model() {
+    fn native_gemini_route_url_is_authoritative_over_mapped_body_model() {
         let adapter = adapter_for(AppKind::Gemini, ProviderType::Gemini);
         let stored = stored_provider(
             AppKind::Gemini,
@@ -7466,14 +7492,20 @@ mod tests {
             value.get("model").and_then(Value::as_str),
             Some("models/gemini-2.5-pro-preview")
         );
-        assert_eq!(
-            request.actual_model_source.as_deref(),
-            Some("model_catalog")
-        );
-        assert_eq!(
-            request.actual_model.as_deref(),
-            Some("models/gemini-2.5-pro-preview")
-        );
+        assert_eq!(request.actual_model_source.as_deref(), Some("route.model"));
+        assert_eq!(request.requested_model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(request.actual_model.as_deref(), Some("gemini-2.5-pro"));
+        // Preserve the existing wire/catalog behavior, but do not mislabel
+        // the model selected by the real native URL as the body mapping.
+        assert!(adapter
+            .resolve_endpoint_for_request(
+                ProxyRoute::Gemini,
+                Some("models/gemini-2.5-pro:generateContent".into()),
+                &stored,
+                &request,
+            )
+            .unwrap()
+            .ends_with("/models/gemini-2.5-pro:generateContent"));
     }
 
     #[test]

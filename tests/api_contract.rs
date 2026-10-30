@@ -7146,6 +7146,7 @@ async fn web_usage_requests_uses_stable_filters_and_cursor_pagination() {
                 actual_model_source: Some("response".to_string()),
             },
             TokenUsage {
+                cache_creation_details: None,
                 raw_input_tokens: Some(16),
                 input_tokens: Some(11),
                 output_tokens: Some(7),
@@ -7371,6 +7372,7 @@ async fn web_usage_rest_aggregates_bundles_surfaces_models_and_share_users() {
                 actual_model_source: Some("response".to_string()),
             },
             TokenUsage {
+                cache_creation_details: None,
                 raw_input_tokens: Some(16),
                 input_tokens: Some(11),
                 output_tokens: Some(7),
@@ -14912,6 +14914,7 @@ fn share_user_quota_log(share_id: &str, user_email: &str, tokens: u64) -> UsageL
             actual_model_source: Some("response".to_string()),
         },
         TokenUsage {
+            cache_creation_details: None,
             raw_input_tokens: Some(tokens),
             input_tokens: Some(tokens),
             output_tokens: Some(0),

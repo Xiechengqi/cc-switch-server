@@ -786,6 +786,12 @@ pub(super) async fn run_installation_heartbeat_once(
             *consecutive_failures = 0;
             *last_failure_warning = None;
             record_installation_heartbeat_success(state).await;
+            if let Err(error) = state.sync_share_value_pricing(&config).await {
+                tracing::warn!(%error,"Share value pricing synchronization pending");
+            }
+            if let Err(error) = state.sync_share_value_watermarks(&config).await {
+                tracing::debug!(%error,"Share value quota watermark synchronization pending");
+            }
             state.retry_pending_setup_completion_notification().await;
         }
         Err(client::InstallationHeartbeatError::RegistrationRequired { status, body }) => {

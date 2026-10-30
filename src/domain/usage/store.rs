@@ -324,6 +324,8 @@ pub struct UsageLog {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_details: Option<CacheCreationDetails>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,8 +431,80 @@ impl UsageLog {
     }
 }
 
+/// Bounded upstream model evidence. It is stored with usage, never in a later
+/// transaction that could briefly release an unverified monetary reservation.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseModelEvidence {
+    pub model: Option<String>,
+    pub conflict: bool,
+}
+impl ResponseModelEvidence {
+    pub fn observe(&mut self, value: &serde_json::Value) {
+        for pointer in [
+            "/model",
+            "/modelVersion",
+            "/response/model",
+            "/message/model",
+        ] {
+            let Some(value) = value.pointer(pointer).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let Some(model) = value.as_str().filter(|model| {
+                !model.is_empty()
+                    && model.len() <= 250
+                    && model.trim() == *model
+                    && !model.chars().any(char::is_control)
+            }) else {
+                self.conflict = true;
+                continue;
+            };
+            if self
+                .model
+                .as_deref()
+                .is_some_and(|previous| previous != model)
+            {
+                self.conflict = true;
+            } else if self.model.is_none() {
+                self.model = Some(model.into());
+            }
+        }
+    }
+    pub fn apply(&self, log: &mut UsageLog) {
+        let native = match log.profile_id.as_deref() {
+            Some(profile) => matches!(
+                profile,
+                "claude.anthropic_api_key" | "codex.openai_api_key" | "gemini.google_api_key"
+            ),
+            None => matches!(
+                log.provider_type,
+                ProviderType::Claude | ProviderType::Codex | ProviderType::Gemini
+            ),
+        };
+        if !native {
+            return;
+        }
+        // A usage-only frame is not evidence that an earlier model vanished.
+        // In particular, HTTP fallback may finish a WebSocket-owned turn log.
+        if let Some(model) = &self.model {
+            if log
+                .reported_model
+                .as_deref()
+                .is_some_and(|previous| previous != model)
+            {
+                log.reported_model_conflict = Some(true);
+            }
+            log.reported_model = Some(model.clone());
+            log.reported_model_source = Some("upstream.response.model".into());
+        }
+        if self.conflict {
+            log.reported_model_conflict = Some(true);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
+    pub response_model: Option<ResponseModelEvidence>,
     pub request_id: Option<String>,
     pub quota_attribution: Option<super::quota_ledger::QuotaAttribution>,
     pub record_kind: UsageRecordKind,
@@ -1010,6 +1084,7 @@ impl UsageLog {
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
+            cache_creation_details: usage.cache_creation_details,
             total_tokens: usage.total_tokens,
             credit_usage: usage.credit_usage,
             image_count: None,
@@ -1054,6 +1129,9 @@ impl UsageLog {
     }
 
     pub fn apply_context(&mut self, context: UsageLogContext) {
+        if let Some(evidence) = context.response_model {
+            evidence.apply(self);
+        }
         self.quota_attribution = context.quota_attribution;
         if let Some(request_id) = context.request_id {
             self.request_id = request_id;
@@ -1242,8 +1320,16 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
+    pub cache_creation_details: Option<CacheCreationDetails>,
     pub total_tokens: Option<u64>,
     pub credit_usage: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheCreationDetails {
+    pub five_minutes: u64,
+    pub one_hour: u64,
 }
 
 impl TokenUsage {
@@ -1343,6 +1429,12 @@ pub fn usage_from_json_with_semantics(
                 ],
             )
         });
+    let cache_creation_details = usage.get("cache_creation").and_then(|detail| {
+        Some(CacheCreationDetails {
+            five_minutes: detail.get("ephemeral_5m_input_tokens")?.as_u64()?,
+            one_hour: detail.get("ephemeral_1h_input_tokens")?.as_u64()?,
+        })
+    });
     let cache_creation_tokens = first_u64(usage, &["cache_write_tokens", "cacheWriteTokens"])
         .or_else(|| {
             usage
@@ -1383,6 +1475,8 @@ pub fn usage_from_json_with_semantics(
                 ],
             )
         });
+    let cache_creation_tokens = cache_creation_tokens
+        .or_else(|| cache_creation_details.and_then(|d| d.five_minutes.checked_add(d.one_hour)));
     let semantics = match semantics {
         InputTokenSemantics::Auto => infer_input_token_semantics(usage),
         explicit => explicit,
@@ -1422,6 +1516,7 @@ pub fn usage_from_json_with_semantics(
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        cache_creation_details,
         total_tokens,
         credit_usage,
     }
@@ -1839,6 +1934,41 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn value_quota_response_model_evidence_is_bounded_and_conflicts_are_sticky() {
+        for path in ["model", "modelVersion"] {
+            let mut evidence = ResponseModelEvidence::default();
+            evidence.observe(&json!({(path):"model-a"}));
+            evidence.observe(&json!({"message":{"model":"model-a"}}));
+            assert_eq!(evidence.model.as_deref(), Some("model-a"));
+            assert!(!evidence.conflict);
+            evidence.observe(&json!({"response":{"model":"model-b"}}));
+            evidence.observe(&json!({"model":"model-a"}));
+            assert!(evidence.conflict);
+        }
+        for invalid in [json!(3), json!("x".repeat(251)), json!("bad\nmodel")] {
+            let mut evidence = ResponseModelEvidence::default();
+            evidence.observe(&json!({"model":invalid}));
+            assert!(evidence.conflict);
+            assert!(evidence.model.is_none());
+        }
+        let mut log = persisted_test_log("model-evidence", 1);
+        log.profile_id = Some("codex.openai_api_key".into());
+        log.reported_model = Some("model-a".into());
+        log.reported_model_source = Some("websocket.response.model".into());
+        ResponseModelEvidence::default().apply(&mut log);
+        assert_eq!(log.reported_model.as_deref(), Some("model-a"));
+        assert_eq!(
+            log.reported_model_source.as_deref(),
+            Some("websocket.response.model")
+        );
+        let mut conflicting = ResponseModelEvidence::default();
+        conflicting.observe(&json!({"model":"model-b"}));
+        conflicting.apply(&mut log);
+        ResponseModelEvidence::default().apply(&mut log);
+        assert_eq!(log.reported_model_conflict, Some(true));
+    }
+
     fn persisted_test_log(request_id: impl Into<String>, created_at_ms: u128) -> UsageLog {
         let mut log = UsageLog::new(
             AppKind::Codex,
@@ -1864,6 +1994,29 @@ mod tests {
         let append = store.prepare_append(log).unwrap();
         append.persist(dir).unwrap();
         store.apply_append(append);
+    }
+
+    #[test]
+    fn value_quota_cache_creation_ttl_preserves_unknown_and_nonoverlapping_input() {
+        let usage = usage_from_json(
+            &json!({"usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":11,
+            "cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}}),
+        );
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.raw_input_tokens, Some(48));
+        assert_eq!(usage.cache_creation_tokens, Some(30));
+        assert_eq!(
+            usage.cache_creation_details,
+            Some(CacheCreationDetails {
+                five_minutes: 10,
+                one_hour: 20
+            })
+        );
+        let old = usage_from_json(
+            &json!({"usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":30}}),
+        );
+        assert!(old.cache_creation_details.is_none());
+        assert_eq!(old.cache_creation_tokens, Some(30));
     }
 
     #[test]
@@ -2530,6 +2683,7 @@ mod tests {
                 actual_model_source: Some("model_mapping".to_string()),
             },
             TokenUsage {
+                cache_creation_details: None,
                 raw_input_tokens: Some(175_000),
                 input_tokens: Some(175_000),
                 output_tokens: Some(18),
@@ -2604,6 +2758,7 @@ mod tests {
                 actual_model_source: Some("model_mapping".to_string()),
             },
             TokenUsage {
+                cache_creation_details: None,
                 raw_input_tokens: Some(100),
                 input_tokens: Some(100),
                 output_tokens: Some(10),

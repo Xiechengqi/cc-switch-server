@@ -470,6 +470,18 @@ impl ProxyError {
 
     pub fn error_code(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        for code in [
+            "value_quota_exhausted",
+            "price_unavailable",
+            "quota_unavailable",
+        ] {
+            if message
+                .strip_prefix(code)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+            {
+                return code;
+            }
+        }
         if self.status == axum::http::StatusCode::SERVICE_UNAVAILABLE {
             for code in [
                 "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
@@ -562,6 +574,12 @@ impl ProxyError {
 
     pub fn error_type(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        if matches!(
+            self.error_code(),
+            "value_quota_exhausted" | "price_unavailable" | "quota_unavailable"
+        ) {
+            return "quota_error";
+        }
         if self.concurrency_metadata().is_some() {
             return "concurrency_limit_error";
         }
@@ -602,6 +620,12 @@ impl ProxyError {
 
     pub fn retryable(&self) -> bool {
         let message = self.message_without_retry_metadata();
+        if matches!(
+            self.error_code(),
+            "value_quota_exhausted" | "price_unavailable" | "quota_unavailable"
+        ) {
+            return false;
+        }
         if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {
             return true;
         }

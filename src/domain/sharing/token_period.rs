@@ -26,6 +26,12 @@ impl ShareTokenPeriod {
 }
 
 pub fn validate_user_policy(policy: &ShareUserPolicy, now_ms: i64) -> Result<(), String> {
+    if let Some(quota) = &policy.value_quota {
+        if policy.token_limit.is_some() {
+            return Err("tokenLimit and valueQuota are mutually exclusive".into());
+        }
+        quota.limit_picos().map_err(|e| e.to_string())?;
+    }
     match (
         policy.token_period.requires_anchor(),
         policy.token_period_anchor_at_ms,

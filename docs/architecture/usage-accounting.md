@@ -9,7 +9,9 @@
 - `outputTokens`：输出 token。
 - `totalTokens`：优先使用上游 `total_tokens/totalTokenCount`；缺失时按 `rawInputTokens + outputTokens` 推导。
 
-Server 只记录上述 Token 桶，不按模型价格计算或保存成本金额。
+上述 Token 桶不表示成本金额，不混入钱包或 Provider 账单。显式协商 Share v10 后另建独立 USD 等值配额 ledger，以 Router 冻结价目做精确定点换算，不重解释既有 Token 数量；准入、覆盖缺口和恢复见 [双口径额度](../share/value-quotas.md)。
+
+Anthropic 明确报告缓存创建时长时，`cacheCreationDetails={fiveMinutes,oneHour}` 保留 5m／1h 原始量，和须等于合并 cache creation。单报合并量不能补成虚构 5m；原四桶总数不双计。Router 明确协商 `cacheCreationTtlV1` 后才输出两字段，即使 USD 功能未开启也可独立协商。
 
 Kiro `meteringEvent` 的 credits 是独立的 Provider 计量，不是 Token：
 

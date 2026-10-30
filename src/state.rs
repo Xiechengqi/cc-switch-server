@@ -173,6 +173,7 @@ mod codex_quota;
 mod grok_media_resident;
 mod in_flight;
 mod provider_bundle;
+mod share_value_quota;
 
 pub(crate) use grok_media_resident::GrokMediaMemoryCapacity;
 use grok_media_resident::GrokMediaResidentSnapshot;
@@ -980,7 +981,7 @@ impl DeviceFlowPrincipalStore {
     }
 }
 
-type CachedRouterShareCapabilities = (String, String, std::time::Instant, (bool, bool));
+type CachedRouterShareCapabilities = (String, String, std::time::Instant, (bool, bool, bool, bool));
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -1017,6 +1018,7 @@ pub struct ServerStateInner {
     pub(crate) shares: RwLock<ShareStore>,
     share_quota_mutations: AsyncMutex<()>,
     quota_usage_degraded: std::sync::atomic::AtomicBool,
+    value_quota_degraded: std::sync::atomic::AtomicBool,
     share_lifecycle: AsyncMutex<()>,
     ui_settings_persistence: StorePersistenceCoordinator,
     pub(crate) ui_settings: RwLock<UiSettingsStore>,
@@ -3561,7 +3563,9 @@ fn validate_server_backup_restore_stage(
 ) -> anyhow::Result<()> {
     let includes = |name: &str| manifest.files.iter().any(|file| file.file_name == name);
     anyhow::ensure!(
-        !includes("account-reset-restore-fence.json"),
+        !includes("account-reset-restore-fence.json")
+            && !includes("share-value-quota-restore-fence.json")
+            && !includes("share-value-quota-degraded.json"),
         "backup must not replace the independent account quota restore fence"
     );
     validate_client_subdomain_adoption_restore_stage(config_dir, stage_dir, &includes)?;
@@ -7103,6 +7107,7 @@ impl ServerStateInner {
             "resolved local request body and request-lifecycle memory limits (body limit is min(local, router-declared))"
         );
 
+        let value_quota_degraded = config_dir.join("share-value-quota-degraded.json").exists();
         Ok(Arc::new(Self {
             bind_addr,
             config_dir,
@@ -7131,6 +7136,7 @@ impl ServerStateInner {
             shares: RwLock::new(shares),
             share_quota_mutations: AsyncMutex::new(()),
             quota_usage_degraded: std::sync::atomic::AtomicBool::new(false),
+            value_quota_degraded: std::sync::atomic::AtomicBool::new(value_quota_degraded),
             share_lifecycle: AsyncMutex::new(()),
             ui_settings_persistence: StorePersistenceCoordinator::default(),
             ui_settings: RwLock::new(ui_settings),
@@ -8418,6 +8424,9 @@ impl ServerStateInner {
                 &backup_id,
                 |stage_dir, manifest| {
                     validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)?;
+                    crate::repository::server_sqlite::value_quota::write_restore_fence(
+                        &config_dir,
+                    )?;
                     account_reset::write_restore_quota_fence(&config_dir)
                 },
             )
@@ -13370,11 +13379,14 @@ impl ServerStateInner {
         if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
             let config_dir = self.config_dir.clone();
             let persisted_log = expected_log.clone();
-            tokio::task::spawn_blocking(move || {
+            let value_degraded = tokio::task::spawn_blocking(move || {
                 crate::repository::server_sqlite::upsert_usage_log(&config_dir, &persisted_log)
             })
             .await
             .context("Usage SQLite persistence task panicked")??;
+            if value_degraded {
+                self.mark_value_quota_degraded();
+            }
             self.usage.write().await.apply_append(append);
             self.usage_persistence.mark_published();
             return Ok(expected_log);
@@ -18608,8 +18620,13 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
+        let value_config = self.config_snapshot().await;
+        let value_capable = self.router_supports_value_quotas().await;
+        let value_providers = self.providers.read().await.clone();
+        let account_reset_capable = self.router_supports_account_reset().await;
         let _commit = self.shares_persistence.gate.lock().await;
         let mut candidate = self.shares.read().await.clone();
+        let value_previous = candidate.clone();
         let previous_quota_revision = candidate.quota_cycle_ledger.revision;
         let previous_account_policies: BTreeMap<_, _> = candidate
             .shares
@@ -18637,10 +18654,18 @@ impl ServerStateInner {
         });
         if writes_account_reset {
             anyhow::ensure!(
-                self.router_supports_account_reset().await,
+                account_reset_capable,
                 "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED"
             );
         }
+        self.prepare_value_bindings_with_context(
+            &mut candidate,
+            &value_previous,
+            now_ms_i64(),
+            &value_config,
+            value_capable,
+            &value_providers,
+        )?;
         #[cfg(test)]
         self.shares_persistence.apply_test_persist_delay().await;
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
@@ -18671,7 +18696,12 @@ impl ServerStateInner {
                     base.to_string(),
                     identity.installation_id.clone(),
                     std::time::Instant::now(),
-                    (capability.account_reset(), capability.market_trials()),
+                    (
+                        capability.account_reset(),
+                        capability.market_trials(),
+                        capability.value_quotas(),
+                        capability.cache_creation_ttl(),
+                    ),
                 )
             });
         *self.router_quota_capability.write().await = value;
@@ -18894,6 +18924,10 @@ impl ServerStateInner {
         let market_started = *context
             .started_at_ms
             .get_or_insert_with(crate::infra::time::now_ms);
+        if let Err(error) = self.mark_value_shadow_request(context).await {
+            self.mark_value_quota_degraded();
+            tracing::warn!(%error,"Share value shadow collection unavailable");
+        }
         let market_share_id = share_id.to_string();
         let market_email = context.user_email.clone().unwrap_or_default();
         let has_market = self
@@ -19020,6 +19054,26 @@ impl ServerStateInner {
     }
 
     pub(crate) async fn apply_router_share_settings_patch_immediate(
+        self: &Arc<Self>,
+        share_id: &str,
+        patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
+    ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
+        match self
+            .apply_router_share_settings_patch_inner(share_id, patch)
+            .await?
+        {
+            Ok(_) => Ok(self
+                .shares
+                .read()
+                .await
+                .get(share_id)
+                .cloned()
+                .ok_or(SharePatchError::NotFound)),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    async fn apply_router_share_settings_patch_inner(
         self: &Arc<Self>,
         share_id: &str,
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
@@ -19307,6 +19361,48 @@ impl ServerStateInner {
         user_email: Option<&str>,
         now_ms: i64,
     ) -> Result<(ShareInvocation, ShareInFlightGuard), ShareInvocationRejection> {
+        self.validate_and_acquire_share_invocation_with_value_text(
+            share_id, app, user_email, now_ms, false,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_and_acquire_share_invocation_with_value_text(
+        self: &Arc<Self>,
+        share_id: &str,
+        app: AppKind,
+        user_email: Option<&str>,
+        now_ms: i64,
+        allow_value_text: bool,
+    ) -> Result<(ShareInvocation, ShareInFlightGuard), ShareInvocationRejection> {
+        if let Err(error) = self.activate_due_value_policies(share_id, now_ms).await {
+            tracing::warn!(%error, "scheduled value policy activation failed");
+            let affected = self
+                .shares
+                .read()
+                .await
+                .get(share_id)
+                .and_then(|share| {
+                    user_email.and_then(|email| share.user_grants.get(&email.to_ascii_lowercase()))
+                })
+                .is_some_and(|grant| {
+                    grant.policy.value_quota.is_some() || grant.pending_value_quota.is_some()
+                });
+            if affected {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "quota_unavailable: scheduled quota activation requires recovery"
+                        .into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
+        }
+        if !allow_value_text && self.share_uses_value_quota(share_id, user_email).await {
+            return Err(ShareInvocationRejection {reason:ShareRejectReason::QuotaUnavailable,
+                message:"quota_unavailable: this request surface does not support USD-equivalent metering".into(),
+                status_changed:false,concurrency:None});
+        }
         let _lifecycle = self.share_lifecycle.lock().await;
         let uses_account_reset = self
             .shares
@@ -19421,6 +19517,10 @@ impl ServerStateInner {
                     }
                 }),
             })?;
+        if !allow_value_text {
+            self.mark_unverified_value_surface(share_id, user_email, now_ms)
+                .await;
+        }
         Ok((invocation, guard))
     }
 
@@ -20688,14 +20788,19 @@ pub(crate) async fn authoritative_share_descriptor(
         );
         apply_account_reset_descriptor_projection(&mut descriptor, &share, account_reset_supported);
         if state.router_supports_market_trials().await {
-            descriptor.contract_version =
-                crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION;
+            descriptor.contract_version = descriptor
+                .contract_version
+                .max(crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION);
         } else {
             anyhow::ensure!(
                 share.market_entitlements.is_empty(),
                 "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED"
             );
         }
+        apply_value_descriptor_projection(
+            &mut descriptor,
+            state.router_supports_value_quotas().await,
+        )?;
         state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
         let prepared = state
@@ -20729,8 +20834,9 @@ fn apply_account_reset_descriptor_projection(
     if !supported {
         return;
     }
-    descriptor.contract_version =
-        crate::domain::sharing::router_contract::ACCOUNT_RESET_CONTRACT_VERSION;
+    descriptor.contract_version = descriptor
+        .contract_version
+        .max(crate::domain::sharing::router_contract::ACCOUNT_RESET_CONTRACT_VERSION);
     for (email, grant) in &mut descriptor.user_grants {
         if let Some(current) = share.user_grants.get(email) {
             grant
@@ -20759,6 +20865,47 @@ fn apply_account_reset_descriptor_projection(
             .supported_user_token_periods
             .push(ShareTokenPeriod::AccountReset);
     }
+}
+
+fn apply_value_descriptor_projection(
+    descriptor: &mut ShareDescriptor,
+    supported: bool,
+) -> anyhow::Result<()> {
+    if !supported {
+        anyhow::ensure!(
+            !descriptor
+                .user_grants
+                .values()
+                .any(|g| g.active
+                    && (g.policy.value_quota.is_some() || g.pending_value_quota.is_some())),
+            "VALUE_QUOTA_ROUTER_UPGRADE_REQUIRED"
+        );
+        for grant in descriptor.user_grants.values_mut() {
+            grant.value_metering = None;
+            // Revocation must remain synchronizable to an older reader. This
+            // only strips the private projection, never the durable history.
+            if !grant.active {
+                grant.policy.value_quota = None;
+                grant.pending_value_quota = None;
+            }
+        }
+        if descriptor.contract_version
+            == crate::domain::sharing::router_contract::VALUE_QUOTA_CONTRACT_VERSION
+        {
+            descriptor.contract_version = if !descriptor.market_entitlements.is_empty() {
+                9
+            } else if descriptor.user_grants.values().any(|g| {
+                g.account_reset_capability.is_some()
+                    || g.policy.token_period
+                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset
+            }) {
+                8
+            } else {
+                7
+            };
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -21669,6 +21816,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let config = state.config_snapshot().await;
         let account_reset_supported = state.router_supports_account_reset().await;
         let market_trial_supported = state.router_supports_market_trials().await;
+        let value_supported = state.router_supports_value_quotas().await;
         let shares = state
             .shares
             .read()
@@ -21682,19 +21830,32 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         // unrelated ordinary Shares in the same synchronization batch.
         let unsupported = shares
             .iter()
-            .filter(|share| !market_trial_supported && !share.market_entitlements.is_empty())
-            .map(|share| share.id.clone())
-            .collect::<BTreeSet<_>>();
-        const UPGRADE_REQUIRED: &str = "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED";
+            .filter_map(|share| {
+                let reason = if !market_trial_supported && !share.market_entitlements.is_empty() {
+                    "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED"
+                } else if !value_supported
+                    && share.user_grants.values().any(|g| {
+                        g.active
+                            && (g.policy.value_quota.is_some() || g.pending_value_quota.is_some())
+                    })
+                {
+                    "VALUE_QUOTA_ROUTER_UPGRADE_REQUIRED"
+                } else {
+                    return None;
+                };
+                Some((share.id.clone(), reason))
+            })
+            .collect::<BTreeMap<_, _>>();
         if shares.iter().any(|share| {
-            unsupported.contains(&share.id)
-                && share.router_last_sync_error.as_deref() != Some(UPGRADE_REQUIRED)
+            unsupported
+                .get(&share.id)
+                .is_some_and(|reason| share.router_last_sync_error.as_deref() != Some(*reason))
         }) {
             state
                 .mutate_shares_immediate(|store| {
                     for share in &mut store.shares {
-                        if unsupported.contains(&share.id) {
-                            share.router_last_sync_error = Some(UPGRADE_REQUIRED.to_string());
+                        if let Some(reason) = unsupported.get(&share.id) {
+                            share.router_last_sync_error = Some((*reason).to_string());
                         }
                     }
                 })
@@ -21702,7 +21863,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         }
         let prepared = shares
             .iter()
-            .filter(|share| !unsupported.contains(&share.id))
+            .filter(|share| !unsupported.contains_key(&share.id))
             .map(|share| {
                 let descriptor = descriptor_for_share_with_accounts_and_usage(
                     share,
@@ -21721,9 +21882,11 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                     account_reset_supported,
                 );
                 if market_trial_supported {
-                    descriptor.contract_version =
-                        crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION;
+                    descriptor.contract_version = descriptor.contract_version.max(
+                        crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION,
+                    );
                 }
+                apply_value_descriptor_projection(&mut descriptor, value_supported)?;
                 state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
                 Ok((share.id.clone(), descriptor, fingerprint))
             })
@@ -22176,6 +22339,18 @@ pub(crate) async fn share_request_log_entry(
         output_tokens: clamp_u64_to_u32(log.output_tokens.unwrap_or(0)),
         cache_read_tokens: clamp_u64_to_u32(log.cache_read_tokens.unwrap_or(0)),
         cache_creation_tokens: clamp_u64_to_u32(log.cache_creation_tokens.unwrap_or(0)),
+        cache_creation_5m_tokens: if state.router_supports_cache_creation_ttl().await {
+            log.cache_creation_details
+                .and_then(|d| u32::try_from(d.five_minutes).ok())
+        } else {
+            None
+        },
+        cache_creation_1h_tokens: if state.router_supports_cache_creation_ttl().await {
+            log.cache_creation_details
+                .and_then(|d| u32::try_from(d.one_hour).ok())
+        } else {
+            None
+        },
         cache_usage_observed: log.cache_read_tokens.is_some()
             || log.cache_creation_tokens.is_some(),
         usage_estimated: log.usage_estimated,
@@ -24117,6 +24292,7 @@ mod tests {
                 actual_model_source: Some("model_mapping".to_string()),
             },
             TokenUsage {
+                cache_creation_details: None,
                 raw_input_tokens: Some(100),
                 input_tokens: Some(100),
                 output_tokens: Some(10),
@@ -31943,6 +32119,444 @@ mod tests {
         .expect("backup/reload must not deadlock");
         backup.unwrap();
         reload.unwrap();
+    }
+
+    #[tokio::test]
+    async fn value_quota_scheduled_switch_preserves_old_token_limits_and_activates_at_the_complete_boundary(
+    ) {
+        use crate::domain::sharing::router_contract::{ShareSettingsPatch, ShareTokenPeriod};
+        use crate::domain::usage::value_pricing::{PricingSnapshot, ValueQuota};
+        use crate::repository::server_sqlite::value_quota as value_ledger;
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "value-install").await;
+        crate::repository::server_sqlite::activate_authority(&state.config_dir).unwrap();
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("provider", "Provider"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 10,
+                    capabilities: vec!["usdEquivalentQuotaV1".into()],
+                },
+            )
+            .await;
+        state
+            .mutate_shares_immediate(|store| {
+                let mut input = router_sync_share_input("value-share", "provider");
+                input.enabled = Some(true);
+                input.status = Some("active".into());
+                store.upsert(input).unwrap();
+                let grant = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "value-share")
+                    .unwrap()
+                    .user_grants
+                    .get_mut("owner@example.com")
+                    .unwrap();
+                grant.policy.token_period = ShareTokenPeriod::Day;
+                grant.policy.token_limit = Some(100);
+            })
+            .await
+            .unwrap();
+        let scope = value_ledger::Scope {
+            router_url: config.router_api_base().unwrap().into(),
+            installation_id: "value-install".into(),
+            share_id: "value-share".into(),
+            email: "owner@example.com".into(),
+        };
+        let pricing:PricingSnapshot=serde_json::from_value(json!({"schemaVersion":1,"tariffPolicyId":"api-equivalent-v1","currency":"USD","exactAliases":{},
+            "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
+            "rates":{"standard/base":{"input":"1000000","output":"1000000","cacheRead":null,"cacheWrite5m":null,"cacheWrite1h":null,"cacheWritePolicy":"unavailable"}}}}})).unwrap();
+        let revision = pricing.revision().unwrap();
+        value_ledger::install_snapshot(
+            &state.config_dir,
+            &scope,
+            &revision,
+            &pricing,
+            now_ms_i64(),
+        )
+        .unwrap();
+        value_ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+        state.mutate_shares_immediate(|_| {}).await.unwrap();
+        let share = state
+            .shares
+            .read()
+            .await
+            .get("value-share")
+            .unwrap()
+            .clone();
+        let origin = share.user_grants["owner@example.com"]
+            .value_metering
+            .as_ref()
+            .unwrap()
+            .value_metered_from_ms;
+        let mut grants = share.user_grants.clone();
+        let grant = grants.get_mut("owner@example.com").unwrap();
+        grant.policy.token_limit = None;
+        grant.policy.value_quota = Some(ValueQuota {
+            limit_usd_micros: "1000000".into(),
+            tariff_policy_id: "api-equivalent-v1".into(),
+        });
+        let saved = state
+            .apply_share_settings_patch_immediate(
+                "value-share",
+                ShareSettingsPatch {
+                    user_grants: Some(grants),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let saved_grant = &saved.user_grants["owner@example.com"];
+        assert_eq!(saved_grant.policy.token_limit, Some(100));
+        assert!(saved_grant.policy.value_quota.is_none());
+        let pending = saved_grant.pending_value_quota.as_ref().unwrap();
+        assert!(pending.retain_access);
+        assert!(pending.effective_from_ms > now_ms_i64());
+        let mut projection =
+            crate::domain::sharing::router_contract::descriptor_for_share_with_usage(
+                &saved,
+                &*state.providers.read().await,
+                None,
+            );
+        assert!(apply_value_descriptor_projection(&mut projection, false).is_err());
+        for grant in projection.user_grants.values_mut() {
+            grant.active = false;
+        }
+        apply_value_descriptor_projection(&mut projection, false).unwrap();
+        assert!(projection.user_grants.values().all(|g| !g.active
+            && g.value_metering.is_none()
+            && g.policy.value_quota.is_none()
+            && g.pending_value_quota.is_none()));
+        assert!(
+            saved_grant.pending_value_quota.is_some(),
+            "projection must not erase durable policy history"
+        );
+        let policy_preview = state
+            .preview_share_value_quota(
+                "value-share",
+                saved.config_revision,
+                BTreeMap::from([("owner@example.com".into(), pending.policy.clone())]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(policy_preview["ready"], true);
+        assert_eq!(
+            policy_preview["rows"][0]["effectiveFromMs"],
+            pending.effective_from_ms
+        );
+        let mut lifetime = pending.policy.clone();
+        lifetime.token_period = ShareTokenPeriod::Lifetime;
+        let immediate = state
+            .preview_share_value_quota(
+                "value-share",
+                saved.config_revision,
+                BTreeMap::from([("owner@example.com".into(), lifetime.clone())]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(immediate["ready"], true);
+        assert!(immediate["rows"][0]["effectiveFromMs"].as_i64().unwrap() <= now_ms_i64());
+        value_ledger::record_gap(
+            &state.config_dir,
+            &scope,
+            "unexplained-history",
+            now_ms_i64(),
+        )
+        .unwrap();
+        let incomplete = state
+            .preview_share_value_quota(
+                "value-share",
+                saved.config_revision,
+                BTreeMap::from([("owner@example.com".into(), lifetime)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            incomplete["ready"], false,
+            "lifetime gaps must not preview as safe to save"
+        );
+        let current = now_ms_i64();
+        let mut copy = state.shares.read().await.clone();
+        assert!(copy
+            .validate_for_invocation(
+                "value-share",
+                AppKind::Codex,
+                Some("owner@example.com"),
+                current
+            )
+            .is_ok());
+        copy.record_user_invocation_result("value-share", Some("owner@example.com"), 100, current);
+        assert_eq!(
+            copy.validate_for_invocation(
+                "value-share",
+                AppKind::Codex,
+                Some("owner@example.com"),
+                current
+            )
+            .unwrap_err()
+            .reason,
+            ShareRejectReason::UserExhausted
+        );
+        let before = state.shares.read().await.clone();
+        // A new authorization cannot use an unlimited placeholder before
+        // the first complete window, even on a free-access Share.
+        let mut newly_authorized = before.clone();
+        newly_authorized
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "value-share")
+            .unwrap()
+            .user_grants
+            .insert(
+                "new@example.test".into(),
+                crate::domain::sharing::router_contract::ShareUserGrant {
+                    email: "new@example.test".into(),
+                    active: true,
+                    policy: pending.policy.clone(),
+                    ..Default::default()
+                },
+            );
+        state
+            .prepare_value_bindings_at(&mut newly_authorized, &before, current)
+            .await
+            .unwrap();
+        assert!(
+            !newly_authorized.get("value-share").unwrap().user_grants["new@example.test"]
+                .pending_value_quota
+                .as_ref()
+                .unwrap()
+                .retain_access
+        );
+        assert_eq!(
+            newly_authorized
+                .validate_for_invocation(
+                    "value-share",
+                    AppKind::Codex,
+                    Some("new@example.test"),
+                    current
+                )
+                .unwrap_err()
+                .reason,
+            ShareRejectReason::QuotaUnavailable
+        );
+        assert_eq!(
+            value_ledger::begin_coverage(&state.config_dir, &scope, current + 100).unwrap(),
+            origin
+        );
+        // A failed candidate commit (or a deleted grant on a free Share) can
+        // leave coverage without a live grant. Requests must still leave a
+        // gap, so a later authorization cannot mistake that history for zero.
+        let orphan = value_ledger::Scope {
+            email: "orphan@example.test".into(),
+            ..scope.clone()
+        };
+        value_ledger::begin_coverage(&state.config_dir, &orphan, current).unwrap();
+        state
+            .mark_value_shadow_request(&UsageLogContext {
+                share_id: Some(orphan.share_id.clone()),
+                user_email: Some(orphan.email.clone()),
+                request_id: Some("unbound-shadow-request".into()),
+                started_at_ms: Some(current as u128),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let unbound = value_ledger::status(
+            &state.config_dir,
+            &orphan,
+            &value_ledger::Window {
+                id: "Lifetime:0:0".into(),
+                starts_at_ms: 0,
+                ends_at_ms: None,
+                metered_from_ms: current,
+            },
+        )
+        .unwrap();
+        assert_eq!(unbound.metering_status, "unavailable");
+        // Missing prices cannot block the unchanged Token policy in shadow.
+        state
+            .admit_share_value_text(
+                &UsageLogContext {
+                    share_id: Some("value-share".into()),
+                    user_email: Some(scope.email.clone()),
+                    request_id: Some("shadow-unpriced".into()),
+                    started_at_ms: Some(current as u128),
+                    ..Default::default()
+                },
+                "unpriced",
+                "standard",
+                true,
+            )
+            .await
+            .unwrap();
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 7,
+                    capabilities: vec![],
+                },
+            )
+            .await;
+        let mut after = before.clone();
+        state
+            .prepare_value_bindings_at(&mut after, &before, pending.effective_from_ms)
+            .await
+            .unwrap();
+        let activated = &after.get("value-share").unwrap().user_grants["owner@example.com"];
+        assert!(activated.pending_value_quota.is_none());
+        assert!(activated.policy.value_quota.is_some());
+        assert_eq!(
+            activated
+                .value_metering
+                .as_ref()
+                .unwrap()
+                .value_metered_from_ms,
+            origin
+        );
+    }
+
+    #[tokio::test]
+    async fn value_quota_free_access_does_not_enforce_a_revoked_individual_policy() {
+        use crate::domain::sharing::router_contract::{ShareUserGrant, ShareUserPolicy};
+        use crate::domain::usage::value_pricing::ValueQuota;
+        let state = test_state();
+        state
+            .mutate_shares_immediate(|store| {
+                let mut input = router_sync_share_input("free-value-share", "provider");
+                input.enabled = Some(true);
+                input.status = Some("active".into());
+                store.upsert(input).unwrap();
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "free-value-share")
+                    .unwrap();
+                share.free_access = true;
+                share.user_grants.insert(
+                    "revoked@example.test".into(),
+                    ShareUserGrant {
+                        email: "revoked@example.test".into(),
+                        active: false,
+                        policy: ShareUserPolicy {
+                            value_quota: Some(ValueQuota {
+                                limit_usd_micros: "1000000".into(),
+                                tariff_policy_id: "api-equivalent-v1".into(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let context = UsageLogContext {
+            share_id: Some("free-value-share".into()),
+            user_email: Some("revoked@example.test".into()),
+            ..Default::default()
+        };
+        state
+            .admit_share_value_text(&context, "unpriced", "standard", false)
+            .await
+            .unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "free-value-share")
+                    .unwrap()
+                    .free_access = false;
+            })
+            .await
+            .unwrap();
+        assert!(state
+            .admit_share_value_text(&context, "unpriced", "standard", false)
+            .await
+            .is_err());
+        let removed = UsageLogContext {
+            user_email: Some("removed@example.test".into()),
+            ..context
+        };
+        assert!(state
+            .admit_share_value_text(&removed, "unpriced", "standard", false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn value_quota_cache_ttl_log_negotiation_is_independent_of_the_usd_capability() {
+        use crate::domain::usage::store::CacheCreationDetails;
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "ttl-install").await;
+        state
+            .mutate_shares_immediate(|s| {
+                s.upsert(router_sync_share_input("ttl-share", "provider"))
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let mut log = UsageLog::new(
+            AppKind::Claude,
+            "provider".into(),
+            "Provider".into(),
+            ProviderType::Claude,
+            200,
+            1,
+            UsageModelMetadata {
+                model: Some("model".into()),
+                ..Default::default()
+            },
+            TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(1),
+                cache_creation_tokens: Some(30),
+                cache_creation_details: Some(CacheCreationDetails {
+                    five_minutes: 10,
+                    one_hour: 20,
+                }),
+                ..Default::default()
+            },
+        );
+        log.apply_context(UsageLogContext {
+            share_id: Some("ttl-share".into()),
+            ..Default::default()
+        });
+        let legacy =
+            serde_json::to_value(share_request_log_entry(&state, &log).await.unwrap()).unwrap();
+        assert!(legacy.get("cacheCreation5mTokens").is_none());
+        assert_eq!(legacy["cacheCreationTokens"], 30);
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 7,
+                    capabilities: vec!["cacheCreationTtlV1".into()],
+                },
+            )
+            .await;
+        assert!(!state.router_supports_value_quotas().await);
+        let extended =
+            serde_json::to_value(share_request_log_entry(&state, &log).await.unwrap()).unwrap();
+        assert_eq!(extended["cacheCreation5mTokens"], 10);
+        assert_eq!(extended["cacheCreation1hTokens"], 20);
     }
 
     fn test_state() -> ServerState {

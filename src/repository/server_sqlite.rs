@@ -26,6 +26,7 @@ use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
 mod payload;
 mod quota;
 mod schema;
+pub(crate) mod value_quota;
 mod wal;
 
 use payload::{
@@ -37,7 +38,7 @@ use wal::validate_wal_if_present;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -946,7 +947,9 @@ pub(crate) fn persist_reference_graph(
     Ok(())
 }
 
-pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Result<()> {
+/// Returns whether USD-only accounting was isolated for recovery. The ordinary
+/// usage/Token transaction must not be lost because a monetary checkpoint failed.
+pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Result<bool> {
     let mut observation = CommitObservation::start("usage_upsert");
     assert_committed(config_dir)?;
     let mut connection = open_database(&database_path(config_dir), false)?;
@@ -955,10 +958,11 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
         .context("begin Usage SQLite UPSERT")?;
     upsert_usage_row(&transaction, log)?;
     quota::upsert_log(&transaction, log)?;
+    let value_degraded = value_quota::settle_usage_log_isolated(&transaction, log)?;
     bump_repository_generation(&transaction)?;
     transaction.commit().context("commit Usage SQLite UPSERT")?;
     observation.succeed();
-    Ok(())
+    Ok(value_degraded)
 }
 
 pub(crate) fn replace_usage_records(config_dir: &Path, usage: &UsageStore) -> anyhow::Result<()> {
@@ -2868,7 +2872,7 @@ mod tests {
             upgrade_schema(&dir).unwrap();
             upgrade_schema(&dir).unwrap();
             let upgraded = read_marker(&dir).unwrap().unwrap();
-            assert_eq!(upgraded.schema_version, 2);
+            assert_eq!(upgraded.schema_version, SCHEMA_VERSION as u32);
             assert_eq!(upgraded.authority, authority);
             assert_eq!(upgraded.source_digest, digest);
             let connection = open_database(&database_path(&dir), true).unwrap();

@@ -323,7 +323,7 @@
     {
       "id": "usageCostAccounting",
       "label": "Usage cost accounting",
-      "reason": "Server records token volume, request status, and latency without model pricing or USD cost calculation"
+      "reason": "No wallet, Provider bill or market settlement accounting. Negotiated Share v10 may execute pure USD-equivalent quota counters from Router-frozen tariffs; it never fetches external prices or treats them as money."
     }
   ],
   "commands": [
@@ -1442,6 +1442,30 @@
       "feature": "shares",
       "endpoint": "GET /api/shares",
       "notes": "Server-native Web compatibility command."
+    },
+    {
+      "name": "preview_share_value_quota",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/preview_share_value_quota",
+      "notes": "Read-only USD-equivalent quota capability, coverage and activation preview."
+    },
+    {
+      "name": "get_share_value_quota_status",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/get_share_value_quota_status",
+      "notes": "Authenticated Server-owned USD-equivalent quota status. Not wallet money."
+    },
+    {
+      "name": "edit_share_value_quota_usage",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/edit_share_value_quota_usage",
+      "notes": "Versioned, watermarked, idempotent USD quota offset correction. Cannot erase observed usage or alter Market grants."
     },
     {
       "name": "get_share_health_status",

@@ -38,6 +38,59 @@ pub(crate) async fn control_preview_account_reset(
         .map(Json)
         .map_err(ApiError::account_quota_preview)
 }
+pub(crate) async fn control_preview_value_quota(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/preview_value_quota", &headers, &body).await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        share_id: String,
+        expected_config_revision: u64,
+        #[serde(default)]
+        policies: BTreeMap<String, crate::domain::sharing::router_contract::ShareUserPolicy>,
+    }
+    let input: Input = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    state
+        .preview_share_value_quota(
+            &input.share_id,
+            input.expected_config_revision,
+            input.policies,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+pub(crate) async fn control_edit_value_usage(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/edit_value_usage", &headers, &body).await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        share_id: String,
+        expected_config_revision: u64,
+        actor: String,
+        edits: BTreeMap<String, crate::domain::usage::value_pricing::ValueUsageEdit>,
+    }
+    let input: Input = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    state
+        .apply_share_value_usage_edits(
+            &input.share_id,
+            input.expected_config_revision,
+            input.edits,
+            &input.actor,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        serde_json::json!({"ok":true,"items":state.value_quota_statuses(&input.share_id).await.map_err(ApiError::internal)?}),
+    ))
+}
 
 pub(crate) async fn control_prepare_client_subdomain_adoption(
     State(state): State<ServerState>,

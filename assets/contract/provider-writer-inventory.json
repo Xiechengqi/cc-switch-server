@@ -9,7 +9,7 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "189b697d43a66c6b8f0524d2fed0fd772c41afaa49137765dc3d9e312a7260b0"
+      "sha256": "6497a88d54f93c0e0089e311ffefae1c0dd9fe419aea7ab75889431dbfde5252"
     },
     {
       "path": "src/api/providers.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "b41c9a813531bad67871a00c50abbb32d9ab1003647d23e68a64bb6fbabc8daf"
+      "sha256": "243b37e0642d27fb7416c17af606183909273b30eb866acb65ae1c1718d6e0bd"
     },
     {
       "path": "src/state/provider_bundle.rs",

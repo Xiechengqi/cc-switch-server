@@ -110,6 +110,16 @@ function normalizeAccountBaseline(value: unknown): ShareUserGrant["accountUsageB
   return value as ShareUserGrant["accountUsageBaseline"];
 }
 
+function normalizeValueQuota(value:unknown):import("@/lib/api/share").ShareUserPolicy["valueQuota"] {
+  if(value==null)return undefined;
+  if(typeof value!=="object")throw new Error("Invalid USD-equivalent quota");
+  const raw=value as RawRecord, amount=raw.limitUsdMicros;
+  if(typeof amount!=="string" || !/^[1-9]\d*$/.test(amount) || amount.length>16 ||
+      BigInt(amount)>1000000000000000n || raw.tariffPolicyId!=="api-equivalent-v1") {
+    throw new Error("Invalid USD-equivalent quota");
+  }
+  return {limitUsdMicros:amount,tariffPolicyId:"api-equivalent-v1"};
+}
 function normalizeUsageBucket(value: unknown): ShareUserUsageBucket {
   const raw = value && typeof value === "object" ? (value as RawRecord) : {};
   return {
@@ -226,6 +236,8 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
         : {};
     const email = readString(raw, "email") ?? key;
     const grant: ShareUserGrant = {
+      valueMetering: normalizeValueMetering(raw.valueMetering),
+      pendingValueQuota: normalizePendingValueQuota(raw.pendingValueQuota),
       accountUsageBaseline: normalizeAccountBaseline(raw.accountUsageBaseline),
       accountQuotaCycle: normalizeAccountCycle(raw.accountQuotaCycle),
       accountResetCapability: normalizeAccountCapability(raw.accountResetCapability),
@@ -239,6 +251,7 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
           "parallel_limit",
         ),
         tokenLimit: readNumber(policyRaw, "tokenLimit", "token_limit"),
+        valueQuota: normalizeValueQuota(policyRaw.valueQuota ?? policyRaw.value_quota),
         tokenPeriod: normalizeTokenPeriod(
           policyRaw.tokenPeriod ?? policyRaw.token_period,
         ),
@@ -269,6 +282,28 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
     result[email.trim().toLowerCase()] = grant;
   }
   return result;
+}
+
+function normalizeValueMetering(value: unknown): ShareUserGrant["valueMetering"] {
+  if (value == null) return undefined;
+  const raw = value as RawRecord;
+  if (typeof raw.quotaPolicyEpoch !== "string" || !raw.quotaPolicyEpoch ||
+      typeof raw.pricingRevision !== "string" || !raw.pricingRevision ||
+      typeof raw.valueMeteredFromMs !== "number" || !Number.isSafeInteger(raw.valueMeteredFromMs) || raw.valueMeteredFromMs < 0 ||
+      typeof raw.effectiveFromMs !== "number" || !Number.isSafeInteger(raw.effectiveFromMs) || raw.effectiveFromMs < raw.valueMeteredFromMs) {
+    throw new Error("Invalid value metering binding");
+  }
+  return value as ShareUserGrant["valueMetering"];
+}
+
+function normalizePendingValueQuota(value: unknown): ShareUserGrant["pendingValueQuota"] {
+  if (value == null) return undefined;
+  const raw = value as RawRecord;
+  const policy = raw.policy as RawRecord | undefined;
+  if (!policy || !normalizeValueQuota(policy.valueQuota) || policy.tokenLimit != null ||
+      typeof raw.effectiveFromMs !== "number" || !Number.isSafeInteger(raw.effectiveFromMs) || raw.effectiveFromMs < 0 ||
+      typeof raw.retainAccess !== "boolean") throw new Error("Invalid pending value policy");
+  return value as ShareUserGrant["pendingValueQuota"];
 }
 
 function normalizeAppKey(value: unknown): keyof ShareBindings | null {

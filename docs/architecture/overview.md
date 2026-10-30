@@ -23,7 +23,7 @@ Token 路由交易系统由**三个角色**构成，运行时只有**两个进�
 
 ### 1.1 资金边界
 
-Server 不参与计费：不保存价格、余额、账单或结算，只统计 Token、状态与延迟。Share Market 与 Client Market 的付费发布、报价和购买均使用 Router 的平台余额；Router 的 `disabled` / `shadow` / `enabled` 财务模式只控制新的官方渠道充值，不切换到旧的 Provider 资金轨道。`shadow` 只允许 Owner 测试充值；开放或重新开放普通用户充值须通过当前渠道及账本验收门槛。关闭充值或退回影子测试不影响既有余额的消费、转账、已发起订单的核对或成熟收益的结算，也不会恢复旧资金写入口。
+Server 不参与资金计费：不保存余额、应付账单或结算。默认只统计 Token、状态与延迟；Share v10 显式协商后可保存 Router 已确认的冻结价目，用于普通 Share 的纯 USD API 标价等值配额，不代表钱包消费或 Provider 成本，详见 [双口径额度](../share/value-quotas.md)。Share Market 与 Client Market 的付费发布、报价和购买均使用 Router 的平台余额；Router 的 `disabled` / `shadow` / `enabled` 财务模式只控制新的官方渠道充值，不切换到旧的 Provider 资金轨道。`shadow` 只允许 Owner 测试充值；开放或重新开放普通用户充值须通过当前渠道及账本验收门槛。关闭充值或退回影子测试不影响既有余额的消费、转账、已发起订单的核对或成熟收益的结算，也不会恢复旧资金写入口。
 
 Provider 的净收益完成七天沉淀后由 Router 自动计入其平台余额，可用于消费或按 Router 的规则流转；外部提现、提现地址和手动「收益转入余额」均已退役。对 Server 而言，Share Market 的租用、恢复和欠费暂停体现为 Router 经 pending Share edit 下发的 `managedGrant` `upsert`（授予/恢复）与 `revoke`（回收/暂停）；Server 落库为 `manager=routerShareMarket` 的授权并据此执行访问与限额。Client Market 欠费由 Router 侧暂停该 Client 的隧道，不需要 Server 配合。当前资金契约以 `cc-switch-router/docs/market-platform-wallet-implementation.md` 开头的现行说明和 `cc-switch-router/docs/market-earnings-automatic-credit.md` 为准，不能把前者保留的旧提现规划当作当前实现。
 

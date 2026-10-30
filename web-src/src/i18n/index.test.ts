@@ -80,6 +80,20 @@ describe("language normalization", () => {
 });
 
 describe("i18n resources", () => {
+  it("keeps every nested USD quota message complete without locale fallback", () => {
+    const leaves=(value:unknown,prefix=""):string[] => value && typeof value==="object"
+      ? Object.entries(value).flatMap(([key,child])=>leaves(child,prefix ? `${prefix}.${key}`:key)) : [prefix];
+    const keys=leaves(serverEn.share.userLimit.valueQuota).sort();
+    for(const language of languages) {
+      expect(leaves(serverLocales[language].share.userLimit.valueQuota).sort()).toEqual(keys);
+      for(const key of keys) {
+        const path=`share.userLimit.valueQuota.${key}`;
+        const text=i18n.getResource(language,"translation",path);
+        expect(typeof text).toBe("string");expect(text.trim()).not.toBe("");
+        expect(i18n.t(path,{lng:language,fallbackLng:false})).toBe(text);
+      }
+    }
+  });
   it("uses the Server Provider creation wording", () => {
     expect(serverZh.providerBundle.stepFamily).toBe("选择类型");
     expect(serverZh.providerBundle.stepSupply).toBe("配置");

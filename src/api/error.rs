@@ -436,6 +436,10 @@ impl ApiError {
     }
 
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
+        if error.to_string().starts_with("VALUE_QUOTA_") || error.to_string() == "price_unavailable"
+        {
+            return Self::value_quota(error);
+        }
         if error.to_string() == "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" {
             return Self::conflict_code(
                 "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED",
@@ -444,6 +448,42 @@ impl ApiError {
         }
         tracing::error!("internal api error: {error}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    }
+
+    pub(crate) fn value_quota(error: impl std::fmt::Display) -> Self {
+        let message = error.to_string();
+        if [
+            "REVISION_CONFLICT",
+            "WATERMARK_CONFLICT",
+            "WINDOW_CONFLICT",
+            "OPERATION_CONFLICT",
+        ]
+        .iter()
+        .any(|code| message.contains(code))
+        {
+            return Self::conflict_code(
+                "quota_revision_conflict",
+                "Quota policy or usage changed; refresh the authoritative preview before retrying",
+            );
+        }
+        if message.contains("TARGET_BELOW_OBSERVED") {
+            return Self::bad_request_code(
+                "quota_target_invalid",
+                "The target cannot be below observed usage or outside the supported range",
+            );
+        }
+        if message == "price_unavailable" {
+            let mut error = Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No verified tariff for this execution model and tier",
+            );
+            error.code = Some("price_unavailable");
+            return error;
+        }
+        tracing::warn!(%message, "USD-equivalent quota control unavailable");
+        let mut error=Self::new(StatusCode::SERVICE_UNAVAILABLE,"USD-equivalent metering is unavailable; check coverage, storage and acknowledged tariff readiness");
+        error.code = Some("quota_unavailable");
+        error
     }
 
     pub(crate) fn not_found(error: impl Into<String>) -> Self {
@@ -785,6 +825,41 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn value_quota_errors_keep_distinct_non_wallet_codes_on_every_inference_surface() {
+        for (code, status) in [
+            ("value_quota_exhausted", StatusCode::TOO_MANY_REQUESTS),
+            ("price_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+            ("quota_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            for surface in [
+                InferenceSurface::OpenAi,
+                InferenceSurface::Anthropic,
+                InferenceSurface::Gemini,
+            ] {
+                let error = InferenceApiError::proxy(
+                    surface,
+                    None,
+                    crate::proxy::ProxyError {
+                        status,
+                        message: format!("{code}: quota test"),
+                    },
+                );
+                assert_eq!(error.code, code);
+                assert_eq!(error.error_type, "quota_error");
+                assert!(!error.retryable);
+            }
+        }
+        let conflict = ApiError::value_quota(anyhow::anyhow!("VALUE_QUOTA_WATERMARK_CONFLICT"));
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert_eq!(conflict.code, Some("quota_revision_conflict"));
+        let invalid = ApiError::value_quota(anyhow::anyhow!(
+            "VALUE_QUOTA_TARGET_BELOW_OBSERVED_OR_OUT_OF_RANGE"
+        ));
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code, Some("quota_target_invalid"));
+    }
 
     #[test]
     fn account_rate_limit_inference_error_has_structured_recovery_metadata() {

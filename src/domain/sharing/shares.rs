@@ -1797,6 +1797,18 @@ impl ShareStore {
         }
         if let Some(grant) = user_grant {
             if grant
+                .pending_value_quota
+                .as_ref()
+                .is_some_and(|pending| !pending.retain_access)
+            {
+                return Err(ShareInvocationRejection {
+                    reason: ShareRejectReason::QuotaUnavailable,
+                    message: "quota_unavailable: the new authorization is scheduled for its first complete quota window".into(),
+                    status_changed: false,
+                    concurrency: None,
+                });
+            }
+            if grant
                 .entitlement_id
                 .as_ref()
                 .is_some_and(|id| super::market_trials::uncertain(share, id))
@@ -1885,7 +1897,13 @@ impl ShareStore {
                 .unwrap_or_else(|| share.id.clone()),
             parallel_limit: share.parallel_limit,
             user_email: normalized_user_email,
-            user_parallel_limit: user_grant.and_then(|grant| grant.policy.parallel_limit),
+            user_parallel_limit: user_grant.and_then(|grant| {
+                if grant.policy.value_quota.is_some() {
+                    Some(grant.policy.parallel_limit.unwrap_or(4).min(4))
+                } else {
+                    grant.policy.parallel_limit
+                }
+            }),
         })
     }
 
@@ -2944,6 +2962,12 @@ impl ShareStore {
             }
             if grant.manager == ShareGrantManager::RouterShareMarket {
                 return Err(SharePatchError::ManagedGrantReadOnly(email));
+            }
+            if grant.policy.value_quota.is_some() || grant.pending_value_quota.is_some() {
+                return Err(SharePatchError::Invalid(
+                    "Token usage edits cannot modify a USD-equivalent grant; use valueUsageEdit"
+                        .into(),
+                ));
             }
             if let Some(period) = edit.period {
                 if period != grant.policy.token_period {
@@ -4146,6 +4170,7 @@ fn default_user_policy(share: &Share) -> ShareUserPolicy {
     ShareUserPolicy {
         parallel_limit: share.parallel_limit,
         token_limit: share.token_limit,
+        value_quota: None,
         token_period: ShareTokenPeriod::Lifetime,
         token_period_anchor_at_ms: None,
         expires_at: canonical_user_policy_expiry(share.expires_at),
@@ -4160,6 +4185,8 @@ fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
         role: role.to_string(),
         active: true,
         policy: default_user_policy(share),
+        value_metering: None,
+        pending_value_quota: None,
         usage: Default::default(),
         usage_rebase: None,
         usage_quota: None,
@@ -4351,6 +4378,11 @@ fn apply_managed_grant_operation(
                 policy.token_period_anchor_at_ms = Some(now.div_euclid(60_000) * 60_000);
             }
             validate_user_policy(&policy, now).map_err(SharePatchError::Invalid)?;
+            if policy.value_quota.is_some() {
+                return Err(SharePatchError::Invalid(
+                    "Share Market contracts cannot use USD-equivalent quotas".into(),
+                ));
+            }
             if policy.token_period == ShareTokenPeriod::AccountReset {
                 return Err(SharePatchError::Invalid(
                     "market contracts cannot use accountReset".into(),
@@ -4411,6 +4443,8 @@ fn apply_managed_grant_operation(
                     role: "shareto".to_string(),
                     active: true,
                     policy,
+                    value_metering: None,
+                    pending_value_quota: None,
                     usage: previous
                         .as_ref()
                         .map(|grant| grant.usage.clone())
@@ -4544,6 +4578,10 @@ fn normalize_user_grants(
         };
         grant.active = true;
         grant.usage = previous.map(|item| item.usage.clone()).unwrap_or_default();
+        grant.value_metering = previous.and_then(|item| item.value_metering.clone());
+        grant.pending_value_quota = previous
+            .and_then(|item| item.pending_value_quota.clone())
+            .filter(|pending| pending.policy == incoming_grant.policy);
         // Usage snapshots and rebases are Server-owned.  Never trust either
         // value from a browser/Router patch; preserve the current durable
         // rebase and rebuild the derived snapshot below.
@@ -4604,6 +4642,8 @@ fn reconcile_user_grants(share: &mut Share) {
                 role: "owner".to_string(),
                 active: true,
                 policy: policy_template.clone(),
+                value_metering: None,
+                pending_value_quota: None,
                 usage: Default::default(),
                 usage_rebase: None,
                 usage_quota: None,
@@ -4676,6 +4716,7 @@ mod tests {
             action,
             email: email.to_string(),
             policy: (action == ShareManagedGrantAction::Upsert).then_some(ShareUserPolicy {
+                value_quota: None,
                 parallel_limit: Some(2),
                 token_limit: Some(10_000),
                 token_period: ShareTokenPeriod::Day,
@@ -6251,6 +6292,7 @@ mod tests {
                 role: "shareto".to_string(),
                 active: true,
                 policy: ShareUserPolicy {
+                    value_quota: None,
                     parallel_limit: input.parallel_limit,
                     token_limit: input.token_limit,
                     token_period: ShareTokenPeriod::Lifetime,
@@ -6376,6 +6418,7 @@ mod tests {
         input.parallel_limit = Some(7);
         input.expires_at = Some(expires_at);
         let expected = ShareUserPolicy {
+            value_quota: None,
             parallel_limit: Some(7),
             token_limit: Some(50_000),
             token_period: ShareTokenPeriod::Lifetime,

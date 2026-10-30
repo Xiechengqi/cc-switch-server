@@ -30,6 +30,8 @@
 | `server-store.sqlite3` | providers/accounts/shares/usage 的事务型权威库与加密回滚 blob | 是 |
 | `server-store-migration.json` | SQLite schema、源摘要与 authority 状态 marker | 否 |
 | `account-reset-restore-fence.json` | 恢复前独立持久化的quota stream/用券安全栅栏，不进入备份且禁止manifest覆盖 | 否 |
+| `share-value-quota-restore-fence.json` | USD 等值恢复安全边界；独立于备份，旧窗口不按零放行 | 含额度身份 |
+| `share-value-quota-degraded.json` | shadow 金额覆盖持久化故障标记，仅阻止 USD，不阻止 Token；禁止备份覆盖 | 否 |
 | `migration-backups/server-store-*/` | 权威切换时生成的一次性只读 legacy 回滚集 | 是 |
 | `image-capabilities/` | 图像能力探测结果 | 否 |
 | `backups/` | 备份归档（见 §5） | 是 |
@@ -78,6 +80,8 @@
 计量口径与字段语义见 [`usage-accounting.md`](usage-accounting.md)；Share 维度的用量重基线见 [`../share/user-usage-rebase.md`](../share/user-usage-rebase.md)。
 
 账号周期另在UsageStore中保留精简毫秒ledger/revisions，不受32天详情裁剪；与详情同次journal/SQL提交。v1精简账策略为retainAllExactRevisions，25万告警/100万限制新有限账号配额准入，不自动删账。ShareStore保存周期事件、公共游标、兑换回执与人工基线。详见[账号周期恢复与回退](../share/account-reset.md)。
+
+SQLite schema v3 另增 USD 等值 snapshots／coverage／attempts／revisions／adjustments／daily checkpoints，与 usage revision 同事务更新；不对金额 TEXT 做浮点聚合，不随详情清理归零。终态有界压缩保留最高修订及去重身份，未知用量不压缩；百万 attempt／4 GiB 仅告警而非删账限额。托管恢复覆盖前写独立 fence，Router 水位领先则冻结，不能删标记消除真实使用量。具体限制见 [value-quotas.md](../share/value-quotas.md)。
 
 ## 5. 备份
 
