@@ -65,6 +65,9 @@ for file in "${shell_scripts[@]}"; do
 done
 
 echo "== provider audits =="
+# Validate generated source fingerprints before the longer receipt fixtures.
+# Otherwise one stale inventory can obscure unrelated negative-case assertions.
+node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node --test scripts/audit/*.test.mjs
 node --test scripts/smoke/*.test.mjs
 node scripts/audit/audit-qoder-cli-oracle.mjs
@@ -80,7 +83,6 @@ node scripts/audit/audit-kiro-reference-delta.mjs
 node scripts/audit/audit-qoder-reference-delta.mjs
 node scripts/audit/audit-provider-enhancement-committed-target.mjs
 node scripts/audit/audit-server-provider-contract.mjs
-node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node scripts/audit/audit-provider-coverage.mjs --check
 node scripts/audit/audit-coding-plan-registry.mjs --check
 node scripts/audit/audit-web-session-registry.mjs --check

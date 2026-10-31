@@ -84,6 +84,8 @@ mapfile -t rust_files < <(rg --files -g '*.rs' src)
 rustfmt --edition 2021 --config skip_children=true --check "${rust_files[@]}"
 ```
 
+`src/state.rs` 等 Provider writer 证据文件变更后（包括仅增加测试），须审查对应写入行为，再运行 `node scripts/audit/audit-provider-phase0-contracts.mjs` 重新生成证据清单，并用同命令加 `--check` 及 `node --test scripts/audit/provider-phase0-contracts.test.mjs` 验证。不得手工更新哈希或移除证据校验；完整后端审计仍需 `node --test scripts/audit/*.test.mjs`。
+
 真实 router/market/OAuth/share-market grant 输入齐备前，只能运行本地验证和离线 readiness；不得把缺真实输入的项目标记为真实通过。
 
 当前可用的 server-native 持久化文件：
