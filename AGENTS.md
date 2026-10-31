@@ -77,6 +77,13 @@ Server Web UI 以本仓库的产品需求、Server API 和 `assets/contract/web-
 - `scripts/smoke/smoke-local.sh`
 - `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh`
 
+Rust 格式检查须覆盖 `include!` 引入的独立源文件；`cargo fmt --check` 不会遍历这些文件，不能单独作为 CI 格式通过的依据。仅检查格式时，使用与 `scripts/static-checks.sh` 一致的命令：
+
+```bash
+mapfile -t rust_files < <(rg --files -g '*.rs' src)
+rustfmt --edition 2021 --config skip_children=true --check "${rust_files[@]}"
+```
+
 真实 router/market/OAuth/share-market grant 输入齐备前，只能运行本地验证和离线 readiness；不得把缺真实输入的项目标记为真实通过。
 
 当前可用的 server-native 持久化文件：
