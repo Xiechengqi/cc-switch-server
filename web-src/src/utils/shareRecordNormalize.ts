@@ -110,15 +110,45 @@ function normalizeAccountBaseline(value: unknown): ShareUserGrant["accountUsageB
   return value as ShareUserGrant["accountUsageBaseline"];
 }
 
-function normalizeValueQuota(value:unknown):import("@/lib/api/share").ShareUserPolicy["valueQuota"] {
-  if(value==null)return undefined;
-  if(typeof value!=="object")throw new Error("Invalid USD-equivalent quota");
-  const raw=value as RawRecord, amount=raw.limitUsdMicros;
-  if(typeof amount!=="string" || !/^[1-9]\d*$/.test(amount) || amount.length>16 ||
-      BigInt(amount)>1000000000000000n || raw.tariffPolicyId!=="api-equivalent-v1") {
-    throw new Error("Invalid USD-equivalent quota");
-  }
-  return {limitUsdMicros:amount,tariffPolicyId:"api-equivalent-v1"};
+/**
+ * A malformed monetary field must neither hide the Share list nor quietly
+ * turn into "no USD quota": the raw value is kept as received and the grant
+ * is flagged, so the editor shows it read-only and a save refuses to send a
+ * policy rebuilt from a value it could not read.
+ */
+type MalformedFlag = { malformed: boolean };
+
+function keepMalformed<T>(field: string, email: string, value: unknown, flag: MalformedFlag): T {
+  console.warn(`[shares] malformed ${field} for ${email}; grant is read-only`, value);
+  flag.malformed = true;
+  return value as T;
+}
+
+function strictValueQuota(value: unknown): ShareUserPolicy["valueQuota"] | null {
+  if (value == null) return undefined;
+  if (typeof value !== "object") return null;
+  const raw = value as RawRecord;
+  const amount = raw.limitUsdMicros ?? raw.limit_usd_micros;
+  const tariff = raw.tariffPolicyId ?? raw.tariff_policy_id;
+  if (typeof amount !== "string" || !/^[1-9]\d*$/.test(amount) || amount.length > 16 ||
+      BigInt(amount) > 1000000000000000n || tariff !== "api-equivalent-v1") return null;
+  return { limitUsdMicros: amount, tariffPolicyId: "api-equivalent-v1" };
+}
+
+function normalizeValueQuota(value: unknown, email: string, flag: MalformedFlag): ShareUserPolicy["valueQuota"] {
+  const quota = strictValueQuota(value);
+  return quota === null ? keepMalformed("valueQuota", email, value, flag) : quota;
+}
+
+function normalizePolicy(policyRaw: RawRecord, email: string, flag: MalformedFlag): ShareUserPolicy {
+  return {
+    parallelLimit: readNumber(policyRaw, "parallelLimit", "parallel_limit"),
+    tokenLimit: readNumber(policyRaw, "tokenLimit", "token_limit"),
+    valueQuota: normalizeValueQuota(policyRaw.valueQuota ?? policyRaw.value_quota, email, flag),
+    tokenPeriod: normalizeTokenPeriod(policyRaw.tokenPeriod ?? policyRaw.token_period),
+    tokenPeriodAnchorAtMs: readNumber(policyRaw, "tokenPeriodAnchorAtMs", "token_period_anchor_at_ms"),
+    expiresAt: readNumber(policyRaw, "expiresAt", "expires_at"),
+  };
 }
 function normalizeUsageBucket(value: unknown): ShareUserUsageBucket {
   const raw = value && typeof value === "object" ? (value as RawRecord) : {};
@@ -235,33 +265,17 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
         ? (raw.policy as RawRecord)
         : {};
     const email = readString(raw, "email") ?? key;
+    const flag: MalformedFlag = { malformed: false };
     const grant: ShareUserGrant = {
-      valueMetering: normalizeValueMetering(raw.valueMetering),
-      pendingValueQuota: normalizePendingValueQuota(raw.pendingValueQuota),
+      valueMetering: normalizeValueMetering(raw.valueMetering ?? raw.value_metering, email, flag),
+      pendingValueQuota: normalizePendingValueQuota(raw.pendingValueQuota ?? raw.pending_value_quota, email, flag),
       accountUsageBaseline: normalizeAccountBaseline(raw.accountUsageBaseline),
       accountQuotaCycle: normalizeAccountCycle(raw.accountQuotaCycle),
       accountResetCapability: normalizeAccountCapability(raw.accountResetCapability),
       email,
       role: raw.role === "owner" ? "owner" : "shareto",
       active: readBool(raw, "active") ?? true,
-      policy: {
-        parallelLimit: readNumber(
-          policyRaw,
-          "parallelLimit",
-          "parallel_limit",
-        ),
-        tokenLimit: readNumber(policyRaw, "tokenLimit", "token_limit"),
-        valueQuota: normalizeValueQuota(policyRaw.valueQuota ?? policyRaw.value_quota),
-        tokenPeriod: normalizeTokenPeriod(
-          policyRaw.tokenPeriod ?? policyRaw.token_period,
-        ),
-        tokenPeriodAnchorAtMs: readNumber(
-          policyRaw,
-          "tokenPeriodAnchorAtMs",
-          "token_period_anchor_at_ms",
-        ),
-        expiresAt: readNumber(policyRaw, "expiresAt", "expires_at"),
-      } satisfies ShareUserPolicy,
+      policy: normalizePolicy(policyRaw, email, flag),
       usage: normalizeUserUsage(raw.usage),
       usageRebase: normalizeUsageRebase(
         raw.usageRebase ?? raw.usage_rebase,
@@ -279,31 +293,41 @@ function normalizeShareUserGrants(input: unknown): ShareUserGrantMap {
           : undefined,
       entitlementId: readString(raw, "entitlementId", "entitlement_id"),
     };
+    if (flag.malformed) grant.valueQuotaMalformed = true;
     result[email.trim().toLowerCase()] = grant;
   }
   return result;
 }
 
-function normalizeValueMetering(value: unknown): ShareUserGrant["valueMetering"] {
+function normalizeValueMetering(value: unknown, email: string, flag: MalformedFlag): ShareUserGrant["valueMetering"] {
   if (value == null) return undefined;
+  if (typeof value !== "object") return keepMalformed("valueMetering", email, value, flag);
   const raw = value as RawRecord;
-  if (typeof raw.quotaPolicyEpoch !== "string" || !raw.quotaPolicyEpoch ||
-      typeof raw.pricingRevision !== "string" || !raw.pricingRevision ||
-      typeof raw.valueMeteredFromMs !== "number" || !Number.isSafeInteger(raw.valueMeteredFromMs) || raw.valueMeteredFromMs < 0 ||
-      typeof raw.effectiveFromMs !== "number" || !Number.isSafeInteger(raw.effectiveFromMs) || raw.effectiveFromMs < raw.valueMeteredFromMs) {
-    throw new Error("Invalid value metering binding");
+  const quotaPolicyEpoch = readString(raw, "quotaPolicyEpoch", "quota_policy_epoch");
+  const pricingRevision = readString(raw, "pricingRevision", "pricing_revision");
+  const valueMeteredFromMs = readNumber(raw, "valueMeteredFromMs", "value_metered_from_ms");
+  const effectiveFromMs = readNumber(raw, "effectiveFromMs", "effective_from_ms");
+  if (!quotaPolicyEpoch || !pricingRevision ||
+      valueMeteredFromMs == null || !Number.isSafeInteger(valueMeteredFromMs) || valueMeteredFromMs < 0 ||
+      effectiveFromMs == null || !Number.isSafeInteger(effectiveFromMs) || effectiveFromMs < valueMeteredFromMs) {
+    return keepMalformed("valueMetering", email, value, flag);
   }
-  return value as ShareUserGrant["valueMetering"];
+  return { quotaPolicyEpoch, pricingRevision, valueMeteredFromMs, effectiveFromMs };
 }
 
-function normalizePendingValueQuota(value: unknown): ShareUserGrant["pendingValueQuota"] {
+function normalizePendingValueQuota(value: unknown, email: string, flag: MalformedFlag): ShareUserGrant["pendingValueQuota"] {
   if (value == null) return undefined;
+  if (typeof value !== "object") return keepMalformed("pendingValueQuota", email, value, flag);
   const raw = value as RawRecord;
-  const policy = raw.policy as RawRecord | undefined;
-  if (!policy || !normalizeValueQuota(policy.valueQuota) || policy.tokenLimit != null ||
-      typeof raw.effectiveFromMs !== "number" || !Number.isSafeInteger(raw.effectiveFromMs) || raw.effectiveFromMs < 0 ||
-      typeof raw.retainAccess !== "boolean") throw new Error("Invalid pending value policy");
-  return value as ShareUserGrant["pendingValueQuota"];
+  const policyRaw = raw.policy && typeof raw.policy === "object" ? raw.policy as RawRecord : undefined;
+  const effectiveFromMs = readNumber(raw, "effectiveFromMs", "effective_from_ms");
+  const retainAccess = readBool(raw, "retainAccess", "retain_access");
+  const quota = policyRaw ? strictValueQuota(policyRaw.valueQuota ?? policyRaw.value_quota) : null;
+  if (!policyRaw || !quota || readNumber(policyRaw, "tokenLimit", "token_limit") != null ||
+      effectiveFromMs == null || !Number.isSafeInteger(effectiveFromMs) || effectiveFromMs < 0 || retainAccess == null) {
+    return keepMalformed("pendingValueQuota", email, value, flag);
+  }
+  return { policy: normalizePolicy(policyRaw, email, flag), effectiveFromMs, retainAccess };
 }
 
 function normalizeAppKey(value: unknown): keyof ShareBindings | null {
@@ -468,7 +492,11 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 export function normalizeShareRecords(raw: unknown): ShareRecord[] {
   if (!Array.isArray(raw)) return [];
   return raw
-    .map((item) => normalizeShareRecord(item))
+    .map((item) => {
+      // A single unreadable record must not hide every other Share.
+      try { return normalizeShareRecord(item); }
+      catch (error) { console.warn("[shares] ignoring malformed share record", error); return null; }
+    })
     .filter((item): item is ShareRecord => item !== null);
 }
 

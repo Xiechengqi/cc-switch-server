@@ -374,6 +374,28 @@ impl ProxyError {
             .starts_with(Self::REQUEST_MEMORY_EXHAUSTED_PREFIX)
     }
 
+    /// Concurrency cap or in-flight USD reservations: retry shortly.
+    pub(crate) fn value_quota_busy() -> Self {
+        Self {
+            status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "{}2]value_quota_busy: USD-equivalent quota is busy with in-flight requests; retry shortly",
+                Self::RETRY_AFTER_PREFIX
+            ),
+        }
+    }
+
+    /// Transient SQLite contention on the quota ledger.
+    pub(crate) fn quota_storage_busy() -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{}5]quota_unavailable: quota storage is busy; retry shortly",
+                Self::RETRY_AFTER_PREFIX
+            ),
+        }
+    }
+
     pub(super) fn rate_limited(message: impl Into<String>, retry_after_seconds: u64) -> Self {
         Self {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -472,6 +494,7 @@ impl ProxyError {
         let message = self.message_without_retry_metadata();
         for code in [
             "value_quota_exhausted",
+            "value_quota_busy",
             "price_unavailable",
             "quota_unavailable",
         ] {
@@ -576,7 +599,10 @@ impl ProxyError {
         let message = self.message_without_retry_metadata();
         if matches!(
             self.error_code(),
-            "value_quota_exhausted" | "price_unavailable" | "quota_unavailable"
+            "value_quota_exhausted"
+                | "value_quota_busy"
+                | "price_unavailable"
+                | "quota_unavailable"
         ) {
             return "quota_error";
         }
@@ -620,11 +646,12 @@ impl ProxyError {
 
     pub fn retryable(&self) -> bool {
         let message = self.message_without_retry_metadata();
-        if matches!(
-            self.error_code(),
-            "value_quota_exhausted" | "price_unavailable" | "quota_unavailable"
-        ) {
-            return false;
+        match self.error_code() {
+            "value_quota_busy" => return true,
+            // Only transient storage contention (with Retry-After) retries.
+            "quota_unavailable" => return self.retry_after_seconds().is_some(),
+            "value_quota_exhausted" | "price_unavailable" => return false,
+            _ => {}
         }
         if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {
             return true;

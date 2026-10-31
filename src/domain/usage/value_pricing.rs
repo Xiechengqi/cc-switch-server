@@ -47,74 +47,289 @@ pub fn supports_value_text_runtime(profile: &str, driver: &str, coding_plan: boo
         )
 }
 
-/// Accept only text and local function tools; reject separately billed resources.
-pub fn is_metered_text_payload(bytes: &[u8]) -> bool {
-    fn text(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Object(map) => {
-                if map.keys().any(|key| {
-                    matches!(
-                        key.as_str(),
-                        "inlineData"
-                            | "inline_data"
-                            | "fileData"
-                            | "file_data"
-                            | "image_url"
-                            | "input_audio"
-                            | "audio"
-                            | "video"
-                            | "image"
-                            | "audioConfig"
-                            | "speechConfig"
-                            | "groundingConfig"
-                            | "cachedContent"
-                            | "googleSearch"
-                            | "google_search"
-                            | "googleSearchRetrieval"
-                            | "google_search_retrieval"
-                            | "codeExecution"
-                            | "code_execution"
-                            | "urlContext"
-                            | "url_context"
-                            | "computer_use"
-                    )
+/// Object keys that positively identify separately billed media, audio
+/// output, cached server context, or a provider-executed (paid) tool. A key
+/// whose value is `null`/`false` is a harmless replayed placeholder.
+const DENIED_KEYS: &[&str] = &[
+    "inlineData",
+    "inline_data",
+    "fileData",
+    "file_data",
+    "image_url",
+    "input_image",
+    "input_audio",
+    "input_file",
+    "audio",
+    "video",
+    "audioConfig",
+    "audio_config",
+    "speechConfig",
+    "speech_config",
+    "cachedContent",
+    "cached_content",
+    "groundingConfig",
+    "grounding_config",
+    "googleSearch",
+    "google_search",
+    "googleSearchRetrieval",
+    "google_search_retrieval",
+    "enterpriseWebSearch",
+    "enterprise_web_search",
+    "googleMaps",
+    "google_maps",
+    "retrieval",
+    "fileSearch",
+    "file_search",
+    "codeExecution",
+    "code_execution",
+    "urlContext",
+    "url_context",
+    "computerUse",
+    "computer_use",
+    "web_search_options",
+    "mcp_servers",
+    "container",
+];
+/// Subtrees that carry caller-defined data (JSON schemas, tool arguments,
+/// opaque signatures). Their `type` members describe schemas or user data,
+/// never billable request content, so they are not interpreted.
+const OPAQUE_KEYS: &[&str] = &[
+    "parameters",
+    "parametersJsonSchema",
+    "parameters_json_schema",
+    "input_schema",
+    "inputSchema",
+    "output_schema",
+    "outputSchema",
+    "schema",
+    "json_schema",
+    "responseSchema",
+    "response_schema",
+    "responseJsonSchema",
+    "response_json_schema",
+    "metadata",
+    "arguments",
+    "args",
+    "encrypted_content",
+    "signature",
+    "thoughtSignature",
+    "thought_signature",
+];
+/// Typed content/tool entries that are billed separately from text tokens:
+/// media parts and provider-executed (server-side/built-in) tools, including
+/// their history items (`web_search_call`, `code_interpreter_call`, ...).
+fn denied_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "image"
+            | "image_url"
+            | "input_image"
+            | "output_image"
+            | "image_file"
+            | "input_audio"
+            | "output_audio"
+            | "audio"
+            | "input_file"
+            | "file"
+            | "document"
+            | "video"
+            | "input_video"
+    ) || [
+        "web_search",
+        "web_fetch",
+        "file_search",
+        "code_interpreter",
+        "code_execution",
+        "computer",
+        "image_generation",
+        "mcp",
+        "bash_",
+        "text_editor_",
+        "google_search",
+        "url_context",
+        "server_tool_use",
+        "container_upload",
+    ]
+    .iter()
+    .any(|prefix| kind.starts_with(prefix))
+}
+fn metered_text_value(value: &serde_json::Value, parent_key: Option<&str>) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(Value::as_str);
+            if kind.is_some_and(denied_type) {
+                return false;
+            }
+            for key in ["responseModalities", "response_modalities", "modalities"] {
+                if map.get(key).and_then(Value::as_array).is_some_and(|modes| {
+                    modes.iter().any(|mode| {
+                        !mode
+                            .as_str()
+                            .is_some_and(|mode| mode.eq_ignore_ascii_case("text"))
+                    })
                 }) {
                     return false;
                 }
-                if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
-                    if !matches!(
-                        kind,
-                        "text"
-                            | "input_text"
-                            | "output_text"
-                            | "message"
-                            | "function"
-                            | "function_call"
-                            | "function_call_output"
-                            | "tool_use"
-                            | "tool_result"
-                    ) {
-                        return false;
-                    }
-                }
-                if map
-                    .get("responseModalities")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|m| m.iter().any(|v| v.as_str() != Some("TEXT")))
-                {
-                    return false;
-                }
-                map.iter().all(|(key, value)| {
-                    matches!(key.as_str(), "parameters" | "input_schema" | "schema") || text(value)
-                })
             }
-            serde_json::Value::Array(items) => items.iter().all(text),
-            _ => true,
+            map.iter().all(|(key, child)| {
+                let key = key.as_str();
+                if DENIED_KEYS.contains(&key) {
+                    return matches!(child, Value::Null | Value::Bool(false));
+                }
+                if OPAQUE_KEYS.contains(&key)
+                    || (key == "input" && matches!(kind, Some("tool_use" | "custom_tool_call")))
+                    || (key == "response"
+                        && matches!(parent_key, Some("functionResponse" | "function_response")))
+                {
+                    return true;
+                }
+                metered_text_value(child, Some(key))
+            })
+        }
+        Value::Array(items) => items
+            .iter()
+            .all(|item| metered_text_value(item, parent_key)),
+        _ => true,
+    }
+}
+/// Protocol-aware text classifier for Messages, Chat Completions, Responses
+/// and Gemini bodies. Everything is text token usage except positively
+/// identified media/audio/file content and provider-executed paid tools.
+/// Client tools (function/custom), thinking/reasoning blocks, cache control,
+/// tool_choice and structured-output formats are ordinary text.
+pub fn is_metered_text_value(body: &serde_json::Value) -> bool {
+    body.is_object() && metered_text_value(body, None)
+}
+pub fn is_metered_text_payload(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|body| is_metered_text_value(&body))
+}
+
+pub const DEFAULT_OUTPUT_CEILING: u64 = 32_000;
+pub const MAX_OUTPUT_CEILING: u64 = 128_000;
+/// Bounded per-request reservation inputs. Input is a byte heuristic
+/// (`ceil(bytes / 3)` fresh-input tokens); output is the request's declared
+/// maximum, clamped to `[1, 128000]`, or 32000 when the client sent none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RiskEstimate {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+impl RiskEstimate {
+    pub fn from_request(body_len: usize, body: Option<&serde_json::Value>) -> Self {
+        use serde_json::Value;
+        let requested = body.and_then(|body| {
+            ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .iter()
+                .find_map(|key| body.get(*key).and_then(Value::as_u64))
+                .or_else(|| {
+                    body.pointer("/generationConfig/maxOutputTokens")
+                        .or_else(|| body.pointer("/generation_config/max_output_tokens"))
+                        .and_then(Value::as_u64)
+                })
+        });
+        Self {
+            input_tokens: u64::try_from(body_len).unwrap_or(u64::MAX).div_ceil(3),
+            output_tokens: requested
+                .map(|n| n.clamp(1, MAX_OUTPUT_CEILING))
+                .unwrap_or(DEFAULT_OUTPUT_CEILING),
         }
     }
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|body| body.is_object() && text(&body))
+    pub fn tokens(&self) -> ValueTokens {
+        ValueTokens {
+            fresh_input: self.input_tokens,
+            output: self.output_tokens,
+            ..Default::default()
+        }
+    }
 }
+/// Everything the forwarder needs from a final upstream body, parsed once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRequestFacts {
+    pub metered_text: bool,
+    pub estimate: RiskEstimate,
+    /// Raw `service_tier` exactly as sent; never canonicalized in place.
+    pub service_tier: Option<String>,
+}
+pub fn value_request_facts(bytes: &[u8]) -> ValueRequestFacts {
+    let body = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    ValueRequestFacts {
+        metered_text: body.as_ref().is_some_and(is_metered_text_value),
+        estimate: RiskEstimate::from_request(bytes.len(), body.as_ref()),
+        service_tier: body
+            .as_ref()
+            .and_then(|body| body.get("service_tier"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    }
+}
+/// The one canonical tier mapping shared by admission and settlement.
+/// OpenAI `auto`/absent/`default` are served at the standard tier unless the
+/// provider reports otherwise; unknown tiers (e.g. `scale`) are unpriced.
+pub fn canonical_service_tier(raw: Option<&str>) -> Option<&'static str> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Some("standard");
+    };
+    if raw.is_empty()
+        || ["auto", "default", "standard"]
+            .iter()
+            .any(|tier| raw.eq_ignore_ascii_case(tier))
+    {
+        Some("standard")
+    } else if raw.eq_ignore_ascii_case("priority") {
+        Some("priority")
+    } else if raw.eq_ignore_ascii_case("flex") {
+        Some("flex")
+    } else {
+        None
+    }
+}
+
+/// Typed USD-equivalent admission rejections. Mappers downcast this instead
+/// of matching message text; `Display` keeps the stable `VALUE_QUOTA_*` code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueQuotaRejectionKind {
+    /// Settled usage reached the limit (403, not retryable).
+    Exhausted,
+    /// Concurrency cap or in-flight reservations; retry shortly (429).
+    Busy,
+    /// Private Share authorization was revoked (403).
+    AuthorizationRevoked,
+    /// SQLite busy/locked; transient (503, retryable).
+    StorageBusy,
+    /// The scope/window needs an owner reconcile (`set`) (503).
+    Blocked,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueQuotaRejection {
+    pub kind: ValueQuotaRejectionKind,
+    pub resets_at_ms: Option<i64>,
+}
+impl ValueQuotaRejection {
+    pub fn new(kind: ValueQuotaRejectionKind) -> Self {
+        Self {
+            kind,
+            resets_at_ms: None,
+        }
+    }
+    pub fn code(&self) -> &'static str {
+        match self.kind {
+            ValueQuotaRejectionKind::Exhausted => "VALUE_QUOTA_EXHAUSTED",
+            ValueQuotaRejectionKind::Busy => "VALUE_QUOTA_BUSY",
+            ValueQuotaRejectionKind::AuthorizationRevoked => "VALUE_QUOTA_AUTHORIZATION_REVOKED",
+            ValueQuotaRejectionKind::StorageBusy => "VALUE_QUOTA_STORAGE_BUSY",
+            ValueQuotaRejectionKind::Blocked => "VALUE_QUOTA_BLOCKED_NEEDS_RECONCILE",
+        }
+    }
+}
+impl std::fmt::Display for ValueQuotaRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+impl std::error::Error for ValueQuotaRejection {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValueMeteringBinding {
@@ -622,6 +837,185 @@ mod tests {
         ] {
             assert!(!is_metered_text_payload(request));
         }
+    }
+    #[test]
+    fn realistic_claude_code_codex_and_chat_bodies_are_metered_text() {
+        let claude_code = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 32000,
+            "stream": true,
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Env info", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "tool_choice": {"type": "auto"},
+            "tools": [
+                {"name": "Bash", "description": "Run", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "image": {"type": "image"}}}},
+                {"type": "custom", "name": "Edit", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "fix it"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "Running"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls", "image": {"type": "image"}}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "ok"}], "is_error": false},
+                    {"type": "text", "text": "continue", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ],
+            "metadata": {"user_id": "u"}
+        });
+        let disabled_thinking = serde_json::json!({"thinking": {"type": "disabled"},
+            "tool_choice": {"type": "tool", "name": "Bash"}, "messages": []});
+        let codex = serde_json::json!({
+            "model": "gpt-5-codex",
+            "instructions": "codex",
+            "stream": true,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "text": {"verbosity": "low", "format": {"type": "json_schema", "name": "out", "schema": {"type": "object"}}},
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "array"}}}},
+                {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}},
+                {"type": "local_shell"}
+            ],
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "rules"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "s"}], "encrypted_content": "gAAA"},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"image_url\":\"x\"}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "done"},
+                {"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": "*** Begin Patch"},
+                {"type": "custom_tool_call_output", "call_id": "c2", "output": "ok"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}, {"type": "refusal", "refusal": "no"}]}
+            ]
+        });
+        let chat = serde_json::json!({
+            "model": "gpt-4.1",
+            "max_completion_tokens": 512,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object", "properties": {"audio": {"type": "string"}}}}},
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "f"}},
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "assistant", "content": null, "audio": null, "refusal": null,
+                 "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "1", "content": "r"},
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+            ]
+        });
+        let gemini = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {"image": {"type": "image"}}}, "thoughtSignature": "x"}]},
+                {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"type": "file"}}}]}],
+            "tools": [{"functionDeclarations": [{"name": "f", "parameters": {"type": "object"}}]}],
+            "generationConfig": {"maxOutputTokens": 1024, "responseModalities": ["TEXT"], "thinkingConfig": {"thinkingBudget": 1024}}
+        });
+        for body in [&claude_code, &disabled_thinking, &codex, &chat, &gemini] {
+            assert!(is_metered_text_value(body), "{body}");
+            assert!(is_metered_text_payload(&serde_json::to_vec(body).unwrap()));
+        }
+    }
+    #[test]
+    fn media_documents_and_server_tools_are_not_metered_text() {
+        for body in [
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "x"}}]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "url", "url": "x"}}]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": [{"type": "image", "source": {}}]}]}]}),
+            serde_json::json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": []}),
+            serde_json::json!({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
+            serde_json::json!({"tools": [{"type": "computer_20250124", "name": "computer"}]}),
+            serde_json::json!({"tools": [{"type": "bash_20250124", "name": "bash"}]}),
+            serde_json::json!({"tools": [{"type": "text_editor_20250429", "name": "str_replace_based_edit_tool"}]}),
+            serde_json::json!({"mcp_servers": [{"type": "url", "url": "x"}]}),
+            serde_json::json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]}),
+            serde_json::json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_file", "file_id": "f"}]}]}),
+            serde_json::json!({"input": [{"type": "web_search_call", "id": "ws", "status": "completed"}]}),
+            serde_json::json!({"tools": [{"type": "web_search_preview"}]}),
+            serde_json::json!({"tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}),
+            serde_json::json!({"tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]}),
+            serde_json::json!({"tools": [{"type": "image_generation"}]}),
+            serde_json::json!({"tools": [{"type": "mcp", "server_label": "x"}]}),
+            serde_json::json!({"tool_choice": {"type": "web_search_preview"}}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "x"}}]}]}),
+            serde_json::json!({"modalities": ["text", "audio"], "audio": {"voice": "alloy"}}),
+            serde_json::json!({"web_search_options": {}}),
+            serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "x"}}]}]}),
+            serde_json::json!({"contents": [{"parts": [{"fileData": {"fileUri": "x"}}]}]}),
+            serde_json::json!({"tools": [{"googleSearch": {}}]}),
+            serde_json::json!({"tools": [{"codeExecution": {}}]}),
+            serde_json::json!({"tools": [{"urlContext": {}}]}),
+            serde_json::json!({"generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}),
+            serde_json::json!({"generationConfig": {"speechConfig": {"voiceConfig": {}}}}),
+            serde_json::json!({"cachedContent": "cachedContents/x"}),
+        ] {
+            assert!(!is_metered_text_value(&body), "{body}");
+        }
+        assert!(!is_metered_text_payload(b"[1]"));
+        assert!(!is_metered_text_payload(b"not json"));
+    }
+    #[test]
+    fn risk_estimate_uses_declared_output_ceiling_and_byte_heuristic() {
+        let facts = value_request_facts(br#"{"max_tokens":4096,"service_tier":"auto"}"#);
+        assert_eq!(facts.estimate.output_tokens, 4096);
+        assert_eq!(facts.estimate.input_tokens, 14);
+        assert_eq!(facts.service_tier.as_deref(), Some("auto"));
+        assert!(facts.metered_text);
+        for (body, ceiling) in [
+            (serde_json::json!({}), DEFAULT_OUTPUT_CEILING),
+            (serde_json::json!({"max_output_tokens": 0}), 1),
+            (
+                serde_json::json!({"max_completion_tokens": 999_999}),
+                MAX_OUTPUT_CEILING,
+            ),
+            (
+                serde_json::json!({"generationConfig": {"maxOutputTokens": 77}}),
+                77,
+            ),
+        ] {
+            assert_eq!(
+                RiskEstimate::from_request(0, Some(&body)).output_tokens,
+                ceiling
+            );
+        }
+        assert_eq!(RiskEstimate::from_request(7, None).input_tokens, 3);
+    }
+    #[test]
+    fn canonical_service_tier_is_shared_and_never_guesses_unknown_tiers() {
+        for raw in [
+            None,
+            Some(""),
+            Some("auto"),
+            Some("default"),
+            Some("Standard"),
+        ] {
+            assert_eq!(canonical_service_tier(raw), Some("standard"), "{raw:?}");
+        }
+        assert_eq!(canonical_service_tier(Some("priority")), Some("priority"));
+        assert_eq!(canonical_service_tier(Some("flex")), Some("flex"));
+        assert_eq!(canonical_service_tier(Some("scale")), None);
+    }
+    #[test]
+    fn value_quota_rejections_keep_stable_codes() {
+        let error = anyhow::Error::new(ValueQuotaRejection {
+            kind: ValueQuotaRejectionKind::Busy,
+            resets_at_ms: None,
+        })
+        .context("admission");
+        assert_eq!(
+            error.downcast_ref::<ValueQuotaRejection>().unwrap().code(),
+            "VALUE_QUOTA_BUSY"
+        );
+        assert!(ValueQuotaRejection::new(ValueQuotaRejectionKind::Exhausted)
+            .to_string()
+            .starts_with("VALUE_QUOTA_"));
     }
     fn rates() -> ExecutionRates {
         ExecutionRates {

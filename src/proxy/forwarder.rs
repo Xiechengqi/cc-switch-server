@@ -888,6 +888,11 @@ struct ForwardAttemptContext {
     request_memory: Option<RequestMemoryBudget>,
     raw_body_memory: Option<RequestMemoryReservation>,
     timing: TimingSlot,
+    /// Set only by a retry whose previous attempt was settled (awaited) at
+    /// $0: it provably never reached upstream (connect error), or upstream
+    /// failed before producing any output. Consumed by the next loop
+    /// iteration so a USD quota user may take that retry.
+    value_previous_attempt_free: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +932,7 @@ impl Default for ForwardAttemptContext {
             request_memory: None,
             raw_body_memory: None,
             timing: TimingSlot::default(),
+            value_previous_attempt_free: false,
         }
     }
 }
@@ -2329,6 +2335,8 @@ async fn forward_with_attempt_inner(
             }
         }
         let attempt_started = Instant::now();
+        let value_retry_after_free_attempt =
+            std::mem::take(&mut attempt_context.value_previous_attempt_free);
         let gemini_path = retry_gemini_path.clone();
         let (body, mut _decoded_body_memory) = decode_request_body_with_memory(
             &headers,
@@ -2397,9 +2405,10 @@ async fn forward_with_attempt_inner(
                 ));
             }
         };
+        // Only enforced USD-equivalent grants are metered (no Token shadow).
         let value_metering = if let Some(share_id) = request_context.share_id.as_deref() {
             state
-                .share_has_value_metering(share_id, request_context.user_email.as_deref())
+                .share_uses_value_quota(share_id, request_context.user_email.as_deref())
                 .await
         } else {
             false
@@ -2421,18 +2430,12 @@ async fn forward_with_attempt_inner(
                     Some("generateContent" | "streamGenerateContent")
                 )
             }))
-            && attempt_context.attempt() == 0
+            && (attempt_context.attempt() == 0 || value_retry_after_free_attempt)
             && (!value_metering
                 || crate::domain::usage::value_pricing::is_metered_text_payload(&body));
-        if let Some(share_id) = request_context.share_id.as_deref() {
-            if state
-                .share_uses_value_quota(share_id, request_context.user_email.as_deref())
-                .await
-                && !value_text_capable
-            {
-                return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
-                    message:"quota_unavailable: USD-equivalent quota requires a verified single-attempt text surface; media, built-in paid tools and transport retries are not covered".into()});
-            }
+        if value_metering && !value_text_capable {
+            return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
+                message:"quota_unavailable: USD-equivalent quota requires a verified text surface; media, built-in paid tools and post-send retries are not covered".into()});
         }
         if request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
             && attempt_context.request_memory().is_none()
@@ -3179,33 +3182,31 @@ async fn forward_with_attempt_inner(
         }
 
         let http_client = forward_http_client(&state, &execution).await?;
-        {
-            let effective_tier = request_context.effective_service_tier.clone().or_else(|| {
-                serde_json::from_slice::<serde_json::Value>(&adapter_request.body)
-                    .ok()
-                    .and_then(|body| {
-                        body.get("service_tier")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-            });
-            let effective_tier = match effective_tier.as_deref() {
-                None | Some("default") | Some("standard") => "standard",
-                Some("priority") => "priority",
-                Some("flex") => "flex",
-                _ => "unknown",
-            };
-            request_context.effective_service_tier = Some(effective_tier.into());
-            state.admit_share_value_text(&request_context,final_model.as_deref().unwrap_or(""),effective_tier,
-                value_text_capable && crate::domain::usage::value_pricing::is_metered_text_payload(&adapter_request.body))
-            .await.map_err(|error| {
-                let message=error.to_string();
-                ProxyError{status:if message.contains("EXHAUSTED"){StatusCode::TOO_MANY_REQUESTS}else{StatusCode::SERVICE_UNAVAILABLE},
-                    message:if message.contains("EXHAUSTED"){"value_quota_exhausted: API-equivalent usage limit reached".into()}
-                        else if message.contains("price_unavailable"){"price_unavailable: no verified tariff for this execution model/tier".into()}
-                        else {"quota_unavailable: USD-equivalent metering is not ready or needs recovery".into()}}
-            })?;
+        // Tier handling is value-quota only: the raw tier stays raw in the
+        // context/usage log, and one shared function canonicalizes it.
+        let value_facts = value_metering.then(|| {
+            crate::domain::usage::value_pricing::value_request_facts(&adapter_request.body)
+        });
+        if let Some(facts) = &value_facts {
+            if request_context.effective_service_tier.is_none() {
+                request_context.effective_service_tier = facts.service_tier.clone();
+            }
         }
+        let mut value_attempt_guard = state
+            .admit_share_value_text(
+                &request_context,
+                final_model.as_deref().unwrap_or(""),
+                crate::domain::usage::value_pricing::canonical_service_tier(
+                    request_context.effective_service_tier.as_deref(),
+                ),
+                value_facts
+                    .as_ref()
+                    .map(|facts| facts.estimate)
+                    .unwrap_or_default(),
+                value_text_capable && value_facts.as_ref().is_some_and(|facts| facts.metered_text),
+            )
+            .await
+            .map_err(value_quota_proxy_error)?;
         let request = build_upstream_post_request(
             &http_client,
             &url,
@@ -3235,6 +3236,9 @@ async fn forward_with_attempt_inner(
                 .map(|timing| timing.wait(WaitKind::Headers));
             request.send().await
         };
+        if let Some(guard) = &value_attempt_guard {
+            guard.mark_sent();
+        }
         let upstream_result = if adapter_request.upstream_stream_requested {
             match execution.stream_first_byte_timeout() {
                 Some(timeout) => match tokio::time::timeout_at(
@@ -3247,7 +3251,7 @@ async fn forward_with_attempt_inner(
                     Err(_) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if let Some(next_attempt) = next_claude_transport_attempt(
+                        if let Some(mut next_attempt) = next_claude_transport_attempt(
                             &state,
                             route,
                             &headers,
@@ -3258,6 +3262,10 @@ async fn forward_with_attempt_inner(
                         )
                         .await
                         {
+                            // Sent without an answer: outcome unknown, so a
+                            // USD user is not re-admitted; settle first anyway.
+                            next_attempt.value_previous_attempt_free =
+                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
@@ -3289,7 +3297,14 @@ async fn forward_with_attempt_inner(
                 if route == ProxyRoute::ClaudeCountTokens {
                     crate::metrics::record_claude_count_tokens_outcome("network_error");
                 }
-                if let Some(next_attempt) = next_claude_transport_attempt(
+                // A connect failure never wrote the request: that attempt
+                // settles at $0 and a USD user may take the transport retry.
+                if error.is_connect() {
+                    if let Some(guard) = &value_attempt_guard {
+                        guard.mark_not_sent();
+                    }
+                }
+                if let Some(mut next_attempt) = next_claude_transport_attempt(
                     &state,
                     route,
                     &headers,
@@ -3304,6 +3319,10 @@ async fn forward_with_attempt_inner(
                 )
                 .await
                 {
+                    // Settle synchronously: the retry's admission must not
+                    // count this attempt's row as in flight.
+                    next_attempt.value_previous_attempt_free =
+                        settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
@@ -3313,6 +3332,9 @@ async fn forward_with_attempt_inner(
             }
         };
         let mut status = upstream.status();
+        if let Some(guard) = &value_attempt_guard {
+            guard.mark_upstream_status(status.as_u16());
+        }
         let mut status_code = status.as_u16();
         let mut response_headers = upstream.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
@@ -4676,9 +4698,19 @@ async fn forward_with_attempt_inner(
                         let sse_error_outcome = sse_error
                             .as_ref()
                             .and_then(|error| claude_sse_error_outcome(&error.error_type));
+                        // An upstream error event (or a protocol failure)
+                        // before any business output: the USD attempt is an
+                        // upstream error ($0 unless usage is logged).
+                        if (sse_error.is_some() || semantic_protocol_error.is_some())
+                            && !pending_chunk_saw_business_output
+                        {
+                            if let Some(guard) = &value_attempt_guard {
+                                guard.mark_upstream_error();
+                            }
+                        }
                         if let Some(outcome) = sse_error_outcome {
                             record_provider_outcome(&state, &stored, outcome).await;
-                            if let Some(next_attempt) = next_claude_transport_attempt(
+                            if let Some(mut next_attempt) = next_claude_transport_attempt(
                                 &state,
                                 route,
                                 &headers,
@@ -4689,6 +4721,9 @@ async fn forward_with_attempt_inner(
                             )
                             .await
                             {
+                                next_attempt.value_previous_attempt_free =
+                                    settle_value_attempt_before_retry(&mut value_attempt_guard)
+                                        .await;
                                 attempt_context = next_attempt;
                                 drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
@@ -4707,12 +4742,17 @@ async fn forward_with_attempt_inner(
                                             next_stage.as_header_value(),
                                             "sse_error",
                                         );
-                                        if let Some(next_attempt) = attempt_context.next(
+                                        if let Some(mut next_attempt) = attempt_context.next(
                                             &execution,
                                             Some(next_stage),
                                             "body",
                                             next_stage.as_header_value(),
                                         ) {
+                                            next_attempt.value_previous_attempt_free =
+                                                settle_value_attempt_before_retry(
+                                                    &mut value_attempt_guard,
+                                                )
+                                                .await;
                                             attempt_context = next_attempt;
                                             drop(account_in_flight_guard);
                                             drop(share_invocation_guard);
@@ -4736,13 +4776,18 @@ async fn forward_with_attempt_inner(
                             | Some(SemanticObservation::ErrorFrame(failure)) => Some(failure),
                             _ => None,
                         } {
+                            if !pending_chunk_saw_business_output {
+                                if let Some(guard) = &value_attempt_guard {
+                                    guard.mark_upstream_error();
+                                }
+                            }
                             if !pending_chunk_saw_business_output
                                 && super::overflow_compact::is_context_length_failure(
                                     &failure.code,
                                     &failure.message,
                                 )
                             {
-                                if let Some(next_attempt) = next_codex_overflow_attempt(
+                                if let Some(mut next_attempt) = next_codex_overflow_attempt(
                                     &state,
                                     route,
                                     &execution,
@@ -4756,6 +4801,9 @@ async fn forward_with_attempt_inner(
                                 )
                                 .await
                                 {
+                                    next_attempt.value_previous_attempt_free =
+                                        settle_value_attempt_before_retry(&mut value_attempt_guard)
+                                            .await;
                                     attempt_context = next_attempt;
                                     drop(inner);
                                     drop(account_in_flight_guard);
@@ -4802,7 +4850,7 @@ async fn forward_with_attempt_inner(
                                     if !pending_chunk_saw_business_output
                                         && !openai_stream_bytes_start_client_output(&chunk)
                                     {
-                                        if let Some(next_attempt) =
+                                        if let Some(mut next_attempt) =
                                             next_codex_capacity_retry_attempt(
                                                 route,
                                                 &attempt_context,
@@ -4810,6 +4858,11 @@ async fn forward_with_attempt_inner(
                                                 failure,
                                             )
                                         {
+                                            next_attempt.value_previous_attempt_free =
+                                                settle_value_attempt_before_retry(
+                                                    &mut value_attempt_guard,
+                                                )
+                                                .await;
                                             attempt_context = next_attempt;
                                             drop(inner);
                                             drop(account_in_flight_guard);
@@ -4854,6 +4907,11 @@ async fn forward_with_attempt_inner(
                     }
                     Ok(None) => {
                         if let Some(error) = semantic_protocol_error {
+                            if !pending_chunk_saw_business_output {
+                                if let Some(guard) = &value_attempt_guard {
+                                    guard.mark_upstream_error();
+                                }
+                            }
                             record_provider_outcome(
                                 &state,
                                 &stored,
@@ -4864,9 +4922,16 @@ async fn forward_with_attempt_inner(
                         }
                     }
                     Err(error) => {
+                        // Nothing reached the client; without business
+                        // output the USD attempt is an upstream error.
+                        if !pending_chunk_saw_business_output {
+                            if let Some(guard) = &value_attempt_guard {
+                                guard.mark_upstream_error();
+                            }
+                        }
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if let Some(next_attempt) = next_claude_transport_attempt(
+                        if let Some(mut next_attempt) = next_claude_transport_attempt(
                             &state,
                             route,
                             &headers,
@@ -4877,6 +4942,8 @@ async fn forward_with_attempt_inner(
                         )
                         .await
                         {
+                            next_attempt.value_previous_attempt_free =
+                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
@@ -25179,6 +25246,67 @@ async fn revalidate_execution_before_account_lease(
     Ok(accounts)
 }
 
+/// Settles a USD attempt before a retry and awaits it, so the retry's
+/// admission never counts this attempt as in flight (`VALUE_QUOTA_BUSY`
+/// race) or keeps its reservation. Returns whether the retry may be admitted
+/// for a USD user: the attempt settled at $0 (never sent, or upstream failed
+/// before producing output). Without a guard (no USD metering) it is false.
+async fn settle_value_attempt_before_retry(
+    guard: &mut Option<crate::state::ValueAttemptGuard>,
+) -> bool {
+    match guard.take() {
+        Some(guard) => guard.settle_now().await,
+        None => false,
+    }
+}
+
+/// Typed USD-equivalent admission errors to stable wire codes.
+fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
+    use crate::domain::usage::value_pricing::{
+        ValueError, ValueQuotaRejection, ValueQuotaRejectionKind,
+    };
+    if let Some(rejection) = error.downcast_ref::<ValueQuotaRejection>() {
+        return match rejection.kind {
+            ValueQuotaRejectionKind::Exhausted => ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: match rejection
+                    .resets_at_ms
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                {
+                    Some(reset) => format!(
+                        "value_quota_exhausted: API-equivalent usage limit reached; resets at {}",
+                        reset.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    ),
+                    None => "value_quota_exhausted: API-equivalent usage limit reached".into(),
+                },
+            },
+            ValueQuotaRejectionKind::Busy => ProxyError::value_quota_busy(),
+            ValueQuotaRejectionKind::AuthorizationRevoked => ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: "Share authorization was revoked".into(),
+            },
+            ValueQuotaRejectionKind::StorageBusy => ProxyError::quota_storage_busy(),
+            ValueQuotaRejectionKind::Blocked => ProxyError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message:
+                    "quota_unavailable: this USD-equivalent quota window awaits owner reconcile"
+                        .into(),
+            },
+        };
+    }
+    if error.downcast_ref::<ValueError>() == Some(&ValueError::PriceUnavailable) {
+        return ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "price_unavailable: no verified tariff for this execution model/tier".into(),
+        };
+    }
+    tracing::debug!(%error, "USD-equivalent admission unavailable");
+    ProxyError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "quota_unavailable: USD-equivalent metering is not ready or needs recovery".into(),
+    }
+}
+
 fn share_rejection_to_proxy_error(rejection: ShareInvocationRejection) -> ProxyError {
     if let Some(concurrency) = rejection.concurrency {
         let scope = match rejection.reason {
@@ -26935,6 +27063,7 @@ impl ResponsesImageJsonLifecycleGuard {
                 parse_error,
                 usage_estimated: false,
                 response_model: ResponseModelEvidence::default(),
+                streamed_text_bytes: 0,
             },
             Some(stream_status),
         )

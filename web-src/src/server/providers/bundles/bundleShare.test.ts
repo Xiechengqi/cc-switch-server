@@ -23,6 +23,7 @@ import {
   deleteBundleShare,
   enableBundleShare,
   isValidShareSlug,
+  MalformedValueQuotaGrantError,
   saveBundleShare,
   shareForBundle,
   toggleBundleShare,
@@ -71,6 +72,49 @@ describe("Provider Bundle sharing", () => {
     expect(changedBundleUserGrants(previous, refreshed)).toBeUndefined();
     refreshed["u@example.com"].policy.tokenLimit = 200;
     expect(changedBundleUserGrants(previous, refreshed)?.["u@example.com"].policy?.tokenLimit).toBe(200);
+  });
+  describe("USD-equivalent edits", () => {
+    const email = "u@example.com";
+    const usd = (micros: string) => ({ limitUsdMicros: micros, tariffPolicyId: "api-equivalent-v1" as const });
+    const grants = (policy: NonNullable<ShareRecord["userGrants"]>[string]["policy"],
+      extra: Partial<NonNullable<ShareRecord["userGrants"]>[string]> = {}): NonNullable<ShareRecord["userGrants"]> =>
+      ({ [email]: { email, role: "shareto", active: true, revision: 5, policy, ...extra } });
+
+    it("sends Tokens unlimited → US$10", () => {
+      const edits = changedBundleUserGrants(grants({ tokenPeriod: "day" }), grants({ tokenPeriod: "day", valueQuota: usd("10000000") }));
+      expect(edits).toEqual({ [email]: { expectedRevision: 5, policy: { tokenPeriod: "day", valueQuota: usd("10000000") } } });
+    });
+    it("sends US$10 → US$20", () => {
+      const edits = changedBundleUserGrants(grants({ tokenPeriod: "day", valueQuota: usd("10000000") }),
+        grants({ tokenPeriod: "day", valueQuota: usd("20000000") }));
+      expect(edits?.[email].policy?.valueQuota).toEqual(usd("20000000"));
+    });
+    it("sends US$10 → Tokens unlimited", () => {
+      const edits = changedBundleUserGrants(grants({ tokenPeriod: "day", valueQuota: usd("10000000") }), grants({ tokenPeriod: "day" }));
+      expect(edits).toEqual({ [email]: { expectedRevision: 5, policy: { tokenPeriod: "day" } } });
+    });
+    it("treats a dropped schedule as a change and an untouched schedule as none", () => {
+      const pending = { policy: { tokenPeriod: "day" as const, valueQuota: usd("10000000") }, effectiveFromMs: 9, retainAccess: true };
+      const baseline = grants({ tokenPeriod: "day", tokenLimit: 100 }, { pendingValueQuota: pending });
+      expect(changedBundleUserGrants(baseline, structuredClone(baseline))).toBeUndefined();
+      const cancelled = grants({ tokenPeriod: "day", tokenLimit: 100 });
+      expect(changedBundleUserGrants(baseline, cancelled)).toEqual({ [email]: { expectedRevision: 5, policy: { tokenPeriod: "day", tokenLimit: 100 } } });
+    });
+    it("refuses to re-send a grant whose USD fields could not be read, but allows revoking it", () => {
+      const baseline = grants({ tokenPeriod: "day", valueQuota: { limitUsdMicros: "01" } as never }, { valueQuotaMalformed: true });
+      expect(changedBundleUserGrants(baseline, structuredClone(baseline))).toBeUndefined();
+      const edited = grants({ tokenPeriod: "day", parallelLimit: 2, valueQuota: { limitUsdMicros: "01" } as never }, { valueQuotaMalformed: true });
+      expect(() => changedBundleUserGrants(baseline, edited)).toThrow(MalformedValueQuotaGrantError);
+      expect(changedBundleUserGrants(baseline, {})).toEqual({ [email]: { expectedRevision: 5, policy: null } });
+    });
+    it("does not save a usage edit for a grant whose USD fields could not be read", async () => {
+      const existing = share({ codex: "bundle-1" });
+      existing.userGrants = grants({ tokenPeriod: "day" }, { pendingValueQuota: "broken" as never, valueQuotaMalformed: true });
+      const draft = createBundleShareDraft(existing);
+      draft.userUsageEdits = { [email]: { action: "clear" } };
+      await expect(saveBundleShare("bundle-1", draft, existing)).rejects.toThrow(MalformedValueQuotaGrantError);
+      expect(shareApiMock.saveProviderBundleShare).not.toHaveBeenCalled();
+    });
   });
   it("freezes the draft revision and exact expiry while sending only changed users", async () => {
     const existing = share({ codex: "bundle-1" }, 7, "2090-10-26T12:34:56Z");

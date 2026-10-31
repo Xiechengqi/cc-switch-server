@@ -75,6 +75,7 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::state::spawn_router_share_log_sync_worker(state.clone());
     cc_switch_server::state::spawn_periodic_backups(state.clone());
     cc_switch_server::state::spawn_periodic_share_sync_retry(state.clone());
+    cc_switch_server::state::spawn_value_quota_sweeper(state.clone());
     cc_switch_server::state::spawn_auto_upgrade_scheduler(state.clone());
     cc_switch_server::state::spawn_periodic_installation_status_report(state.clone());
     cc_switch_server::state::spawn_installation_upgrade_task_reporter(state.clone());

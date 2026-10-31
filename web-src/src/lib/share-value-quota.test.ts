@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview } from "./share-value-quota";
-import { applyShareUserPolicyBatch } from "../components/providers/share-user-policy-batch";
-import { normalizeShareRecord } from "../utils/shareRecordNormalize";
+import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
+  parseValueLimitInput, valueLimitLabel, valueRowKind, valuePreviewNeedsConfirmation, valuePreviewBlocker, valueErrorMessage, valueRequestError, ValueQuotaResponseError,
+  splitValueRows, mergeValueRows, valueStatusReason } from "./share-value-quota";
+import { applyShareUserPolicyBatch, patchedSharePolicy } from "../components/providers/share-user-policy-batch";
+import { stageGrantPolicy } from "../utils/shareFormUtils";
+import { normalizeShareRecord, normalizeShareRecords } from "../utils/shareRecordNormalize";
+import { HttpResponseError } from "./runtime";
 import type { ShareUserGrant } from "./api/share";
 
 describe("Share USD-equivalent quotas", () => {
@@ -22,15 +26,24 @@ describe("Share USD-equivalent quotas", () => {
     expect(parseValueLimit("0.000001")).toBe("1");
     expect(parseValueLimit("1000000000")).toBe("1000000000000000");
     expect(valueLimitInput("12345678")).toBe("12.345678");
-    for(const bad of ["0","01","1.",".1","1e6","-1"," 1","1.0000001","1000000000.000001"]) expect(parseValueLimit(bad)).toBeUndefined();
+    for(const [input,micros] of [["$10.00","10000000"],[" 10","10000000"],[".5","500000"],["05","5000000"],["1,000","1000000000"],["US$ 1,250.5","1250500000"],["10.","10000000"]])
+      expect(parseValueLimit(input),input).toBe(micros);
+    for(const [input,error] of [["","empty"],["$","empty"],["0","too_small"],["1.0000001","too_many_decimals"],["1000000000.000001","too_large"],
+      ["1e6","format"],["-1","format"],["1,00","format"],[".","format"],["1 000","format"]] as const) expect(parseValueLimitInput(input),input).toEqual({ok:false,error});
+    expect(valueLimitLabel("10000000")).toBe("US$10");
+    expect(valueLimitLabel("1000500000")).toBe("US$1,000.50");
+    expect(valueUsageLabel("1500000000000")).toBe("US$1.50");
+    expect(valueUsageLabel("1234000000000000")).toBe("US$1,234.00");
+    expect(parseValueUsage("$1,000.5")).toBe("1000500000000000");
     expect(parseValueUsage("0")).toBe("0");
     expect(parseValueUsage("0.000000000001")).toBe("1");
     expect(parseValueUsage("1.0000000000001")).toBeUndefined();
     expect(valueUsageLabel("1")).toBe("< US$0.000001");
     expect(valueUsageLabel("18000000000")).toBe("US$0.018");
     expect(valueUsageLabel(undefined)).toBe("—");
-    expect(valueQuotaAvailability("999999999999","1000000")).toEqual({remainingPicos:"1",exhausted:false});
-    expect(valueQuotaAvailability("1000000000001","1000000")).toEqual({remainingPicos:"0",exhausted:true});
+    expect(valueQuotaAvailability("999999999999","1000000")).toEqual({remainingPicos:"1",exhausted:false,nearLimit:true,percent:99.99});
+    expect(valueQuotaAvailability("1000000000001","1000000")).toEqual({remainingPicos:"0",exhausted:true,nearLimit:true,percent:100});
+    expect(valueQuotaAvailability("700000000000","1000000")?.nearLimit).toBe(false);
     expect(valueQuotaAvailability(undefined,"1000000")).toBeUndefined();
   });
   const quota={limitUsdMicros:"1000000",tariffPolicyId:"api-equivalent-v1" as const};
@@ -50,15 +63,59 @@ describe("Share USD-equivalent quotas", () => {
     expect(dollars[grant.email].policy.tokenLimit).toBeUndefined();
     expect(one[grant.email].policy.tokenLimit).toBe(100);
   });
+  it("drops a waiting USD policy only when the owner stages a different policy", () => {
+    const kept=stageGrantPolicy(grant,{...grant.pendingValueQuota!.policy});
+    expect(kept.pendingValueQuota).toBe(grant.pendingValueQuota);
+    expect(kept.policy).toBe(grant.policy);
+    const tokens=stageGrantPolicy(grant,{tokenLimit:300,tokenPeriod:"day"});
+    expect(tokens.pendingValueQuota).toBeUndefined();
+    expect(tokens.policy).toEqual({tokenLimit:300,tokenPeriod:"day"});
+    expect(tokens.valueMetering).toEqual(binding);
+    const batch=applyShareUserPolicyBatch({[grant.email]:grant},new Set([grant.email]),{tokenLimit:{value:7,period:"day"}});
+    expect(batch[grant.email].pendingValueQuota).toBeUndefined();
+    expect(patchedSharePolicy(grant,{expiresAt:{value:5}})).toEqual({...grant.pendingValueQuota!.policy,expiresAt:5});
+    const broken={...grant,valueQuotaMalformed:true};
+    expect(applyShareUserPolicyBatch({[grant.email]:broken},new Set([grant.email]),{parallelLimit:{value:2}})[grant.email]).toBe(broken);
+  });
+  it("keeps correction refusals apart from status rows and merges rows per user", () => {
+    const row={email:"User@Example.Test",usedPicos:"1",meteringStatus:"observed"} as ValueStatus;
+    const {rows,errors}=splitValueRows([row,{email:"b@example.test",error:{code:"quota_target_invalid"}},null]);
+    expect(rows.map(item=>item.email)).toEqual(["user@example.test"]);
+    expect(errors).toEqual([{email:"b@example.test",code:"quota_target_invalid"}]);
+    const other={...row,email:"other@example.test"};
+    expect(mergeValueRows([other,{...row,email:"user@example.test",usedPicos:"0"}],rows)).toEqual([other,rows[0]]);
+    expect(valueErrorMessage({code:"value_quota_not_active"})).toEqual({key:"share.userLimit.valueQuota.error.notActive"});
+    expect(valueStatusReason({...row,reasonCode:"pricing_unavailable"})).toBeUndefined();
+    expect(valueStatusReason({...row,meteringStatus:"unavailable",reasonCode:"pricing_unavailable"})).toEqual({key:"share.userLimit.valueQuota.reasonCode.pricing_unavailable"});
+    expect(valueStatusReason({...row,meteringStatus:"unavailable",reasonCode:"coverage_gap"})).toEqual({raw:"coverage_gap"});
+    const preview:ValuePreview={ready:false,configRevision:3,rows:[],invalidRows:[{email:"a@example.test",reasonCode:"invalid_policy"}]};
+    expect(isValuePreview(preview,3)).toBe(true);
+    expect(isValuePreview({...preview,invalidRows:[{}]},3)).toBe(false);
+    expect(valuePreviewBlocker(preview)).toEqual({email:"a@example.test",message:{key:"share.userLimit.valueQuota.reasonCode.invalid_policy"}});
+  });
   it("normalizes monetary evidence without converting or accepting malformed limits", () => {
     const raw={id:"share",userGrants:{[grant.email]:grant}};
     const read=normalizeShareRecord(raw)!;
     expect(read.userGrants?.[grant.email].valueMetering).toEqual(binding);
     expect(read.userGrants?.[grant.email].pendingValueQuota).toEqual(grant.pendingValueQuota);
     for(const limit of [1,"0","01","1000000000000001"]) {
-      expect(()=>normalizeShareRecord({id:"share",userGrants:{[grant.email]:{...grant,
-        policy:{valueQuota:{...quota,limitUsdMicros:limit},tokenPeriod:"day"}}}})).toThrow();
+      const tolerant=normalizeShareRecord({id:"share",userGrants:{[grant.email]:{...grant,
+        policy:{valueQuota:{...quota,limitUsdMicros:limit},tokenPeriod:"day"}}}})!;
+      // Kept exactly as received and flagged, never read as "no USD quota".
+      expect(tolerant.userGrants?.[grant.email].policy.valueQuota).toEqual({...quota,limitUsdMicros:limit});
+      expect(tolerant.userGrants?.[grant.email].valueQuotaMalformed).toBe(true);
+      expect(tolerant.userGrants?.[grant.email].valueMetering).toEqual(binding);
     }
+    const snake=normalizeShareRecord({id:"share",userGrants:{[grant.email]:{...grant,pendingValueQuota:undefined,
+      pending_value_quota:{policy:{value_quota:{limit_usd_micros:"1000000",tariff_policy_id:"api-equivalent-v1"},token_period:"week"},effective_from_ms:9,retain_access:false}}}})!;
+    expect(snake.userGrants?.[grant.email].pendingValueQuota).toEqual({policy:{valueQuota:quota,tokenPeriod:"week"},effectiveFromMs:9,retainAccess:false});
+    const list=normalizeShareRecords([{id:"a",userGrants:{[grant.email]:{...grant,valueMetering:{broken:true},pendingValueQuota:{policy:null}}}},{id:"b"}]);
+    expect(list.map(item=>item.id)).toEqual(["a","b"]);
+    expect(list[0].userGrants?.[grant.email].valueMetering).toEqual({broken:true});
+    expect(list[0].userGrants?.[grant.email].pendingValueQuota).toEqual({policy:null});
+    expect(list[0].userGrants?.[grant.email].valueQuotaMalformed).toBe(true);
+    expect(read.userGrants?.[grant.email].valueQuotaMalformed).toBeUndefined();
+    expect(snake.userGrants?.[grant.email].valueQuotaMalformed).toBeUndefined();
   });
   it("labels missing, stale and uncertain evidence without implying zero", () => {
     const status={meteringStatus:"pending",syncedAtMs:1} as ValueStatus;
@@ -74,5 +131,30 @@ describe("Share USD-equivalent quotas", () => {
     expect(matchingValueStatus([status],{...active,active:false})).toBeUndefined();
     expect(matchingValueStatus([status],{...active,email:"other@example.test"})).toBeUndefined();
     expect(matchingValueStatus([status],{...active,policy:{valueQuota:{...quota,limitUsdMicros:"2000000"},tokenPeriod:"day"}})).toBeUndefined();
+  });
+  it("classifies previews by reason code and asks to confirm only a later start or carried usage",()=>{
+    const row={email:"a@example.test",effectiveFromMs:10000,meteredFromMs:10000,usedPicos:"0"};
+    expect(valueRowKind({...row,reasonCode:"scheduled_next_window"},0)).toBe("scheduled");
+    expect(valueRowKind({...row,reasonCode:"metered_from_now"},0)).toBe("fromNow");
+    expect(valueRowKind({...row,reasonCode:"invalid_policy"},0)).toBe("blocked");
+    expect(valueRowKind({...row,reasonCode:"ready",ready:false},0)).toBe("blocked");
+    expect(valueRowKind(row,0)).toBe("scheduled");
+    const preview:ValuePreview={ready:true,configRevision:1,rows:[{...row,reasonCode:"metered_from_now"}]};
+    expect(valuePreviewNeedsConfirmation(preview,0)).toBe(false);
+    expect(valuePreviewNeedsConfirmation({...preview,rows:[{...row,reasonCode:"ready",usedPicos:"3"}]},0)).toBe(true);
+    expect(valuePreviewBlocker({...preview,ready:false,rows:[{...row,reasonCode:"blocked_needs_reconcile"}]},0))
+      .toEqual({email:row.email,message:{key:"share.userLimit.valueQuota.reasonCode.blocked_needs_reconcile"}});
+    expect(valuePreviewBlocker({...preview,ready:false,rows:[],reason:"Unknown server text"},0)?.message).toEqual({raw:"Unknown server text"});
+  });
+  it("maps request failures to the same readiness distinctions as the Router",()=>{
+    expect(valueRequestError(new HttpResponseError("x",409,{code:"quota_revision_conflict"}))).toBe("conflict");
+    expect(valueRequestError(new HttpResponseError("x",401))).toBe("controlAuth");
+    expect(valueRequestError(new HttpResponseError("x",404))).toBe("upgrade");
+    expect(valueRequestError(new HttpResponseError("x",504))).toBe("timeout");
+    expect(valueRequestError(new TypeError("Failed to fetch"))).toBe("offline");
+    expect(valueRequestError(new ValueQuotaResponseError())).toBe("invalidResponse");
+    expect(valueRequestError(new Error("boom"))).toBe("failed");
+    expect(valueErrorMessage(new HttpResponseError("x",400,{code:"quota_target_invalid"}))).toEqual({key:"share.userLimit.valueQuota.error.targetInvalid"});
+    expect(valueStateKey({meteringStatus:"blocked",syncedAtMs:1} as ValueStatus,2)).toBe("share.userLimit.valueQuota.state.blocked");
   });
 });

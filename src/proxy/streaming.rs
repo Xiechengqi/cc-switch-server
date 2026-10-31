@@ -57,6 +57,7 @@ pub struct StreamUsageAccumulator {
     parse_error: bool,
     usage_estimated: bool,
     response_model: ResponseModelEvidence,
+    streamed_text_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,8 @@ pub struct StreamUsageResult {
     pub parse_error: bool,
     pub usage_estimated: bool,
     pub response_model: ResponseModelEvidence,
+    /// UTF-8 bytes of generated text deltas (text, thinking, tool arguments).
+    pub streamed_text_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -491,6 +494,7 @@ impl StreamUsageAccumulator {
             parse_error: false,
             usage_estimated: false,
             response_model: ResponseModelEvidence::default(),
+            streamed_text_bytes: 0,
         }
     }
 
@@ -536,11 +540,15 @@ impl StreamUsageAccumulator {
             parse_error: self.parse_error,
             usage_estimated: self.usage_estimated,
             response_model: self.response_model,
+            streamed_text_bytes: self.streamed_text_bytes,
         }
     }
 
     fn merge_events(&mut self, events: Vec<JsonStreamEvent>) {
         for event in events {
+            self.streamed_text_bytes = self
+                .streamed_text_bytes
+                .saturating_add(generated_text_bytes(&event.value));
             self.response_model.observe(&event.value);
             merge_usage(
                 &mut self.usage,
@@ -1033,6 +1041,51 @@ fn stream_terminal_error(value: &Value) -> ResponsesSseAggregationError {
     )
 }
 
+/// UTF-8 bytes of generated text carried by one stream event, across the
+/// Anthropic, Chat Completions, Responses and Gemini stream shapes.
+fn generated_text_bytes(event: &Value) -> u64 {
+    fn len(value: Option<&Value>) -> u64 {
+        value
+            .and_then(Value::as_str)
+            .map_or(0, |text| u64::try_from(text.len()).unwrap_or(u64::MAX))
+    }
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut total = 0u64;
+    if kind == "content_block_delta" {
+        if let Some(delta) = event.get("delta") {
+            for key in ["text", "thinking", "partial_json"] {
+                total = total.saturating_add(len(delta.get(key)));
+            }
+        }
+    } else if kind.ends_with(".delta") {
+        total = total.saturating_add(len(event.get("delta")));
+    }
+    if let Some(choices) = event.get("choices").and_then(Value::as_array) {
+        for delta in choices.iter().filter_map(|choice| choice.get("delta")) {
+            for key in ["content", "reasoning_content", "reasoning"] {
+                total = total.saturating_add(len(delta.get(key)));
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    total = total.saturating_add(len(call.pointer("/function/arguments")));
+                }
+            }
+        }
+    }
+    if let Some(candidates) = event.get("candidates").and_then(Value::as_array) {
+        for parts in candidates
+            .iter()
+            .filter_map(|candidate| candidate.pointer("/content/parts"))
+            .filter_map(Value::as_array)
+        {
+            for part in parts {
+                total = total.saturating_add(len(part.get("text")));
+            }
+        }
+    }
+    total
+}
+
 fn merge_usage(target: &mut TokenUsage, next: TokenUsage, input_semantics: InputTokenSemantics) {
     let next_has_raw_input = next.raw_input_tokens.is_some();
     let next_has_input = next.input_tokens.is_some();
@@ -1295,6 +1348,23 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_read_
         assert_eq!(result.usage.output_tokens, Some(5));
         assert_eq!(result.usage.raw_input_tokens, Some(7));
         assert_eq!(result.usage.total_tokens, Some(12));
+    }
+
+    #[test]
+    fn stream_accumulator_counts_generated_text_bytes_across_protocols() {
+        let mut parser = StreamUsageAccumulator::new(InputTokenSemantics::Exclusive);
+        parser.push(concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"abc\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hey\",\"tool_calls\":[{\"function\":{\"arguments\":\"{1}\"}}]}}]}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"four\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gem\"}]}}]}\n\n",
+        ).as_bytes());
+        assert_eq!(
+            parser.finish_with_status().streamed_text_bytes,
+            5 + 3 + 2 + 3 + 3 + 4 + 3
+        );
     }
 
     #[test]

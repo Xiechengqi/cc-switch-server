@@ -61,7 +61,7 @@ pub(crate) async fn control_preview_value_quota(
         )
         .await
         .map(Json)
-        .map_err(ApiError::value_quota)
+        .map_err(ApiError::value_quota_preview)
 }
 pub(crate) async fn control_edit_value_usage(
     State(state): State<ServerState>,
@@ -86,9 +86,9 @@ pub(crate) async fn control_edit_value_usage(
             &input.actor,
         )
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::value_usage_edit)?;
     Ok(Json(
-        serde_json::json!({"ok":true,"items":state.value_quota_statuses(&input.share_id).await.map_err(ApiError::internal)?}),
+        serde_json::json!({"ok":true,"items":state.value_quota_edit_statuses(&input.share_id).await.map_err(ApiError::value_quota)?}),
     ))
 }
 

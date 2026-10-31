@@ -311,20 +311,15 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     let status = ledger::status(&state.config_dir, &scope, &window).unwrap();
                     let label =
                     format!("{profile} {app:?} {route:?} streaming={streaming} mismatch={mismatched_model}");
-                    assert_eq!(
-                        status.observed_picos,
-                        if mismatched_model { "0" } else { "18000000000" },
-                        "{label}"
-                    );
-                    assert_eq!(
-                        status.pending_risk_picos,
-                        if mismatched_model { "100000000" } else { "0" },
-                        "{label}"
-                    );
+                    // A model-evidence mismatch is outcome-unknown: the observed
+                    // usage (or the reserved risk, whichever is higher) is charged
+                    // conservatively instead of blocking the window.
+                    assert_eq!(status.observed_picos, "18000000000", "{label}");
+                    assert_eq!(status.pending_risk_picos, "0", "{label}");
                     assert_eq!(
                         status.metering_status,
                         if mismatched_model {
-                            "unavailable"
+                            "conservative"
                         } else {
                             "observed"
                         },
@@ -341,15 +336,8 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     )
                     .await
                     .unwrap_err();
-                    assert_eq!(
-                        error.error_code(),
-                        if mismatched_model {
-                            "quota_unavailable"
-                        } else {
-                            "value_quota_exhausted"
-                        },
-                        "{label}"
-                    );
+                    assert_eq!(error.error_code(), "value_quota_exhausted", "{label}");
+                    assert_eq!(error.status, StatusCode::FORBIDDEN, "{label}");
                     assert!(!error.retryable());
                     assert_eq!(calls.load(Ordering::SeqCst), 1);
 

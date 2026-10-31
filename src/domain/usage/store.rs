@@ -376,6 +376,11 @@ pub struct UsageLog {
     pub usage_revision: u64,
     #[serde(default)]
     pub usage_estimated: bool,
+    /// UTF-8 bytes of generated text streamed so far (text, thinking, tool
+    /// arguments). Local-only evidence for settling interrupted USD-quota
+    /// streams; never exported to the Router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_streamed_text_bytes: Option<u64>,
     #[serde(default)]
     pub share_name: Option<String>,
     #[serde(default)]
@@ -1121,6 +1126,7 @@ impl UsageLog {
             },
             usage_revision: 1,
             usage_estimated: false,
+            value_streamed_text_bytes: None,
             share_name: None,
             user_country: None,
             user_country_iso3: None,

@@ -972,6 +972,13 @@ impl RouterShareCapabilities {
     pub fn cache_creation_ttl(&self) -> bool {
         self.capabilities.iter().any(|c| c == "cacheCreationTtlV1")
     }
+    /// Explicit Router promise that the value-pricing fetch accepts
+    /// `{"knownRevision"}`; clears a remembered fallback to `{}`.
+    pub fn value_pricing_known_revision(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == "valuePricingKnownRevisionV1")
+    }
     pub fn value_quotas(&self) -> bool {
         self.share_contract_version >= 10
             && self
@@ -2342,8 +2349,61 @@ async fn push_share_descriptor_ops_request(
     }
 
     let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::CONFLICT {
+        if let Some(missing) = ValuePricingAckMissing::from_error_body(&body) {
+            return Err(missing.into());
+        }
+    }
     bail!("router strict Share descriptor sync failed: {status}: {body}");
 }
+
+/// Router 409 `value_pricing_ack_missing`: a USD grant's binding references
+/// pricing revisions this installation never acknowledged on the Router
+/// (e.g. after a Router DB restore). The Server re-sends the signed ACK for
+/// revisions it has installed locally and retries the sync once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValuePricingAckMissing {
+    pub revisions: Vec<String>,
+}
+
+impl ValuePricingAckMissing {
+    pub const CODE: &'static str = "value_pricing_ack_missing";
+
+    pub fn from_error_body(body: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        if value.get("code").and_then(serde_json::Value::as_str) != Some(Self::CODE) {
+            return None;
+        }
+        let mut revisions = value
+            .pointer("/details/revisions")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|revision| !revision.is_empty() && revision.len() <= 256)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        revisions.sort();
+        revisions.dedup();
+        Some(Self { revisions })
+    }
+}
+
+impl std::fmt::Display for ValuePricingAckMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "router Share descriptor sync rejected: {} for revisions [{}]",
+            Self::CODE,
+            self.revisions.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ValuePricingAckMissing {}
 
 fn legacy_share_operations(mut ops: Vec<ShareSyncOperation>) -> Vec<ShareSyncOperation> {
     for operation in &mut ops {
@@ -2693,6 +2753,37 @@ fn normalize_lease_url_scheme(
         lease.tunnel_url = format!("https://{}", lease.tunnel_url.trim_start_matches("http://"));
     }
     lease
+}
+
+/// Canonical JSON for signed Router payloads: every object rebuilt with its
+/// keys sorted by byte order. This crate enables serde_json `preserve_order`,
+/// so a struct would otherwise be signed in field order while the Router
+/// verifies a sorted-key re-serialization.
+pub fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json_value(value)))
+                .collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical_json_value).collect())
+        }
+        other => other,
+    }
+}
+
+/// Signs and sends the canonical form of `payload` (USD-equivalent quota
+/// pricing fetch/ACK and watermark endpoints).
+pub fn signed_canonical_request<T: Serialize>(
+    identity: &RouterIdentity,
+    action: &str,
+    payload: T,
+) -> anyhow::Result<SignedRequest<serde_json::Value>> {
+    let payload = serde_json::to_value(payload).context("serialize signed payload")?;
+    signed_request(identity, action, canonical_json_value(payload))
 }
 
 pub fn signed_request<T: Serialize>(
@@ -5005,5 +5096,36 @@ mod tests {
         verifying_key
             .verify(canonical.as_bytes(), &signature)
             .unwrap();
+    }
+
+    #[test]
+    fn value_pricing_ack_missing_conflict_body_is_typed() {
+        let missing = ValuePricingAckMissing::from_error_body(
+            r#"{"message":"acknowledge it and retry","code":"value_pricing_ack_missing","details":{"revisions":["sha256:b","sha256:a","sha256:a"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(missing.revisions, vec!["sha256:a", "sha256:b"]);
+        let error: anyhow::Error = missing.clone().into();
+        assert_eq!(
+            error.downcast_ref::<ValuePricingAckMissing>(),
+            Some(&missing)
+        );
+        assert!(ValuePricingAckMissing::from_error_body(
+            r#"{"message":"conflict","code":"share_descriptor_conflict"}"#
+        )
+        .is_none());
+        assert!(ValuePricingAckMissing::from_error_body("not json").is_none());
+    }
+
+    #[test]
+    fn value_quota_signed_payloads_are_canonical_sorted_json() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/share-value-signed-payload-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&canonical_json_value(fixture["payload"].clone())).unwrap(),
+            fixture["canonical"].as_str().unwrap()
+        );
     }
 }

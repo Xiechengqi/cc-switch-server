@@ -1,6 +1,7 @@
 import {
   shareApi,
   type ShareRecord,
+  type ShareUserGrant,
   type ShareUserGrantMap,
   type ShareUserPolicy,
   type ShareUserUsageEditMap,
@@ -8,6 +9,7 @@ import {
 import {
   buildShareUserGrants,
   normalizeShareEmails,
+  sharePolicyKey,
 } from "@/utils/shareFormUtils";
 import {
   getProviderSharePhase,
@@ -245,6 +247,14 @@ export async function saveBundleShare(
       allowedUsageEmails.has(email.trim().toLowerCase()),
     ),
   );
+  for (const email of Object.keys(userUsageEdits)) {
+    const grant = draft.userGrants[email.trim().toLowerCase()] ?? draft.userGrants[email];
+    if (grant?.valueQuotaMalformed) throw new MalformedValueQuotaGrantError(grant.email);
+  }
+  if (!draft.baseline) {
+    const flagged = Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.valueQuotaMalformed);
+    if (flagged) throw new MalformedValueQuotaGrantError(flagged.email);
+  }
   const bankedResetExpiryLeadMinutes = limitValue(
     draft.bankedResetExpiryLeadMinutes,
     60,
@@ -288,13 +298,36 @@ export async function saveBundleShare(
   });
 }
 
-/** Only policy/authorization intent goes over the wire, never live counters. */
+/**
+ * Enforced policy plus the scheduled one. Dropping a schedule (the editor does
+ * so when the owner stages a different policy) is a change even when the
+ * enforced policy itself is untouched.
+ */
+function grantPolicyKey(grant: ShareUserGrant) {
+  return JSON.stringify([sharePolicyKey(grant.policy),
+    grant.pendingValueQuota?.policy ? sharePolicyKey(grant.pendingValueQuota.policy) : null]);
+}
+
+export class MalformedValueQuotaGrantError extends Error {
+  readonly email: string;
+  constructor(email: string) {
+    super(i18n.t("share.userLimit.valueQuota.malformedSave", {
+      email,
+      defaultValue: "{{email}} has a USD quota this page can't read. Reload, or remove the user, before saving.",
+    }));
+    this.name = "MalformedValueQuotaGrantError";
+    this.email = email;
+  }
+}
+
+/**
+ * Only policy/authorization intent goes over the wire, never live counters.
+ * A grant whose USD fields could not be read may be revoked, but never
+ * re-sent as a policy: that policy would be rebuilt without the unreadable
+ * quota or schedule.
+ */
 export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: ShareUserGrantMap) {
   const changes: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }> = {};
-  const policyKey = (policy: ShareUserPolicy) => JSON.stringify([
-    policy.parallelLimit ?? null, policy.tokenLimit ?? null, policy.tokenPeriod ?? "lifetime",
-    policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null,
-  ]);
   for (const email of new Set([...Object.keys(baseline), ...Object.keys(draft)])) {
     const previous = baseline[email];
     const next = draft[email];
@@ -302,7 +335,10 @@ export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: Shar
         (next?.active !== false && next?.manager === "routerShareMarket")) continue;
     const wasActive = !!previous && previous.active !== false;
     const active = !!next && next.active !== false;
-    if (wasActive === active && (!active || policyKey(previous.policy) === policyKey(next.policy))) continue;
+    if (wasActive === active && (!active || grantPolicyKey(previous) === grantPolicyKey(next))) continue;
+    if (active && (previous?.valueQuotaMalformed || next.valueQuotaMalformed)) {
+      throw new MalformedValueQuotaGrantError(next.email || email);
+    }
     changes[email] = { expectedRevision: previous?.revision ?? 0, policy: active ? next.policy : null };
   }
   return Object.keys(changes).length ? changes : undefined;

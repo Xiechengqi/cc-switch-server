@@ -987,6 +987,23 @@ pub fn spawn_periodic_share_sync_retry(state: ServerState) {
     });
 }
 
+/// Settles USD-equivalent quota attempts left pending by a crash, a lost
+/// usage write or a stream that outlived every timeout. At startup it covers
+/// every attempt started before this process; afterwards anything older than
+/// the longest provider request timeout plus five minutes.
+pub fn spawn_value_quota_sweeper(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            if state.is_shutting_down() {
+                return;
+            }
+            let stale_before = state.value_quota_stale_before_ms(now_ms_i64()).await;
+            state.sweep_value_quota_attempts(stale_before).await;
+            sleep(Duration::from_secs(300)).await;
+        }
+    });
+}
+
 pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
     let config = state.config_snapshot().await;
     if !config.has_registered_router_identity() {

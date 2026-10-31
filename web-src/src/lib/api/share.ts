@@ -137,6 +137,12 @@ export type ShareTotalUsageEdit = {
 export type ShareUserGrant = {
   valueMetering?: {quotaPolicyEpoch:string;valueMeteredFromMs:number;effectiveFromMs:number;pricingRevision:string};
   pendingValueQuota?: {policy:ShareUserPolicy;effectiveFromMs:number;retainAccess:boolean};
+  /**
+   * Client-side only: `valueQuota`, `pendingValueQuota` or `valueMetering`
+   * could not be read and is kept exactly as received. Such a grant is shown
+   * read-only and must not be re-sent as an edited policy.
+   */
+  valueQuotaMalformed?: boolean;
   accountQuotaCycle?: AccountQuotaCycle;
   accountResetCapability?: AccountResetCapability;
   accountUsageBaseline?: { sourceRef: string; cycleId: string; targetTokens: number;

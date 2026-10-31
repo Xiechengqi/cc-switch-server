@@ -1,10 +1,32 @@
 import type { ShareBindings } from "@/lib/api";
-import type { ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
+import type { ShareUserGrant, ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function isValidShareEmail(value: string): boolean {
   return EMAIL_PATTERN.test(value);
+}
+
+/** Every policy field the Server enforces, the USD quota included. */
+export function sharePolicyKey(policy: ShareUserPolicy): string {
+  return JSON.stringify([
+    policy.parallelLimit ?? null, policy.tokenLimit ?? null,
+    policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
+    policy.tokenPeriod ?? "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null,
+  ]);
+}
+
+/**
+ * Puts an owner's edited policy on a grant that may wait for a USD policy.
+ * Asking again for exactly the waiting policy changes nothing: the enforced
+ * policy and the schedule both stay. Anything else becomes the grant's policy
+ * and the schedule is dropped; the Server works out a new one when the Share
+ * is saved. `valueMetering` is left alone so recorded USD usage is kept.
+ */
+export function stageGrantPolicy(grant: ShareUserGrant, policy: ShareUserPolicy): ShareUserGrant {
+  const waiting = grant.pendingValueQuota;
+  if (waiting?.policy && sharePolicyKey(waiting.policy) === sharePolicyKey(policy)) return { ...grant };
+  return { ...grant, policy, pendingValueQuota: undefined };
 }
 
 export function uniqueSortedEmails(emails: string[]): string[] {

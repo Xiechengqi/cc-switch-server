@@ -217,3 +217,41 @@ describe("Provider Bundle share user grants", () => {
     container.remove();
   });
 });
+
+describe("USD-equivalent rows", () => {
+  it("keeps a grant with unreadable USD fields read-only and shows the enforced policy beside a schedule", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const usd = (micros: string) => ({ limitUsdMicros: micros, tariffPolicyId: "api-equivalent-v1" as const });
+    const grants: ShareUserGrantMap = {
+      "owner@example.com": { email: "owner@example.com", role: "owner", active: true, policy: { tokenPeriod: "lifetime" } },
+      "broken@example.com": { email: "broken@example.com", role: "shareto", active: true, valueQuotaMalformed: true,
+        policy: { tokenPeriod: "day", valueQuota: { limitUsdMicros: "01" } as never } },
+      "waiting@example.com": { email: "waiting@example.com", role: "shareto", active: true,
+        policy: { tokenPeriod: "day", tokenLimit: 1234 },
+        pendingValueQuota: { policy: { tokenPeriod: "day", valueQuota: usd("10000000") }, effectiveFromMs: Date.UTC(2030, 0, 1), retainAccess: true } },
+    };
+    function Harness() {
+      const [value, setValue] = useState(grants);
+      return <ShareUserGrantsEditor value={value} ownerEmail="owner@example.com" defaultPolicy={{ tokenPeriod: "lifetime" }} onChange={setValue} />;
+    }
+    try {
+      await act(async () => { root.render(<Harness />); });
+      const rows = Array.from(document.querySelectorAll("tbody tr"));
+      const broken = rows.find((row) => row.textContent?.includes("broken@example.com"))!;
+      expect(broken.textContent).toContain(i18n.t("share.userLimit.valueQuota.malformed"));
+      expect(broken.querySelector(`button[aria-label="${i18n.t("common.edit", { defaultValue: "编辑" })}"]`)).toBeNull();
+      const waiting = rows.find((row) => row.textContent?.includes("waiting@example.com"))!;
+      // The enforced Token limit stays visible; the USD policy is a line under it.
+      expect(waiting.textContent).toContain((1234).toLocaleString());
+      expect(waiting.textContent).toContain("US$10");
+      await act(async () => { findButton(i18n.t("share.userLimit.batchEdit")).click(); });
+      expect(document.querySelector(`button[aria-label="${i18n.t("share.userLimit.selectUser", { email: "broken@example.com" })}"]`)).toBeNull();
+      expect(document.querySelector(`button[aria-label="${i18n.t("share.userLimit.selectUser", { email: "waiting@example.com" })}"]`)).not.toBeNull();
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+    }
+  });
+});

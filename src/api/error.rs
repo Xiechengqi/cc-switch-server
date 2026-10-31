@@ -87,6 +87,14 @@ impl InferenceApiError {
     fn details(&self) -> Value {
         let mut details = Map::new();
         details.insert("retryable".to_string(), Value::Bool(self.retryable));
+        if self.code == "value_quota_exhausted" {
+            if let Some((_, resets_at)) = self.message.split_once("; resets at ") {
+                details.insert(
+                    "resetsAt".to_string(),
+                    Value::String(resets_at.trim().to_string()),
+                );
+            }
+        }
         if let Some(scope) = self.scope {
             details.insert("scope".to_string(), Value::String(scope.to_string()));
             if scope == "account_rate_limit" {
@@ -448,6 +456,52 @@ impl ApiError {
         }
         tracing::error!("internal api error: {error}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    }
+
+    /// Preview is an admin validation read: policy/validation failures are
+    /// 400, revision conflicts 409, storage failures 503 — never a 500.
+    pub(crate) fn value_quota_preview(error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        if message.contains("REVISION_CONFLICT") {
+            return Self::value_quota(message);
+        }
+        if message == "Share not found" {
+            return Self::not_found(message);
+        }
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        {
+            return Self::value_quota(message);
+        }
+        Self::bad_request_code("invalid_policy", message)
+    }
+
+    /// USD usage edit / reconcile (`set`/`clear`): validation and
+    /// precondition failures are typed 400/409 answers, storage failures
+    /// 503 — never a 500.
+    pub(crate) fn value_usage_edit(error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        if message == "Share not found" {
+            return Self::not_found(message);
+        }
+        if let Some(detail) = message.strip_prefix("VALUE_QUOTA_NOT_ACTIVE: ") {
+            return Self::conflict_code("value_quota_not_active", detail.to_owned());
+        }
+        if let Some(detail) = message.strip_prefix("VALUE_QUOTA_TARGET_INVALID: ") {
+            return Self::bad_request_code("quota_target_invalid", detail.to_owned());
+        }
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::domain::usage::value_pricing::ValueError>()
+                .is_some()
+        }) {
+            return Self::bad_request_code(
+                "quota_target_invalid",
+                "The target is not a valid unsigned picos amount",
+            );
+        }
+        Self::value_quota(message)
     }
 
     pub(crate) fn value_quota(error: impl std::fmt::Display) -> Self {
@@ -829,7 +883,7 @@ mod tests {
     #[test]
     fn value_quota_errors_keep_distinct_non_wallet_codes_on_every_inference_surface() {
         for (code, status) in [
-            ("value_quota_exhausted", StatusCode::TOO_MANY_REQUESTS),
+            ("value_quota_exhausted", StatusCode::FORBIDDEN),
             ("price_unavailable", StatusCode::SERVICE_UNAVAILABLE),
             ("quota_unavailable", StatusCode::SERVICE_UNAVAILABLE),
         ] {
@@ -851,6 +905,66 @@ mod tests {
                 assert!(!error.retryable);
             }
         }
+        let busy = InferenceApiError::proxy(
+            InferenceSurface::Anthropic,
+            None,
+            crate::proxy::ProxyError::value_quota_busy(),
+        );
+        assert_eq!(busy.code, "value_quota_busy");
+        assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(busy.retryable);
+        assert_eq!(busy.retry_after_seconds, Some(2));
+        let storage = InferenceApiError::proxy(
+            InferenceSurface::OpenAi,
+            None,
+            crate::proxy::ProxyError::quota_storage_busy(),
+        );
+        assert_eq!(storage.code, "quota_unavailable");
+        assert!(storage.retryable);
+        assert_eq!(storage.retry_after_seconds, Some(5));
+        let exhausted = InferenceApiError::proxy(
+            InferenceSurface::OpenAi,
+            None,
+            crate::proxy::ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: "value_quota_exhausted: API-equivalent usage limit reached; resets at 2026-11-01T00:00:00Z".into(),
+            },
+        );
+        assert_eq!(exhausted.details()["resetsAt"], "2026-11-01T00:00:00Z");
+        assert_eq!(
+            ApiError::value_quota_preview(anyhow::anyhow!("invalid token period anchor")).status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::value_quota_preview(anyhow::anyhow!("VALUE_QUOTA_REVISION_CONFLICT")).status,
+            StatusCode::CONFLICT
+        );
+        let inactive = ApiError::value_usage_edit(anyhow::anyhow!(
+            "VALUE_QUOTA_NOT_ACTIVE: active USD-equivalent grant required for a@example.com"
+        ));
+        assert_eq!(inactive.status, StatusCode::CONFLICT);
+        assert_eq!(inactive.code, Some("value_quota_not_active"));
+        let invalid = ApiError::value_usage_edit(anyhow::anyhow!(
+            "VALUE_QUOTA_TARGET_INVALID: clear must not include targetPicos"
+        ));
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code, Some("quota_target_invalid"));
+        let below = ApiError::value_usage_edit(anyhow::anyhow!(
+            "VALUE_QUOTA_TARGET_BELOW_OBSERVED_OR_OUT_OF_RANGE"
+        ));
+        assert_eq!(below.status, StatusCode::BAD_REQUEST);
+        assert_eq!(below.code, Some("quota_target_invalid"));
+        let stale = ApiError::value_usage_edit(anyhow::anyhow!("VALUE_QUOTA_REVISION_CONFLICT"));
+        assert_eq!(stale.status, StatusCode::CONFLICT);
+        assert_eq!(stale.code, Some("quota_revision_conflict"));
+        assert_eq!(
+            ApiError::value_usage_edit(anyhow::anyhow!("Share not found")).status,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(
+            ApiError::value_usage_edit(anyhow::anyhow!("disk I/O error")).status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         let conflict = ApiError::value_quota(anyhow::anyhow!("VALUE_QUOTA_WATERMARK_CONFLICT"));
         assert_eq!(conflict.status, StatusCode::CONFLICT);
         assert_eq!(conflict.code, Some("quota_revision_conflict"));

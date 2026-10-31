@@ -132,6 +132,7 @@ pub(super) async fn update_stream_usage(
         false,
         false,
         None,
+        None,
         stream_status,
     )
     .await;
@@ -159,6 +160,7 @@ pub(super) async fn update_stream_usage_result(
         result.parse_error,
         result.usage_estimated,
         Some(result.response_model),
+        (result.streamed_text_bytes > 0).then_some(result.streamed_text_bytes),
         stream_status,
     )
     .await;
@@ -176,12 +178,16 @@ async fn update_stream_usage_with_parse_status(
     usage_parse_error: bool,
     usage_estimated: bool,
     response_model: Option<ResponseModelEvidence>,
+    streamed_text_bytes: Option<u64>,
     stream_status: Option<&str>,
 ) {
     let persisted = state
         .update_usage_log(request_id, |log| {
             if let Some(evidence) = &response_model {
                 evidence.apply(log);
+            }
+            if streamed_text_bytes.is_some() {
+                log.value_streamed_text_bytes = streamed_text_bytes;
             }
             let router_visible_changed = apply_stream_usage_fields(
                 log,
