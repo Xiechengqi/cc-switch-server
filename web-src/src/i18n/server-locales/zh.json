@@ -1139,6 +1139,19 @@
     "unlimited": "无上限",
     "userLimit": {
       "valueQuota": {
+        "readiness": {
+          "loading": "正在检查美元额度能力…",
+          "ready": "可使用美元等值额度",
+          "blocked": "美元等值额度尚未就绪",
+          "retry": "重新检查",
+          "failed": "检查失败，请重试或查看 Server 诊断。",
+          "upgrade": "请升级 Server 至支持美元额度就绪诊断的版本。",
+          "router_protocol": "尚未协商 Router 协议 v10 的金额额度能力。",
+          "sqlite_authority": "Server SQLite 尚非权威存储，需要按维护流程完成切换。",
+          "metering_storage": "计量存储异常，请检查并恢复 Server 存储。",
+          "acknowledged_tariff": "Server 尚无已确认且生效的执行价目。",
+          "text_surface": "此运行时绑定尚未通过文本金额计量验证："
+        },
         "remaining": "剩余等值额度：{{amount}}",
         "exhausted": "已耗尽",
         "diagnostics": "金额额度计量健康",

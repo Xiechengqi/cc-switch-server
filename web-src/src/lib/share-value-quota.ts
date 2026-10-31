@@ -19,7 +19,20 @@ export function valueUsageLabel(picos:string|undefined):string {
   const whole=value/1000000000000n,decimal=(value%1000000000000n/1000000n).toString().padStart(6,"0").replace(/0+$/,"").padEnd(2,"0");
   return "US$"+whole.toString()+"."+decimal;
 }
-export type ValuePreview={ready:boolean;reason?:string|null;activePricingRevision?:string|null;rows:Array<{email:string;effectiveFromMs:number;usedPicos?:string|null}>};
+export type ValuePreview={ready:boolean;configRevision?:number;capabilityReady?:boolean;
+  checks?:Array<{code:string;ready:boolean;state?:string;app?:string;profileId?:string|null;driverId?:string|null}>;
+  reason?:string|null;activePricingRevision?:string|null;rows:Array<{email:string;effectiveFromMs:number;usedPicos?:string|null}>};
+export function isValuePreview(value:unknown,revision:number):value is ValuePreview {
+  if(!value || typeof value!=="object")return false;
+  const p=value as ValuePreview;
+  return typeof p.ready==="boolean" && p.configRevision===revision && Array.isArray(p.rows)
+    && (p.checks==null || (Array.isArray(p.checks) && p.checks.every(c=>c && typeof c.code==="string" && typeof c.ready==="boolean")));
+}
+export function valueCapabilityReady(value:ValuePreview|undefined) {
+  return value?.capabilityReady === true && Array.isArray(value.checks)
+    && ["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].every(code=>value.checks!.some(c=>c?.code===code))
+    && value.checks.every(check=>check?.ready===true);
+}
 export type ValueStatus={email:string;usedPicos:string;observedPicos:string;manualOffsetPicos:string;windowId:string;policyEpoch:string;usageWatermark:number;meteringStatus:string;syncedAtMs:number;limitUsdMicros?:string|null};
 export function matchingValueStatus(items:ValueStatus[],grant:ShareUserGrant):ValueStatus|undefined {
   if(!grant.active || !grant.valueMetering)return undefined;

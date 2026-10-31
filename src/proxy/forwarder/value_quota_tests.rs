@@ -1,5 +1,12 @@
 // Backend-only local upstream fixtures. No browser, real credential or payment.
 fn value_quota_fixture_stream(app: AppKind, reply: &Value) -> String {
+    if reply["object"] == "chat.completion" {
+        let chunk = json!({"id":reply["id"],"object":"chat.completion.chunk","model":reply["model"],
+            "choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]});
+        let end = json!({"id":reply["id"],"object":"chat.completion.chunk","model":reply["model"],
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":reply["usage"]});
+        return format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+    }
     match app {
         AppKind::Claude => {
             let start = json!({"type":"message_start","message":{"id":"msg_fixture","type":"message","role":"assistant","model":reply["model"],"content":[],"usage":{"input_tokens":1000,"output_tokens":0}}});
@@ -66,6 +73,21 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
             Some("models/text-model:generateContent".to_string()),
         ),
     ] {
+      for custom in [false, true] {
+        let (profile, binding) = if custom {
+            let protocol = match (app, route) {
+                (AppKind::Claude, _) => "anthropic_messages",
+                (AppKind::Codex, ProxyRoute::CodexChatCompletions) => "open_ai_chat",
+                (AppKind::Codex, _) => "open_ai_responses",
+                (AppKind::Gemini, _) => "gemini_native",
+            };
+            (match app { AppKind::Claude=>"claude.custom_http", AppKind::Codex=>"codex.custom_http", AppKind::Gemini=>"gemini.custom_http" },
+                Some(serde_json::from_value(json!({"upstreamProtocol":protocol,"authScheme":if app==AppKind::Gemini {"api_key"} else {"bearer"}})).unwrap()))
+        } else { (profile, None) };
+        let reply = if custom && route == ProxyRoute::CodexChatCompletions {
+            json!({"id":"chat_fixture","object":"chat.completion","model":"text-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":1000,"total_tokens":2000}})
+        } else {reply.clone()};
         for streaming in [false, true] {
             for mismatched_model in [false, true] {
                 let mut request = request.clone();
@@ -151,19 +173,20 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 let server = tokio::spawn(async move {
                     axum::serve(listener, upstream).await.unwrap();
                 });
-                state.upsert_provider_command(
+                let stored = state.upsert_provider_draft_command(crate::domain::providers::credentials::ProviderWriteDraft {
             app,
-            Provider {
+            provider: Provider {
                 id: "value-native-provider".into(),
                 name: "Value native provider".into(),
-                settings_config: json!({"env":{(base_key):format!("http://{address}")},"models":["text-model","unpriced-model"]}),
+                settings_config: json!({"env":{(base_key):format!("http://{address}")},"models":["text-model","unpriced-model"],"modelMapping":{"mode":"passthrough"}}),
                 category: None,
                 meta: None,
                 extra: Default::default(),
             },
-            Some(ProfileId::parse(profile).unwrap()), None, None,
-            BTreeMap::from([("/settingsConfig/apiKey".into(), CredentialPatch::Replace {value:"fixture-only-key".into()})]),
-        ).await.unwrap().unwrap();
+            profile_id: Some(ProfileId::parse(profile).unwrap()), custom_binding: binding.clone(),
+            expected_revision: None, client_request_id: None,
+            credential_patches: BTreeMap::from([("/settingsConfig/apiKey".into(), CredentialPatch::Replace {value:"fixture-only-key".into()})]),
+        }).await.unwrap().unwrap();
                 // Native profiles intentionally ignore caller-supplied base URLs.
                 // Override only the cfg(test) runtime index, and assert loopback before
                 // forwarding so this fixture never depends on an external endpoint.
@@ -184,8 +207,8 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 state.mutate_shares_immediate(|store| {
             store.shares.push(serde_json::from_value(json!({
                 "id":"fixture-value-share","app":app.as_str(),"providerId":"value-native-provider",
-                "providerType":app.as_str(),"ownerEmail":"owner@example.test","enabled":true,"status":"active",
-                "bindings":[{"app":app.as_str(),"providerId":"value-native-provider","providerType":app.as_str()}],
+                "providerType":stored.provider_type,"ownerEmail":"owner@example.test","enabled":true,"status":"active",
+                "bindings":[{"app":app.as_str(),"providerId":"value-native-provider","providerType":stored.provider_type}],
                 "userGrants":{"owner@example.test":{"email":"owner@example.test","role":"owner","active":true,
                     "policy":{"tokenPeriod":"lifetime","valueQuota":{"limitUsdMicros":"100","tariffPolicyId":"api-equivalent-v1"}}}}
             })).unwrap());
@@ -251,7 +274,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     )
                     .await
                     .unwrap_err();
-                    assert_eq!(error.error_code(), "price_unavailable");
+                    assert_eq!(error.error_code(), "price_unavailable", "{profile} {route:?} streaming={streaming}");
                     assert_eq!(calls.load(Ordering::SeqCst), 0);
                 }
                 let response = forward(
@@ -262,7 +285,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     Bytes::from(serde_json::to_vec(&request).unwrap()),
                 )
                 .await
-                .unwrap_or_else(|error| panic!("{app:?} {route:?} streaming={streaming} mismatch={mismatched_model}: {error:?}"));
+                .unwrap_or_else(|error| panic!("{profile} {app:?} {route:?} streaming={streaming} mismatch={mismatched_model}: {error:?}"));
                 assert_eq!(response.status(), StatusCode::OK, "{app:?} {route:?}");
                 let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                     .await
@@ -273,7 +296,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 }
                 let status = ledger::status(&state.config_dir, &scope, &window).unwrap();
                 let label =
-                    format!("{app:?} {route:?} streaming={streaming} mismatch={mismatched_model}");
+                    format!("{profile} {app:?} {route:?} streaming={streaming} mismatch={mismatched_model}");
                 assert_eq!(
                     status.observed_picos,
                     if mismatched_model { "0" } else { "18000000000" },
@@ -356,5 +379,6 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 server.abort();
             }
         }
+      }
     }
 }

@@ -470,10 +470,17 @@ impl ResponseModelEvidence {
         }
     }
     pub fn apply(&self, log: &mut UsageLog) {
+        // This is response evidence capture, not admission authorization. Runtime
+        // capability is separately verified against the compiled profile + driver.
         let native = match log.profile_id.as_deref() {
             Some(profile) => matches!(
                 profile,
-                "claude.anthropic_api_key" | "codex.openai_api_key" | "gemini.google_api_key"
+                "claude.anthropic_api_key"
+                    | "codex.openai_api_key"
+                    | "gemini.google_api_key"
+                    | "claude.custom_http"
+                    | "codex.custom_http"
+                    | "gemini.custom_http"
             ),
             None => matches!(
                 log.provider_type,
@@ -1967,6 +1974,24 @@ mod tests {
         conflicting.apply(&mut log);
         ResponseModelEvidence::default().apply(&mut log);
         assert_eq!(log.reported_model_conflict, Some(true));
+        for profile in [
+            "claude.custom_http",
+            "codex.custom_http",
+            "gemini.custom_http",
+        ] {
+            let mut custom = persisted_test_log("custom-model-evidence", 1);
+            custom.profile_id = Some(profile.into());
+            conflicting.apply(&mut custom);
+            assert_eq!(
+                custom.reported_model.as_deref(),
+                Some("model-b"),
+                "{profile}"
+            );
+            let mut changed = ResponseModelEvidence::default();
+            changed.observe(&json!({"model":"model-c"}));
+            changed.apply(&mut custom);
+            assert_eq!(custom.reported_model_conflict, Some(true), "{profile}");
+        }
     }
 
     fn persisted_test_log(request_id: impl Into<String>, created_at_ms: u128) -> UsageLog {

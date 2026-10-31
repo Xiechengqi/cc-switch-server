@@ -1139,6 +1139,19 @@
     "unlimited": "Unlimited",
     "userLimit": {
       "valueQuota": {
+        "readiness": {
+          "loading": "Checking USD quota readiness…",
+          "ready": "USD-equivalent quota is available",
+          "blocked": "USD-equivalent quota is not ready",
+          "retry": "Check again",
+          "failed": "Readiness could not be checked. Retry or check Server diagnostics.",
+          "upgrade": "Upgrade Server to a version with structured USD-quota readiness.",
+          "router_protocol": "Router protocol v10 capability has not been negotiated.",
+          "sqlite_authority": "Server SQLite is not authoritative. Complete the controlled storage migration.",
+          "metering_storage": "Metering storage is unhealthy; inspect and recover Server storage.",
+          "acknowledged_tariff": "No acknowledged, effective execution tariff is active on Server.",
+          "text_surface": "This runtime binding is not verified for text value metering:"
+        },
         "remaining": "Remaining equivalent quota: {{amount}}",
         "exhausted": "Limit reached",
         "diagnostics": "USD quota metering health",

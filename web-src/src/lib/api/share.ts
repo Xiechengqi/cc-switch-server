@@ -713,8 +713,8 @@ export const shareApi = {
     invokeCommand<BundleSharePreflight>("get_provider_bundle_share_preflight", { bundleId }, { cache: "no-store" }),
   editValueUsage:(shareId:string,expectedConfigRevision:number,edits:Record<string,import("../share-value-quota").ValueUsageEdit>) =>
     invokeCommand<{items:import("../share-value-quota").ValueStatus[]}>("edit_share_value_quota_usage",{shareId,expectedConfigRevision,edits}),
-  previewValueQuota: (shareId:string,expectedConfigRevision:number,policies?:Record<string,ShareUserPolicy>) =>
-    invokeCommand<import("../share-value-quota").ValuePreview>("preview_share_value_quota",{shareId,expectedConfigRevision,policies}),
+  previewValueQuota: (shareId:string,expectedConfigRevision:number,policies?:Record<string,ShareUserPolicy>,signal?:AbortSignal) =>
+    invokeCommand<import("../share-value-quota").ValuePreview>("preview_share_value_quota",{shareId,expectedConfigRevision,policies},{signal,cache:"no-store"}),
   valueQuotaStatus: (shareId:string) => invokeCommand<{items:import("../share-value-quota").ValueStatus[];diagnostics?:import("../share-value-quota").ValueDiagnostics}>("get_share_value_quota_status",{shareId}),
   previewAccountReset: (shareId: string, expectedConfigRevision: number, policies?: Record<string, ShareUserPolicy>) =>
     invokeCommand<AccountResetPreview>("preview_share_account_reset", { shareId, expectedConfigRevision, policies }),

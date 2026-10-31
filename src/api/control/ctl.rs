@@ -61,7 +61,7 @@ pub(crate) async fn control_preview_value_quota(
         )
         .await
         .map(Json)
-        .map_err(ApiError::internal)
+        .map_err(ApiError::value_quota)
 }
 pub(crate) async fn control_edit_value_usage(
     State(state): State<ServerState>,

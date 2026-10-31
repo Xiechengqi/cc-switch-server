@@ -1,6 +1,6 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-10-30。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-10-31。
 
 ## 1. 含义与启用条件
 
@@ -11,7 +11,7 @@
 1. Router reader ≥10 且 heartbeat 显式声明 `usdEquivalentQuotaV1`，能力与 Router URL、installation 绑定，缓存有效期 300 秒。
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
 3. Router Owner 发布已核对的完整执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。默认无执行价目，不自动相信参考价目。
-4. Share 只绑定已验证的原生 API-key profile：`claude.anthropic_api_key`、`codex.openai_api_key`、`gemini.google_api_key`，并核对实际 HTTP driver。当前 generic 文本转发面支持 Messages、Chat Completions、Responses、Gemini；Web Session、Coding Plan、其他自定义 profile、OAuth、媒体、内置付费工具、估算、未知模型／tier、多 attempt/retry 不在金额模式可用范围。仅凭兼容 ProviderType 为 Claude/Codex/Gemini 不足以放行。客户端自定义 function tool 文本允许；Server 不执行工具。
+4. Share 所有绑定必须通过同一个 profile／driver 能力函数。允许 `claude.anthropic_api_key` 或 `claude.custom_http` + `http.anthropic_messages`；`codex.openai_api_key` 或 `codex.custom_http` + `http.openai_responses`；`codex.custom_http` + `http.openai_chat`；`gemini.google_api_key` 或 `gemini.custom_http` + `http.gemini_native`。generic 文本转发面支持 Messages、Chat Completions、Responses、Gemini。未列出的自定义协议组合、Web Session、Coding Plan、OAuth、媒体、内置付费工具、估算、未知模型／tier、多 attempt/retry 不在金额模式可用范围。仅凭兼容 ProviderType 不足以放行；自定义 Claude 的实际兼容类型可为 `claude_auth`。客户端自定义 function tool 文本允许；Server 不执行工具。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。
 
@@ -88,3 +88,22 @@ schema v3 新增独立 snapshots／coverage／attempts／revisions／adjustments
 - `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh`：`failures=0`、`decision=blocked`，因为聚合本地检查显式跳过且没有真实／部署输入；不能据此标记发布或生产验收通过。格式、生成契约、SQLite 权威边界、产品／Web 边界、文档索引及空白检查通过。
 
 本地代码验证为 `local_verified`，真实流量验收保持 `live_pending`；没有执行截图、浏览器或其他 UI 自动化。
+
+## 8. 就绪诊断和受控启用（2026-10-31）
+
+预览返回 `capabilityReady` 与 `checks[]`，独立报告 `router_protocol`、`sqlite_authority`（committed／prepared／shadow_verified／unavailable）、`metering_storage`、`acknowledged_tariff` 和每个绑定的 `text_surface`（app／profileId／driverId）。任一基础条件失败均返回全部诊断及空 rows，不继续查询用户窗口；config revision 不匹配仍返回冲突。基础能力与用户 coverage 分开，不能因一个用户历史不完整禁用全体用户的单位选择。Server Web 和 Router 都可重新检查，后台检查不覆盖显式策略确认预览。
+
+Router Owner 的执行价目面板提供逐模型／tier/context 费率表单和高级 JSON。费率表单为美元／百万 Token，wire 仍为整数微美元。同名参考价只能生成待审草稿，不能自动证明 cache TTL、长上下文或 tier；未覆盖模型和未知费率不得猜为零。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
+
+现有 `shadow_verified` 不代表完成 SQLite 权威迁移。操作人应先安排停服、确认实际配置目录／运行用户／密钥环境、做完整安全备份，然后按 [官方 Server SQLite Authority 迁移](../guide/data-migration.md#server-sqlite-authority) 先运行只读 `config migrate-server-store`，通过后显式 `--apply`，再重启并验证旧授权、Provider 和用量。命令需持有独占目录锁，禁止在线强改 marker。Provider S1→S2 前提必须满足，备份和密钥按凭据管理。
+
+部署顺序为 Router 再 Server。Owner 明确审核并发布真实执行模型／响应别名的完整价目，等生效、安装及 ACK 激活后，在对应 Share 重新检查；用户策略仍须单独确认覆盖起点或排期。故障不能靠删除 ledger、恢复旧库或清除安全标记绕过。此代码变更未自动切换任何生产存储或发布估值；真实灰度继续 `live_pending`。
+
+## 9. 本轮验证与整体 review（2026-10-31）
+
+- `cargo clippy --locked --all-targets -- -D warnings`、格式及空白检查通过。`value_quota_` 定向测试 18 项通过、1 项既有容量测试默认 ignored；价目域纯测试 8 项也通过（与定向测试部分重叠，不重复累计）。本轮未重跑第 7 节的全量 Rust 测试或 10 万条容量测试。
+- 本地 HTTP 夹具扩展为 8 个原生／自定义入口组合 × 流式／非流式 × 正常／异常模型，共 32 组。正常精确结算 `$0.018`，异常模型保留风险；发网前持久准入、缺价和未覆盖 Gemini 动作拒绝仍通过。无真实凭据或外部 Provider。
+- Web 额度／批量策略／传输／i18n 纯测试 34 项、类型检查及 Vite 生产构建通过，`web-dist` 与源同步。既有大 chunk 提示不作失败，构建体积审计通过。Provider 覆盖、UI 矩阵、文档索引、SQLite 权威、产品／Web 边界、i18n literals 和运行时契约审计通过。
+- Review 发现并修复自定义 HTTP 响应模型证据遗漏：这些 profile 的报告模型和 sticky conflict 现在进入持久计量路径，但不会因此绕过 profile／driver 准入。两端就绪检查与显式策略确认独立，旧账号／Share／revision 响应不能恢复旧能力；非法预览或配置冲突不能当成功处理。
+
+这是本地代码验证，不是生产或视觉验收；没有截图、浏览器／UI 自动化、远程迁移或部署，真实灰度保持 `live_pending`。截至本轮收尾未发现已知阻塞性代码问题，修改尚未提交或推送。

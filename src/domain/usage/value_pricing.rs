@@ -40,6 +40,10 @@ pub fn supports_value_text_runtime(profile: &str, driver: &str, coding_plan: boo
             ("claude.anthropic_api_key", "http.anthropic_messages")
                 | ("codex.openai_api_key", "http.openai_responses")
                 | ("gemini.google_api_key", "http.gemini_native")
+                | ("claude.custom_http", "http.anthropic_messages")
+                | ("codex.custom_http", "http.openai_chat")
+                | ("codex.custom_http", "http.openai_responses")
+                | ("gemini.custom_http", "http.gemini_native")
         )
 }
 
@@ -545,6 +549,10 @@ mod tests {
             ("claude.anthropic_api_key", "http.anthropic_messages"),
             ("codex.openai_api_key", "http.openai_responses"),
             ("gemini.google_api_key", "http.gemini_native"),
+            ("claude.custom_http", "http.anthropic_messages"),
+            ("codex.custom_http", "http.openai_chat"),
+            ("codex.custom_http", "http.openai_responses"),
+            ("gemini.custom_http", "http.gemini_native"),
         ] {
             assert!(supports_value_text_runtime(profile, driver, false));
             assert!(!supports_value_text_runtime(profile, driver, true));
@@ -558,6 +566,9 @@ mod tests {
             ("codex.perplexity_web_session", "web_session.perplexity"),
             ("claude.xiaomi_mimo_token_plan", "http.anthropic_messages"),
             ("codex.openai_oauth", "oauth.openai_codex"),
+            ("claude.custom_http", "http.openai_chat"),
+            ("codex.custom_http", "http.anthropic_messages"),
+            ("gemini.custom_http", "http.openai_responses"),
         ] {
             assert!(!supports_value_text_runtime(profile, driver, false));
         }

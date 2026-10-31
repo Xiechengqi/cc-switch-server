@@ -1,10 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, type ValueStatus } from "./share-value-quota";
+import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview } from "./share-value-quota";
 import { applyShareUserPolicyBatch } from "../components/providers/share-user-policy-batch";
 import { normalizeShareRecord } from "../utils/shareRecordNormalize";
 import type { ShareUserGrant } from "./api/share";
 
 describe("Share USD-equivalent quotas", () => {
+  it("separates infrastructure readiness from policy coverage and fails closed on missing checks",()=>{
+    const checks=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
+    const preview:ValuePreview={ready:false,capabilityReady:true,checks,rows:[]};
+    expect(valueCapabilityReady(preview)).toBe(true);
+    expect(valueCapabilityReady({...preview,ready:true,checks:undefined})).toBe(false);
+    for(const check of checks) {
+      expect(valueCapabilityReady({...preview,checks:checks.filter(c=>c!==check)})).toBe(false);
+      expect(valueCapabilityReady({...preview,checks:checks.map(c=>c===check?{...c,ready:false}:c)})).toBe(false);
+    }
+    expect(valueCapabilityReady({...preview,checks:[...checks,{code:"text_surface",ready:false}]})).toBe(false);
+    expect(isValuePreview({...preview,configRevision:7},7)).toBe(true);
+    for(const invalid of [null,{},[],{ready:true,configRevision:6,rows:[]},{ready:true,configRevision:7,rows:[],checks:[null]}])expect(isValuePreview(invalid,7)).toBe(false);
+  });
   it("keeps micro limits and pico usage exact without wallet conversion", () => {
     expect(parseValueLimit("0.000001")).toBe("1");
     expect(parseValueLimit("1000000000")).toBe("1000000000000000");

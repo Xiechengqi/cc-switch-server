@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -42,6 +42,7 @@ import { shareApi } from "@/lib/api/share";
 import { isValidShareEmail } from "@/utils/shareFormUtils";
 import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
 import { ShareValueUsageCorrection } from "./ShareValueUsageCorrection";
+import { ShareValueReadiness, useShareValueReadiness } from "./ShareValueReadiness";
 import { parseValueLimit, valueLimitInput, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, type ValuePreview, type ValueStatus, type ValueDiagnostics } from "@/lib/share-value-quota";
 
 type PolicyDraft = {
@@ -253,30 +254,39 @@ export function ShareUserGrantsEditor({
   const { t } = useTranslation();
   const [accountPreview, setAccountPreview] = useState<AccountResetPreview>();
   const [valuePreview, setValuePreview] = useState<ValuePreview>();
-  const [valueCapabilityReady, setValueCapabilityReady] = useState(false);
+  const readiness = useShareValueReadiness(shareId,configRevision);
+  const valueCapabilityReady = readiness.ready;
+  const valueScope=useRef(readiness.key);valueScope.current=readiness.key;
+  const confirmedValueScope=useRef("");
+  const valuePreviewRequest=useRef<AbortController|null>(null);
   const [valueIntent, setValueIntent] = useState("");
   const [valueStatuses,setValueStatuses]=useState<ValueStatus[]>([]);
   const [valueStatusScope,setValueStatusScope]=useState<string>();
   const [valueDiagnostics,setValueDiagnostics]=useState<ValueDiagnostics>();
   useEffect(()=>{
-    setValuePreview(undefined); setValueIntent(""); setValueStatuses([]); setValueCapabilityReady(false);
+    setValueStatuses([]);
     if(!shareId || configRevision==null)return;
     let current=true;
-    void shareApi.previewValueQuota(shareId,configRevision).then((data)=>{if(current){setValuePreview(data);setValueCapabilityReady(data.ready);}}).catch(()=>{});
     const refresh=()=>void shareApi.valueQuotaStatus(shareId).then((data)=>{if(current){setValueStatuses(data.items);setValueStatusScope(shareId);setValueDiagnostics(data.diagnostics);}}).catch(()=>{if(current){setValueStatuses([]);setValueDiagnostics(undefined);}});
     refresh();const timer=window.setInterval(refresh,15000);
     return ()=>{current=false;window.clearInterval(timer);};
-  },[shareId,configRevision,value]);
+  },[shareId,configRevision,value,readiness.key]);
+  useEffect(()=>{setValuePreview(undefined);setValueIntent("");setPreviewBusy(false);confirmedValueScope.current="";
+    return ()=>valuePreviewRequest.current?.abort();},[readiness.key]);
   const confirmValuePreview=async(policies:Record<string,ShareUserPolicy>,intent:string)=>{
     if(!shareId || configRevision==null)throw new Error(t("share.userLimit.valueQuota.notReady"));
-    if(valuePreview?.ready && valueIntent===intent)return true;
+    if(valuePreview?.ready && valueIntent===intent && confirmedValueScope.current===readiness.key)return true;
+    const requestedScope=readiness.key;
+    valuePreviewRequest.current?.abort();const controller=new AbortController();valuePreviewRequest.current=controller;
     setPreviewBusy(true);
     try {
-      const preview=await shareApi.previewValueQuota(shareId,configRevision,policies);
+      const preview=await shareApi.previewValueQuota(shareId,configRevision,policies,controller.signal);
+      if(controller.signal.aborted || requestedScope!==valueScope.current)return false;
       setValuePreview(preview);
       if(!preview.ready)throw new Error(preview.reason || t("share.userLimit.valueQuota.notReady"));
-      setValueIntent(intent);return false;
-    }finally{setPreviewBusy(false);}
+      confirmedValueScope.current=requestedScope;setValueIntent(intent);return false;
+    }catch(cause){if(controller.signal.aborted || requestedScope!==valueScope.current)return false;throw cause;
+    }finally{if(requestedScope===valueScope.current)setPreviewBusy(false);}
   };
   const [previewIntent, setPreviewIntent] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -1022,6 +1032,7 @@ export function ShareUserGrantsEditor({
                 <Select value={draft.quotaUnit} onValueChange={(unit)=>setDraft({...draft,quotaUnit:unit==="usdEquivalent"?"usdEquivalent":"tokens",tokenLimit:"",usageAction:"unchanged",consumedTokens:""})}>
                   <SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="tokens">{t("share.userLimit.valueQuota.tokens")}</SelectItem><SelectItem value="usdEquivalent" disabled={!valueCapabilityReady && draft.quotaUnit!=="usdEquivalent"}>{t("share.userLimit.valueQuota.usd")}</SelectItem></SelectContent>
                 </Select>
+                <ShareValueReadiness state={readiness}/>
                 <Label htmlFor="share-user-token">{draft.quotaUnit==="usdEquivalent" ? t("share.userLimit.valueQuota.usd") : t("share.tokenLimit", { defaultValue: "Token 限额" })}</Label>
                 <Input id="share-user-token" type="text" inputMode="decimal" placeholder={unlimited} value={draft.tokenLimit} onChange={(event) => setDraft({ ...draft, tokenLimit: event.target.value })} />
                 {draft.quotaUnit==="usdEquivalent" ? <div className="text-xs text-muted-foreground"><p>{t("share.userLimit.valueQuota.hint")}</p><p>{t("share.userLimit.valueQuota.start")}</p>{valuePreview?.rows.map((row)=><p key={row.email}>{row.email}: {new Date(row.effectiveFromMs).toLocaleString()} · {valueUsageLabel(row.usedPicos ?? undefined)}</p>)}</div> : null}
@@ -1235,6 +1246,7 @@ export function ShareUserGrantsEditor({
                 <Select disabled={!batchDraft.applyTokenLimit} value={batchDraft.quotaUnit} onValueChange={(unit)=>setBatchDraft({...batchDraft,quotaUnit:unit==="usdEquivalent"?"usdEquivalent":"tokens",tokenLimit:"",applyConsumedTokens:false})}>
                   <SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="tokens">{t("share.userLimit.valueQuota.tokens")}</SelectItem><SelectItem value="usdEquivalent" disabled={!valueCapabilityReady && batchDraft.quotaUnit!=="usdEquivalent"}>{t("share.userLimit.valueQuota.usd")}</SelectItem></SelectContent>
                 </Select>
+                {batchDraft.applyTokenLimit?<ShareValueReadiness state={readiness}/>:null}
                 <Input
                   type="text"
                   inputMode="decimal"

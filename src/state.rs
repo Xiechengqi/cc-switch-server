@@ -32151,6 +32151,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn value_quota_readiness_reports_independent_blockers_without_opening_shadow_ledger() {
+        use crate::repository::server_sqlite::{self, value_quota as ledger};
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "readiness-install").await;
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("provider", "Provider"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .upsert(router_sync_share_input("readiness-share", "provider"))
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let revision = state
+            .shares
+            .read()
+            .await
+            .get("readiness-share")
+            .unwrap()
+            .config_revision;
+        let policies = BTreeMap::from([(
+            "user@example.com".into(),
+            crate::domain::sharing::router_contract::ShareUserPolicy::default(),
+        )]);
+        let preview = state
+            .preview_share_value_quota("readiness-share", revision, policies.clone())
+            .await
+            .unwrap();
+        let check = |preview: &Value, code: &str| {
+            preview["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["code"] == code)
+                .unwrap()["ready"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(!check(&preview, "router_protocol"));
+        assert!(!check(&preview, "sqlite_authority"));
+        assert!(!check(&preview, "acknowledged_tariff"));
+        assert!(check(&preview, "text_surface"));
+        assert_eq!(preview["rows"], json!([]));
+        assert_eq!(preview["capabilityReady"], false);
+        assert!(state
+            .preview_share_value_quota("readiness-share", revision + 1, BTreeMap::new())
+            .await
+            .is_err());
+        server_sqlite::activate_authority(&state.config_dir).unwrap();
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 10,
+                    capabilities: vec!["usdEquivalentQuotaV1".into()],
+                },
+            )
+            .await;
+        let preview = state
+            .preview_share_value_quota("readiness-share", revision, BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(check(&preview, "sqlite_authority"));
+        assert!(check(&preview, "router_protocol"));
+        assert!(!check(&preview, "acknowledged_tariff"));
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/share-value-pricing-v1.json"
+        ))
+        .unwrap();
+        let snapshot: crate::domain::usage::value_pricing::PricingSnapshot =
+            serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+        let scope = ledger::Scope {
+            router_url: config.router_api_base().unwrap().into(),
+            installation_id: "readiness-install".into(),
+            share_id: "readiness-share".into(),
+            email: "owner@example.com".into(),
+        };
+        let pricing_revision = snapshot.revision().unwrap();
+        ledger::install_snapshot(
+            &state.config_dir,
+            &scope,
+            &pricing_revision,
+            &snapshot,
+            now_ms_i64(),
+        )
+        .unwrap();
+        let installed = state
+            .preview_share_value_quota("readiness-share", revision, BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(
+            !check(&installed, "acknowledged_tariff"),
+            "installation alone is not acknowledgement"
+        );
+        ledger::activate_snapshot(&state.config_dir, &scope, &pricing_revision).unwrap();
+        let active = state
+            .preview_share_value_quota("readiness-share", revision, BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(active["ready"], true);
+        assert_eq!(active["capabilityReady"], true);
+        state.mark_value_quota_degraded();
+        let failed = state
+            .preview_share_value_quota("readiness-share", revision, policies)
+            .await
+            .unwrap();
+        assert!(!check(&failed, "metering_storage"));
+        assert_eq!(failed["ready"], false);
+        assert_eq!(failed["rows"], json!([]));
+    }
+
+    #[tokio::test]
     async fn value_quota_scheduled_switch_preserves_old_token_limits_and_activates_at_the_complete_boundary(
     ) {
         use crate::domain::sharing::router_contract::{ShareSettingsPatch, ShareTokenPeriod};

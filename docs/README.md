@@ -66,7 +66,7 @@
 | [user-usage-rebase.md](share/user-usage-rebase.md) | 权威 | Share 用户用量重基线 |
 | [account-reset.md](share/account-reset.md) | 权威 | 账号重置周期实现、全供应商门槛、53项离线映射、存储恢复和review；真实验收独立live_pending |
 | [market-trials.md](share/market-trials.md) | 权威 | v9 一次性市场试用、请求阶段归属、迟到用量、重启隔离与正式授权确认 |
-| [value-quotas.md](share/value-quotas.md) | 权威 | v10 Token／USD 等值额度、冻结价目、独立 SQLite 计量、预览与校准、恢复限制和 live_pending 门槛 |
+| [value-quotas.md](share/value-quotas.md) | 权威 | v10 双口径额度、自定义文本 profile／driver、分项就绪诊断、执行价目与受控 SQLite 启用、恢复限制和 live_pending 门槛 |
 
 ## 验收 `docs/acceptance/`
 

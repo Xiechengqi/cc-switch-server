@@ -64,10 +64,7 @@ fn window(grant: &ShareUserGrant, now: i64) -> anyhow::Result<ledger::Window> {
 fn verified_text_bindings(share: &Share, providers: &ProviderStore) -> bool {
     !share.bindings.is_empty()
         && share.bindings.iter().all(|binding| {
-            matches!(
-                binding.provider_type,
-                ProviderType::Claude | ProviderType::Codex | ProviderType::Gemini
-            ) && providers
+            providers
                 .runtime_plan(binding.app, &binding.provider_id)
                 .is_some_and(|plan| {
                     crate::domain::usage::value_pricing::supports_value_text_runtime(
@@ -241,15 +238,70 @@ impl ServerStateInner {
             "VALUE_QUOTA_REVISION_CONFLICT"
         );
         let providers = self.providers.read().await.clone();
-        let capable = self.router_supports_value_quotas().await
-            && verified_text_bindings(&share, &providers)
-            && !self
-                .value_quota_degraded
-                .load(std::sync::atomic::Ordering::Acquire);
         let config = self.config_snapshot().await;
         let now = now_ms_i64();
         let tariff = scope(&config, share_id, "preview@local.invalid")
             .and_then(|identity| ledger::active_snapshot(&self.config_dir, &identity));
+        let authority = server_sqlite::read_marker(&self.config_dir)
+            .ok()
+            .flatten()
+            .map(|marker| marker.authority);
+        let storage = match authority {
+            Some(server_sqlite::AuthorityState::Committed) => "committed",
+            Some(server_sqlite::AuthorityState::Prepared) => "prepared",
+            Some(server_sqlite::AuthorityState::ShadowVerified) => "shadow_verified",
+            None => "unavailable",
+        };
+        let surfaces = share
+            .bindings
+            .iter()
+            .map(|binding| {
+                let plan = providers.runtime_plan(binding.app, &binding.provider_id);
+                let ready = plan.as_ref().is_some_and(|plan| {
+                    crate::domain::usage::value_pricing::supports_value_text_runtime(
+                        plan.profile_id.as_str(),
+                        plan.driver_id.as_str(),
+                        plan.coding_plan.is_some(),
+                    )
+                });
+                serde_json::json!({"code":"text_surface", "ready":ready,
+                "app":binding.app, "profileId":plan.as_ref().map(|p|p.profile_id.as_str()),
+                "driverId":plan.as_ref().map(|p|p.driver_id.as_str())})
+            })
+            .collect::<Vec<_>>();
+        let mut checks = vec![
+            serde_json::json!({"code":"router_protocol", "ready":self.value_quota_router_negotiated().await}),
+            serde_json::json!({"code":"sqlite_authority", "ready":storage == "committed", "state":storage}),
+            serde_json::json!({"code":"metering_storage", "ready":!self.value_quota_degraded.load(std::sync::atomic::Ordering::Acquire)
+                && !self.quota_usage_degraded.load(std::sync::atomic::Ordering::Acquire)}),
+            serde_json::json!({"code":"acknowledged_tariff", "ready":tariff.is_ok()}),
+        ];
+        if surfaces.is_empty() {
+            checks.push(serde_json::json!({"code":"text_surface", "ready":false}));
+        }
+        checks.extend(surfaces);
+        let capability_ready = checks.iter().all(|check| check["ready"] == true);
+        // Validate the proposed policies even when infrastructure is unavailable,
+        // but never open the authoritative ledger in shadow/failed-storage mode.
+        for (email, policy) in &policies {
+            crate::domain::sharing::token_period::validate_user_policy(policy, now)
+                .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                !share
+                    .user_grants
+                    .get(&email.trim().to_ascii_lowercase())
+                    .is_some_and(|g| g.active && g.manager == ShareGrantManager::RouterShareMarket),
+                "Share Market managed users are read-only"
+            );
+        }
+        if !capability_ready {
+            return Ok(
+                serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,
+                "ready":false,"capabilityReady":false,"checks":checks,"reason":"capability_unavailable",
+                "activePricingRevision":tariff.as_ref().ok().map(|(r,_)|r),
+                "meteredFromConfirmationRequired":true,"softLimit":true,"maximumParallel":4,"rows":[]}),
+            );
+        }
         let mut rows = Vec::new();
         let mut all_rows_ready = true;
         for (email, policy) in &policies {
@@ -314,8 +366,9 @@ impl ServerStateInner {
                 "usageWatermark":status.as_ref().ok().map(|s|s.usage_watermark),"ready":row_ready,"reason":reason}));
         }
         Ok(
-            serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,"ready":capable && tariff.is_ok() && all_rows_ready,
-            "reason":if !capable {Some("Router v10, committed SQLite storage and verified text bindings are required")} else if tariff.is_err() {Some("An acknowledged executable pricing snapshot is required")} else if !all_rows_ready {Some("Complete metering history is required; wait for in-flight requests or choose a complete natural window")} else {None},
+            serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,"ready":capability_ready && all_rows_ready,
+            "capabilityReady":capability_ready,"checks":checks,
+            "reason":if !all_rows_ready {Some("Complete metering history is required; wait for in-flight requests or choose a complete natural window")} else {None},
             "activePricingRevision":tariff.as_ref().ok().map(|(r,_)|r),"meteredFromConfirmationRequired":true,
             "softLimit":true,"maximumParallel":4,"rows":rows}),
         )
@@ -324,6 +377,9 @@ impl ServerStateInner {
         if !server_sqlite::is_committed(&self.config_dir).unwrap_or(false) {
             return false;
         }
+        self.value_quota_router_negotiated().await
+    }
+    async fn value_quota_router_negotiated(&self) -> bool {
         let config = self.config_snapshot().await;
         self.router_quota_capability
             .read()

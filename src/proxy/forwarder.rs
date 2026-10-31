@@ -2404,30 +2404,26 @@ async fn forward_with_attempt_inner(
         } else {
             false
         };
-        let value_text_capable =
-            matches!(
-                execution.stored.provider_type,
-                ProviderType::Claude | ProviderType::Codex | ProviderType::Gemini
-            ) && crate::domain::usage::value_pricing::supports_value_text_runtime(
-                execution.plan.profile_id.as_str(),
-                execution.plan.driver_id.as_str(),
-                execution.plan.coding_plan.is_some(),
-            ) && matches!(
-                route,
-                ProxyRoute::ClaudeMessages
-                    | ProxyRoute::CodexChatCompletions
-                    | ProxyRoute::CodexResponses
-                    | ProxyRoute::Gemini
-            ) && (route != ProxyRoute::Gemini
-                || gemini_path.as_deref().is_some_and(|path| {
-                    matches!(
-                        path.rsplit(':').next(),
-                        Some("generateContent" | "streamGenerateContent")
-                    )
-                }))
-                && attempt_context.attempt() == 0
-                && (!value_metering
-                    || crate::domain::usage::value_pricing::is_metered_text_payload(&body));
+        let value_text_capable = crate::domain::usage::value_pricing::supports_value_text_runtime(
+            execution.plan.profile_id.as_str(),
+            execution.plan.driver_id.as_str(),
+            execution.plan.coding_plan.is_some(),
+        ) && matches!(
+            route,
+            ProxyRoute::ClaudeMessages
+                | ProxyRoute::CodexChatCompletions
+                | ProxyRoute::CodexResponses
+                | ProxyRoute::Gemini
+        ) && (route != ProxyRoute::Gemini
+            || gemini_path.as_deref().is_some_and(|path| {
+                matches!(
+                    path.rsplit(':').next(),
+                    Some("generateContent" | "streamGenerateContent")
+                )
+            }))
+            && attempt_context.attempt() == 0
+            && (!value_metering
+                || crate::domain::usage::value_pricing::is_metered_text_payload(&body));
         if let Some(share_id) = request_context.share_id.as_deref() {
             if state
                 .share_uses_value_quota(share_id, request_context.user_email.as_deref())

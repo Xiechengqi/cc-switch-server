@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HttpResponseError, jsonFetch } from "./runtime";
+import { HttpResponseError, jsonFetch, invokeCommand } from "./runtime";
 
 vi.mock("@/lib/api/auth", () => ({ isRemoteWebMode: () => false }));
 vi.mock("@/lib/routerAuth", () => ({
@@ -10,6 +10,12 @@ vi.mock("@/lib/routerAuth", () => ({
 afterEach(() => vi.unstubAllGlobals());
 
 describe("structured HTTP errors", () => {
+  it("forwards readonly quota preview cancellation without caching its private response",async()=>{
+    const controller=new AbortController();const fetch=vi.fn().mockResolvedValue(Response.json({ready:false}));
+    vi.stubGlobal("fetch",fetch);
+    await invokeCommand("preview_share_value_quota",{shareId:"share",expectedConfigRevision:1},{signal:controller.signal,cache:"no-store"});
+    expect(fetch).toHaveBeenCalledWith("/web-api/invoke/preview_share_value_quota",expect.objectContaining({signal:controller.signal,cache:"no-store",method:"POST"}));
+  });
   it.each([
     {
       error: "authentication mismatch",

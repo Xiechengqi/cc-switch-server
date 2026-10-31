@@ -1139,6 +1139,19 @@
     "unlimited": "無上限",
     "userLimit": {
       "valueQuota": {
+        "readiness": {
+          "loading": "米ドル相当額の上限を確認中…",
+          "ready": "米ドル相当額の上限を利用できます",
+          "blocked": "米ドル相当額の上限は利用準備ができていません",
+          "retry": "再確認",
+          "failed": "確認に失敗しました。再試行するか Server の診断を確認してください。",
+          "upgrade": "構造化された上限診断をサポートする Server に更新してください。",
+          "router_protocol": "Router プロトコル v10 の金額上限機能が未確認です。",
+          "sqlite_authority": "Server SQLite はまだ正本ではありません。保守手順に従って切り替えてください。",
+          "metering_storage": "計量ストレージが異常です。Server ストレージを確認・復旧してください。",
+          "acknowledged_tariff": "Server に確認済みで有効な実行料金表がありません。",
+          "text_surface": "この実行バインディングはテキスト金額計量で未検証です："
+        },
         "remaining": "残りの換算使用量：{{amount}}",
         "exhausted": "上限に達しました",
         "diagnostics": "USD 使用量計測の状態",
