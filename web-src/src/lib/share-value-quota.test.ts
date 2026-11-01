@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
   parseValueLimitInput, valueLimitLabel, valueRowKind, valuePreviewNeedsConfirmation, valuePreviewBlocker, valueErrorMessage, valueRequestError, ValueQuotaResponseError,
-  splitValueRows, mergeValueRows, valueStatusReason } from "./share-value-quota";
+  splitValueRows, mergeValueRows, valueStatusReason, VALUE_STATUS_STALE_MS } from "./share-value-quota";
 import { applyShareUserPolicyBatch, patchedSharePolicy } from "../components/providers/share-user-policy-batch";
 import { stageGrantPolicy } from "../utils/shareFormUtils";
 import { normalizeShareRecord, normalizeShareRecords } from "../utils/shareRecordNormalize";
@@ -121,7 +121,8 @@ describe("Share USD-equivalent quotas", () => {
     const status={meteringStatus:"pending",syncedAtMs:1} as ValueStatus;
     expect(valueStateKey(undefined)).toBe("share.userLimit.valueQuota.pending");
     expect(valueStateKey(status,2)).toBe("share.userLimit.valueQuota.state.pending");
-    expect(valueStateKey(status,100000)).toBe("share.userLimit.valueQuota.stale");
+    expect(valueStateKey(status,1+VALUE_STATUS_STALE_MS)).toBe("share.userLimit.valueQuota.state.pending");
+    expect(valueStateKey(status,2+VALUE_STATUS_STALE_MS)).toBe("share.userLimit.valueQuota.stale");
     expect(valueStateKey({...status,meteringStatus:"unexpected"},2)).toBe("share.userLimit.valueQuota.state.unavailable");
   });
   it("never attaches usage to another policy, user, or pending draft",()=>{
