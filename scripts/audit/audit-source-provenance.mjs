@@ -31,12 +31,26 @@ const technicalDependencyPatterns = Object.freeze([
   ["retired import ledger", /UPSTREAM_IMPORT[.]md/],
 ]);
 
+// Other audit tests run in parallel and create short-lived scratch
+// directories inside the checkout (e.g. the Kiro hard-link receipt test), so
+// an entry may vanish between listing and reading; it is simply skipped.
+const vanished = (error) => error?.code === "ENOENT";
+
+export function readDirectoryEntries(directory) {
+  try {
+    return fs.readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if (vanished(error)) return [];
+    throw error;
+  }
+}
+
 function walkFiles(root) {
   const files = [];
   const stack = [root];
   while (stack.length > 0) {
     const current = stack.pop();
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    for (const entry of readDirectoryEntries(current)) {
       if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
       const absolutePath = path.join(current, entry.name);
       if (entry.isDirectory()) stack.push(absolutePath);
@@ -51,7 +65,13 @@ function relativePath(root, absolutePath) {
 }
 
 function readText(absolutePath) {
-  const content = fs.readFileSync(absolutePath);
+  let content;
+  try {
+    content = fs.readFileSync(absolutePath);
+  } catch (error) {
+    if (vanished(error)) return null;
+    throw error;
+  }
   return content.includes(0) ? null : content.toString("utf8");
 }
 
