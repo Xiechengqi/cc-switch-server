@@ -94,6 +94,19 @@ describe("i18n resources", () => {
       }
     }
   });
+  it("keeps the Server storage settings copy complete in every language", () => {
+    const leaves=(value:unknown,prefix=""):string[] => value && typeof value==="object"
+      ? Object.entries(value).flatMap(([key,child])=>leaves(child,prefix ? `${prefix}.${key}`:key)) : [prefix];
+    const keys=leaves(serverEn.settings.serverStorage).sort();
+    expect(keys.length).toBeGreaterThan(0);
+    for(const language of languages) {
+      expect(leaves(serverLocales[language].settings.serverStorage).sort(),language).toEqual(keys);
+      for(const key of keys) {
+        const text=i18n.getResource(language,"translation",`settings.serverStorage.${key}`);
+        expect(typeof text).toBe("string");expect(text.trim()).not.toBe("");
+      }
+    }
+  });
   it("uses the Server Provider creation wording", () => {
     expect(serverZh.providerBundle.stepFamily).toBe("选择类型");
     expect(serverZh.providerBundle.stepSupply).toBe("配置");

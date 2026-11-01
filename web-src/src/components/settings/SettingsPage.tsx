@@ -33,6 +33,10 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import { PAGE_SHELL_PADDING_X } from "@/lib/layout";
 import { stableStringify } from "@/lib/stableStringify";
+import {
+  SERVER_SETTINGS_SECTIONS,
+  type ServerSettingsSection,
+} from "@/lib/serverView";
 import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { BackupListSection } from "@/components/settings/BackupListSection";
@@ -46,6 +50,7 @@ import { ServerSecuritySettings } from "@/components/settings/ServerSecuritySett
 import { ServerUpgradePolicySettings } from "@/components/settings/ServerUpgradePolicySettings";
 import { ServerVersionSettings } from "@/components/settings/ServerVersionSettings";
 import { ServerConfigDirSettings } from "@/components/settings/ServerConfigDirSettings";
+import { ServerStorageSettings } from "@/components/settings/ServerStorageSettings";
 import {
   ShareSettingsTab,
   type ShareSettingsSaveState,
@@ -61,6 +66,8 @@ interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   defaultTab?: SettingsTab | "router" | "diagnostics" | "tunnel" | "backup";
+  /** Scroll to this section (its DOM id) once, on the tab that holds it. */
+  focusSection?: ServerSettingsSection | null;
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
 }
 
@@ -76,7 +83,7 @@ export const SettingsPage = forwardRef<
   SettingsPageHandle,
   SettingsDialogProps
 >(function SettingsPage(
-  { open, onOpenChange, defaultTab = "general", onSignOut },
+  { open, onOpenChange, defaultTab = "general", focusSection, onSignOut },
   ref,
 ) {
   const { t } = useTranslation();
@@ -110,8 +117,9 @@ export const SettingsPage = forwardRef<
 
   useEffect(() => {
     if (open) {
-      const normalizedTab =
-        defaultTab === "proxy" || defaultTab === "tunnel" || defaultTab === "backup"
+      const normalizedTab = focusSection
+        ? SERVER_SETTINGS_SECTIONS[focusSection]
+        : defaultTab === "proxy" || defaultTab === "tunnel" || defaultTab === "backup"
           ? "advanced"
           : defaultTab === "router" || defaultTab === "diagnostics"
             ? "share"
@@ -120,7 +128,7 @@ export const SettingsPage = forwardRef<
       advancedBaselineRef.current = null;
       setPendingNavigation(null);
     }
-  }, [open, defaultTab]);
+  }, [open, defaultTab, focusSection]);
 
   useEffect(() => {
     if (
@@ -149,6 +157,24 @@ export const SettingsPage = forwardRef<
       tabScrollContainerRef.current.scrollTop = 0;
     }
   }, [activeTab]);
+
+  // Deep link: once the section's tab has rendered, bring it into view and
+  // move focus there so keyboard and screen-reader users land on it too.
+  const focusedSectionRef = useRef<string | null>(null);
+  const settingsReady = Boolean(settings);
+  useEffect(() => {
+    if (!open || !focusSection || !settingsReady) return;
+    if (activeTab !== SERVER_SETTINGS_SECTIONS[focusSection]) return;
+    if (focusedSectionRef.current === focusSection) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(focusSection);
+      if (!target) return;
+      focusedSectionRef.current = focusSection;
+      target.scrollIntoView({ block: "start" });
+      target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeTab, focusSection, open, settingsReady]);
 
   const closeAfterSave = useCallback(() => {
     onOpenChange(false);
@@ -308,6 +334,7 @@ export const SettingsPage = forwardRef<
                     <ThemeSettings />
                     <ServerSecuritySettings />
                     <ServerVersionSettings />
+                    <ServerStorageSettings />
                     <ServerUpgradePolicySettings />
                   </motion.div>
                 ) : (

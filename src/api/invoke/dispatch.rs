@@ -91,6 +91,16 @@ async fn web_invoke_dispatch(
                     .await?;
             Ok(json!(response.0))
         }
+        "get_server_store_authority" => {
+            crate::api::server_store::authority_snapshot(state).await
+        }
+        "request_server_store_activation" => {
+            let restart = args.get("restart").and_then(Value::as_bool).unwrap_or(true);
+            crate::api::server_store::request_activation(state, headers, restart).await
+        }
+        "cancel_server_store_activation" => {
+            crate::api::server_store::cancel_activation(state).await
+        }
         "rollback_server_service" => {
             let response =
                 crate::api::self_update::admin_rollback(State(state.clone()), headers.clone())
@@ -711,8 +721,14 @@ async fn web_invoke_dispatch(
         }
         "get_share_value_quota_status" => {
             let id=web_arg_share_id(&args)?;
-            Ok(json!({"items":state.value_quota_statuses(&id).await.map_err(ApiError::internal)?,
-                "diagnostics":state.value_quota_diagnostics(&id).map_err(ApiError::internal)?}))
+            let mut response=json!({"items":state.value_quota_statuses(&id).await.map_err(ApiError::internal)?});
+            // Without a committed ledger there is nothing to diagnose; the rows
+            // already say `unavailable`, so the status call itself succeeds.
+            match state.value_quota_diagnostics(&id) {
+                Ok(diagnostics)=>response["diagnostics"]=diagnostics,
+                Err(error)=>tracing::debug!(%error,share_id=%id,"USD quota diagnostics are unavailable"),
+            }
+            Ok(response)
         }
         "edit_share_value_quota_usage" => {
             let id=web_arg_share_id(&args)?;

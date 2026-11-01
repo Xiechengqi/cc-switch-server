@@ -6911,6 +6911,20 @@ impl ServerStateInner {
         });
         let sqlite_activation_requested =
             crate::repository::server_sqlite::authority_activation_requested();
+        let sqlite_activation_request = if sqlite_committed {
+            None
+        } else {
+            match crate::repository::server_sqlite::read_activation_request(&config_dir) {
+                Ok(request) => request.filter(|request| {
+                    request.status
+                        == crate::repository::server_sqlite::ActivationRequestStatus::Pending
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "ignoring an unreadable SQLite authority activation request");
+                    None
+                }
+            }
+        };
         if sqlite_committed {
             crate::repository::server_sqlite::activate_authority(&config_dir)
                 .context("resume committed Server SQLite authority cleanup")?;
@@ -7055,22 +7069,79 @@ impl ServerStateInner {
                     usage: &usage,
                 },
             );
+            let legacy_stores_empty =
+                crate::repository::server_sqlite::fresh_install_activation_enabled()
+                    && providers.providers.is_empty()
+                    && accounts.accounts.is_empty()
+                    && shares.shares.is_empty()
+                    && usage.logs.is_empty();
+            let activation_trigger = crate::repository::server_sqlite::ActivationTrigger::decide(
+                sqlite_roll_forward_required,
+                sqlite_activation_requested,
+                sqlite_activation_request.is_some(),
+                legacy_stores_empty,
+            );
+            let record_activation_failure = |error: &anyhow::Error| {
+                let Some(request) = sqlite_activation_request.as_ref() else {
+                    return;
+                };
+                let failed = crate::repository::server_sqlite::ActivationRequest {
+                    status: crate::repository::server_sqlite::ActivationRequestStatus::Failed,
+                    failed_at_ms: Some(crate::infra::time::now_ms() as i64),
+                    error: Some(format!("{error:#}")),
+                    ..request.clone()
+                };
+                if let Err(write_error) =
+                    crate::repository::server_sqlite::write_activation_request(&config_dir, &failed)
+                {
+                    tracing::warn!(error = %write_error, "failed to record the SQLite authority activation failure");
+                }
+            };
             match shadow_result {
-                Ok(report) if sqlite_roll_forward_required || sqlite_activation_requested => {
-                    let marker = crate::repository::server_sqlite::activate_authority(&config_dir)
-                        .context("commit Server SQLite authority migration")?;
-                    tracing::info!(
-                        provider_count = report.provider_count,
-                        account_count = report.account_count,
-                        share_count = report.share_count,
-                        usage_count = report.usage_count,
-                        source_file_count = report.source_file_count,
-                        credentials_verified = report.credentials_verified,
-                        source_digest = %report.source_digest,
-                        committed_at_ms = marker.committed_at_ms,
-                        legacy_backup_dir = marker.legacy_backup_dir.as_deref().unwrap_or("none"),
-                        "committed the transactional SQLite authority"
-                    );
+                Ok(report) if activation_trigger.is_some() => {
+                    let trigger = activation_trigger.expect("checked above");
+                    match crate::repository::server_sqlite::activate_authority(&config_dir) {
+                        Ok(marker) => {
+                            if let Err(error) =
+                                crate::repository::server_sqlite::clear_activation_request(
+                                    &config_dir,
+                                )
+                            {
+                                tracing::warn!(%error, "SQLite authority committed but its activation request could not be removed");
+                            }
+                            tracing::info!(
+                                trigger = ?trigger,
+                                provider_count = report.provider_count,
+                                account_count = report.account_count,
+                                share_count = report.share_count,
+                                usage_count = report.usage_count,
+                                source_file_count = report.source_file_count,
+                                credentials_verified = report.credentials_verified,
+                                source_digest = %report.source_digest,
+                                committed_at_ms = marker.committed_at_ms,
+                                legacy_backup_dir =
+                                    marker.legacy_backup_dir.as_deref().unwrap_or("none"),
+                                "committed the transactional SQLite authority"
+                            );
+                        }
+                        Err(error) => {
+                            let authority_after =
+                                crate::repository::server_sqlite::read_marker(&config_dir)
+                                    .ok()
+                                    .flatten()
+                                    .map(|marker| marker.authority);
+                            if !trigger.tolerates_failure(authority_after) {
+                                return Err(error)
+                                    .context("commit Server SQLite authority migration");
+                            }
+                            record_activation_failure(&error);
+                            tracing::warn!(
+                                trigger = ?trigger,
+                                error = %format!("{error:#}"),
+                                "SQLite authority activation failed before it was prepared; legacy stores remain authoritative"
+                            );
+                        }
+                    }
                 }
                 Ok(report) => tracing::info!(
                     provider_count = report.provider_count,
@@ -7082,15 +7153,21 @@ impl ServerStateInner {
                     source_digest = %report.source_digest,
                     "verified the transactional SQLite shadow store"
                 ),
-                Err(error) if sqlite_roll_forward_required || sqlite_activation_requested => {
+                Err(error)
+                    if activation_trigger
+                        == Some(crate::repository::server_sqlite::ActivationTrigger::Required) =>
+                {
                     return Err(error).context(
                         "SQLite authority activation was requested but its shadow is invalid",
                     );
                 }
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    "SQLite shadow import failed; legacy stores remain authoritative"
-                ),
+                Err(error) => {
+                    record_activation_failure(&error);
+                    tracing::warn!(
+                        error = %error,
+                        "SQLite shadow import failed; legacy stores remain authoritative"
+                    );
+                }
             }
         }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
@@ -19993,6 +20070,12 @@ pub async fn refresh_router_installation_registration(state: &ServerState) -> bo
             false
         }
     }
+}
+
+/// Lets the shipped binary commit the SQLite authority of an empty data
+/// directory at startup (see `ActivationTrigger::FreshInstall`).
+pub fn enable_fresh_install_sqlite_authority() {
+    crate::repository::server_sqlite::enable_fresh_install_activation();
 }
 
 pub async fn restore_tunnels(state: ServerState) {

@@ -153,7 +153,9 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 Router Owner 的执行价目面板提供逐模型／tier/context 费率表单和高级 JSON。费率表单为美元／百万 Token，wire 仍为整数微美元。同名参考价只能生成待审草稿，不能自动证明 cache TTL、长上下文或 tier；未覆盖模型和未知费率不得猜为零。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
 
-现有 `shadow_verified` 不代表完成 SQLite 权威迁移。操作人应先安排停服、确认实际配置目录／运行用户／密钥环境、做完整安全备份，然后按 [官方 Server SQLite Authority 迁移](../guide/data-migration.md#server-sqlite-authority) 先运行只读 `config migrate-server-store`，通过后显式 `--apply`，再重启并验证旧授权、Provider 和用量。命令需持有独占目录锁，禁止在线强改 marker。Provider S1→S2 前提必须满足，备份和密钥按凭据管理。
+现有 `shadow_verified` 不代表完成 SQLite 权威迁移。空数据目录首次启动直接提交；已有数据的 Server 由管理员在「设置 → 通用 → 数据存储」点「迁移并重启」（一次性请求，下次启动在目录锁内执行，`prepared` 前失败则保留 legacy 并显示原因），或按 [官方 Server SQLite Authority 迁移](../guide/data-migration.md#server-sqlite-authority) 停服运行 `config migrate-server-store --apply`。禁止在线强改 marker。迁移后重启并验证旧授权、Provider 和用量。
+
+未提交时，价目同步与水位同步在 `router_supports_value_quotas` 直接跳过（每进程记一条 info 日志）；`get_share_value_quota_status` 省略 `diagnostics` 而不是返回 500。预览中 `acknowledged_tariff` 失败时带 `blockedBy`：存储未提交为 `sqlite_authority`，Router 未协商为 `router_protocol`，经 Router 代理且价目未发布时为 `tariff_published`（Router 补充）。界面只把无 `blockedBy`（或其阻塞项已通过）的失败项当作根因，按 router_protocol、sqlite_authority、metering_storage、tariff_published、acknowledged_tariff、text_surface 排序，行内显示首个根因及 +N，其余列为「等待：…」。
 
 部署顺序为 Router 再 Server。Owner 明确审核并发布真实执行模型／响应别名的完整价目，等生效、安装及 ACK 激活后，在对应 Share 重新检查；用户策略仍须单独确认覆盖起点或排期。故障不能靠删除 ledger、恢复旧库或清除安全标记绕过。此代码变更未自动切换任何生产存储或发布估值；真实灰度继续 `live_pending`。
 

@@ -1013,6 +1013,30 @@
       "notes": "Web invoke bridge for admin restart; works on client tunnel where /api/admin/restart may be unavailable."
     },
     {
+      "name": "get_server_store_authority",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/get_server_store_authority",
+      "notes": "Read-only Server SQLite authority state, shadow freshness and any pending or failed activation request."
+    },
+    {
+      "name": "request_server_store_activation",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/request_server_store_activation",
+      "notes": "Records a one-shot SQLite authority activation for the next start and, by default, restarts the Server to apply it."
+    },
+    {
+      "name": "cancel_server_store_activation",
+      "support": "native",
+      "implemented": true,
+      "feature": "settings",
+      "endpoint": "POST /web-api/invoke/cancel_server_store_activation",
+      "notes": "Clears a pending or failed SQLite authority activation request."
+    },
+    {
       "name": "rollback_server_service",
       "support": "native",
       "implemented": true,

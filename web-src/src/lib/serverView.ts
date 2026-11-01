@@ -1,6 +1,18 @@
 export const SERVER_VIEW_STORAGE_KEY = "cc-switch-server-view";
 export const SERVER_VIEW_QUERY_PARAM = "view";
 export const SERVER_VIEW_EMBED_PARAM = "embed";
+export const SERVER_SETTINGS_SECTION_PARAM = "section";
+
+/**
+ * Settings sections other UI may link to, as `?view=settings&section=<id>`.
+ * Each id is also the section's DOM id; the value is the tab that holds it.
+ */
+export const SERVER_SETTINGS_SECTIONS = {
+  "server-storage": "general",
+} as const;
+export type ServerSettingsSection = keyof typeof SERVER_SETTINGS_SECTIONS;
+export const SERVER_STORAGE_SETTINGS_SECTION: ServerSettingsSection =
+  "server-storage";
 
 export const SERVER_VIEWS = [
   "providers",
@@ -28,6 +40,42 @@ export function requestedServerView(
   const params = new URLSearchParams(query);
   const view = params.get(SERVER_VIEW_QUERY_PARAM);
   return isServerView(view) ? view : null;
+}
+
+export function isServerSettingsSection(
+  value: string | null | undefined,
+): value is ServerSettingsSection {
+  return !!value && Object.prototype.hasOwnProperty.call(SERVER_SETTINGS_SECTIONS, value);
+}
+
+/** The settings section a deep link asks for; only with `view=settings`. */
+export function requestedSettingsSection(
+  search: string | null | undefined,
+): ServerSettingsSection | null {
+  if (requestedServerView(search) !== "settings") return null;
+  const query = search!.startsWith("?") ? search!.slice(1) : search!;
+  const section = new URLSearchParams(query).get(SERVER_SETTINGS_SECTION_PARAM);
+  return isServerSettingsSection(section) ? section : null;
+}
+
+/**
+ * This page's URL opened on one settings section. Other query parameters are
+ * kept; an embed flag and any hash are dropped.
+ */
+export function serverSettingsSectionUrl(
+  section: ServerSettingsSection,
+  href: string,
+): string {
+  try {
+    const url = new URL(href);
+    url.searchParams.set(SERVER_VIEW_QUERY_PARAM, "settings");
+    url.searchParams.set(SERVER_SETTINGS_SECTION_PARAM, section);
+    url.searchParams.delete(SERVER_VIEW_EMBED_PARAM);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return `?${SERVER_VIEW_QUERY_PARAM}=settings&${SERVER_SETTINGS_SECTION_PARAM}=${section}`;
+  }
 }
 
 /**

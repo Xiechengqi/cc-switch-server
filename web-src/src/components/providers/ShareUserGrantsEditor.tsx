@@ -392,7 +392,8 @@ export function ShareUserGrantsEditor({
   const readiness = useShareValueReadiness(shareId, configRevision, { enabled: dialogOpen, poll: dialogOpen && (usdSelected || hasUsdGrant) });
   const singlePreview = useShareValuePreview(shareId, configRevision, readiness.key, singleUsdPolicies);
   const batchPreview = useShareValuePreview(shareId, configRevision, readiness.key, batchUsdPolicies);
-  const valueStatus = useShareValueStatus(shareId, configRevision != null);
+  // USD usage rows only matter once some user has (or is being given) a USD quota.
+  const valueStatus = useShareValueStatus(shareId, configRevision != null && (hasUsdGrant || usdSelected));
   const [applying, setApplying] = useState(false);
   const [amountAttempted, setAmountAttempted] = useState(false);
   const [correctionEmail, setCorrectionEmail] = useState<string | null>(null);

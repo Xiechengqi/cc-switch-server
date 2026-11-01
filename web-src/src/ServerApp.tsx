@@ -36,8 +36,10 @@ import { clearRouterSessionTokens } from "@/lib/routerAuth";
 import { writeToken } from "@/lib/runtime";
 import {
   isEmbeddedServerView,
+  requestedSettingsSection,
   resolveInitialServerView,
   SERVER_VIEW_STORAGE_KEY,
+  type ServerSettingsSection,
   type ServerView,
 } from "@/lib/serverView";
 import { cn } from "@/lib/utils";
@@ -70,6 +72,14 @@ export default function ServerApp({
   );
   const [settingsDefaultTab, setSettingsDefaultTab] =
     useState<SettingsTab>("general");
+  // `?view=settings&section=server-storage` scrolls to that section once;
+  // opening Settings from the toolbar clears it.
+  const [settingsSection, setSettingsSection] =
+    useState<ServerSettingsSection | null>(() =>
+      typeof window === "undefined"
+        ? null
+        : requestedSettingsSection(window.location.search),
+    );
   const settingsPageRef = useRef<SettingsPageHandle>(null);
   const [embedded] = useState(() =>
     typeof window === "undefined"
@@ -105,6 +115,7 @@ export default function ServerApp({
 
   const openSettings = useCallback((tab: SettingsTab) => {
     setSettingsDefaultTab(tab);
+    setSettingsSection(null);
     setCurrentView("settings");
   }, []);
 
@@ -124,6 +135,7 @@ export default function ServerApp({
           open
           onOpenChange={() => setCurrentView("providers")}
           defaultTab={settingsDefaultTab}
+          focusSection={settingsSection}
           onSignOut={handleSignOut}
         />
       );

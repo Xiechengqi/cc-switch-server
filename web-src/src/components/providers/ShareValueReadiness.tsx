@@ -1,19 +1,20 @@
 // Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V4 · component-scope; Server UI tokens.
 import { useId, type ReactNode } from "react";
-import { Info } from "lucide-react";
+import { ExternalLink, Info } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { SERVER_STORAGE_SETTINGS_SECTION, serverSettingsSectionUrl } from "@/lib/serverView";
 import {
-  formatValueTime, valueErrorMessage, valueInvalidRowMessage, valueLimitLabel, valuePreviewBlocker, valueQuotaAvailability, valueRowKind,
+  formatValueTime, valueCheckBlocker, valueErrorMessage, valueFailedChecks, valueReadinessRoots, valueReadinessSummary, VALUE_CHECK_ORDER, valueInvalidRowMessage, valueLimitLabel, valuePreviewBlocker, valueQuotaAvailability, valueRowKind,
   valueStateKey, valueStateName, valueStatusReason, valueUsageLabel, VALUE_STATUS_STALE_MS, type ValueMessage, type ValuePreviewRow,
   type ValueStatus,
 } from "@/lib/share-value-quota";
 import type { useShareValueReadiness, ValuePreviewState } from "./shareValueHooks";
 
 export type ShareQuotaUnit = "tokens" | "usdEquivalent";
-const CHECK_CODES = ["router_protocol", "sqlite_authority", "metering_storage", "acknowledged_tariff", "text_surface"];
+const isKnownCheck = (code: string) => (VALUE_CHECK_ORDER as readonly string[]).includes(code);
 
 export function useValueMessage() {
   const { t } = useTranslation();
@@ -76,27 +77,51 @@ export function ShareValueUnitToggle({ value, onChange, usdDisabled, disabled, l
   </>;
 }
 
-/** Silent when ready or unknown; one line with the checklist behind ⓘ when not. */
+const linkClass = "rounded px-1 font-medium text-blue-600 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:opacity-50 dark:text-blue-400";
+
+/**
+ * Silent when ready or unknown. When not, one line naming the first root cause
+ * ("Server storage migration required +1") with the full checklist behind ⓘ;
+ * checks that only wait on another failing check are marked as such there.
+ * A request failure keeps the generic line, since the checklist may be stale.
+ */
 export function ShareValueReadiness({ state, id }: { state: ReturnType<typeof useShareValueReadiness>; id?: string }) {
   const { t } = useTranslation(); const prefix = "share.userLimit.valueQuota.readiness.";
   if (!state.unavailable) return null;
-  const failed = state.preview?.checks?.filter((check) => !check.ready) ?? [];
+  const failed = valueFailedChecks(state.preview?.checks);
+  const summary = state.error ? undefined : valueReadinessSummary(failed);
+  const rootCode = summary && isKnownCheck(summary.root.code) ? summary.root.code : undefined;
+  const shortName = (code: string) => isKnownCheck(code) ? t(prefix + "root." + code) : code;
+  // Any root storage cause gets the fix link. It opens beside the Share editor so its unsaved draft survives.
+  const storageHref = summary && valueReadinessRoots(failed).some((check) => check.code === "sqlite_authority") ? serverSettingsSectionUrl(SERVER_STORAGE_SETTINGS_SECTION, window.location.href) : undefined;
   return <div className="flex flex-wrap items-center gap-x-1 text-xs text-muted-foreground" role="status" aria-busy={state.loading}>
-    <span id={id} className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-amber-500" />{t("share.userLimit.valueQuota.unavailable")}</span>
+    <span id={id} className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+      {rootCode ? t(prefix + "root." + rootCode) : t("share.userLimit.valueQuota.unavailable")}
+      {rootCode && summary!.more > 0 ? <span className="font-medium">{t(prefix + "more", { count: summary!.more })}</span> : null}
+    </span>
     <ShareValueInfo label={t(prefix + "blocked")}>
       {state.error ? <p className="text-destructive">{t(prefix + state.error)}</p> : null}
       {failed.length ? <>
         <p>{t("share.userLimit.valueQuota.unavailableHint")}</p>
-        <ul className="list-disc space-y-1 pl-4">{failed.map((check, index) => <li key={`${check.code}:${index}`}>
-          {t(prefix + (CHECK_CODES.includes(check.code) ? check.code : "failed"))}
-          {check.code === "sqlite_authority" && check.state ? ` (${check.state})` : null}
-          {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
-        </li>)}</ul>
+        <ul className="list-disc space-y-1 pl-4">{failed.map((check, index) => {
+          const blocker = valueCheckBlocker(check, failed);
+          return <li key={`${check.code}:${index}`} className={cn(blocker && "text-muted-foreground")}>
+            {t(prefix + (isKnownCheck(check.code) ? check.code : "failed"))}
+            {check.code === "sqlite_authority" && check.state ? ` (${check.state})` : null}
+            {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
+            {blocker ? <span className="block italic">{t(prefix + "waitingOn", { blocker: shortName(blocker) })}</span> : null}
+          </li>;
+        })}</ul>
       </> : null}
     </ShareValueInfo>
+    {storageHref ? <>
+      <span aria-hidden="true">·</span>
+      <a href={storageHref} target="_blank" rel="noopener noreferrer" className={cn(linkClass, "inline-flex items-center gap-1")}>
+        {t(prefix + "openStorage")}<ExternalLink className="h-3 w-3" aria-hidden="true" /><span className="sr-only">{t(prefix + "opensNewTab")}</span>
+      </a>
+    </> : null}
     <span aria-hidden="true">·</span>
-    <button type="button" disabled={state.loading} onClick={state.retry}
-      className="rounded px-1 font-medium text-blue-600 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:opacity-50 dark:text-blue-400">
+    <button type="button" disabled={state.loading} onClick={state.retry} className={linkClass}>
       {t(prefix + "retry")}
     </button>
   </div>;

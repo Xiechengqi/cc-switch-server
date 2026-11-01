@@ -981,6 +981,40 @@
       "intervalDescription": "Default 60 minutes, minimum 5 minutes.",
       "intervalTitle": "Auto-check interval (minutes)",
       "title": "Upgrade Policy"
+    },
+    "serverStorage": {
+      "title": "資料儲存",
+      "authority": {
+        "committed": "SQLite（交易式儲存）",
+        "shadow_verified": "舊版 JSON 檔案 · SQLite 副本已驗證",
+        "legacy": "舊版 JSON 檔案 · 尚未建立 SQLite 副本",
+        "prepared": "遷移進行中 · 下次啟動時完成",
+        "unknown": "未知儲存狀態（{{value}}）"
+      },
+      "loadFailed": "無法讀取儲存狀態。",
+      "why": "美元等值額度與交易式寫入需要 SQLite 作為 Server 的唯一儲存。",
+      "what": "遷移會重新啟動 Server，代理會短暫中斷（通常幾秒）。啟動時會驗證或重建 SQLite 副本，在 migration-backups/ 下保留 JSON 檔案的唯讀備份，然後完成切換。此操作不可逆，回退需使用命令列（config migrate-server-store --rollback-export）。",
+      "counts": "待遷移：{{providers}} 個 Provider · {{accounts}} 個帳號 · {{shares}} 個 Share · {{usageRecords}} 筆用量紀錄",
+      "shadowStale": "SQLite 副本落後於 JSON 檔案，遷移時會自動重建，無需事先處理。",
+      "shadowError": "上次 SQLite 副本檢查：{{error}}",
+      "migrating": "SQLite 已準備就緒，將在 Server 下次啟動時完成切換。",
+      "pending": "{{by}} 於 {{time}} 請求了遷移，將在 Server 下次啟動時執行。",
+      "failed": "遷移於 {{time}} 失敗。Server 已繼續使用 JSON 檔案執行，資料未受影響。",
+      "migrate": "遷移並重新啟動",
+      "retry": "重試遷移",
+      "cancel": "撤銷請求",
+      "restartNow": "立即重新啟動",
+      "restartConfirmMessage": "現在重新啟動 Server 以執行已請求的儲存遷移？代理會短暫中斷（通常幾秒）。",
+      "confirmTitle": "將儲存遷移到 SQLite？",
+      "confirmMessage": "Server 將立即重新啟動，並在啟動過程中完成遷移。代理會短暫中斷（通常幾秒）。\n\nJSON 檔案的唯讀備份會保留在 migration-backups/ 下。此切換不可逆，回退需使用命令列。",
+      "restarting": "已請求遷移，正在重新啟動 Server…",
+      "restartFailed": "Server 重新啟動失敗：{{error}}。遷移將在下次啟動時執行。",
+      "restartNotScheduled": "未能安排重新啟動，遷移將在 Server 下次啟動時執行。",
+      "alreadyCommitted": "儲存已切換到 SQLite。",
+      "cancelled": "已撤銷遷移請求。",
+      "waiting": "正在重新啟動並遷移… Server 恢復後頁面會自動重新整理。",
+      "committedAt": "遷移時間",
+      "backupDir": "JSON 備份"
     }
   },
   "share": {
@@ -1145,7 +1179,7 @@
           "failed": "檢查失敗，請重試或查看 Server 診斷。",
           "upgrade": "請升級 Server 至支援美元額度就緒診斷的版本。",
           "router_protocol": "尚未協商 Router 協定 v10 的金額額度能力。",
-          "sqlite_authority": "Server SQLite 尚非權威儲存，需按維護流程完成切換。",
+          "sqlite_authority": "Server 尚未以 SQLite 作為權威儲存，請在 設定 → 通用 → 資料儲存 中完成遷移。",
           "metering_storage": "計量儲存異常，請檢查並復原 Server 儲存。",
           "acknowledged_tariff": "Server 尚無已確認且生效的執行價目。",
           "text_surface": "此執行時綁定尚未通過文字金額計量驗證：",
@@ -1153,7 +1187,20 @@
           "timeout": "Server 回應逾時，請重試。",
           "controlAuth": "目前工作階段無權執行此檢查，請重新登入。",
           "invalidResponse": "Server 傳回無效的檢查結果，請升級或重試。",
-          "conflict": "Share 設定已變更，請重新載入後再試。"
+          "conflict": "Share 設定已變更，請重新載入後再試。",
+          "tariff_published": "Router 尚未為此 Server 發布執行價目。",
+          "root": {
+            "router_protocol": "Router 尚未啟用美元額度",
+            "sqlite_authority": "需完成 Server 儲存遷移",
+            "metering_storage": "計量儲存異常",
+            "tariff_published": "Router 尚未發布執行價目",
+            "acknowledged_tariff": "等待 Server 確認價目",
+            "text_surface": "有 Provider 不支援美元計量"
+          },
+          "more": "+{{count}} 項",
+          "waitingOn": "需先解決：{{blocker}}",
+          "openStorage": "前往儲存設定",
+          "opensNewTab": "（在新分頁開啟）"
         },
         "remaining": "剩餘等值額度：{{amount}}",
         "exhausted": "已用盡",

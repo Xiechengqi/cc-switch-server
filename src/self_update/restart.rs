@@ -15,6 +15,9 @@ use crate::self_update::version::{
 const HELPER_SPEC_FILENAME: &str = "upgrade-helper.json";
 const RESTART_OPERATION_FILENAME: &str = "restart-operation.json";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(45);
+/// A start that commits the SQLite authority does so before it listens, so
+/// its first health answer can take much longer than a plain restart's.
+const MIGRATION_HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
 const PROCESS_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_DETECTION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -572,7 +575,27 @@ pub fn run_update_helper(spec_path: &Path) -> anyhow::Result<()> {
 }
 
 fn run_update_helper_inner(spec_path: &Path, spec: &UpdateHelperSpec) -> anyhow::Result<()> {
-    run_update_helper_inner_with_timeout(spec_path, spec, HEALTH_TIMEOUT)
+    run_update_helper_inner_with_timeout(spec_path, spec, health_timeout_for(&spec.config_dir))
+}
+
+/// Stopping a replacement that is still migrating would leave the Server down
+/// (a restart-only helper has nothing to roll back to), so wait longer when
+/// the next start will commit or roll forward the SQLite authority.
+fn health_timeout_for(config_dir: &Path) -> Duration {
+    use crate::repository::server_sqlite;
+    let request_pending = server_sqlite::read_activation_request(config_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|request| request.status == server_sqlite::ActivationRequestStatus::Pending);
+    let roll_forward = server_sqlite::read_marker(config_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|marker| marker.authority == server_sqlite::AuthorityState::Prepared);
+    if request_pending || roll_forward {
+        MIGRATION_HEALTH_TIMEOUT
+    } else {
+        HEALTH_TIMEOUT
+    }
 }
 
 fn run_update_helper_inner_with_timeout(
@@ -1254,6 +1277,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn health_window_widens_only_while_a_migration_is_due() {
+        use crate::repository::server_sqlite::{
+            clear_activation_request, write_activation_request, ActivationRequest,
+            ActivationRequestStatus,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-server-migration-health-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(health_timeout_for(&dir), HEALTH_TIMEOUT);
+        let mut request = ActivationRequest {
+            status: ActivationRequestStatus::Pending,
+            requested_at_ms: 1,
+            requested_by: "owner@example.com".into(),
+            failed_at_ms: None,
+            error: None,
+        };
+        write_activation_request(&dir, &request).unwrap();
+        assert_eq!(health_timeout_for(&dir), MIGRATION_HEALTH_TIMEOUT);
+        request.status = ActivationRequestStatus::Failed;
+        write_activation_request(&dir, &request).unwrap();
+        assert_eq!(health_timeout_for(&dir), HEALTH_TIMEOUT);
+        clear_activation_request(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

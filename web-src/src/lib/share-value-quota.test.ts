@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
   parseValueLimitInput, valueLimitLabel, valueRowKind, valuePreviewNeedsConfirmation, valuePreviewBlocker, valueErrorMessage, valueRequestError, ValueQuotaResponseError,
-  splitValueRows, mergeValueRows, valueStatusReason, VALUE_STATUS_STALE_MS } from "./share-value-quota";
+  splitValueRows, mergeValueRows, valueStatusReason, VALUE_STATUS_STALE_MS,
+  valueFailedChecks, valueCheckBlocker, valueReadinessRoots, valueReadinessSummary, type ValueCheck } from "./share-value-quota";
 import { applyShareUserPolicyBatch, patchedSharePolicy } from "../components/providers/share-user-policy-batch";
 import { stageGrantPolicy } from "../utils/shareFormUtils";
 import { normalizeShareRecord, normalizeShareRecords } from "../utils/shareRecordNormalize";
@@ -21,6 +22,35 @@ describe("Share USD-equivalent quotas", () => {
     expect(valueCapabilityReady({...preview,checks:[...checks,{code:"text_surface",ready:false}]})).toBe(false);
     expect(isValuePreview({...preview,configRevision:7},7)).toBe(true);
     for(const invalid of [null,{},[],{ready:true,configRevision:6,rows:[]},{ready:true,configRevision:7,rows:[],checks:[null]}])expect(isValuePreview(invalid,7)).toBe(false);
+  });
+  it("names the root cause of an unready USD quota, not its consequences",()=>{
+    const fail=(code:string,blockedBy?:string):ValueCheck=>({code,ready:false,...(blockedBy?{blockedBy}:{})});
+    const ok=(code:string):ValueCheck=>({code,ready:true});
+    // Storage not committed: the tariff check only waits on it.
+    const storage=[ok("router_protocol"),fail("acknowledged_tariff","sqlite_authority"),fail("sqlite_authority"),ok("metering_storage"),ok("text_surface")];
+    expect(valueReadinessRoots(storage).map(c=>c.code)).toEqual(["sqlite_authority"]);
+    expect(valueReadinessSummary(storage)).toEqual({root:storage[2],more:0});
+    expect(valueCheckBlocker(storage[1],storage)).toBe("sqlite_authority");
+    expect(valueFailedChecks(storage).map(c=>c.code)).toEqual(["sqlite_authority","acknowledged_tariff"]);
+    // A blocker that passes (or is missing) no longer hides the check.
+    const cleared=[ok("sqlite_authority"),fail("acknowledged_tariff","sqlite_authority")];
+    expect(valueReadinessRoots(cleared).map(c=>c.code)).toEqual(["acknowledged_tariff"]);
+    expect(valueCheckBlocker(cleared[1],cleared)).toBeUndefined();
+    expect(valueReadinessRoots([fail("acknowledged_tariff","router_protocol")]).map(c=>c.code)).toEqual(["acknowledged_tariff"]);
+    expect(valueCheckBlocker(fail("sqlite_authority","sqlite_authority"),[fail("sqlite_authority","sqlite_authority")])).toBeUndefined();
+    // Chains resolve to their start; fix-first order, unknown codes last, +N counts other root codes.
+    const mixed=[fail("future_check"),fail("text_surface"),fail("acknowledged_tariff","tariff_published"),fail("tariff_published","router_protocol"),
+      fail("metering_storage"),fail("router_protocol"),ok("sqlite_authority"),fail("text_surface")];
+    expect(valueReadinessRoots(mixed).map(c=>c.code)).toEqual(["router_protocol","metering_storage","text_surface","text_surface","future_check"]);
+    expect(valueReadinessSummary(mixed)).toEqual({root:mixed[5],more:3});
+    expect(valueFailedChecks(mixed).map(c=>c.code)).toEqual(["router_protocol","metering_storage","tariff_published","acknowledged_tariff","text_surface","text_surface","future_check"]);
+    // Several unverified bindings are one cause.
+    expect(valueReadinessSummary([fail("text_surface"),fail("text_surface")])?.more).toBe(0);
+    // A blocker cycle must not hide every failure.
+    expect(valueReadinessRoots([fail("a","b"),fail("b","a")]).map(c=>c.code)).toEqual(["a","b"]);
+    expect(valueReadinessSummary([ok("router_protocol")])).toBeUndefined();
+    expect(valueReadinessSummary(undefined)).toBeUndefined();
+    expect(valueReadinessRoots([null as unknown as ValueCheck,fail("sqlite_authority")]).map(c=>c.code)).toEqual(["sqlite_authority"]);
   });
   it("keeps micro limits and pico usage exact without wallet conversion", () => {
     expect(parseValueLimit("0.000001")).toBe("1");

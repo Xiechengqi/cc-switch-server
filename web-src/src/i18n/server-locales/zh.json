@@ -981,6 +981,40 @@
       "intervalDescription": "默认 60 分钟，最小 5 分钟。",
       "intervalTitle": "自动检查间隔（分钟）",
       "title": "升级策略"
+    },
+    "serverStorage": {
+      "title": "数据存储",
+      "authority": {
+        "committed": "SQLite（事务存储）",
+        "shadow_verified": "旧版 JSON 文件 · SQLite 副本已校验",
+        "legacy": "旧版 JSON 文件 · 尚未建立 SQLite 副本",
+        "prepared": "迁移进行中 · 下次启动时完成",
+        "unknown": "未知存储状态（{{value}}）"
+      },
+      "loadFailed": "无法读取存储状态。",
+      "why": "美元等值额度和事务写入需要 SQLite 作为 Server 的唯一存储。",
+      "what": "迁移会重启 Server，代理会短暂中断（通常几秒）。启动时会校验或重建 SQLite 副本，在 migration-backups/ 下保留 JSON 文件的只读备份，然后完成切换。此操作不可逆，回退需使用命令行（config migrate-server-store --rollback-export）。",
+      "counts": "待迁移：{{providers}} 个 Provider · {{accounts}} 个账号 · {{shares}} 个 Share · {{usageRecords}} 条用量记录",
+      "shadowStale": "SQLite 副本落后于 JSON 文件，迁移时会自动重建，无需预先处理。",
+      "shadowError": "上次 SQLite 副本检查：{{error}}",
+      "migrating": "SQLite 已准备就绪，将在 Server 下次启动时完成切换。",
+      "pending": "{{by}} 于 {{time}} 请求了迁移，将在 Server 下次启动时执行。",
+      "failed": "迁移于 {{time}} 失败。Server 已继续使用 JSON 文件运行，数据未受影响。",
+      "migrate": "迁移并重启",
+      "retry": "重试迁移",
+      "cancel": "撤销请求",
+      "restartNow": "立即重启",
+      "restartConfirmMessage": "现在重启 Server 以执行已请求的存储迁移？代理会短暂中断（通常几秒）。",
+      "confirmTitle": "迁移存储到 SQLite？",
+      "confirmMessage": "Server 将立即重启，并在启动过程中完成迁移。代理会短暂中断（通常几秒）。\n\nJSON 文件的只读备份会保留在 migration-backups/ 下。此切换不可逆，回退需使用命令行。",
+      "restarting": "已请求迁移，正在重启 Server…",
+      "restartFailed": "Server 重启失败：{{error}}。迁移将在下次启动时执行。",
+      "restartNotScheduled": "未能安排重启，迁移将在 Server 下次启动时执行。",
+      "alreadyCommitted": "存储已切换到 SQLite。",
+      "cancelled": "已撤销迁移请求。",
+      "waiting": "正在重启并迁移… Server 恢复后页面会自动刷新。",
+      "committedAt": "迁移时间",
+      "backupDir": "JSON 备份"
     }
   },
   "share": {
@@ -1145,7 +1179,7 @@
           "failed": "检查失败，请重试或查看 Server 诊断。",
           "upgrade": "请升级 Server 至支持美元额度就绪诊断的版本。",
           "router_protocol": "尚未协商 Router 协议 v10 的金额额度能力。",
-          "sqlite_authority": "Server SQLite 尚非权威存储，需要按维护流程完成切换。",
+          "sqlite_authority": "Server 尚未以 SQLite 作为权威存储，请在 设置 → 通用 → 数据存储 中完成迁移。",
           "metering_storage": "计量存储异常，请检查并恢复 Server 存储。",
           "acknowledged_tariff": "Server 尚无已确认且生效的执行价目。",
           "text_surface": "此运行时绑定尚未通过文本金额计量验证：",
@@ -1153,7 +1187,20 @@
           "timeout": "Server 响应超时，请重试。",
           "controlAuth": "当前会话无权执行此检查，请重新登录。",
           "invalidResponse": "Server 返回无效的检查结果，请升级或重试。",
-          "conflict": "Share 设置已变化，请重新加载后再试。"
+          "conflict": "Share 设置已变化，请重新加载后再试。",
+          "tariff_published": "Router 尚未为此 Server 发布执行价目。",
+          "root": {
+            "router_protocol": "Router 尚未启用美元额度",
+            "sqlite_authority": "需完成 Server 存储迁移",
+            "metering_storage": "计量存储异常",
+            "tariff_published": "Router 尚未发布执行价目",
+            "acknowledged_tariff": "等待 Server 确认价目",
+            "text_surface": "有 Provider 不支持美元计量"
+          },
+          "more": "+{{count}} 项",
+          "waitingOn": "需先解决：{{blocker}}",
+          "openStorage": "前往存储设置",
+          "opensNewTab": "（在新标签页打开）"
         },
         "remaining": "剩余等值额度：{{amount}}",
         "exhausted": "已耗尽",

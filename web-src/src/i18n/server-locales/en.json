@@ -981,6 +981,40 @@
       "intervalDescription": "Default 60 minutes, minimum 5 minutes.",
       "intervalTitle": "Auto-check interval (minutes)",
       "title": "Upgrade Policy"
+    },
+    "serverStorage": {
+      "title": "Data storage",
+      "authority": {
+        "committed": "SQLite (transactional)",
+        "shadow_verified": "Legacy JSON files · SQLite copy verified",
+        "legacy": "Legacy JSON files · SQLite copy not built yet",
+        "prepared": "Migration in progress · finishes on the next start",
+        "unknown": "Unknown storage state ({{value}})"
+      },
+      "loadFailed": "Couldn't load the storage status.",
+      "why": "USD-equivalent quotas and transactional writes need SQLite as the Server's only store.",
+      "what": "Migrating restarts the Server; proxying pauses briefly, usually a few seconds. While starting it verifies or rebuilds the SQLite copy, keeps a read-only backup of the JSON files under migration-backups/, then switches over. It is one-way: going back needs the CLI (config migrate-server-store --rollback-export).",
+      "counts": "To migrate: {{providers}} providers · {{accounts}} accounts · {{shares}} shares · {{usageRecords}} usage records",
+      "shadowStale": "The SQLite copy is behind the JSON files. It is rebuilt during the migration, so nothing needs doing first.",
+      "shadowError": "Last SQLite copy check: {{error}}",
+      "migrating": "SQLite is prepared. The switch completes the next time the Server starts.",
+      "pending": "Migration requested {{time}} by {{by}}. It runs the next time the Server starts.",
+      "failed": "The migration failed {{time}}. The Server kept running on the JSON files; nothing was lost.",
+      "migrate": "Migrate and restart",
+      "retry": "Retry migration",
+      "cancel": "Cancel request",
+      "restartNow": "Restart now",
+      "restartConfirmMessage": "Restart the Server now to run the requested storage migration? Proxying pauses briefly, usually a few seconds.",
+      "confirmTitle": "Migrate storage to SQLite?",
+      "confirmMessage": "The Server restarts now and migrates while starting. Proxying pauses briefly, usually a few seconds.\n\nA read-only backup of the JSON files is kept under migration-backups/. The switch is one-way; going back needs the CLI.",
+      "restarting": "Migration requested. Restarting the Server…",
+      "restartFailed": "The Server couldn't restart: {{error}}. The migration will run on the next start.",
+      "restartNotScheduled": "No restart was scheduled. The migration will run the next time the Server starts.",
+      "alreadyCommitted": "Storage is already on SQLite.",
+      "cancelled": "Migration request cancelled.",
+      "waiting": "Restarting to migrate… This page reloads when the Server is back.",
+      "committedAt": "Migrated",
+      "backupDir": "JSON backup"
     }
   },
   "share": {
@@ -1145,7 +1179,7 @@
           "failed": "Readiness could not be checked. Retry or check Server diagnostics.",
           "upgrade": "Upgrade Server to a version with structured USD-quota readiness.",
           "router_protocol": "Router protocol v10 capability has not been negotiated.",
-          "sqlite_authority": "Server SQLite is not authoritative. Complete the controlled storage migration.",
+          "sqlite_authority": "Server SQLite is not authoritative yet. Migrate storage in Settings → General → Data storage.",
           "metering_storage": "Metering storage is unhealthy; inspect and recover Server storage.",
           "acknowledged_tariff": "No acknowledged, effective execution tariff is active on Server.",
           "text_surface": "This runtime binding is not verified for text value metering:",
@@ -1153,7 +1187,20 @@
           "timeout": "The Server did not respond in time. Please retry.",
           "controlAuth": "Your session is not authorized for this check. Sign in again.",
           "invalidResponse": "The Server returned an invalid readiness response. Upgrade or retry.",
-          "conflict": "Share settings changed. Reload the Share before retrying."
+          "conflict": "Share settings changed. Reload the Share before retrying.",
+          "tariff_published": "The Router has not published an execution tariff for this Server.",
+          "root": {
+            "router_protocol": "Router hasn't enabled USD quotas yet",
+            "sqlite_authority": "Server storage migration required",
+            "metering_storage": "Metering storage needs attention",
+            "tariff_published": "Router hasn't published a tariff yet",
+            "acknowledged_tariff": "Waiting for the Server to confirm the tariff",
+            "text_surface": "A Provider can't meter USD yet"
+          },
+          "more": "+{{count}} more",
+          "waitingOn": "Clears once this is fixed: {{blocker}}",
+          "openStorage": "Open storage settings",
+          "opensNewTab": "(opens in a new tab)"
         },
         "remaining": "Remaining equivalent quota: {{amount}}",
         "exhausted": "Limit reached",

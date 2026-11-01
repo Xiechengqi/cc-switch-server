@@ -29,6 +29,7 @@
 | `usage/` | 首次 SQLite 迁移前的用量账目；提交后移入只读 migration backup | 部分 |
 | `server-store.sqlite3` | providers/accounts/shares/usage 的事务型权威库与加密回滚 blob | 是 |
 | `server-store-migration.json` | SQLite schema、源摘要与 authority 状态 marker | 否 |
+| `server-store-activation-request.json` | Web 管理端提交的一次性 authority 切换请求（`pending`／`failed`），下次启动消费 | 否 |
 | `account-reset-restore-fence.json` | 恢复前独立持久化的quota stream/用券安全栅栏，不进入备份且禁止manifest覆盖 | 否 |
 | `share-value-quota-restore-fence.json` | USD 等值恢复安全边界；独立于备份，旧窗口不按零放行 | 含额度身份 |
 | `share-value-quota-degraded.json` | shadow 金额覆盖持久化故障标记，仅阻止 USD，不阻止 Token；禁止备份覆盖 | 否 |
@@ -39,9 +40,21 @@
 
 `store.json` 与 `.codex-workspace-rebind-transaction.json` 为迁移/事务过程文件，不是稳定契约。
 
-首次启动构建并验证 `shadow_verified`。显式设置
-`CC_SWITCH_SERVER_SQLITE_AUTHORITY=committed` 后，启动才经 `prepared` 原子推进到
-`committed`；一旦进入 prepared/committed，后续启动会强制 roll-forward。marker 为
+启动构建并验证 `shadow_verified` 后，以下任一触发会经 `prepared` 原子推进到
+`committed`（`ActivationTrigger`）：
+
+- **Required**：marker 已是 `prepared`（roll-forward），或显式设置
+  `CC_SWITCH_SERVER_SQLITE_AUTHORITY=committed`。失败即启动 fail closed。
+- **Requested**：Web 管理端「设置 → 通用 → 数据存储 → 迁移并重启」写入
+  `server-store-activation-request.json`（`pending`）后重启。成功后删除请求；若在 `prepared`
+  之前失败（shadow 无效、备份失败等），请求改为 `failed` 并带错误，Server 继续以 legacy
+  文件启动，管理端显示错误并可重试或取消。
+- **FreshInstall**：发布二进制（`main` 调用 `enable_fresh_install_sqlite_authority`）启动时，
+  providers／accounts／shares／usage 全空即直接提交，新装 Server 不再停在 shadow。以库方式
+  嵌入（测试）不启用该触发。
+
+后两者失败时只要 marker 仍是 `shadow_verified` 就不阻止启动；一旦进入 prepared/committed，
+后续启动会强制 roll-forward。marker 为
 `committed` 时 SQLite 是唯一权威；根目录下重新出现的旧 JSON/JSONL 不会被反向导入，
 并会在验证数据库后清理。`accounts.key` 始终留在数据库外。
 
@@ -143,13 +156,15 @@ Server 已持有数据目录独占锁后，启动会执行以下过程：
 3. 校验逐表计数、Provider/Account 关键 generation 哈希、foreign-key graph 与 `integrity_check`；
 4. Account/Provider payload 只能取自磁盘密文，禁止序列化内存明文；非空 Provider S1 会拒绝导入，须先迁到 S2；
 5. checkpoint、fsync 后原子替换影子数据库，原子写 `shadow_verified` marker；
-6. 管理员停服后运行 `cc-switch-server config migrate-server-store --apply`，或显式设置
-   `CC_SWITCH_SERVER_SQLITE_AUTHORITY=committed` 再启动，生成确定路径的只读 migration
-   backup，依次持久化 DB/marker 的 `prepared` 与 `committed`；
+6. 管理员在 Web 管理端请求「迁移并重启」、停服后运行
+   `cc-switch-server config migrate-server-store --apply`，或显式设置
+   `CC_SWITCH_SERVER_SQLITE_AUTHORITY=committed` 再启动（空数据目录的首次启动自动进行），
+   生成确定路径的只读 migration backup，依次持久化 DB/marker 的 `prepared` 与 `committed`；
 7. 验证 committed DB 后移除根目录 legacy 源，后续启动只从 SQLite 重建内存 Store。
 
-在临时库创建、事务提交或替换前失败不会改变上一个已验证数据库。任何切换失败都会
-使启动 fail closed；已有 `committed` marker 时禁止从旧文件反向覆盖数据库。
+在临时库创建、事务提交或替换前失败不会改变上一个已验证数据库。Required 触发的切换
+失败会使启动 fail closed，Requested／FreshInstall 在 `prepared` 前失败则保留 legacy 权威并
+记录原因；已有 `committed` marker 时禁止从旧文件反向覆盖数据库。
 
 ### 7.3 权威切换与崩溃状态机
 

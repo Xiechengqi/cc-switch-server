@@ -981,6 +981,40 @@
       "intervalDescription": "Default 60 minutes, minimum 5 minutes.",
       "intervalTitle": "Auto-check interval (minutes)",
       "title": "Upgrade Policy"
+    },
+    "serverStorage": {
+      "title": "データストレージ",
+      "authority": {
+        "committed": "SQLite（トランザクション対応）",
+        "shadow_verified": "従来の JSON ファイル · SQLite コピー検証済み",
+        "legacy": "従来の JSON ファイル · SQLite コピー未作成",
+        "prepared": "移行中 · 次回起動時に完了します",
+        "unknown": "不明なストレージ状態（{{value}}）"
+      },
+      "loadFailed": "ストレージの状態を読み込めませんでした。",
+      "why": "USD 換算の利用枠とトランザクション書き込みには、SQLite を Server の唯一のストレージにする必要があります。",
+      "what": "移行すると Server が再起動し、プロキシが一時的（通常は数秒）に停止します。起動時に SQLite コピーを検証または再構築し、JSON ファイルの読み取り専用バックアップを migration-backups/ に残してから切り替えます。元に戻せない操作で、戻すには CLI（config migrate-server-store --rollback-export）が必要です。",
+      "counts": "移行対象：Provider {{providers}} 件 · アカウント {{accounts}} 件 · Share {{shares}} 件 · 使用量記録 {{usageRecords}} 件",
+      "shadowStale": "SQLite コピーが JSON ファイルより古くなっています。移行時に再構築されるため、事前の対応は不要です。",
+      "shadowError": "前回の SQLite コピー確認：{{error}}",
+      "migrating": "SQLite の準備ができました。Server の次回起動時に切り替えが完了します。",
+      "pending": "{{time}} に {{by}} が移行を依頼しました。Server の次回起動時に実行されます。",
+      "failed": "{{time}} に移行が失敗しました。Server は JSON ファイルのまま動作を続けており、データは失われていません。",
+      "migrate": "移行して再起動",
+      "retry": "移行を再試行",
+      "cancel": "依頼を取り消す",
+      "restartNow": "今すぐ再起動",
+      "restartConfirmMessage": "依頼済みのストレージ移行を実行するため、今すぐ Server を再起動しますか？プロキシは一時的（通常は数秒）に停止します。",
+      "confirmTitle": "ストレージを SQLite に移行しますか？",
+      "confirmMessage": "Server をすぐに再起動し、起動中に移行します。プロキシは一時的（通常は数秒）に停止します。\n\nJSON ファイルの読み取り専用バックアップは migration-backups/ に残ります。この切り替えは元に戻せず、戻すには CLI が必要です。",
+      "restarting": "移行を依頼しました。Server を再起動しています…",
+      "restartFailed": "Server を再起動できませんでした：{{error}}。移行は次回起動時に実行されます。",
+      "restartNotScheduled": "再起動は予約されませんでした。移行は Server の次回起動時に実行されます。",
+      "alreadyCommitted": "ストレージはすでに SQLite に移行済みです。",
+      "cancelled": "移行の依頼を取り消しました。",
+      "waiting": "移行のため再起動中… Server が戻るとこのページは再読み込みされます。",
+      "committedAt": "移行日時",
+      "backupDir": "JSON バックアップ"
     }
   },
   "share": {
@@ -1145,7 +1179,7 @@
           "failed": "確認に失敗しました。再試行するか Server の診断を確認してください。",
           "upgrade": "構造化された上限診断をサポートする Server に更新してください。",
           "router_protocol": "Router プロトコル v10 の金額上限機能が未確認です。",
-          "sqlite_authority": "Server SQLite はまだ正本ではありません。保守手順に従って切り替えてください。",
+          "sqlite_authority": "Server の SQLite がまだ正式なストレージではありません。設定 → 一般 → データストレージ で移行してください。",
           "metering_storage": "計量ストレージが異常です。Server ストレージを確認・復旧してください。",
           "acknowledged_tariff": "Server に確認済みで有効な実行料金表がありません。",
           "text_surface": "この実行バインディングはテキスト金額計量で未検証です：",
@@ -1153,7 +1187,20 @@
           "timeout": "Server が時間内に応答しませんでした。再試行してください。",
           "controlAuth": "現在のセッションにはこの確認の権限がありません。再ログインしてください。",
           "invalidResponse": "Server から無効な確認結果が返されました。アップグレードまたは再試行してください。",
-          "conflict": "Share の設定が変更されました。再読み込みしてから再試行してください。"
+          "conflict": "Share の設定が変更されました。再読み込みしてから再試行してください。",
+          "tariff_published": "Router がこの Server 向けの実行料金表をまだ公開していません。",
+          "root": {
+            "router_protocol": "Router で USD 枠がまだ有効になっていません",
+            "sqlite_authority": "Server ストレージの移行が必要です",
+            "metering_storage": "計測ストレージに問題があります",
+            "tariff_published": "Router が料金表をまだ公開していません",
+            "acknowledged_tariff": "Server の料金表確認を待っています",
+            "text_surface": "USD 計測に未対応の Provider があります"
+          },
+          "more": "ほか {{count}} 件",
+          "waitingOn": "先に解決が必要：{{blocker}}",
+          "openStorage": "ストレージ設定を開く",
+          "opensNewTab": "（新しいタブで開きます）"
         },
         "remaining": "残りの換算使用量：{{amount}}",
         "exhausted": "上限に達しました",

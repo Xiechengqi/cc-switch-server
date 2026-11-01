@@ -1065,6 +1065,94 @@ export async function rollbackServerService(): Promise<void> {
   await invokeCommand<{ ok: boolean }>("rollback_server_service");
 }
 
+/**
+ * Waits (up to `maxAttempts` seconds) for a different Server process to
+ * answer, then reloads the page. False when the old process is still there.
+ */
+export async function pollReplacementAndReload(
+  previous: { processId: number; processInstanceId: string },
+  maxAttempts = 60,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    try {
+      const runtime = await loadRuntimeVersionInfo();
+      if (
+        (runtime.processInstanceId &&
+          runtime.processInstanceId !== previous.processInstanceId) ||
+        (runtime.processId > 0 &&
+          previous.processId > 0 &&
+          runtime.processId !== previous.processId)
+      ) {
+        window.location.reload();
+        return true;
+      }
+    } catch {
+      // service may be restarting
+    }
+  }
+  return false;
+}
+
+/** Which store the Server reads and writes as the source of truth. */
+export type ServerStoreAuthorityState =
+  | "legacy"
+  | "shadow_verified"
+  | "prepared"
+  | "committed";
+
+/** An owner's request to commit SQLite at the next Server start. */
+export interface ServerStoreActivationRequest {
+  status: "pending" | "failed";
+  requestedAtMs: number;
+  requestedBy: string;
+  failedAtMs: number | null;
+  error: string | null;
+}
+
+export interface ServerStoreAuthority {
+  authority: ServerStoreAuthorityState;
+  committedAtMs: number | null;
+  legacyBackupDir: string | null;
+  /** Shadow DB matches the current legacy files; null when committed or no shadow. */
+  shadowCurrent: boolean | null;
+  shadowError: string | null;
+  activationRequest: ServerStoreActivationRequest | null;
+  restartStrategy: "systemd" | "openrc" | "standalone";
+  counts: {
+    providers: number;
+    accounts: number;
+    shares: number;
+    usageRecords: number;
+  };
+}
+
+export async function loadServerStoreAuthority(): Promise<ServerStoreAuthority> {
+  return invokeCommand<ServerStoreAuthority>("get_server_store_authority");
+}
+
+/**
+ * Asks the Server to commit SQLite at its next start, and by default to
+ * restart now. 409 when storage is already committed.
+ */
+export async function requestServerStoreActivation(
+  input: { restart?: boolean } = {},
+): Promise<{
+  ok: true;
+  activationRequest: ServerStoreActivationRequest;
+  restartOperationId: string | null;
+  restartError: string | null;
+}> {
+  return invokeCommand("request_server_store_activation", {
+    restart: input.restart ?? true,
+  });
+}
+
+/** Clears a pending or failed activation request. */
+export async function cancelServerStoreActivation(): Promise<void> {
+  await invokeCommand<{ ok: true }>("cancel_server_store_activation");
+}
+
 export async function startServerUpgrade(input: {
   restartAfter: boolean;
   force?: boolean;

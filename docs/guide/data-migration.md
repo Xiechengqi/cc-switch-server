@@ -113,8 +113,24 @@ or environment key before any live file is replaced.
 
 ## Server SQLite Authority
 
-Provider S1 -> S2 conversion must be complete before a non-empty Provider store
-can enter SQLite. Keep the Server stopped and run the read-only preflight first:
+A Server started from an empty data directory commits SQLite directly. An
+existing installation keeps its legacy JSON files authoritative until the
+administrator migrates it; USD-equivalent Share quotas stay unavailable until
+then.
+
+The usual path is the Web admin: **Settings → General → Data storage →
+Migrate and restart** (deep link `?view=settings&section=server-storage`).
+It records a one-shot request in `server-store-activation-request.json` and
+restarts the Server. The next start, holding the data-directory lock, rebuilds
+or verifies the shadow, writes the read-only legacy backup under
+`migration-backups/` and commits. If that fails before the `prepared` step, the
+Server starts on the legacy files as before and the card shows the error, with
+retry and cancel. The transition is one-way; use the rollback export below to
+go back.
+
+Offline alternative: Provider S1 -> S2 conversion must be complete before a
+non-empty Provider store can enter SQLite. Keep the Server stopped and run the
+read-only preflight first:
 
 ```bash
 cc-switch-server --config-dir "$CONFIG_DIR" config migrate-server-store

@@ -551,11 +551,23 @@ impl ServerStateInner {
                 "driverId":plan.as_ref().map(|p|p.driver_id.as_str())})
             })
             .collect::<Vec<_>>();
+        let router_negotiated = self.value_quota_router_negotiated().await;
+        let mut tariff_check =
+            serde_json::json!({"code":"acknowledged_tariff", "ready":tariff.is_ok()});
+        // Pricing sync needs both a committed ledger and a negotiated Router,
+        // so a missing tariff names the check it is waiting on.
+        if tariff.is_err() {
+            if storage != "committed" {
+                tariff_check["blockedBy"] = "sqlite_authority".into();
+            } else if !router_negotiated {
+                tariff_check["blockedBy"] = "router_protocol".into();
+            }
+        }
         let mut checks = vec![
-            serde_json::json!({"code":"router_protocol", "ready":self.value_quota_router_negotiated().await}),
+            serde_json::json!({"code":"router_protocol", "ready":router_negotiated}),
             serde_json::json!({"code":"sqlite_authority", "ready":storage == "committed", "state":storage}),
             serde_json::json!({"code":"metering_storage", "ready":!self.quota_usage_degraded.load(std::sync::atomic::Ordering::Acquire)}),
-            serde_json::json!({"code":"acknowledged_tariff", "ready":tariff.is_ok()}),
+            tariff_check,
         ];
         if surfaces.is_empty() {
             checks.push(serde_json::json!({"code":"text_surface", "ready":false}));
@@ -732,6 +744,12 @@ impl ServerStateInner {
     }
     pub async fn router_supports_value_quotas(&self) -> bool {
         if !server_sqlite::is_committed(&self.config_dir).unwrap_or(false) {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::info!(
+                    "USD-equivalent Share quotas stay unavailable until the Server SQLite authority is committed; pricing and watermark sync are skipped (Settings -> Storage)"
+                )
+            });
             return false;
         }
         self.value_quota_router_negotiated().await

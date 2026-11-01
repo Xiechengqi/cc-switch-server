@@ -66,8 +66,54 @@ export type ValuePreviewRow = { email: string; effectiveFromMs: number; meteredF
 /** A requested policy refused before any timing is worked out (bad amount, period or user). */
 export type ValueInvalidRow = { email: string; reasonCode?: string | null; reason?: string | null };
 export type ValuePreview = { ready: boolean; configRevision?: number; capabilityReady?: boolean; invalidRows?: ValueInvalidRow[];
-  checks?: Array<{ code: string; ready: boolean; state?: string; app?: string; profileId?: string | null; driverId?: string | null }>;
+  checks?: ValueCheck[];
   reason?: string | null; reasonCode?: string | null; activePricingRevision?: string | null; rows: ValuePreviewRow[] };
+/**
+ * One readiness check. `blockedBy` names another check this one waits on
+ * (e.g. `acknowledged_tariff` waits on `sqlite_authority`), so it is a
+ * consequence rather than a cause while that check is failing.
+ */
+export type ValueCheck = { code: string; ready: boolean; blockedBy?: string | null; state?: string; app?: string;
+  profileId?: string | null; driverId?: string | null };
+/** Fix-first order: an earlier check usually unblocks the later ones. Unknown codes go last. */
+export const VALUE_CHECK_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
+  "acknowledged_tariff", "text_surface"] as const;
+const checkRank = (code: string) => {
+  const index = (VALUE_CHECK_ORDER as readonly string[]).indexOf(code);
+  return index < 0 ? VALUE_CHECK_ORDER.length : index;
+};
+/** Every failed check, in fix-first order (stable within a code). */
+export function valueFailedChecks(checks: ValueCheck[] | null | undefined): ValueCheck[] {
+  return (Array.isArray(checks) ? checks : []).filter((check) => check && check.ready !== true)
+    .map((check, index) => ({ check, index }))
+    .sort((a, b) => checkRank(a.check.code) - checkRank(b.check.code) || a.index - b.index)
+    .map(({ check }) => check);
+}
+/** The failing check this one waits on, if that blocker is itself failing. */
+export function valueCheckBlocker(check: ValueCheck, checks: ValueCheck[] | null | undefined): string | undefined {
+  const blocker = check.blockedBy?.trim();
+  if (!blocker || blocker === check.code) return undefined;
+  return valueFailedChecks(checks).some((other) => other.code === blocker) ? blocker : undefined;
+}
+/**
+ * Failed checks that are causes: no `blockedBy`, or a blocker that is not
+ * failing. A blocker cycle would hide everything, so it falls back to all
+ * failed checks rather than to none.
+ */
+export function valueReadinessRoots(checks: ValueCheck[] | null | undefined): ValueCheck[] {
+  const failed = valueFailedChecks(checks);
+  const roots = failed.filter((check) => !valueCheckBlocker(check, failed));
+  return roots.length ? roots : failed;
+}
+/**
+ * What the one-line readiness label says: the first root, plus how many other
+ * root causes (distinct codes; several unverified bindings count once) remain.
+ */
+export function valueReadinessSummary(checks: ValueCheck[] | null | undefined): { root: ValueCheck; more: number } | undefined {
+  const roots = valueReadinessRoots(checks);
+  if (!roots.length) return undefined;
+  return { root: roots[0], more: new Set(roots.map((check) => check.code)).size - 1 };
+}
 export function isValuePreview(value: unknown, revision: number): value is ValuePreview {
   if (!value || typeof value !== "object") return false;
   const p = value as ValuePreview;

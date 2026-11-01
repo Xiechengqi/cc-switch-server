@@ -38,6 +38,7 @@ use wal::validate_wal_if_present;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
+pub(crate) const ACTIVATION_REQUEST_FILE_NAME: &str = "server-store-activation-request.json";
 const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -603,6 +604,121 @@ pub(crate) fn authority_activation_requested() -> bool {
                 "1" | "true" | "yes" | "committed"
             )
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActivationRequestStatus {
+    Pending,
+    Failed,
+}
+
+/// An administrator's request, made while the Server runs, to commit the
+/// SQLite authority at the next start. Startup owns the data-directory lock,
+/// so the transition itself never runs beside live writers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActivationRequest {
+    pub status: ActivationRequestStatus,
+    pub requested_at_ms: i64,
+    pub requested_by: String,
+    #[serde(default)]
+    pub failed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+pub(crate) fn activation_request_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(ACTIVATION_REQUEST_FILE_NAME)
+}
+
+/// A missing file is no request; an unreadable one is reported, never acted on.
+pub(crate) fn read_activation_request(
+    config_dir: &Path,
+) -> anyhow::Result<Option<ActivationRequest>> {
+    let path = activation_request_path(config_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+pub(crate) fn write_activation_request(
+    config_dir: &Path,
+    request: &ActivationRequest,
+) -> anyhow::Result<()> {
+    crate::infra::storage::write_json_pretty(&activation_request_path(config_dir), request)
+        .context("write Server SQLite activation request")
+}
+
+pub(crate) fn clear_activation_request(config_dir: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(activation_request_path(config_dir)) {
+        Ok(()) => crate::infra::storage::sync_directory(config_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove Server SQLite activation request"),
+    }
+}
+
+/// Whether the shadow was built from the legacy files as they are now. A
+/// running legacy Server keeps writing them, so `false` is normal: the next
+/// start rebuilds the shadow before any activation.
+pub(crate) fn shadow_is_current(config_dir: &Path) -> anyhow::Result<bool> {
+    let marker = read_marker(config_dir)?.context("Server SQLite migration marker is missing")?;
+    Ok(marker.source_digest == aggregate_source_digest(&collect_sources(config_dir)?))
+}
+
+static FRESH_INSTALL_ACTIVATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The shipped binary commits an empty installation at its first start;
+/// embedders such as tests keep the legacy start unless they opt in.
+pub(crate) fn enable_fresh_install_activation() {
+    FRESH_INSTALL_ACTIVATION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn fresh_install_activation_enabled() -> bool {
+    FRESH_INSTALL_ACTIVATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Why startup commits the SQLite authority, which decides what a failure means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationTrigger {
+    /// A prepared marker or the operator's environment opt-in: failure stops startup.
+    Required,
+    /// An administrator's request from the running Server.
+    Requested,
+    /// Nothing to migrate yet: providers, accounts, shares and usage are empty.
+    FreshInstall,
+}
+
+impl ActivationTrigger {
+    pub(crate) fn decide(
+        roll_forward_required: bool,
+        environment_requested: bool,
+        request_pending: bool,
+        legacy_stores_empty: bool,
+    ) -> Option<Self> {
+        if roll_forward_required || environment_requested {
+            Some(Self::Required)
+        } else if request_pending {
+            Some(Self::Requested)
+        } else if legacy_stores_empty {
+            Some(Self::FreshInstall)
+        } else {
+            None
+        }
+    }
+
+    /// A best-effort trigger may leave the legacy stores authoritative only
+    /// while the marker still says `shadow_verified`; once prepared, startup
+    /// must roll forward like any interrupted migration.
+    pub(crate) fn tolerates_failure(self, authority_after: Option<AuthorityState>) -> bool {
+        self != Self::Required
+            && matches!(authority_after, None | Some(AuthorityState::ShadowVerified))
+    }
 }
 
 pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<AuthoritativeStores> {
@@ -2121,6 +2237,93 @@ mod tests {
         log.request_id = format!("request-{sequence:04}");
         log.created_at_ms = u128::try_from(sequence).unwrap().saturating_add(1);
         log
+    }
+
+    #[test]
+    fn activation_trigger_prefers_required_over_requests_and_fresh_installs() {
+        use ActivationTrigger::*;
+        assert_eq!(
+            ActivationTrigger::decide(true, false, true, true),
+            Some(Required)
+        );
+        assert_eq!(
+            ActivationTrigger::decide(false, true, true, true),
+            Some(Required)
+        );
+        assert_eq!(
+            ActivationTrigger::decide(false, false, true, true),
+            Some(Requested)
+        );
+        assert_eq!(
+            ActivationTrigger::decide(false, false, false, true),
+            Some(FreshInstall)
+        );
+        assert_eq!(ActivationTrigger::decide(false, false, false, false), None);
+    }
+
+    #[test]
+    fn only_best_effort_triggers_tolerate_a_failure_before_prepare() {
+        use ActivationTrigger::*;
+        for trigger in [Requested, FreshInstall] {
+            assert!(trigger.tolerates_failure(None));
+            assert!(trigger.tolerates_failure(Some(AuthorityState::ShadowVerified)));
+            assert!(!trigger.tolerates_failure(Some(AuthorityState::Prepared)));
+            assert!(!trigger.tolerates_failure(Some(AuthorityState::Committed)));
+        }
+        assert!(!Required.tolerates_failure(Some(AuthorityState::ShadowVerified)));
+        assert!(!Required.tolerates_failure(None));
+    }
+
+    #[test]
+    fn activation_request_round_trips_and_clears_idempotently() {
+        let dir = temp_dir("activation-request");
+        assert_eq!(read_activation_request(&dir).unwrap(), None);
+        let request = ActivationRequest {
+            status: ActivationRequestStatus::Failed,
+            requested_at_ms: 1,
+            requested_by: "owner@example.com".into(),
+            failed_at_ms: Some(2),
+            error: Some("shadow invalid".into()),
+        };
+        write_activation_request(&dir, &request).unwrap();
+        assert_eq!(read_activation_request(&dir).unwrap(), Some(request));
+        let raw: Value =
+            serde_json::from_slice(&fs::read(activation_request_path(&dir)).unwrap()).unwrap();
+        assert_eq!(raw["status"], "failed");
+        assert_eq!(raw["requestedBy"], "owner@example.com");
+        clear_activation_request(&dir).unwrap();
+        clear_activation_request(&dir).unwrap();
+        assert_eq!(read_activation_request(&dir).unwrap(), None);
+        // The request is not a migration source, so it never changes the digest.
+        assert!(!collect_sources(&dir)
+            .unwrap()
+            .iter()
+            .any(|source| source.relative_path == ACTIVATION_REQUEST_FILE_NAME));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shadow_freshness_follows_later_legacy_writes() {
+        let dir = temp_dir("shadow-current");
+        let providers = ProviderStore::default();
+        let accounts = account_store_with_token("token-a");
+        accounts.save(&dir).unwrap();
+        let shares = ShareStore::default();
+        let usage = UsageStore::default();
+        refresh_shadow(
+            &dir,
+            ShadowImportInput {
+                providers: &providers,
+                accounts: &accounts,
+                shares: &shares,
+                usage: &usage,
+            },
+        )
+        .unwrap();
+        assert!(shadow_is_current(&dir).unwrap());
+        account_store_with_token("token-b").save(&dir).unwrap();
+        assert!(!shadow_is_current(&dir).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

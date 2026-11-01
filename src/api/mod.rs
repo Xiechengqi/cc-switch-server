@@ -18,6 +18,7 @@ pub(in crate::api) mod providers;
 mod request_audit;
 pub(in crate::api) mod router;
 pub(in crate::api) mod self_update;
+pub(in crate::api) mod server_store;
 pub(crate) mod session;
 pub(in crate::api) mod settings;
 pub(in crate::api) mod shares;

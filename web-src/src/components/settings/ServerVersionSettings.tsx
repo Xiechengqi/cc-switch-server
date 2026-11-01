@@ -46,6 +46,7 @@ import {
   loadBuildInfo,
   loadRuntimeVersionInfo,
   loadUpgradeStatus,
+  pollReplacementAndReload,
   readAdminVersionInfoCache,
   restartServerService,
   rollbackServerService,
@@ -309,31 +310,6 @@ function buildVersionCardSubtitle(
     current,
     defaultValue: "已是最新版本 {{current}}",
   });
-}
-
-async function pollReplacementAndReload(
-  previous: { processId: number; processInstanceId: string },
-  maxAttempts = 60,
-): Promise<boolean> {
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    await new Promise((resolve) => window.setTimeout(resolve, 1000));
-    try {
-      const runtime = await loadRuntimeVersionInfo();
-      if (
-        (runtime.processInstanceId &&
-          runtime.processInstanceId !== previous.processInstanceId) ||
-        (runtime.processId > 0 &&
-          previous.processId > 0 &&
-          runtime.processId !== previous.processId)
-      ) {
-        window.location.reload();
-        return true;
-      }
-    } catch {
-      // service may be restarting
-    }
-  }
-  return false;
 }
 
 export function ServerVersionSettings() {
