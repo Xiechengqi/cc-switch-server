@@ -10,7 +10,7 @@
 
 1. Router reader ≥10 且 heartbeat 显式声明 `usdEquivalentQuotaV1`，能力与 Router URL、installation 绑定，缓存有效期 300 秒。
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
-3. Router Owner 发布已核对的完整执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。默认无执行价目，不自动相信参考价目。
+3. Router 从模型价格（LiteLLM 派生价 + 模型价格表中的管理员定价）自动派生并发布执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。
 4. Share 所有绑定必须通过同一个 profile／driver 能力函数。允许 `claude.anthropic_api_key` 或 `claude.custom_http` + `http.anthropic_messages`；`codex.openai_api_key` 或 `codex.custom_http` + `http.openai_responses`；`codex.custom_http` + `http.openai_chat`；`gemini.google_api_key` 或 `gemini.custom_http` + `http.gemini_native`。generic 文本转发面支持 Messages、Chat Completions、Responses、Gemini。未列出的自定义协议组合、Web Session、Coding Plan、OAuth、媒体、内置付费工具、未知模型／tier 不在金额模式可用范围；发网后的重试同样不覆盖（唯一例外见 §3 的连接失败重试）。仅凭兼容 ProviderType 不足以放行；自定义 Claude 的实际兼容类型可为 `claude_auth`。客户端自定义 function tool 文本允许；Server 不执行工具。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。
@@ -151,13 +151,13 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 预览返回 `capabilityReady` 与 `checks[]`，独立报告 `router_protocol`、`sqlite_authority`（committed／prepared／shadow_verified／unavailable）、`metering_storage`、`acknowledged_tariff` 和每个绑定的 `text_surface`（app／profileId／driverId）。任一基础条件失败均返回全部诊断及空 rows，不继续查询用户窗口；config revision 不匹配仍返回冲突。基础能力与用户 coverage 分开，不能因一个用户历史不完整禁用全体用户的单位选择。Server Web 和 Router 都可重新检查，后台检查不覆盖显式策略确认预览。
 
-Router Owner 的执行价目面板提供逐模型／tier/context 费率表单和高级 JSON。费率表单为美元／百万 Token，wire 仍为整数微美元。同名参考价只能生成待审草稿，不能自动证明 cache TTL、长上下文或 tier；未覆盖模型和未知费率不得猜为零。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
+执行价目不再单独编辑：Router 在启动和每次改价后，把「设置 → 模型价格」（LiteLLM 派生价 + 管理员为未定价模型填的价）冻结成快照并自动发布，替换已有价目时 60 秒后生效。快照按价格显示的回退链物化各 tier／上下文行，长上下文按含缓存的输入判定，缺 1h 写价按 5m 计；美元额度扣的就是用户看到的价格。Server `PricingSnapshot::model` 与显示使用同一模型身份剥离（厂商前缀、路径、`-thinking`／`[1m]`／`-v1:0`、日期戳等），共用 `tests/fixtures/share-value-model-identity-v1.json`。未定价模型美元额度用户无法调用，需在模型价格表定价。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
 
 现有 `shadow_verified` 不代表完成 SQLite 权威迁移。空数据目录首次启动直接提交；已有数据的 Server 由管理员在「设置 → 通用 → 数据存储」点「迁移并重启」（一次性请求，下次启动在目录锁内执行，`prepared` 前失败则保留 legacy 并显示原因），或按 [官方 Server SQLite Authority 迁移](../guide/data-migration.md#server-sqlite-authority) 停服运行 `config migrate-server-store --apply`。禁止在线强改 marker。迁移后重启并验证旧授权、Provider 和用量。
 
 未提交时，价目同步与水位同步在 `router_supports_value_quotas` 直接跳过（每进程记一条 info 日志）；`get_share_value_quota_status` 省略 `diagnostics` 而不是返回 500。预览中 `acknowledged_tariff` 失败时带 `blockedBy`：存储未提交为 `sqlite_authority`，Router 未协商为 `router_protocol`，经 Router 代理且价目未发布时为 `tariff_published`（Router 补充）。界面只把无 `blockedBy`（或其阻塞项已通过）的失败项当作根因，按 router_protocol、sqlite_authority、metering_storage、tariff_published、acknowledged_tariff、text_surface 排序，行内显示首个根因及 +N，其余列为「等待：…」。
 
-部署顺序为 Router 再 Server。Owner 明确审核并发布真实执行模型／响应别名的完整价目，等生效、安装及 ACK 激活后，在对应 Share 重新检查；用户策略仍须单独确认覆盖起点或排期。故障不能靠删除 ledger、恢复旧库或清除安全标记绕过。此代码变更未自动切换任何生产存储或发布估值；真实灰度继续 `live_pending`。
+部署顺序为 Router 再 Server。Router 自动发布价目，等 Server 安装及 ACK 激活后，在对应 Share 重新检查；用户策略仍须单独确认覆盖起点或排期。故障不能靠删除 ledger、恢复旧库或清除安全标记绕过。此代码变更未自动切换任何生产存储或发布估值；真实灰度继续 `live_pending`。
 
 ## 9. 本轮验证与整体 review（2026-10-31）
 

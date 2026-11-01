@@ -3,7 +3,7 @@
 //! Router and Server implement the same specification and golden vectors.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 pub const TARIFF_POLICY: &str = "api-equivalent-v1";
 pub const PICOS_PER_MICRO: i128 = 1_000_000;
@@ -716,14 +716,214 @@ impl PricingSnapshot {
         let bytes = serde_json::to_vec(self).map_err(|_| ValueError::InvalidSnapshot)?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
+    /// Resolves the wire model exactly as the Router price display does: the
+    /// name as sent, then with provider qualifiers and runtime suffixes peeled
+    /// (`anthropic.`, `publishers/…/models/`, `-thinking`, `[1m]`, `-v1:0`,
+    /// date stamps), each candidate matched as an exact alias or model key.
+    /// Shared vectors: `tests/fixtures/share-value-model-identity-v1.json`.
     pub fn model(&self, effective_model: &str) -> Result<&ExecutionModelPrice, ValueError> {
-        let key = self
-            .exact_aliases
-            .get(effective_model)
-            .map(String::as_str)
-            .unwrap_or(effective_model);
-        self.models.get(key).ok_or(ValueError::PriceUnavailable)
+        std::iter::once(effective_model.to_string())
+            .chain(identity_candidates(effective_model))
+            .find_map(|candidate| {
+                let key = self
+                    .exact_aliases
+                    .get(&candidate)
+                    .map(String::as_str)
+                    .unwrap_or(&candidate);
+                self.models.get(key)
+            })
+            .ok_or(ValueError::PriceUnavailable)
     }
+}
+
+// Model identity, ported verbatim from the Router's `model_price_catalog.rs`
+// so a USD quota charges the model the price display shows.
+
+/// Exact-match candidates derived from a logged model name.
+///
+/// Order is most-specific first: the original text, then successively
+/// unwrapped identities. Every candidate is a whole-string identity, never a
+/// family prefix, so `claude-sonnet-4-5-thinking` can land on
+/// `claude-sonnet-4-5` while `gpt-5-mini` cannot land on `gpt-5`.
+fn identity_candidates(model_text: &str) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(model_text.trim().to_ascii_lowercase());
+    while let Some(current) = queue.pop_front() {
+        if current.is_empty() || !seen.insert(current.clone()) {
+            continue;
+        }
+        ordered.push(current.clone());
+        for next in unwrap_identity(&current) {
+            if !next.is_empty() && !seen.contains(&next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    ordered
+}
+
+fn unwrap_identity(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    push_unique(&mut out, strip_path_leaf(value));
+    push_unique(&mut out, strip_provider_dot_prefix(value));
+    push_unique(&mut out, strip_runtime_suffix(value));
+    push_unique(&mut out, strip_date_stamp(value));
+    push_unique(&mut out, claude_dot_version_to_hyphen(value));
+    out
+}
+
+fn push_unique(out: &mut Vec<String>, next: Option<String>) {
+    if let Some(next) = next {
+        if !out.iter().any(|existing| existing == &next) {
+            out.push(next);
+        }
+    }
+}
+
+/// `publishers/anthropic/models/claude-sonnet-4-5` → `claude-sonnet-4-5`.
+/// Also covers `moonshotai/kimi-k2.5` and OpenRouter-style `anthropic/...`.
+fn strip_path_leaf(value: &str) -> Option<String> {
+    let leaf = value.rsplit('/').next()?.trim();
+    if leaf.is_empty() || leaf == value {
+        return None;
+    }
+    Some(leaf.to_string())
+}
+
+/// `anthropic.claude-sonnet-4-5-20250514-v1:0` → `claude-sonnet-4-5-20250514-v1:0`
+/// and `global.anthropic.claude-opus-4-8` → `claude-opus-4-8`.
+///
+/// Only a known vendor token before the first `claude-` / `gpt-` / `o[0-9]`
+/// stem is peeled, so `gpt-5.5` is left alone.
+fn strip_provider_dot_prefix(value: &str) -> Option<String> {
+    const STEMS: &[&str] = &[
+        "claude-",
+        "gpt-",
+        "gemini-",
+        "kimi-",
+        "glm-",
+        "deepseek-",
+        "codex-",
+    ];
+    let mut stem_at = None;
+    for stem in STEMS {
+        if let Some(at) = value.find(stem) {
+            if at > 0 && value.as_bytes()[at - 1] == b'.' {
+                stem_at = Some(stem_at.map_or(at, |current: usize| current.min(at)));
+            }
+        }
+    }
+    // OpenAI o-series keys (`o1`, `o3`, `o4-mini`) sit after a vendor
+    // qualifier too, but the stem is a single letter+digit so it must be
+    // bounded or `global.` would match the `o1` inside `anthropic`.
+    for (i, _) in value.match_indices('o') {
+        if i == 0 || value.as_bytes()[i - 1] != b'.' {
+            continue;
+        }
+        let after = &value[i + 1..];
+        if after.starts_with(|ch: char| ch.is_ascii_digit()) {
+            stem_at = Some(stem_at.map_or(i, |current| current.min(i)));
+        }
+    }
+    let stem_at = stem_at?;
+    let prefix = &value[..stem_at - 1];
+    if prefix.is_empty()
+        || !prefix
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    Some(value[stem_at..].to_string())
+}
+
+/// Runtime / vendor packaging that does not change the priced identity:
+/// `-thinking`, `-latest`, `[1m]`, `-1m`, Bedrock `-v1:0` / `:0`.
+/// Date stamps stay — they are themselves catalog keys.
+fn strip_runtime_suffix(value: &str) -> Option<String> {
+    let mut current = value.to_string();
+    let mut changed = false;
+    loop {
+        let mut stripped = false;
+        for suffix in ["-thinking", "-latest"] {
+            if let Some(next) = current.strip_suffix(suffix) {
+                if next.is_empty() {
+                    break;
+                }
+                current = next.to_string();
+                stripped = true;
+                changed = true;
+            }
+        }
+        for suffix in ["[1m]", "-1m"] {
+            if let Some(next) = current.strip_suffix(suffix) {
+                if next.is_empty() {
+                    break;
+                }
+                current = next.to_string();
+                stripped = true;
+                changed = true;
+            }
+        }
+        if let Some(next) = strip_bedrock_revision(&current) {
+            current = next;
+            stripped = true;
+            changed = true;
+        }
+        if !stripped {
+            break;
+        }
+    }
+    changed.then_some(current)
+}
+
+/// `claude-sonnet-4-5-20250929-v1:0` → `claude-sonnet-4-5-20250929`.
+/// The dated-v1:0 form is itself a catalog key, so the original is tried
+/// first; this only fires when that exact key is absent.
+fn strip_bedrock_revision(value: &str) -> Option<String> {
+    if let Some(next) = value.strip_suffix(":0") {
+        if let Some(base) = next.rsplit_once("-v") {
+            if !base.0.is_empty() && base.1.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Some(base.0.to_string());
+            }
+        }
+        if !next.is_empty() {
+            return Some(next.to_string());
+        }
+    }
+    None
+}
+
+/// `claude-sonnet-4-5-20250514` → `claude-sonnet-4-5`.
+///
+/// Date stamps that are themselves catalog keys are tried first (BFS
+/// most-specific-first). This only fires when that dated key is absent, so
+/// `claude-sonnet-4-5-20250929` still prefers its own catalog row.
+fn strip_date_stamp(value: &str) -> Option<String> {
+    let (base, suffix) = value.rsplit_once('-')?;
+    if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()) && !base.is_empty() {
+        return Some(base.to_string());
+    }
+    None
+}
+
+/// Kiro writes `claude-sonnet-4.8`; the catalog key is `claude-sonnet-4-8`.
+fn claude_dot_version_to_hyphen(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("claude-")?;
+    let (family, version) = rest.split_once('-')?;
+    if !matches!(family, "sonnet" | "opus" | "haiku") {
+        return None;
+    }
+    if !version.contains('.')
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    Some(format!("claude-{family}-{}", version.replace('.', "-")))
 }
 
 // Serde's default map reader silently accepts repeated model/rate keys.
@@ -758,6 +958,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_identity_matches_shared_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/share-value-model-identity-v1.json"
+        ))
+        .unwrap();
+        let rates = ExecutionRates {
+            input: Some("1".into()),
+            output: Some("1".into()),
+            cache_read: None,
+            cache_write5m: None,
+            cache_write1h: None,
+            cache_write_policy: CacheWritePolicy::Unavailable,
+        };
+        let model = ExecutionModelPrice {
+            context_input_basis: ContextInputBasis::RawInput,
+            long_context_threshold: None,
+            long_context_inclusive: false,
+            rates: [("standard/base".to_string(), rates)].into_iter().collect(),
+        };
+        let snapshot = PricingSnapshot {
+            schema_version: 1,
+            tariff_policy_id: TARIFF_POLICY.into(),
+            currency: "USD".into(),
+            models: fixture["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| (key.as_str().unwrap().to_string(), model.clone()))
+                .collect(),
+            exact_aliases: serde_json::from_value(fixture["exactAliases"].clone()).unwrap(),
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let observed = case["model"].as_str().unwrap();
+            let resolved = snapshot.model(observed).ok().map(|price| {
+                snapshot
+                    .models
+                    .iter()
+                    .find(|(_, candidate)| std::ptr::eq(*candidate, price))
+                    .map(|(key, _)| key.as_str())
+                    .unwrap()
+            });
+            assert_eq!(resolved, case["expected"].as_str(), "{observed:?}");
+        }
+    }
+
     #[test]
     fn value_quota_native_runtime_gate_does_not_trust_compatibility_provider_type() {
         for (profile, driver) in [
