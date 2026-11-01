@@ -36,9 +36,12 @@ test("a scratch directory removed mid-walk is skipped, not fatal", () => {
   const scratch = path.join(root, ".kiro-receipt-hardlink-gone");
   fs.mkdirSync(scratch);
   fs.rmSync(scratch, { recursive: true });
+  const file = path.join(root, "plain.txt");
+  fs.writeFileSync(file, "x");
   try {
     assert.deepEqual(readDirectoryEntries(scratch), []);
-    assert.deepEqual(auditSourceProvenance(root), []);
+    // Only a vanished entry is tolerated; any other failure still surfaces.
+    assert.throws(() => readDirectoryEntries(file), { code: "ENOTDIR" });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
