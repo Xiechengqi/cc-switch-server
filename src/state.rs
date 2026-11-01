@@ -32275,6 +32275,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn value_quota_readiness_ignores_bound_but_disabled_apps() {
+        let state = test_state();
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("provider", "Provider"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .upsert(router_sync_share_input("bundle-share", "provider"))
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        // A Provider Bundle Share binds every surface; this one has no Gemini
+        // runtime (no credentials) and only Codex enabled, like production.
+        let set_enabled = |enabled: Option<std::collections::BTreeSet<AppKind>>| {
+            let state = state.clone();
+            async move {
+                state
+                    .mutate_shares_immediate(move |store| {
+                        let share = store
+                            .shares
+                            .iter_mut()
+                            .find(|share| share.id == "bundle-share")
+                            .unwrap();
+                        if !share.bindings.iter().any(|b| b.app == AppKind::Gemini) {
+                            share
+                                .bindings
+                                .push(crate::domain::sharing::shares::ShareBinding {
+                                    app: AppKind::Gemini,
+                                    provider_id: "provider".into(),
+                                    provider_type: ProviderType::Gemini,
+                                });
+                        }
+                        share.enabled_apps = enabled;
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        let surfaces = |preview: &Value| -> Vec<(String, bool)> {
+            preview["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["code"] == "text_surface")
+                .map(|c| {
+                    (
+                        c["app"].as_str().unwrap_or("").to_string(),
+                        c["ready"] == true,
+                    )
+                })
+                .collect()
+        };
+        let preview = |state: ServerState| async move {
+            let revision = state
+                .shares
+                .read()
+                .await
+                .get("bundle-share")
+                .unwrap()
+                .config_revision;
+            state
+                .preview_share_value_quota("bundle-share", revision, BTreeMap::new())
+                .await
+                .unwrap()
+        };
+        set_enabled(Some([AppKind::Codex].into_iter().collect())).await;
+        assert_eq!(
+            surfaces(&preview(state.clone()).await),
+            vec![("codex".to_string(), true)]
+        );
+        // Enabling the uncredentialed app makes it a real, failing surface.
+        set_enabled(None).await;
+        let both = surfaces(&preview(state.clone()).await);
+        assert!(both.contains(&("codex".to_string(), true)), "{both:?}");
+        assert!(both.contains(&("gemini".to_string(), false)), "{both:?}");
+    }
+
+    #[tokio::test]
     async fn value_quota_readiness_reports_independent_blockers_without_opening_shadow_ledger() {
         use crate::repository::server_sqlite::{self, value_quota as ledger};
         let state = test_state();

@@ -149,7 +149,7 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 ## 8. 就绪诊断和受控启用（2026-10-31）
 
-预览返回 `capabilityReady` 与 `checks[]`，独立报告 `router_protocol`、`sqlite_authority`（committed／prepared／shadow_verified／unavailable）、`metering_storage`、`acknowledged_tariff` 和每个绑定的 `text_surface`（app／profileId／driverId）。任一基础条件失败均返回全部诊断及空 rows，不继续查询用户窗口；config revision 不匹配仍返回冲突。基础能力与用户 coverage 分开，不能因一个用户历史不完整禁用全体用户的单位选择。Server Web 和 Router 都可重新检查，后台检查不覆盖显式策略确认预览。
+预览返回 `capabilityReady` 与 `checks[]`，独立报告 `router_protocol`、`sqlite_authority`（committed／prepared／shadow_verified／unavailable）、`metering_storage`、`acknowledged_tariff` 和每个**已启用 app** 绑定的 `text_surface`（app／profileId／driverId）；Provider Bundle 中已绑定但未启用的 app（常见于该 app 没有凭据）不承载请求，不参与就绪和保存校验，转发时每个请求仍单独校验运行面。任一基础条件失败均返回全部诊断及空 rows，不继续查询用户窗口；config revision 不匹配仍返回冲突。基础能力与用户 coverage 分开，不能因一个用户历史不完整禁用全体用户的单位选择。Server Web 和 Router 都可重新检查，后台检查不覆盖显式策略确认预览。
 
 执行价目不再单独编辑：Router 在启动和每次改价后，把「设置 → 模型价格」（LiteLLM 派生价 + 管理员为未定价模型填的价）冻结成快照并自动发布，替换已有价目时 60 秒后生效。快照按价格显示的回退链物化各 tier／上下文行，长上下文按含缓存的输入判定，缺 1h 写价按 5m 计；美元额度扣的就是用户看到的价格。Server `PricingSnapshot::model` 与显示使用同一模型身份剥离（厂商前缀、路径、`-thinking`／`[1m]`／`-v1:0`、日期戳等），共用 `tests/fixtures/share-value-model-identity-v1.json`。未定价模型美元额度用户无法调用，需在模型价格表定价。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
 

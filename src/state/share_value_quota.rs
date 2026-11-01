@@ -86,9 +86,21 @@ fn window(grant: &ShareUserGrant, now: i64) -> anyhow::Result<ledger::Window> {
         metered_from_ms: binding.value_metered_from_ms,
     })
 }
+/// Bindings that can carry traffic. A bound but disabled app (often a
+/// Provider Bundle surface without credentials) serves no request, so it
+/// neither proves nor blocks USD metering; every request still checks its
+/// own runtime in the forwarder.
+fn enabled_bindings(
+    share: &Share,
+) -> impl Iterator<Item = &crate::domain::sharing::shares::ShareBinding> {
+    share
+        .bindings
+        .iter()
+        .filter(|binding| crate::domain::sharing::shares::share_app_api_enabled(share, binding.app))
+}
 fn verified_text_bindings(share: &Share, providers: &ProviderStore) -> bool {
-    !share.bindings.is_empty()
-        && share.bindings.iter().all(|binding| {
+    enabled_bindings(share).next().is_some()
+        && enabled_bindings(share).all(|binding| {
             providers
                 .runtime_plan(binding.app, &binding.provider_id)
                 .is_some_and(|plan| {
@@ -534,9 +546,7 @@ impl ServerStateInner {
             Some(server_sqlite::AuthorityState::ShadowVerified) => "shadow_verified",
             None => "unavailable",
         };
-        let surfaces = share
-            .bindings
-            .iter()
+        let surfaces = enabled_bindings(&share)
             .map(|binding| {
                 let plan = providers.runtime_plan(binding.app, &binding.provider_id);
                 let ready = plan.as_ref().is_some_and(|plan| {
