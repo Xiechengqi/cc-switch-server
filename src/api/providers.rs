@@ -1782,13 +1782,16 @@ async fn test_codebuddy_provider_inner(
         ));
     }
     ensure_provider_outbound_allowed(state, &execution).await?;
-    let body = provider_test_body(
+    let probe = build_provider_model_probe(
         stored.app,
-        &stored,
-        Some(&model),
+        stored.provider_type,
+        &model,
         query.test_prompt.as_deref().unwrap_or("ping"),
         requested_stream,
+        "",
     );
+    let output_token_limit = probe.body.get("max_output_tokens").and_then(Value::as_u64);
+    let body = probe.body_json();
     let timeout = query
         .timeout_ms
         .filter(|value| *value > 0)
@@ -1924,8 +1927,8 @@ async fn test_codebuddy_provider_inner(
         }
         Ok(Ok(Ok(body))) => body,
     };
-    let stream_completed =
-        requested_stream.then(|| buddy_probe_stream_completed(stored.app, &body));
+    let stream_completed = requested_stream
+        .then(|| buddy_probe_stream_completed(stored.app, &body, output_token_limit));
     let network_error = if !(200..=299).contains(&status) {
         Some(redact_provider_test_error(&String::from_utf8_lossy(&body)))
     } else if body.is_empty() {
@@ -5468,8 +5471,14 @@ pub(in crate::api) fn provider_test_stream_completed(app: AppKind, body: &str) -
 }
 
 /// Buddy's bridge emits native downstream terminals. Marker text in an error
-/// or generated content is never evidence that the stream completed.
-fn buddy_probe_stream_completed(app: AppKind, body: &[u8]) -> bool {
+/// or generated content is never evidence that the stream completed. The
+/// probe's deliberate output cap can end generation before a natural stop;
+/// accepting it here does not change partial terminals on the inference wire.
+fn buddy_probe_stream_completed(
+    app: AppKind,
+    body: &[u8],
+    output_token_limit: Option<u64>,
+) -> bool {
     let mut decoder = proxy::SseEventDecoder::new(PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES);
     let Ok(events) = decoder.push(body) else {
         return false;
@@ -5479,37 +5488,60 @@ fn buddy_probe_stream_completed(app: AppKind, body: &[u8]) -> bool {
     };
     let mut completed = false;
     for event in events.into_iter().chain(tail) {
-        if matches!(
-            event.event.as_deref(),
-            Some("error" | "response.failed" | "response.incomplete")
-        ) {
+        if matches!(event.event.as_deref(), Some("error" | "response.failed")) {
             return false;
         }
         if !event.has_data || event.data == b"[DONE]" {
+            if event.event.as_deref() == Some("response.incomplete") {
+                return false;
+            }
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&event.data) else {
             return false;
         };
         let event_type = value.get("type").and_then(Value::as_str);
+        let response_status = value.pointer("/response/status").and_then(Value::as_str);
+        let expected_output_limit = app == AppKind::Codex
+            && event_type == Some("response.incomplete")
+            && event
+                .event
+                .as_deref()
+                .is_none_or(|name| name == "response.incomplete")
+            && response_status == Some("incomplete")
+            && value
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens")
+            && output_token_limit
+                .filter(|limit| *limit > 0)
+                .is_some_and(|limit| {
+                    value
+                        .pointer("/response/usage/output_tokens")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|tokens| tokens >= limit)
+                });
         if value.get("error").is_some_and(|error| !error.is_null())
-            || matches!(
-                event_type,
-                Some("error" | "response.failed" | "response.incomplete")
-            )
-            || matches!(
-                value.pointer("/response/status").and_then(Value::as_str),
-                Some("failed" | "incomplete")
-            )
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+            || matches!(event_type, Some("error" | "response.failed"))
+            || response_status == Some("failed")
+        {
+            return false;
+        }
+        if !expected_output_limit
+            && (event.event.as_deref() == Some("response.incomplete")
+                || event_type == Some("response.incomplete")
+                || response_status == Some("incomplete"))
         {
             return false;
         }
         completed |= match app {
             AppKind::Claude => event_type == Some("message_stop"),
             AppKind::Codex => {
-                event_type == Some("response.completed")
-                    && value.pointer("/response/status").and_then(Value::as_str)
-                        == Some("completed")
+                (event_type == Some("response.completed") && response_status == Some("completed"))
+                    || expected_output_limit
             }
             AppKind::Gemini => value
                 .get("candidates")
@@ -5781,6 +5813,20 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        serve_buddy_provider_api_fixture_with_finish(catalog, generation_model, complete, "stop")
+            .await
+    }
+
+    async fn serve_buddy_provider_api_fixture_with_finish(
+        catalog: Option<Value>,
+        generation_model: &'static str,
+        complete: bool,
+        finish_reason: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -5831,7 +5877,8 @@ mod tests {
                             "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\",\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
                             "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
                             "data: [DONE]\n\n"
-                        ).replace("default-model", generation_model);
+                        ).replace("default-model", generation_model)
+                            .replace("\"finish_reason\":\"stop\"", &format!("\"finish_reason\":\"{finish_reason}\""));
                         let body = if complete { Body::from(content) } else {
                             Body::from_stream(async_stream::stream! {
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::from(content.replace("data: [DONE]\n\n", "")));
@@ -6082,6 +6129,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buddy_length_limited_probe_is_healthy_without_changing_inference_terminals() {
+        use crate::domain::codebuddy::CodeBuddySite;
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                let (origin, observations, server) = serve_buddy_provider_api_fixture_with_finish(
+                    Some(json!({"code":0,"data":{
+                        "models":[{"id":"hy3"}],
+                        "agents":[{"name":"cli","models":["hy3"]}]
+                    }})),
+                    "hy3",
+                    true,
+                    "length",
+                )
+                .await;
+                let state = provider_api_test_state("buddy-length-limited-probe");
+                let config_dir = state.config_dir.clone();
+                let execution =
+                    install_buddy_execution_for_site(&state, origin, AppKind::Codex, product, site)
+                        .await;
+                let response = test_provider_inner(
+                    &state,
+                    execution.clone(),
+                    &TestProviderQuery {
+                        app: AppKind::Codex,
+                        model: None,
+                        network: Some(true),
+                        stream: Some(true),
+                        timeout_ms: Some(2_000),
+                        test_prompt: Some("ping".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(response.ok, "{product:?}/{site:?}: {}", response.message);
+                assert_eq!(response.model, "hy3");
+                assert_eq!(response.network_stream_completed, Some(true));
+                assert!(response.network_error.is_none());
+                let result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                    &response,
+                    &Default::default(),
+                );
+                assert!(result.success);
+                assert!(result.error_category.is_none());
+
+                // Actual inference retains its partial-response semantics. Only
+                // the deliberately capped health probe accepts this terminal.
+                let forwarded = proxy::forward_provider_test(
+                    state.clone(),
+                    proxy::ProxyRoute::CodexResponses,
+                    execution.clone(),
+                    None,
+                    HeaderMap::new(),
+                    Bytes::from(provider_test_body(
+                        AppKind::Codex,
+                        &execution.runtime_stored_view(),
+                        Some("auto"),
+                        "ping",
+                        true,
+                    )),
+                )
+                .await
+                .unwrap();
+                let body = axum::body::to_bytes(forwarded.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains("\"type\":\"response.incomplete\""), "{text}");
+                assert!(text.contains("\"reason\":\"max_output_tokens\""), "{text}");
+                assert!(!text.contains("\"type\":\"response.completed\""), "{text}");
+                let observations = observations.lock().unwrap();
+                let generation: Vec<_> = observations
+                    .iter()
+                    .filter(|entry| entry["path"] == crate::domain::codebuddy::CODEBUDDY_CHAT_PATH)
+                    .collect();
+                assert_eq!(generation.len(), 2);
+                for entry in generation {
+                    assert_eq!(entry["body"]["model"], "hy3");
+                    assert_eq!(entry["body"]["max_tokens"], 1);
+                }
+                assert_eq!(observations.len(), 3, "one catalog; no retry or refresh");
+                drop(observations);
+                server.abort();
+                drop(state);
+                std::fs::remove_dir_all(config_dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn buddy_catalog_probe_rejections_are_configuration_errors_before_streaming() {
         use crate::domain::codebuddy::CodeBuddySite;
         for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
@@ -6203,42 +6339,51 @@ mod tests {
     async fn buddy_probe_reports_a_committed_truncated_stream_without_hiding_the_model() {
         for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
             for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-                let (origin, observations, server) =
-                    serve_buddy_provider_api_fixture(None, "default-model", false).await;
-                let state = provider_api_test_state("buddy-truncated-probe");
-                let config_dir = state.config_dir.clone();
-                let execution = install_buddy_execution(&state, origin, app, product).await;
-                let response = test_provider_inner(
-                    &state,
-                    execution,
-                    &TestProviderQuery {
-                        app,
-                        network: Some(true),
-                        stream: Some(true),
-                        model: None,
-                        timeout_ms: Some(2_000),
-                        test_prompt: Some("ping".to_string()),
-                    },
-                )
-                .await
-                .unwrap();
-                assert!(!response.ok);
-                assert_eq!(response.model, "default-model");
-                assert_eq!(response.network_status_code, Some(200));
-                assert_eq!(response.network_stream_completed, Some(false));
-                let result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
-                    &response,
-                    &Default::default(),
-                );
-                assert_eq!(result.error_category.as_deref(), Some("streamIncomplete"));
-                assert_eq!(
-                    observations.lock().unwrap().len(),
-                    2,
-                    "one catalog and one generation; no retry"
-                );
-                server.abort();
-                drop(state);
-                std::fs::remove_dir_all(config_dir).unwrap();
+                for finish_reason in ["stop", "length"] {
+                    let (origin, observations, server) =
+                        serve_buddy_provider_api_fixture_with_finish(
+                            None,
+                            "default-model",
+                            false,
+                            finish_reason,
+                        )
+                        .await;
+                    let state = provider_api_test_state("buddy-truncated-probe");
+                    let config_dir = state.config_dir.clone();
+                    let execution = install_buddy_execution(&state, origin, app, product).await;
+                    let response = test_provider_inner(
+                        &state,
+                        execution,
+                        &TestProviderQuery {
+                            app,
+                            network: Some(true),
+                            stream: Some(true),
+                            model: None,
+                            timeout_ms: Some(2_000),
+                            test_prompt: Some("ping".to_string()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!response.ok);
+                    assert_eq!(response.model, "default-model");
+                    assert_eq!(response.network_status_code, Some(200));
+                    assert_eq!(response.network_stream_completed, Some(false));
+                    let result =
+                        crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                            &response,
+                            &Default::default(),
+                        );
+                    assert_eq!(result.error_category.as_deref(), Some("streamIncomplete"));
+                    assert_eq!(
+                        observations.lock().unwrap().len(),
+                        2,
+                        "one catalog and one generation; no retry"
+                    );
+                    server.abort();
+                    drop(state);
+                    std::fs::remove_dir_all(config_dir).unwrap();
+                }
             }
         }
     }
@@ -6257,21 +6402,105 @@ mod tests {
             ),
         ] {
             let success = format!("data: {terminal}\n\n");
-            assert!(buddy_probe_stream_completed(app, success.as_bytes()));
+            assert!(buddy_probe_stream_completed(app, success.as_bytes(), None));
             for failure in [
                 json!({"error":{"message":"truncated before [DONE]; missing response.completed / message_stop / finishReason"}}),
                 json!({"type":"response.incomplete","response":{"status":"incomplete"}}),
             ] {
                 let failed = format!("data: {failure}\n\n{success}data: [DONE]\n\n");
-                assert!(!buddy_probe_stream_completed(app, failed.as_bytes()));
+                assert!(!buddy_probe_stream_completed(app, failed.as_bytes(), None));
             }
             let content = format!(
                 "data: {}\n\n",
                 json!({"delta":{"content":terminal.to_string()}})
             );
-            assert!(!buddy_probe_stream_completed(app, content.as_bytes()));
-            assert!(!buddy_probe_stream_completed(app, b"data: [DONE]\n\n"));
-            assert!(!buddy_probe_stream_completed(app, b"data: {invalid}\n\n"));
+            assert!(!buddy_probe_stream_completed(app, content.as_bytes(), None));
+            assert!(!buddy_probe_stream_completed(
+                app,
+                b"data: [DONE]\n\n",
+                None
+            ));
+            assert!(!buddy_probe_stream_completed(
+                app,
+                b"data: {invalid}\n\n",
+                None
+            ));
+        }
+    }
+
+    #[test]
+    fn buddy_probe_output_limit_requires_the_sent_cap_and_matching_metered_terminal() {
+        let limited = json!({"type":"response.incomplete","response":{
+            "status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"output_tokens":1}
+        }});
+        let body = format!("event: response.incomplete\ndata: {limited}\n\ndata: [DONE]\n\n");
+        assert!(buddy_probe_stream_completed(
+            AppKind::Codex,
+            body.as_bytes(),
+            Some(1)
+        ));
+        for cap in [None, Some(0), Some(2)] {
+            assert!(!buddy_probe_stream_completed(
+                AppKind::Codex,
+                body.as_bytes(),
+                cap
+            ));
+        }
+        for app in [AppKind::Claude, AppKind::Gemini] {
+            assert!(!buddy_probe_stream_completed(app, body.as_bytes(), Some(1)));
+        }
+        for (path, value) in [
+            ("/type", json!("response.completed")),
+            ("/response/status", json!("failed")),
+            ("/response/status", json!("completed")),
+            (
+                "/response/incomplete_details/reason",
+                json!("content_filter"),
+            ),
+            ("/response/incomplete_details/reason", Value::Null),
+            ("/response/usage/output_tokens", json!(0)),
+            ("/response/usage/output_tokens", json!(1.0)),
+            ("/response/usage/output_tokens", json!("1")),
+            ("/response/usage", Value::Null),
+        ] {
+            let mut invalid = limited.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            let invalid_body = format!("data: {invalid}\n\n");
+            assert!(
+                !buddy_probe_stream_completed(AppKind::Codex, invalid_body.as_bytes(), Some(1)),
+                "{invalid}"
+            );
+        }
+        for error_path in ["error", "response"] {
+            let mut invalid = limited.clone();
+            if error_path == "error" {
+                invalid["error"] = json!({"message":"actual failure"});
+            } else {
+                invalid["response"]["error"] = json!({"message":"actual failure"});
+            }
+            let invalid_body = format!("data: {invalid}\n\n");
+            assert!(!buddy_probe_stream_completed(
+                AppKind::Codex,
+                invalid_body.as_bytes(),
+                Some(1)
+            ));
+        }
+        for (prefix, suffix) in [
+            ("event: error\n", ""),
+            ("event: response.failed\n", ""),
+            ("event: response.completed\n", ""),
+            (
+                "",
+                "event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n",
+            ),
+            ("", "event: response.incomplete\n\n"),
+        ] {
+            let failed = format!("{prefix}data: {limited}\n\n{suffix}");
+            assert!(
+                !buddy_probe_stream_completed(AppKind::Codex, failed.as_bytes(), Some(1)),
+                "{failed}"
+            );
         }
     }
 

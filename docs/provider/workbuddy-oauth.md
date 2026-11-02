@@ -4,6 +4,8 @@
 
 WorkBuddy 是腾讯办公 Agent 产品，与编程产品 CodeBuddy 分开注册。`workbuddy_oauth` 使用 `family.workbuddy_oauth`、`claude.workbuddy_oauth` / `codex.workbuddy_oauth` / `gemini.workbuddy_oauth` 和 `special.workbuddy_oauth`。固定绑定一个个人 Account，站点仅 `cn` / `intl`；不引入账号池、站点切换、跨 Provider/Account fallback、签到或桌面任务编排。
 
+连接探针维持 1 token 输出上限。Codex 的预期输出上限终态仅在本次探针设置了上限、`response.incomplete` 的状态/原因为 incomplete / max_output_tokens 且 usage 证明达到该上限时视为健康；其他 incomplete、错误或真实断流仍失败。此检查不改生产推理的 partial-response 语义，详见 [CodeBuddy 测试合同](codebuddy-oauth.md#2026-11-02-自动模型测试与账号展示)。
+
 | 策略 | CN | Intl |
 | --- | --- | --- |
 | 原生登录 platform | `workbuddy` | `workbuddy-ai` |

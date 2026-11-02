@@ -1,5 +1,15 @@
 # Protocol evidence policy
 
+## 2026-11-02 Buddy 单 token 探针的预期输出上限终态
+
+远程 Server `240c6571a9c3` 已包含自动模型和账号展示修复。只读核对发现 WorkBuddy CN 单模型 `auto` 已解析为 `hy3`；同一时段的实际调用记录为 HTTP 200、outputTokens=1、streamStatus=completed，而模型健康检查报告 streamIncomplete。现有公开探针本身设置 `max_output_tokens=1`，不能用“必须自然完成整段回答”判断这种连接检查。
+
+使用同一精确绑定账号的现有有效 access token，按现有 CLI 2.142.0 身份和生成协议仅执行一次 `hy3` / `ping` / `max_tokens=1` 最小探针，不刷新凭据、不修改生产配置或持久化状态。实测 HTTP 200，3 个 JSON 数据事件，finish_reason=length，唯一 `[DONE]`、正常 EOF；usage 为 prompt_tokens=20、completion_tokens=1、total_tokens=21，无上游错误。只保留终态与计量元数据，不记录凭据、UID、手机或生成正文。这确认了本账号本次最小调用的形态，不提升 WorkBuddy 双站或其他能力的联合验收状态。
+
+根因是既有 bridge 正确把 length 映射为 Responses `response.incomplete` / `max_output_tokens`，Buddy 健康探针却将所有 incomplete 归为未完成。修复仅在探针确实设置正整数输出上限、终态类型/状态/原因匹配且 usage 证明达到该上限时认可预期结束；error/failed、其他 incomplete、缺少计量、畸形帧和真实截断继续拒绝。生产推理仍返回原 `response.incomplete`，不增加探针预算、不更换模型、不重试，也不改 Router 或上游 wire。
+
+本地网络回环在旧实现先复现相同错误，修复后覆盖两个产品和两个站点的预期上限终态，并确认推理仍返回 incomplete；三个 App 的 stop/length 后缺少 DONE 均继续失败。全量 Rust 4,176 项通过、3 项忽略，后端审计 2,111 项通过；格式检查（含 include 源文件）、cargo check、严格 Clippy、构建、本地启动 smoke 及契约/文档检查通过。整体代码 review 未发现遗留阻断项。补丁尚未部署生产；离线 readiness 仍因完整真实验收输入及部署验证缺失而 blocked，不能标记补丁的远程健康检查或双站联合验收已通过。
+
 ## 2026-11-02 WorkBuddy CN 自动模型与账号展示修复
 
 对同机 Server/Router 的生产故障做只读核查：现有 WorkBuddy CN 账号配置单模型 `auto`，全局健康测试模型为带 reasoning modifier 的 GPT ID。旧路径将它改写为 `auto`，随后硬编码为 `default`，但绑定账号的 CLI 通道没有该 ID，因此生成前 403；流尚未建立却被标记为 streamIncomplete。账号已有昵称，但公开投影与 Web 标签只读取 email/login/ID，正常刷新也未合并显示资料。

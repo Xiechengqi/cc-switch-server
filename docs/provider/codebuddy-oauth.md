@@ -848,8 +848,10 @@ WorkBuddy 已作为独立产品接入，见 [WorkBuddy 合同](workbuddy-oauth.m
 
 ## 2026-11-02 自动模型、测试与账号展示
 
+Buddy 连接探针沿用既有 1 token 输出上限。Codex Responses 中，由该上限触发的 `response.incomplete` / `max_output_tokens` 只有在本次探针确实设置正整数上限、终态类型与状态匹配且 usage.output_tokens 达到上限时才视为探针完整结束；不把它当作网络截断。此规则仅用于健康检查，生产推理保留原 incomplete 语义。错误、其他未完成原因、缺少计量和真正截断仍失败，不增加探针预算或跨模型重试。
+
 `auto` 的当前目录选择规则见 §6.3；CN 的总模型表包含 `default`，不意味着当前 CLI agent 授权它。自动选择只发生在同一绑定目录内，不新增模型权益、不改变工具/reasoning 要求、不因上游错误尝试其它模型。目录优先顺序计入现有缓存内存所有权，空通道及目录撤销继续失败关闭。
 
-单模型健康检查始终采用该 Surface 配置的 upstreamModel（包含 `auto`），不从全局测试模型注入 GPT ID 或 effort；透传模式保留请求/App/供应商的测试模型覆盖，无覆盖则使用 `auto`。Web 单模型测试框显示并跟随上游模型。成功探针通过内部响应 extension 获取实际 native model，不增加 wire header 或额外目录读取；健康记录使用该模型。生成前目录拒绝归为 invalidConfig，stream completion 为未知；只有收到成功 HTTP 流后缺少终态才归为 streamIncomplete，timeout/auth/quota 等已有分类仍保留。Buddy 探针按有界 SSE 解码后的真实终态判断，error/failed/incomplete 优先拒绝，生成文本或错误说明中的 `[DONE]`、`response.completed` 等子串不能冒充完成。
+单模型健康检查始终采用该 Surface 配置的 upstreamModel（包含 `auto`），不从全局测试模型注入 GPT ID 或 effort；透传模式保留请求/App/供应商的测试模型覆盖，无覆盖则使用 `auto`。Web 单模型测试框显示并跟随上游模型。成功探针通过内部响应 extension 获取实际 native model，不增加 wire header 或额外目录读取；健康记录使用该模型。生成前目录拒绝归为 invalidConfig，stream completion 为未知；只有收到成功 HTTP 流后缺少终态才归为 streamIncomplete，timeout/auth/quota 等已有分类仍保留。Buddy 探针按有界 SSE 解码后的真实终态判断，error/failed 及非预期 incomplete 优先拒绝，生成文本或错误说明中的 `[DONE]`、`response.completed` 等子串不能冒充完成。
 
 CodeBuddy 与 WorkBuddy 的 AccountPublicView / ManagedAuthAccount 增加可选 `displayName`。优先真实邮箱、脱敏手机号、nickname/name、内部 ID；手机号不放入 email。旧账号的已存昵称立即可用，后续正常刷新复用已认证 `/accounts` 请求补全显示资料。先落旋转 token receipt，再核对 UID/enterprise，最后合并非空可显示字段；缺失、对象及非法显示值不清除旧资料。显示信息不改变 principal、认证代次、Provider/Share 绑定；完整 profile、原始手机和凭据不进入公开视图。2026-11-02 CN GET 观察只证明字段/目录形态，不能替代推理、OAuth 轮换或双站联合接受性验收。
