@@ -2425,3 +2425,13 @@ Server 与 Router 统一 Codex → Claude → Gemini，按 Share 自身启用、
 最终验证针对当前两个未提交工作树：Server `cargo fmt --check`、`cargo check`、完整 `cargo test`（4,080 通过、3 忽略）、`cargo build`、严格全目标 Clippy 和 `scripts/static-checks.sh` 均通过；后者含 Node 审计 1,914 项及 smoke 脚本测试 13 项。Web 全量 267 项、类型检查与生产构建通过，已更新内嵌资产。Router 格式、编译、健康检查契约审计及完整 Rust 1,684 项均通过。新二进制本地 smoke 通过，临时配置和监听端口已清理。
 
 整体 review 核对固定顺序、Share 范围、同运行时/同槽复用、指纹隔离、执行锁与持久化顺序、旧模型归属和非 Bundle 兼容；已纠正排队目标失效及不支持探测的展示边界，并用本地先执行、Router 先执行、并发、重放、模型/槽变化回归验证。Provider 源码摘要由生成器更新，没有放宽审计。Router 原有四处前端及未跟踪文件改动保持不变。本轮未提交、推送或部署；离线 readiness 为 `failures=0`、`blocked_inputs`，真实凭据、真实部署和人工 UI 验收仍不宣称通过。
+
+## 2026-11-01 Claude 历史文本到 OpenAI Responses 的角色类型
+
+只读核对 CLIProxyAPI@250d598175db61a4e99ac38b9164ed04745754e5 的 `internal/translator/codex/claude/codex_claude_request.go`（`appendTextContent`）及 codex2api@dfab070b32291c0a32d62c8941970a945d6ac3d3 的 `proxy/translator.go`（`normalizeResponsesContentPartTypes` / `normalizeResponsesContentItemType`）。前者在 Anthropic 转换源头按角色选文本类型，后者在 Responses 出站按角色纠正文本 part。未执行或引入外仓代码。官方 Responses 文档本轮访问被拒，不能据此宣称已在线核实官方接口或完成真实接受性验收。
+
+Server 的 Anthropic→Responses 转换原来把 assistant 历史文本也固定写成 `input_text`，与现有 Chat→Responses 的角色处理不一致。修复范围为源头按角色输出文本类型，以及 Codex OAuth 共享出站边界对普通 message 的直接文本 part 作有限归一化：assistant 使用 `output_text`，user/system/developer 使用 `input_text`。不递归工具参数或结果，不改原生 `agent_message`、未知 item、refusal、reasoning 或媒体语义；不增加重试、账号切换或额度写入。覆盖文档由本仓生成器更新。本轮验证仅使用离线夹具和严格本地回环上游，不部署、不调用真实 OpenAI 账号。
+
+验证：4 项旧实现反例先失败，修复后 7 项新增回归全部通过。严格回环上游先拒绝旧 assistant `input_text` 请求，再验证 Claude 字符串/数组历史的流式与非流式调用、固定 OAuth 身份、文本及用量返回；同时覆盖 HTTP、Compact、平铺/嵌套 WebSocket、HTTP 回退、工具顺序、系统文本数组、加密 reasoning 历史和幂等/不透明边界。完整 `cargo test` 为 4,116 通过、0 失败、3 项既有忽略；fmt（含所有独立 include 源文件）、check、严格全目标 Clippy、build、新二进制本地 smoke、覆盖文档/接口矩阵/产品边界/文档索引审计及 13 项 smoke 脚本测试通过。验证后的本次 Rust 源文件摘要与完整测试开始时一致。
+
+全仓 Node 审计为 1,911 通过、4 失败，均因工作区原有且并行推进的 `src/state.rs` 未同步 Provider writer 源码摘要；本次未修改该文件、无关额度/Router 改动或其审计清单，也未放宽门禁。离线 readiness 为 `failures=0`、`blocked_inputs`，真实凭据/部署及脚本内跳过的本地门禁仍明确阻塞，不能等同于发布通过。整体 review 未发现本次修复的阻断问题；未提交、推送或部署，真实 OpenAI 接受性验收仍待执行。

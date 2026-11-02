@@ -3419,12 +3419,49 @@ fn flush_responses_tool_media(input: &mut Vec<Value>, pending: &mut Vec<Value>) 
     }
 }
 
-fn openai_chat_content_to_responses_content(role: &str, content: Option<&Value>) -> Vec<Value> {
-    let text_type = if role == "assistant" {
+fn responses_text_part_type(role: &str) -> &'static str {
+    if role == "assistant" {
         "output_text"
     } else {
         "input_text"
+    }
+}
+
+/// Repair only direct text parts of ordinary messages with known roles. Native
+/// agent items, tool payloads, and future item/part schemas remain opaque.
+pub(super) fn normalize_responses_message_text_parts(item: &mut Value) {
+    if item
+        .get("type")
+        .is_some_and(|kind| kind.as_str() != Some("message"))
+    {
+        return;
+    }
+    let Some(role) = item
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|role| matches!(*role, "assistant" | "user" | "system" | "developer"))
+    else {
+        return;
     };
+    let text_type = responses_text_part_type(role);
+    let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for part in parts {
+        if part
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(kind, "text" | "input_text" | "output_text") && kind != text_type
+            })
+        {
+            part["type"] = Value::String(text_type.to_string());
+        }
+    }
+}
+
+fn openai_chat_content_to_responses_content(role: &str, content: Option<&Value>) -> Vec<Value> {
+    let text_type = responses_text_part_type(role);
     let Some(content) = content else {
         return Vec::new();
     };
@@ -5187,7 +5224,7 @@ fn anthropic_system_to_openai_responses(system: Option<&Value>) -> Option<Value>
             let content = blocks
                 .iter()
                 .filter(|block| anthropic_text_from_block(block).is_some())
-                .map(anthropic_block_to_openai_response_content)
+                .map(|block| anthropic_block_to_openai_response_content("system", block))
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| json!({"role": "system", "content": content}))
         }
@@ -5614,7 +5651,10 @@ fn anthropic_message_to_openai_response_items(message: &Value) -> Vec<Value> {
             }
             _ => {
                 flush_responses_tool_media(&mut items, &mut pending_media);
-                content.push(anthropic_block_to_openai_response_content(block));
+                content.push(anthropic_block_to_openai_response_content(
+                    response_role,
+                    block,
+                ));
             }
         }
     }
@@ -6261,12 +6301,12 @@ fn anthropic_block_to_openai_chat_content(block: &Value) -> Value {
     }
 }
 
-fn anthropic_block_to_openai_response_content(block: &Value) -> Value {
+fn anthropic_block_to_openai_response_content(role: &str, block: &Value) -> Value {
     match block.get("type").and_then(Value::as_str) {
         Some("image") => anthropic_image_to_openai_response(block),
         _ => {
             let mut output = json!({
-                "type": "input_text",
+                "type": responses_text_part_type(role),
                 "text": anthropic_text_from_block(block).unwrap_or_default()
             });
             copy_cache_control(block, &mut output);
@@ -11135,6 +11175,128 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ping")
         );
+    }
+
+    #[test]
+    fn responses_message_text_types_follow_anthropic_history_roles() {
+        for block_content in [false, true] {
+            let content = |text: &str| {
+                if block_content {
+                    json!([{"type":"text", "text":text, "cache_control":{"type":"ephemeral"}}])
+                } else {
+                    json!(text)
+                }
+            };
+            let input = json!({
+                "model":"gpt-5.4",
+                "system":content("be helpful"),
+                "messages":[
+                    {"role":"user", "content":content("first")},
+                    {"role":"assistant", "content":content("answer")},
+                    {"role":"user", "content":content("next")}
+                ]
+            });
+            for instructions in [false, true] {
+                let output =
+                    anthropic_to_openai_responses_with_system_mode(&input, instructions).unwrap();
+                let offset = usize::from(!instructions);
+                if instructions {
+                    assert_eq!(output["instructions"], "be helpful");
+                } else if block_content {
+                    assert_eq!(output["input"][0]["role"], "system");
+                    assert_eq!(output["input"][0]["content"][0]["type"], "input_text");
+                }
+                for (index, (role, text_type, text)) in [
+                    ("user", "input_text", "first"),
+                    ("assistant", "output_text", "answer"),
+                    ("user", "input_text", "next"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let item = &output["input"][offset + index];
+                    assert_eq!(item["role"], role);
+                    assert_eq!(item["content"][0]["type"], text_type);
+                    assert_eq!(item["content"][0]["text"], text);
+                    if block_content {
+                        assert_eq!(item["content"][0]["cache_control"]["type"], "ephemeral");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_message_text_types_preserve_tool_turn_order() {
+        let arguments = json!({"type":"input_text", "text":"opaque argument"});
+        let input = json!({
+            "model":"gpt-5.4",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"text", "text":"before"},
+                    {"type":"tool_use", "id":"call_1", "name":"lookup", "input":arguments},
+                    {"type":"text", "text":"after"}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"call_1", "content":"tool output"},
+                    {"type":"text", "text":"continue"}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_responses_with_instructions(&input).unwrap();
+        let items = output["input"].as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        for (index, text) in [(0, "before"), (2, "after")] {
+            assert_eq!(items[index]["role"], "assistant");
+            assert_eq!(
+                items[index]["content"][0],
+                json!({"type":"output_text", "text":text})
+            );
+        }
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(
+            serde_json::from_str::<Value>(items[1]["arguments"].as_str().unwrap()).unwrap(),
+            arguments
+        );
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["output"], "tool output");
+        assert_eq!(items[4]["role"], "user");
+        assert_eq!(
+            items[4]["content"][0],
+            json!({"type":"input_text", "text":"continue"})
+        );
+    }
+
+    #[test]
+    fn responses_message_text_types_preserve_reasoning_history_round_trip() {
+        let reasoning = json!({
+            "id":"rs_history_source", "type":"reasoning",
+            "summary":[{"type":"summary_text", "text":"visible reasoning"}],
+            "encrypted_content":"opaque-reasoning"
+        });
+        let previous = openai_responses_response_to_anthropic(&json!({
+            "id":"resp_history_source", "status":"completed", "model":"gpt-6-astra",
+            "output":[reasoning, {
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":"previous answer"}]
+            }]
+        }))
+        .unwrap();
+        let next = anthropic_to_openai_responses_with_instructions(&json!({
+            "model":"gpt-6-astra", "messages":[
+                {"role":"user", "content":"first"},
+                {"role":"assistant", "content":previous["content"]},
+                {"role":"user", "content":"next"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(next["input"][1], reasoning);
+        assert_eq!(next["input"][2]["role"], "assistant");
+        assert_eq!(
+            next["input"][2]["content"][0],
+            json!({"type":"output_text", "text":"previous answer"})
+        );
+        assert_eq!(next["input"][3]["content"][0]["type"], "input_text");
     }
 
     #[test]
