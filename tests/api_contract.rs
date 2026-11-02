@@ -1367,6 +1367,8 @@ async fn ordinary_share_settings_entrypoint_rejects_managed_grants() {
                     trial_token_limit: None,
                     trial_scope_id: None,
                     trial_token_allowance: None,
+                    trial_value_allowance_usd_micros: None,
+                    trial_value_limit_usd_micros: None,
                 }),
                 ..ShareSettingsPatch::default()
             },

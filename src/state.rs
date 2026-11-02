@@ -6990,6 +6990,21 @@ impl ServerStateInner {
             shares_changed |= crate::domain::sharing::market_trials::recover(share, &usage, false)
                 .map_err(anyhow::Error::msg)?;
         }
+        // USD trial usage is mirrored from the durable value ledger after
+        // its commit; re-derive it before any admission can read a stale
+        // (lower) counter. On failure Market admission stays paused.
+        let market_trial_value_unavailable =
+            match share_value_quota::reconcile_market_trial_value_on_load(&config_dir, &mut shares)
+            {
+                Ok(changed) => {
+                    shares_changed |= changed;
+                    false
+                }
+                Err(error) => {
+                    tracing::error!(%error, "USD trial usage could not be re-derived at startup; Market admission is paused");
+                    true
+                }
+            };
         let repaired_shares = integrity_outcomes
             .iter()
             .filter(|outcome| {
@@ -7240,7 +7255,9 @@ impl ServerStateInner {
             shares_persistence: StorePersistenceCoordinator::default(),
             shares: RwLock::new(shares),
             share_quota_mutations: AsyncMutex::new(()),
-            quota_usage_degraded: std::sync::atomic::AtomicBool::new(false),
+            quota_usage_degraded: std::sync::atomic::AtomicBool::new(
+                market_trial_value_unavailable,
+            ),
             value_pricing_known_revision_unsupported: std::sync::Mutex::new(BTreeSet::new()),
             share_lifecycle: AsyncMutex::new(()),
             ui_settings_persistence: StorePersistenceCoordinator::default(),
@@ -13498,6 +13515,19 @@ impl ServerStateInner {
             }
             self.usage.write().await.apply_append(append);
             self.usage_persistence.mark_published();
+            if has_market_receipt {
+                // The ledger settled this request's USD attempt in the same
+                // SQLite commit; mirror it into a USD trial budget now. A
+                // crash before this save is repaired by the startup pass.
+                if let Err(error) = self
+                    .sync_market_trial_value(Some(&expected_log.request_id), true)
+                    .await
+                {
+                    tracing::error!(%error, request_id = %expected_log.request_id,
+                        "USD trial usage could not be mirrored; Market admission is paused until restart re-derives it");
+                    self.mark_quota_usage_degraded();
+                }
+            }
             return Ok(expected_log);
         }
         let persisted_append = append.clone();
@@ -32452,6 +32482,7 @@ mod tests {
             installation_id: "readiness-install".into(),
             share_id: "readiness-share".into(),
             email: "owner@example.com".into(),
+            entitlement_id: None,
         };
         let pricing_revision = snapshot.revision().unwrap();
         ledger::install_snapshot(
@@ -32544,6 +32575,7 @@ mod tests {
             installation_id: "value-install".into(),
             share_id: "value-share".into(),
             email: "owner@example.com".into(),
+            entitlement_id: None,
         };
         let pricing:PricingSnapshot=serde_json::from_value(json!({"schemaVersion":1,"tariffPolicyId":"api-equivalent-v1","currency":"USD","exactAliases":{},
             "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
@@ -32804,6 +32836,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn value_quota_market_seat_binding_is_per_contract_and_never_scheduled() {
+        use crate::domain::sharing::router_contract::{
+            ShareGrantManager, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
+        };
+        use crate::domain::sharing::shares::ShareStore;
+        use crate::domain::usage::value_pricing::{PricingSnapshot, ValueQuota};
+        use crate::repository::server_sqlite::value_quota as value_ledger;
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "seat-install").await;
+        crate::repository::server_sqlite::activate_authority(&state.config_dir).unwrap();
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("provider", "Provider"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let config = state.config_snapshot().await;
+        let negotiate = |version: u16, capabilities: Vec<String>| {
+            let state = state.clone();
+            let config = config.clone();
+            async move {
+                state
+                    .record_router_quota_capability(
+                        &config,
+                        client::RouterShareCapabilities {
+                            share_contract_version: version,
+                            capabilities,
+                        },
+                    )
+                    .await;
+            }
+        };
+        negotiate(10, vec!["usdEquivalentQuotaV1".into()]).await;
+        state
+            .mutate_shares_immediate(|store| {
+                let mut input = router_sync_share_input("seat-share", "provider");
+                input.enabled = Some(true);
+                input.status = Some("active".into());
+                store.upsert(input).unwrap();
+            })
+            .await
+            .unwrap();
+        let scope = value_ledger::Scope {
+            router_url: config.router_api_base().unwrap().into(),
+            installation_id: "seat-install".into(),
+            share_id: "seat-share".into(),
+            email: "renter@example.com".into(),
+            entitlement_id: None,
+        };
+        let pricing:PricingSnapshot=serde_json::from_value(json!({"schemaVersion":1,"tariffPolicyId":"api-equivalent-v1","currency":"USD","exactAliases":{},
+            "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
+            "rates":{"standard/base":{"input":"1000000","output":"1000000","cacheRead":null,"cacheWrite5m":null,"cacheWrite1h":null,"cacheWritePolicy":"unavailable"}}}}})).unwrap();
+        let revision = pricing.revision().unwrap();
+        value_ledger::install_snapshot(
+            &state.config_dir,
+            &scope,
+            &revision,
+            &pricing,
+            now_ms_i64(),
+        )
+        .unwrap();
+        value_ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+        // Earlier Share traffic of this email in the current window: an
+        // ordinary grant would be scheduled; a seat is metered from now.
+        {
+            let mut recorded = crate::domain::usage::store::UsageLog::new(
+                AppKind::Codex,
+                "provider".into(),
+                "Provider".into(),
+                ProviderType::Codex,
+                200,
+                1,
+                crate::domain::usage::store::UsageModelMetadata {
+                    model: Some("model".into()),
+                    ..Default::default()
+                },
+                crate::domain::usage::store::TokenUsage::default(),
+            );
+            recorded.apply_context(UsageLogContext {
+                request_id: Some("pre-seat-request".into()),
+                share_id: Some("seat-share".into()),
+                user_email: Some("renter@example.com".into()),
+                ..Default::default()
+            });
+            state.usage.write().await.logs.push(recorded);
+        }
+        let usd_policy = |micros: &str| ShareUserPolicy {
+            value_quota: Some(ValueQuota {
+                limit_usd_micros: micros.into(),
+                tariff_policy_id: "api-equivalent-v1".into(),
+            }),
+            token_period: ShareTokenPeriod::Day,
+            ..Default::default()
+        };
+        // What `apply_managed_grant_operation` leaves in the candidate.
+        let upserted = |store: &ShareStore, entitlement: &str, policy: ShareUserPolicy| {
+            let mut store = store.clone();
+            store
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "seat-share")
+                .unwrap()
+                .user_grants
+                .insert(
+                    "renter@example.com".into(),
+                    ShareUserGrant {
+                        email: "renter@example.com".into(),
+                        role: "shareto".into(),
+                        active: true,
+                        policy,
+                        value_metering: None,
+                        pending_value_quota: None,
+                        manager: ShareGrantManager::RouterShareMarket,
+                        entitlement_id: Some(entitlement.into()),
+                        ..Default::default()
+                    },
+                );
+            store
+        };
+        let seat = |store: &ShareStore| {
+            store.get("seat-share").unwrap().user_grants["renter@example.com"].clone()
+        };
+
+        // First USD upsert of a contract: metered from now, never pending.
+        let before = state.shares.read().await.clone();
+        let t1 = now_ms_i64();
+        let mut first = upserted(&before, "seat-1", usd_policy("10000000"));
+        state
+            .prepare_value_bindings_at(&mut first, &before, t1)
+            .await
+            .unwrap();
+        let bound = seat(&first);
+        assert!(bound.pending_value_quota.is_none());
+        assert_eq!(bound.policy.value_quota, usd_policy("10000000").value_quota);
+        let binding = bound.value_metering.clone().unwrap();
+        assert_eq!(binding.value_metered_from_ms, t1);
+        assert_eq!(binding.effective_from_ms, t1);
+        assert_eq!(binding.pricing_revision, revision);
+
+        // Re-upsert of the same contract and policy keeps the binding.
+        let mut again = upserted(&first, "seat-1", usd_policy("10000000"));
+        state
+            .prepare_value_bindings_at(&mut again, &first, t1 + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(seat(&again).value_metering, Some(binding.clone()));
+
+        // Billing suspend (revoke) then resume of the same entitlement.
+        let mut suspended = again.clone();
+        {
+            let grant = suspended
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "seat-share")
+                .unwrap()
+                .user_grants
+                .get_mut("renter@example.com")
+                .unwrap();
+            grant.active = false;
+        }
+        let mut resumed = upserted(&suspended, "seat-1", usd_policy("10000000"));
+        state
+            .prepare_value_bindings_at(&mut resumed, &suspended, t1 + 2_000)
+            .await
+            .unwrap();
+        let resumed_binding = seat(&resumed).value_metering.unwrap();
+        assert_eq!(resumed_binding.value_metered_from_ms, t1);
+        assert_eq!(
+            resumed_binding.quota_policy_epoch,
+            binding.quota_policy_epoch
+        );
+
+        // Trial -> paid with a new amount: same origin, new policy epoch.
+        let mut paid = upserted(&resumed, "seat-1", usd_policy("20000000"));
+        state
+            .prepare_value_bindings_at(&mut paid, &resumed, t1 + 3_000)
+            .await
+            .unwrap();
+        let paid_binding = seat(&paid).value_metering.unwrap();
+        assert!(seat(&paid).pending_value_quota.is_none());
+        assert_eq!(paid_binding.value_metered_from_ms, t1);
+        assert_ne!(paid_binding.quota_policy_epoch, binding.quota_policy_epoch);
+
+        // A different contract for the same email starts its own metering.
+        let mut ended = paid.clone();
+        ended
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "seat-share")
+            .unwrap()
+            .user_grants
+            .get_mut("renter@example.com")
+            .unwrap()
+            .active = false;
+        let t2 = t1 + 4_000;
+        let mut second = upserted(&ended, "seat-2", usd_policy("10000000"));
+        state
+            .prepare_value_bindings_at(&mut second, &ended, t2)
+            .await
+            .unwrap();
+        let second_binding = seat(&second).value_metering.unwrap();
+        assert_eq!(second_binding.value_metered_from_ms, t2);
+        assert_ne!(
+            second_binding.quota_policy_epoch,
+            paid_binding.quota_policy_epoch
+        );
+
+        // Capability loss: a bound seat survives a background save untouched,
+        // but a new contract fails the save (fail closed).
+        negotiate(7, vec![]).await;
+        let mut background = second.clone();
+        state
+            .prepare_value_bindings_at(&mut background, &second, t2 + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(seat(&background), seat(&second));
+        let mut third = upserted(&ended, "seat-3", usd_policy("10000000"));
+        let error = state
+            .prepare_value_bindings_at(&mut third, &ended, t2 + 2_000)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "VALUE_QUOTA_ROUTER_UPGRADE_OR_COMMITTED_STORAGE_REQUIRED"
+        );
+
+        // The Router-facing preview advertises USD seat support, always ready.
+        let config_revision = before.get("seat-share").unwrap().config_revision;
+        let preview = state
+            .preview_share_value_quota("seat-share", config_revision, BTreeMap::new())
+            .await
+            .unwrap();
+        let checks = preview["checks"].as_array().unwrap();
+        assert!(checks
+            .iter()
+            .any(|c| c == &json!({"code":"market_seat_quota","ready":true})));
+        let seat_index = checks
+            .iter()
+            .position(|c| c["code"] == "market_seat_quota")
+            .unwrap();
+        assert_eq!(
+            checks.get(seat_index + 1),
+            Some(&json!({"code":"market_trial_value","ready":true})),
+            "USD trial budgets are advertised next to USD seats"
+        );
+        assert_eq!(
+            preview["capabilityReady"], false,
+            "router_protocol still gates"
+        );
+        assert_ne!(
+            preview["reasonCode"], "market_trial_value",
+            "an always-ready capability check never becomes the reason code"
+        );
+    }
+
+    #[tokio::test]
     async fn value_quota_free_access_does_not_enforce_a_revoked_individual_policy() {
         use crate::domain::sharing::router_contract::{ShareUserGrant, ShareUserPolicy};
         use crate::domain::usage::value_pricing::ValueQuota;
@@ -32927,6 +33221,7 @@ mod tests {
             installation_id: "retry-install".into(),
             share_id: "retry-share".into(),
             email: "owner@example.com".into(),
+            entitlement_id: None,
         };
         let pricing:PricingSnapshot=serde_json::from_value(json!({"schemaVersion":1,"tariffPolicyId":"api-equivalent-v1","currency":"USD","exactAliases":{},
             "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
@@ -33031,6 +33326,223 @@ mod tests {
         // Only the unknown attempt's bounded reservation (20 tokens) counts.
         assert_eq!(status.used_picos, "20000000");
         assert_eq!(status.pending_risk_picos, "0");
+    }
+
+    #[tokio::test]
+    async fn value_quota_usd_trial_mirrors_settled_ledger_value_and_rederives_it_on_restart() {
+        use crate::domain::sharing::market_trials;
+        use crate::domain::sharing::router_contract::{
+            ShareGrantManager, ShareMarketEntitlement, ShareMarketPhase, ShareTokenPeriod,
+            ShareUserGrant, ShareUserPolicy,
+        };
+        use crate::domain::sharing::shares::ShareStore;
+        use crate::domain::usage::value_pricing::{PricingSnapshot, RiskEstimate, ValueQuota};
+        use crate::repository::server_sqlite::value_quota as value_ledger;
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "trial-usd-install").await;
+        crate::repository::server_sqlite::activate_authority(&state.config_dir).unwrap();
+        state
+            .upsert_provider_command(
+                AppKind::Codex,
+                test_provider("provider", "Provider"),
+                Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+                None,
+                None,
+                test_api_key_credential(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let config = state.config_snapshot().await;
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 10,
+                    capabilities: vec!["usdEquivalentQuotaV1".into()],
+                },
+            )
+            .await;
+        let scope = value_ledger::Scope {
+            router_url: config.router_api_base().unwrap().into(),
+            installation_id: "trial-usd-install".into(),
+            share_id: "trial-usd-share".into(),
+            email: "renter@example.com".into(),
+            entitlement_id: Some("usd-trial".into()),
+        };
+        let pricing:PricingSnapshot=serde_json::from_value(json!({"schemaVersion":1,"tariffPolicyId":"api-equivalent-v1","currency":"USD","exactAliases":{},
+            "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
+            "rates":{"standard/base":{"input":"1000000","output":"1000000","cacheRead":null,"cacheWrite5m":null,"cacheWrite1h":null,"cacheWritePolicy":"unavailable"}}}}})).unwrap();
+        let revision = pricing.revision().unwrap();
+        value_ledger::install_snapshot(
+            &state.config_dir,
+            &scope,
+            &revision,
+            &pricing,
+            now_ms_i64(),
+        )
+        .unwrap();
+        value_ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+        // A managed USD seat whose trial budget is $0.00003 (30 micro-USD):
+        // one unknown-outcome attempt reserves 20 Tokens = 20 micro-USD.
+        state
+            .mutate_shares_immediate(|store| {
+                let mut input = router_sync_share_input("trial-usd-share", "provider");
+                input.enabled = Some(true);
+                input.status = Some("active".into());
+                store.upsert(input).unwrap();
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "trial-usd-share")
+                    .unwrap();
+                share.user_grants.insert(
+                    "renter@example.com".into(),
+                    ShareUserGrant {
+                        email: "renter@example.com".into(),
+                        role: "shareto".into(),
+                        active: true,
+                        policy: ShareUserPolicy {
+                            value_quota: Some(ValueQuota {
+                                limit_usd_micros: "10000000".into(),
+                                tariff_policy_id: "api-equivalent-v1".into(),
+                            }),
+                            token_period: ShareTokenPeriod::Lifetime,
+                            ..Default::default()
+                        },
+                        manager: ShareGrantManager::RouterShareMarket,
+                        entitlement_id: Some("usd-trial".into()),
+                        ..Default::default()
+                    },
+                );
+                share.market_entitlements.insert(
+                    "usd-trial".into(),
+                    ShareMarketEntitlement {
+                        trial_scope_id: "usd-scope".into(),
+                        trial_token_allowance: None,
+                        email: "renter@example.com".into(),
+                        phase: ShareMarketPhase::Trial,
+                        active: true,
+                        trial_token_limit: None,
+                        trial_tokens_used: 0,
+                        usage_revision: 0,
+                        usage_uncertain: false,
+                        applied_at_ms: now_ms_i64(),
+                        paid_started_at_ms: None,
+                        trial_value_allowance_usd_micros: Some("1000000".into()),
+                        trial_value_limit_usd_micros: Some("30".into()),
+                        trial_value_used_picos: "0".into(),
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        let started = now_ms_i64() + 1;
+        let attempt = |request: &'static str, at: i64| {
+            let state = state.clone();
+            async move {
+                state
+                    .mutate_shares_immediate(|store| {
+                        let share = store
+                            .shares
+                            .iter_mut()
+                            .find(|s| s.id == "trial-usd-share")
+                            .unwrap();
+                        market_trials::admit(share, "renter@example.com", request, at)
+                    })
+                    .await
+                    .unwrap()?;
+                let context = UsageLogContext {
+                    share_id: Some("trial-usd-share".into()),
+                    user_email: Some("renter@example.com".into()),
+                    request_id: Some(request.into()),
+                    started_at_ms: Some(at as u128),
+                    attempt_count: Some(1),
+                    ..Default::default()
+                };
+                let guard = state
+                    .admit_share_value_text(
+                        &context,
+                        "model",
+                        Some("standard"),
+                        RiskEstimate {
+                            input_tokens: 10,
+                            output_tokens: 10,
+                        },
+                        true,
+                    )
+                    .await?
+                    .unwrap();
+                guard.mark_sent();
+                // Sent without an answer: charged its reservation.
+                assert!(!guard.settle_now().await);
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+        let entitlement = |store: &ShareStore| {
+            store.get("trial-usd-share").unwrap().market_entitlements["usd-trial"].clone()
+        };
+        attempt("trial-usd-first", started).await.unwrap();
+        let mirrored = entitlement(&*state.shares.read().await);
+        assert_eq!(mirrored.trial_value_used_picos, "20000000");
+        assert_eq!(mirrored.usage_revision, 1);
+        assert!(!market_trials::exhausted(
+            state.shares.read().await.get("trial-usd-share").unwrap(),
+            "usd-trial"
+        ));
+        // The settlement is mirrored durably, not just in memory.
+        let saved =
+            <ShareStore as PersistedStateSnapshot>::load_snapshot(&state.config_dir).unwrap();
+        assert_eq!(entitlement(&saved).trial_value_used_picos, "20000000");
+
+        // Soft cap: an admitted request finishes; the next one is refused.
+        attempt("trial-usd-second", started + 1).await.unwrap();
+        assert_eq!(
+            entitlement(&*state.shares.read().await).trial_value_used_picos,
+            "30000000"
+        );
+        let refused = attempt("trial-usd-third", started + 2)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("MARKET_TRIAL_EXHAUSTED"), "{refused}");
+        // Re-reading the ledger is idempotent.
+        assert!(!state.sync_market_trial_value(None, false).await.unwrap());
+
+        // Crash between the ledger commit and the Share save: the mirror is
+        // lost, the ledger is not. Startup re-derives it before admission.
+        state
+            .mutate_shares_immediate(|store| {
+                let share = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "trial-usd-share")
+                    .unwrap();
+                share
+                    .market_entitlements
+                    .get_mut("usd-trial")
+                    .unwrap()
+                    .trial_value_used_picos = "0".into();
+                for receipt in share.market_requests.values_mut() {
+                    receipt.value_picos = "0".into();
+                }
+            })
+            .await
+            .unwrap();
+        let config_dir = state.config_dir.clone();
+        drop(state);
+        let restarted = test_state_at(config_dir);
+        let recovered = entitlement(&*restarted.shares.read().await);
+        assert_eq!(recovered.trial_value_used_picos, "30000000");
+        assert!(market_trials::exhausted(
+            restarted
+                .shares
+                .read()
+                .await
+                .get("trial-usd-share")
+                .unwrap(),
+            "usd-trial"
+        ));
     }
 
     #[tokio::test]
@@ -33223,6 +33735,9 @@ mod tests {
                         usage_uncertain: false,
                         applied_at_ms: now_ms_i64(),
                         paid_started_at_ms: None,
+                        trial_value_allowance_usd_micros: None,
+                        trial_value_limit_usd_micros: None,
+                        trial_value_used_picos: "0".into(),
                     },
                 );
             })

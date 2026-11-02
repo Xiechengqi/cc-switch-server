@@ -21,6 +21,10 @@ pub(crate) struct Scope {
     pub installation_id: String,
     pub share_id: String,
     pub email: String,
+    /// Market USD metering belongs to one sold contract, not to the email's
+    /// earlier/later rentals. Omitted keeps ordinary quota keys unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_id: Option<String>,
 }
 impl Scope {
     pub fn key(&self) -> anyhow::Result<String> {
@@ -35,6 +39,12 @@ impl Scope {
                 && self.email.len() <= 320
                 && self.email == self.email.trim().to_ascii_lowercase(),
             "invalid value quota identity"
+        );
+        ensure!(
+            self.entitlement_id
+                .as_ref()
+                .is_none_or(|id| !id.is_empty() && id.len() <= 256),
+            "invalid value quota entitlement"
         );
         Ok(serde_json::to_string(self)?)
     }
@@ -85,6 +95,163 @@ pub(crate) struct Admission<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Admitted {
     pub reserved_picos: i128,
+}
+
+/// An additional one-time cap on a Trial-phase USD seat. The settled mirror
+/// floors keep conservative settlements monotonic even if later evidence is
+/// lower. Pending reservations are read atomically from the same ledger.
+#[derive(Debug, Clone)]
+pub(crate) struct MarketTrialBudget {
+    pub scope_id: String,
+    pub entitlement_id: String,
+    pub allowance_micros: String,
+    pub limit_micros: String,
+    pub scope_used_picos: String,
+    pub used_picos: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarketTrialAttempt {
+    request_id: String,
+    attempt_id: String,
+    entitlement_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_floor_picos: Option<String>,
+}
+
+fn trial_index_key(request_id: &str, attempt_id: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "value_trial_index:{}",
+        serde_json::to_string(&(request_id, attempt_id))?
+    ))
+}
+
+fn read_trial_attempt(
+    conn: &Connection,
+    request_id: &str,
+    attempt_id: &str,
+) -> anyhow::Result<Option<(String, MarketTrialAttempt)>> {
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [trial_index_key(request_id, attempt_id)?],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(key) = key else { return Ok(None) };
+    let raw: String =
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0))?;
+    let marker: MarketTrialAttempt = serde_json::from_str(&raw)?;
+    ensure!(
+        marker.request_id == request_id && marker.attempt_id == attempt_id,
+        "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT"
+    );
+    Ok(Some((key, marker)))
+}
+
+fn trial_attempt_prefix(scope: &Scope, trial: &MarketTrialBudget) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut scope = scope.clone();
+    scope.entitlement_id = None;
+    let identity = serde_json::to_vec(&(scope, &trial.scope_id))?;
+    Ok(format!(
+        "value_trial_attempt:{}:",
+        hex::encode(Sha256::digest(identity))
+    ))
+}
+
+/// A primary-key prefix query, not a scan over all Share requests. Index
+/// entries survive tariff compaction, and reference durable attempts whose
+/// observed/conservative/pending values are always current.
+fn trial_available_in_tx(
+    tx: &Transaction<'_>,
+    scope: &Scope,
+    trial: &MarketTrialBudget,
+) -> anyhow::Result<i128> {
+    let mut scope_spent = 0i128;
+    let mut scope_pending = 0i128;
+    let mut spent = 0i128;
+    let mut pending = 0i128;
+    let pattern = format!("{}*", trial_attempt_prefix(scope, trial)?);
+    let mut query = tx.prepare("SELECT m.value,a.scope,a.usage_picos,a.pending_risk_picos,a.metering_status
+        FROM meta m LEFT JOIN value_quota_attempts a
+          ON a.request_id=json_extract(m.value,'$.requestId') AND a.attempt_id=json_extract(m.value,'$.attemptId')
+        WHERE m.key GLOB ?1")?;
+    let rows = query.query_map([pattern], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (raw, stored_scope, used, risk, state) = row?;
+        let marker: MarketTrialAttempt = serde_json::from_str(&raw)?;
+        let attempt_scope: Scope =
+            serde_json::from_str(&stored_scope.context("VALUE_QUOTA_TRIAL_ATTEMPT_MISSING")?)?;
+        ensure!(
+            attempt_scope.router_url == scope.router_url
+                && attempt_scope.installation_id == scope.installation_id
+                && attempt_scope.share_id == scope.share_id
+                && attempt_scope.email == scope.email
+                && attempt_scope.entitlement_id.as_deref() == Some(&marker.entitlement_id),
+            "VALUE_QUOTA_USAGE_SCOPE_CONFLICT"
+        );
+        if state == "unavailable" {
+            return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Blocked).into());
+        }
+        let used = unsigned_decimal(&used)?.max(unsigned_decimal(
+            marker.settled_floor_picos.as_deref().unwrap_or("0"),
+        )?);
+        let risk = unsigned_decimal(&risk)?;
+        scope_spent = scope_spent
+            .checked_add(used)
+            .context("value quota arithmetic overflow")?;
+        scope_pending = scope_pending
+            .checked_add(risk)
+            .context("value quota arithmetic overflow")?;
+        if marker.entitlement_id == trial.entitlement_id {
+            spent = spent
+                .checked_add(used)
+                .context("value quota arithmetic overflow")?;
+            pending = pending
+                .checked_add(risk)
+                .context("value quota arithmetic overflow")?;
+        }
+    }
+    let mut remaining = i128::MAX;
+    for (limit, spent, pending) in [
+        (
+            &trial.limit_micros,
+            spent.max(unsigned_decimal(&trial.used_picos)?),
+            pending,
+        ),
+        (
+            &trial.allowance_micros,
+            scope_spent.max(unsigned_decimal(&trial.scope_used_picos)?),
+            scope_pending,
+        ),
+    ] {
+        let limit = unsigned_decimal(limit)?
+            .checked_mul(crate::domain::usage::value_pricing::PICOS_PER_MICRO)
+            .context("value quota arithmetic overflow")?;
+        if spent >= limit {
+            return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Exhausted).into());
+        }
+        remaining = remaining.min(
+            limit
+                .checked_sub(spent)
+                .and_then(|v| v.checked_sub(pending))
+                .context("value quota arithmetic overflow")?,
+        );
+    }
+    if remaining <= 0 {
+        return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Busy).into());
+    }
+    Ok(remaining)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -985,17 +1152,34 @@ pub(crate) fn status(
     Ok(status)
 }
 pub(crate) fn admit(config_dir: &Path, input: &Admission<'_>) -> anyhow::Result<Admitted> {
+    admit_with_market_trial(config_dir, input, None)
+}
+
+pub(crate) fn admit_with_market_trial(
+    config_dir: &Path,
+    input: &Admission<'_>,
+    trial: Option<&MarketTrialBudget>,
+) -> anyhow::Result<Admitted> {
     assert_committed(config_dir)?;
     if input.enforce && restore_fence_blocks(config_dir, input.scope, input.window)? {
         return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Blocked).into());
     }
     let mut connection = open_database(&database_path(config_dir), false)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let result = admit_in_tx(&tx, input)?;
+    let result = admit_with_trial_in_tx(&tx, input, trial)?;
     tx.commit()?;
     Ok(result)
 }
+#[cfg(test)]
 fn admit_in_tx(tx: &Transaction<'_>, a: &Admission<'_>) -> anyhow::Result<Admitted> {
+    admit_with_trial_in_tx(tx, a, None)
+}
+
+fn admit_with_trial_in_tx(
+    tx: &Transaction<'_>,
+    a: &Admission<'_>,
+    trial: Option<&MarketTrialBudget>,
+) -> anyhow::Result<Admitted> {
     a.window.validate()?;
     ensure!(
         !a.policy_epoch.is_empty() && !a.request_id.is_empty() && !a.attempt_id.is_empty(),
@@ -1007,6 +1191,14 @@ fn admit_in_tx(tx: &Transaction<'_>, a: &Admission<'_>) -> anyhow::Result<Admitt
         "VALUE_QUOTA_WINDOW_CONFLICT"
     );
     let key = a.scope.key()?;
+    if let Some(trial) = trial {
+        ensure!(
+            a.enforce
+                && !trial.scope_id.is_empty()
+                && a.scope.entitlement_id.as_deref() == Some(&trial.entitlement_id),
+            "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT"
+        );
+    }
     let snapshot = cached_snapshot(
         tx,
         &a.scope.router_url,
@@ -1048,6 +1240,19 @@ fn admit_in_tx(tx: &Transaction<'_>, a: &Admission<'_>) -> anyhow::Result<Admitt
             ),
             "VALUE_QUOTA_REQUEST_IDENTITY_CONFLICT"
         );
+        if let Some(trial) = trial {
+            let marker_key = format!(
+                "{}{}",
+                trial_attempt_prefix(a.scope, trial)?,
+                serde_json::to_string(&(a.request_id, a.attempt_id))?
+            );
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+                [marker_key],
+                |r| r.get(0),
+            )?;
+            ensure!(exists, "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT");
+        }
         return Ok(Admitted {
             reserved_picos: read_attempt_meta(tx, a.request_id, a.attempt_id)?
                 .map(|meta| meta.reserved())
@@ -1072,12 +1277,15 @@ fn admit_in_tx(tx: &Transaction<'_>, a: &Admission<'_>) -> anyhow::Result<Admitt
         // Settled usage is below the limit; only in-flight reservations fill
         // it. That is temporary, so answer "busy" (retryable), never a
         // lock-out until the window resets.
-        let available = limit
+        let mut available = limit
             .checked_sub(spent)
             .and_then(|v| v.checked_sub(pending))
             .context("value quota arithmetic overflow")?;
         if available <= 0 {
             return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Busy).into());
+        }
+        if let Some(trial) = trial {
+            available = available.min(trial_available_in_tx(tx, a.scope, trial)?);
         }
         let in_flight: i64 = tx.query_row(
             "SELECT count(*) FROM value_quota_attempts WHERE scope=?1 AND metering_status='pending'
@@ -1117,6 +1325,27 @@ fn admit_in_tx(tx: &Transaction<'_>, a: &Admission<'_>) -> anyhow::Result<Admitt
             })?
         ],
     )?;
+    if let Some(trial) = trial {
+        let marker = MarketTrialAttempt {
+            request_id: a.request_id.into(),
+            attempt_id: a.attempt_id.into(),
+            entitlement_id: trial.entitlement_id.clone(),
+            settled_floor_picos: Some("0".into()),
+        };
+        let marker_key = format!(
+            "{}{}",
+            trial_attempt_prefix(a.scope, trial)?,
+            serde_json::to_string(&(a.request_id, a.attempt_id))?
+        );
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
+            params![marker_key, serde_json::to_string(&marker)?,],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2)",
+            params![trial_index_key(a.request_id, a.attempt_id)?, marker_key],
+        )?;
+    }
     update_checkpoint(
         tx,
         &key,
@@ -1655,6 +1884,26 @@ fn write_settlement(
     state: &str,
     risk: i128,
 ) -> anyhow::Result<()> {
+    // Persist the trial high-water in this same transaction, before a crash
+    // can separate ledger settlement from the entitlement mirror. A later
+    // genuine lower settlement corrects the periodic meter, never reopens
+    // one-time free allowance. The marker survives tariff compaction.
+    if matches!(state, "observed" | "conservative") {
+        if let Some((key, mut marker)) = read_trial_attempt(tx, request_id, attempt_id)? {
+            let scope: Scope = serde_json::from_str(&old.0)?;
+            ensure!(
+                scope.entitlement_id.as_deref() == Some(&marker.entitlement_id),
+                "VALUE_QUOTA_USAGE_SCOPE_CONFLICT"
+            );
+            let floor =
+                unsigned_decimal(marker.settled_floor_picos.as_deref().unwrap_or("0"))?.max(amount);
+            marker.settled_floor_picos = Some(floor.to_string());
+            tx.execute(
+                "UPDATE meta SET value=?2 WHERE key=?1",
+                params![key, serde_json::to_string(&marker)?],
+            )?;
+        }
+    }
     let watermark = next_watermark(tx)?;
     let (amount, risk) = (amount.to_string(), risk.to_string());
     tx.execute(
@@ -1895,6 +2144,75 @@ pub(crate) fn settle_attempt_outcome(
     let settled = settle_outcome_in_tx(&tx, request_id, attempt_id, outcome, true)?;
     tx.commit()?;
     Ok(settled)
+}
+/// One request whose settled USD-equivalent value a Share Market trial
+/// budget reads: the attempt rows must belong to this Share, email and contract.
+pub(crate) struct SettledRequest<'a> {
+    pub request_id: &'a str,
+    pub share_id: &'a str,
+    pub email: &'a str,
+    pub entitlement_id: Option<&'a str>,
+}
+/// Sum of `usage_picos` over a request's terminal (`observed` or
+/// `conservative`) attempts. Pending/unavailable attempts are not yet
+/// counted (like provisional streaming Tokens); the sweeper settles them
+/// conservatively later. Requests without a terminal attempt are absent.
+pub(crate) fn settled_request_picos(
+    config_dir: &Path,
+    requests: &[SettledRequest<'_>],
+) -> anyhow::Result<BTreeMap<String, i128>> {
+    assert_committed(config_dir)?;
+    if requests.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    settled_request_picos_in(&open_database(&database_path(config_dir), true)?, requests)
+}
+fn settled_request_picos_in(
+    conn: &Connection,
+    requests: &[SettledRequest<'_>],
+) -> anyhow::Result<BTreeMap<String, i128>> {
+    let mut totals = BTreeMap::new();
+    let mut query = conn.prepare(
+        "SELECT scope,usage_picos,attempt_id FROM value_quota_attempts
+         WHERE request_id=?1 AND metering_status IN ('observed','conservative')",
+    )?;
+    for request in requests {
+        let rows = query
+            .query_map([request.request_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut total: Option<i128> = None;
+        for (scope, amount, attempt_id) in rows {
+            let scope: Scope = serde_json::from_str(&scope)?;
+            ensure!(
+                scope.share_id == request.share_id
+                    && scope.email.eq_ignore_ascii_case(request.email)
+                    && scope.entitlement_id.as_deref() == request.entitlement_id,
+                "VALUE_QUOTA_USAGE_SCOPE_CONFLICT"
+            );
+            let floor = read_trial_attempt(conn, request.request_id, &attempt_id)?
+                .map(|(_, marker)| {
+                    unsigned_decimal(marker.settled_floor_picos.as_deref().unwrap_or("0"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            total = Some(
+                total
+                    .unwrap_or(0)
+                    .checked_add(unsigned_decimal(&amount)?.max(floor))
+                    .context("value quota arithmetic overflow")?,
+            );
+        }
+        if let Some(total) = total {
+            totals.insert(request.request_id.to_owned(), total);
+        }
+    }
+    Ok(totals)
 }
 fn resolve_window_pending_in_tx(
     tx: &Transaction<'_>,
@@ -2986,6 +3304,154 @@ mod tests {
         };
         assert!(checkpoint.count().is_err());
     }
+    #[test]
+    fn market_trial_reservations_share_one_atomic_budget_and_contracts_are_isolated() {
+        let (mut conn, mut scope, window, quota, revision) = setup();
+        scope.entitlement_id = Some("first".into());
+        let trial = MarketTrialBudget {
+            scope_id: "one-time".into(),
+            entitlement_id: "first".into(),
+            allowance_micros: "10".into(),
+            limit_micros: "5".into(),
+            scope_used_picos: "0".into(),
+            used_picos: "0".into(),
+        };
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO value_quota_coverage(scope,collected_from_ms) VALUES(?1,0)",
+            [scope.key().unwrap()],
+        )
+        .unwrap();
+        let admission = |request_id, scope| Admission {
+            enforce: true,
+            scope,
+            window: &window,
+            policy_epoch: "epoch",
+            quota: &quota,
+            pricing_revision: &revision,
+            request_id,
+            attempt_id: "1",
+            effective_model: "model",
+            effective_tier: "standard",
+            started_at_ms: 1,
+            estimate: RiskEstimate {
+                input_tokens: 1,
+                output_tokens: 2,
+            },
+            parallel_limit: 4,
+        };
+        assert_eq!(
+            admit_with_trial_in_tx(&tx, &admission("one", &scope), Some(&trial))
+                .unwrap()
+                .reserved_picos,
+            3_000_000
+        );
+        assert_eq!(
+            admit_with_trial_in_tx(&tx, &admission("two", &scope), Some(&trial))
+                .unwrap()
+                .reserved_picos,
+            2_000_000
+        );
+        let busy =
+            admit_with_trial_in_tx(&tx, &admission("three", &scope), Some(&trial)).unwrap_err();
+        assert_eq!(
+            busy.downcast_ref::<ValueQuotaRejection>().unwrap().kind,
+            ValueQuotaRejectionKind::Busy
+        );
+        // An identical replay does not allocate a second reservation.
+        assert_eq!(
+            admit_with_trial_in_tx(&tx, &admission("one", &scope), Some(&trial))
+                .unwrap()
+                .reserved_picos,
+            3_000_000
+        );
+        settle_outcome_in_tx(&tx, "one", "1", AttemptOutcome::Unknown, true).unwrap();
+        settle_outcome_in_tx(&tx, "two", "1", AttemptOutcome::Unknown, true).unwrap();
+        let exhausted =
+            admit_with_trial_in_tx(&tx, &admission("three", &scope), Some(&trial)).unwrap_err();
+        assert_eq!(
+            exhausted
+                .downcast_ref::<ValueQuotaRejection>()
+                .unwrap()
+                .kind,
+            ValueQuotaRejectionKind::Exhausted
+        );
+        // Genuine evidence may lower the periodic meter after a conservative
+        // result, but the durable trial floor must survive even if its Share
+        // mirror had not been written when the process crashed.
+        let old = read_attempt_row(&tx, "one", "1").unwrap().unwrap();
+        write_settlement(&tx, "one", "1", &old, 1, "lower", "{}", 0, "observed", 0).unwrap();
+        assert_eq!(
+            status_in_tx(&tx, &scope, &window).unwrap().used_picos,
+            "2000000"
+        );
+        assert!(admit_with_trial_in_tx(&tx, &admission("three", &scope), Some(&trial)).is_err());
+        compact_in_tx(&tx, 2, 30 * DAY_MS).unwrap();
+        let mirrored = settled_request_picos_in(
+            &tx,
+            &[SettledRequest {
+                request_id: "one",
+                share_id: "share",
+                email: "user@example.com",
+                entitlement_id: Some("first"),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            mirrored["one"], 3_000_000,
+            "the trial floor survives compaction and mirror recovery"
+        );
+        // A new contract starts a fresh periodic meter, including at the
+        // same millisecond, but still shares the original lifetime trial.
+        let second_scope = Scope {
+            entitlement_id: Some("second".into()),
+            ..scope.clone()
+        };
+        let second_trial = MarketTrialBudget {
+            entitlement_id: "second".into(),
+            ..trial.clone()
+        };
+        tx.execute(
+            "INSERT INTO value_quota_coverage(scope,collected_from_ms) VALUES(?1,0)",
+            [second_scope.key().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            status_in_tx(&tx, &second_scope, &window)
+                .unwrap()
+                .used_picos,
+            "0"
+        );
+        assert_eq!(
+            admit_with_trial_in_tx(&tx, &admission("four", &second_scope), Some(&second_trial))
+                .unwrap()
+                .reserved_picos,
+            3_000_000
+        );
+        assert_eq!(
+            status_in_tx(&tx, &scope, &window).unwrap().used_picos,
+            "2000000"
+        );
+        // A persisted monotonic floor cannot be reopened by lower evidence.
+        let floored = MarketTrialBudget {
+            scope_used_picos: "10000000".into(),
+            ..second_trial.clone()
+        };
+        assert!(
+            admit_with_trial_in_tx(&tx, &admission("five", &second_scope), Some(&floored)).is_err()
+        );
+        // Ordinary keys remain byte-for-byte compatible with old ledgers.
+        let ordinary = Scope {
+            entitlement_id: None,
+            ..scope.clone()
+        };
+        assert!(!ordinary.key().unwrap().contains("entitlementId"));
+        assert_eq!(
+            status_in_tx(&tx, &ordinary, &window).unwrap().used_picos,
+            "0"
+        );
+    }
+
     fn setup() -> (Connection, Scope, Window, ValueQuota, String) {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::initialize_schema(&conn).unwrap();
@@ -2994,6 +3460,7 @@ mod tests {
             installation_id: "install".into(),
             share_id: "share".into(),
             email: "user@example.com".into(),
+            entitlement_id: None,
         };
         let window = Window {
             id: "day:0".into(),
@@ -3551,6 +4018,77 @@ mod tests {
         assert_eq!(view.used_picos, "27000000");
         assert_eq!(view.pending_risk_picos, "0");
         assert_eq!(view.metering_status, "conservative");
+    }
+    #[test]
+    fn value_quota_settled_request_picos_sum_terminal_attempts_of_the_same_scope_only() {
+        let (mut conn, scope, window, quota, revision) = setup();
+        let tx = conn.transaction().unwrap();
+        let admission = |request_id, attempt_id| Admission {
+            enforce: true,
+            scope: &scope,
+            window: &window,
+            policy_epoch: "epoch",
+            quota: &quota,
+            pricing_revision: &revision,
+            request_id,
+            attempt_id,
+            effective_model: "model",
+            effective_tier: "standard",
+            started_at_ms: 1,
+            estimate: RiskEstimate {
+                input_tokens: 10,
+                output_tokens: 10,
+            },
+            parallel_limit: 4,
+        };
+        admit_in_tx(&tx, &admission("retried", "1")).unwrap();
+        admit_in_tx(&tx, &admission("retried", "2")).unwrap();
+        admit_in_tx(&tx, &admission("in-flight", "1")).unwrap();
+        let request = |request_id| SettledRequest {
+            request_id,
+            share_id: "share",
+            email: "USER@example.com",
+            entitlement_id: None,
+        };
+        let read = |tx: &Transaction<'_>| {
+            settled_request_picos_in(tx, &[request("retried"), request("in-flight")]).unwrap()
+        };
+        assert!(
+            read(&tx).is_empty(),
+            "pending attempts are not counted until settled"
+        );
+        // Outcome unknown charges the reservation conservatively.
+        assert!(settle_outcome_in_tx(&tx, "retried", "1", AttemptOutcome::Unknown, true).unwrap());
+        assert_eq!(
+            read(&tx),
+            BTreeMap::from([("retried".to_string(), 20_000_000)])
+        );
+        assert!(settle_outcome_in_tx(&tx, "retried", "2", AttemptOutcome::Unknown, true).unwrap());
+        assert_eq!(
+            read(&tx),
+            BTreeMap::from([("retried".to_string(), 40_000_000)]),
+            "every terminal attempt of the request counts"
+        );
+        assert!(
+            settle_outcome_in_tx(&tx, "in-flight", "1", AttemptOutcome::NotSent, true).unwrap()
+        );
+        assert_eq!(
+            read(&tx).get("in-flight"),
+            Some(&0),
+            "a free terminal attempt is a settled zero, not missing"
+        );
+        let foreign = SettledRequest {
+            request_id: "retried",
+            share_id: "another-share",
+            email: "user@example.com",
+            entitlement_id: None,
+        };
+        assert!(settled_request_picos_in(&tx, &[foreign]).is_err());
+        let wrong_contract = SettledRequest {
+            entitlement_id: Some("another-contract"),
+            ..request("retried")
+        };
+        assert!(settled_request_picos_in(&tx, &[wrong_contract]).is_err());
     }
     #[test]
     fn value_quota_usage_log_settles_only_its_own_attempt() {

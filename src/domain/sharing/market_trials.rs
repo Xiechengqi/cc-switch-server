@@ -1,9 +1,12 @@
 //! Durable request attribution for one-time Market trials. Receipts survive
 //! grant replacement and are never inferred from the bounded recent log view.
 use super::{
-    router_contract::{ShareMarketPhase, ShareUserUsage},
+    router_contract::{
+        is_zero_decimal, zero_decimal, ShareMarketEntitlement, ShareMarketPhase, ShareUserUsage,
+    },
     shares::{Share, SharePatchError},
 };
+use crate::domain::usage::value_pricing::{unsigned_decimal, PICOS_PER_MICRO};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -49,6 +52,117 @@ pub fn exhausted(share: &Share, id: &str) -> bool {
                 .fold(0u64, |sum, e| sum.saturating_add(e.trial_tokens_used))
                 >= limit
         })
+        || value_exhausted(share, state)
+}
+
+/// Whether the entitlement's one-time trial is budgeted in USD-equivalent
+/// micros (the seat's quota unit) instead of Tokens.
+pub fn usd_trial(state: &ShareMarketEntitlement) -> bool {
+    state.trial_value_limit_usd_micros.is_some() || state.trial_value_allowance_usd_micros.is_some()
+}
+
+fn micros_to_picos(micros: &str) -> Option<i128> {
+    unsigned_decimal(micros).ok()?.checked_mul(PICOS_PER_MICRO)
+}
+
+/// USD trial exhaustion: this entitlement's settled trial picos reach its
+/// own limit, or the whole scope's settled trial picos reach the original
+/// allowance. Exact integer arithmetic; an unreadable amount fails closed.
+fn value_exhausted(share: &Share, state: &ShareMarketEntitlement) -> bool {
+    if let Some(limit) = state.trial_value_limit_usd_micros.as_deref() {
+        match (
+            micros_to_picos(limit),
+            unsigned_decimal(&state.trial_value_used_picos).ok(),
+        ) {
+            (Some(limit), Some(used)) if used < limit => {}
+            _ => return true,
+        }
+    }
+    let Some(allowance) = state.trial_value_allowance_usd_micros.as_deref() else {
+        return false;
+    };
+    let Some(allowance) = micros_to_picos(allowance) else {
+        return true;
+    };
+    let mut sum = 0i128;
+    for entitlement in share
+        .market_entitlements
+        .values()
+        .filter(|e| e.trial_scope_id == state.trial_scope_id)
+    {
+        match unsigned_decimal(&entitlement.trial_value_used_picos)
+            .ok()
+            .and_then(|used| sum.checked_add(used))
+        {
+            Some(next) => sum = next,
+            None => return true,
+        }
+    }
+    sum >= allowance
+}
+
+/// Request IDs whose settled USD-equivalent value still counts toward a USD
+/// trial budget: retained Trial-phase receipts of USD-trial entitlements,
+/// including late completions after the entitlement converted to Paid.
+pub fn value_receipts(share: &Share) -> impl Iterator<Item = &str> {
+    share
+        .market_requests
+        .keys()
+        .filter(|id| value_receipt(share, id).is_some())
+        .map(String::as_str)
+}
+
+/// The receipt of `request_id` when it counts toward a USD trial budget.
+pub fn value_receipt<'a>(share: &'a Share, request_id: &str) -> Option<&'a MarketRequestReceipt> {
+    share.market_requests.get(request_id).filter(|receipt| {
+        receipt.phase == ShareMarketPhase::Trial
+            && share
+                .market_entitlements
+                .get(&receipt.entitlement_id)
+                .is_some_and(usd_trial)
+    })
+}
+
+/// Folds the value ledger's settled USD-equivalent picos for one request
+/// into its Trial receipt and the entitlement's `trial_value_used_picos`.
+/// `picos` is the ledger's current total over the request's terminal
+/// (`observed`/`conservative`) attempts. The receipt keeps the highest total
+/// it has seen, so replays are idempotent, a higher settlement revision only
+/// adds its delta, and a lower re-settlement (genuine usage replacing a
+/// conservative estimate) never reopens the budget. Paid receipts and Token
+/// trials are ignored.
+pub fn record_value(share: &mut Share, request_id: &str, picos: i128) -> Result<bool, String> {
+    let Some(receipt) = share.market_requests.get_mut(request_id) else {
+        return Ok(false);
+    };
+    if receipt.phase != ShareMarketPhase::Trial {
+        return Ok(false);
+    }
+    let entitlement = share
+        .market_entitlements
+        .get_mut(&receipt.entitlement_id)
+        .ok_or("market entitlement missing")?;
+    if !usd_trial(entitlement) {
+        return Ok(false);
+    }
+    if picos < 0 {
+        return Err("market USD usage cannot be negative".into());
+    }
+    let seen = unsigned_decimal(&receipt.value_picos).map_err(|e| e.to_string())?;
+    if picos <= seen {
+        return Ok(false);
+    }
+    let used = unsigned_decimal(&entitlement.trial_value_used_picos)
+        .map_err(|e| e.to_string())?
+        .checked_add(picos - seen)
+        .ok_or("market USD usage overflow")?;
+    entitlement.usage_revision = entitlement
+        .usage_revision
+        .checked_add(1)
+        .ok_or("market usage revision overflow")?;
+    entitlement.trial_value_used_picos = used.to_string();
+    receipt.value_picos = picos.to_string();
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +178,11 @@ pub struct MarketRequestReceipt {
     pub count_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_request_id: Option<String>,
+    /// Highest USD-equivalent picos the value ledger has settled for this
+    /// request (see `record_value`); only Trial receipts of USD-trial
+    /// entitlements carry a non-zero amount.
+    #[serde(default = "zero_decimal", skip_serializing_if = "is_zero_decimal")]
+    pub value_picos: String,
 }
 
 fn default_count_request() -> bool {
@@ -127,6 +246,7 @@ pub fn admit(
             revision: 0,
             count_request: true,
             parent_request_id: None,
+            value_picos: zero_decimal(),
         },
     );
     Ok(true)
@@ -152,6 +272,7 @@ pub fn record(
             receipt.tokens = 0;
             receipt.revision = 0;
             receipt.count_request = false;
+            receipt.value_picos = zero_decimal();
             receipt.parent_request_id.clone_from(&log.parent_request_id);
             share
                 .market_requests
@@ -368,6 +489,33 @@ pub fn validate_transition(
                 "market entitlement phase or budget cannot be reset".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// USD counterpart of the Token budget fence in `validate_transition`: a USD
+/// trial budget belongs only to the Trial phase and an existing Trial
+/// entitlement can never be re-granted a different (fresh) USD budget.
+pub fn validate_value_transition(
+    share: &Share,
+    id: &str,
+    phase: ShareMarketPhase,
+    value_limit: Option<&str>,
+) -> Result<(), SharePatchError> {
+    if phase == ShareMarketPhase::Paid && value_limit.is_some() {
+        return Err(SharePatchError::Invalid(
+            "a USD trial budget belongs only to the trial phase".into(),
+        ));
+    }
+    if phase == ShareMarketPhase::Trial
+        && share
+            .market_entitlements
+            .get(id)
+            .is_some_and(|existing| existing.trial_value_limit_usd_micros.as_deref() != value_limit)
+    {
+        return Err(SharePatchError::Invalid(
+            "market entitlement phase or budget cannot be reset".into(),
+        ));
     }
     Ok(())
 }

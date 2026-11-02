@@ -18,6 +18,12 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 /// Error prefixes the admin API maps to typed 409/400 answers (never 500).
 pub(crate) const VALUE_QUOTA_NOT_ACTIVE: &str = "VALUE_QUOTA_NOT_ACTIVE";
 pub(crate) const VALUE_QUOTA_TARGET_INVALID: &str = "VALUE_QUOTA_TARGET_INVALID";
+/// Preview check advertising that managed (Share Market) grants may carry a
+/// USD-equivalent quota on this build.
+pub(crate) const MARKET_SEAT_QUOTA_CHECK: &str = "market_seat_quota";
+/// Preview check advertising that a Share Market one-time trial may be
+/// budgeted in the seat's USD-equivalent unit (`trialValue*UsdMicros`).
+pub(crate) const MARKET_TRIAL_VALUE_CHECK: &str = "market_trial_value";
 /// Margin added to the longest provider request timeout before a pending
 /// attempt counts as stuck (sweeper and `set` reconcile share it).
 const STALE_ATTEMPT_MARGIN_MS: i64 = 5 * 60 * 1000;
@@ -33,7 +39,27 @@ fn scope(config: &ServerConfig, share_id: &str, email: &str) -> anyhow::Result<l
         installation_id: identity.installation_id.clone(),
         share_id: share_id.into(),
         email: email.trim().to_ascii_lowercase(),
+        entitlement_id: None,
     })
+}
+
+fn grant_scope(
+    config: &ServerConfig,
+    share_id: &str,
+    email: &str,
+    grant: &ShareUserGrant,
+) -> anyhow::Result<ledger::Scope> {
+    let mut identity = scope(config, share_id, email)?;
+    if grant.manager == ShareGrantManager::RouterShareMarket {
+        identity.entitlement_id = Some(
+            grant
+                .entitlement_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .context("VALUE_QUOTA_ENTITLEMENT_REQUIRED")?,
+        );
+    }
+    Ok(identity)
 }
 /// Persisted window ids embed this label; it must stay byte-identical to the
 /// historical `{:?}` rendering of the period.
@@ -221,7 +247,7 @@ fn value_status(
         .value_metering
         .as_ref()
         .context("VALUE_QUOTA_BINDING_UNAVAILABLE")?;
-    let identity = scope(config, share_id, email)?;
+    let identity = grant_scope(config, share_id, email, grant)?;
     let w = window(grant, now)?;
     let revision =
         ledger::active_revision(dir, &identity)?.context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
@@ -375,6 +401,99 @@ pub(super) fn remove_legacy_degraded_marker(config_dir: &std::path::Path) {
         Err(error) => tracing::warn!(%error, path = %path.display(),
             "legacy USD metering degraded marker could not be removed; it is ignored"),
     }
+}
+
+/// (request, Share, email, entitlement) of every retained Trial receipt that counts toward
+/// a USD trial budget, or only of `only` (a direct lookup, no scan).
+fn market_trial_value_requests(
+    store: &crate::domain::sharing::shares::ShareStore,
+    only: Option<&str>,
+) -> Vec<(String, String, String, String)> {
+    use crate::domain::sharing::market_trials::{value_receipt, value_receipts};
+    let mut requests = Vec::new();
+    for share in &store.shares {
+        let mut push = |id: &str| {
+            if let Some(receipt) = value_receipt(share, id) {
+                requests.push((
+                    id.to_owned(),
+                    share.id.clone(),
+                    receipt.email.clone(),
+                    receipt.entitlement_id.clone(),
+                ));
+            }
+        };
+        match only {
+            Some(id) => push(id),
+            None => value_receipts(share).for_each(push),
+        }
+    }
+    requests
+}
+
+fn read_market_trial_value(
+    config_dir: &std::path::Path,
+    requests: &[(String, String, String, String)],
+) -> anyhow::Result<BTreeMap<String, i128>> {
+    let requests: Vec<_> = requests
+        .iter()
+        .map(
+            |(request_id, share_id, email, entitlement_id)| ledger::SettledRequest {
+                request_id,
+                share_id,
+                email,
+                entitlement_id: Some(entitlement_id),
+            },
+        )
+        .collect();
+    ledger::settled_request_picos(config_dir, &requests)
+}
+
+/// Whether any receipt would grow; avoids a Share save when nothing did.
+fn market_trial_value_grows(
+    store: &crate::domain::sharing::shares::ShareStore,
+    totals: &BTreeMap<String, i128>,
+) -> bool {
+    use crate::domain::sharing::market_trials::value_receipt;
+    totals.iter().any(|(id, picos)| {
+        store.shares.iter().any(|share| {
+            value_receipt(share, id).is_some_and(|receipt| {
+                crate::domain::usage::value_pricing::unsigned_decimal(&receipt.value_picos)
+                    .map_or(true, |seen| *picos > seen)
+            })
+        })
+    })
+}
+
+fn apply_market_trial_value(
+    store: &mut crate::domain::sharing::shares::ShareStore,
+    totals: &BTreeMap<String, i128>,
+) -> anyhow::Result<bool> {
+    let mut changed = false;
+    for share in &mut store.shares {
+        for (id, picos) in totals {
+            changed |= crate::domain::sharing::market_trials::record_value(share, id, *picos)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Startup pass (before the state is published): re-derives USD trial usage
+/// from the durable value ledger so a crash between a ledger settlement and
+/// the Share save that mirrors it cannot under-count a trial budget.
+pub(super) fn reconcile_market_trial_value_on_load(
+    config_dir: &std::path::Path,
+    store: &mut crate::domain::sharing::shares::ShareStore,
+) -> anyhow::Result<bool> {
+    if !server_sqlite::is_committed(config_dir)? {
+        return Ok(false);
+    }
+    let requests = market_trial_value_requests(store, None);
+    if requests.is_empty() {
+        return Ok(false);
+    }
+    let totals = read_market_trial_value(config_dir, &requests)?;
+    apply_market_trial_value(store, &totals)
 }
 fn rejection_reason(error: &anyhow::Error) -> &'static str {
     match error.downcast_ref::<ValueQuotaRejection>().map(|r| r.kind) {
@@ -583,6 +702,14 @@ impl ServerStateInner {
             checks.push(serde_json::json!({"code":"text_surface", "ready":false}));
         }
         checks.extend(surfaces);
+        // Build capability, not readiness: this Server can meter Router
+        // Share Market seats sold with a USD-equivalent quota. Always ready,
+        // so it never changes `capabilityReady`; a Router treats its absence
+        // as "this Server cannot run USD seats".
+        checks.push(serde_json::json!({"code":MARKET_SEAT_QUOTA_CHECK, "ready":true}));
+        // Same kind of build capability: one-time Market trials of a USD seat
+        // may carry a USD-equivalent budget. Always ready.
+        checks.push(serde_json::json!({"code":MARKET_TRIAL_VALUE_CHECK, "ready":true}));
         let capability_ready = checks.iter().all(|check| check["ready"] == true);
         let first_failed = checks
             .iter()
@@ -832,6 +959,43 @@ impl ServerStateInner {
             let old_share = previous.get(&share.id);
             let mut changed = false;
             for (email, grant) in &mut share.user_grants {
+                if grant.active
+                    && grant.manager == ShareGrantManager::RouterShareMarket
+                    && grant.policy.value_quota.is_some()
+                {
+                    let old = old_share.and_then(|s| s.user_grants.get(email));
+                    let original = grant.clone();
+                    // A managed operation re-inserts the grant without a
+                    // binding; that (or a policy change) is the edit case
+                    // and must fail the save, so the Router sees the
+                    // operation fail and an active managed USD grant is never
+                    // persisted unbound. A background save of an already
+                    // bound grant never aborts the store.
+                    let managed_edit = grant.value_metering.is_none()
+                        || old.is_none_or(|g| {
+                            !g.active
+                                || g.policy != grant.policy
+                                || g.entitlement_id != grant.entitlement_id
+                        });
+                    match self.prepare_managed_value_grant(
+                        &share.id,
+                        email,
+                        grant,
+                        old,
+                        now,
+                        config,
+                        capable,
+                        verified_surface,
+                    ) {
+                        Ok(grant_changed) => changed |= grant_changed,
+                        Err(error) if managed_edit => return Err(error),
+                        Err(error) => {
+                            *grant = original;
+                            tracing::warn!(%error, share_id = %share.id, "USD quota preparation skipped for one managed grant; its stored state is unchanged");
+                        }
+                    }
+                    continue;
+                }
                 if !grant.active
                     || grant.manager == ShareGrantManager::RouterShareMarket
                     || (grant.policy.value_quota.is_none() && grant.pending_value_quota.is_none())
@@ -869,6 +1033,102 @@ impl ServerStateInner {
             }
         }
         Ok(())
+    }
+    /// Router Share Market seat with a USD-equivalent quota. Metering is per
+    /// contract (entitlement): the first USD upsert of a contract starts a
+    /// binding metered from now. The ledger scope includes entitlementId, so
+    /// old requests cannot leak into a new contract even at the same millisecond.
+    /// Later upserts of the same entitlement (trial -> paid, suspend/resume,
+    /// app-scope or integrity re-upserts) reuse that binding; only a changed
+    /// amount, period or anchor starts a new policy epoch. Never scheduled,
+    /// never back-dated to the window start, never calibrated by hand.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_managed_value_grant(
+        &self,
+        share_id: &str,
+        email: &str,
+        grant: &mut ShareUserGrant,
+        old: Option<&ShareUserGrant>,
+        now: i64,
+        config: &ServerConfig,
+        capable: bool,
+        verified_surface: bool,
+    ) -> anyhow::Result<bool> {
+        let original = grant.clone();
+        grant.pending_value_quota = None;
+        if original.value_metering.is_none() {
+            anyhow::ensure!(verified_surface, "VALUE_QUOTA_UNSUPPORTED_PROVIDER_SURFACE");
+            anyhow::ensure!(
+                capable,
+                "VALUE_QUOTA_ROUTER_UPGRADE_OR_COMMITTED_STORAGE_REQUIRED"
+            );
+            let identity = grant_scope(config, share_id, email, grant)?;
+            ledger::active_revision(&self.config_dir, &identity)?
+                .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
+        }
+        let same_contract = old.filter(|g| {
+            g.manager == ShareGrantManager::RouterShareMarket
+                && g.entitlement_id.is_some()
+                && g.entitlement_id == grant.entitlement_id
+                && g.policy.value_quota.is_some()
+        });
+        let reusable = same_contract.and_then(|g| g.value_metering.clone().map(|b| (g, b)));
+        let policy_changed = old.is_none_or(|g| {
+            !g.active || g.policy != grant.policy || g.entitlement_id != grant.entitlement_id
+        });
+        if !policy_changed {
+            if grant.value_metering.is_some() {
+                // Background save of an unchanged, already bound seat.
+                return Ok(*grant != original);
+            }
+            if let Some((_, mut binding)) = reusable.clone() {
+                // Re-upsert of the same contract and policy: keep the binding
+                // and refresh the pricing revision when it can be read.
+                if let Some(revision) = scope(config, share_id, email)
+                    .and_then(|identity| ledger::active_revision(&self.config_dir, &identity))
+                    .ok()
+                    .flatten()
+                {
+                    binding.pricing_revision = revision;
+                }
+                grant.value_metering = Some(binding);
+                return Ok(*grant != original);
+            }
+        }
+        anyhow::ensure!(verified_surface, "VALUE_QUOTA_UNSUPPORTED_PROVIDER_SURFACE");
+        anyhow::ensure!(
+            capable,
+            "VALUE_QUOTA_ROUTER_UPGRADE_OR_COMMITTED_STORAGE_REQUIRED"
+        );
+        let identity = grant_scope(config, share_id, email, grant)?;
+        let revision = ledger::active_revision(&self.config_dir, &identity)?
+            .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
+        let mut binding = match reusable {
+            Some((previous, mut binding)) => {
+                if previous.policy.value_quota != grant.policy.value_quota
+                    || previous.policy.token_period != grant.policy.token_period
+                    || previous.policy.token_period_anchor_at_ms
+                        != grant.policy.token_period_anchor_at_ms
+                {
+                    binding.quota_policy_epoch = crate::domain::sharing::quota_cycle::opaque_id();
+                }
+                binding
+            }
+            None => {
+                ledger::begin_coverage(&self.config_dir, &identity, now)?;
+                ValueMeteringBinding {
+                    quota_policy_epoch: crate::domain::sharing::quota_cycle::opaque_id(),
+                    value_metered_from_ms: now,
+                    effective_from_ms: now,
+                    pricing_revision: revision.clone(),
+                }
+            }
+        };
+        binding.pricing_revision = revision;
+        grant.value_metering = Some(binding);
+        // Validate that the window exists for the stored policy.
+        window(grant, now)?;
+        Ok(*grant != original)
     }
     #[allow(clippy::too_many_arguments)]
     fn prepare_value_grant(
@@ -1287,7 +1547,13 @@ impl ServerStateInner {
         .await;
         match result {
             Ok(Ok(true)) => {
-                tracing::debug!(%request_id, ?outcome, "USD attempt settled without a usage log")
+                tracing::debug!(%request_id, ?outcome, "USD attempt settled without a usage log");
+                // A sent attempt with an unknown outcome is charged its
+                // reservation; a USD trial budget must see that charge.
+                if let Err(error) = self.sync_market_trial_value(Some(request_id), false).await {
+                    tracing::error!(%error, %request_id, "USD trial usage could not be mirrored; Market admission is paused until restart re-derives it");
+                    self.mark_quota_usage_degraded();
+                }
             }
             Ok(Ok(false)) => {}
             Ok(Err(error)) => {
@@ -1322,6 +1588,52 @@ impl ServerStateInner {
             Ok(Err(error)) => tracing::warn!(%error, "USD quota sweeper failed; will retry"),
             Err(error) => tracing::warn!(%error, "USD quota sweeper task panicked"),
         }
+        // Every run (including the startup one) re-derives USD trial usage,
+        // which also covers settlements whose direct mirror failed.
+        if let Err(error) = self.sync_market_trial_value(None, false).await {
+            tracing::warn!(%error, "USD trial usage reconciliation failed; will retry");
+        }
+    }
+    /// Folds settled USD-equivalent usage of Trial-phase requests from the
+    /// value ledger into `trialValueUsedPicos` (`market_trials::record_value`).
+    /// The ledger is the durable source and the entitlement counter a
+    /// monotone mirror: the startup pass and every sweeper run re-derive it,
+    /// so a crash between a ledger commit and this Share save is repaired
+    /// before it can under-count, and replays at worst keep a higher amount.
+    /// `in_workspace` is set by callers already holding the workspace gate.
+    pub(crate) async fn sync_market_trial_value(
+        &self,
+        only: Option<&str>,
+        in_workspace: bool,
+    ) -> anyhow::Result<bool> {
+        if !server_sqlite::is_committed(&self.config_dir)? {
+            return Ok(false);
+        }
+        let requests = market_trial_value_requests(&*self.shares.read().await, only);
+        if requests.is_empty() {
+            return Ok(false);
+        }
+        let config_dir = self.config_dir.clone();
+        let totals =
+            tokio::task::spawn_blocking(move || read_market_trial_value(&config_dir, &requests))
+                .await
+                .context("USD trial usage read task panicked")??;
+        if !market_trial_value_grows(&*self.shares.read().await, &totals) {
+            return Ok(false);
+        }
+        let apply = |store: &mut crate::domain::sharing::shares::ShareStore| {
+            apply_market_trial_value(store, &totals)
+        };
+        let changed = if in_workspace {
+            self.try_mutate_shares_in_workspace_transaction(apply)
+                .await??
+        } else {
+            self.try_mutate_shares_immediate(apply).await??
+        };
+        if changed {
+            self.router_share_sync_wakeup.notify_one();
+        }
+        Ok(changed)
     }
     /// Pre-send USD admission for one attempt. Only enforced USD grants are
     /// metered. Reads the grant under the shares read lock only (the ledger
@@ -1342,13 +1654,63 @@ impl ServerStateInner {
         let (Some(share_id), Some(email)) = (&context.share_id, &context.user_email) else {
             return Ok(None);
         };
-        let (free_access, grant) = {
+        let (free_access, grant, trial) = {
             let shares = self.shares.read().await;
             let share = shares.get(share_id).context("VALUE_QUOTA_SHARE_REVOKED")?;
-            (
-                share.free_access,
-                share.user_grants.get(&email.to_ascii_lowercase()).cloned(),
-            )
+            let grant = share.user_grants.get(&email.to_ascii_lowercase()).cloned();
+            let mut trial = None;
+            if let Some(grant) = grant.as_ref().filter(|g| {
+                g.manager == ShareGrantManager::RouterShareMarket && g.policy.value_quota.is_some()
+            }) {
+                let id = grant
+                    .entitlement_id
+                    .as_deref()
+                    .context("VALUE_QUOTA_ENTITLEMENT_REQUIRED")?;
+                if context
+                    .request_id
+                    .as_ref()
+                    .and_then(|id| share.market_requests.get(id))
+                    .is_none_or(|receipt| {
+                        receipt.entitlement_id != id || !receipt.email.eq_ignore_ascii_case(email)
+                    })
+                {
+                    return Err(ValueQuotaRejection::new(
+                        ValueQuotaRejectionKind::AuthorizationRevoked,
+                    )
+                    .into());
+                }
+                if let Some(state) = share.market_entitlements.get(id).filter(|e| {
+                    e.phase == crate::domain::sharing::router_contract::ShareMarketPhase::Trial
+                }) {
+                    if let (Some(allowance), Some(limit)) = (
+                        &state.trial_value_allowance_usd_micros,
+                        &state.trial_value_limit_usd_micros,
+                    ) {
+                        let scope_used = share
+                            .market_entitlements
+                            .values()
+                            .filter(|e| e.trial_scope_id == state.trial_scope_id)
+                            .try_fold(0i128, |total, e| -> anyhow::Result<i128> {
+                                total
+                                    .checked_add(
+                                        crate::domain::usage::value_pricing::unsigned_decimal(
+                                            &e.trial_value_used_picos,
+                                        )?,
+                                    )
+                                    .context("value quota arithmetic overflow")
+                            })?;
+                        trial = Some(ledger::MarketTrialBudget {
+                            scope_id: state.trial_scope_id.clone(),
+                            entitlement_id: id.into(),
+                            allowance_micros: allowance.clone(),
+                            limit_micros: limit.clone(),
+                            scope_used_picos: scope_used.to_string(),
+                            used_picos: state.trial_value_used_picos.clone(),
+                        });
+                    }
+                }
+            }
+            (share.free_access, grant, trial)
         };
         let Some(grant) = grant.filter(|grant| grant.active) else {
             // Free-access traffic does not acquire a revoked individual's
@@ -1382,7 +1744,7 @@ impl ServerStateInner {
                 "VALUE_QUOTA_SCHEDULED"
             );
             let config = self.config_snapshot().await;
-            let identity = scope(&config, share_id, email)?;
+            let identity = grant_scope(&config, share_id, email, &grant)?;
             let w = window(&grant, started)?;
             let request_id = context
                 .request_id
@@ -1396,24 +1758,27 @@ impl ServerStateInner {
             tokio::task::spawn_blocking(move || {
                 let revision = ledger::active_revision(&config_dir, &identity)?
                     .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
-                ledger::admit(
-                    &config_dir,
-                    &ledger::Admission {
-                        enforce: true,
-                        scope: &identity,
-                        window: &w,
-                        policy_epoch: &binding.quota_policy_epoch,
-                        quota: &quota,
-                        pricing_revision: &revision,
-                        request_id: &blocking_request,
-                        attempt_id: &blocking_attempt,
-                        effective_model: &model,
-                        effective_tier: tier,
-                        started_at_ms: started,
-                        estimate,
-                        parallel_limit,
-                    },
-                )
+                let admission = ledger::Admission {
+                    enforce: true,
+                    scope: &identity,
+                    window: &w,
+                    policy_epoch: &binding.quota_policy_epoch,
+                    quota: &quota,
+                    pricing_revision: &revision,
+                    request_id: &blocking_request,
+                    attempt_id: &blocking_attempt,
+                    effective_model: &model,
+                    effective_tier: tier,
+                    started_at_ms: started,
+                    estimate,
+                    parallel_limit,
+                };
+                match trial.as_ref() {
+                    Some(trial) => {
+                        ledger::admit_with_market_trial(&config_dir, &admission, Some(trial))
+                    }
+                    None => ledger::admit(&config_dir, &admission),
+                }
             })
             .await
             .context("value quota admission task panicked")??;
@@ -1562,7 +1927,7 @@ impl ServerStateInner {
                     continue;
                 }
             };
-            let identity_scope = scope(config, &id, &status.email)?;
+            let identity_scope = grant_scope(config, &id, &status.email, &grant)?;
             let needs_sync = match ledger::projection_needs_sync(
                 &self.config_dir,
                 &identity_scope,

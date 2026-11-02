@@ -214,6 +214,16 @@ pub struct ShareManagedGrantOperation {
     /// None means time-only; zero is never a valid cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trial_token_limit: Option<u64>,
+    /// USD-equivalent counterpart of `trial_token_allowance` (whole-scope
+    /// original budget, canonical decimal micro-USD). The trial unit follows
+    /// the seat quota unit: only a seat with `policy.valueQuota` may carry it,
+    /// and an operation never mixes it with the Token trial fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_allowance_usd_micros: Option<String>,
+    /// USD-equivalent counterpart of `trial_token_limit` (this entitlement's
+    /// one-time budget, canonical decimal micro-USD, <= the allowance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -241,6 +251,26 @@ pub struct ShareMarketEntitlement {
     pub applied_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_started_at_ms: Option<i64>,
+    /// USD trial budgets (canonical decimal micro-USD); present only when the
+    /// trial was granted in the seat's USD unit. Mutually exclusive with the
+    /// Token trial budget fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_allowance_usd_micros: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_value_limit_usd_micros: Option<String>,
+    /// Settled USD-equivalent picos of trial-phase requests (canonical
+    /// decimal). Only increases; dynamic like `trial_tokens_used` (bumps
+    /// `usage_revision`, excluded from the static descriptor fingerprint).
+    #[serde(default = "zero_decimal", skip_serializing_if = "is_zero_decimal")]
+    pub trial_value_used_picos: String,
+}
+
+pub(crate) fn zero_decimal() -> String {
+    "0".to_string()
+}
+
+pub(crate) fn is_zero_decimal(value: &str) -> bool {
+    value == "0"
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1434,6 +1464,7 @@ fn static_descriptor_projection(
     {
         for state in states.values_mut().filter_map(Value::as_object_mut) {
             state.remove("trialTokensUsed");
+            state.remove("trialValueUsedPicos");
             state.remove("usageUncertain");
             state.remove("usageRevision");
         }
@@ -2580,11 +2611,15 @@ mod tests {
                 usage_uncertain: false,
                 applied_at_ms: 1_000,
                 paid_started_at_ms: None,
+                trial_value_allowance_usd_micros: None,
+                trial_value_limit_usd_micros: None,
+                trial_value_used_picos: "0".into(),
             },
         );
         let market_fingerprint = static_descriptor_fingerprint(&market, &providers).unwrap();
         let state = market.market_entitlements.get_mut("one-time").unwrap();
         state.trial_tokens_used = 50;
+        state.trial_value_used_picos = "1500000".into();
         state.usage_revision = 1;
         state.usage_uncertain = true;
         assert_eq!(

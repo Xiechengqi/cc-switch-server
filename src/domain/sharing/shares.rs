@@ -4242,7 +4242,7 @@ fn validate_managed_grant_operation(
                     ));
                 }
             }
-            Ok(())
+            validate_managed_value_trial(operation)
         }
         ShareManagedGrantAction::Revoke => {
             if operation.policy.is_some()
@@ -4251,6 +4251,8 @@ fn validate_managed_grant_operation(
                 || operation.trial_token_limit.is_some()
                 || operation.trial_scope_id.is_some()
                 || operation.trial_token_allowance.is_some()
+                || operation.trial_value_allowance_usd_micros.is_some()
+                || operation.trial_value_limit_usd_micros.is_some()
             {
                 return Err(SharePatchError::Invalid(
                     "managed grant revoke must not include policy or durationSeconds".to_string(),
@@ -4258,6 +4260,47 @@ fn validate_managed_grant_operation(
             }
             Ok(())
         }
+    }
+}
+
+/// Static shape of a USD-equivalent one-time trial budget. The trial unit
+/// follows the seat quota unit: both amounts or neither, never mixed with the
+/// Token trial fields, on a seat with `policy.valueQuota` and a market
+/// phase; canonical positive micro-USD decimals with limit <= allowance.
+fn validate_managed_value_trial(
+    operation: &ShareManagedGrantOperation,
+) -> Result<(), SharePatchError> {
+    use crate::domain::usage::value_pricing::{unsigned_decimal, MAX_LIMIT_MICROS};
+    let invalid = |message: &str| Err(SharePatchError::Invalid(message.to_string()));
+    let (allowance, limit) = match (
+        operation.trial_value_allowance_usd_micros.as_deref(),
+        operation.trial_value_limit_usd_micros.as_deref(),
+    ) {
+        (None, None) => return Ok(()),
+        (Some(allowance), Some(limit)) => (allowance, limit),
+        _ => return invalid("USD trial allowance and limit must be provided together"),
+    };
+    if operation.trial_token_allowance.is_some() || operation.trial_token_limit.is_some() {
+        return invalid("a market trial budget uses one unit: Token or USD-equivalent, not both");
+    }
+    if operation.market_phase.is_none() {
+        return invalid("USD trial budget requires a market phase");
+    }
+    if operation
+        .policy
+        .as_ref()
+        .is_none_or(|policy| policy.value_quota.is_none())
+    {
+        return invalid("USD trial budget requires a USD-equivalent seat quota (valueQuota)");
+    }
+    let parse = |raw: &str| {
+        unsigned_decimal(raw)
+            .ok()
+            .filter(|micros| (1..=MAX_LIMIT_MICROS).contains(micros))
+    };
+    match (parse(allowance), parse(limit)) {
+        (Some(allowance), Some(limit)) if limit <= allowance => Ok(()),
+        _ => invalid("invalid one-time market USD trial budget"),
     }
 }
 
@@ -4303,6 +4346,12 @@ fn apply_managed_grant_operation(
                     phase,
                     operation.trial_token_limit,
                 )?;
+                super::market_trials::validate_value_transition(
+                    share,
+                    &operation.entitlement_id,
+                    phase,
+                    operation.trial_value_limit_usd_micros.as_deref(),
+                )?;
                 let scope = operation
                     .trial_scope_id
                     .as_deref()
@@ -4331,7 +4380,9 @@ fn apply_managed_grant_operation(
                     .is_some_and(|e| {
                         e.trial_scope_id != scope
                             || (phase == super::router_contract::ShareMarketPhase::Trial
-                                && e.trial_token_allowance != operation.trial_token_allowance)
+                                && (e.trial_token_allowance != operation.trial_token_allowance
+                                    || e.trial_value_allowance_usd_micros
+                                        != operation.trial_value_allowance_usd_micros))
                     })
                 {
                     return Err(SharePatchError::Invalid(
@@ -4377,12 +4428,11 @@ fn apply_managed_grant_operation(
             if policy.token_period.requires_anchor() && policy.token_period_anchor_at_ms.is_none() {
                 policy.token_period_anchor_at_ms = Some(now.div_euclid(60_000) * 60_000);
             }
+            // `valueQuota` (exclusive with `tokenLimit`, checked above) is
+            // allowed in every market phase: a trial keeps its one-time Token
+            // or USD budget on the entitlement. The Server binds USD metering per
+            // contract when the store is prepared (see share_value_quota.rs).
             validate_user_policy(&policy, now).map_err(SharePatchError::Invalid)?;
-            if policy.value_quota.is_some() {
-                return Err(SharePatchError::Invalid(
-                    "Share Market contracts cannot use USD-equivalent quotas".into(),
-                ));
-            }
             if policy.token_period == ShareTokenPeriod::AccountReset {
                 return Err(SharePatchError::Invalid(
                     "market contracts cannot use accountReset".into(),
@@ -4426,6 +4476,13 @@ fn apply_managed_grant_operation(
                         usage_uncertain: false,
                         applied_at_ms: now,
                         paid_started_at_ms: None,
+                        trial_value_allowance_usd_micros: operation
+                            .trial_value_allowance_usd_micros
+                            .clone(),
+                        trial_value_limit_usd_micros: operation
+                            .trial_value_limit_usd_micros
+                            .clone(),
+                        trial_value_used_picos: "0".into(),
                     });
                 if state.phase != phase {
                     state.applied_at_ms = now;
@@ -4729,6 +4786,8 @@ mod tests {
             trial_token_limit: None,
             trial_scope_id: None,
             trial_token_allowance: None,
+            trial_value_allowance_usd_micros: None,
+            trial_value_limit_usd_micros: None,
         }
     }
 
@@ -5258,6 +5317,587 @@ mod tests {
                 .token_limit,
             Some(10_000)
         );
+    }
+
+    #[test]
+    fn managed_grant_accepts_usd_quota_in_every_market_phase_but_not_account_reset() {
+        use crate::domain::sharing::{market_trials, router_contract::ShareMarketPhase};
+        use crate::domain::usage::value_pricing::ValueQuota;
+        let usd = || {
+            Some(ValueQuota {
+                limit_usd_micros: "10000000".into(),
+                tariff_policy_id: "api-equivalent-v1".into(),
+            })
+        };
+        let usd_operation = |id: &str, entitlement: &str, revision: u64, email: &str| {
+            let mut op = managed_operation(
+                id,
+                entitlement,
+                revision,
+                ShareManagedGrantAction::Upsert,
+                email,
+            );
+            let policy = op.policy.as_mut().unwrap();
+            policy.token_limit = None;
+            policy.value_quota = usd();
+            op
+        };
+        let apply = |store: &mut ShareStore, share_id: &str, op: ShareManagedGrantOperation| {
+            store.apply_settings_patch(
+                share_id,
+                ShareSettingsPatch {
+                    managed_grant: Some(op),
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Free seat (no market phase).
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-free-seat")).unwrap();
+        let updated = apply(
+            &mut store,
+            &share.id,
+            usd_operation(
+                "free-op",
+                "free-seat",
+                share.config_revision,
+                "renter@example.com",
+            ),
+        )
+        .unwrap();
+        let grant = &updated.user_grants["renter@example.com"];
+        assert_eq!(grant.manager, ShareGrantManager::RouterShareMarket);
+        assert_eq!(grant.policy.value_quota, usd());
+        assert_eq!(grant.policy.token_limit, None);
+        assert!(grant.pending_value_quota.is_none());
+
+        // Trial phase keeps its one-time Token budget beside the USD policy,
+        // and the paid upsert of the same entitlement keeps the USD policy.
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-trial-seat")).unwrap();
+        let mut trial = usd_operation(
+            "trial-op",
+            "trial-seat",
+            share.config_revision,
+            "renter@example.com",
+        );
+        trial.market_phase = Some(ShareMarketPhase::Trial);
+        trial.trial_token_limit = Some(100);
+        trial.trial_scope_id = Some("usd-scope".into());
+        trial.trial_token_allowance = Some(100);
+        let updated = apply(&mut store, &share.id, trial.clone()).unwrap();
+        assert_eq!(
+            updated.user_grants["renter@example.com"].policy.value_quota,
+            usd()
+        );
+        let seat = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-trial-seat")
+            .unwrap();
+        seat.market_entitlements
+            .get_mut("trial-seat")
+            .unwrap()
+            .trial_tokens_used = 100;
+        assert!(
+            market_trials::exhausted(seat, "trial-seat"),
+            "a USD seat still ends its trial on the one-time Token budget"
+        );
+        let mut paid = trial;
+        paid.operation_id = "paid-op".into();
+        paid.share_sequence = 2;
+        paid.expected_config_revision = store.get("usd-trial-seat").unwrap().config_revision;
+        paid.market_phase = Some(ShareMarketPhase::Paid);
+        paid.trial_token_limit = None;
+        paid.trial_token_allowance = None;
+        let updated = apply(&mut store, "usd-trial-seat", paid).unwrap();
+        assert_eq!(
+            updated.user_grants["renter@example.com"].policy.value_quota,
+            usd()
+        );
+        let seat = store.get("usd-trial-seat").unwrap();
+        assert!(!market_trials::exhausted(seat, "trial-seat"));
+
+        // tokenLimit and valueQuota stay mutually exclusive.
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-both-limits")).unwrap();
+        let mut both = usd_operation(
+            "both-op",
+            "both-seat",
+            share.config_revision,
+            "renter@example.com",
+        );
+        both.policy.as_mut().unwrap().token_limit = Some(10);
+        let error = apply(&mut store, &share.id, both).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+        assert!(!store
+            .get("usd-both-limits")
+            .unwrap()
+            .user_grants
+            .get("renter@example.com")
+            .is_some_and(|grant| grant.active));
+
+        // accountReset stays forbidden for market contracts.
+        let mut reset = usd_operation(
+            "reset-op",
+            "reset-seat",
+            share.config_revision,
+            "renter@example.com",
+        );
+        reset.policy.as_mut().unwrap().token_period = ShareTokenPeriod::AccountReset;
+        let error = apply(&mut store, &share.id, reset).unwrap_err();
+        assert!(error.to_string().contains("accountReset"), "{error}");
+    }
+
+    /// A USD seat trial operation: `valueQuota` policy, Trial phase and a
+    /// USD-equivalent one-time budget (micro-USD decimal strings).
+    fn usd_trial_operation(
+        operation_id: &str,
+        entitlement_id: &str,
+        expected_config_revision: u64,
+        allowance: &str,
+        limit: &str,
+    ) -> ShareManagedGrantOperation {
+        use crate::domain::sharing::router_contract::ShareMarketPhase;
+        let mut op = managed_operation(
+            operation_id,
+            entitlement_id,
+            expected_config_revision,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        let policy = op.policy.as_mut().unwrap();
+        policy.token_limit = None;
+        policy.value_quota = Some(crate::domain::usage::value_pricing::ValueQuota {
+            limit_usd_micros: "10000000".into(),
+            tariff_policy_id: "api-equivalent-v1".into(),
+        });
+        op.market_phase = Some(ShareMarketPhase::Trial);
+        op.trial_scope_id = Some("usd-scope".into());
+        op.trial_value_allowance_usd_micros = Some(allowance.into());
+        op.trial_value_limit_usd_micros = Some(limit.into());
+        op
+    }
+
+    fn apply_managed(
+        store: &mut ShareStore,
+        share_id: &str,
+        op: ShareManagedGrantOperation,
+    ) -> Result<Share, SharePatchError> {
+        store.apply_settings_patch(
+            share_id,
+            ShareSettingsPatch {
+                managed_grant: Some(op),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn managed_usd_trial_budget_validation_follows_the_seat_unit() {
+        use crate::domain::sharing::router_contract::ShareMarketPhase;
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-trial-rules")).unwrap();
+        let revision = share.config_revision;
+        let rejected = |store: &mut ShareStore, op: ShareManagedGrantOperation, needle: &str| {
+            let error = apply_managed(store, "usd-trial-rules", op).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        };
+        let base = || usd_trial_operation("op", "usd-trial", revision, "1000000", "400000");
+
+        // Both or neither.
+        let mut op = base();
+        op.trial_value_limit_usd_micros = None;
+        rejected(&mut store, op, "provided together");
+        let mut op = base();
+        op.trial_value_allowance_usd_micros = None;
+        rejected(&mut store, op, "provided together");
+        // One trial unit per operation.
+        let mut op = base();
+        op.trial_token_allowance = Some(100);
+        op.trial_token_limit = Some(100);
+        rejected(&mut store, op, "one unit");
+        let mut op = base();
+        op.trial_token_limit = Some(100);
+        rejected(&mut store, op, "one unit");
+        // Requires a market phase and a USD seat.
+        let mut op = base();
+        op.market_phase = None;
+        rejected(&mut store, op, "requires a market phase");
+        let mut op = base();
+        let policy = op.policy.as_mut().unwrap();
+        policy.value_quota = None;
+        policy.token_limit = Some(10_000);
+        rejected(&mut store, op, "valueQuota");
+        // Canonical positive micro-USD decimals, limit <= allowance.
+        for (allowance, limit) in [
+            ("1000000", "1000001"),
+            ("01000000", "400000"),
+            ("1000000", "0400000"),
+            ("0", "0"),
+            ("1000000", "0"),
+            ("1000000.5", "400000"),
+            ("-1000000", "400000"),
+            ("", "400000"),
+            ("1000000000000001", "400000"),
+            ("1e6", "400000"),
+        ] {
+            let mut op = base();
+            op.trial_value_allowance_usd_micros = Some(allowance.into());
+            op.trial_value_limit_usd_micros = Some(limit.into());
+            rejected(&mut store, op, "invalid one-time market USD trial budget");
+        }
+        assert!(store
+            .get("usd-trial-rules")
+            .unwrap()
+            .market_entitlements
+            .is_empty());
+
+        // The upper bound is accepted (limit == allowance is covered by the
+        // exhaustion tests).
+        let applied = apply_managed(
+            &mut store,
+            "usd-trial-rules",
+            usd_trial_operation(
+                "accepted",
+                "usd-trial",
+                revision,
+                "1000000000000000",
+                "1000000",
+            ),
+        )
+        .unwrap();
+        let state = &applied.market_entitlements["usd-trial"];
+        assert_eq!(
+            state.trial_value_allowance_usd_micros.as_deref(),
+            Some("1000000000000000")
+        );
+        assert_eq!(
+            state.trial_value_limit_usd_micros.as_deref(),
+            Some("1000000")
+        );
+        assert_eq!(state.trial_value_used_picos, "0");
+        assert_eq!(
+            (state.trial_token_allowance, state.trial_token_limit),
+            (None, None)
+        );
+
+        // The allowance and the entitlement budget cannot be re-granted.
+        let next = |id: &str, store: &ShareStore, allowance: &str, limit: &str| {
+            let mut op = usd_trial_operation(
+                id,
+                "usd-trial",
+                store.get("usd-trial-rules").unwrap().config_revision,
+                allowance,
+                limit,
+            );
+            op.share_sequence = 2;
+            op
+        };
+        let op = next("regrant", &store, "1000000000000000", "500000");
+        rejected(&mut store, op, "cannot be reset");
+        let op = next("allowance", &store, "2000000", "1000000");
+        rejected(&mut store, op, "cannot be changed");
+        // Switching the trial unit of an existing entitlement is a re-grant.
+        let mut op = next("unit", &store, "1", "1");
+        op.trial_value_allowance_usd_micros = None;
+        op.trial_value_limit_usd_micros = None;
+        op.trial_token_allowance = Some(100);
+        op.trial_token_limit = Some(100);
+        assert!(apply_managed(&mut store, "usd-trial-rules", op).is_err());
+        // The same budget re-upserted (integrity repair) is accepted.
+        let op = next("same", &store, "1000000000000000", "1000000");
+        apply_managed(&mut store, "usd-trial-rules", op).unwrap();
+
+        // Paid upserts never carry a USD trial budget.
+        let mut op = next("paid", &store, "1000000000000000", "1000000");
+        op.market_phase = Some(ShareMarketPhase::Paid);
+        rejected(&mut store, op, "only to the trial phase");
+        let mut op = next("paid-ok", &store, "1", "1");
+        op.market_phase = Some(ShareMarketPhase::Paid);
+        op.trial_value_allowance_usd_micros = None;
+        op.trial_value_limit_usd_micros = None;
+        let paid = apply_managed(&mut store, "usd-trial-rules", op).unwrap();
+        let state = &paid.market_entitlements["usd-trial"];
+        assert_eq!(state.phase, ShareMarketPhase::Paid);
+        assert_eq!(
+            state.trial_value_limit_usd_micros.as_deref(),
+            Some("1000000"),
+            "the historical trial budget is kept after conversion"
+        );
+
+        // Revoke must not carry a USD trial budget.
+        let mut revoke = managed_operation(
+            "revoke",
+            "usd-trial",
+            paid.config_revision,
+            ShareManagedGrantAction::Revoke,
+            "renter@example.com",
+        );
+        revoke.share_sequence = 3;
+        revoke.trial_value_limit_usd_micros = Some("1".into());
+        assert!(apply_managed(&mut store, "usd-trial-rules", revoke.clone()).is_err());
+        revoke.trial_value_limit_usd_micros = None;
+        revoke.trial_value_allowance_usd_micros = Some("1".into());
+        assert!(apply_managed(&mut store, "usd-trial-rules", revoke).is_err());
+    }
+
+    #[test]
+    fn usd_trial_exhausts_by_entitlement_limit_and_by_scope_allowance() {
+        use crate::domain::sharing::market_trials;
+        const PICOS_PER_MICRO: i128 = 1_000_000;
+        // Entitlement limit: $0.20 of a $1 scope.
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-limit")).unwrap();
+        apply_managed(
+            &mut store,
+            &share.id,
+            usd_trial_operation(
+                "limit",
+                "limited",
+                share.config_revision,
+                "1000000",
+                "200000",
+            ),
+        )
+        .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-limit")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "first", 1_000).unwrap();
+        assert!(market_trials::record_value(share, "first", 199_999 * PICOS_PER_MICRO).unwrap());
+        assert!(!market_trials::exhausted(share, "limited"));
+        // An admitted request finishes (soft cap) and its full cost counts.
+        market_trials::admit(share, "renter@example.com", "second", 2_000).unwrap();
+        assert!(market_trials::record_value(share, "second", 2 * PICOS_PER_MICRO).unwrap());
+        assert_eq!(
+            share.market_entitlements["limited"].trial_value_used_picos,
+            (200_001 * PICOS_PER_MICRO).to_string()
+        );
+        assert!(market_trials::exhausted(share, "limited"));
+        let error = market_trials::admit(share, "renter@example.com", "third", 3_000)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MARKET_TRIAL_EXHAUSTED"), "{error}");
+
+        // Scope allowance: a late completion of the first entitlement ends the
+        // second entitlement's trial although its own limit is not reached.
+        let mut store = ShareStore::default();
+        let original = store.upsert(codex_share_input("usd-scope")).unwrap();
+        apply_managed(
+            &mut store,
+            &original.id,
+            usd_trial_operation(
+                "one",
+                "first",
+                original.config_revision,
+                "1000000",
+                "1000000",
+            ),
+        )
+        .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-scope")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "old", 1_000).unwrap();
+        market_trials::record_value(share, "old", 300_000 * PICOS_PER_MICRO).unwrap();
+        share.market_entitlements.get_mut("first").unwrap().active = false;
+        share
+            .user_grants
+            .get_mut("renter@example.com")
+            .unwrap()
+            .active = false;
+        let mut second =
+            usd_trial_operation("two", "second", share.config_revision, "1000000", "700000");
+        second.share_sequence = 2;
+        apply_managed(&mut store, "usd-scope", second).unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-scope")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "new", 2_000).unwrap();
+        market_trials::record_value(share, "new", 500_000 * PICOS_PER_MICRO).unwrap();
+        assert!(
+            !market_trials::exhausted(share, "second"),
+            "$0.80 of the $1 scope is used"
+        );
+        assert!(market_trials::record_value(share, "old", 500_000 * PICOS_PER_MICRO).unwrap());
+        assert_eq!(
+            share.market_entitlements["first"].trial_value_used_picos,
+            (500_000 * PICOS_PER_MICRO).to_string()
+        );
+        assert!(market_trials::exhausted(share, "second"));
+        assert!(market_trials::admit(share, "renter@example.com", "after-late", 3_000).is_err());
+        assert_eq!(
+            share.user_grants["renter@example.com"]
+                .usage
+                .lifetime
+                .tokens_used,
+            0,
+            "USD trial usage never touches the Token periodic counters"
+        );
+    }
+
+    #[test]
+    fn usd_trial_record_value_is_idempotent_monotonic_and_trial_only() {
+        use crate::domain::sharing::{market_trials, router_contract::ShareMarketPhase};
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("usd-record")).unwrap();
+        apply_managed(
+            &mut store,
+            &share.id,
+            usd_trial_operation("trial", "usd", share.config_revision, "1000000", "1000000"),
+        )
+        .unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-record")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "request", 1_000).unwrap();
+        let state = |share: &Share| {
+            let e = &share.market_entitlements["usd"];
+            (e.trial_value_used_picos.clone(), e.usage_revision)
+        };
+        assert!(!market_trials::record_value(share, "unknown-request", 5).unwrap());
+        assert!(market_trials::record_value(share, "request", 100).is_ok_and(|changed| changed));
+        assert_eq!(state(share), ("100".into(), 1));
+        // Replays of the same settlement are no-ops.
+        assert!(!market_trials::record_value(share, "request", 100).unwrap());
+        assert_eq!(state(share), ("100".into(), 1));
+        // A lower re-settlement (genuine usage replacing a conservative
+        // estimate) never reopens the budget.
+        assert!(!market_trials::record_value(share, "request", 40).unwrap());
+        assert_eq!(state(share), ("100".into(), 1));
+        assert_eq!(share.market_requests["request"].value_picos, "100");
+        // A higher settlement adds only its delta.
+        assert!(market_trials::record_value(share, "request", 250).unwrap());
+        assert_eq!(state(share), ("250".into(), 2));
+        assert!(market_trials::record_value(share, "request", -1).is_err());
+        // Receipts persist the seen amount, so a restart cannot double count.
+        let json = serde_json::to_string(&store).unwrap();
+        let mut store: ShareStore = serde_json::from_str(&json).unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-record")
+            .unwrap();
+        assert!(!market_trials::record_value(share, "request", 250).unwrap());
+        assert_eq!(state(share), ("250".into(), 2));
+
+        // Paid-phase requests never count toward the trial budget.
+        let mut paid =
+            usd_trial_operation("paid", "usd", share.config_revision, "1000000", "1000000");
+        paid.share_sequence = 2;
+        paid.market_phase = Some(ShareMarketPhase::Paid);
+        paid.trial_value_allowance_usd_micros = None;
+        paid.trial_value_limit_usd_micros = None;
+        apply_managed(&mut store, "usd-record", paid).unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "usd-record")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "paid-request", 2_000).unwrap();
+        assert!(!market_trials::record_value(share, "paid-request", 1_000).unwrap());
+        // A late trial completion still counts after conversion.
+        assert!(market_trials::record_value(share, "request", 300).unwrap());
+        assert_eq!(state(share), ("300".into(), 3));
+        assert_eq!(
+            market_trials::value_receipts(share).collect::<Vec<_>>(),
+            vec!["request"]
+        );
+
+        // Token trials ignore USD settlements entirely.
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("token-trial")).unwrap();
+        let mut op = usd_trial_operation("token", "token", share.config_revision, "1", "1");
+        op.trial_value_allowance_usd_micros = None;
+        op.trial_value_limit_usd_micros = None;
+        op.trial_token_allowance = Some(100);
+        op.trial_token_limit = Some(100);
+        apply_managed(&mut store, "token-trial", op).unwrap();
+        let share = store
+            .shares
+            .iter_mut()
+            .find(|s| s.id == "token-trial")
+            .unwrap();
+        market_trials::admit(share, "renter@example.com", "token-request", 1_000).unwrap();
+        assert!(!market_trials::record_value(share, "token-request", 1_000).unwrap());
+        assert_eq!(market_trials::value_receipts(share).count(), 0);
+        assert!(!market_trials::exhausted(share, "token"));
+    }
+
+    #[test]
+    fn usd_trial_fields_are_absent_from_legacy_payloads() {
+        use crate::domain::sharing::{
+            market_trials::MarketRequestReceipt,
+            router_contract::{ShareMarketEntitlement, ShareMarketPhase},
+        };
+        let op = managed_operation(
+            "legacy",
+            "legacy",
+            1,
+            ShareManagedGrantAction::Upsert,
+            "renter@example.com",
+        );
+        let json = serde_json::to_value(&op).unwrap();
+        assert!(json.get("trialValueAllowanceUsdMicros").is_none());
+        assert!(json.get("trialValueLimitUsdMicros").is_none());
+        let parsed: ShareManagedGrantOperation = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, op);
+
+        let legacy = serde_json::json!({
+            "trialScopeId": "scope",
+            "trialTokenAllowance": 100,
+            "email": "renter@example.com",
+            "phase": "trial",
+            "active": true,
+            "trialTokenLimit": 100,
+            "trialTokensUsed": 7,
+            "usageRevision": 1,
+            "usageUncertain": false,
+            "appliedAtMs": 1000
+        });
+        let entitlement: ShareMarketEntitlement = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(entitlement.trial_value_used_picos, "0");
+        assert_eq!(entitlement.trial_value_limit_usd_micros, None);
+        assert_eq!(entitlement.phase, ShareMarketPhase::Trial);
+        assert_eq!(
+            serde_json::to_value(&entitlement).unwrap(),
+            legacy,
+            "a Token trial entitlement serializes byte-for-byte as before"
+        );
+        let receipt = serde_json::json!({
+            "entitlementId": "e",
+            "email": "renter@example.com",
+            "phase": "trial",
+            "startedAtMs": 1,
+            "tokens": 3,
+            "revision": 1,
+            "countRequest": true
+        });
+        let parsed: MarketRequestReceipt = serde_json::from_value(receipt.clone()).unwrap();
+        assert_eq!(parsed.value_picos, "0");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), receipt);
+
+        let mut usd = entitlement;
+        usd.trial_token_allowance = None;
+        usd.trial_token_limit = None;
+        usd.trial_value_allowance_usd_micros = Some("1000000".into());
+        usd.trial_value_limit_usd_micros = Some("400000".into());
+        usd.trial_value_used_picos = "1500000".into();
+        let json = serde_json::to_value(&usd).unwrap();
+        assert_eq!(json["trialValueAllowanceUsdMicros"], "1000000");
+        assert_eq!(json["trialValueLimitUsdMicros"], "400000");
+        assert_eq!(json["trialValueUsedPicos"], "1500000");
+        assert!(json.get("trialTokenAllowance").is_none());
     }
 
     #[test]

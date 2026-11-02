@@ -124,6 +124,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                         installation_id: "fixture-value-installation".into(),
                         share_id: "fixture-value-share".into(),
                         email: "owner@example.test".into(),
+                        entitlement_id: None,
                     };
                     let fixture: Value = serde_json::from_str(include_str!(
                         "../../../tests/fixtures/share-value-pricing-v1.json"

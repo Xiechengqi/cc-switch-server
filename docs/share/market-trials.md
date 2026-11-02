@@ -6,9 +6,15 @@ Server 只处理绑定 Router 下发的 managed entitlement，不计算价格、
 
 ## 预算与阶段
 
-`marketEntitlements` 以 entitlement ID 索引：scope／email、`phase=trial|paid`、active、原始 trialTokenAllowance、本次 trialTokenLimit、trialTokensUsed／usageRevision、appliedAtMs、paidStartedAtMs、usageUncertain。scope 跨相同用户同一 Share 的租约保留。Token 缺省表示时间试用；不允许用普通 tokenLimit=0 表达“不限”。普通周期 quota 仍独立生效。
+`marketEntitlements` 以 entitlement ID 索引：scope／email、`phase=trial|paid`、active、原始 trialTokenAllowance、本次 trialTokenLimit、trialTokensUsed／usageRevision、appliedAtMs、paidStartedAtMs、usageUncertain。scope 跨相同用户同一 Share 的租约保留。两个单位的预算都缺省才表示时间试用；不允许用普通 tokenLimit=0 表达“不限”。普通周期 quota 仍独立生效；席位策略可以是 Token 或 USD 等值（`valueQuota`），新试用预算跟随单位，旧冻结 Token 预算保持原语义，见 [双口径额度 §12](value-quotas.md#12-share-market-usd-席位托管授权)。
+
+USD 预算字段为 `trialValueAllowanceUsdMicros`、`trialValueLimitUsdMicros`（成对、正规范整数、limit ≤ allowance ≤ 10^15，与 Token 预算互斥、要求 USD policy），用量 `trialValueUsedPicos` 为规范非负整数，默认／零省略。更新与 Token 共用 `usageRevision`；试用转 paid 不携带新预算，但 entitlement 保留原冻结条款和累计，迟到 trial 请求仍计入原 scope。Router 默认 US$1、空白继承／0 时间试用、首次单位锁及跨单位仅保留时间，均由 Router 冻结后下发，Server 不自行换算 Token 与美元。
+
+发网前，Server 在同一 SQLite IMMEDIATE 事务中读取周期额度、当前 entitlement 和原 scope 的累计试用已用与全部在途预占，按三者最小剩余量预占。相同 request／attempt 重试不重复占用；在途占满返回可重试 busy，已结算耗尽返回 exhausted，不能靠跨周期／新合同重新领取。scope 的试用索引和每 attempt 最高终态值使用现有 meta 存储、随结算原子推进；覆盖压缩和崩溃恢复，不依赖短期 Usage 日志或异步镜像是否已经完成。低于先前保守结算的真实用量可纠正周期 meter，但不重新开放一次性试用。
 
 同 entitlement 不能改用户或 scope、不能 Paid→Trial、不能重新给试用预算。同 scope 不能绑定其他邮箱。revoke 只停授权，不删除累计计数或未完成请求；后续旧请求的 Tokens 仍能结束同 scope 的新 trial。
+
+USD 结算后的最高用量镜像到 entitlement；正常结算、无日志终结守卫、启动与清扫器均补偿镜像，并核对 request 的 Share／邮箱／entitlement。动态金额水位和 Token 水位一样从静态 descriptor 指纹中剔除。旧 Server 缺 `market_trial_value` 检查声明时 Router 禁止新的正金额试用，不能悄悄转成时间试用；普通 v9 Token 协议无须带任何新美元字段。
 
 `state.begin_share_quota_usage` 在任何上游工作前持久化 request ID、entitlement 和当时 phase。`commit_usage_append` 先持久化累计 Token 修订及阶段 quota，再写 Usage journal；失败不得重新开放免费预算。重试同 revision 必须相同 payload，较旧 revision 不再重复计数。试用→正式时重新投影当前 entitlement 的正式请求 quota，保留 trial 累计水位，迟到 trial 响应不能扣正式额度。
 
@@ -29,3 +35,5 @@ Router 先预留资金，再下发 paid phase；Server 原子应用 policy 和 p
 ## 本地验收
 
 单元测试覆盖跨 quota 周期不重置、阶段切换与迟到用量隔离、跨 entitlement scope 消耗、重启未知用量隔离、receipt 压缩与 lifetime 保留，以及动态用量不改变静态 descriptor 指纹。需与 Router 的冻结报价、保留资金、仅一次扣款及安全释放测试共同执行。真实上游调用、生产部署与真实付款不属于本地测试结论。
+
+2026-11-02 扩展已补充金额预算／跨合同原子预占、较低结算与压缩后高水位恢复、冻结条款及能力声明用例；按约定仅编译测试代码，不运行测试，不做截图或浏览器／UI 自动化，未部署。

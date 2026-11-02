@@ -1,10 +1,10 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-10-31（第三轮：旧 Router 兼容、ACK 丢失恢复、预发错误免费重试、证明为空窗口立即生效）。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-02（Share Market USD 席位与美元试用预算，§12；本轮只做编译／静态验证，不运行测试）。
 
 ## 1. 含义与启用条件
 
-普通授权用户可选择 Token 数量或 USD API 标价等值额度。后者是使用资格，**不扣平台钱包，不代表 Provider 真实成本或应付账单**。Share 总 Token、用户到期、App 权限、并发与上游额度照常生效。市场托管授权禁止设置金额策略，既有试用／租金不变。
+普通授权用户可选择 Token 数量或 USD API 标价等值额度。后者是使用资格，**不扣平台钱包，不代表 Provider 真实成本或应付账单**。Share 总 Token、用户到期、App 权限、并发与上游额度照常生效。Router Share Market 托管席位也可以按 USD 等值额度出售，规则见 §12。
 
 必须同时满足：
 
@@ -120,7 +120,7 @@ Server Web 管理 invoke：`preview_share_value_quota`、`get_share_value_quota_
 
 指标 `share_value_quota_rejections_total{reason=exhausted|busy|price_unavailable|quota_unavailable}`。准入错误为类型化 `ValueQuotaRejection`，映射方 downcast，不再匹配字符串。
 
-金额校准独立于 Token `usageRebase/userUsageEdits`：set/clear 带 config CAS、grant revision、window、幂等 operationId、actor 和审计理由。**不再要求精确 `expectedWatermark`**（任何请求都会推进水位，Owner 永远无法保存）；改为在应用时校验 target ≥ 已观测量，字段保留并写入审计。批量同一事务全成或全败；活跃市场 grant 只读。
+金额校准独立于 Token `usageRebase/userUsageEdits`：set/clear 带 config CAS、grant revision、window、幂等 operationId、actor 和审计理由。**不再要求精确 `expectedWatermark`**（任何请求都会推进水位，Owner 永远无法保存）；改为在应用时校验 target ≥ 已观测量，字段保留并写入审计。批量同一事务全成或全败；活跃市场 grant（含 USD 席位）只读，不提供人工校准。
 
 **对账 = 对某窗口执行 `set`**，同一事务内：(1) 把该窗口中开始时间早于清扫器同一陈旧阈值（max(进程启动, now − (最长请求超时 + 5 分钟))）仍 pending（含旧 unavailable）的 attempt 按“结果未知”结算，更年轻的 pending 行可能仍在进行，保持原样（其预占照常计入）；(2) 从 attempt／gap 行重建该 scope 的全部日检查点；(3) 若阻断记录带有 Router 水位（Router ACK 领先），先把全局水位计数器 `value_quota_watermark_v1` 抬到至少该值，使本次调整记录的水位为 Router 水位 + 1 以上，下一次同步领先而不会再次阻断；(4) 清除该 scope/window 的阻断、旧的 scope 级阻断和旧全局标记；审计记录写明处理数量与 Router 水位。提交后再清除该 scope 的恢复 fence（文件，幂等）。
 
@@ -178,3 +178,22 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 对应上文 §2–§6：旧 Router 的 `knownRevision` 400 回退、descriptor 409 `value_pricing_ack_missing` 的 ACK 恢复（单次重试）、Router 水位领先后的 `set` 越过水位、移除旧 degraded 标记、重试前同步结算与预发上游错误免费重试、清扫器逐行 savepoint／读写事务分离／pending 优先、`meteringStatus` 只在非 USD 生效时报 scheduled、校准错误码与编辑响应错误行、保活 45 秒、未来价目先安装并 ACK、用量日志只结算匹配 attempt、`set` 使用清扫器陈旧阈值、证明为空的自然周期立即生效。schema 与迁移校验和未改动。本轮只运行 `cargo check`／`cargo clippy`／格式检查，新增和修改的测试未运行。
 
+## 12. Share Market USD 席位（托管授权）
+
+Router 托管授权（`manager=routerShareMarket`）的 managed upsert 可携带 `policy.valueQuota`，与 `tokenLimit` 互斥，在任意市场阶段（`trial`、`paid` 或无阶段的免费席位）都可接受；`accountReset` 仍被拒绝。新试用预算跟随席位单位：USD 字段 `trialValueLimitUsdMicros`／`trialValueAllowanceUsdMicros` 与 Token 字段互斥；旧冻结 Token 试用仍按原规则。试用预算与席位自身的周期额度同时执行，详见 [试用协议](market-trials.md)。
+
+计量按合同（`entitlementId`）隔离，Market ledger scope 为 (Router, installation, Share, email, entitlementId)；普通授权不序列化 entitlementId，旧账本键保持不变：
+
+- 合同第一次以 USD 策略应用时新建 binding：`valueMeteredFromMs = effectiveFromMs = 应用时刻`，`begin_coverage(now)`。同一 email 此前的合同或普通授权在同一窗口的用量因 entitlement scope 被隔离，同毫秒和迟到结算也不会串账。托管授权**从不**排期（`pendingValueQuota`），不使用“零请求”窗口证明，也不把 coverage 回拨到窗口起点。
+- 同一 entitlement 之后的 upsert（trial → paid、计费暂停 revoke 后恢复、App 范围升级、完整性修复重发）沿用原 binding（计量起点与 epoch 不变），只刷新 `pricingRevision`；只有金额、`tokenPeriod` 或 anchor 变化时才生成新的 `quotaPolicyEpoch`。sevenDays／thirtyDays 在付费 upsert 时重新物化 anchor，窗口随之从付费开始重算；自然周期中试用期用量计入同一窗口，与 Token 模式一致。不同 entitlement（即使同一 email）一律新建 binding。
+- 新建或策略变化需要与普通 USD 策略相同的门槛（Router v10＋`usdEquivalentQuotaV1`、SQLite authority 已提交、已启用绑定全部通过文本计量运行面、已激活价目）。不满足时 managed 操作失败（`VALUE_QUOTA_UNSUPPORTED_PROVIDER_SURFACE`／`VALUE_QUOTA_ROUTER_UPGRADE_OR_COMMITTED_STORAGE_REQUIRED`／`VALUE_QUOTA_SNAPSHOT_UNAVAILABLE`），Router 拉取路径与 `/_ctl/apply_share_settings` 都经由同一 ShareStore 提交（`prepare_value_bindings_with_context`），因此活动的托管 USD 授权不会无 binding 落盘。已绑定授权的后台重新准备失败只记 warn，不中止整个 ShareStore。
+
+准入（`admit_share_value_text`）、状态行与水位同步对托管授权与普通授权一视同仁；有效并发仍为 min(`parallelLimit`, 4)。用量校准（`edit_share_value_quota_usage`、`/_ctl/edit_value_usage`）对托管授权返回 400 `quota_target_invalid`；普通预览中的托管用户行仍为 `invalid_policy`（只读）。
+
+能力声明：预览 `checks[]` 末尾固定包含 `{"code":"market_seat_quota","ready":true}` 和 `{"code":"market_trial_value","ready":true}`，分别表示本构建支持 USD 席位和一次性 USD 试用。它们始终 ready，不影响 `capabilityReady`／`reasonCode`；Router 缺失相应声明时禁止 USD 席位／新的正金额 USD 试用。Server Web 只列出失败的检查，因此这两项不显示；托管授权行与普通 USD 授权一样显示美元额度与周期，但不可校准。
+
+一次性试用在周期 admission 的同一事务内附加合同／scope 预算检查，在途预占一并扣除；试用索引保留跨合同金额，且每次终态结算原子保存最高试用金额，保证“先保守结算、后真实下修”及崩溃／压缩也不重新开放免费预算。正常周期 meter 仍按最新真实金额；动态 `trialValueUsedPicos` 使用最高值镜像，与 Token 共用 `usageRevision`。缺持久化 Market request receipt 或更换 entitlement 的竞态拒绝发网。
+
+Router 的“本期 API 等值／实际折扣”是 Router 保留日志与窗口末端目录价格的展示估算，不是该账本的权威额度，不改变任何钱包和 Provider 结算。标称折扣按 30 天满额折算，Token／lifetime／免费席位不推算。
+
+本节只做 `cargo check`／格式检查，新增测试未运行。
