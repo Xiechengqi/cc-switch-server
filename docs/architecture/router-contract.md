@@ -16,6 +16,7 @@
 | `/_ctl/*` 控制面端点 | `src/api/control/ctl.rs` |
 | `/_share-router/*` 探针 | `src/api/control/share_router.rs` |
 | Share 契约不变量与退役字段 | `src/domain/sharing/router_contract.rs`、`retired_fields.rs` |
+| Share 市场最终撤权与消费回执 | `src/repository/server_sqlite/market_termination.rs`；[权威说明](../share/market-termination.md) |
 | 客户端子域申领与隧道供给编排 | `src/client_tunnel_provision.rs` |
 
 协议纪元常量：`PROTOCOL_EPOCH = "namespace-flat-1"`（`src/clients/router/ingress.rs`）。

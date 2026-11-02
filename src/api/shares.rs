@@ -607,6 +607,10 @@ pub(in crate::api) async fn remove_share_binding(
             Err(crate::state::ConditionalShareDeleteError::InFlight) => {
                 return Err(share_in_flight_error());
             }
+            Err(crate::state::ConditionalShareDeleteError::MarketSettlementPending) => {
+                return Err(ApiError::conflict_code("cc_switch_share_market_settlement_pending",
+                    "End active Market rentals and wait for their final revoke acknowledgments before deleting this Share"));
+            }
         };
         crate::state::stop_share_tunnel(&state, &id).await;
         spawn_share_delete_sync(state.clone(), tombstone);
@@ -941,6 +945,9 @@ pub(in crate::api) async fn delete_share(
         .map_err(ApiError::internal)?
         .map_err(|error| match error {
             crate::state::ShareDeleteError::InFlight => share_in_flight_error(),
+            crate::state::ShareDeleteError::MarketSettlementPending => ApiError::conflict_code(
+                "cc_switch_share_market_settlement_pending",
+                "End active Market rentals and wait for their final revoke acknowledgments before deleting this Share"),
         })?;
     if let Some(tombstone) = tombstone.as_ref() {
         crate::state::stop_share_tunnel(&state, &id).await;

@@ -72,6 +72,8 @@ jobs:
           cargo test domain::providers::registry::tests --lib
           cargo test amazon_q --lib
           cargo test web_session --lib
+          cargo test --locked market_termination --lib
+          cargo test --locked repository::server_sqlite::schema::tests --lib
 
   # The committed web-dist can lag web-src. Generate release assets once and
   # pass exactly those bytes to both architecture builds.

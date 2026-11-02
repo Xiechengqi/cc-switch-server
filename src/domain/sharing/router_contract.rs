@@ -192,6 +192,8 @@ pub enum ShareManagedGrantAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareManagedGrantOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<super::market_termination_contract::TerminationFence>,
     pub operation_id: String,
     pub entitlement_id: String,
     pub share_sequence: i64,
@@ -552,6 +554,8 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareDescriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_archive_since_ms: Option<i64>,
     pub contract_version: u16,
     pub share_id: String,
     #[serde(default)]
@@ -1331,6 +1335,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         }
     }
     ShareDescriptor {
+        termination_archive_since_ms: None,
         contract_version: if user_grants
             .values()
             .any(|g| g.value_metering.is_some() || g.policy.value_quota.is_some())
@@ -3607,6 +3612,7 @@ mod tests {
             user_grants: BTreeMap::new(),
             market_entitlements: BTreeMap::new(),
             market_requests: BTreeMap::new(),
+            pending_market_termination_acks: BTreeMap::new(),
             market_compacted_usage: BTreeMap::new(),
             market_receipts_before_ms: 0,
         }

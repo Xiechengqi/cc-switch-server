@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=3).contains(&version),
+    anyhow::ensure!((1..=4).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -168,6 +168,37 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         checksum == value_checksum,
         "Server SQLite v3 migration checksum mismatch"
     );
+    let termination_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!(
+            "market_termination_schema.sql"
+        )))
+    );
+    if version < 4 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("market_termination_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(4,'market_termination_evidence',0,?1)",
+                [&termination_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=4; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v4 Market settlement")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=4",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == termination_checksum,
+        "Server SQLite v4 migration checksum mismatch"
+    );
     Ok(())
 }
 
@@ -179,7 +210,8 @@ mod tests {
     fn quota_v1_migration_is_idempotent_and_preserves_original_checksum() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
+        connection.execute_batch("DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
+            DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
             DROP TABLE value_quota_checkpoints;
             DROP TABLE value_quota_adjustments; DROP TABLE value_quota_gaps; DROP TABLE value_quota_coverage; DROP TABLE value_pricing_snapshots;
             DELETE FROM meta WHERE key='value_quota_watermark_v1';
@@ -196,14 +228,14 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             connection
@@ -218,7 +250,7 @@ mod tests {
     fn quota_higher_schema_or_changed_migration_is_never_downgraded() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("PRAGMA user_version=5;").unwrap();
         assert!(migrate_to_current(&connection)
             .unwrap_err()
             .to_string()
@@ -227,7 +259,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         connection.execute_batch("PRAGMA user_version=2; UPDATE schema_migrations SET checksum='modified' WHERE version=1;").unwrap();
         assert!(migrate_to_current(&connection).is_err());

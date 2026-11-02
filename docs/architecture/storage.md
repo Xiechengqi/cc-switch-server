@@ -131,13 +131,15 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 
 ### 7.1 SQLite schema 与不变量
 
-实现见 `src/repository/server_sqlite.rs`，当前schema version为2；保留v1 checksum并以独立迁移新增：
+实现见 `src/repository/server_sqlite.rs`，当前 schema version 为 4；保留旧 checksum 并以独立迁移新增：
 
 - `providers` 主键为 `(app, provider_id)`，保留 revision、credential generation 和原始 S2 密文 record；
 - `accounts` 主键为 `(provider_type, account_id)`，保留 auth identity/token refresh generation 和原始字段级密文；
 - `provider_accounts`、`shares`、`share_bindings` 使用 foreign key 校验 Provider/Account/Share 图；
 - `usage_records` 以 request id 为主键，按创建时间和 Share 建索引，payload 保留未知扩展字段；
 - `quota_usage_entries` 按request/revision保存精简账项、唯一watermark、来源/用户/开始毫秒索引与payload SHA256；metadata digest及完整水位连续性另校验，详情replace不删除精简账；
+- v3 `value_quota_*` 保存 USD 等值额度的执行价目快照、请求预占及尝试结算；这是使用限额账本，不是平台资金；
+- v4 `market_settlement_requests/market_settlement_receipts` 保存原市场 entitlement 的完整 admission／最终消费证据和不可变撤权回执，独立于展示日志保留；`market_settlement_ack_outbox` 在网络确认与 Share 标记持久化之间提供崩溃重试。真实归档起点及升级／ACK 规则见 [Share 市场退租](../share/market-termination.md)；
 - `legacy_blobs` 保存原始加密 JSON/JSONL 字节，供一个发布窗口内精确 DB→legacy 回滚；`accounts.key` **不进入 SQLite**，回滚仍必须同时持有数据目录根密钥。
 
 所有时间写入 SQLite 时使用 Unix 毫秒并限制在 signed 64-bit 范围。所有 generation
@@ -145,7 +147,7 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 WAL、`synchronous=FULL`、5 秒 busy timeout 和 1000 page auto-checkpoint；这些参数是
 schema v1 的明确崩溃合同，后续只能凭故障/性能数据修改。
 
-v1→v2在单事务提交后原子补marker；数据库已v2而marker仍v1时按authority幂等恢复，不重新导入旧JSON。未知更高schema拒绝。写入v2或accountReset后不可直接换旧binary；回退必须保留新reader/账本，旧schema迁回须另设计离线迁移。
+各版本迁移事务提交后原子补 marker；数据库已升级而 marker 仍是旧版本时按 authority 幂等恢复，不重新导入旧 JSON。未知更高 schema 拒绝。写入新 schema 后不可直接换旧 binary；回退必须保留新 reader／账本，旧 schema 迁回须另设计离线迁移。
 
 ### 7.2 Shadow import、切换与验证
 

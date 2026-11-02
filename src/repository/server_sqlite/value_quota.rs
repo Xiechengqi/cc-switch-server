@@ -2150,7 +2150,7 @@ pub(crate) fn settled_request_picos(
     }
     settled_request_picos_in(&open_database(&database_path(config_dir), true)?, requests)
 }
-fn settled_request_picos_in(
+pub(super) fn settled_request_picos_in(
     conn: &Connection,
     requests: &[SettledRequest<'_>],
 ) -> anyhow::Result<BTreeMap<String, i128>> {

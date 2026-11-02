@@ -778,11 +778,13 @@ pub(crate) enum ConditionalShareDeleteError {
     NotFound,
     RevisionConflict { current_revision: u64 },
     InFlight,
+    MarketSettlementPending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShareDeleteError {
     InFlight,
+    MarketSettlementPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -982,7 +984,12 @@ impl DeviceFlowPrincipalStore {
     }
 }
 
-type CachedRouterShareCapabilities = (String, String, std::time::Instant, (bool, bool, bool, bool));
+type CachedRouterShareCapabilities = (
+    String,
+    String,
+    std::time::Instant,
+    (bool, bool, bool, bool, bool),
+);
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -18919,6 +18926,7 @@ impl ServerStateInner {
                         capability.market_trials(),
                         capability.value_quotas(),
                         capability.cache_creation_ttl(),
+                        capability.share_termination(),
                     ),
                 )
             });
@@ -18937,6 +18945,21 @@ impl ServerStateInner {
                     && config
                         .registered_router_identity()
                         .is_some_and(|identity| identity.installation_id == *installation)
+            })
+    }
+
+    pub(crate) async fn router_supports_share_termination(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, c)| {
+                c.4 && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
             })
     }
 
@@ -19519,6 +19542,12 @@ impl ServerStateInner {
             if store.get(share_id).is_some() && self.share_in_flight.has_in_flight(share_id) {
                 return Err(ShareDeleteError::InFlight);
             }
+            if store
+                .get(share_id)
+                .is_some_and(share_market_deletion_blocked)
+            {
+                return Err(ShareDeleteError::MarketSettlementPending);
+            }
             Ok(match router_target.as_ref() {
                 Some((router_api_base, installation_id)) => {
                     store.delete_for_router_target(share_id, router_api_base, installation_id)
@@ -19555,6 +19584,9 @@ impl ServerStateInner {
             }
             if self.share_in_flight.has_in_flight(share_id) {
                 return Err(ConditionalShareDeleteError::InFlight);
+            }
+            if share_market_deletion_blocked(current) {
+                return Err(ConditionalShareDeleteError::MarketSettlementPending);
             }
             Ok(match router_target.as_ref() {
                 Some((router_api_base, installation_id)) => store
@@ -20991,6 +21023,12 @@ pub(crate) async fn authoritative_share_descriptor(
             Some(&usage),
         );
         let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+        descriptor.termination_archive_since_ms = if state.router_supports_share_termination().await
+        {
+            crate::repository::server_sqlite::market_termination::archive_since(&state.config_dir)?
+        } else {
+            None
+        };
         let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
         let account_reset_supported = state.router_supports_account_reset().await;
         anyhow::ensure!(
@@ -21150,6 +21188,8 @@ async fn pull_and_apply_pending_share_edits_locked(state: &ServerState) -> Share
             ..ShareEditSyncSummary::default()
         };
     }
+    let mut summary = ShareEditSyncSummary::default();
+    replay_share_termination_acks(state, &config, &mut summary).await;
     let share_ids = {
         let shares = state.shares.read().await;
         shares
@@ -21159,27 +21199,96 @@ async fn pull_and_apply_pending_share_edits_locked(state: &ServerState) -> Share
             .collect::<Vec<_>>()
     };
     if share_ids.is_empty() {
-        return ShareEditSyncSummary::default();
+        return summary;
     }
     let http_client = state.http_client().await;
     let edits = match client::pending_share_edits(&http_client, &config, share_ids).await {
         Ok(edits) => edits,
         Err(error) => {
             record_share_edit_sync_error(state, error.to_string()).await;
-            return ShareEditSyncSummary {
-                error: Some(error.to_string()),
-                ..ShareEditSyncSummary::default()
-            };
+            summary.error = Some(error.to_string());
+            return summary;
         }
     };
-    let mut summary = ShareEditSyncSummary {
-        pulled: edits.len(),
-        ..ShareEditSyncSummary::default()
-    };
+    summary.pulled = edits.len();
     for edit in edits {
         apply_and_ack_share_edit(state, &config, edit, &mut summary).await;
     }
     summary
+}
+
+/// Recovery must not depend on the edit still appearing in pending-edits.
+/// The Router can commit an ACK whose HTTP response never reaches us.
+async fn replay_share_termination_acks(
+    state: &ServerState,
+    config: &ServerConfig,
+    summary: &mut ShareEditSyncSummary,
+) {
+    use crate::repository::server_sqlite::market_termination as settlement;
+    let Some(base) = config.router_api_base() else {
+        return;
+    };
+    let Some(identity) = config.registered_router_identity() else {
+        return;
+    };
+    let rows = match settlement::pending_acks(&state.config_dir, base, &identity.installation_id) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "reading durable Share termination ACKs failed");
+            summary.ack_failed += 1;
+            return;
+        }
+    };
+    let http_client = state.http_client().await;
+    for row in rows {
+        let result = async {
+            settlement::touch_ack(&state.config_dir, &row.operation_id)?;
+            let ack: ShareEditAckPayload = serde_json::from_value(row.payload)?;
+            anyhow::ensure!(
+                ack.status == "applied"
+                    && ack
+                        .termination_receipt
+                        .as_ref()
+                        .is_some_and(|r| r.operation_id == row.operation_id
+                            && r.termination_id == row.termination_id),
+                "durable Share termination ACK identity mismatch"
+            );
+            client::ack_share_edit(&http_client, config, ack).await?;
+            complete_share_termination_ack(state, &row.operation_id, &row.termination_id).await
+        }
+        .await;
+        match result {
+            Ok(()) => summary.acked += 1,
+            Err(error) => {
+                summary.ack_failed += 1;
+                tracing::warn!(operation_id=%row.operation_id,%error,"durable Share termination ACK deferred");
+            }
+        }
+    }
+}
+
+async fn complete_share_termination_ack(
+    state: &ServerState,
+    operation_id: &str,
+    termination_id: &str,
+) -> anyhow::Result<()> {
+    state
+        .mutate_shares_immediate(|shares| {
+            for share in &mut shares.shares {
+                share.pending_market_termination_acks.remove(operation_id);
+                share
+                    .pending_market_termination_acks
+                    .retain(|_, id| id != termination_id);
+            }
+            shares.forget_router_control_operation(operation_id)
+        })
+        .await?;
+    // Delete the outbox entry last. A crash at any earlier point safely
+    // replays the same ACK instead of leaving a permanent deletion barrier.
+    crate::repository::server_sqlite::market_termination::delete_ack(
+        &state.config_dir,
+        operation_id,
+    )
 }
 
 async fn apply_and_ack_share_edit(
@@ -21188,7 +21297,32 @@ async fn apply_and_ack_share_edit(
     edit: ShareEditView,
     summary: &mut ShareEditSyncSummary,
 ) {
-    let apply_result = apply_share_edit_locally(state, &edit).await;
+    let mut termination_receipt = None;
+    let apply_result = match apply_share_edit_locally(state, &edit).await {
+        Ok(result) => {
+            if let Some(op) = edit
+                .patch
+                .managed_grant
+                .as_ref()
+                .filter(|op| op.termination.is_some())
+            {
+                match crate::repository::server_sqlite::market_termination::receipt(
+                    &state.config_dir,
+                    &edit.share_id,
+                    op,
+                ) {
+                    Ok(receipt) => {
+                        termination_receipt = Some(receipt);
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(result)
+            }
+        }
+        Err(error) => Err(error),
+    };
     let (
         ack_status,
         ack_error,
@@ -21238,7 +21372,7 @@ async fn apply_and_ack_share_edit(
         Err(error) => {
             summary.rejected += 1;
             let message = error.to_string();
-            let (error_code, retryable, current_config_revision) = error
+            let (mut error_code, mut retryable, current_config_revision) = error
                 .downcast_ref::<crate::domain::sharing::shares::SharePatchError>()
                 .map(|error| {
                     let current_config_revision = match error {
@@ -21255,6 +21389,10 @@ async fn apply_and_ack_share_edit(
                     )
                 })
                 .unwrap_or((None, None, None));
+            if message.contains("MARKET_TERMINATION_PENDING") {
+                error_code = Some("market_termination_pending".into());
+                retryable = Some(true);
+            }
             let current_share = if current_config_revision.is_some() {
                 match authoritative_share_descriptor(state, &edit.share_id).await {
                     Ok(descriptor) => Some(descriptor),
@@ -21287,7 +21425,9 @@ async fn apply_and_ack_share_edit(
             )
         }
     };
+    let applied_ack = ack_status == "applied";
     let ack = ShareEditAckPayload {
+        termination_receipt,
         settings_receipt: match edit.patch.edit_context.as_ref() {
             Some(context) => state
                 .shares
@@ -21309,14 +21449,50 @@ async fn apply_and_ack_share_edit(
         applied_at_ms,
         effective_policy,
     };
+    let durable_ack = ack
+        .termination_receipt
+        .as_ref()
+        .filter(|_| applied_ack)
+        .map(|r| (r.operation_id.clone(), r.termination_id.clone()));
+    if durable_ack.is_some() {
+        let prepared = (|| -> anyhow::Result<()> {
+            let base = config
+                .router_api_base()
+                .ok_or_else(|| anyhow::anyhow!("Router is not configured"))?;
+            let identity = config
+                .registered_router_identity()
+                .ok_or_else(|| anyhow::anyhow!("installation is not registered"))?;
+            crate::repository::server_sqlite::market_termination::enqueue_ack(
+                &state.config_dir,
+                base,
+                &identity.installation_id,
+                &edit.share_id,
+                &serde_json::to_value(&ack)?,
+            )
+        })();
+        if let Err(error) = prepared {
+            summary.ack_failed += 1;
+            tracing::warn!(edit_id=%edit.id,%error,"persisting final Share termination ACK failed");
+            return;
+        }
+    }
     let http_client = state.http_client().await;
     match client::ack_share_edit(&http_client, config, ack).await {
         Ok(()) => {
             summary.acked += 1;
+            if let Some((operation_id, termination_id)) = durable_ack {
+                if let Err(error) =
+                    complete_share_termination_ack(state, &operation_id, &termination_id).await
+                {
+                    tracing::warn!(edit_id=%edit.id,%error,"Share termination ACK cleanup deferred to durable retry");
+                }
+                return;
+            }
             if let Some(operation_id) = edit
                 .patch
                 .managed_grant
                 .as_ref()
+                .filter(|op| applied_ack || op.termination.is_none())
                 .map(|operation| operation.operation_id.clone())
             {
                 if let Err(error) = state
@@ -21343,6 +21519,16 @@ async fn apply_and_ack_share_edit(
             );
         }
     }
+}
+
+fn share_market_deletion_blocked(share: &crate::domain::sharing::shares::Share) -> bool {
+    !share.pending_market_termination_acks.is_empty()
+        || share.market_entitlements.values().any(|e| e.active)
+        || share.user_grants.values().any(|g| {
+            g.active
+                && g.manager
+                    == crate::domain::sharing::router_contract::ShareGrantManager::RouterShareMarket
+        })
 }
 
 async fn apply_share_edit_locally(
@@ -22062,6 +22248,11 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let account_reset_supported = state.router_supports_account_reset().await;
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
+        let termination_archive_since_ms = if state.router_supports_share_termination().await {
+            crate::repository::server_sqlite::market_termination::archive_since(&state.config_dir)?
+        } else {
+            None
+        };
         let shares = state
             .shares
             .read()
@@ -22117,6 +22308,9 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                     Some(&usage),
                 );
                 let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
+                // Publish the durable archive on normal sync too, not only
+                // on explicit authoritative reads. Omit it for old Routers.
+                descriptor.termination_archive_since_ms = termination_archive_since_ms;
                 let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
                 // v8 read-only capabilities also describe ordinary users, so
                 // a ready source can offer an explicit migration. These
@@ -35342,6 +35536,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_market_termination_blocks_deletion_until_the_successful_ack_is_persisted() {
+        let state = test_state();
+        let share = state
+            .mutate_shares_immediate(|store| {
+                let share = store
+                    .upsert(router_sync_share_input(
+                        "settlementdelete",
+                        "provider-settlement",
+                    ))
+                    .unwrap();
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == share.id)
+                    .unwrap()
+                    .pending_market_termination_acks
+                    .insert("operation".into(), "termination".into());
+                share
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state.delete_share_immediate(&share.id).await.unwrap(),
+            Err(ShareDeleteError::MarketSettlementPending)
+        );
+        assert_eq!(
+            state
+                .delete_share_immediate_at_revision(&share.id, share.config_revision)
+                .await
+                .unwrap(),
+            Err(ConditionalShareDeleteError::MarketSettlementPending)
+        );
+        state
+            .mutate_shares_immediate(|store| {
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == share.id)
+                    .unwrap()
+                    .pending_market_termination_acks
+                    .clear();
+            })
+            .await
+            .unwrap();
+        assert!(state
+            .delete_share_immediate(&share.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn share_delete_is_blocked_until_in_flight_accounting_finishes() {
         let state = test_state();
         let share = state
@@ -36613,6 +36860,7 @@ mod tests {
             user_grants: std::collections::BTreeMap::new(),
             market_entitlements: Default::default(),
             market_requests: Default::default(),
+            pending_market_termination_acks: Default::default(),
             market_compacted_usage: Default::default(),
             market_receipts_before_ms: 0,
         }

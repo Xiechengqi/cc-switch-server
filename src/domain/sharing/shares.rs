@@ -762,6 +762,10 @@ pub struct Share {
     pub market_entitlements: BTreeMap<String, super::router_contract::ShareMarketEntitlement>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub market_requests: BTreeMap<String, super::market_trials::MarketRequestReceipt>,
+    /// A final revoke ACK must reach the Router before deletion can remove
+    /// the original Share needed to replay that exact operation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_market_termination_acks: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub market_compacted_usage: BTreeMap<String, super::market_trials::CompactedUsage>,
     #[serde(default)]
@@ -1302,6 +1306,10 @@ impl ShareStore {
             market_requests: self
                 .get(&share_id)
                 .map(|s| s.market_requests.clone())
+                .unwrap_or_default(),
+            pending_market_termination_acks: self
+                .get(&share_id)
+                .map(|s| s.pending_market_termination_acks.clone())
                 .unwrap_or_default(),
             market_compacted_usage: self
                 .get(&share_id)
@@ -4209,6 +4217,19 @@ fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
 fn validate_managed_grant_operation(
     operation: &ShareManagedGrantOperation,
 ) -> Result<(), SharePatchError> {
+    if let Some(t) = operation.termination.as_ref() {
+        if operation.action != ShareManagedGrantAction::Revoke
+            || t.termination_id.is_empty()
+            || t.termination_id.len() > 128
+            || t.period_start_ms < 0
+            || t.period_start_ms > t.cutoff_at_ms
+            || t.cutoff_at_ms > t.period_end_ms
+        {
+            return Err(SharePatchError::Invalid(
+                "invalid Market termination fence".into(),
+            ));
+        }
+    }
     if operation.operation_id.trim().is_empty() || operation.operation_id.len() > 128 {
         return Err(SharePatchError::Invalid(
             "managed grant operationId must contain 1-128 characters".to_string(),
@@ -4532,6 +4553,11 @@ fn apply_managed_grant_operation(
             super::market_trials::project(share);
         }
         ShareManagedGrantAction::Revoke => {
+            if let Some(fence) = &operation.termination {
+                share
+                    .pending_market_termination_acks
+                    .insert(operation.operation_id.clone(), fence.termination_id.clone());
+            }
             if let Some(state) = share.market_entitlements.get_mut(&operation.entitlement_id) {
                 state.active = false;
             }
@@ -4766,6 +4792,7 @@ mod tests {
         email: &str,
     ) -> ShareManagedGrantOperation {
         ShareManagedGrantOperation {
+            termination: None,
             operation_id: operation_id.to_string(),
             entitlement_id: entitlement_id.to_string(),
             share_sequence: 1,
@@ -4789,6 +4816,59 @@ mod tests {
             trial_value_allowance_usd_micros: None,
             trial_value_limit_usd_micros: None,
         }
+    }
+
+    #[test]
+    fn market_termination_pending_revoke_replays_the_original_fingerprint_and_marker() {
+        let mut store = ShareStore::default();
+        let share = store.upsert(codex_share_input("termination")).unwrap();
+        let mut operation = managed_operation(
+            "termination-revoke",
+            "entitlement",
+            share.config_revision,
+            ShareManagedGrantAction::Revoke,
+            "renter@example.com",
+        );
+        operation.termination = Some(
+            super::super::market_termination_contract::TerminationFence {
+                termination_id: "termination".into(),
+                cutoff_at_ms: 2,
+                period_start_ms: 1,
+                period_end_ms: 3,
+                policy: ShareUserPolicy::default(),
+            },
+        );
+        let patch = |op| ShareSettingsPatch {
+            managed_grant: Some(op),
+            ..Default::default()
+        };
+        let first = store
+            .apply_settings_patch(&share.id, patch(operation.clone()))
+            .unwrap();
+        let replay = store
+            .apply_settings_patch(&share.id, patch(operation.clone()))
+            .unwrap();
+        assert_eq!(
+            replay.config_revision, first.config_revision,
+            "revoke is not applied twice while usage drains"
+        );
+        assert_eq!(
+            replay
+                .pending_market_termination_acks
+                .get("termination-revoke")
+                .map(String::as_str),
+            Some("termination")
+        );
+        assert!(store
+            .applied_router_control_operations
+            .contains_key("termination-revoke"));
+        operation.termination.as_mut().unwrap().cutoff_at_ms = 3;
+        assert!(
+            store
+                .apply_settings_patch(&share.id, patch(operation))
+                .is_err(),
+            "same operation cannot change its frozen cutoff"
+        );
     }
 
     #[test]
@@ -8946,6 +9026,7 @@ mod tests {
             router_synced_descriptor_fingerprint: None,
             market_entitlements: BTreeMap::new(),
             market_requests: BTreeMap::new(),
+            pending_market_termination_acks: BTreeMap::new(),
             market_compacted_usage: BTreeMap::new(),
             market_receipts_before_ms: 0,
             user_grants: BTreeMap::from([(

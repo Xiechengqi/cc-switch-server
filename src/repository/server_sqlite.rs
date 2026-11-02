@@ -23,6 +23,7 @@ use crate::domain::providers::store::{providers_path, ProviderStore};
 use crate::domain::sharing::shares::{shares_path, ShareStore};
 use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
 
+pub(crate) mod market_termination;
 mod payload;
 mod quota;
 mod schema;
@@ -39,7 +40,7 @@ use wal::validate_wal_if_present;
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
 pub(crate) const ACTIVATION_REQUEST_FILE_NAME: &str = "server-store-activation-request.json";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1075,6 +1076,7 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
     upsert_usage_row(&transaction, log)?;
     quota::upsert_log(&transaction, log)?;
     let value_degraded = value_quota::settle_usage_log_isolated(&transaction, log)?;
+    market_termination::finalize_log_in(&transaction, log)?;
     bump_repository_generation(&transaction)?;
     transaction.commit().context("commit Usage SQLite UPSERT")?;
     observation.succeed();
@@ -1461,6 +1463,7 @@ fn import_share_rows(
     shares: &ShareStore,
     payloads: &BTreeMap<String, Value>,
 ) -> anyhow::Result<()> {
+    market_termination::archive_in(transaction, shares)?;
     for share in &shares.shares {
         let payload = payloads
             .get(&share.id)

@@ -933,6 +933,7 @@ mod tests {
             user_grants: BTreeMap::new(),
             market_entitlements: BTreeMap::new(),
             market_requests: BTreeMap::new(),
+            pending_market_termination_acks: BTreeMap::new(),
             market_compacted_usage: BTreeMap::new(),
             market_receipts_before_ms: 0,
         }

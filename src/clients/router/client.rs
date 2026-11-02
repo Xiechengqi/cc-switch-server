@@ -601,6 +601,9 @@ pub struct SharePendingEditsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ShareEditAckPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_receipt:
+        Option<crate::domain::sharing::market_termination_contract::TerminationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_receipt: Option<crate::domain::sharing::router_contract::ShareSettingsReceipt>,
     pub edit_id: String,
     pub revision: i64,
@@ -969,6 +972,9 @@ pub struct RouterShareCapabilities {
 }
 
 impl RouterShareCapabilities {
+    pub fn share_termination(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "shareTerminationV1")
+    }
     pub fn cache_creation_ttl(&self) -> bool {
         self.capabilities.iter().any(|c| c == "cacheCreationTtlV1")
     }
@@ -3282,6 +3288,7 @@ mod tests {
         let descriptor = canonicalize_share_descriptor(
             &config,
             ShareDescriptor {
+                termination_archive_since_ms: None,
                 subdomain: "codex-pro".to_string(),
                 ..ShareDescriptor::default()
             },
@@ -3292,6 +3299,7 @@ mod tests {
         let canonical = canonicalize_share_descriptor(
             &config,
             ShareDescriptor {
+                termination_archive_since_ms: None,
                 subdomain: "codex-pro--client-alpha".to_string(),
                 ..ShareDescriptor::default()
             },
@@ -3302,6 +3310,7 @@ mod tests {
         let error = canonicalize_share_descriptor(
             &config,
             ShareDescriptor {
+                termination_archive_since_ms: None,
                 subdomain: "codex-pro--client-beta".to_string(),
                 ..ShareDescriptor::default()
             },
@@ -3362,6 +3371,7 @@ mod tests {
             ShareSyncOperation {
                 kind: "upsert".to_string(),
                 share: Some(ShareDescriptor {
+                    termination_archive_since_ms: None,
                     subdomain: "claude-pro".to_string(),
                     ..ShareDescriptor::default()
                 }),
@@ -3434,6 +3444,7 @@ mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-42".to_string(),
                 revision: 7,
@@ -3468,6 +3479,7 @@ mod tests {
     fn revision_conflict_ack_includes_authoritative_share_snapshot() {
         let payload = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-conflict".into(),
                 revision: 8,
@@ -3479,6 +3491,7 @@ mod tests {
                 retryable: Some(true),
                 current_config_revision: Some(4),
                 current_share: Some(ShareDescriptor {
+                    termination_archive_since_ms: None,
                     share_id: "share-conflict".into(),
                     config_revision: 4,
                     ..ShareDescriptor::default()
@@ -4426,6 +4439,7 @@ mod tests {
             kind: "upsert".into(),
             share_id: None,
             share: Some(ShareDescriptor {
+                termination_archive_since_ms: None,
                 share_id: "share-descriptor-fallback".into(),
                 capacity_pool_id: "cp-descriptor-fallback".into(),
                 share_name: "Descriptor fallback".into(),
@@ -4872,6 +4886,7 @@ mod tests {
             kind: "upsert".into(),
             share_id: None,
             share: Some(ShareDescriptor {
+                termination_archive_since_ms: None,
                 contract_version: SHARE_CONTRACT_VERSION,
                 share_id: "share-raw-ops".into(),
                 share_name: "Raw operations".into(),
@@ -4926,6 +4941,7 @@ mod tests {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-raw-namespace-lease".into();
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-raw-namespace-lease".into(),
             share_name: "Raw namespace lease".into(),
@@ -4989,6 +5005,7 @@ mod tests {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-claim-v2".into();
         let share = ShareDescriptor {
+            termination_archive_since_ms: None,
             contract_version: SHARE_CONTRACT_VERSION,
             share_id: "share-claim-v2".into(),
             share_name: "Claim v2".into(),
@@ -5051,6 +5068,7 @@ mod tests {
     #[test]
     fn share_edit_ack_envelope_reuses_the_exact_raw_ack() {
         let ack = ShareEditAckPayload {
+            termination_receipt: None,
             settings_receipt: None,
             edit_id: "edit-raw-ack".into(),
             revision: 7,
@@ -5060,6 +5078,7 @@ mod tests {
             retryable: Some(true),
             current_config_revision: Some(2),
             current_share: Some(ShareDescriptor {
+                termination_archive_since_ms: None,
                 contract_version: SHARE_CONTRACT_VERSION,
                 share_id: "share-raw-ack".into(),
                 share_name: "Raw ACK".into(),
