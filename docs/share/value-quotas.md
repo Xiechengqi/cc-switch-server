@@ -12,6 +12,7 @@
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
 3. Router 从模型价格（LiteLLM 派生价 + 模型价格表中的管理员定价）自动派生并发布执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。
 4. Share 所有绑定必须通过同一个 profile／driver 能力函数。允许 `claude.anthropic_api_key` 或 `claude.custom_http` + `http.anthropic_messages`；`codex.openai_api_key` 或 `codex.custom_http` + `http.openai_responses`；`codex.custom_http` + `http.openai_chat`；`gemini.google_api_key` 或 `gemini.custom_http` + `http.gemini_native`。generic 文本转发面支持 Messages、Chat Completions、Responses、Gemini。未列出的自定义协议组合、Web Session、Coding Plan、OAuth、媒体、内置付费工具、未知模型／tier 不在金额模式可用范围；发网后的重试同样不覆盖（唯一例外见 §3 的连接失败重试）。仅凭兼容 ProviderType 不足以放行；自定义 Claude 的实际兼容类型可为 `claude_auth`。客户端自定义 function tool 文本允许；Server 不执行工具。
+5. 已启用且通过上述能力检查的 Single 绑定，其实际 upstream model 必须在当前 active 快照中具备 standard tier 价格。预览输出 `model_price_coverage`（模型／App／修订／排期时间），主动保存 USD 策略再次检查；只在排期快照有价时提示等待生效。Passthrough 输出 `scope=request_time`，不承诺所有调用方模型均有价，每次准入仍核实实际模型和 tier。后台保存已有授权不因该覆盖检查中断，也不清空历史。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。
 
@@ -81,18 +82,20 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 
 线格式权威为 Router `PROTOCOL.md §13`。执行价目纯函数在 `domain/usage/value_pricing.rs`；Server 不运行时抓取 LiteLLM，也不读取 Router 钱包。快照 schema v1 最多 4 MiB／10,000 模型，规范 SHA-256。协议黄金向量在 `tests/fixtures/share-value-pricing-v1.json`。
 
-Server→Router 使用通用 installation Ed25519 envelope，三个金额端点的 payload 一律以**规范 JSON** 签名并发送：递归按字节序排序所有对象键（`clients/router/client.rs::canonical_json_value`）。本仓启用了 serde_json `preserve_order`，否则嵌套 `status` 会按字段顺序签名而被 Router 的排序重序列化验签拒绝。双端共享向量 `tests/fixtures/share-value-signed-payload-v1.json`。
+Server→Router 使用通用 installation Ed25519 envelope，四个金额端点的 payload 一律以**规范 JSON** 签名并发送：递归按字节序排序所有对象键（`clients/router/client.rs::canonical_json_value`）。本仓启用了 serde_json `preserve_order`，否则嵌套 `status` 会按字段顺序签名而被 Router 的排序重序列化验签拒绝。双端共享向量 `tests/fixtures/share-value-signed-payload-v1.json`。
 
 | POST 路径 | action |
 | --- | --- |
 | `/v1/shares/value-pricing/fetch` | `share_value_pricing_fetch` |
 | `/v1/shares/value-pricing/ack` | `share_value_pricing_ack` |
+| `/v1/shares/value-pricing/active` | `share_value_pricing_active`；需 Router 声明 `valuePricingActivationV1` |
 | `/v1/shares/:share_id/value-quota-watermarks` | `share_value_quota_watermark` |
 
-价目拉取 payload 为 `{"knownRevision":"<本地最新已安装 revision>"}`（已安装并 ACK 的排期 revision 优先，否则 active；尚无安装时为 `{}`）。Router 的发布 revision 是**全局**的（不区分 installation）：`knownRevision` 等于 Router 当前发布 revision 时回 `{"unchanged":true,"revision":"<rev>"}`，否则回完整响应。unchanged（或回传的正是 active／已排期 revision）时不安装、不 ACK、不改 Share；新 revision 安装、ACK、激活后也不需要改写 binding。调价只影响新的 attempt，旧 attempt 用冻结费率。
+价目拉取 payload 为 `{"knownRevision":"<本地最新已安装 revision>"}`（已安装并 ACK 的排期 revision 优先，否则 active；尚无安装时为 `{}`）。Router 的发布 revision 是**全局**的（不区分 installation）：`knownRevision` 等于 Router 当前发布 revision **且本 installation 有 ACK** 时回 `{"unchanged":true,"revision":"<rev>"}`，否则回完整响应。unchanged 时不安装、不 ACK、不改 Share；完整响应为已安装的修订时仍重 ACK，以恢复 Router 丢失的证据。Router 重新发布旧 active 修订时，取消与之不符的 pending，避免激活已撤回调价。新 revision 安装、ACK、激活后也不需要改写 binding。调价只影响新的 attempt，旧 attempt 用冻结费率。
 
 - **旧 Router 兼容**：本变更之前构建的 Router 对任何非空 fetch payload 回 400（“fetch payload must be empty”）。Server 收到携带 `knownRevision` 的请求被 400 拒绝时立即用 `{}` 重试，并在内存中按 Router URL 记住“不支持 knownRevision”；进程重启或 Router heartbeat 能力声明 `valuePricingKnownRevisionV1` 时清除。
-- **未来生效的价目**：Router 最新 revision 尚未到 `effectiveFrom` 时，Server 收到即校验、存储并 ACK，在 `meta` 记录排期（`value_tariff_pending:*`，不改 schema），之后 heartbeat 发现到期再激活；期间旧 active revision 继续用于准入，`knownRevision` 发送已排期 revision，Router 回 unchanged，不再每次重下最多 4 MiB 的快照。更新且已生效的 revision 会直接激活并清除排期。
+- **未来生效的价目**：Router 最新 revision 尚未到 `effectiveFrom` 时，Server 收到即校验、存储并 ACK，在 `meta` 记录排期（`value_tariff_pending:*`，不改 schema）。独立本地任务每秒激活到期排期，准入 IMMEDIATE 事务再次检查并原子选择修订，**不再等待 heartbeat**；断连／重启仍可激活。期间旧 active revision 继续用于准入，`knownRevision` 发送已排期 revision，Router 回 unchanged，不再每次重下最多 4 MiB 的快照。已有 attempt 重放沿用冻结修订；更新且已生效的 revision 会直接激活并清除排期。
+- **激活证据独立于 ACK**：协商 `valuePricingActivationV1` 后，heartbeat 后用签名 `share_value_pricing_active` 上报 `{revision,storageSchema:3}`。失败只等待下一轮重报，不阻断水位。Router 对本 installation ACK、生效时间、签名时间和 180 秒新鲜度独立校验；只收到 ACK／旧 Server 未发 active 回执时不显示“已激活”。Router-first 部署；旧 Router 不声明能力时不调用 active 端点。本地元数据激活不依赖此回执成功。
 - **ACK 丢失恢复**：Router 若在 descriptor 同步时发现金额授权绑定的价目 revision 未被本 installation ACK（如 Router DB 恢复／installation 清理），返回 409 `value_pricing_ack_missing`、`details.revisions`。Server 对其中本地已安装的 revision 重发与正常流程相同的签名 ACK，然后**只重试一次** descriptor 同步；本地未安装的 revision 记 warn、授权保持原样。再次失败交回调用方正常的重试节奏（不会热循环）。
 
 动态水位与静态 descriptor 分离；只同步金额授权（生效或排期中），公平游标按 Share+email 轮转，每轮最多 16 次／约 5 秒、单请求 3 秒超时；相同投影的保活阈值为 45 秒（低于 60±6 秒的 heartbeat 间隔，空闲用户每次 heartbeat 都会同步；Router 侧把投影的陈旧阈值提高到 180 秒）。

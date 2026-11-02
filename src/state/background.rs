@@ -780,6 +780,7 @@ pub(super) async fn run_installation_heartbeat_once(
     .await
     {
         Ok(capabilities) => {
+            let report_tariff_activation = capabilities.value_pricing_activation();
             state
                 .record_router_quota_capability(&config, capabilities)
                 .await;
@@ -788,6 +789,11 @@ pub(super) async fn run_installation_heartbeat_once(
             record_installation_heartbeat_success(state).await;
             if let Err(error) = state.sync_share_value_pricing(&config).await {
                 tracing::warn!(%error,"Share value pricing synchronization pending");
+            }
+            if report_tariff_activation && state.router_supports_value_quotas().await {
+                if let Err(error) = state.report_active_value_tariff(&config).await {
+                    tracing::debug!(%error,"Share value pricing activation report pending");
+                }
             }
             if let Err(error) = state.sync_share_value_watermarks(&config).await {
                 tracing::debug!(%error,"Share value quota watermark synchronization pending");
@@ -992,6 +998,7 @@ pub fn spawn_periodic_share_sync_retry(state: ServerState) {
 /// every attempt started before this process; afterwards anything older than
 /// the longest provider request timeout plus five minutes.
 pub fn spawn_value_quota_sweeper(state: ServerState) {
+    ServerStateInner::spawn_value_tariff_activation(state.clone());
     tokio::spawn(async move {
         loop {
             if state.is_shutting_down() {

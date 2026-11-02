@@ -3206,7 +3206,15 @@ async fn forward_with_attempt_inner(
                 value_text_capable && value_facts.as_ref().is_some_and(|facts| facts.metered_text),
             )
             .await
-            .map_err(value_quota_proxy_error)?;
+            .map_err(|error| {
+                if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>() {
+                    tracing::warn!(request_id=?request_context.request_id,share_id=?request_context.share_id,
+                        model=%price.model,tier=%price.tier,reason_code=price.reason_code,
+                        active_pricing_revision=?price.active_pricing_revision,pending_pricing_revision=?price.pending_pricing_revision,
+                        effective_from_ms=?price.effective_from_ms,upstream_sent=false,"USD price admission refused");
+                }
+                value_quota_proxy_error(error)
+            })?;
         let request = build_upstream_post_request(
             &http_client,
             &url,
@@ -25265,6 +25273,17 @@ fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
     use crate::domain::usage::value_pricing::{
         ValueError, ValueQuotaRejection, ValueQuotaRejectionKind,
     };
+    if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
+    {
+        return ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "price_unavailable: {}\n{}",
+                serde_json::to_string(price).unwrap_or_default(),
+                price.message()
+            ),
+        };
+    }
     if let Some(rejection) = error.downcast_ref::<ValueQuotaRejection>() {
         return match rejection.kind {
             ValueQuotaRejectionKind::Exhausted => ProxyError {

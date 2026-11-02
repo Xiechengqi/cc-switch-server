@@ -11,6 +11,42 @@ pub const PICOS_PER_USD: i128 = 1_000_000_000_000;
 pub const MAX_LIMIT_MICROS: i128 = 1_000_000_000_000_000;
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MODELS: usize = 10_000;
+
+/// Safe diagnostic facts for a pre-send pricing refusal, never request content.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceRejection {
+    pub reason_code: &'static str,
+    pub model: String,
+    pub tier: String,
+    pub active_pricing_revision: Option<String>,
+    pub pending_pricing_revision: Option<String>,
+    pub effective_from_ms: Option<i64>,
+}
+/// Bounded identifiers only: never permit control characters in logs/errors.
+pub(crate) fn diagnostic_identity(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
+}
+impl PriceRejection {
+    pub fn message(&self) -> &'static str {
+        match self.reason_code {
+            "tariff_not_effective" => "Model price update is installed and awaiting its effective time; retry after activation.",
+            "tier_unknown" => "The execution service tier is not supported for USD-equivalent pricing.",
+            "tier_unpriced" => "The execution service tier has no verified price in the active tariff.",
+            _ => "The execution model has no verified price in the active tariff; configure its price in Router settings.",
+        }
+    }
+}
+impl std::fmt::Display for PriceRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for PriceRejection {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValueUsageEdit {

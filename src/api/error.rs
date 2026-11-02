@@ -36,6 +36,7 @@ pub(crate) struct InferenceApiError {
     limit: Option<u32>,
     request_id: Option<String>,
     param: Option<&'static str>,
+    price_details: Option<Value>,
 }
 
 impl InferenceApiError {
@@ -58,6 +59,7 @@ impl InferenceApiError {
             limit: concurrency.map(|metadata| metadata.limit),
             request_id,
             param: error.error_param(),
+            price_details: error.price_details(),
         }
     }
 
@@ -81,11 +83,19 @@ impl InferenceApiError {
             limit: None,
             request_id,
             param: None,
+            price_details: if error.code == Some("price_unavailable") {
+                error.details.map(|details| *details)
+            } else {
+                None
+            },
         }
     }
 
     fn details(&self) -> Value {
         let mut details = Map::new();
+        if let Some(Value::Object(price)) = &self.price_details {
+            details.extend(price.clone());
+        }
         details.insert("retryable".to_string(), Value::Bool(self.retryable));
         if self.code == "value_quota_exhausted" {
             if let Some((_, resets_at)) = self.message.split_once("; resets at ") {
@@ -152,6 +162,21 @@ impl InferenceApiError {
             }),
             InferenceSurface::Gemini => {
                 let mut metadata = Map::new();
+                if let Some(Value::Object(price)) = &self.price_details {
+                    for (key, value) in price {
+                        if !value.is_null() {
+                            metadata.insert(
+                                key.clone(),
+                                Value::String(
+                                    value
+                                        .as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| value.to_string()),
+                                ),
+                            );
+                        }
+                    }
+                }
                 metadata.insert("code".to_string(), Value::String(self.code.to_string()));
                 metadata.insert(
                     "retryable".to_string(),
@@ -506,6 +531,11 @@ impl ApiError {
 
     pub(crate) fn value_quota(error: impl std::fmt::Display) -> Self {
         let message = error.to_string();
+        if let Some(json) = message.strip_prefix("VALUE_QUOTA_PRICE_COVERAGE: ") {
+            let mut error = Self::bad_request_code("invalid_policy","The configured execution model is not priced in the active tariff. Set its price or wait for activation.");
+            error.details = serde_json::from_str(json).ok();
+            return error;
+        }
         if [
             "REVISION_CONFLICT",
             "WATERMARK_CONFLICT",
@@ -557,7 +587,7 @@ impl ApiError {
             error_type: Some(error_type),
             retryable: Some(retryable),
             retry_after_seconds,
-            details: None,
+            details: error.price_details().map(Box::new),
         }
     }
 
@@ -879,6 +909,67 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn pricing_rejections_keep_readable_messages_and_structured_facts_on_all_surfaces() {
+        let price = crate::domain::usage::value_pricing::PriceRejection {
+            reason_code: "tariff_not_effective",
+            model: "qiniu/conatus-free".into(),
+            tier: "standard".into(),
+            active_pricing_revision: Some("old".into()),
+            pending_pricing_revision: Some("new".into()),
+            effective_from_ms: Some(100),
+        };
+        let proxy = || crate::proxy::ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "price_unavailable: {}\n{}",
+                serde_json::to_string(&price).unwrap(),
+                price.message()
+            ),
+        };
+        for surface in [
+            InferenceSurface::OpenAi,
+            InferenceSurface::Anthropic,
+            InferenceSurface::Gemini,
+        ] {
+            for error in [
+                InferenceApiError::proxy(surface, None, proxy()),
+                InferenceApiError::api(surface, None, ApiError::proxy(proxy())),
+            ] {
+                let body = error.body();
+                assert_eq!(error.code, "price_unavailable");
+                assert_eq!(body["error"]["message"], price.message());
+                let details = if surface == InferenceSurface::Gemini {
+                    &body["error"]["details"][0]["metadata"]
+                } else {
+                    &body["error"]["details"]
+                };
+                assert_eq!(details["reasonCode"], "tariff_not_effective");
+                assert_eq!(details["model"], "qiniu/conatus-free");
+                assert_eq!(details["activePricingRevision"], "old");
+                assert_eq!(details["pendingPricingRevision"], "new");
+                assert_eq!(
+                    details["effectiveFromMs"],
+                    if surface == InferenceSurface::Gemini {
+                        json!("100")
+                    } else {
+                        json!(100)
+                    }
+                );
+            }
+        }
+        let rejected=ApiError::value_quota("VALUE_QUOTA_PRICE_COVERAGE: {\"code\":\"model_price_coverage\",\"reasonCode\":\"model_unpriced\",\"model\":\"qiniu/conatus-free\"}");
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejected.code, Some("invalid_policy"));
+        assert_eq!(rejected.details.unwrap()["reasonCode"], "model_unpriced");
+        let bounded = crate::domain::usage::value_pricing::diagnostic_identity(&format!(
+            "model\n\r\0{}",
+            "界".repeat(400)
+        ));
+        assert_eq!(bounded.chars().count(), 256);
+        assert!(!bounded.chars().any(char::is_control));
+    }
 
     #[test]
     fn value_quota_errors_keep_distinct_non_wallet_codes_on_every_inference_surface() {

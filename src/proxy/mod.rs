@@ -419,6 +419,12 @@ impl ProxyError {
             .concurrency_metadata_and_message()
             .map(|(_, message)| message)
             .unwrap_or_else(|| self.message_without_retry_metadata());
+        if let Some((_, readable)) = message
+            .strip_prefix("price_unavailable: ")
+            .and_then(|s| s.split_once('\n'))
+        {
+            return readable;
+        }
         message
             .strip_prefix(Self::TOOL_JSON_INVALID_PREFIX)
             .or_else(|| message.strip_prefix(Self::TOOL_JSON_INCOMPLETE_PREFIX))
@@ -438,6 +444,14 @@ impl ProxyError {
             .or_else(|| message.strip_prefix(Self::CAPACITY_SHED_PREFIX))
             .or_else(|| message.strip_prefix(Self::REQUEST_MEMORY_EXHAUSTED_PREFIX))
             .unwrap_or(message)
+    }
+
+    pub fn price_details(&self) -> Option<serde_json::Value> {
+        let (json, _) = self
+            .message_without_retry_metadata()
+            .strip_prefix("price_unavailable: ")?
+            .split_once('\n')?;
+        serde_json::from_str(json).ok()
     }
 
     pub fn retry_after_seconds(&self) -> Option<u64> {

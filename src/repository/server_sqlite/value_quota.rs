@@ -9,10 +9,12 @@
 use super::*;
 use crate::domain::usage::value_pricing::{
     canonical_service_tier, unsigned_decimal, ExecutionModelPrice, PricingSnapshot, RiskEstimate,
-    ValueError, ValueQuota, ValueQuotaRejection, ValueQuotaRejectionKind, ValueTokens,
-    MAX_OUTPUT_CEILING,
+    ValueQuota, ValueQuotaRejection, ValueQuotaRejectionKind, ValueTokens, MAX_OUTPUT_CEILING,
 };
 use std::sync::{Arc, Mutex, OnceLock};
+
+mod tariff;
+pub(crate) use tariff::{activate_due_tariff, model_coverage, schedule_tariff};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -675,6 +677,7 @@ pub(crate) fn install_snapshot(
     tx.commit()?;
     Ok(())
 }
+#[cfg(test)]
 pub(crate) fn activate_snapshot(
     config_dir: &Path,
     scope: &Scope,
@@ -692,18 +695,7 @@ pub(crate) fn activate_snapshot(
 /// The acknowledged active revision only (no payload parse); used for the
 /// `knownRevision` fetch contract and cheap readiness checks.
 pub(crate) fn active_revision(config_dir: &Path, scope: &Scope) -> anyhow::Result<Option<String>> {
-    assert_committed(config_dir)?;
-    let conn = open_database(&database_path(config_dir), true)?;
-    Ok(conn
-        .query_row(
-            "SELECT value FROM meta WHERE key=?1",
-            [format!(
-                "value_tariff:{}:{}",
-                scope.router_url, scope.installation_id
-            )],
-            |r| r.get(0),
-        )
-        .optional()?)
+    activate_due_tariff(config_dir, scope, crate::infra::time::now_ms() as i64)
 }
 fn pending_tariff_key(scope: &Scope) -> String {
     format!(
@@ -712,8 +704,8 @@ fn pending_tariff_key(scope: &Scope) -> String {
     )
 }
 /// A validated, stored and Router-acknowledged revision whose
-/// `effectiveFrom` has not passed yet. It is activated by the heartbeat once
-/// due; until then the previous active revision keeps pricing admissions.
+/// `effectiveFrom` has not passed yet. The independent local timer and
+/// admission transaction activate it when due, even without a heartbeat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PendingTariff {
@@ -726,40 +718,7 @@ pub(crate) fn pending_tariff(
 ) -> anyhow::Result<Option<PendingTariff>> {
     assert_committed(config_dir)?;
     let conn = open_database(&database_path(config_dir), true)?;
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key=?1",
-            [pending_tariff_key(scope)],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
-}
-pub(crate) fn set_pending_tariff(
-    config_dir: &Path,
-    scope: &Scope,
-    pending: Option<&PendingTariff>,
-) -> anyhow::Result<()> {
-    assert_committed(config_dir)?;
-    let conn = open_database(&database_path(config_dir), false)?;
-    match pending {
-        Some(pending) => {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM value_pricing_snapshots WHERE router_url=?1 AND installation_id=?2 AND revision=?3)",
-                params![scope.router_url, scope.installation_id, pending.revision],
-                |r| r.get(0),
-            )?;
-            ensure!(exists, "VALUE_QUOTA_SNAPSHOT_UNAVAILABLE");
-            conn.execute(
-                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![pending_tariff_key(scope), serde_json::to_string(pending)?],
-            )?;
-        }
-        None => {
-            conn.execute("DELETE FROM meta WHERE key=?1", [pending_tariff_key(scope)])?;
-        }
-    }
-    Ok(())
+    tariff::read_pending(&conn, scope)
 }
 /// Whether this (router, installation) stored `revision` locally.
 pub(crate) fn snapshot_installed(
@@ -1166,7 +1125,14 @@ pub(crate) fn admit_with_market_trial(
     }
     let mut connection = open_database(&database_path(config_dir), false)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let result = admit_with_trial_in_tx(&tx, input, trial)?;
+    // Resolve and freeze the revision in the same transaction as reservation.
+    // An idempotent replay must keep its already frozen revision after a price edit.
+    let revision = tariff::admission_revision(&tx, input, crate::infra::time::now_ms() as i64)?;
+    let frozen = Admission {
+        pricing_revision: &revision,
+        ..input.clone()
+    };
+    let result = admit_with_trial_in_tx(&tx, &frozen, trial)?;
     tx.commit()?;
     Ok(result)
 }
@@ -1205,9 +1171,26 @@ fn admit_with_trial_in_tx(
         &a.scope.installation_id,
         a.pricing_revision,
     )?;
-    let model = snapshot.model(a.effective_model)?;
+    let model = snapshot.model(a.effective_model).map_err(|_| {
+        tariff::price_rejection(
+            tx,
+            a.scope,
+            a.pricing_revision,
+            a.effective_model,
+            a.effective_tier,
+            "model_unpriced",
+        )
+    })?;
     if !model.supports_tier(a.effective_tier) {
-        return Err(ValueError::PriceUnavailable.into());
+        return Err(tariff::price_rejection(
+            tx,
+            a.scope,
+            a.pricing_revision,
+            a.effective_model,
+            a.effective_tier,
+            "tier_unpriced",
+        )
+        .into());
     }
     // policy_epoch is deliberately not part of the identity: a retry after a
     // policy edit is the same request in the same real window.
@@ -2492,6 +2475,7 @@ pub(crate) fn diagnostics(dir: &Path, share_id: &str) -> anyhow::Result<serde_js
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("value_quota/tariff_tests.rs");
     /// 2M tokens at $1/M = $2: larger than the $1 fixture limit, so the
     /// bounded reservation equals the remaining capacity.
     const ESTIMATE: RiskEstimate = RiskEstimate {

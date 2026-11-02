@@ -27,6 +27,7 @@ pub(crate) const MARKET_TRIAL_VALUE_CHECK: &str = "market_trial_value";
 /// Margin added to the longest provider request timeout before a pending
 /// attempt counts as stuck (sweeper and `set` reconcile share it).
 const STALE_ATTEMPT_MARGIN_MS: i64 = 5 * 60 * 1000;
+mod tariff;
 fn scope(config: &ServerConfig, share_id: &str, email: &str) -> anyhow::Result<ledger::Scope> {
     let identity = config
         .registered_router_identity()
@@ -496,6 +497,9 @@ pub(super) fn reconcile_market_trial_value_on_load(
     apply_market_trial_value(store, &totals)
 }
 fn rejection_reason(error: &anyhow::Error) -> &'static str {
+    if error.is::<crate::domain::usage::value_pricing::PriceRejection>() {
+        return "price_unavailable";
+    }
     match error.downcast_ref::<ValueQuotaRejection>().map(|r| r.kind) {
         Some(ValueQuotaRejectionKind::Exhausted) => "exhausted",
         Some(ValueQuotaRejectionKind::Busy) => "busy",
@@ -702,6 +706,7 @@ impl ServerStateInner {
             checks.push(serde_json::json!({"code":"text_surface", "ready":false}));
         }
         checks.extend(surfaces);
+        checks.extend(self.value_model_coverage(&share, &providers, &config, now)?);
         // Build capability, not readiness: this Server can meter Router
         // Share Market seats sold with a USD-equivalent quota. Always ready,
         // so it never changes `capabilityReady`; a Router treats its absence
@@ -719,6 +724,7 @@ impl ServerStateInner {
             Some("router_protocol") => "router_upgrade_required",
             Some("sqlite_authority" | "metering_storage") => "storage_unavailable",
             Some("acknowledged_tariff") => "pricing_unavailable",
+            Some("model_price_coverage") => "pricing_unavailable",
             Some(_) => "unverified_surface",
             None => "ready",
         };
@@ -957,6 +963,33 @@ impl ServerStateInner {
         for share in &mut candidate.shares {
             let verified_surface = verified_text_bindings(share, providers);
             let old_share = previous.get(&share.id);
+            let needs_prices = share.user_grants.iter().any(|(email, g)| {
+                g.active
+                    && g.policy.value_quota.is_some()
+                    && old_share
+                        .and_then(|s| s.user_grants.get(email))
+                        .is_none_or(|old| {
+                            !old.active
+                                || old.policy != g.policy
+                                || old.entitlement_id != g.entitlement_id
+                                || (g.manager == ShareGrantManager::RouterShareMarket
+                                    && g.value_metering.is_none())
+                        })
+            });
+            let price_checks = if needs_prices && capable && verified_surface {
+                self.value_model_coverage(share, providers, config, now)?
+            } else {
+                Vec::new()
+            };
+            let require_prices = || -> anyhow::Result<()> {
+                if let Some(check) = price_checks.iter().find(|check| check["ready"] != true) {
+                    anyhow::bail!(
+                        "VALUE_QUOTA_PRICE_COVERAGE: {}",
+                        serde_json::to_string(check)?
+                    );
+                }
+                Ok(())
+            };
             let mut changed = false;
             for (email, grant) in &mut share.user_grants {
                 if grant.active
@@ -977,6 +1010,9 @@ impl ServerStateInner {
                                 || g.policy != grant.policy
                                 || g.entitlement_id != grant.entitlement_id
                         });
+                    if managed_edit {
+                        require_prices()?;
+                    }
                     match self.prepare_managed_value_grant(
                         &share.id,
                         email,
@@ -1006,9 +1042,12 @@ impl ServerStateInner {
                 let original = grant.clone();
                 let requested = grant.policy.clone();
                 let user_edit = old.is_none_or(|g| {
-                    g.policy != requested
+                    (!g.active || g.policy != requested)
                         && g.pending_value_quota.as_ref().map(|p| &p.policy) != Some(&requested)
                 });
+                if user_edit && grant.policy.value_quota.is_some() {
+                    require_prices()?;
+                }
                 match self.prepare_value_grant(
                     &share.id,
                     email,
@@ -1404,12 +1443,12 @@ impl ServerStateInner {
     }
     /// Heartbeat pricing sync. The fetch names the newest installed revision
     /// (`{"knownRevision"}`; `{}` before any install or for a Router that
-    /// rejects the key). `{"unchanged":true}` (or the same revision again)
-    /// installs, acknowledges and writes nothing. A future-dated revision is
-    /// validated, stored and acknowledged on receipt and activated by a later
-    /// heartbeat once `effectiveFrom` passes; the previous active revision
-    /// keeps pricing admissions until then. Request execution only uses the
-    /// last local acknowledged snapshot when the Router is unavailable.
+    /// rejects the key). `{"unchanged":true}` installs and writes nothing.
+    /// A full response for an installed revision re-ACKs it (the Router may
+    /// have restored its database). Future revisions are validated, stored
+    /// and acknowledged on receipt and activated locally at `effectiveFrom`,
+    /// independently of later heartbeats. Until then, or offline, execution
+    /// uses the last locally acknowledged active snapshot.
     pub(super) async fn sync_share_value_pricing(
         &self,
         config: &ServerConfig,
@@ -1422,18 +1461,8 @@ impl ServerStateInner {
             .context("Router identity unavailable")?;
         let base = config.router_api_base().context("Router URL unavailable")?;
         let pricing_scope = scope(config, "pricing", "pricing@local.invalid")?;
-        let mut active = ledger::active_revision(&self.config_dir, &pricing_scope)?;
-        let mut pending = ledger::pending_tariff(&self.config_dir, &pricing_scope)?;
-        if let Some(due) = pending
-            .as_ref()
-            .filter(|pending| pending.effective_from_ms <= now_ms_i64())
-        {
-            ledger::activate_snapshot(&self.config_dir, &pricing_scope, &due.revision)?;
-            ledger::set_pending_tariff(&self.config_dir, &pricing_scope, None)?;
-            tracing::info!(revision = %due.revision, "scheduled value pricing revision is now active");
-            active = Some(due.revision.clone());
-            pending = None;
-        }
+        let active = ledger::active_revision(&self.config_dir, &pricing_scope)?;
+        let pending = ledger::pending_tariff(&self.config_dir, &pricing_scope)?;
         let newest = pending
             .as_ref()
             .map(|pending| pending.revision.clone())
@@ -1492,6 +1521,23 @@ impl ServerStateInner {
                 .as_ref()
                 .is_some_and(|pending| pending.revision == manifest.revision)
         {
+            Self::send_value_pricing_ack(&http, identity, base, &manifest.revision).await?;
+            // Router rollback to an older content revision can supersede a
+            // different pending revision. Never activate the withdrawn one.
+            if pending
+                .as_ref()
+                .is_some_and(|p| p.revision != manifest.revision)
+            {
+                ledger::schedule_tariff(
+                    &self.config_dir,
+                    &pricing_scope,
+                    &ledger::PendingTariff {
+                        revision: manifest.revision.clone(),
+                        effective_from_ms: manifest.effective_from_ms,
+                    },
+                    now_ms_i64(),
+                )?;
+            }
             return Ok(());
         }
         let config_dir = self.config_dir.clone();
@@ -1509,24 +1555,15 @@ impl ServerStateInner {
         .await
         .context("value pricing install task panicked")??;
         Self::send_value_pricing_ack(&http, identity, base, &manifest.revision).await?;
-        if manifest.effective_from_ms > now_ms_i64() {
-            ledger::set_pending_tariff(
-                &self.config_dir,
-                &pricing_scope,
-                Some(&ledger::PendingTariff {
-                    revision: manifest.revision.clone(),
-                    effective_from_ms: manifest.effective_from_ms,
-                }),
-            )?;
-            tracing::info!(revision = %manifest.revision, effective_from_ms = manifest.effective_from_ms,
-                "future value pricing revision installed and acknowledged; activation is scheduled");
-            return Ok(());
-        }
-        ledger::activate_snapshot(&self.config_dir, &pricing_scope, &manifest.revision)?;
-        // A newer, already effective revision supersedes any scheduled one.
-        if pending.is_some() {
-            ledger::set_pending_tariff(&self.config_dir, &pricing_scope, None)?;
-        }
+        ledger::schedule_tariff(
+            &self.config_dir,
+            &pricing_scope,
+            &ledger::PendingTariff {
+                revision: manifest.revision.clone(),
+                effective_from_ms: manifest.effective_from_ms,
+            },
+            now_ms_i64(),
+        )?;
         // Admission always prices against the active revision; bindings do
         // not need rewriting, so no Share mutation happens here.
         Ok(())
@@ -1733,7 +1770,18 @@ impl ServerStateInner {
                 .clone()
                 .context("VALUE_QUOTA_BINDING_UNAVAILABLE")?;
             anyhow::ensure!(verified_surface, "VALUE_QUOTA_UNVERIFIED_SURFACE");
-            let tier = effective_tier.ok_or(ValueError::PriceUnavailable)?;
+            let tier = effective_tier.ok_or_else(|| {
+                crate::domain::usage::value_pricing::PriceRejection {
+                    reason_code: "tier_unknown",
+                    model: crate::domain::usage::value_pricing::diagnostic_identity(
+                        effective_model,
+                    ),
+                    tier: "unknown".into(),
+                    active_pricing_revision: None,
+                    pending_pricing_revision: None,
+                    effective_from_ms: None,
+                }
+            })?;
             let started = i64::try_from(
                 context
                     .started_at_ms

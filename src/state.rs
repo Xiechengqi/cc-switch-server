@@ -22853,6 +22853,7 @@ async fn issue_share_tunnel_lease(
 
 #[cfg(test)]
 mod tests {
+    include!("state/share_value_quota/tariff_state_tests.rs");
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
