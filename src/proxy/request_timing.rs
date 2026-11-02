@@ -236,6 +236,7 @@ impl TimingSlot {
             ProviderType::AmazonQOAuth => "amazon_q_oauth",
             ProviderType::QoderCosy => "qoder_cosy",
             ProviderType::CodeBuddyOAuth => "codebuddy_oauth",
+            ProviderType::WorkBuddyOAuth => "workbuddy_oauth",
             _ => return None,
         };
         let request = self

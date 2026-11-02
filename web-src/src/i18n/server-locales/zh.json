@@ -51,7 +51,25 @@
     "intlSite": "国际站",
     "loginSite": "新登录账号站点",
     "loginWithCodeBuddy": "使用 CodeBuddy 登录",
-    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。"
+    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。",
+    "importTitle": "导入凭据",
+    "importHint": "所选产品和站点适用于每条记录。粘贴含 UID/domain 的双 token，或 account/auth 导出。预览只做本地校验，不请求供应商。",
+    "importError": "导入失败，请核对产品、站点、双 token 和 UID。桌面加密导出请改用原生登录。",
+    "previewImport": "预览导入",
+    "applyImport": "导入 {{count}} 个账号"
+  },
+  "workBuddyOauth": {
+    "authStatus": "WorkBuddy OAuth 认证",
+    "cnSite": "中国站",
+    "intlSite": "国际站",
+    "loginSite": "新登录账号站点",
+    "loginWithCodeBuddy": "使用 WorkBuddy 登录",
+    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。",
+    "importTitle": "导入凭据",
+    "importHint": "所选产品和站点适用于每条记录。粘贴含 UID/domain 的双 token，或 account/auth 导出。预览只做本地校验，不请求供应商。",
+    "importError": "导入失败，请核对产品、站点、双 token 和 UID。桌面加密导出请改用原生登录。",
+    "previewImport": "预览导入",
+    "applyImport": "导入 {{count}} 个账号"
   },
   "codexBankedReset": {
     "needsReconcile": "兑换结果待核对，不会自动消费新券；尚未确认共享周主桶重置。",

@@ -36,6 +36,7 @@ export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "kimi_code",
   "qoder_cosy",
   "codebuddy_oauth",
+  "workbuddy_oauth",
   "trae_solo",
   "deepseek_account",
 ] as const;
@@ -161,6 +162,8 @@ export function ManagedAccountSection({
       return <KimiOAuthSection {...common} />;
     case "qoder_cosy":
       return <QoderOAuthSection {...common} />;
+    case "workbuddy_oauth":
+      return <CodeBuddyOAuthSection {...common} authProvider="workbuddy_oauth" />;
     case "codebuddy_oauth":
       return <CodeBuddyOAuthSection {...common} />;
     case "trae_solo":

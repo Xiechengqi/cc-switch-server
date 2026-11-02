@@ -5,7 +5,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-use crate::domain::codebuddy::{CodeBuddyAccountProfile, CodeBuddySite};
+use crate::domain::codebuddy::{buddy_product_policy, CodeBuddyAccountProfile, CodeBuddySite};
+use crate::domain::providers::model::ProviderType;
 use crate::infra::resident_memory::ResidentMemoryBudget;
 
 mod resident;
@@ -125,6 +126,10 @@ pub struct CodeBuddyModelCapability {
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
+    pub only_reasoning: bool,
+    pub can_disable_thinking: bool,
+    pub context_window: Option<u64>,
+    pub context_window_lengths: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +213,12 @@ impl CodeBuddyModelCatalog {
                     .saturating_add(reasoning)
                     .saturating_add(
                         capability
+                            .context_window_lengths
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<u64>()),
+                    )
+                    .saturating_add(
+                        capability
                             .default_reasoning_effort
                             .as_ref()
                             .map_or(0, String::capacity),
@@ -289,10 +300,22 @@ impl std::fmt::Debug for CodeBuddyRuntimeCache {
     }
 }
 
+#[cfg(test)]
 pub fn parse_codebuddy_model_catalog(
     value: &Value,
     site: CodeBuddySite,
 ) -> Result<FetchedCodeBuddyModelCatalog, String> {
+    parse_buddy_model_catalog(value, ProviderType::CodeBuddyOAuth, site)
+}
+
+pub fn parse_buddy_model_catalog(
+    value: &Value,
+    provider_type: ProviderType,
+    site: CodeBuddySite,
+) -> Result<FetchedCodeBuddyModelCatalog, String> {
+    let catalog_agent = buddy_product_policy(provider_type, site)?
+        .client_identity
+        .catalog_agent();
     if let Some(raw_code) = value.get("code") {
         let code = json_i64(Some(raw_code))
             .ok_or_else(|| "CodeBuddy model catalog has an invalid business code".to_string())?;
@@ -313,6 +336,52 @@ pub fn parse_codebuddy_model_catalog(
         ));
     }
 
+    // Missing agents is the legacy schema. An explicit empty list (or an
+    // explicit CLI agent with no models) is an authoritative empty entitlement.
+    let agent_models = value
+        .pointer("/data/agents")
+        .or_else(|| value.get("agents"))
+        .map(
+            |agents| -> Result<std::collections::BTreeSet<String>, String> {
+                let agents = agents
+                    .as_array()
+                    .ok_or("CodeBuddy agents must be an array")?;
+                if agents.len() > MAX_MODEL_CATALOG_ENTRIES {
+                    return Err("CodeBuddy agents exceed the limit".to_string());
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                let mut matched = false;
+                for agent in agents {
+                    let name = agent
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or("CodeBuddy agent is missing name")?;
+                    if !name.eq_ignore_ascii_case(catalog_agent) {
+                        continue;
+                    }
+                    if matched {
+                        return Err("Buddy catalog contains duplicate active agents".to_string());
+                    }
+                    matched = true;
+                    let models = agent
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .ok_or("CodeBuddy CLI agent models must be an array")?;
+                    if models.len() > MAX_MODEL_CATALOG_ENTRIES {
+                        return Err("CodeBuddy CLI agent model list exceeds the limit".to_string());
+                    }
+                    for id in models {
+                        let id = id
+                            .as_str()
+                            .filter(|id| !id.is_empty() && id.len() <= MAX_MODEL_ID_BYTES)
+                            .ok_or("CodeBuddy CLI agent has an invalid model id")?;
+                        ids.insert(id.to_string());
+                    }
+                }
+                Ok(ids)
+            },
+        )
+        .transpose()?;
     let reviewed = reviewed_models(site);
     let mut seen = BTreeMap::<String, ()>::new();
     let mut enabled_models = Vec::new();
@@ -343,7 +412,11 @@ pub fn parse_codebuddy_model_catalog(
         }
         let disabled = bool_field(object, "disabled")?.unwrap_or(false)
             || bool_field(object, "enable")?.is_some_and(|enabled| !enabled);
-        if disabled {
+        if disabled
+            || agent_models
+                .as_ref()
+                .is_some_and(|models| !models.contains(&id))
+        {
             continue;
         }
         if !reviewed.contains(&id.as_str()) {
@@ -359,12 +432,15 @@ pub fn parse_codebuddy_model_catalog(
             "reasoning": {"supportedEfforts": capability.reasoning_efforts},
             "maxInputTokens": capability.max_input_tokens,
             "maxOutputTokens": capability.max_output_tokens,
+            "onlyReasoning": capability.only_reasoning,
+            "canDisableThinking": capability.can_disable_thinking,
+            "contextWindow": {"defaultLength": capability.context_window, "supportedLengths": capability.context_window_lengths},
         });
         enabled_models.push(id.clone());
         raw_configs.insert(id.clone(), reviewed_config);
         capabilities.insert(id, capability);
     }
-    if !entries.is_empty() && enabled_models.is_empty() {
+    if unreviewed_enabled > 0 && enabled_models.is_empty() {
         return Err(
             "CodeBuddy upstream catalog is non-empty but has no reviewed text model".to_string(),
         );
@@ -398,16 +474,21 @@ fn codebuddy_model_capability(
     id: &str,
     object: &Map<String, Value>,
 ) -> Result<CodeBuddyModelCapability, String> {
-    let supports_reasoning = bool_field(object, "supportsReasoning")?.unwrap_or_else(|| {
-        object
+    let only_reasoning = bool_field(object, "onlyReasoning")?.unwrap_or(false);
+    let can_disable_thinking = !only_reasoning
+        && object
             .get("reasoning")
-            .is_some_and(|reasoning| reasoning.is_object())
-            || bool_field(object, "onlyReasoning")
-                .ok()
-                .flatten()
-                .unwrap_or(false)
-    });
-    let reasoning_efforts = object
+            .and_then(Value::as_object)
+            .map(|reasoning| bool_field(reasoning, "canDisableThinking"))
+            .transpose()?
+            .flatten()
+            .unwrap_or(false);
+    let supports_reasoning = bool_field(object, "supportsReasoning")?
+        .unwrap_or(only_reasoning || object.get("reasoning").is_some_and(Value::is_object));
+    if only_reasoning && !supports_reasoning {
+        return Err("CodeBuddy catalog has contradictory reasoning capabilities".to_string());
+    }
+    let mut reasoning_efforts = object
         .get("reasoning")
         .and_then(Value::as_object)
         .and_then(|reasoning| reasoning.get("supportedEfforts"))
@@ -440,6 +521,31 @@ fn codebuddy_model_capability(
                     .filter(|value| !value.is_empty() && value.len() <= 32)
                     .map(str::to_string)
             });
+    if reasoning_efforts.is_empty() {
+        if let Some(default) = &default_reasoning_effort {
+            reasoning_efforts.push(default.clone());
+        }
+    }
+    let mut seen_efforts = std::collections::BTreeSet::new();
+    reasoning_efforts.retain(|effort| seen_efforts.insert(effort.clone()));
+    let max_input_tokens = positive_u64(object.get("maxInputTokens"));
+    let context = object.get("contextWindow").and_then(Value::as_object);
+    let mut context_window_lengths: Vec<u64> = context
+        .and_then(|context| context.get("supportedLengths"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| positive_u64(Some(value)))
+        .filter(|value| max_input_tokens.is_none_or(|max| *value <= max))
+        .collect();
+    context_window_lengths.sort_unstable();
+    context_window_lengths.dedup();
+    let context_window = context
+        .and_then(|context| positive_u64(context.get("defaultLength")))
+        .filter(|value| max_input_tokens.is_none_or(|max| *value <= max))
+        .filter(|value| context_window_lengths.is_empty() || context_window_lengths.contains(value))
+        .or_else(|| context_window_lengths.first().copied())
+        .or(max_input_tokens);
     Ok(CodeBuddyModelCapability {
         id: id.to_string(),
         display_name: object
@@ -451,11 +557,15 @@ fn codebuddy_model_capability(
             .map(str::to_string),
         reasoning_efforts,
         default_reasoning_effort,
-        max_input_tokens: positive_u64(object.get("maxInputTokens")),
+        max_input_tokens,
         max_output_tokens: positive_u64(object.get("maxOutputTokens")),
         // Missing capability evidence cannot authorize a tool-bearing request.
         supports_tools: bool_field(object, "supportsToolCall")?.unwrap_or(false),
         supports_reasoning,
+        only_reasoning,
+        can_disable_thinking,
+        context_window,
+        context_window_lengths,
     })
 }
 
@@ -488,6 +598,7 @@ pub fn resolve_codebuddy_model_id(site: CodeBuddySite, requested: &str) -> Resul
     let requested = requested
         .trim()
         .strip_prefix("codebuddy/")
+        .or_else(|| requested.trim().strip_prefix("workbuddy/"))
         .unwrap_or(requested.trim())
         .trim()
         .to_ascii_lowercase();
@@ -509,6 +620,9 @@ pub fn build_codebuddy_payload(
     model_id: &str,
     capability: &CodeBuddyModelCapability,
 ) -> Result<Value, String> {
+    if contains_image_content(canonical_chat_request) {
+        return Err("CodeBuddy text rail does not support image input".to_string());
+    }
     let mut request = canonical_chat_request
         .as_object()
         .cloned()
@@ -516,9 +630,6 @@ pub fn build_codebuddy_payload(
     let model_id = model_id.trim();
     if model_id.is_empty() {
         return Err("CodeBuddy request model is empty".to_string());
-    }
-    if contains_image_content(&Value::Object(request.clone())) {
-        return Err("CodeBuddy text rail does not support image input".to_string());
     }
     let messages = request
         .get_mut("messages")
@@ -544,6 +655,19 @@ pub fn build_codebuddy_payload(
         );
     }
     normalize_codebuddy_tools_and_choice(&mut request)?;
+    super::buddy_schema::normalize_tools(&mut request)?;
+    if let Some(max_completion_tokens) = request.remove("max_completion_tokens") {
+        if let Some(max_tokens) = request.get("max_tokens") {
+            if max_tokens != &max_completion_tokens {
+                return Err(
+                    "Buddy request contains conflicting max_tokens and max_completion_tokens"
+                        .to_string(),
+                );
+            }
+        } else {
+            request.insert("max_tokens".to_string(), max_completion_tokens);
+        }
+    }
     request.insert("model".to_string(), Value::String(model_id.to_string()));
     request.insert("stream".to_string(), Value::Bool(true));
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
@@ -583,6 +707,11 @@ pub fn build_codebuddy_payload(
             .then(|| capability.default_reasoning_effort.clone())
             .flatten()
     });
+    if canonical_requested && effort.is_none() {
+        return Err(format!(
+            "CodeBuddy model {model_id} has no reviewed default reasoning effort"
+        ));
+    }
     request.remove("reasoning_effort");
     if let Some(mut effort) = effort {
         if !capability.supports_reasoning {
@@ -590,7 +719,19 @@ pub fn build_codebuddy_payload(
                 "CodeBuddy model {model_id} does not advertise reasoning support"
             ));
         }
-        if !capability.reasoning_efforts.is_empty() {
+        if effort.eq_ignore_ascii_case("none") && !capability.can_disable_thinking {
+            return Err(format!(
+                "CodeBuddy model {model_id} cannot disable thinking"
+            ));
+        }
+        if capability.reasoning_efforts.is_empty()
+            && !(effort.eq_ignore_ascii_case("none") && capability.can_disable_thinking)
+        {
+            return Err(format!(
+                "CodeBuddy model {model_id} has no reviewed reasoning effort menu"
+            ));
+        }
+        if !(effort.eq_ignore_ascii_case("none") && capability.can_disable_thinking) {
             let Some(supported) = capability
                 .reasoning_efforts
                 .iter()
@@ -627,20 +768,15 @@ fn canonicalize_codebuddy_assistant_reasoning(message: &mut Map<String, Value>) 
 /// but remove only the unusable protocol portion of incomplete history. This
 /// never invents a tool result or changes tool output content.
 fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) {
-    let source = std::mem::take(messages);
+    let mut source = std::mem::take(messages).into_iter().peekable();
     let mut repaired = Vec::with_capacity(source.len());
-    let mut index = 0;
-    while index < source.len() {
-        let Some(message) = source[index].as_object() else {
-            repaired.push(source[index].clone());
-            index += 1;
+    while let Some(mut current) = source.next() {
+        let Some(message) = current.as_object() else {
+            repaired.push(current);
             continue;
         };
         let role = codebuddy_message_role(message);
         if role.eq_ignore_ascii_case("tool") {
-            // A tool result can only be emitted as part of the immediately
-            // preceding complete assistant round.
-            index += 1;
             continue;
         }
         let has_tool_calls = role.eq_ignore_ascii_case("assistant")
@@ -648,33 +784,28 @@ fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) {
                 .get("tool_calls")
                 .is_some_and(|value| !codebuddy_value_is_semantically_empty(value));
         if !has_tool_calls {
-            repaired.push(source[index].clone());
-            index += 1;
+            repaired.push(current);
             continue;
         }
-
-        let mut result_end = index + 1;
-        while result_end < source.len()
-            && source[result_end]
-                .as_object()
-                .is_some_and(|next| codebuddy_message_role(next).eq_ignore_ascii_case("tool"))
+        let mut results = Vec::new();
+        while source
+            .peek()
+            .and_then(Value::as_object)
+            .is_some_and(|next| codebuddy_message_role(next).eq_ignore_ascii_case("tool"))
         {
-            result_end += 1;
+            results.push(source.next().expect("peeked tool result"));
         }
-        let results = &source[index + 1..result_end];
-        if codebuddy_tool_round_is_complete(message, results) {
-            repaired.push(source[index].clone());
-            repaired.extend(results.iter().cloned());
+        if codebuddy_tool_round_is_complete(message, &results) {
+            repaired.push(current);
+            repaired.extend(results);
         } else {
-            let mut assistant = source[index].clone();
-            if let Some(assistant) = assistant.as_object_mut() {
+            if let Some(assistant) = current.as_object_mut() {
                 assistant.remove("tool_calls");
             }
-            if codebuddy_message_is_semantic(&assistant) {
-                repaired.push(assistant);
+            if codebuddy_message_is_semantic(&current) {
+                repaired.push(current);
             }
         }
-        index = result_end;
     }
     *messages = repaired;
 }
@@ -880,7 +1011,7 @@ fn normalize_codebuddy_tools_and_choice(
         .ok_or_else(|| "CodeBuddy named tool_choice requires a tools array".to_string())?;
     let selected = tools
         .iter()
-        .find(|tool| {
+        .position(|tool| {
             tool.get("type").and_then(Value::as_str) == Some("function")
                 && tool
                     .get("function")
@@ -889,10 +1020,10 @@ fn normalize_codebuddy_tools_and_choice(
                     .and_then(Value::as_str)
                     .is_some_and(|candidate| candidate == name)
         })
-        .cloned()
         .ok_or_else(|| {
             format!("CodeBuddy named tool_choice references unknown function {name:?}")
         })?;
+    let selected = tools.swap_remove(selected);
     *tools = vec![selected];
     request.insert(
         "tool_choice".to_string(),
@@ -928,6 +1059,10 @@ mod tests {
             max_output_tokens: Some(24_000),
             supports_tools: true,
             supports_reasoning: true,
+            only_reasoning: false,
+            can_disable_thinking: false,
+            context_window: None,
+            context_window_lengths: Vec::new(),
         }
     }
 
@@ -1618,5 +1753,132 @@ mod tests {
             arguments
         );
         assert_eq!(payload["messages"][4]["tool_call_id"], "call_opaque");
+    }
+    #[test]
+    fn codebuddy_agent_allowlist_distinguishes_absent_empty_and_invalid() {
+        let base = json!({"data":{"models":[{"id":"default-model","supportsToolCall":true}]}});
+        assert_eq!(
+            parse_codebuddy_model_catalog(&base, CodeBuddySite::Intl)
+                .unwrap()
+                .enabled_models
+                .len(),
+            1
+        );
+        for agents in [
+            json!([]),
+            json!([{"name":"CLI","models":[]}]),
+            json!([{"name":"web","models":["default-model"]}]),
+        ] {
+            let mut value = base.clone();
+            value["data"]["agents"] = agents;
+            assert!(parse_codebuddy_model_catalog(&value, CodeBuddySite::Intl)
+                .unwrap()
+                .enabled_models
+                .is_empty());
+        }
+        let mut value = base;
+        value["data"]["agents"] = json!([{"name":"CLI","models":null}]);
+        assert!(parse_codebuddy_model_catalog(&value, CodeBuddySite::Intl).is_err());
+    }
+
+    #[test]
+    fn codebuddy_reasoning_and_context_metadata_preserve_client_intent() {
+        let value = json!({"data":{"models":[{"id":"default-model","onlyReasoning":true,"supportsReasoning":true,
+            "reasoning":{"canDisableThinking":true,"defaultEffort":"high","supportedEfforts":["low","high"]},
+            "maxInputTokens":128000,"maxOutputTokens":8192,
+            "contextWindow":{"defaultLength":64000,"supportedLengths":[64000,128000,256000]}}]}});
+        let catalog = parse_codebuddy_model_catalog(&value, CodeBuddySite::Intl).unwrap();
+        let caps = &catalog.capabilities["default-model"];
+        assert!(caps.only_reasoning);
+        assert!(!caps.can_disable_thinking);
+        assert_eq!(caps.context_window, Some(64000));
+        assert_eq!(caps.context_window_lengths, vec![64000, 128000]);
+        let request = json!({"messages":[{"role":"user","content":"hello"}]});
+        assert!(build_codebuddy_payload(&request, "default-model", caps)
+            .unwrap()
+            .get("reasoning_effort")
+            .is_none());
+        let mut disabled = request.clone();
+        disabled["reasoning_effort"] = json!("none");
+        assert!(build_codebuddy_payload(&disabled, "default-model", caps).is_err());
+        let mut low = request;
+        low["reasoning_effort"] = json!("low");
+        assert_eq!(
+            build_codebuddy_payload(&low, "default-model", caps).unwrap()["reasoning_effort"],
+            "low"
+        );
+        let mut unknown = caps.clone();
+        unknown.reasoning_efforts.clear();
+        assert!(build_codebuddy_payload(&low, "default-model", &unknown).is_err());
+    }
+
+    #[test]
+    fn buddy_catalog_uses_only_the_active_channel_for_each_product_and_site() {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Cn, CodeBuddySite::Intl] {
+                let reviewed = reviewed_models(site);
+                let mut value = json!({"data":{
+                    "models":[{"id":reviewed[0]}, {"id":reviewed[1]}],
+                    "agents":[
+                        {"name":"cli", "models":[reviewed[0]]},
+                        {"name":"codebuddy", "models":[reviewed[1]]},
+                        {"name":"workbuddy", "models":[reviewed[1]]}
+                    ]
+                }});
+                let catalog = parse_buddy_model_catalog(&value, product, site).unwrap();
+                assert_eq!(catalog.enabled_models, vec![reviewed[0]]);
+                value["data"]["agents"][0]["models"] = json!([]);
+                assert!(parse_buddy_model_catalog(&value, product, site)
+                    .unwrap()
+                    .enabled_models
+                    .is_empty());
+                value["data"]["agents"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name":"CLI", "models":[reviewed[1]]}));
+                assert!(parse_buddy_model_catalog(&value, product, site).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn buddy_output_token_alias_preserves_explicit_values_and_rejects_conflicts() {
+        let base = json!({"messages":[{"role":"user","content":"hello"}]});
+        let caps = text_capability();
+        let no_limit = build_codebuddy_payload(&base, "default-model", &caps).unwrap();
+        assert!(no_limit.get("max_tokens").is_none());
+        for keys in [
+            vec!["max_completion_tokens"],
+            vec!["max_tokens"],
+            vec!["max_completion_tokens", "max_tokens"],
+        ] {
+            let mut input = base.clone();
+            for key in keys {
+                input[key] = json!(123456);
+            }
+            let payload = build_codebuddy_payload(&input, "default-model", &caps).unwrap();
+            assert_eq!(payload["max_tokens"], 123456);
+            assert!(payload.get("max_completion_tokens").is_none());
+        }
+        let mut input = base;
+        input["max_tokens"] = json!(64);
+        input["max_completion_tokens"] = json!(128);
+        assert!(build_codebuddy_payload(&input, "default-model", &caps)
+            .unwrap_err()
+            .contains("conflicting max_tokens"));
+    }
+
+    #[test]
+    fn tool_history_repair_moves_large_results_without_copying_their_storage() {
+        let output = "tool result ".repeat(100_000);
+        let mut messages = vec![
+            json!({"role":"assistant", "tool_calls":[{"id":"call1", "type":"function", "function":{"name":"lookup","arguments":"{}"}}]}),
+            json!({"role":"tool", "tool_call_id":"call1", "content":output}),
+            json!({"role":"user", "content":"continue"}),
+        ];
+        let pointer = messages[1]["content"].as_str().unwrap().as_ptr();
+        repair_codebuddy_tool_history(&mut messages);
+        assert_eq!(messages[1]["content"].as_str().unwrap().as_ptr(), pointer);
+        assert_eq!(messages.len(), 3);
     }
 }

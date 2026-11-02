@@ -14,6 +14,7 @@ export type ManagedAuthProvider =
   | "kimi_code"
   | "qoder_cosy"
   | "codebuddy_oauth"
+  | "workbuddy_oauth"
   | "trae_solo";
 
 export type QoderSite = "global" | "cn";
@@ -533,7 +534,23 @@ export async function deepseekAccountSetDefault(
   return invokeCommand("deepseek_account_set_default", { accountId });
 }
 
+export interface BuddyImportResult {
+  ok: boolean;
+  preview: boolean;
+  accounts: Array<{ id: string; email?: string | null }>;
+}
+
+export async function authImportBuddyCredentials(
+  providerType: "codebuddy_oauth" | "workbuddy_oauth",
+  site: CodeBuddySite,
+  payload: unknown,
+  preview = false,
+): Promise<BuddyImportResult> {
+  return invokeCommand<BuddyImportResult>("auth_import_buddy", { providerType, site, payload, preview });
+}
+
 export const authApi = {
+  authImportBuddyCredentials,
   authStartLogin,
   authCancelLogin,
   authSubmitOauthCode,

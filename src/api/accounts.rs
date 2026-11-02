@@ -50,7 +50,7 @@ pub(in crate::api) async fn upsert_account(
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     let account = state
         .try_mutate_accounts_immediate(|store| {
-            if input.provider_type == ProviderType::CodeBuddyOAuth {
+            if input.provider_type.is_buddy_oauth() {
                 reuse_existing_codebuddy_identity_account(store, &mut input);
             }
             let manager = manager_for(input.provider_type);
@@ -83,6 +83,49 @@ pub(in crate::api) async fn account_import_templates(
     Ok(Json(AccountImportTemplatesResponse {
         ok: true,
         templates: crate::domain::accounts::managers::account_import_templates(),
+    }))
+}
+
+pub(in crate::api) async fn import_buddy_credentials(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<ImportBuddyCredentialsRequest>,
+) -> Result<Json<ImportBuddyCredentialsResponse>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    let site = crate::domain::codebuddy::CodeBuddySite::parse(&input.site)
+        .map_err(ApiError::bad_request)?;
+    let inputs = crate::domain::accounts::buddy_import::normalize_buddy_import(
+        input.provider_type,
+        site,
+        &input.payload,
+    )
+    .map_err(ApiError::bad_request)?;
+    let apply = |store: &mut crate::domain::accounts::store::AccountStore| -> Result<Vec<Account>, ApiError> {
+        let mut candidate = store.clone();
+        let mut imported = Vec::new();
+        for mut account in inputs {
+            reuse_existing_codebuddy_identity_account(&candidate, &mut account);
+            imported.push(manager_for(account.provider_type).finish_login(&mut candidate, account).map_err(ApiError::bad_request)?);
+        }
+        *store = candidate;
+        Ok(imported)
+    };
+    let accounts = if input.preview {
+        apply(&mut state.accounts_snapshot().await)?
+    } else {
+        let _operation = state.lock_managed_auth_operations().await;
+        state
+            .try_mutate_accounts_immediate(apply)
+            .await
+            .map_err(map_account_write_error)??
+    };
+    Ok(Json(ImportBuddyCredentialsResponse {
+        ok: true,
+        preview: input.preview,
+        accounts: accounts
+            .iter()
+            .map(AccountLoginAccountSummary::from_account)
+            .collect(),
     }))
 }
 
@@ -884,12 +927,14 @@ fn reuse_existing_codebuddy_identity_account(
     store: &crate::domain::accounts::store::AccountStore,
     input: &mut UpsertAccountInput,
 ) {
-    let Ok(profile) =
-        crate::domain::codebuddy::CodeBuddyAccountProfile::parse(input.profile.as_ref())
-    else {
+    let Ok(profile) = crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+        input.provider_type,
+        input.profile.as_ref(),
+    ) else {
         return;
     };
-    if let Some(account_id) = store.codebuddy_account_id_for_stable_identity(
+    if let Some(account_id) = store.buddy_account_id_for_stable_identity(
+        input.provider_type,
         profile.site,
         &profile.uid,
         &profile.enterprise_id,
@@ -1781,7 +1826,7 @@ async fn persist_completed_device_login(
             if let Some(subject) = verified_codex_subject.as_deref() {
                 reuse_existing_codex_subject_account(store, &mut account_input, subject);
             }
-            if provider_type == ProviderType::CodeBuddyOAuth {
+            if provider_type.is_buddy_oauth() {
                 reuse_existing_codebuddy_identity_account(store, &mut account_input);
             }
             manager_for(provider_type)
@@ -2217,17 +2262,47 @@ pub(in crate::api) async fn start_codebuddy_login(
     headers: HeaderMap,
     Json(input): Json<StartCodeBuddyLoginRequest>,
 ) -> Result<Json<StartCodeBuddyLoginResponse>, ApiError> {
+    start_buddy_login(
+        ProviderType::CodeBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn start_workbuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<StartCodeBuddyLoginRequest>,
+) -> Result<Json<StartCodeBuddyLoginResponse>, ApiError> {
+    start_buddy_login(
+        ProviderType::WorkBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn start_buddy_login(
+    provider_type: ProviderType,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<StartCodeBuddyLoginRequest>,
+) -> Result<Json<StartCodeBuddyLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let site = crate::domain::codebuddy::CodeBuddySite::parse(&input.site)
         .map_err(ApiError::bad_request)?;
     let now = now_ms() as i64;
-    let (login, flow) = crate::clients::oauth::codebuddy::start_login(site, now)
-        .await
-        .map_err(map_codebuddy_client_error)?;
+    let (login, flow) =
+        crate::clients::oauth::codebuddy::start_login_for_product(provider_type, site, now)
+            .await
+            .map_err(map_codebuddy_client_error)?;
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     if !state
         .try_bind_device_flow_principal_bounded(
-            ProviderType::CodeBuddyOAuth,
+            provider_type,
             login.flow_id.clone(),
             principal.oauth_binding_id(),
             login.expires_at,
@@ -2247,7 +2322,7 @@ pub(in crate::api) async fn start_codebuddy_login(
     {
         state
             .remove_device_flow_principal(
-                ProviderType::CodeBuddyOAuth,
+                provider_type,
                 &login.flow_id,
                 &principal.oauth_binding_id(),
                 now,
@@ -2267,12 +2342,41 @@ pub(in crate::api) async fn poll_codebuddy_login(
     headers: HeaderMap,
     Json(input): Json<PollCodeBuddyLoginRequest>,
 ) -> Result<Json<PollCodeBuddyLoginResponse>, ApiError> {
+    poll_buddy_login(
+        ProviderType::CodeBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn poll_workbuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollCodeBuddyLoginRequest>,
+) -> Result<Json<PollCodeBuddyLoginResponse>, ApiError> {
+    poll_buddy_login(
+        ProviderType::WorkBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn poll_buddy_login(
+    provider_type: ProviderType,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<PollCodeBuddyLoginRequest>,
+) -> Result<Json<PollCodeBuddyLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let principal_id = principal.oauth_binding_id();
     let now = now_ms() as i64;
     require_device_flow_owner(
         &state,
-        ProviderType::CodeBuddyOAuth,
+        provider_type,
         &input.flow_id,
         &principal_id,
         now,
@@ -2308,7 +2412,7 @@ pub(in crate::api) async fn poll_codebuddy_login(
                         state
                             .remove_device_flow_for_principal_under_managed_auth_guard(
                                 &managed_auth_operation,
-                                ProviderType::CodeBuddyOAuth,
+                                provider_type,
                                 &input.flow_id,
                                 &principal_id,
                                 completed_at,
@@ -2358,7 +2462,7 @@ pub(in crate::api) async fn poll_codebuddy_login(
     })?;
     let account = persist_completed_device_login(
         &state,
-        ProviderType::CodeBuddyOAuth,
+        provider_type,
         &input.flow_id,
         &principal_id,
         account_input,
@@ -2378,12 +2482,41 @@ pub(in crate::api) async fn cancel_codebuddy_login(
     headers: HeaderMap,
     Json(input): Json<CancelCodeBuddyLoginRequest>,
 ) -> Result<Json<CancelCodeBuddyLoginResponse>, ApiError> {
+    cancel_buddy_login(
+        ProviderType::CodeBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn cancel_workbuddy_login(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelCodeBuddyLoginRequest>,
+) -> Result<Json<CancelCodeBuddyLoginResponse>, ApiError> {
+    cancel_buddy_login(
+        ProviderType::WorkBuddyOAuth,
+        State(state),
+        headers,
+        Json(input),
+    )
+    .await
+}
+
+pub(in crate::api) async fn cancel_buddy_login(
+    provider_type: ProviderType,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(input): Json<CancelCodeBuddyLoginRequest>,
+) -> Result<Json<CancelCodeBuddyLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     let cancelled = state
         .remove_device_flow_for_principal_under_managed_auth_guard(
             &managed_auth_operation,
-            ProviderType::CodeBuddyOAuth,
+            provider_type,
             &input.flow_id,
             &principal.oauth_binding_id(),
             now_ms() as i64,
@@ -3864,6 +3997,7 @@ pub(in crate::api) fn is_oauth_secret_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    include!("buddy_import_tests.rs");
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -19,6 +19,8 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
   inline = false,
 }) => {
   const { t } = useTranslation();
+  const product = meta?.providerType === PROVIDER_TYPES.WORKBUDDY_OAUTH
+    ? PROVIDER_TYPES.WORKBUDDY_OAUTH : PROVIDER_TYPES.CODEBUDDY_OAUTH;
   const {
     data: quota,
     isFetching: loading,
@@ -26,14 +28,15 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
   } = useCodeBuddyOauthQuota(meta, { enabled: true });
   const identity = resolveManagedAccountIdentity(
     meta,
-    PROVIDER_TYPES.CODEBUDDY_OAUTH,
+    product,
   );
   const handleRefresh = React.useCallback(
-    () =>
-      refreshOauthQuotaAndReload(
+    () => {
+      if (!identity) return Promise.resolve();
+      return refreshOauthQuotaAndReload(
         () =>
           subscriptionApi.refreshOauthQuota(
-            PROVIDER_TYPES.CODEBUDDY_OAUTH,
+            product,
             identity?.accountId ?? null,
             meta?.providerType,
             undefined,
@@ -42,8 +45,9 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
             identity?.authIdentityGeneration,
           ),
         () => refetch(),
-      ),
-    [identity?.accountId, identity?.authIdentityGeneration, meta?.providerType, refetch],
+      );
+    },
+    [identity?.accountId, identity?.authIdentityGeneration, product, meta?.providerType, refetch],
   );
   const usage = quota?.providerUsage;
   const usageText =
@@ -68,7 +72,7 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
         quota={quota}
         loading={loading}
         refetch={handleRefresh}
-        appIdForExpiredHint={PROVIDER_TYPES.CODEBUDDY_OAUTH}
+        appIdForExpiredHint={product}
         inline={inline}
       />
       {usageText ? (

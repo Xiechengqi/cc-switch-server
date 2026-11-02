@@ -11,7 +11,6 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use crate::domain::providers::model::ProviderType;
 use crate::state::{CodeBuddyRuntimeError, ServerState};
 
 use super::super::adapters::AdapterRequest;
@@ -38,7 +37,7 @@ pub(crate) fn bound_account_identity(
             "CodeBuddy Provider must bind one explicit codebuddy_oauth managed account",
         ));
     };
-    if provider_type != ProviderType::CodeBuddyOAuth {
+    if !provider_type.is_buddy_oauth() || provider_type != execution.stored.provider_type {
         return Err(ProxyError::bad_request(
             "CodeBuddy Provider account type does not match its runtime contract",
         ));
@@ -84,29 +83,25 @@ impl CanonicalRequest {
 pub(crate) fn prepare_canonical_request(
     request: &AdapterRequest,
 ) -> Result<CanonicalRequest, ProxyError> {
+    let body = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
+        ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
+    })?;
     let requested_model = request
         .actual_model
         .clone()
         .or_else(|| request.model.clone())
-        .or_else(|| model_from_canonical_chat(&request.body))
+        .or_else(|| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| ProxyError::bad_request("CodeBuddy request is missing a model"))?;
-    let body = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
-        ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
-    })?;
     Ok(CanonicalRequest {
         requested_model,
         body,
     })
-}
-
-fn model_from_canonical_chat(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("model")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 #[derive(Debug)]
@@ -144,9 +139,11 @@ pub(crate) fn prepare_generation(
     // model strings are allocated.
     let prepared_memory = request_memory
         .map(|budget| {
+            let canonical_working_bytes = canonical.retained_bytes().saturating_mul(3);
             budget.reserve(
                 RequestMemoryComponent::NormalizedBody,
-                canonical.retained_bytes().saturating_mul(3),
+                canonical_working_bytes
+                    .saturating_add(super::super::buddy_schema::growth_bound(&canonical.body)),
             )
         })
         .transpose()

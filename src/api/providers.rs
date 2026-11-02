@@ -1334,7 +1334,9 @@ pub(in crate::api) async fn test_provider_inner(
             .await;
     }
 
-    if execution.driver_is("special.codebuddy_oauth") {
+    if execution.driver_is("special.codebuddy_oauth")
+        || execution.driver_is("special.workbuddy_oauth")
+    {
         return Box::pin(test_codebuddy_provider_inner(
             state,
             execution,
@@ -1685,7 +1687,12 @@ async fn test_codebuddy_provider_inner(
         // The managed runtime selects a fixed site endpoint from the bound
         // Account. Provider Test must not echo that endpoint or any credential
         // material back through the control-plane response.
-        endpoint: "[managed CodeBuddy runtime]".to_string(),
+        endpoint: if stored.provider_type == ProviderType::WorkBuddyOAuth {
+            "[managed WorkBuddy runtime]"
+        } else {
+            "[managed CodeBuddy runtime]"
+        }
+        .to_string(),
         model: model.clone(),
         stream: requested_stream,
         header_names: Vec::new(),
@@ -1697,7 +1704,7 @@ async fn test_codebuddy_provider_inner(
         reconciliation: None,
         message,
     };
-    let Some((ProviderType::CodeBuddyOAuth, account_id, expected_generation)) =
+    let Some((provider_type, account_id, expected_generation)) =
         execution.managed_account_identity_target()
     else {
         let message = "CodeBuddy Provider must bind one exact codebuddy_oauth Account".to_string();
@@ -1713,8 +1720,13 @@ async fn test_codebuddy_provider_inner(
         ));
     };
     let valid_account = state
-        .find_account_for_provider(ProviderType::CodeBuddyOAuth, account_id)
+        .find_account_for_provider(provider_type, account_id)
         .await
+        .filter(|_| {
+            provider_type.is_buddy_oauth()
+                && provider_type == stored.provider_type
+                && stored.provider_type.buddy_driver_id() == Some(execution.plan.driver_id.as_str())
+        })
         .filter(|account| account.auth_identity_generation == expected_generation)
         .filter(|account| !account.needs_relogin)
         .filter(|account| {
@@ -1724,9 +1736,12 @@ async fn test_codebuddy_provider_inner(
                 .is_some_and(|token| !token.trim().is_empty())
         })
         .and_then(|account| {
-            crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref())
-                .ok()
-                .map(|_| account)
+            crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+                account.provider_type,
+                account.profile.as_ref(),
+            )
+            .ok()
+            .map(|_| account)
         })
         .is_some();
     if !valid_account {
@@ -3310,11 +3325,12 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     execution
         .ensure_operation_supported(proxy::provider_ops::ProviderOperation::Discovery)
         .map_err(ApiError::proxy)?;
-    if stored.provider_type == ProviderType::CodeBuddyOAuth
-        || execution.driver_is("special.codebuddy_oauth")
+    if stored.provider_type.is_buddy_oauth()
+        || (execution.driver_is("special.codebuddy_oauth")
+            || execution.driver_is("special.workbuddy_oauth"))
     {
-        if stored.provider_type != ProviderType::CodeBuddyOAuth
-            || !execution.driver_is("special.codebuddy_oauth")
+        if !stored.provider_type.is_buddy_oauth()
+            || stored.provider_type.buddy_driver_id() != Some(execution.plan.driver_id.as_str())
         {
             return Err(ApiError::conflict(
                 "CodeBuddy model discovery ProviderType and Driver do not match",
@@ -3944,18 +3960,19 @@ pub(in crate::api) async fn fetch_provider_models_inner(
     })
 }
 
-async fn fetch_codebuddy_provider_models(
+pub(super) async fn fetch_codebuddy_provider_models(
     state: &ServerState,
     execution: &proxy::provider_ops::ProviderExecution,
     timeout_ms: Option<u64>,
 ) -> Result<ProviderModelsFetchResult, ApiError> {
-    let (ProviderType::CodeBuddyOAuth, account_id, expected_generation) =
+    ensure_provider_outbound_allowed(state, execution).await?;
+    let (provider_type, account_id, expected_generation) =
         execution.managed_account_identity_target().ok_or_else(|| {
             ApiError::bad_request(
                 "CodeBuddy model discovery requires one explicit managed Account binding",
             )
-        })?
-    else {
+        })?;
+    if !provider_type.is_buddy_oauth() || provider_type != execution.stored.provider_type {
         return Err(ApiError::bad_request(
             "CodeBuddy model discovery managed Account has the wrong ProviderType",
         ));
@@ -3983,7 +4000,7 @@ async fn fetch_codebuddy_provider_models(
                 recovery_attempted = true;
                 state
                     .refresh_managed_account_now_for_generation(
-                        ProviderType::CodeBuddyOAuth,
+                        provider_type,
                         account_id,
                         expected_generation,
                     )
@@ -4007,7 +4024,7 @@ async fn fetch_codebuddy_provider_models(
                     .map(|capability| {
                         json!({
                             "id": capability.id,
-                            "source": "codebuddy_live_model_catalog",
+                            "source": format!("{}_live_model_catalog", if provider_type == ProviderType::WorkBuddyOAuth { "workbuddy" } else { "codebuddy" }),
                             "stale": runtime.catalog.stale,
                             "capabilities": {
                                 "stream": true,
@@ -4015,7 +4032,11 @@ async fn fetch_codebuddy_provider_models(
                                 "images": false,
                                 "reasoning": capability.supports_reasoning,
                                 "reasoningEfforts": capability.reasoning_efforts,
-                                "contextWindow": capability.max_input_tokens,
+                                "contextWindow": capability.context_window,
+                                "maxInputTokens": capability.max_input_tokens,
+                                "contextWindowLengths": capability.context_window_lengths,
+                                "onlyReasoning": capability.only_reasoning,
+                                "canDisableThinking": capability.can_disable_thinking,
                                 "maxOutputTokens": capability.max_output_tokens,
                             }
                         })
@@ -4031,7 +4052,14 @@ async fn fetch_codebuddy_provider_models(
             crate::domain::codebuddy::CODEBUDDY_CONFIG_PATH
         ),
         models,
-        source: Some("codebuddy_live_model_catalog".to_string()),
+        source: Some(format!(
+            "{}_live_model_catalog",
+            if provider_type == ProviderType::WorkBuddyOAuth {
+                "workbuddy"
+            } else {
+                "codebuddy"
+            }
+        )),
         stale: Some(runtime.catalog.stale),
         fetched_at_ms: Some(runtime.catalog.fetched_at_ms),
     })
@@ -5018,6 +5046,9 @@ fn s1_provider_for_profile(
         "claude.codebuddy_oauth" | "codex.codebuddy_oauth" | "gemini.codebuddy_oauth" => {
             ("CodeBuddy OAuth", json!({}))
         }
+        "claude.workbuddy_oauth" | "codex.workbuddy_oauth" | "gemini.workbuddy_oauth" => {
+            ("WorkBuddy OAuth", json!({}))
+        }
         "claude.trae_solo" | "codex.trae_solo" | "gemini.trae_solo" => ("Trae CN Solo", json!({})),
         "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
         "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),
@@ -5527,12 +5558,21 @@ mod tests {
         base_url: String,
         app: AppKind,
     ) -> proxy::provider_ops::ProviderExecution {
+        install_buddy_execution(state, base_url, app, ProviderType::CodeBuddyOAuth).await
+    }
+
+    async fn install_buddy_execution(
+        state: &ServerState,
+        base_url: String,
+        app: AppKind,
+        product: ProviderType,
+    ) -> proxy::provider_ops::ProviderExecution {
         state
             .mutate_accounts_immediate(move |accounts| {
                 accounts.upsert(
                     serde_json::from_value(json!({
                         "id": "codebuddy-discovery-account",
-                        "providerType": "codebuddy_oauth",
+                        "providerType": product.as_str(),
                         "accessToken": "codebuddy-discovery-access",
                         "refreshToken": "codebuddy-discovery-refresh",
                         "tokenType": "Bearer",
@@ -5544,7 +5584,7 @@ mod tests {
                             "enterpriseId": "",
                             "name": "CodeBuddy fixture",
                             "clientVersion": crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION,
-                            "productPlatform": crate::domain::codebuddy::CODEBUDDY_PLATFORM
+                            "productPlatform": crate::domain::codebuddy::buddy_product_policy(product,crate::domain::codebuddy::CodeBuddySite::Intl).unwrap().auth_platform
                         },
                         "raw": {
                             "source": "fixture",
@@ -5563,11 +5603,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let profile_id = match app {
-            AppKind::Claude => "claude.codebuddy_oauth",
-            AppKind::Codex => "codex.codebuddy_oauth",
-            AppKind::Gemini => "gemini.codebuddy_oauth",
-        };
+        let profile_id = format!("{}.{}", app.as_str(), product.as_str());
         let stored = StoredProvider {
             app,
             provider: Provider {
@@ -5578,10 +5614,10 @@ mod tests {
                 }),
                 category: None,
                 meta: Some(ProviderMeta {
-                    provider_type: Some("codebuddy_oauth".to_string()),
+                    provider_type: Some(product.as_str().to_string()),
                     auth_binding: Some(AuthBinding {
                         source: Some("account_store".to_string()),
-                        auth_provider: Some("codebuddy_oauth".to_string()),
+                        auth_provider: Some(product.as_str().to_string()),
                         account_id: Some("codebuddy-discovery-account".to_string()),
                         auth_identity_generation: Some(1),
                     }),
@@ -5589,11 +5625,11 @@ mod tests {
                 }),
                 extra: Default::default(),
             },
-            provider_type: ProviderType::CodeBuddyOAuth,
-            provider_type_id: "codebuddy_oauth".to_string(),
+            provider_type: product,
+            provider_type_id: product.as_str().to_string(),
             resource: crate::domain::providers::store::ProviderResourceMetadata {
                 profile_id: Some(
-                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                    crate::domain::providers::registry::ProfileId::parse(&profile_id).unwrap(),
                 ),
                 profile_schema_revision: Some(1),
                 revision: 1,
@@ -5736,11 +5772,16 @@ mod tests {
         std::fs::remove_dir_all(config_dir).unwrap();
     }
 
-    async fn run_codebuddy_provider_test_for_app_surface(app: AppKind) {
+    async fn run_codebuddy_provider_test_for_app_surface(app: AppKind, product: ProviderType) {
         let (base_url, observations, server) = serve_codebuddy_provider_api_fixture().await;
         let state = provider_api_test_state(&format!("codebuddy-test-{}", app.as_str()));
         let config_dir = state.config_dir.clone();
-        let execution = install_codebuddy_execution(&state, base_url, app).await;
+        let expected_endpoint = if product == ProviderType::WorkBuddyOAuth {
+            "[managed WorkBuddy runtime]"
+        } else {
+            "[managed CodeBuddy runtime]"
+        };
+        let execution = install_buddy_execution(&state, base_url, app, product).await;
         let dry_run = Box::pin(test_provider_inner(
             &state,
             execution.clone(),
@@ -5757,7 +5798,7 @@ mod tests {
         .unwrap();
         assert!(dry_run.ok, "{}: {}", app.as_str(), dry_run.message);
         assert!(!dry_run.network_checked);
-        assert_eq!(dry_run.endpoint, "[managed CodeBuddy runtime]");
+        assert_eq!(dry_run.endpoint, expected_endpoint);
         assert!(dry_run.header_names.is_empty());
         assert!(observations.lock().unwrap().is_empty());
 
@@ -5783,8 +5824,8 @@ mod tests {
                 response.message
             );
             assert!(response.network_checked);
-            assert_eq!(response.driver_id, "special.codebuddy_oauth");
-            assert_eq!(response.endpoint, "[managed CodeBuddy runtime]");
+            assert_eq!(response.driver_id, product.buddy_driver_id().unwrap());
+            assert_eq!(response.endpoint, expected_endpoint);
             assert!(response.header_names.is_empty());
             assert_eq!(response.network_status_code, Some(StatusCode::OK.as_u16()));
             assert_eq!(
@@ -5819,8 +5860,10 @@ mod tests {
     #[tokio::test]
     async fn codebuddy_provider_test_is_local_on_dry_run_and_reaches_strict_driver_for_all_surfaces(
     ) {
-        for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-            run_codebuddy_provider_test_for_app_surface(app).await;
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                run_codebuddy_provider_test_for_app_surface(app, product).await;
+            }
         }
     }
 

@@ -517,6 +517,16 @@ impl AccountManager for AccountProviderDriver {
                 )));
             }
         }
+        if input.provider_type.is_buddy_oauth() {
+            if let Some(owner) = input.refresh_token.as_deref().and_then(|token| {
+                store.refresh_token_owner(input.provider_type, token, input.id.as_deref())
+            }) {
+                return Err(AccountManagerError::CredentialUnavailable(format!(
+                    "refresh token already managed by account {}; use its owning product account",
+                    owner.id
+                )));
+            }
+        }
         if input.provider_type == ProviderType::CodexOAuth {
             if let Some(refresh_token) = input
                 .refresh_token
@@ -699,6 +709,7 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
@@ -726,7 +737,7 @@ fn validate_required_account_credential(
     if input.provider_type == ProviderType::QoderCosy {
         validate_qoder_account_input(input)?;
     }
-    if input.provider_type == ProviderType::CodeBuddyOAuth {
+    if input.provider_type.is_buddy_oauth() {
         validate_codebuddy_account_input(input)?;
     }
     if input.provider_type == ProviderType::TraeSolo {
@@ -897,13 +908,18 @@ fn validate_qoder_account_input(input: &UpsertAccountInput) -> Result<(), Accoun
 }
 
 fn validate_codebuddy_account_input(input: &UpsertAccountInput) -> Result<(), AccountManagerError> {
-    crate::domain::codebuddy::CodeBuddyAccountProfile::parse(input.profile.as_ref()).map_err(
-        |error| {
-            AccountManagerError::CredentialUnavailable(format!(
-                "invalid CodeBuddy account: {error}"
-            ))
-        },
-    )?;
+    let profile = crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+        input.provider_type,
+        input.profile.as_ref(),
+    )
+    .map_err(|error| {
+        AccountManagerError::CredentialUnavailable(format!("invalid CodeBuddy account: {error}"))
+    })?;
+    if !profile.enterprise_id.trim().is_empty() {
+        return Err(AccountManagerError::CredentialUnavailable(
+            "enterprise subscriptions are not enabled for this personal-account rail".to_string(),
+        ));
+    }
     validate_fixed_oauth_token_pair(input, "CodeBuddy")?;
     if input
         .extra_headers
@@ -1003,7 +1019,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 20] {
+fn account_provider_types() -> [ProviderType; 21] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -1016,6 +1032,7 @@ fn account_provider_types() -> [ProviderType; 20] {
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
+        ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
@@ -1065,6 +1082,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
@@ -1144,6 +1162,7 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
@@ -1163,7 +1182,7 @@ pub(crate) fn account_credential_ownership(
 
 fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapability> {
     let mut flows = Vec::new();
-    if provider_type == ProviderType::CodeBuddyOAuth {
+    if provider_type.is_buddy_oauth() {
         flows.push(AccountLoginFlowCapability {
             kind: AccountLoginFlowKind::BrowserOAuth,
             supports_callback: false,
@@ -1371,6 +1390,15 @@ fn account_import_template_for(provider_type: ProviderType) -> AccountImportTemp
                 "xai-entitlement-status",
             ],
             notes: "xAI/Grok OAuth token import; native refresh is enabled when refreshToken is present",
+        },
+        ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => AccountImportTemplate {
+            provider_type,
+            credential_kind: "oauth_token_pair",
+            required_fields: vec!["providerType", "accessToken", "refreshToken", "profile.site", "profile.domain", "profile.uid"],
+            optional_fields: optional_oauth_fields.clone(),
+            profile_hints: vec!["site", "domain", "uid", "enterpriseId", "clientVersion", "productPlatform"],
+            raw_hints: vec!["observedAtMs"],
+            notes: "personal Intl/CN accounts only; product and site must be explicit, rotating tokens cannot be shared across products; desktop $wbEncrypted exports require native login instead",
         },
         _ => {
             let notes = if oauth_provider_spec(provider_type)
@@ -1799,6 +1827,12 @@ mod tests {
                 true,
             ),
             (
+                ProviderType::WorkBuddyOAuth,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
                 ProviderType::TraeSolo,
                 OAuthRefreshCapability::ProviderDynamic,
                 OAuthQuotaCapability::LiveRefresh,
@@ -1924,7 +1958,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            14
+            15
         );
         assert_eq!(
             registrations

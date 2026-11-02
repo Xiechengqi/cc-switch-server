@@ -51,7 +51,25 @@
     "intlSite": "国際",
     "loginSite": "新規ログインのサイト",
     "loginWithCodeBuddy": "CodeBuddy でログイン",
-    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。"
+    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。",
+    "importTitle": "認証情報をインポート",
+    "importHint": "選択した製品とサイトは全レコードに適用されます。UID/domain とアクセストークン・更新トークン、または account/auth 形式を貼り付けてください。プレビューはローカル検証のみで、プロバイダーには接続しません。",
+    "importError": "インポートできません。製品、サイト、トークンの組、UID を確認してください。暗号化されたデスクトップのエクスポートは通常のログインを使用してください。",
+    "previewImport": "インポートをプレビュー",
+    "applyImport": "{{count}} 件のアカウントをインポート"
+  },
+  "workBuddyOauth": {
+    "authStatus": "WorkBuddy OAuth 認証",
+    "cnSite": "中国",
+    "intlSite": "国際",
+    "loginSite": "新規ログインのサイト",
+    "loginWithCodeBuddy": "WorkBuddy でログイン",
+    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。",
+    "importTitle": "認証情報をインポート",
+    "importHint": "選択した製品とサイトは全レコードに適用されます。UID/domain とアクセストークン・更新トークン、または account/auth 形式を貼り付けてください。プレビューはローカル検証のみで、プロバイダーには接続しません。",
+    "importError": "インポートできません。製品、サイト、トークンの組、UID を確認してください。暗号化されたデスクトップのエクスポートは通常のログインを使用してください。",
+    "previewImport": "インポートをプレビュー",
+    "applyImport": "{{count}} 件のアカウントをインポート"
   },
   "codexBankedReset": {
     "needsReconcile": "交換結果の照合が必要です。新しい券を自動消費せず、共有週次枠のリセットは未確認です。",

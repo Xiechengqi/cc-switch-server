@@ -550,17 +550,30 @@ pub fn app_router(state: ServerState) -> Router {
             "/api/accounts/qoder/device/cancel",
             post(cancel_qoder_device_login),
         )
+        .route("/api/accounts/buddy/import", post(import_buddy_credentials))
         .route(
             "/api/accounts/codebuddy/login/start",
             post(start_codebuddy_login),
+        )
+        .route(
+            "/api/accounts/workbuddy/login/start",
+            post(start_workbuddy_login),
         )
         .route(
             "/api/accounts/codebuddy/login/poll",
             post(poll_codebuddy_login),
         )
         .route(
+            "/api/accounts/workbuddy/login/poll",
+            post(poll_workbuddy_login),
+        )
+        .route(
             "/api/accounts/codebuddy/login/cancel",
             post(cancel_codebuddy_login),
+        )
+        .route(
+            "/api/accounts/workbuddy/login/cancel",
+            post(cancel_workbuddy_login),
         )
         .route("/api/accounts/trae/login/start", post(start_trae_login))
         .route("/api/accounts/trae/login/status", post(trae_login_status))
@@ -1472,6 +1485,49 @@ async fn proxy_models_for_selection(
     provider_id: Option<&str>,
 ) -> Result<Json<OpenAiModelsResponse>, ApiError> {
     let providers = state.providers.read().await.clone();
+    // Discovery and generation share the same exact managed-account catalog.
+    // Never expose configured aliases when entitlement could not be verified.
+    if let Some(provider) = providers.providers.iter().find(|provider| {
+        provider.provider_type.is_buddy_oauth()
+            && app == Some(provider.app)
+            && provider_id == Some(provider.provider.id.as_str())
+    }) {
+        let execution = proxy::provider_ops::ProviderExecution::from_store_for_operation(
+            &providers,
+            provider.clone(),
+        )
+        .map_err(ApiError::proxy)?;
+        let catalog = providers::fetch_codebuddy_provider_models(state, &execution, None).await?;
+        let data = catalog
+            .models
+            .into_iter()
+            .map(|model| {
+                let capability = &model.raw["capabilities"];
+                OpenAiModel {
+                    id: model.id,
+                    object: "model",
+                    owned_by: model_owner(provider),
+                    reasoning_efforts: capability["reasoningEfforts"].as_array().map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect()
+                    }),
+                    input_modalities: Some(vec!["text".to_string()]),
+                    context_window: capability["contextWindow"].as_u64(),
+                    max_output_tokens: capability["maxOutputTokens"].as_u64(),
+                    supports_tools: capability["tools"].as_bool(),
+                }
+            })
+            .collect();
+        return Ok(Json(OpenAiModelsResponse {
+            object: "list",
+            data,
+            source: catalog.source,
+            stale: catalog.stale,
+            fetched_at_ms: catalog.fetched_at_ms,
+        }));
+    }
     let mut data = openai_model_list(&providers.providers, app, provider_id);
     let claude_catalog = resolve_claude_catalog_provider(&providers, app, provider_id)
         .map(|_| crate::clients::oauth::claude_models::static_claude_model_catalog());
@@ -1534,6 +1590,7 @@ async fn proxy_models_for_selection(
                     input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
                     context_window: None,
                     supports_tools: None,
+                    max_output_tokens: None,
                 });
             }
         }
@@ -1598,6 +1655,7 @@ async fn proxy_models_for_selection(
                     }),
                     context_window: descriptor.max_input_tokens,
                     supports_tools: None,
+                    max_output_tokens: None,
                 });
             }
         }
@@ -1629,6 +1687,7 @@ async fn proxy_models_for_selection(
                     input_modalities: None,
                     context_window: None,
                     supports_tools: None,
+                    max_output_tokens: None,
                 });
             }
         }
@@ -1748,6 +1807,7 @@ async fn append_trae_models(
             .pointer("/capabilities/tools")
             .and_then(Value::as_bool);
         data.push(OpenAiModel {
+            max_output_tokens: None,
             id: model.id,
             object: "model",
             owned_by: owner.clone(),
@@ -1846,6 +1906,7 @@ async fn append_qoder_models(
                 input_modalities: Some(model.route.input_modalities),
                 context_window: model.route.max_input_tokens,
                 supports_tools: Some(model.route.supports_tools),
+                max_output_tokens: None,
             }),
     );
     data.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1965,6 +2026,7 @@ async fn append_kimi_models(
                 input_modalities: None,
                 context_window: None,
                 supports_tools: None,
+                max_output_tokens: None,
             }),
     );
     data.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2140,6 +2202,7 @@ async fn append_cursor_api_key_models(
                     input_modalities: None,
                     context_window: None,
                     supports_tools: None,
+                    max_output_tokens: None,
                 });
             }
         }
@@ -5839,6 +5902,7 @@ mod grok_catalog_provider_tests {
         );
         server.abort();
     }
+    include!("buddy_catalog_tests.rs");
 }
 
 async fn web_runtime_context(

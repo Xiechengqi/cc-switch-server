@@ -85,6 +85,14 @@
         "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
         "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
       }
+    },
+    {
+      "driverId": "special.workbuddy_oauth",
+      "operations": {
+        "forward": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "test": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []},
+        "discovery": {"verificationLevel": "fixture_verified", "liveState": "live_pending", "receipts": []}
+      }
     }
   ]
 }

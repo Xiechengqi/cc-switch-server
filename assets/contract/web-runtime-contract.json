@@ -491,6 +491,13 @@
       "notes": "Selects a Codex ChatGPT Account-ID only from organizations verified in the account token claims. Accounts reserved by a Share require a paused Share plus shareId and expectedConfigRevision so Account, Provider binding generation, and Share history advance together."
     },
     {
+      "name": "auth_import_buddy",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Server-native credential preview or atomic import with explicit product/site, 1-32 entries; only reviewed fields survive and encrypted exports are rejected."
+    },
+    {
       "name": "auth_start_login",
       "support": "shim",
       "implemented": true,

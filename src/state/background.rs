@@ -1325,6 +1325,7 @@ pub(super) fn account_quota_refresh_candidate(accounts: &AccountStore, account: 
         | ProviderType::GrokOAuth
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::KimiCode
         | ProviderType::OllamaCloud => {
             account

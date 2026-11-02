@@ -1,3 +1,4 @@
+pub mod buddy_import;
 pub mod capability_evidence;
 pub mod claude_quota;
 pub mod claude_subscription;

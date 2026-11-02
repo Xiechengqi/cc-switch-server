@@ -185,6 +185,7 @@ pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
             | ProviderType::AmazonQOAuth
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
     ) {
         return true;
@@ -415,7 +416,7 @@ where
         )
         .await;
     }
-    if account.provider_type == ProviderType::CodeBuddyOAuth {
+    if account.provider_type.is_buddy_oauth() {
         return crate::clients::oauth::codebuddy::refresh_codebuddy_account(
             http,
             account,
@@ -697,7 +698,7 @@ pub async fn validate_native_account_refresh_receipt(
         update =
             crate::clients::oauth::qoder::complete_qoder_refresh_receipt(http, account, update)
                 .await?;
-    } else if account.provider_type == ProviderType::CodeBuddyOAuth {
+    } else if account.provider_type.is_buddy_oauth() {
         update = crate::clients::oauth::codebuddy::complete_codebuddy_refresh_receipt(
             http, account, update,
         )

@@ -54,8 +54,8 @@ pub(in crate::api) fn gemini_model_from_openai(model: OpenAiModel) -> GeminiMode
         version: "001".to_string(),
         display_name: id.clone(),
         description: format!("cc-switch provider model {id}"),
-        input_token_limit: 1_048_576,
-        output_token_limit: 65_536,
+        input_token_limit: model.context_window,
+        output_token_limit: model.max_output_tokens,
         supported_generation_methods: vec![
             "generateContent".to_string(),
             "streamGenerateContent".to_string(),
@@ -191,6 +191,7 @@ pub(in crate::api) fn openai_model_list(
                     .and_then(|capability| capability.context_window)
                     .or_else(|| claude_capability.map(|capability| capability.context_window)),
                 supports_tools: claude_capability.map(|_| true),
+                max_output_tokens: None,
             });
         }
     }
@@ -355,6 +356,7 @@ mod tests {
             input_modalities: None,
             context_window: None,
             supports_tools: None,
+            max_output_tokens: None,
         });
 
         assert_eq!(model.name, "models/gemini-2.5-pro");

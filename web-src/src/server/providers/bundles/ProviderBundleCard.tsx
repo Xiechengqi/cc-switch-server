@@ -85,7 +85,7 @@ function BundleQuotaSummary({
   if (quotaSource === "claude_oauth") {
     return <ClaudeOauthQuotaFooter meta={provider.meta} inline />;
   }
-  if (quotaSource === "codebuddy_oauth") {
+  if (quotaSource === "codebuddy_oauth" || quotaSource === "workbuddy_oauth") {
     return <CodeBuddyOauthQuotaFooter meta={provider.meta} inline />;
   }
   if (quotaSource === "google_gemini_oauth") {

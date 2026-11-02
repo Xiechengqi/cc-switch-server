@@ -806,7 +806,7 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             refresh_capability: OAuthRefreshCapability::ProviderDynamic,
             quota_capability: OAuthQuotaCapability::LiveRefresh,
         }),
-        ProviderType::CodeBuddyOAuth => Some(OAuthProviderSpec {
+        ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => Some(OAuthProviderSpec {
             provider_type,
             stage: OAuthSupportStage::NativeRefreshProfile,
             authorize_url: None,
@@ -900,6 +900,7 @@ pub fn oauth_specs() -> Vec<OAuthProviderSpec> {
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
+        ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,

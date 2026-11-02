@@ -172,6 +172,7 @@ export type ProviderQuotaSource =
   | "cursor_apikey"
   | "kiro_oauth"
   | "codebuddy_oauth"
+  | "workbuddy_oauth"
   | "ollama_cloud"
   | "official"
   | "none";
@@ -221,6 +222,10 @@ export function getProviderQuotaSource(
 
   if (provider.meta?.providerType === PROVIDER_TYPES.KIRO_OAUTH) {
     return "kiro_oauth";
+  }
+
+  if (provider.meta?.providerType === PROVIDER_TYPES.WORKBUDDY_OAUTH) {
+    return "workbuddy_oauth";
   }
 
   if (provider.meta?.providerType === PROVIDER_TYPES.CODEBUDDY_OAUTH) {

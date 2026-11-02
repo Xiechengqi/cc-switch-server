@@ -121,6 +121,7 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
+        ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
@@ -150,6 +151,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::KimiCode,
             ProviderType::QoderCosy,
             ProviderType::CodeBuddyOAuth,
+            ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
@@ -175,6 +177,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::KimiCode,
             ProviderType::QoderCosy,
             ProviderType::CodeBuddyOAuth,
+            ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
             ProviderType::KiroOAuth,
             ProviderType::AmazonQOAuth,
@@ -204,6 +207,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::KimiCode,
             ProviderType::QoderCosy,
             ProviderType::CodeBuddyOAuth,
+            ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
         ],
     }
@@ -274,6 +278,7 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
@@ -299,6 +304,7 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::KimiCode => Some("https://kimi.com"),
         ProviderType::QoderCosy => Some("https://qoder.com"),
         ProviderType::CodeBuddyOAuth => Some("https://www.codebuddy.ai"),
+        ProviderType::WorkBuddyOAuth => Some("https://www.workbuddy.ai"),
         ProviderType::TraeSolo => Some("https://www.trae.cn"),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
@@ -328,6 +334,7 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::KimiCode => "Kimi OAuth",
         ProviderType::QoderCosy => "Qoder OAuth",
         ProviderType::CodeBuddyOAuth => "CodeBuddy",
+        ProviderType::WorkBuddyOAuth => "WorkBuddy",
         ProviderType::TraeSolo => "Trae CN Solo",
         ProviderType::CursorOAuth => "Cursor OAuth",
         ProviderType::CursorApiKey => "Cursor API Key",
@@ -448,6 +455,13 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
+        ProviderType::WorkBuddyOAuth => ProviderDefaults {
+            base_url: "https://www.workbuddy.ai",
+            api_format: "openai_chat",
+            model: "auto",
+            key: "ANTHROPIC_AUTH_TOKEN",
+            aws_region: None,
+        },
         ProviderType::TraeSolo => ProviderDefaults {
             base_url: "https://trae-api-cn.mchost.guru",
             api_format: "openai_chat",
@@ -542,7 +556,10 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
         | ProviderType::KiroOAuth
         | ProviderType::AmazonQOAuth => &["ANTHROPIC_AUTH_TOKEN"],
         ProviderType::KimiCode => &["OPENAI_BASE_URL"],
-        ProviderType::QoderCosy | ProviderType::CodeBuddyOAuth | ProviderType::TraeSolo => &[],
+        ProviderType::QoderCosy
+        | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
+        | ProviderType::TraeSolo => &[],
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             &["OPENAI_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
         }
@@ -584,6 +601,7 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
@@ -605,6 +623,7 @@ fn account_supported(provider_type: ProviderType) -> bool {
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
@@ -635,6 +654,7 @@ fn managed_account_recommended(provider_type: ProviderType) -> bool {
             | ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
@@ -669,7 +689,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         (_, ProviderType::QoderCosy) => {
             "Qoder COSY uses one explicitly bound managed account and a site-frozen signed driver; real-account acceptance remains external"
         }
-        (_, ProviderType::CodeBuddyOAuth) => {
+        (_, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             "CodeBuddy uses one explicitly bound managed account and immutable Intl/CN site identity; real-account acceptance remains external"
         }
         (_, ProviderType::TraeSolo) => {

@@ -5,6 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::Account;
+use crate::domain::providers::model::ProviderType;
 
 pub const CODEBUDDY_CLIENT_VERSION: &str = "2.142.0";
 pub const CODEBUDDY_PLATFORM: &str = "CLI";
@@ -24,6 +25,82 @@ pub const CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH: &str =
 pub const CODEBUDDY_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
 pub const CODEBUDDY_SESSION_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const CODEBUDDY_SESSION_REFRESH_JITTER_MS: i64 = 30 * 60 * 1_000;
+
+/// The active, evidence-gated transport identity. WorkBuddy's native login
+/// does not by itself authorize switching its catalog or inference to Desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuddyClientIdentity {
+    CodeBuddyCli,
+    WorkBuddyCli,
+}
+
+impl BuddyClientIdentity {
+    pub const fn version(self) -> &'static str {
+        match self {
+            Self::CodeBuddyCli | Self::WorkBuddyCli => CODEBUDDY_CLIENT_VERSION,
+        }
+    }
+
+    pub const fn user_agent(self) -> &'static str {
+        match self {
+            Self::CodeBuddyCli | Self::WorkBuddyCli => "CLI/2.142.0 CodeBuddy/2.142.0",
+        }
+    }
+
+    pub const fn revision(self) -> &'static str {
+        match self {
+            Self::CodeBuddyCli => "codebuddy:cli:2.142.0:v1",
+            Self::WorkBuddyCli => "workbuddy:cli:2.142.0:v1",
+        }
+    }
+
+    pub const fn catalog_agent(self) -> &'static str {
+        "cli"
+    }
+}
+
+/// Server-owned product policy. Auth identity is independent from the CLI
+/// generation identity: tokens from two products are never merged by domain.
+#[derive(Debug, Clone, Copy)]
+pub struct BuddyProductPolicy {
+    pub auth_platform: &'static str,
+    pub control_endpoint: &'static str,
+    pub generation_endpoint: &'static str,
+    pub refresh_source: &'static str,
+    pub client_identity: BuddyClientIdentity,
+}
+
+pub fn buddy_product_policy(
+    provider_type: ProviderType,
+    site: CodeBuddySite,
+) -> Result<BuddyProductPolicy, String> {
+    match provider_type {
+        ProviderType::CodeBuddyOAuth => Ok(BuddyProductPolicy {
+            auth_platform: CODEBUDDY_PLATFORM,
+            control_endpoint: site.profile().endpoint,
+            generation_endpoint: site.profile().endpoint,
+            refresh_source: "plugin",
+            client_identity: BuddyClientIdentity::CodeBuddyCli,
+        }),
+        ProviderType::WorkBuddyOAuth => Ok(BuddyProductPolicy {
+            auth_platform: match site {
+                CodeBuddySite::Cn => "workbuddy",
+                CodeBuddySite::Intl => "workbuddy-ai",
+            },
+            control_endpoint: match site {
+                CodeBuddySite::Cn => "https://www.codebuddy.cn",
+                CodeBuddySite::Intl => "https://www.workbuddy.ai",
+            },
+            generation_endpoint: match site {
+                CodeBuddySite::Cn => "https://copilot.tencent.com",
+                CodeBuddySite::Intl => "https://www.workbuddy.ai",
+            },
+            refresh_source: "plugin",
+            client_identity: BuddyClientIdentity::WorkBuddyCli,
+        }),
+        _ => Err("expected CodeBuddy or WorkBuddy account".to_string()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +238,10 @@ fn default_platform() -> String {
 
 impl CodeBuddyAccountProfile {
     pub fn parse(value: Option<&Value>) -> Result<Self, String> {
+        Self::parse_for(ProviderType::CodeBuddyOAuth, value)
+    }
+
+    pub fn parse_for(provider_type: ProviderType, value: Option<&Value>) -> Result<Self, String> {
         let value = value
             .and_then(Value::as_object)
             .ok_or_else(|| "CodeBuddy account profile must be an object".to_string())?;
@@ -207,19 +288,37 @@ impl CodeBuddyAccountProfile {
                 profile.client_version
             },
             product_platform: if profile.product_platform.is_empty() {
-                default_platform()
+                buddy_product_policy(provider_type, site)?
+                    .auth_platform
+                    .to_string()
             } else {
                 profile.product_platform
             },
             ..profile
         };
-        profile.validate()?;
+        profile.validate_for(provider_type)?;
         Ok(profile)
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_for(ProviderType::CodeBuddyOAuth)
+    }
+
+    pub fn validate_for(&self, provider_type: ProviderType) -> Result<(), String> {
+        let policy = buddy_product_policy(provider_type, self.site)?;
         if self.uid.trim().is_empty() {
             return Err("CodeBuddy account profile is missing uid".to_string());
+        }
+        for value in [
+            &self.uid,
+            &self.enterprise_id,
+            &self.name,
+            &self.email,
+            &self.nickname,
+        ] {
+            if value.len() > 512 || value.chars().any(char::is_control) {
+                return Err("Buddy account profile contains an invalid identity field".to_string());
+            }
         }
         if self.site.canonical_token_domain(&self.domain).as_deref() != Some(self.domain.as_str()) {
             return Err(format!(
@@ -227,13 +326,18 @@ impl CodeBuddyAccountProfile {
                 self.site.as_str()
             ));
         }
-        if self.client_version.trim() != CODEBUDDY_CLIENT_VERSION {
+        if self.client_version.trim() != policy.client_identity.version() {
             return Err(format!(
-                "CodeBuddy clientVersion must be the reviewed {CODEBUDDY_CLIENT_VERSION} identity"
+                "Buddy clientVersion must be the reviewed {} identity",
+                policy.client_identity.version()
             ));
         }
-        if self.product_platform.trim() != CODEBUDDY_PLATFORM {
-            return Err("CodeBuddy productPlatform must be CLI".to_string());
+        if self.product_platform.trim() != policy.auth_platform {
+            return Err(format!(
+                "{} productPlatform must be {}",
+                provider_type.as_str(),
+                policy.auth_platform
+            ));
         }
         Ok(())
     }
@@ -252,12 +356,32 @@ pub fn codebuddy_account_id(
     uid: &str,
     enterprise_id: &str,
 ) -> Result<String, String> {
+    buddy_account_id(ProviderType::CodeBuddyOAuth, site, uid, enterprise_id)
+}
+
+pub fn buddy_account_id(
+    provider_type: ProviderType,
+    site: CodeBuddySite,
+    uid: &str,
+    enterprise_id: &str,
+) -> Result<String, String> {
+    buddy_product_policy(provider_type, site)?;
     let uid = uid.trim();
     if uid.is_empty() {
         return Err("CodeBuddy account id requires uid".to_string());
     }
     let mut digest = Sha256::new();
-    digest.update(b"cc-switch/codebuddy/account-id/v2");
+    digest.update(
+        format!(
+            "cc-switch/{}/account-id/v2",
+            if provider_type == ProviderType::WorkBuddyOAuth {
+                "workbuddy"
+            } else {
+                "codebuddy"
+            }
+        )
+        .as_bytes(),
+    );
     digest.update([0]);
     digest.update(site.as_str().as_bytes());
     digest.update([0]);
@@ -265,7 +389,15 @@ pub fn codebuddy_account_id(
     digest.update([0]);
     digest.update(enterprise_id.trim().as_bytes());
     let encoded = hex::encode(digest.finalize());
-    Ok(format!("codebuddy-{}", &encoded[..12]))
+    Ok(format!(
+        "{}-{}",
+        if provider_type == ProviderType::WorkBuddyOAuth {
+            "workbuddy"
+        } else {
+            "codebuddy"
+        },
+        &encoded[..12]
+    ))
 }
 
 pub fn codebuddy_access_token_subject(access_token: &str) -> Option<String> {
@@ -285,7 +417,7 @@ pub fn codebuddy_access_token_subject(access_token: &str) -> Option<String> {
 /// deterministic per-account jitter prevents all locally configured accounts
 /// from refreshing on the same scan without introducing account selection.
 pub fn codebuddy_session_refresh_due(account: &Account, now_ms: i64) -> bool {
-    if account.provider_type != crate::domain::providers::model::ProviderType::CodeBuddyOAuth
+    if !account.provider_type.is_buddy_oauth()
         || account.needs_relogin
         || account
             .refresh_token
@@ -483,5 +615,39 @@ mod tests {
         assert!(codebuddy_session_refresh_due(&account, 1_000_000));
         account.needs_relogin = true;
         assert!(!codebuddy_session_refresh_due(&account, i64::MAX));
+    }
+    #[test]
+    fn workbuddy_identity_is_product_and_site_scoped() {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            let policy = buddy_product_policy(ProviderType::WorkBuddyOAuth, site).unwrap();
+            let codebuddy = buddy_product_policy(ProviderType::CodeBuddyOAuth, site).unwrap();
+            assert_ne!(policy.client_identity, codebuddy.client_identity);
+            assert_ne!(
+                policy.client_identity.revision(),
+                codebuddy.client_identity.revision()
+            );
+            for identity in [policy.client_identity, codebuddy.client_identity] {
+                assert_eq!(
+                    identity.user_agent(),
+                    format!("CLI/{0} CodeBuddy/{0}", identity.version())
+                );
+                assert_eq!(identity.catalog_agent(), "cli");
+            }
+            let profile = serde_json::json!({"site":site,"domain":site.profile().domain,"uid":"shared-uid","productPlatform":policy.auth_platform});
+            assert!(CodeBuddyAccountProfile::parse_for(
+                ProviderType::WorkBuddyOAuth,
+                Some(&profile)
+            )
+            .is_ok());
+            assert!(CodeBuddyAccountProfile::parse(Some(&profile)).is_err());
+            let wb =
+                buddy_account_id(ProviderType::WorkBuddyOAuth, site, "shared-uid", "").unwrap();
+            assert!(wb.starts_with("workbuddy-"));
+            assert_ne!(wb, codebuddy_account_id(site, "shared-uid", "").unwrap());
+        }
+        assert_ne!(
+            buddy_account_id(ProviderType::WorkBuddyOAuth, CodeBuddySite::Cn, "u", "").unwrap(),
+            buddy_account_id(ProviderType::WorkBuddyOAuth, CodeBuddySite::Intl, "u", "").unwrap()
+        );
     }
 }

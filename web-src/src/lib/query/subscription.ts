@@ -306,19 +306,21 @@ export function useCodeBuddyOauthQuota(
   options: UseCodeBuddyOauthQuotaOptions = {},
 ) {
   const { enabled = true } = options;
+  const product = meta?.providerType === PROVIDER_TYPES.WORKBUDDY_OAUTH
+    ? PROVIDER_TYPES.WORKBUDDY_OAUTH : PROVIDER_TYPES.CODEBUDDY_OAUTH;
   const identity = resolveManagedAccountIdentity(
     meta,
-    PROVIDER_TYPES.CODEBUDDY_OAUTH,
+    product,
   );
   return useQuery({
     queryKey: oauthQuotaAccountKey(
-      PROVIDER_TYPES.CODEBUDDY_OAUTH,
+      product,
       identity?.accountId,
       identity?.authIdentityGeneration,
     ),
     queryFn: async () =>
       fetchOauthQuotaWithFallback(
-        PROVIDER_TYPES.CODEBUDDY_OAUTH,
+        product,
         identity!.accountId,
         meta?.providerType,
         undefined,

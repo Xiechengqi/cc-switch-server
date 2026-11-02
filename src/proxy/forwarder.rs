@@ -2247,6 +2247,7 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
                         | ProviderType::AmazonQOAuth
                         | ProviderType::QoderCosy
                         | ProviderType::CodeBuddyOAuth
+                        | ProviderType::WorkBuddyOAuth
                 )
         })
 }
@@ -2754,7 +2755,9 @@ async fn forward_with_attempt_inner(
             })
             .await;
         }
-        if execution.driver_is("special.codebuddy_oauth") {
+        if execution.driver_is("special.codebuddy_oauth")
+            || execution.driver_is("special.workbuddy_oauth")
+        {
             if !matches!(
                 route,
                 ProxyRoute::ClaudeMessages
@@ -20006,10 +20009,16 @@ async fn send_codebuddy_generation(
         ("x-codebuddy-request".to_string(), "1".to_string()),
         (
             "user-agent".to_string(),
-            format!(
-                "CLI/{0} CodeBuddy/{0}",
-                crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION
-            ),
+            crate::domain::codebuddy::buddy_product_policy(
+                execution.stored.provider_type,
+                profile.site,
+            )
+            .map_err(|message| {
+                CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_request(message))
+            })?
+            .client_identity
+            .user_agent()
+            .to_string(),
         ),
     ];
     if profile.enterprise_id.trim().is_empty() {
@@ -20106,7 +20115,8 @@ async fn send_codebuddy_generation(
             .transpose()
             .map_err(|error| CodeBuddyForwardAttemptError::Proxy(error.into_proxy_error()))?;
         return Err(CodeBuddyForwardAttemptError::Upstream(
-            super::codebuddy::CodeBuddyUpstreamError::from_status_body(status.as_u16(), &body),
+            super::codebuddy::CodeBuddyUpstreamError::from_status_body(status.as_u16(), &body)
+                .with_retry_after(response.headers()),
         ));
     }
 
@@ -20194,7 +20204,7 @@ async fn recover_codebuddy_auth(
     let (provider_type, account_id, expected_generation) = execution
         .managed_account_identity_target()
         .ok_or_else(|| ProxyError::bad_request("CodeBuddy managed account binding is missing"))?;
-    if provider_type != ProviderType::CodeBuddyOAuth {
+    if !provider_type.is_buddy_oauth() || provider_type != execution.stored.provider_type {
         return Err(ProxyError::bad_request(
             "CodeBuddy managed account binding has the wrong provider type",
         ));
@@ -20205,11 +20215,7 @@ async fn recover_codebuddy_auth(
             .await;
     }
     state
-        .refresh_managed_account_now_for_generation(
-            ProviderType::CodeBuddyOAuth,
-            account_id,
-            expected_generation,
-        )
+        .refresh_managed_account_now_for_generation(provider_type, account_id, expected_generation)
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)
 }
@@ -26642,6 +26648,7 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {

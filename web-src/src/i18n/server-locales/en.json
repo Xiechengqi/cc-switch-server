@@ -51,7 +51,25 @@
     "intlSite": "International",
     "loginSite": "Site for new login",
     "loginWithCodeBuddy": "Sign in with CodeBuddy",
-    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors."
+    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors.",
+    "importTitle": "Import credentials",
+    "importHint": "The selected product and site apply to every entry. Paste a token pair with UID/domain or an account/auth export. Preview validates locally; it does not contact the provider.",
+    "importError": "Import failed. Check the product, site, token pair and UID; encrypted desktop exports require native login.",
+    "previewImport": "Preview import",
+    "applyImport": "Import {{count}} accounts"
+  },
+  "workBuddyOauth": {
+    "authStatus": "WorkBuddy OAuth authentication",
+    "cnSite": "China",
+    "intlSite": "International",
+    "loginSite": "Site for new login",
+    "loginWithCodeBuddy": "Sign in with WorkBuddy",
+    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors.",
+    "importTitle": "Import credentials",
+    "importHint": "The selected product and site apply to every entry. Paste a token pair with UID/domain or an account/auth export. Preview validates locally; it does not contact the provider.",
+    "importError": "Import failed. Check the product, site, token pair and UID; encrypted desktop exports require native login.",
+    "previewImport": "Preview import",
+    "applyImport": "Import {{count}} accounts"
   },
   "codexBankedReset": {
     "needsReconcile": "The outcome needs reconciliation. No new credit will be consumed automatically; the shared weekly reset has not been confirmed.",

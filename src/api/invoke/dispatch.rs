@@ -1163,6 +1163,11 @@ async fn web_invoke_dispatch(
                 .collect::<Vec<_>>();
             Ok(json!(mapped))
         }
+        "auth_import_buddy" => {
+            let input = serde_json::from_value(args.clone()).map_err(ApiError::bad_request)?;
+            let response = import_buddy_credentials(State(state.clone()), headers.clone(), Json(input)).await?.0;
+            Ok(json!(response))
+        }
         "auth_start_login" => {
             web_managed_auth_start_login(state.clone(), headers.clone(), &args).await
         }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::coding_plan::CodingPlanProfileSpec;
 use super::model::{AppKind, ProviderType};
 
-pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 9;
+pub const PROVIDER_REGISTRY_SCHEMA_VERSION: u32 = 10;
 pub const PROVIDER_REGISTRY_FORMAT: &str = "cc-switch-provider-registry";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -365,6 +365,7 @@ pub enum ManagedIdentityFamily {
     KimiCli,
     Qoder,
     Codebuddy,
+    Workbuddy,
     Trae,
     Kiro,
     AmazonQCli,
@@ -1542,18 +1543,20 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 45] = [
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
     "claude.qoder_cosy",
     "claude.codebuddy_oauth",
+    "claude.workbuddy_oauth",
     "claude.trae_solo",
     "codex.github_copilot",
     "codex.kiro_oauth",
     "codex.kimi_code",
     "codex.qoder_cosy",
     "codex.codebuddy_oauth",
+    "codex.workbuddy_oauth",
     "codex.trae_solo",
     "codex.openai_api_key",
     "gemini.google_api_key",
@@ -1561,6 +1564,7 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 45] = [
     "gemini.kimi_code",
     "gemini.qoder_cosy",
     "gemini.codebuddy_oauth",
+    "gemini.workbuddy_oauth",
     "gemini.trae_solo",
     "gemini.cursor_api_key",
     "gemini.cursor_oauth",
@@ -1599,8 +1603,8 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.families.len(), 36);
-        assert_eq!(registry.profiles.len(), 82);
+        assert_eq!(registry.families.len(), 37);
+        assert_eq!(registry.profiles.len(), 85);
         assert_eq!(registry.legacy_preset_mappings.len(), 31);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
@@ -1790,12 +1794,15 @@ mod tests {
             (ProviderType::CodeBuddyOAuth, AppKind::Claude),
             (ProviderType::CodeBuddyOAuth, AppKind::Codex),
             (ProviderType::CodeBuddyOAuth, AppKind::Gemini),
+            (ProviderType::WorkBuddyOAuth, AppKind::Claude),
+            (ProviderType::WorkBuddyOAuth, AppKind::Codex),
+            (ProviderType::WorkBuddyOAuth, AppKind::Gemini),
             (ProviderType::TraeSolo, AppKind::Claude),
             (ProviderType::TraeSolo, AppKind::Codex),
             (ProviderType::TraeSolo, AppKind::Gemini),
         ];
 
-        assert_eq!(required.len(), 50);
+        assert_eq!(required.len(), 53);
 
         for (provider_type, app) in required {
             let profiles = provider_registry()

@@ -1,5 +1,25 @@
 # Protocol evidence policy
 
+## 2026-11-02 Buddy 既有反代能力增量补强（magpie）
+
+只读参考固定为 `magpie@834c6c7dfe6a6c1dc8c98fb2141105962908377f`，其 `internal/provider/migrate_workbuddy.go` 要求社区 WorkBuddy 插件最低 `0.2.11`。插件源码固定提交 `486a68a54f7300e230023322bb1deb7d952fc310` 的 `packages/workbuddy/index.mjs`，SHA-256 为 `e96bdfb39faac4c975aa1020b1d5340d1265614864a731d58dbfbfc0c721ed96`。外部代码只作本次协议证据，不进入构建、测试或运行依赖；magpie 的 `internal/agent/codebuddy.go` 是下游客户端配置，不是独立 CodeBuddy 订阅上游。
+
+本轮只补强已有 OAuth、目录、Chat 桥接、工具、错误、套餐和内存边界。参考的 `systemOn` 提供输出上限字段拼写证据，但其中正文/角色改写不迁入；`fitShape` 只取保持 JSON Schema 约束的变换，不删除空 enum 或放宽 tuple/联合；`explained`、magpie 的 `WBRestricted` 与带时区重置测试提供业务错误证据；`packagesOf`、`endOf`、`cycleOf` 提供套餐分页和失效/重置的分离证据。
+
+WorkBuddy Desktop 5.9.3 / CLI 2.165.0 的完整身份和两站账单 UTC+8 查询窗口来自参考源码及其测量记录，尚无本 Server 的真实联合回执。活跃策略保持各产品现有受审 CLI 2.142.0 通道与 origin，分别建模并纳入身份指纹；不自动启用参考 Desktop 头、变更认证 origin 或推断新模型权益。目录只取实际 CLI 通道，不能合并其他客户端的 agents 权益。CodeBuddy 和 WorkBuddy 的真实身份接受性分别保持 `live_pending`。
+
+不新增原生 Messages 上游、API Key、企业、搜索、图像、免费模型策略、签到、账号调度、gzip 或跨请求会话映射。既有单账号/单站点、一次输出提交前 401 恢复、唯一 DONE+EOF、取消和请求生命周期内存合同继续成立。
+
+## 2026-11-02 CodeBuddy / WorkBuddy 独立产品与协议增强
+
+本次研究按 `/data/projects/proxy/CodeBuddy/AGENTS.md` 重新检查四个参考的已提交代码：`cli2api@fb2eb35`（推理、目录、错误分类）、`workbuddy-switch@22b318c`（原生 OAuth、刷新、套餐和官方用量）、`workbuddy-cliproxy@6528fdc` 与 `codebuddy2openai@8804ad6`（交叉证据）。未跟踪文档排除；这些工作区不成为任何构建或运行输入。
+
+CodeBuddy 与 WorkBuddy 是独立产品，产品身份与 Intl/CN 站点是两个维度。新增 `workbuddy_oauth`、独立 Family / 三 App Profile / Driver / Account 命名空间，不迁移既有 CodeBuddy 账号。原生登录平台为 CN `workbuddy`、Intl `workbuddy-ai`；刷新固定 `plugin`（switch 的原生控制面证据），推理使用受审 CLI 通道。相同 UID 不合并；同一旋转 refresh token 禁止跨类型重复拥有。不引入账号池、fallback 或桌面 Agent 编排。
+
+CodeBuddy 的公开模型发现应复用管理面的精确绑定实时目录；成功空目录权威，认证/协议错误不能借静态配置或 stale 放行。官方用量接口可能把数据和 total 同时截断到最早 3000 条，不能按 total 判完整：满页保持 pageNum=1、按最大时间推进 inclusive startTime 并去重，停滞/坏时间/安全上限失败关闭。`11148` 属客户端工具历史错误；限流保留 Retry-After / 合法未来重置时间，不罚供应商健康或触发认证恢复。
+
+模型能力仅从实时目录取值，保留 onlyReasoning / canDisableThinking / contextWindow 与输出上限；不主动提高用户 reasoning effort，不凭参考名称猜测 wire profile。新 CLI / Desktop 身份与 `deepseek-v4.1-flash` 仍需双站真实回执，原 CB-N4 门禁不变。原生 WorkBuddy 登录与 CLI 推理的联合真实接受性仍为 `live_pending`；本次本地 fixture 不构成真实厂商通过。
+
 ## 2026-10-30 Custom 认证推荐与草稿预检
 
 本次只核对本仓库 Registry、Custom 转发和分享代码，不引入外部项目或域名特例。Registry v9 为每个 Custom policy 声明初始协议及各协议推荐认证，推荐必须唯一解析到允许的 Driver；OpenAI Chat/Responses 推荐 Bearer、Anthropic/Gemini 推荐各自 API-key header。推荐是编辑意图，落盘仍为明确的协议/认证绑定，重新打开配置时保留已保存方式，不新增运行时猜测或 S2 数据格式迁移。

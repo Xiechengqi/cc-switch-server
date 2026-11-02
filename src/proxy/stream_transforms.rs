@@ -106,7 +106,7 @@ impl StreamEventTransformer {
                 // CodeBuddy emits finish_reason before its separate usage tail.
                 // Hold the Anthropic terminal until that tail (or [DONE]) so
                 // cache metering is not committed as zero.
-                let state = if stored.provider_type == ProviderType::CodeBuddyOAuth {
+                let state = if stored.provider_type.is_buddy_oauth() {
                     ChatAnthropicState::deferred_terminal()
                 } else {
                     ChatAnthropicState::default()

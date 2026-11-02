@@ -2522,6 +2522,7 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::AmazonQOAuth => "amazon_q_oauth",
         ProviderType::QoderCosy => "qoder_cosy",
         ProviderType::CodeBuddyOAuth => "codebuddy_oauth",
+        ProviderType::WorkBuddyOAuth => "workbuddy_oauth",
         ProviderType::TraeSolo => "trae_solo",
         ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
@@ -3064,17 +3065,24 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 "site": response.device.site,
             }))
         }
-        ProviderType::CodeBuddyOAuth => {
+        ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
             let site = crate::domain::codebuddy::CodeBuddySite::parse(
                 web_optional_string_any(
                     args,
-                    &["codeBuddySite", "codebuddySite", "codebuddy_site", "site"],
+                    &[
+                        "workBuddySite",
+                        "codeBuddySite",
+                        "codebuddySite",
+                        "codebuddy_site",
+                        "site",
+                    ],
                 )
                 .as_deref()
                 .unwrap_or("intl"),
             )
             .map_err(ApiError::bad_request)?;
-            let response = start_codebuddy_login(
+            let response = start_buddy_login(
+                provider_type,
                 State(state),
                 headers,
                 Json(StartCodeBuddyLoginRequest {
@@ -3287,8 +3295,9 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
-        ProviderType::CodeBuddyOAuth => {
-            let response = poll_codebuddy_login(
+        ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
+            let response = poll_buddy_login(
+                provider_type,
                 State(state.clone()),
                 headers,
                 Json(PollCodeBuddyLoginRequest {
@@ -3452,8 +3461,9 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
         .0;
         return Ok(json!(response));
     }
-    if provider_type == ProviderType::CodeBuddyOAuth {
-        let response = cancel_codebuddy_login(
+    if provider_type.is_buddy_oauth() {
+        let response = cancel_buddy_login(
+            provider_type,
             State(state),
             headers,
             Json(CancelCodeBuddyLoginRequest {

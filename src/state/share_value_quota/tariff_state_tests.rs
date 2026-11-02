@@ -3,6 +3,7 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
     use crate::domain::usage::value_pricing::PricingSnapshot;
     use crate::repository::server_sqlite::{self, value_quota as ledger};
     let state = test_state();
+    server_sqlite::activate_authority(&state.config_dir).unwrap();
     state
         .configure_value_quota_router_for_test("coverage-server")
         .await;
@@ -29,7 +30,6 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
         })
         .await
         .unwrap();
-    server_sqlite::activate_authority(&state.config_dir).unwrap();
     let config = state.config_snapshot().await;
     let scope = ledger::Scope {
         router_url: config.router_api_base().unwrap().into(),
@@ -110,20 +110,30 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
             .user_grants
             .insert("user@example.test".into(), grant.clone());
     };
-    assert!(state
-        .mutate_shares_immediate(insert_grant)
-        .await
-        .unwrap_err()
-        .to_string()
-        .starts_with("VALUE_QUOTA_PRICE_COVERAGE:"));
-    assert!(state
+    let previous_grants = state
         .shares
         .read()
         .await
         .get("coverage-share")
         .unwrap()
         .user_grants
-        .is_empty());
+        .clone();
+    assert!(state
+        .mutate_shares_immediate(insert_grant)
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("VALUE_QUOTA_PRICE_COVERAGE:"));
+    assert_eq!(
+        state
+            .shares
+            .read()
+            .await
+            .get("coverage-share")
+            .unwrap()
+            .user_grants,
+        previous_grants
+    );
     // Activation is local, with no Router call or heartbeat.
     ledger::schedule_tariff(
         &state.config_dir,

@@ -53,6 +53,8 @@ pub enum ProviderType {
     QoderCosy,
     #[serde(rename = "codebuddy_oauth")]
     CodeBuddyOAuth,
+    #[serde(rename = "workbuddy_oauth")]
+    WorkBuddyOAuth,
     #[serde(rename = "trae_solo")]
     TraeSolo,
     #[serde(rename = "cursor_oauth")]
@@ -76,6 +78,18 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    pub const fn is_buddy_oauth(self) -> bool {
+        matches!(self, Self::CodeBuddyOAuth | Self::WorkBuddyOAuth)
+    }
+
+    pub const fn buddy_driver_id(self) -> Option<&'static str> {
+        match self {
+            Self::CodeBuddyOAuth => Some("special.codebuddy_oauth"),
+            Self::WorkBuddyOAuth => Some("special.workbuddy_oauth"),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -93,6 +107,7 @@ impl ProviderType {
             Self::KimiCode => "kimi_code",
             Self::QoderCosy => "qoder_cosy",
             Self::CodeBuddyOAuth => "codebuddy_oauth",
+            Self::WorkBuddyOAuth => "workbuddy_oauth",
             Self::TraeSolo => "trae_solo",
             Self::CursorOAuth => "cursor_oauth",
             Self::CursorApiKey => "cursor_apikey",
@@ -277,6 +292,7 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("kimi_code") => return ProviderType::KimiCode,
         Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
+        Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => return ProviderType::TraeSolo,
         Some("cursor_oauth") => return ProviderType::CursorOAuth,
         Some("cursor_apikey") => return ProviderType::CursorApiKey,
@@ -327,6 +343,7 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("kimi_code") => ProviderType::KimiCode,
         Some("qoder_cosy") => ProviderType::QoderCosy,
         Some("codebuddy_oauth") => ProviderType::CodeBuddyOAuth,
+        Some("workbuddy_oauth") => ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => ProviderType::TraeSolo,
         Some("kiro_oauth") => ProviderType::KiroOAuth,
         Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => ProviderType::AmazonQOAuth,
@@ -369,6 +386,7 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("kimi_code") => return ProviderType::KimiCode,
         Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
+        Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => return ProviderType::TraeSolo,
         Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => {
             return ProviderType::AmazonQOAuth

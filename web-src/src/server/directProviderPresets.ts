@@ -159,6 +159,21 @@ export const serverProviderPresets: Readonly<
     },
     "category": "official"
   },
+  "claude.workbuddy_oauth": {
+    "name": "WorkBuddy OAuth",
+    "websiteUrl": "https://www.workbuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "ANTHROPIC_MODEL": "auto"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      }
+    },
+    "category": "official"
+  },
   "claude.trae_solo": {
     "name": "Trae CN Solo",
     "websiteUrl": "https://www.trae.cn",
@@ -646,6 +661,23 @@ export const serverProviderPresets: Readonly<
   "codex.codebuddy_oauth": {
     "name": "CodeBuddy OAuth",
     "websiteUrl": "https://www.codebuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "auth": {},
+      "config": "",
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      },
+      "env": {
+        "OPENAI_MODEL": "auto"
+      }
+    },
+    "category": "official"
+  },
+  "codex.workbuddy_oauth": {
+    "name": "WorkBuddy OAuth",
+    "websiteUrl": "https://www.workbuddy.ai",
     "notes": "",
     "settingsConfig": {
       "auth": {},
@@ -1157,6 +1189,21 @@ export const serverProviderPresets: Readonly<
   "gemini.codebuddy_oauth": {
     "name": "CodeBuddy OAuth",
     "websiteUrl": "https://www.codebuddy.ai",
+    "notes": "",
+    "settingsConfig": {
+      "env": {
+        "GEMINI_MODEL": "auto"
+      },
+      "modelMapping": {
+        "mode": "single",
+        "upstreamModel": "auto"
+      }
+    },
+    "category": "official"
+  },
+  "gemini.workbuddy_oauth": {
+    "name": "WorkBuddy OAuth",
+    "websiteUrl": "https://www.workbuddy.ai",
     "notes": "",
     "settingsConfig": {
       "env": {

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -16,14 +16,16 @@ use url::Url;
 use crate::domain::accounts::oauth::{merge_account_refresh_raw, OAuthErrorKind};
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
 use crate::domain::codebuddy::{
-    codebuddy_access_token_subject, codebuddy_account_id, CodeBuddyAccountProfile, CodeBuddySite,
-    CODEBUDDY_ACCOUNTS_PATH, CODEBUDDY_AUTH_STATE_PATH, CODEBUDDY_AUTH_TOKEN_PATH,
-    CODEBUDDY_CLIENT_VERSION, CODEBUDDY_CONFIG_PATH, CODEBUDDY_LOGIN_ACCOUNT_PATH,
-    CODEBUDDY_PLATFORM, CODEBUDDY_REFRESH_PATH, CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH,
-    CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH, CODEBUDDY_RESOURCE_PATH,
-    CODEBUDDY_RESOURCE_SUMMARY_PATH, CODEBUDDY_USAGE_PATH,
+    buddy_account_id, buddy_product_policy, codebuddy_access_token_subject, BuddyClientIdentity,
+    CodeBuddyAccountProfile, CodeBuddySite, CODEBUDDY_ACCOUNTS_PATH, CODEBUDDY_AUTH_TOKEN_PATH,
+    CODEBUDDY_CONFIG_PATH, CODEBUDDY_LOGIN_ACCOUNT_PATH, CODEBUDDY_REFRESH_PATH,
+    CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH, CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH,
+    CODEBUDDY_RESOURCE_PATH, CODEBUDDY_RESOURCE_SUMMARY_PATH, CODEBUDDY_USAGE_PATH,
 };
 use crate::domain::providers::model::ProviderType;
+
+#[cfg(test)]
+use crate::domain::codebuddy::{CODEBUDDY_CLIENT_VERSION, CODEBUDDY_PLATFORM};
 
 const FLOW_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
@@ -33,6 +35,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_PENDING_CODE: i64 = 11_217;
 const ACCOUNT_PENDING_CODE: i64 = 12_151;
 const MAX_CODEBUDDY_LOGIN_FLOWS: usize = 64;
+const CODEBUDDY_BILLING_PAGE_SIZE: usize = 200;
+const CODEBUDDY_BILLING_MAX_PAGES: usize = 10;
+const CODEBUDDY_BILLING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CODEBUDDY_USAGE_PAGE_SIZE: usize = 3_000;
 const CODEBUDDY_USAGE_MAX_PAGES: usize = 100;
 const CODEBUDDY_USAGE_DETAIL_LIMIT: usize = 100;
@@ -59,42 +64,59 @@ pub(crate) enum CodeBuddyBillingResources {
         summary: Option<Value>,
         paid: Option<Value>,
         free: Option<Value>,
+        // Only fully scanned paid AND free collections may replace summary.
+        details_complete: bool,
     },
     Legacy(Value),
 }
 
 #[derive(Debug, Clone)]
 pub struct CodeBuddyEndpoints {
+    pub provider_type: ProviderType,
     pub site: CodeBuddySite,
     pub base_url: Url,
 }
 
 impl CodeBuddyEndpoints {
     pub fn for_site(site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        let base_url = Url::parse(site.profile().endpoint).map_err(|error| {
+        Self::for_product(ProviderType::CodeBuddyOAuth, site)
+    }
+
+    pub fn for_product(
+        provider_type: ProviderType,
+        site: CodeBuddySite,
+    ) -> Result<Self, CodeBuddyClientError> {
+        let policy =
+            buddy_product_policy(provider_type, site).map_err(CodeBuddyClientError::bad_request)?;
+        let base_url = Url::parse(policy.control_endpoint).map_err(|error| {
             CodeBuddyClientError::bad_gateway(format!(
                 "invalid reviewed CodeBuddy endpoint: {error}"
             ))
         })?;
-        Ok(Self { site, base_url })
+        Ok(Self {
+            provider_type,
+            site,
+            base_url,
+        })
     }
 
     #[cfg(test)]
     fn for_test(site: CodeBuddySite, base_url: &str) -> Self {
         Self {
+            provider_type: ProviderType::CodeBuddyOAuth,
             site,
             base_url: Url::parse(base_url).unwrap(),
         }
     }
 
     #[cfg(not(test))]
-    fn for_account(_account: &Account, site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        Self::for_site(site)
+    fn for_account(account: &Account, site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
+        Self::for_product(account.provider_type, site)
     }
 
     #[cfg(test)]
     fn for_account(account: &Account, site: CodeBuddySite) -> Result<Self, CodeBuddyClientError> {
-        let mut endpoints = Self::for_site(site)?;
+        let mut endpoints = Self::for_product(account.provider_type, site)?;
         if let Some(base_url) = account
             .raw
             .as_ref()
@@ -112,12 +134,51 @@ impl CodeBuddyEndpoints {
         Ok(endpoints)
     }
 
+    fn for_generation(
+        account: &Account,
+        site: CodeBuddySite,
+    ) -> Result<Self, CodeBuddyClientError> {
+        let mut endpoints = Self::for_account(account, site)?;
+        let policy = buddy_product_policy(account.provider_type, site)
+            .map_err(CodeBuddyClientError::bad_request)?;
+        #[cfg(test)]
+        if account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("testCodeBuddyBaseUrl"))
+            .is_some()
+        {
+            return Ok(endpoints);
+        }
+        endpoints.base_url = Url::parse(policy.generation_endpoint)
+            .map_err(|error| CodeBuddyClientError::bad_request(error.to_string()))?;
+        Ok(endpoints)
+    }
+
     fn url(&self, path: &str) -> Result<Url, CodeBuddyClientError> {
         self.base_url.join(path).map_err(|error| {
             CodeBuddyClientError::bad_gateway(format!(
                 "invalid CodeBuddy endpoint path {path}: {error}"
             ))
         })
+    }
+
+    fn generation_url(&self, path: &str) -> Result<Url, CodeBuddyClientError> {
+        #[cfg(test)]
+        if self.base_url != Self::for_product(self.provider_type, self.site)?.base_url {
+            return self.url(path);
+        }
+        let policy = buddy_product_policy(self.provider_type, self.site)
+            .map_err(CodeBuddyClientError::bad_request)?;
+        Url::parse(policy.generation_endpoint)
+            .and_then(|origin| origin.join(path))
+            .map_err(|error| CodeBuddyClientError::bad_gateway(error.to_string()))
+    }
+
+    fn client_identity(&self) -> Result<BuddyClientIdentity, CodeBuddyClientError> {
+        buddy_product_policy(self.provider_type, self.site)
+            .map(|policy| policy.client_identity)
+            .map_err(CodeBuddyClientError::bad_request)
     }
 
     pub(crate) fn base_url(&self) -> String {
@@ -473,7 +534,19 @@ pub async fn start_login(
     site: CodeBuddySite,
     now_ms: i64,
 ) -> Result<(CodeBuddyLoginStart, PendingCodeBuddyLoginFlow), CodeBuddyClientError> {
-    start_login_with_endpoints(CodeBuddyEndpoints::for_site(site)?, now_ms).await
+    start_login_for_product(ProviderType::CodeBuddyOAuth, site, now_ms).await
+}
+
+pub async fn start_login_for_product(
+    provider_type: ProviderType,
+    site: CodeBuddySite,
+    now_ms: i64,
+) -> Result<(CodeBuddyLoginStart, PendingCodeBuddyLoginFlow), CodeBuddyClientError> {
+    start_login_with_endpoints(
+        CodeBuddyEndpoints::for_product(provider_type, site)?,
+        now_ms,
+    )
+    .await
 }
 
 async fn start_login_with_endpoints(
@@ -491,8 +564,14 @@ async fn start_login_with_endpoints(
         .map_err(|error| {
             CodeBuddyClientError::bad_gateway(format!("build CodeBuddy cookie client: {error}"))
         })?;
-    let url = endpoints.url(CODEBUDDY_AUTH_STATE_PATH)?;
+    let policy = buddy_product_policy(endpoints.provider_type, endpoints.site)
+        .map_err(CodeBuddyClientError::bad_request)?;
+    let url = endpoints.url(&format!(
+        "/v2/plugin/auth/state?platform={}",
+        policy.auth_platform
+    ))?;
     let request = unauthenticated_request(
+        policy.client_identity,
         client
             .request(Method::POST, url)
             .header(CONTENT_TYPE, "application/json")
@@ -570,8 +649,13 @@ pub async fn poll_login(
             "CodeBuddy enterprise subscriptions are not supported by the personal-account rail",
         ));
     }
-    let account_id = codebuddy_account_id(flow.endpoints.site, &identity.uid, &enterprise_id)
-        .map_err(CodeBuddyClientError::protocol)?;
+    let account_id = buddy_account_id(
+        flow.endpoints.provider_type,
+        flow.endpoints.site,
+        &identity.uid,
+        &enterprise_id,
+    )
+    .map_err(CodeBuddyClientError::protocol)?;
     let profile = json!({
         "site": flow.endpoints.site,
         "domain": token.domain,
@@ -581,12 +665,12 @@ pub async fn poll_login(
         "email": identity.email,
         "nickname": identity.nickname,
         "accountType": identity.account_type,
-        "clientVersion": CODEBUDDY_CLIENT_VERSION,
-        "productPlatform": CODEBUDDY_PLATFORM,
+        "clientVersion": flow.endpoints.client_identity()?.version(),
+        "productPlatform": buddy_product_policy(flow.endpoints.provider_type, flow.endpoints.site).map_err(CodeBuddyClientError::protocol)?.auth_platform,
     });
     let account_input = UpsertAccountInput {
         id: Some(account_id),
-        provider_type: ProviderType::CodeBuddyOAuth,
+        provider_type: flow.endpoints.provider_type,
         email: non_empty(identity.email),
         access_token: Some(token.access_token),
         refresh_token: Some(token.refresh_token),
@@ -597,7 +681,7 @@ pub async fn poll_login(
         scopes: token.scopes,
         profile: Some(profile),
         raw: Some(json!({
-            "source": "codebuddy_oauth_login",
+            "source": format!("{}_login", flow.endpoints.provider_type.as_str()),
             "site": flow.endpoints.site.as_str(),
             "domain": token.domain,
             "observedAtMs": now_ms,
@@ -634,14 +718,15 @@ where
 {
     use crate::clients::oauth::refresh::AccountRefreshFailure;
 
-    if account.provider_type != ProviderType::CodeBuddyOAuth {
+    if !account.provider_type.is_buddy_oauth() {
         return Err(AccountRefreshFailure::bad_request(format!(
             "expected codebuddy_oauth account, got {}",
             account.provider_type.as_str()
         )));
     }
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(AccountRefreshFailure::bad_request)?;
+    let profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(AccountRefreshFailure::bad_request)?;
     let access_token = account
         .access_token
         .as_deref()
@@ -660,10 +745,18 @@ where
         .url(CODEBUDDY_REFRESH_PATH)
         .map_err(codebuddy_refresh_client_failure)?;
     let request = authenticated_request(
+        endpoints
+            .client_identity()
+            .map_err(codebuddy_refresh_client_failure)?,
         http.post(url)
             .header(CONTENT_TYPE, "application/json")
             .header("X-Refresh-Token", refresh_token)
-            .header("X-Auth-Refresh-Source", "plugin")
+            .header(
+                "X-Auth-Refresh-Source",
+                buddy_product_policy(account.provider_type, profile.site)
+                    .map_err(AccountRefreshFailure::bad_request)?
+                    .refresh_source,
+            )
             .body("{}"),
         access_token,
         &profile.uid,
@@ -747,18 +840,20 @@ pub(crate) async fn fetch_model_config(
     account: &Account,
     request_timeout: Duration,
 ) -> Result<(Value, String), CodeBuddyClientError> {
-    if account.provider_type != ProviderType::CodeBuddyOAuth {
+    if !account.provider_type.is_buddy_oauth() {
         return Err(CodeBuddyClientError::bad_request(format!(
             "expected codebuddy_oauth account, got {}",
             account.provider_type.as_str()
         )));
     }
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(CodeBuddyClientError::bad_request)?;
+    let profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(CodeBuddyClientError::bad_request)?;
     let access_token = profile_access_token(account)?;
-    let endpoints = CodeBuddyEndpoints::for_account(account, profile.site)?;
+    let endpoints = CodeBuddyEndpoints::for_generation(account, profile.site)?;
     let url = endpoints.url(CODEBUDDY_CONFIG_PATH)?;
     let request = authenticated_request(
+        endpoints.client_identity()?,
         http.get(url),
         access_token,
         &profile.uid,
@@ -802,14 +897,30 @@ pub(crate) async fn fetch_billing_resources(
     account: &Account,
     request_timeout: Duration,
 ) -> Result<CodeBuddyBillingResources, CodeBuddyClientError> {
-    if account.provider_type != ProviderType::CodeBuddyOAuth {
+    tokio::time::timeout(
+        request_timeout.min(REQUEST_TIMEOUT),
+        fetch_billing_resources_inner(http, account, request_timeout),
+    )
+    .await
+    .map_err(|_| {
+        CodeBuddyClientError::bad_gateway("Buddy billing resource scan deadline exceeded")
+    })?
+}
+
+async fn fetch_billing_resources_inner(
+    http: &reqwest::Client,
+    account: &Account,
+    request_timeout: Duration,
+) -> Result<CodeBuddyBillingResources, CodeBuddyClientError> {
+    if !account.provider_type.is_buddy_oauth() {
         return Err(CodeBuddyClientError::bad_request(format!(
             "expected codebuddy_oauth account, got {}",
             account.provider_type.as_str()
         )));
     }
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(CodeBuddyClientError::bad_request)?;
+    let profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(CodeBuddyClientError::bad_request)?;
     profile_access_token(account)?;
     let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
     let billing = CodeBuddyBillingClient {
@@ -836,22 +947,22 @@ pub(crate) async fn fetch_billing_resources(
             json!({}),
             "billing resource summary",
         ),
-        billing.fetch(
+        billing.fetch_package_pages(
             CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH,
             json!({
                 "PageNumber": 1,
-                "PageSize": 200,
+                "PageSize": CODEBUDDY_BILLING_PAGE_SIZE,
                 "Status": [0, 3],
                 "PackageCodes": CODEBUDDY_PAID_PACKAGE_CODES,
                 "NeedRenewInfo": true,
             }),
             "billing paid packages",
         ),
-        billing.fetch(
+        billing.fetch_package_pages(
             CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH,
             json!({
                 "PageNumber": 1,
-                "PageSize": 200,
+                "PageSize": CODEBUDDY_BILLING_PAGE_SIZE,
                 "Status": [0, 3],
                 "SlicePeriodStartTime": day_start.format("%Y-%m-%d %H:%M:%S").to_string(),
                 "SlicePeriodEndTime": day_end.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -870,26 +981,37 @@ pub(crate) async fn fetch_billing_resources(
             }
         }
     }
-    let summary = modern.0.ok();
-    let paid = modern.1.ok();
-    let free = modern.2.ok();
-    if summary
-        .as_ref()
-        .is_some_and(|value| modern_billing_array_present(value, "Packages"))
-        || paid
+    let legacy_fallback_allowed = [&modern.0, &modern.1, &modern.2].iter().all(|result| {
+        result
             .as_ref()
-            .is_some_and(|value| modern_billing_array_present(value, "Accounts"))
-        || free
-            .as_ref()
-            .is_some_and(|value| modern_billing_array_present(value, "Accounts"))
-    {
+            .err()
+            .is_some_and(|error| error.upstream_status == Some(StatusCode::NOT_FOUND))
+    });
+    let modern_failure = [&modern.0, &modern.1, &modern.2]
+        .into_iter()
+        .filter_map(|result| result.as_ref().err())
+        .find(|error| error.upstream_status != Some(StatusCode::NOT_FOUND))
+        .cloned();
+    let summary = modern
+        .0
+        .ok()
+        .filter(|value| modern_billing_array_present(value, "Packages"));
+    let details_complete = modern.1.is_ok() && modern.2.is_ok();
+    if summary.is_some() || details_complete {
         return Ok(CodeBuddyBillingResources::Modern {
             summary,
-            paid,
-            free,
+            paid: modern.1.ok(),
+            free: modern.2.ok(),
+            details_complete,
         });
     }
 
+    if !legacy_fallback_allowed {
+        if let Some(error) = modern_failure {
+            return Err(error);
+        }
+        return Err(CodeBuddyClientError::protocol("CodeBuddy modern billing has no valid resource arrays; legacy fallback requires HTTP 404"));
+    }
     let range_end = now
         .checked_add_signed(chrono::Duration::days(365 * 100))
         .ok_or_else(|| {
@@ -917,12 +1039,26 @@ fn modern_billing_array_present(value: &Value, field: &str) -> bool {
         format!("/data/data/Response/Data/{field}"),
     ]
     .iter()
-    .any(|path| {
-        value
-            .pointer(path)
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    })
+    .any(|path| value.pointer(path).and_then(Value::as_array).is_some())
+}
+
+pub(crate) fn billing_package_identity(row: &Value) -> Option<String> {
+    ["ResourceId", "AccountId", "Id", "id"]
+        .into_iter()
+        .find_map(|field| {
+            let value = row.get(field)?;
+            let id = value
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .map(str::to_string)
+                .or_else(|| value.as_u64().map(|id| id.to_string()))?;
+            let code = row
+                .get("PackageCode")
+                .or_else(|| row.get("SubProductCode"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(format!("{field}:{}:{id}:{}:{code}", id.len(), code.len()))
+        })
 }
 
 struct CodeBuddyBillingClient<'a> {
@@ -934,6 +1070,125 @@ struct CodeBuddyBillingClient<'a> {
 }
 
 impl CodeBuddyBillingClient<'_> {
+    async fn fetch_package_pages(
+        &self,
+        path: &str,
+        mut body: Value,
+        operation: &str,
+    ) -> Result<Value, CodeBuddyClientError> {
+        use sha2::{Digest, Sha256};
+        let protocol = || {
+            CodeBuddyClientError::protocol(
+                "Buddy billing package scan is incomplete or inconsistent",
+            )
+        };
+        let mut packages = Vec::<Value>::new();
+        let mut seen = BTreeMap::<String, usize>::new();
+        let mut reported_total = None;
+        let mut retained_bytes = 0usize;
+        for page in 1..=CODEBUDDY_BILLING_MAX_PAGES {
+            body["PageNumber"] = json!(page);
+            let mut response = self.fetch(path, body.clone(), operation).await?;
+            let data = [
+                "/data",
+                "/data/data",
+                "/data/Response/Data",
+                "/data/data/Response/Data",
+            ]
+            .into_iter()
+            .find_map(|pointer| {
+                response
+                    .pointer(pointer)
+                    .filter(|data| data.get("Accounts").is_some())
+                    .map(|_| pointer)
+            })
+            .ok_or_else(protocol)?;
+            let data = response
+                .pointer_mut(data)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(protocol)?;
+            let total = match data.get("TotalCount") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str()?.parse().ok())
+                        .and_then(|total| usize::try_from(total).ok())
+                        .ok_or_else(protocol)?,
+                ),
+            };
+            if total.is_some_and(|total| {
+                total > CODEBUDDY_BILLING_PAGE_SIZE * CODEBUDDY_BILLING_MAX_PAGES
+            }) || reported_total.is_some_and(|prior| prior != total)
+            {
+                return Err(protocol());
+            }
+            reported_total = Some(total);
+            let rows = data
+                .remove("Accounts")
+                .and_then(|value| match value {
+                    Value::Array(rows) => Some(rows),
+                    _ => None,
+                })
+                .ok_or_else(protocol)?;
+            let row_count = rows.len();
+            if row_count > CODEBUDDY_BILLING_PAGE_SIZE {
+                return Err(protocol());
+            }
+            let previous_count = packages.len();
+            for row in rows {
+                if !row.is_object() {
+                    return Err(protocol());
+                }
+                let stable_id = billing_package_identity(&row);
+                let has_id = stable_id.is_some();
+                let key = stable_id.unwrap_or_else(|| {
+                    format!(
+                        "row:{}",
+                        hex::encode(Sha256::digest(
+                            serde_json::to_vec(&row).expect("JSON value")
+                        ))
+                    )
+                });
+                if let Some(index) = seen.get(&key) {
+                    // Without an ID, equal rows might be two distinct grants.
+                    // Never silently subtract that ambiguity from quota.
+                    if !has_id || packages[*index] != row {
+                        return Err(protocol());
+                    }
+                    continue;
+                }
+                retained_bytes = retained_bytes
+                    .saturating_add(crate::infra::resident_memory::retained_json_bytes(&row))
+                    .saturating_add(key.capacity())
+                    .saturating_add(
+                        std::mem::size_of::<String>() + 4 * std::mem::size_of::<usize>(),
+                    );
+                if retained_bytes > CODEBUDDY_BILLING_MAX_BYTES {
+                    return Err(protocol());
+                }
+                seen.insert(key, packages.len());
+                packages.push(row);
+            }
+            if total.is_some_and(|total| packages.len() > total) {
+                return Err(protocol());
+            }
+            let complete = match total {
+                // A full page needs a tail probe even when TotalCount is
+                // already reached: some vendor totals are truncated.
+                Some(total) => packages.len() == total && row_count < CODEBUDDY_BILLING_PAGE_SIZE,
+                None => row_count < CODEBUDDY_BILLING_PAGE_SIZE,
+            };
+            if complete {
+                return Ok(json!({"data":{"Accounts":packages, "TotalCount":packages.len()}}));
+            }
+            if packages.len() == previous_count {
+                return Err(protocol());
+            }
+        }
+        Err(protocol())
+    }
+
     async fn fetch(
         &self,
         path: &str,
@@ -958,6 +1213,9 @@ impl CodeBuddyBillingClient<'_> {
             ))
         })?;
         let request = authenticated_request(
+            buddy_product_policy(self.account.provider_type, self.profile.site)
+                .map_err(CodeBuddyClientError::bad_request)?
+                .client_identity,
             self.http
                 .post(url)
                 .header(CONTENT_TYPE, "application/json")
@@ -1013,9 +1271,42 @@ pub(crate) async fn fetch_official_usage(
     account: &Account,
     request_timeout: Duration,
 ) -> Result<Value, CodeBuddyClientError> {
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(CodeBuddyClientError::bad_request)?;
-    let endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    tokio::time::timeout(
+        request_timeout.min(REQUEST_TIMEOUT),
+        fetch_official_usage_inner(http, account, request_timeout),
+    )
+    .await
+    .map_err(|_| {
+        CodeBuddyClientError::bad_gateway("CodeBuddy official usage scan deadline exceeded")
+    })?
+}
+
+async fn fetch_official_usage_inner(
+    http: &reqwest::Client,
+    account: &Account,
+    request_timeout: Duration,
+) -> Result<Value, CodeBuddyClientError> {
+    let profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(CodeBuddyClientError::bad_request)?;
+    let mut endpoints = CodeBuddyBillingEndpoints::for_account(account, &profile)?;
+    if account.provider_type == ProviderType::WorkBuddyOAuth {
+        #[cfg(test)]
+        let use_reviewed_origin = account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("testCodeBuddyBillingBaseUrl"))
+            .is_none();
+        #[cfg(not(test))]
+        let use_reviewed_origin = true;
+        if use_reviewed_origin {
+            endpoints.base_url = Url::parse(match profile.site {
+                CodeBuddySite::Cn => "https://www.workbuddy.cn",
+                CodeBuddySite::Intl => "https://www.workbuddy.ai",
+            })
+            .map_err(|error| CodeBuddyClientError::protocol(error.to_string()))?;
+        }
+    }
     let billing = CodeBuddyBillingClient {
         http,
         account,
@@ -1031,6 +1322,9 @@ pub(crate) async fn fetch_official_usage(
     let range_start = today
         .checked_sub_signed(chrono::Duration::days(30))
         .ok_or_else(|| CodeBuddyClientError::bad_gateway("CodeBuddy usage range underflow"))?;
+    use chrono::TimeZone;
+    let mut cursor = range_start.and_hms_opt(0, 0, 0).unwrap();
+    let range_end = today.and_hms_opt(23, 59, 59).unwrap();
     let mut page_number = 1_usize;
     let mut fetched_raw = 0_usize;
     let mut reported_total = 0_usize;
@@ -1051,9 +1345,9 @@ pub(crate) async fn fetch_official_usage(
             .fetch_with_limit(
                 CODEBUDDY_USAGE_PATH,
                 json!({
-                    "startTime": format!("{range_start} 00:00:00"),
+                    "startTime": cursor.format("%Y-%m-%d %H:%M:%S").to_string(),
                     "endTime": format!("{today} 23:59:59"),
-                    "pageNum": page_number,
+                    "pageNum": 1,
                     "pageSize": CODEBUDDY_USAGE_PAGE_SIZE,
                 }),
                 "official request usage",
@@ -1079,10 +1373,27 @@ pub(crate) async fn fetch_official_usage(
             .unwrap_or(rows.len());
         reported_total = reported_total.max(page_total);
         fetched_raw = fetched_raw.saturating_add(rows.len());
+        let mut latest = None;
         for row in rows {
-            let Some(projected) = codebuddy_usage_row(row, timezone)? else {
-                continue;
-            };
+            let projected = codebuddy_usage_row(row, timezone)?.ok_or_else(|| {
+                CodeBuddyClientError::protocol("CodeBuddy official usage has an invalid row")
+            })?;
+            let timestamp = projected["requestTime"]
+                .as_str()
+                .and_then(|value| value.parse::<i64>().ok())
+                .and_then(|value| timezone.timestamp_millis_opt(value).single())
+                .map(|value| value.naive_local())
+                .ok_or_else(|| {
+                    CodeBuddyClientError::protocol("CodeBuddy usage timestamp is invalid")
+                })?;
+            if timestamp < cursor || timestamp > range_end {
+                return Err(CodeBuddyClientError::protocol(
+                    "CodeBuddy usage row is outside the requested window",
+                ));
+            }
+            latest = Some(latest.map_or(timestamp, |previous: chrono::NaiveDateTime| {
+                previous.max(timestamp)
+            }));
             let date = projected["requestDate"]
                 .as_str()
                 .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
@@ -1096,6 +1407,11 @@ pub(crate) async fn fetch_official_usage(
             }
             let credit = projected["credit"].as_f64().unwrap_or(0.0);
             credit_total += credit;
+            if !credit_total.is_finite() {
+                return Err(CodeBuddyClientError::protocol(
+                    "CodeBuddy official usage credit sum exceeds the numeric range",
+                ));
+            }
             if date == Some(today) {
                 credit_today += credit;
             }
@@ -1116,19 +1432,28 @@ pub(crate) async fn fetch_official_usage(
                 details.push(safe);
             }
         }
-        if fetched_raw >= reported_total {
+        // The upstream can cap both total and rows at 3000 and ignore pageNum.
+        // Only an unsaturated time window proves exhaustion; total is advisory.
+        if rows.len() < CODEBUDDY_USAGE_PAGE_SIZE {
+            if page_total > rows.len() {
+                return Err(CodeBuddyClientError::protocol(
+                    "CodeBuddy usage returned a short nonterminal window",
+                ));
+            }
             break;
         }
-        if rows.is_empty() {
+        let next = latest.ok_or_else(|| {
+            CodeBuddyClientError::protocol("CodeBuddy usage window has no timestamp")
+        })?;
+        // Inclusive second precision preserves boundary records. A saturated
+        // second cannot be safely skipped, even if every row is a duplicate.
+        let next = next.with_nanosecond(0).unwrap();
+        if next <= cursor || page_number >= CODEBUDDY_USAGE_MAX_PAGES {
             return Err(CodeBuddyClientError::protocol(
-                "CodeBuddy official usage pagination ended before the reported total",
+                "CodeBuddy official usage scan is incomplete: stalled window or safety limit",
             ));
         }
-        if page_number >= CODEBUDDY_USAGE_MAX_PAGES {
-            return Err(CodeBuddyClientError::protocol(
-                "CodeBuddy official usage pagination exceeded its safety limit",
-            ));
-        }
+        cursor = next;
         page_number = page_number.saturating_add(1);
     }
     let models = models
@@ -1201,8 +1526,14 @@ fn codebuddy_usage_row(
         }
         Ok(value.to_string())
     };
+    let request_id = bounded(&["requestId", "request_id"], "")?;
+    if request_id.is_empty() {
+        return Err(CodeBuddyClientError::protocol(
+            "CodeBuddy official usage is missing requestId",
+        ));
+    }
     Ok(Some(json!({
-        "requestId": bounded(&["requestId", "request_id"], "unknown")?,
+        "requestId": request_id,
         "credit": credit,
         "model": bounded(&["model"], "unknown")?,
         "client": bounded(&["client"], "unknown")?,
@@ -1221,7 +1552,7 @@ fn codebuddy_usage_time(
         .as_i64()
         .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
     {
-        let millis = if number.abs() < 10_000_000_000 {
+        let millis = if number.unsigned_abs() < 10_000_000_000 {
             number.saturating_mul(1_000)
         } else {
             number
@@ -1232,23 +1563,24 @@ fn codebuddy_usage_time(
     let text = value.as_str()?.trim();
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
         return Some((
-            text.to_string(),
+            parsed.timestamp_millis().to_string(),
             parsed.with_timezone(&timezone).date_naive(),
         ));
     }
     for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, format) {
-            let date = timezone.from_local_datetime(&parsed).single()?.date_naive();
-            return Some((text.to_string(), date));
+            let date = timezone.from_local_datetime(&parsed).single()?;
+            return Some((date.timestamp_millis().to_string(), date.date_naive()));
         }
     }
     None
 }
 
 pub(crate) fn runtime_base_url(account: &Account) -> Result<String, CodeBuddyClientError> {
-    let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(CodeBuddyClientError::bad_request)?;
-    CodeBuddyEndpoints::for_account(account, profile.site).map(|endpoints| endpoints.base_url())
+    let profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(CodeBuddyClientError::bad_request)?;
+    CodeBuddyEndpoints::for_generation(account, profile.site).map(|endpoints| endpoints.base_url())
 }
 
 pub async fn complete_codebuddy_refresh_receipt(
@@ -1258,8 +1590,9 @@ pub async fn complete_codebuddy_refresh_receipt(
 ) -> Result<AccountRefreshUpdate, crate::clients::oauth::refresh::AccountRefreshFailure> {
     use crate::clients::oauth::refresh::AccountRefreshFailure;
 
-    let mut profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-        .map_err(AccountRefreshFailure::parse)?;
+    let mut profile =
+        CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+            .map_err(AccountRefreshFailure::parse)?;
     let access_token = update
         .access_token
         .as_deref()
@@ -1344,6 +1677,9 @@ async fn fetch_current_account_identity(
         .url(CODEBUDDY_ACCOUNTS_PATH)
         .map_err(codebuddy_refresh_client_failure)?;
     let request = authenticated_request(
+        endpoints
+            .client_identity()
+            .map_err(codebuddy_refresh_client_failure)?,
         http.get(url),
         access_token,
         &profile.uid,
@@ -1371,9 +1707,12 @@ async fn fetch_current_account_identity(
         AccountRefreshFailure::parse("CodeBuddy refresh identity response is missing stable uid")
     })?;
     let config_url = endpoints
-        .url(CODEBUDDY_CONFIG_PATH)
+        .generation_url(CODEBUDDY_CONFIG_PATH)
         .map_err(codebuddy_refresh_client_failure)?;
     let config_request = authenticated_request(
+        endpoints
+            .client_identity()
+            .map_err(codebuddy_refresh_client_failure)?,
         http.get(config_url),
         access_token,
         &uid,
@@ -1554,7 +1893,7 @@ async fn poll_token(
     let mut url = flow.endpoints.url(CODEBUDDY_AUTH_TOKEN_PATH)?;
     url.query_pairs_mut()
         .append_pair("state", &flow.upstream_state);
-    let request = unauthenticated_request(flow.client.get(url));
+    let request = unauthenticated_request(flow.endpoints.client_identity()?, flow.client.get(url));
     let (status, body) = execute_bounded(request, "auth token poll").await?;
     if !status.is_success() {
         return Err(CodeBuddyClientError::upstream(
@@ -1584,8 +1923,14 @@ async fn poll_token(
             CodeBuddyClientError::protocol("CodeBuddy token response is missing refreshToken")
         })?;
     let expires_in = i64_at(token_data, &["/expiresIn", "/expires_in"]);
-    let domain = string_at(token_data, &["/domain"])
-        .unwrap_or_else(|| flow.endpoints.site.profile().domain.to_string());
+    let domain = string_at(token_data, &["/domain"]).unwrap_or_else(|| {
+        // A test transport override must never become credential routing data.
+        buddy_product_policy(flow.endpoints.provider_type, flow.endpoints.site)
+            .ok()
+            .and_then(|policy| Url::parse(policy.control_endpoint).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default()
+    });
     let domain = flow
         .endpoints
         .site
@@ -1626,6 +1971,7 @@ async fn poll_account(
     url.query_pairs_mut()
         .append_pair("state", &flow.upstream_state);
     let request = unauthenticated_request(
+        flow.endpoints.client_identity()?,
         flow.client
             .get(url)
             .header(AUTHORIZATION, format!("Bearer {}", token.access_token)),
@@ -1668,8 +2014,9 @@ async fn fetch_enterprise_identity(
     token: &CodeBuddyLoginToken,
     uid: &str,
 ) -> Result<String, CodeBuddyClientError> {
-    let url = flow.endpoints.url(CODEBUDDY_CONFIG_PATH)?;
+    let url = flow.endpoints.generation_url(CODEBUDDY_CONFIG_PATH)?;
     let request = authenticated_request(
+        flow.endpoints.client_identity()?,
         flow.client.get(url),
         &token.access_token,
         uid,
@@ -1729,10 +2076,13 @@ fn pending_result(
     }
 }
 
-fn unauthenticated_request(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+fn unauthenticated_request(
+    identity: BuddyClientIdentity,
+    request: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
     request
         .header(ACCEPT, "application/json, text/plain, */*")
-        .header(USER_AGENT, codebuddy_user_agent())
+        .header(USER_AGENT, identity.user_agent())
         .header("X-Requested-With", "XMLHttpRequest")
         .header("X-No-Authorization", "true")
         .header("X-No-User-Id", "true")
@@ -1740,7 +2090,8 @@ fn unauthenticated_request(request: reqwest::RequestBuilder) -> reqwest::Request
         .header("X-No-Department-Info", "true")
 }
 
-pub(crate) fn authenticated_request(
+fn authenticated_request(
+    identity: BuddyClientIdentity,
     request: reqwest::RequestBuilder,
     access_token: &str,
     uid: &str,
@@ -1749,7 +2100,7 @@ pub(crate) fn authenticated_request(
 ) -> reqwest::RequestBuilder {
     let mut request = request
         .header(ACCEPT, "application/json, text/plain, */*")
-        .header(USER_AGENT, codebuddy_user_agent())
+        .header(USER_AGENT, identity.user_agent())
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header("X-User-Id", uid)
         .header("X-Domain", domain)
@@ -1954,10 +2305,6 @@ fn random_request_id() -> String {
     hex::encode(bytes)
 }
 
-fn codebuddy_user_agent() -> String {
-    format!("CLI/{CODEBUDDY_CLIENT_VERSION} CodeBuddy/{CODEBUDDY_CLIENT_VERSION}")
-}
-
 fn non_empty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
@@ -1994,11 +2341,24 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Observation {
         path: String,
+        query: Option<String>,
         headers: HeaderMap,
     }
 
     async fn serve_login_fixture(
         enterprise_id: &str,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Observation>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        serve_login_fixture_for_site(enterprise_id, CodeBuddySite::Intl).await
+    }
+
+    async fn serve_login_fixture_for_site(
+        enterprise_id: &str,
+        site: CodeBuddySite,
     ) -> (
         String,
         Arc<Mutex<Vec<Observation>>>,
@@ -2026,6 +2386,7 @@ mod tests {
                 async move {
                     observations.lock().unwrap().push(Observation {
                         path: uri.path().to_string(),
+                        query: uri.query().map(str::to_string),
                         headers: headers.clone(),
                     });
                     let json_response = |value: Value| {
@@ -2060,7 +2421,7 @@ mod tests {
                                     "refreshToken": "refresh-secret",
                                     "expiresIn": 3600,
                                     "tokenType": "Bearer",
-                                    "domain": "www.codebuddy.ai",
+                                    "domain": site.profile().domain,
                                     "scope": "chat models"
                                 }
                             }))
@@ -2338,6 +2699,7 @@ mod tests {
                 async move {
                     observations.lock().unwrap().push(Observation {
                         path: uri.path().to_string(),
+                        query: uri.query().map(str::to_string),
                         headers,
                     });
                     let (status, response) = match uri.path() {
@@ -2489,7 +2851,9 @@ mod tests {
         account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
             json!("http://127.0.0.1:6543");
         let runtime = CodeBuddyEndpoints::for_account(&account, CodeBuddySite::Intl).unwrap();
-        let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref()).unwrap();
+        let profile =
+            CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+                .unwrap();
         let billing = CodeBuddyBillingEndpoints::for_account(&account, &profile).unwrap();
         assert_eq!(runtime.base_url.as_str(), "http://127.0.0.1:3210/");
         assert_eq!(billing.base_url.as_str(), "http://127.0.0.1:6543/");
@@ -2687,5 +3051,398 @@ mod tests {
         let test = CodeBuddyEndpoints::for_test(CodeBuddySite::Intl, "http://127.0.0.1:3210");
         assert!(validate_auth_url("http://127.0.0.1:3210/login", &test).is_ok());
         assert!(validate_auth_url("http://127.0.0.1:3211/login", &test).is_err());
+    }
+    #[tokio::test]
+    async fn workbuddy_native_login_uses_site_platform_and_private_cookie_lifecycle() {
+        for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+            let (base, observations, _, server) = serve_login_fixture_for_site("", site).await;
+            let mut endpoints = CodeBuddyEndpoints::for_test(site, &base);
+            endpoints.provider_type = ProviderType::WorkBuddyOAuth;
+            let (_, flow) = start_login_with_endpoints(endpoints, 1000).await.unwrap();
+            let first = poll_login(&flow, 1000).await.unwrap();
+            assert!(first.pending);
+            let mut flow = flow;
+            flow.token = first.token;
+            let completed = poll_login(&flow, 3000).await.unwrap();
+            let input = completed.account_input.unwrap();
+            assert_eq!(input.provider_type, ProviderType::WorkBuddyOAuth);
+            assert!(input.id.unwrap().starts_with("workbuddy-"));
+            assert_eq!(
+                input.profile.unwrap()["productPlatform"],
+                buddy_product_policy(ProviderType::WorkBuddyOAuth, site)
+                    .unwrap()
+                    .auth_platform
+            );
+            let rows = observations.lock().unwrap();
+            assert_eq!(
+                rows[0].query.as_deref(),
+                Some(
+                    format!(
+                        "platform={}",
+                        buddy_product_policy(ProviderType::WorkBuddyOAuth, site)
+                            .unwrap()
+                            .auth_platform
+                    )
+                    .as_str()
+                )
+            );
+            assert!(rows
+                .iter()
+                .skip(1)
+                .all(|row| row.headers.get("cookie").is_some()));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn codebuddy_official_usage_sweeps_past_truncated_total_and_deduplicates_boundary() {
+        for stalled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let start = (chrono::Utc::now().date_naive() - chrono::Duration::days(2))
+                .and_hms_opt(0, 0, 0)
+                .unwrap();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let app = axum::Router::new().route(CODEBUDDY_USAGE_PATH, axum::routing::post(move |axum::Json(body):axum::Json<Value>| {
+                let requests = Arc::clone(&requests);
+                async move {
+                    let round = requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(body["pageNum"],1);
+                    if round > 0 { assert_eq!(body["startTime"], (start + chrono::Duration::seconds(2999)).format("%Y-%m-%d %H:%M:%S").to_string()); }
+                    let range = if round == 0 || stalled {0..3000} else {2999..5000};
+                    let rows:Vec<Value> = range.map(|index| json!({"requestId":format!("id-{index}"),"credit":1,
+                        "model":"m","requestTime":(start+chrono::Duration::seconds(index)).format("%Y-%m-%d %H:%M:%S").to_string()})).collect();
+                    axum::Json(json!({"code":0,"data":{"total":rows.len(),"data":rows}}))
+                }
+            }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut account = refresh_account("http://127.0.0.1:1", "uid-1");
+            account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+                json!(format!("http://{address}"));
+            let result =
+                fetch_official_usage(&reqwest::Client::new(), &account, Duration::from_secs(10))
+                    .await;
+            if stalled {
+                assert!(result.is_err());
+            } else {
+                let value = result.unwrap();
+                assert_eq!(value["status"], "complete");
+                assert_eq!(value["requestCount"], 5000);
+                assert_eq!(value["usageTotal"], 5000.0);
+                assert_eq!(value["requests"].as_array().unwrap().len(), 100);
+            }
+            assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn workbuddy_cn_identity_config_uses_generation_origin_and_control_stays_native() {
+        let endpoints =
+            CodeBuddyEndpoints::for_product(ProviderType::WorkBuddyOAuth, CodeBuddySite::Cn)
+                .unwrap();
+        assert_eq!(
+            endpoints.url(CODEBUDDY_REFRESH_PATH).unwrap().host_str(),
+            Some("www.codebuddy.cn")
+        );
+        assert_eq!(
+            endpoints
+                .generation_url(CODEBUDDY_CONFIG_PATH)
+                .unwrap()
+                .host_str(),
+            Some("copilot.tencent.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn codebuddy_workbuddy_modern_billing_empty_fallback_and_transient_classification() {
+        for scenario in ["empty", "absent", "transient", "invalid"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let legacy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = Arc::clone(&legacy);
+            let app =
+                axum::Router::new().fallback(axum::routing::any(move |uri: axum::http::Uri| {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        let (status, value) = if uri.path() == CODEBUDDY_RESOURCE_PATH {
+                            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            (StatusCode::OK, json!({"code":0,"data":{"Accounts":[]}}))
+                        } else if scenario == "empty"
+                            && uri.path() == CODEBUDDY_RESOURCE_SUMMARY_PATH
+                        {
+                            (StatusCode::OK, json!({"code":0,"data":{"Packages":[]}}))
+                        } else if scenario == "transient" {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                json!({"message":"temporary"}),
+                            )
+                        } else if scenario == "invalid" {
+                            (StatusCode::OK, json!({"code":0,"data":{}}))
+                        } else {
+                            (StatusCode::NOT_FOUND, json!({"message":"absent"}))
+                        };
+                        (status, axum::Json(value))
+                    }
+                }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut account = refresh_account("http://127.0.0.1:1", "uid-1");
+            account.provider_type = ProviderType::WorkBuddyOAuth;
+            account.profile.as_mut().unwrap()["productPlatform"] = json!("workbuddy-ai");
+            account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+                json!(format!("http://{address}"));
+            let result =
+                fetch_billing_resources(&reqwest::Client::new(), &account, Duration::from_secs(2))
+                    .await;
+            match scenario {
+                "empty" => assert!(matches!(
+                    result.unwrap(),
+                    CodeBuddyBillingResources::Modern { .. }
+                )),
+                "absent" => assert!(matches!(
+                    result.unwrap(),
+                    CodeBuddyBillingResources::Legacy(_)
+                )),
+                "transient" => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.upstream_status, Some(StatusCode::SERVICE_UNAVAILABLE));
+                    assert!(error.is_transient());
+                }
+                _ => {
+                    assert!(result.is_err());
+                }
+            }
+            assert_eq!(
+                legacy.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(scenario == "absent")
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn codebuddy_usage_rejects_missing_dedup_identity_and_bad_timestamp() {
+        for row in [
+            json!({"credit":1,"requestTime":"2026-11-01 00:00:00"}),
+            json!({"credit":1,"requestId":"id","requestTime":"not-a-time"}),
+        ] {
+            assert!(codebuddy_usage_row(&row, chrono_tz::UTC)
+                .ok()
+                .flatten()
+                .is_none());
+        }
+    }
+    mod billing_pagination_tests {
+        use super::*;
+        use axum::{extract::State, http::Uri, routing::post, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        #[derive(Clone)]
+        struct Fixture {
+            scenario: &'static str,
+            pages: Arc<AtomicUsize>,
+        }
+
+        async fn packages(
+            State(state): State<Fixture>,
+            uri: Uri,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            if uri.path() == CODEBUDDY_RESOURCE_SUMMARY_PATH {
+                if matches!(state.scenario, "no-summary" | "summary-failure") {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+                }
+                return (
+                    StatusCode::OK,
+                    Json(
+                        json!({"data":{"Packages":[{"PackageCode":"summary","CycleTotalCapacity":1000,"CycleRemainCapacity":900}]}}),
+                    ),
+                );
+            }
+            if uri.path() == CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"data":{"Accounts":[],"TotalCount":0}})),
+                );
+            }
+            assert_eq!(uri.path(), CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH);
+            assert_eq!(body["PageSize"], CODEBUDDY_BILLING_PAGE_SIZE);
+            state.pages.fetch_add(1, Ordering::SeqCst);
+            let page = body["PageNumber"].as_u64().unwrap() as usize;
+            if page == 2 && state.scenario == "auth" {
+                return (StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            if page == 2 && state.scenario == "transient" {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+            }
+            if page == 2 && state.scenario == "timeout" {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let start = if page == 1 || matches!(state.scenario, "stagnant" | "no-summary") {
+                0
+            } else if state.scenario == "overlap" {
+                199
+            } else {
+                (page - 1) * CODEBUDDY_BILLING_PAGE_SIZE
+            };
+            let end = if matches!(
+                state.scenario,
+                "page-cap" | "memory-cap" | "stagnant" | "no-summary"
+            ) {
+                start + 200
+            } else {
+                (start + 200).min(201)
+            };
+            let mut rows = (start..end).map(|id| json!({"AccountId":id.to_string(),"PackageCode":"paid","CapacitySize":10,"CapacityRemain":8})).collect::<Vec<_>>();
+            if state.scenario == "memory-cap" {
+                for row in &mut rows {
+                    row["opaque"] = json!("x".repeat(900));
+                }
+            }
+            if page == 2 && matches!(state.scenario, "missing-tail" | "exact-full-page") {
+                rows.clear();
+            }
+            if page == 2 && state.scenario == "conflicting-row" {
+                rows.push(json!({"AccountId":"0","PackageCode":"paid","CapacitySize":10,"CapacityRemain":5}));
+            }
+            let mut data = json!({"Accounts":rows});
+            if !matches!(state.scenario, "no-total" | "page-cap") {
+                data["TotalCount"] = json!(if page == 2 && state.scenario == "total-drift" {
+                    202
+                } else if state.scenario == "excessive-total" {
+                    2001
+                } else if matches!(state.scenario, "underreported-total" | "exact-full-page") {
+                    200
+                } else if state.scenario == "memory-cap" {
+                    2000
+                } else {
+                    201
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(json!({"data":{"Response":{"Data":data}}})),
+            )
+        }
+
+        async fn run(
+            scenario: &'static str,
+            product: ProviderType,
+        ) -> (
+            Result<CodeBuddyBillingResources, CodeBuddyClientError>,
+            usize,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let pages = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().fallback(post(packages)).with_state(Fixture {
+                scenario,
+                pages: pages.clone(),
+            });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut account = super::refresh_account("http://127.0.0.1:1", "uid-1");
+            account.provider_type = product;
+            account.profile.as_mut().unwrap()["productPlatform"] = json!(
+                buddy_product_policy(product, CodeBuddySite::Intl)
+                    .unwrap()
+                    .auth_platform
+            );
+            account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+                json!(format!("http://{address}"));
+            let timeout = if scenario == "timeout" {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(5)
+            };
+            let result = fetch_billing_resources(&reqwest::Client::new(), &account, timeout).await;
+            let count = pages.load(Ordering::SeqCst);
+            server.abort();
+            (result, count)
+        }
+
+        #[tokio::test]
+        async fn buddy_billing_scans_multiple_pages_and_deduplicates_overlap() {
+            for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+                for scenario in [
+                    "complete",
+                    "overlap",
+                    "no-total",
+                    "summary-failure",
+                    "exact-full-page",
+                ] {
+                    let (result, count) = run(scenario, product).await;
+                    let CodeBuddyBillingResources::Modern {
+                        paid,
+                        details_complete,
+                        ..
+                    } = result.unwrap()
+                    else {
+                        panic!("modern expected")
+                    };
+                    assert!(details_complete, "{scenario}");
+                    assert_eq!(
+                        paid.unwrap()["data"]["Accounts"].as_array().unwrap().len(),
+                        if scenario == "exact-full-page" {
+                            200
+                        } else {
+                            201
+                        },
+                        "{scenario}"
+                    );
+                    assert_eq!(count, 2, "{scenario}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn buddy_billing_incomplete_details_cannot_override_summary() {
+            for scenario in [
+                "stagnant",
+                "total-drift",
+                "missing-tail",
+                "conflicting-row",
+                "page-cap",
+                "excessive-total",
+                "transient",
+                "underreported-total",
+                "memory-cap",
+            ] {
+                let (result, count) = run(scenario, ProviderType::WorkBuddyOAuth).await;
+                let CodeBuddyBillingResources::Modern {
+                    paid,
+                    summary,
+                    details_complete,
+                    ..
+                } = result.unwrap()
+                else {
+                    panic!("modern expected")
+                };
+                assert!(!details_complete, "{scenario}");
+                assert!(paid.is_none(), "{scenario}");
+                assert!(summary.is_some(), "{scenario}");
+                assert!(count <= CODEBUDDY_BILLING_MAX_PAGES, "{scenario}");
+            }
+            let (result, _) = run("no-summary", ProviderType::WorkBuddyOAuth).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn buddy_billing_later_page_auth_and_total_deadline_remain_visible() {
+            let (result, count) = run("auth", ProviderType::WorkBuddyOAuth).await;
+            assert!(result.unwrap_err().is_authentication_failure());
+            assert_eq!(count, 2);
+            let (result, _) = run("timeout", ProviderType::WorkBuddyOAuth).await;
+            assert!(result.unwrap_err().is_transient());
+        }
     }
 }

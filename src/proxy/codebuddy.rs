@@ -38,6 +38,7 @@ pub struct CodeBuddyUpstreamError {
     pub status: u16,
     pub code: Option<i64>,
     pub message: String,
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl CodeBuddyUpstreamError {
@@ -64,7 +65,28 @@ impl CodeBuddyUpstreamError {
             status,
             code,
             message,
+            retry_after_seconds: None,
         }
+    }
+
+    pub fn with_retry_after(mut self, headers: &axum::http::HeaderMap) -> Self {
+        self.retry_after_seconds = headers
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value.trim().parse::<u64>().ok().or_else(|| {
+                    let deadline = httpdate::parse_http_date(value).ok()?;
+                    Some(
+                        deadline
+                            .duration_since(std::time::SystemTime::now())
+                            .ok()?
+                            .as_secs()
+                            .saturating_add(1),
+                    )
+                })
+            })
+            .map(|seconds| seconds.min(86_400));
+        self
     }
 
     pub fn from_event(value: &Value) -> Option<Self> {
@@ -84,14 +106,22 @@ impl CodeBuddyUpstreamError {
             status: status_for_code(code).as_u16(),
             code: Some(code),
             message,
+            retry_after_seconds: None,
         })
     }
 
     pub fn downstream_status(&self) -> axum::http::StatusCode {
-        self.code.map(status_for_code).unwrap_or_else(|| {
-            axum::http::StatusCode::from_u16(self.status)
-                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY)
-        })
+        if let Some(status) = self
+            .code
+            .map(status_for_code)
+            .filter(|status| *status != axum::http::StatusCode::BAD_GATEWAY)
+        {
+            return status;
+        }
+        axum::http::StatusCode::from_u16(self.status)
+            .ok()
+            .filter(|status| status.is_client_error() || status.is_server_error())
+            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY)
     }
 
     pub fn is_authentication_failure(&self) -> bool {
@@ -107,29 +137,80 @@ impl CodeBuddyUpstreamError {
 
     pub fn into_proxy_error(self) -> ProxyError {
         let status = self.downstream_status();
-        ProxyError {
-            status,
-            message: match self
-                .code
-                .filter(|code| status_for_code(*code) != axum::http::StatusCode::BAD_GATEWAY)
-            {
-                Some(code) => format!("CodeBuddy upstream error {code}: {}", self.message),
-                None => self.message,
-            },
+        let retry = self.retry_after_seconds.or_else(|| {
+            (self.code == Some(6_004))
+                .then(|| quota_reset_seconds(&self.message, chrono::Utc::now()))
+                .flatten()
+        });
+        let message = match self
+            .code
+            .filter(|code| status_for_code(*code) != axum::http::StatusCode::BAD_GATEWAY)
+        {
+            Some(code) => format!("CodeBuddy upstream error {code}: {}", self.message),
+            None => self.message,
+        };
+        if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+            if let Some(seconds) = retry {
+                return ProxyError::rate_limited(message, seconds);
+            }
         }
+        ProxyError { status, message }
     }
 }
 
 fn status_for_code(code: i64) -> axum::http::StatusCode {
     match code {
         12_005 | 11_212 | 11_216 | 12_153 => axum::http::StatusCode::UNAUTHORIZED,
-        11_102 | 11_133 => axum::http::StatusCode::FORBIDDEN,
+        11_102 | 11_133 | 11_140 => axum::http::StatusCode::FORBIDDEN,
         14_001..=14_018 | 6_001..=6_008 | 10_105 | 15_001 => {
             axum::http::StatusCode::TOO_MANY_REQUESTS
         }
-        11_101 | 11_115 | 11_128 => axum::http::StatusCode::BAD_REQUEST,
+        11_101 | 11_115 | 11_128 | 11_148 | 11_153 => axum::http::StatusCode::BAD_REQUEST,
         _ => axum::http::StatusCode::BAD_GATEWAY,
     }
+}
+
+fn quota_reset_seconds(message: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    use chrono::TimeZone;
+    // Only explicit reset wording with a complete offset and terminator is
+    // authoritative. An arbitrary date (or a truncated UTC suffix) is not.
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| regex::Regex::new(
+        r"(?i)(?P<prefix>resets?\s+at\s+|将在\s*)(?P<time>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})\s*(?P<zone>UTC[+-]\d{1,2}(?::\d{2})?|[+-]\d{2}:?\d{2}|Z)\s*(?P<suffix>重置[，,。.!?]|[,.;，。])"
+    ).expect("static Buddy reset pattern"));
+    let captures = pattern.captures(message)?;
+    if captures["prefix"].starts_with("将在") && !captures["suffix"].starts_with("重置") {
+        return None;
+    }
+    let timestamp = captures["time"].replace('T', " ");
+    let local = chrono::NaiveDateTime::parse_from_str(&timestamp, "%Y-%m-%d %H:%M:%S").ok()?;
+    let zone = captures["zone"].to_ascii_uppercase();
+    let seconds = if zone == "Z" {
+        0
+    } else {
+        let zone = zone.strip_prefix("UTC").unwrap_or(&zone);
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let digits = zone.get(1..)?;
+        let (hours, minutes) = if let Some((hours, minutes)) = digits.split_once(':') {
+            (hours.parse::<i32>().ok()?, minutes.parse::<i32>().ok()?)
+        } else if digits.len() == 4 {
+            (
+                digits[..2].parse::<i32>().ok()?,
+                digits[2..].parse::<i32>().ok()?,
+            )
+        } else {
+            (digits.parse::<i32>().ok()?, 0)
+        };
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    let reset = chrono::FixedOffset::east_opt(seconds)?
+        .from_local_datetime(&local)
+        .single()?;
+    let millis = reset.signed_duration_since(now).num_milliseconds();
+    (millis > 0).then(|| (millis as u64).div_ceil(1000).min(86_400))
 }
 
 #[derive(Debug)]
@@ -2304,5 +2385,89 @@ mod tests {
             .is_err());
         assert!(aggregator.push(Bytes::new()).is_err());
         assert!(aggregator.finish("auto", 1).is_err());
+    }
+    #[test]
+    fn codebuddy_tool_sequence_errors_are_client_errors_and_limits_preserve_retry() {
+        let error = CodeBuddyUpstreamError::from_status_body(
+            400,
+            br#"{"code":11148,"msg":"tool sequence"}"#,
+        )
+        .into_proxy_error();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        let error =
+            CodeBuddyUpstreamError::from_status_body(401, br#"{"code":6004,"msg":"limit"}"#)
+                .with_retry_after(&headers);
+        assert!(!error.is_authentication_failure());
+        assert_eq!(error.into_proxy_error().retry_after_seconds(), Some(120));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            quota_reset_seconds(
+                "usage will reset at 2026-11-02 08:01:00 UTC+8, try later",
+                now
+            ),
+            Some(60)
+        );
+        assert_eq!(
+            quota_reset_seconds("将在2026-11-02 07:59:00 UTC+8重置。", now),
+            None
+        );
+        assert_eq!(
+            quota_reset_seconds("reset at 2026-02-30 08:01:00 UTC+8.", now),
+            None
+        );
+        for message in [
+            "将在2026-11-02 08:01:00 UTC+8重置。",
+            "reset at 2026-11-02T00:01:00Z.",
+            "reset at 2026-11-01 19:01:00 UTC-5, try later",
+            "resets at 2026-11-02 08:01:00 +0800.",
+            "reset at 2026-11-02 08:01:00 UTC+08:00.",
+        ] {
+            assert_eq!(quota_reset_seconds(message, now), Some(60), "{message}");
+        }
+        for message in [
+            "deprecated on 2026-11-02 08:01:00 UTC+8.",
+            "retry after 2026-11-02 08:01:00 UTC+8.",
+            "reset at 2026-11-02 08:01:00 UTC+8",
+            "reset at 2026-11-02 08:01:00 UTC+.",
+            "reset at 2026-11-02 08:01:00 UTC+99.",
+            "reset at 2026-11-02 08:01:00.",
+            "将在2026-11-02 08:01:00 UTC+8。",
+        ] {
+            assert_eq!(quota_reset_seconds(message, now), None, "{message}");
+        }
+        assert_eq!(
+            quota_reset_seconds("reset at 2026-12-02 08:01:00 UTC+8.", now),
+            Some(86_400)
+        );
+    }
+
+    #[test]
+    fn buddy_business_errors_preserve_transport_status_without_reclassifying_entitlement() {
+        for (code, expected) in [(11140, 403), (11153, 400), (11133, 403)] {
+            let body = serde_json::to_vec(&json!({"code":code,"msg":"rejected"})).unwrap();
+            let error = CodeBuddyUpstreamError::from_status_body(401, &body);
+            assert!(!error.is_authentication_failure());
+            assert_eq!(error.downstream_status().as_u16(), expected);
+            assert_eq!(
+                CodeBuddyUpstreamError::from_event(&json!({"code":code}))
+                    .unwrap()
+                    .downstream_status()
+                    .as_u16(),
+                expected
+            );
+        }
+        for (status, expected) in [(400, 400), (403, 403), (429, 429), (503, 503), (200, 502)] {
+            let error = CodeBuddyUpstreamError::from_status_body(
+                status,
+                br#"{"code":19999,"msg":"unknown"}"#,
+            );
+            assert_eq!(error.downstream_status().as_u16(), expected);
+        }
+        let error = CodeBuddyUpstreamError::from_event(&json!({"code":19999})).unwrap();
+        assert_eq!(error.downstream_status().as_u16(), 502);
     }
 }

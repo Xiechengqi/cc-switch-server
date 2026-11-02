@@ -6,12 +6,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+const product = new URL(import.meta.url).searchParams.get("product") || "codebuddy";
+if (!["codebuddy", "workbuddy"].includes(product)) throw new Error("invalid receipt product");
+const productUpper = product.toUpperCase();
+const productLabel = product === "workbuddy" ? "WorkBuddy" : "CodeBuddy";
+const providerType = `${product}_oauth`;
+const scopeField = `${product}CredentialScope`;
+const catalogSource = product === "workbuddy" ? "workbuddy_live_model_catalog" : "codebuddy_live_model_catalog";
+
 let failureReported = false;
 
 function reportFailure() {
   if (!failureReported) {
     failureReported = true;
-    console.error("[FAIL] CodeBuddy acceptance failed (details redacted)");
+    console.error(`[FAIL] ${productLabel} acceptance failed (details redacted)`);
   }
   process.exitCode = 1;
 }
@@ -28,7 +36,7 @@ process.on("unhandledRejection", reportFailure);
 const repoRoot = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const contract = JSON.parse(
   fs.readFileSync(
-    path.join(repoRoot, "assets/contract/codebuddy-reference-delta.json"),
+    path.join(repoRoot, product === "codebuddy" ? "assets/contract/codebuddy-reference-delta.json" : "assets/contract/workbuddy-protocol.json"),
     "utf8",
   ),
 );
@@ -40,26 +48,26 @@ const CATALOG_FUTURE_SKEW_MS = 60_000;
 const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
 const siteSpecs = Object.freeze({
   intl: Object.freeze({
-    accountEnv: "CODEBUDDY_INTL_TEST_ACCOUNT",
+    accountEnv: `${productUpper}_INTL_TEST_ACCOUNT`,
     providerEnvs: Object.freeze({
-      claude: "CC_SWITCH_CODEBUDDY_INTL_CLAUDE_PROVIDER_ID",
-      codex: "CC_SWITCH_CODEBUDDY_INTL_CODEX_PROVIDER_ID",
-      gemini: "CC_SWITCH_CODEBUDDY_INTL_GEMINI_PROVIDER_ID",
+      claude: `CC_SWITCH_${productUpper}_INTL_CLAUDE_PROVIDER_ID`,
+      codex: `CC_SWITCH_${productUpper}_INTL_CODEX_PROVIDER_ID`,
+      gemini: `CC_SWITCH_${productUpper}_INTL_GEMINI_PROVIDER_ID`,
     }),
-    shareEnv: "CC_SWITCH_CODEBUDDY_INTL_SHARE_ID",
-    modelEnv: "CC_SWITCH_CODEBUDDY_INTL_MODEL",
-    receiptEnv: "CODEBUDDY_INTL_REAL_RECEIPT_FILE",
+    shareEnv: `CC_SWITCH_${productUpper}_INTL_SHARE_ID`,
+    modelEnv: `CC_SWITCH_${productUpper}_INTL_MODEL`,
+    receiptEnv: `${productUpper}_INTL_REAL_RECEIPT_FILE`,
   }),
   cn: Object.freeze({
-    accountEnv: "CODEBUDDY_CN_TEST_ACCOUNT",
+    accountEnv: `${productUpper}_CN_TEST_ACCOUNT`,
     providerEnvs: Object.freeze({
-      claude: "CC_SWITCH_CODEBUDDY_CN_CLAUDE_PROVIDER_ID",
-      codex: "CC_SWITCH_CODEBUDDY_CN_CODEX_PROVIDER_ID",
-      gemini: "CC_SWITCH_CODEBUDDY_CN_GEMINI_PROVIDER_ID",
+      claude: `CC_SWITCH_${productUpper}_CN_CLAUDE_PROVIDER_ID`,
+      codex: `CC_SWITCH_${productUpper}_CN_CODEX_PROVIDER_ID`,
+      gemini: `CC_SWITCH_${productUpper}_CN_GEMINI_PROVIDER_ID`,
     }),
-    shareEnv: "CC_SWITCH_CODEBUDDY_CN_SHARE_ID",
-    modelEnv: "CC_SWITCH_CODEBUDDY_CN_MODEL",
-    receiptEnv: "CODEBUDDY_CN_REAL_RECEIPT_FILE",
+    shareEnv: `CC_SWITCH_${productUpper}_CN_SHARE_ID`,
+    modelEnv: `CC_SWITCH_${productUpper}_CN_MODEL`,
+    receiptEnv: `${productUpper}_CN_REAL_RECEIPT_FILE`,
   }),
 });
 
@@ -121,7 +129,7 @@ function gitCommit() {
   }
 }
 
-const site = argValue("--site", env("CC_SWITCH_CODEBUDDY_REAL_SITE"));
+const site = argValue("--site", env(`CC_SWITCH_${productUpper}_REAL_SITE`));
 const spec = siteSpecs[site];
 if (!spec) {
   console.log(
@@ -135,7 +143,7 @@ if (!spec) {
   process.exit(0);
 }
 
-const fixtureMode = env("CC_SWITCH_CODEBUDDY_HARNESS_MODE") === "fixture";
+const fixtureMode = env(`CC_SWITCH_${productUpper}_HARNESS_MODE`) === "fixture";
 const serverUrl = env("SERVER_URL").replace(/\/+$/, "");
 const shareUrl = env("CC_SWITCH_SHARE_URL").replace(/\/+$/, "");
 const serverToken = env("CC_SWITCH_SERVER_TOKEN");
@@ -442,13 +450,13 @@ async function validateAccount() {
   const account = exactOne(
     response.accounts.filter(
       (candidate) =>
-        candidate?.providerType === "codebuddy_oauth" &&
+        candidate?.providerType === providerType &&
         (candidate.id === accountSelector ||
           candidate.email?.trim().toLowerCase() === selector),
     ),
     "CodeBuddy Account selector",
   );
-  if (account.codebuddyCredentialScope?.site !== site) {
+  if (account[scopeField]?.site !== site) {
     fail("CodeBuddy Account profile site does not match the selected site");
   }
   if (
@@ -473,12 +481,12 @@ function validateProvider(view, app, providerId, account) {
   if (
     view.app !== app ||
     view.provider?.id !== providerId ||
-    view.providerType !== "codebuddy_oauth" ||
-    view.providerTypeId !== "codebuddy_oauth" ||
-    view.runtime?.driverId !== "special.codebuddy_oauth" ||
+    view.providerType !== providerType ||
+    view.providerTypeId !== providerType ||
+    view.runtime?.driverId !== `special.${providerType}` ||
     view.runtime?.configurationState !== "ready" ||
     authRef?.kind !== "managed_account" ||
-    authRef.expectedProviderType !== "codebuddy_oauth" ||
+    authRef.expectedProviderType !== providerType ||
     authRef.accountId !== account.id ||
     authRef.authIdentityGeneration !== account.authIdentityGeneration
   ) {
@@ -550,7 +558,7 @@ async function validateBindings(account) {
     if (
       appBindings.length !== 1 ||
       appBindings[0]?.providerId !== providerId ||
-      appBindings[0]?.providerType !== "codebuddy_oauth"
+      appBindings[0]?.providerType !== providerType
     ) {
       fail(`CodeBuddy Share does not have one exact ${app} Provider binding`);
     }
@@ -578,7 +586,7 @@ async function validateCatalog(app, providerId) {
   const now = Date.now();
   if (
     !Array.isArray(catalog?.data) ||
-    catalog.source !== "codebuddy_live_model_catalog" ||
+    catalog.source !== catalogSource ||
     catalog.stale !== false ||
     !freshCatalogTimestamp(catalog.fetchedAtMs, now)
   ) {
@@ -599,7 +607,7 @@ async function validateCatalog(app, providerId) {
     fetchedAtMs: catalog.fetchedAtMs,
     stale: false,
     digest: digest(
-      `cc-switch-server:codebuddy-${app}-catalog:v2`,
+      `cc-switch-server:${product}-${app}-catalog:v2`,
       [...catalog.data].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
     ),
   };
@@ -612,29 +620,29 @@ function expectedGenerations(account, binding) {
       {
         providerRevision: value.providerRevision,
         runtimeFingerprintDigest: digest(
-          `cc-switch-server:codebuddy-${app}-runtime:v2`,
+          `cc-switch-server:${product}-${app}-runtime:v2`,
           value.runtimeFingerprint,
         ),
       },
     ]),
   );
-  const accountIdentityDigest = digest("cc-switch-server:codebuddy-account:v2", {
+  const accountIdentityDigest = digest(`cc-switch-server:${product}-account:v2`, {
     accountId: account.id,
     site,
     authIdentityGeneration: account.authIdentityGeneration,
     tokenRefreshGeneration: account.tokenRefreshGeneration,
   });
-  const providerBindingDigest = digest("cc-switch-server:codebuddy-provider-bindings:v2", {
+  const providerBindingDigest = digest(`cc-switch-server:${product}-provider-bindings:v2`, {
     accountIdentityDigest,
     bindings: Object.entries(providerIds)
       .map(([app, providerId]) => ({ app, providerId, ...surfaceBindings[app] }))
       .sort((left, right) => left.app.localeCompare(right.app)),
   });
-  const shareBindingDigest = digest("cc-switch-server:codebuddy-share-binding:v2", {
+  const shareBindingDigest = digest(`cc-switch-server:${product}-share-binding:v2`, {
     shareId,
     shareRevision: binding.shareRevision,
     bindings: Object.entries(providerIds)
-      .map(([app, providerId]) => ({ app, providerId, providerType: "codebuddy_oauth" }))
+      .map(([app, providerId]) => ({ app, providerId, providerType: providerType }))
       .sort((left, right) => left.app.localeCompare(right.app)),
   });
   return {
@@ -725,7 +733,7 @@ function validateReceipt(receipt, context) {
   }
   if (
     receipt.schemaVersion !== contract.realAcceptance.receiptSchemaVersion ||
-    receipt.providerFamily !== "codebuddy" ||
+    receipt.providerFamily !== product ||
     receipt.site !== site ||
     receipt.targetCommit !== context.targetCommit ||
     receipt.harnessRevision !== HARNESS_REVISION ||
@@ -806,7 +814,7 @@ function validateReceipt(receipt, context) {
   ) {
     fail("CodeBuddy receipt did not prove isolation and secret safety");
   }
-  const scopeDigest = digest("cc-switch-server:codebuddy-real-scope:v2", {
+  const scopeDigest = digest(`cc-switch-server:${product}-real-scope:v2`, {
     site,
     targetCommit: context.targetCommit,
     harnessRevision: HARNESS_REVISION,
@@ -874,7 +882,7 @@ async function main() {
   const verificationState = fixtureMode ? "contract_verified" : "live_verified";
   const liveState = fixtureMode ? "live_pending" : "live_verified";
   console.log(
-    `[PASS] CodeBuddy ${site} private receipt accepted (verificationState=${verificationState}, liveState=${liveState})`,
+    `[PASS] ${productLabel} ${site} private receipt accepted (verificationState=${verificationState}, liveState=${liveState})`,
   );
 }
 

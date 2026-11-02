@@ -94,6 +94,8 @@ pub(in crate::api) struct AccountPublicView {
     pub(in crate::api) qoder_credential_scope: Option<QoderCredentialScopeView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) codebuddy_credential_scope: Option<CodeBuddyCredentialScopeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) workbuddy_credential_scope: Option<CodeBuddyCredentialScopeView>,
     pub(in crate::api) has_refresh_error: bool,
     pub(in crate::api) refresh_consecutive_failures: u32,
     pub(in crate::api) needs_relogin: bool,
@@ -179,6 +181,18 @@ impl From<&Account> for AccountPublicView {
             codebuddy_credential_scope: (account.provider_type == ProviderType::CodeBuddyOAuth)
                 .then(|| {
                     crate::domain::codebuddy::CodeBuddyAccountProfile::parse(
+                        account.profile.as_ref(),
+                    )
+                    .ok()
+                    .map(|profile| CodeBuddyCredentialScopeView {
+                        site: profile.site.as_str(),
+                    })
+                })
+                .flatten(),
+            workbuddy_credential_scope: (account.provider_type == ProviderType::WorkBuddyOAuth)
+                .then(|| {
+                    crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+                        account.provider_type,
                         account.profile.as_ref(),
                     )
                     .ok()
@@ -1443,4 +1457,22 @@ mod tests {
         assert!(!reflected.contains("stored-access-secret"));
         assert!(reflected.contains("[REDACTED]"));
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportBuddyCredentialsRequest {
+    pub provider_type: ProviderType,
+    pub site: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub preview: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::api) struct ImportBuddyCredentialsResponse {
+    pub ok: bool,
+    pub preview: bool,
+    pub accounts: Vec<AccountLoginAccountSummary>,
 }

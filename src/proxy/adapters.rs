@@ -658,6 +658,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::KimiCode,
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
+        ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
@@ -753,7 +754,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::QoderCosy) => {
             ("claude_to_qoder_cosy", AdapterSupport::Native)
         }
-        (AppKind::Claude, ProviderType::CodeBuddyOAuth) => {
+        (AppKind::Claude, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("claude_to_codebuddy_chat", AdapterSupport::Native)
         }
         (AppKind::Claude, ProviderType::TraeSolo) => {
@@ -809,7 +810,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::QoderCosy) => {
             ("codex_to_qoder_cosy", AdapterSupport::Native)
         }
-        (AppKind::Codex, ProviderType::CodeBuddyOAuth) => {
+        (AppKind::Codex, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("codex_to_codebuddy_chat", AdapterSupport::Native)
         }
         (AppKind::Codex, ProviderType::TraeSolo) => ("codex_to_trae_solo", AdapterSupport::Native),
@@ -859,7 +860,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Gemini, ProviderType::QoderCosy) => {
             ("gemini_to_qoder_cosy", AdapterSupport::Native)
         }
-        (AppKind::Gemini, ProviderType::CodeBuddyOAuth) => {
+        (AppKind::Gemini, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("gemini_to_codebuddy_chat", AdapterSupport::Native)
         }
         (AppKind::Gemini, ProviderType::TraeSolo) => {
@@ -906,6 +907,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::Nvidia
                 | ProviderType::GrokOAuth
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ),
         AppKind::Codex => matches!(
@@ -929,6 +931,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AmazonQOAuth
                 | ProviderType::KimiCode
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ),
         AppKind::Gemini => matches!(
@@ -948,6 +951,7 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GrokOAuth
                 | ProviderType::KimiCode
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ),
     }
@@ -977,6 +981,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GrokOAuth
                 | ProviderType::KimiCode
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ) | (
             AppKind::Codex,
@@ -999,6 +1004,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GitHubCopilot
                 | ProviderType::KimiCode
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ) | (
             AppKind::Gemini,
@@ -1019,6 +1025,7 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GitHubCopilot
                 | ProviderType::KimiCode
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         )
     )
@@ -1039,6 +1046,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AmazonQOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ) | (
             AppKind::Codex,
@@ -1052,6 +1060,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::AmazonQOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         ) | (
             AppKind::Gemini,
@@ -1063,6 +1072,7 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::GrokOAuth
                 | ProviderType::GitHubCopilot
                 | ProviderType::CodeBuddyOAuth
+                | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
         )
     )
@@ -1088,6 +1098,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo => app,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
@@ -1620,9 +1631,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::GrokOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::KimiCode => Some(UpstreamFormat::AnthropicMessages),
             ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
-            ProviderType::CodeBuddyOAuth | ProviderType::TraeSolo => {
-                Some(UpstreamFormat::OpenAiChat)
-            }
+            ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
+            | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1641,6 +1652,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
             ProviderType::KiroOAuth | ProviderType::AmazonQOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
@@ -1668,6 +1680,7 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::KimiCode
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
+            | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {

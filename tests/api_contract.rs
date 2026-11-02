@@ -7675,16 +7675,16 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["format"],
         "cc-switch-provider-registry"
     );
-    assert_eq!(registry["registry"]["schemaVersion"], 9);
+    assert_eq!(registry["registry"]["schemaVersion"], 10);
     assert_eq!(
         registry["registry"]["optionSchemas"]
             .as_array()
             .map(Vec::len),
-        Some(25)
+        Some(26)
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        82
+        85
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7748,7 +7748,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 27);
+    assert_eq!(presets.len(), 28);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));
@@ -7770,6 +7770,9 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.codebuddy_oauth"));
+    assert!(presets
+        .iter()
+        .any(|preset| preset["profileId"] == "codex.workbuddy_oauth"));
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.trae_solo"));

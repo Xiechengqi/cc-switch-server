@@ -149,6 +149,7 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::KimiCode
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
+        | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
         | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
         ProviderType::Claude

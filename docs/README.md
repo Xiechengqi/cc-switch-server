@@ -49,6 +49,7 @@
 | [kimi-code.md](provider/kimi-code.md) | 权威 | Kimi Code 单账号反代 |
 | [qoder-cosy.md](provider/qoder-cosy.md) | 权威 | Qoder COSY 单账号反代、站点/凭据 rail、动态模型 capability 与签名边界 |
 | [codebuddy-oauth.md](provider/codebuddy-oauth.md) | 权威 | CodeBuddy OAuth 单账号反代实现合同：单 ProviderType + 国内/国际站点、固定身份 OAuth/refresh、三 Surface、严格终态与 `fixture_verified / live_pending` 边界 |
+| [workbuddy-oauth.md](provider/workbuddy-oauth.md) | 权威 | 独立 WorkBuddy 产品、原生双站 OAuth、固定账号、共享协议原语与真实验收边界 |
 | [trae-solo.md](provider/trae-solo.md) | 权威 | Trae CN Solo Server-native 单账号 bridge 实现合同：固定 endpoint、callback capability、三 Surface、严格终态、目录/额度与真实验收门禁 |
 | [deepseek-web.md](provider/deepseek-web.md) | 权威 | DeepSeek Web bearer、session/PoW、严格终态与单账号恢复边界 |
 | [api-key-coding-plans.md](provider/api-key-coding-plans.md) | 权威 | 20 个 region × Surface typed API Key Plan、外部证据漂移门禁与 Ollama Cloud |

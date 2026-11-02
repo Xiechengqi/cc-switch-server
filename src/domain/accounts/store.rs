@@ -1167,6 +1167,21 @@ impl AccountStore {
         uid: &str,
         enterprise_id: &str,
     ) -> Option<&str> {
+        self.buddy_account_id_for_stable_identity(
+            ProviderType::CodeBuddyOAuth,
+            site,
+            uid,
+            enterprise_id,
+        )
+    }
+
+    pub fn buddy_account_id_for_stable_identity(
+        &self,
+        provider_type: ProviderType,
+        site: crate::domain::codebuddy::CodeBuddySite,
+        uid: &str,
+        enterprise_id: &str,
+    ) -> Option<&str> {
         let uid = uid.trim();
         let enterprise_id = enterprise_id.trim();
         if uid.is_empty() {
@@ -1175,16 +1190,19 @@ impl AccountStore {
         self.accounts
             .iter()
             .find(|account| {
-                if account.provider_type != ProviderType::CodeBuddyOAuth {
+                if account.provider_type != provider_type {
                     return false;
                 }
-                crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref())
-                    .ok()
-                    .is_some_and(|profile| {
-                        profile.site == site
-                            && profile.uid.trim() == uid
-                            && profile.enterprise_id.trim() == enterprise_id
-                    })
+                crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+                    account.provider_type,
+                    account.profile.as_ref(),
+                )
+                .ok()
+                .is_some_and(|profile| {
+                    profile.site == site
+                        && profile.uid.trim() == uid
+                        && profile.enterprise_id.trim() == enterprise_id
+                })
             })
             .map(|account| account.id.as_str())
     }
@@ -1197,7 +1215,8 @@ impl AccountStore {
     ) -> Option<&Account> {
         let fingerprint = refresh_token_fingerprint(refresh_token)?;
         self.accounts.iter().find(|account| {
-            account.provider_type == provider_type
+            (account.provider_type == provider_type
+                || (account.provider_type.is_buddy_oauth() && provider_type.is_buddy_oauth()))
                 && except_account_id != Some(account.id.as_str())
                 && account
                     .refresh_token
@@ -1888,7 +1907,9 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
         qoder_identity: (account.provider_type == ProviderType::QoderCosy)
             .then(|| qoder_identity_evidence(account))
             .flatten(),
-        codebuddy_identity: (account.provider_type == ProviderType::CodeBuddyOAuth)
+        codebuddy_identity: account
+            .provider_type
+            .is_buddy_oauth()
             .then(|| codebuddy_identity_evidence(account))
             .flatten(),
         trae_identity: (account.provider_type == ProviderType::TraeSolo)
@@ -1932,7 +1953,7 @@ fn account_auth_identity_changed(
             (Some(_), None) => true,
         };
     }
-    if previous.provider_type == ProviderType::CodeBuddyOAuth {
+    if previous.provider_type.is_buddy_oauth() {
         return managed_profile_identity_changed(
             &previous.codebuddy_identity,
             &current.codebuddy_identity,
@@ -1998,7 +2019,7 @@ pub fn account_refresh_replaces_auth_identity(
             (Some(_), None) => true,
         };
     }
-    if previous.provider_type == ProviderType::CodeBuddyOAuth {
+    if previous.provider_type.is_buddy_oauth() {
         return managed_refresh_profile_identity_replaced(
             &previous.codebuddy_identity,
             &candidate.codebuddy_identity,
@@ -2172,8 +2193,11 @@ fn qoder_identity_evidence(account: &Account) -> Option<QoderIdentityEvidence> {
 }
 
 fn codebuddy_identity_evidence(account: &Account) -> Option<CodeBuddyIdentityEvidence> {
-    let profile =
-        crate::domain::codebuddy::CodeBuddyAccountProfile::parse(account.profile.as_ref()).ok()?;
+    let profile = crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+        account.provider_type,
+        account.profile.as_ref(),
+    )
+    .ok()?;
     let [site, uid, enterprise_id] = profile.stable_identity_components();
     Some(CodeBuddyIdentityEvidence {
         site: site.to_string(),

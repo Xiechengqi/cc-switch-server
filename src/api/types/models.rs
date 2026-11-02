@@ -39,6 +39,8 @@ pub(in crate::api) struct OpenAiModel {
     pub(in crate::api) context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) supports_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,7 +56,9 @@ pub(in crate::api) struct GeminiModel {
     pub(in crate::api) version: String,
     pub(in crate::api) display_name: String,
     pub(in crate::api) description: String,
-    pub(in crate::api) input_token_limit: u32,
-    pub(in crate::api) output_token_limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) input_token_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) output_token_limit: Option<u64>,
     pub(in crate::api) supported_generation_methods: Vec<String>,
 }

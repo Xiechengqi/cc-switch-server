@@ -1326,7 +1326,29 @@ fn codebuddy_client_runtime_error(
 
 fn codebuddy_request_identity_fingerprint(account: &Account) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cc-switch-server:codebuddy-request-identity:v1\0");
+    digest.update(b"cc-switch-server:codebuddy-request-identity:v2\0");
+    if let Ok(profile) = crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+        account.provider_type,
+        account.profile.as_ref(),
+    ) {
+        if let Ok(policy) =
+            crate::domain::codebuddy::buddy_product_policy(account.provider_type, profile.site)
+        {
+            for component in [
+                policy.client_identity.revision(),
+                policy.client_identity.version(),
+                policy.client_identity.user_agent(),
+                policy.client_identity.catalog_agent(),
+                policy.auth_platform,
+                policy.refresh_source,
+                policy.control_endpoint,
+                policy.generation_endpoint,
+            ] {
+                digest.update((component.len() as u64).to_be_bytes());
+                digest.update(component.as_bytes());
+            }
+        }
+    }
     let profile = account
         .profile
         .as_ref()
@@ -1339,6 +1361,7 @@ fn codebuddy_request_identity_fingerprint(account: &Account) -> String {
         .map(Value::to_string)
         .unwrap_or_default();
     for component in [
+        account.provider_type.as_str(),
         account.access_token.as_deref().unwrap_or_default(),
         account.refresh_token.as_deref().unwrap_or_default(),
         profile.as_str(),
@@ -14161,6 +14184,20 @@ impl ServerStateInner {
         if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
+        if account.provider_type.is_buddy_oauth() {
+            let accounts = self.accounts.read().await;
+            if account.refresh_token.as_deref().is_some_and(|token| {
+                accounts
+                    .refresh_token_owner(account.provider_type, token, Some(&account.id))
+                    .is_some()
+            }) {
+                return Err(ManagedAccountRefreshError::Refresh {
+                    status_code: 409,
+                    message: "rotating token has multiple managed owners; remove the duplicate account before refreshing".to_string(),
+                    retry_after_ms: None,
+                });
+            }
+        }
         if self.credential_persistence_degraded() {
             return Err(ManagedAccountRefreshError::CredentialPersistenceDegraded);
         }
@@ -15875,7 +15912,7 @@ impl ServerStateInner {
             ProviderType::QoderCosy => {
                 self.cancel_qoder_device_flow(device_code).await;
             }
-            ProviderType::CodeBuddyOAuth => {
+            ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
                 self.cancel_codebuddy_login_flow(device_code).await;
             }
             ProviderType::TraeSolo => {
@@ -15919,7 +15956,7 @@ impl ServerStateInner {
                 ProviderType::QoderCosy => {
                     self.cancel_qoder_device_flow(device_code).await;
                 }
-                ProviderType::CodeBuddyOAuth => {
+                ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
                     self.cancel_codebuddy_login_flow(device_code).await;
                 }
                 ProviderType::TraeSolo => {
@@ -17695,9 +17732,22 @@ impl ServerStateInner {
     {
         use crate::domain::codebuddy::CodeBuddyAccountProfile;
         use crate::proxy::codebuddy_runtime::{
-            parse_codebuddy_model_catalog, CodeBuddyRuntimeScope, PreparedCodeBuddyRuntime,
+            parse_buddy_model_catalog, CodeBuddyRuntimeScope, PreparedCodeBuddyRuntime,
         };
 
+        let provider_type = self
+            .providers
+            .read()
+            .await
+            .providers
+            .iter()
+            .find(|stored| {
+                stored.app == app
+                    && stored.provider.id == provider_id
+                    && stored.provider_type.is_buddy_oauth()
+            })
+            .map(|stored| stored.provider_type)
+            .ok_or(CodeBuddyRuntimeError::IdentityChanged)?;
         if self.credential_persistence_degraded() {
             return Err(CodeBuddyRuntimeError::CredentialPersistenceDegraded);
         }
@@ -17716,14 +17766,14 @@ impl ServerStateInner {
         }
 
         self.refresh_managed_account_if_needed_for_generation(
-            ProviderType::CodeBuddyOAuth,
+            provider_type,
             account_id,
             expected_auth_identity_generation,
         )
         .await
         .map_err(CodeBuddyRuntimeError::Refresh)?;
         let (account, account_incarnation) = self
-            .find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, account_id)
+            .find_account_for_provider_with_incarnation(provider_type, account_id)
             .await
             .ok_or(CodeBuddyRuntimeError::NotFound)?;
         if account.auth_identity_generation != expected_auth_identity_generation {
@@ -17736,8 +17786,9 @@ impl ServerStateInner {
                 retryable: false,
             });
         }
-        let profile = CodeBuddyAccountProfile::parse(account.profile.as_ref())
-            .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
+        let profile =
+            CodeBuddyAccountProfile::parse_for(account.provider_type, account.profile.as_ref())
+                .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
         let access_token = account
             .access_token
             .as_deref()
@@ -17802,13 +17853,12 @@ impl ServerStateInner {
                 .await;
                 match fetched {
                     Ok((value, _)) => {
-                        let parsed = parse_codebuddy_model_catalog(&value, profile.site).map_err(
-                            |message| CodeBuddyRuntimeError::Upstream {
+                        let parsed = parse_buddy_model_catalog(&value, provider_type, profile.site)
+                            .map_err(|message| CodeBuddyRuntimeError::Upstream {
                                 status_code: 502,
                                 message,
                                 retryable: false,
-                            },
-                        )?;
+                            })?;
                         if !self
                             .codebuddy_runtime_snapshot_matches(
                                 app,
@@ -17891,7 +17941,7 @@ impl ServerStateInner {
         let Some(stored) = providers.providers.iter().find(|stored| {
             stored.app == app
                 && stored.provider.id == provider_id
-                && stored.provider_type == ProviderType::CodeBuddyOAuth
+                && stored.provider_type.is_buddy_oauth()
                 && stored.resource.revision == provider_revision
         }) else {
             return false;
@@ -17903,14 +17953,14 @@ impl ServerStateInner {
             && plan.runtime_fingerprint == runtime_fingerprint
             && plan.configuration_state
                 != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
-            && plan.driver_id.as_str() == "special.codebuddy_oauth"
+            && Some(plan.driver_id.as_str()) == stored.provider_type.buddy_driver_id()
             && matches!(
                 &plan.auth_ref,
                 crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
                     account_id: bound_account_id,
-                    expected_provider_type: ProviderType::CodeBuddyOAuth,
+                    expected_provider_type,
                     auth_identity_generation,
-                } if bound_account_id == account_id
+                } if *expected_provider_type == stored.provider_type && bound_account_id == account_id
                     && *auth_identity_generation == expected_auth_identity_generation
             )
     }
@@ -17939,7 +17989,7 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, &expected.id)
+        self.find_account_for_provider_with_incarnation(expected.provider_type, &expected.id)
             .await
             .is_some_and(|(current, incarnation)| {
                 incarnation == expected_incarnation
@@ -17970,6 +18020,21 @@ impl ServerStateInner {
         account_incarnation: u64,
         scope: &crate::proxy::codebuddy_runtime::CodeBuddyRuntimeScope,
     ) -> bool {
+        let Some(provider_type) = self
+            .providers
+            .read()
+            .await
+            .providers
+            .iter()
+            .find(|stored| {
+                stored.app == app
+                    && stored.provider.id == provider_id
+                    && stored.provider_type.is_buddy_oauth()
+            })
+            .map(|stored| stored.provider_type)
+        else {
+            return false;
+        };
         if !self
             .codebuddy_runtime_matches(
                 app,
@@ -17983,13 +18048,14 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider_with_incarnation(ProviderType::CodeBuddyOAuth, account_id)
+        self.find_account_for_provider_with_incarnation(provider_type, account_id)
             .await
             .is_some_and(|(account, incarnation)| {
                 account.auth_identity_generation == auth_identity_generation
                     && account.token_refresh_generation == token_refresh_generation
                     && incarnation == account_incarnation
-                    && crate::domain::codebuddy::CodeBuddyAccountProfile::parse(
+                    && crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+                        account.provider_type,
                         account.profile.as_ref(),
                     )
                     .ok()

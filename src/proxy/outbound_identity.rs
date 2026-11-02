@@ -129,10 +129,11 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         }
         ManagedIdentityFamily::Codebuddy => set_user_agent(
             headers,
-            format!(
-                "CLI/{0} CodeBuddy/{0}",
-                crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION
-            ),
+            crate::domain::codebuddy::BuddyClientIdentity::CodeBuddyCli.user_agent().to_string(),
+        ),
+        ManagedIdentityFamily::Workbuddy => set_user_agent(
+            headers,
+            crate::domain::codebuddy::BuddyClientIdentity::WorkBuddyCli.user_agent().to_string(),
         ),
         ManagedIdentityFamily::Trae => set_user_agent(
             headers,

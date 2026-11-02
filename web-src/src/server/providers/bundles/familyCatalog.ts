@@ -53,6 +53,7 @@ export const SUBSCRIPTION_FAMILY_IDS = [
   "family.kimi_code",
   "family.qoder_cosy",
   "family.codebuddy_oauth",
+  "family.workbuddy_oauth",
   "family.trae_solo",
   "family.kimi_coding_api_key",
   "family.zhipu_glm_cn",
@@ -129,7 +130,8 @@ const FAMILY_SEARCH_ALIASES: Record<string, string[]> = {
   "family.kimi_code": ["kimi code oauth", "kimi code"],
   "family.kimi_coding_api_key": ["kimi code api key"],
   "family.qoder_cosy": ["qoder cosy"],
-  "family.codebuddy_oauth": ["codebuddy", "workbuddy"],
+  "family.codebuddy_oauth": ["codebuddy"],
+  "family.workbuddy_oauth": ["workbuddy", "办公"],
   "family.trae_solo": ["trae", "trae cn solo"],
   "family.bailian_coding_plan_cn": ["alibaba", "alibaba china"],
   "family.bailian_coding_plan_global": [

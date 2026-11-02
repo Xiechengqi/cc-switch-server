@@ -72,7 +72,7 @@ iOADomain          : tencent.sso.copilot.tencent.com, ...
 cloudHostedDomain  : *.sso.copilot.tencent.com, *.copilot.qq.com, ...
 ```
 
-文档另行确认 `workbuddy.ai` 也属国际 endpoint 集合【B】（见 §6.4）。`www.workbuddy.cn` 归入 `internalDomain`【A】。因此 workbuddy 与 codebuddy 是同一平台的两个品牌门面，**不构成第三个站点**，共用同一套 endpoint 与协议。
+文档另行确认 `workbuddy.ai` 也属国际 endpoint 集合【B】（见 §6.4）。`www.workbuddy.cn` 归入 `internalDomain`【A】。CodeBuddy 与 WorkBuddy 是两个产品，品牌域名可在同站集合中出现，但不据此互认凭据、刷新会话或订阅权益。WorkBuddy **不构成第三个站点**；它使用独立 ProviderType 和产品策略，原生 OAuth 与推理 origin 的差异见 [WorkBuddy 合同](workbuddy-oauth.md)。本节 endpoint 表仅约束 CodeBuddy。
 
 **站点是不可变的账号属性。** 请求中的模型、403、配额或网络错误都不能改变站点；不存在"国际失败回落国内"的路径。
 
@@ -715,7 +715,7 @@ receipt 的 `recordedAt` 必须在最终接受时仍位于 24 小时有效期内
 
 ### 10.2 订阅信息投影
 
-实现优先并行请求 summary / paid / free。任一路给出权威数组即可形成 modern partial result，detail 包按 package code 覆盖 summary 重复项；若三路都没有可识别资源结构，才回退旧 `/v2/...get-user-resource`。任一路 401 不得被兄弟请求的成功掩盖，而是交给统一控制面做至多一次 refresh + 全查询重放。
+实现并行请求 summary 与 paid/free 分页扫描。每类明细每页 200 项、最多 10 页、累计逻辑内存上限 2 MiB，单响应仍受 256 KiB 限制；整个查询共用最多 30 秒的截止时间（与调用方超时取小值）。按稳定资源 ID 去重，拒绝冲突内容、重复停滞、总量漂移、缺页及越界。只有 paid/free 都完整时，detail 才按 package code 覆盖 summary；明细不完整时仅采用可信 summary，无 summary 则保持未知。三路都明确 HTTP 404 才允许旧 `/v2/...get-user-resource`，不能把空数组、瞬时错误或坏响应当作旧接口探测依据。任一路、任意页的认证失败不得被兄弟请求的成功掩盖，由统一控制面执行既有至多一次 refresh + 全查询重放。
 
 旧接口请求：
 
@@ -736,7 +736,8 @@ receipt 的 `recordedAt` 必须在最终接受时仍位于 24 小时有效期内
 | UI 字段 | 来源 | 备注 |
 |---|---|---|
 | 等级 | `PackageName`（细分用 `SubProductCode`） | 服务端给可读串，**不得客户端拼装 Free/Pro** |
-| 到期 | `CycleEndTime` | `ExpiredTime` 实测为空串，不可用；也**不得**用 JWT `exp` 冒充 |
+| 到期 | 旧接口 `CycleEndTime`；现代接口 `DeductionEndTime` / `ExpiredTime` | 投影为 `expiresAt`，不得用 JWT `exp` 冒充，也不能据此声称周期重置 |
+| 周期重置 | 现代接口明确的 `CycleEndTime` 或匹配订阅 summary 的周期时间 | 与包失效分开；旧接口仅证明到期时，`resets_at` 保持未知 |
 | 余额 / 配额 | `CapacityRemain` / `CapacitySize`，单位 `CapacityUnit` | 单位实测有 `credit` 与 `credits` 两种写法，比较前须归一 |
 | 合计 | `TotalDosage` | 服务端已聚合，不要自行求和 |
 
@@ -751,7 +752,7 @@ requestId, credit, model, client, requestTime, inputTrunc, input, agentPurpose
 ```
 
 - **`input` / `inputTrunc` 是 prompt 正文**（CLI 请求实测为空，但字段存在）。消费方必须白名单裁剪，只取 `model` / `credit` / `requestTime` / `requestId`，**原文不得落盘、不得进日志、不得进 receipt**。
-- 分页按 `total` 推进，按 `(requestId, requestTime)` 去重；空页但尚未达到权威 `total`、超过 100 页或响应超过 8 MiB 均视为不完整，不能误报成功。
+- `total` 仅作提示，上游可能把 rows 与 total 一起截断至最早 3000 条且忽略 pageNum。固定 pageNum=1；满页以最大时间推进 inclusive startTime、按 `(requestId, 归一毫秒时间)` 去重，短页才可证明当前窗口结束。同秒饱和、停滞、坏行、超过 100 次扫描或响应超过 8 MiB 失败关闭，套餐仍可保留但明细 unavailable，不能误报 complete。
 - 观测到 `codewise-model-a9` 等**后端真实模型 id**，与 CLI 别名不同，可用于交叉验证 §6 目录。
 - 失败请求也可能计费：`gpt-5.6-terra` 返回 `11133` 拒绝，用量表仍记 0.02 credit。重试策略须据此设上限。
 
@@ -823,3 +824,22 @@ R4-CB-01比较完整客户端tuple后继续使用本仓受审2.142.0及原目录
 
 
 CORE-03统一观察见增强计划§20.10.7：两站独立send/headers/read和原同账号恢复分attempt记录；sanitize后的文本、推理及实际工具字段才算首内容，空字段/role/usage/finish-only排除。原DONE+EOF、错误锁存、license/limit与恢复合同保持，HTTP仅body handoff，取消和真实末owner释放独立。计时不改变提示词、客户端身份、目录、usage或健康；两站真实验收继续live_pending。
+
+## 2026-11-02 增强
+
+公开 signed-Share `/v1/models` 与管理发现使用同一精确绑定 runtime，成功空目录权威；传播真实 context/output 上限至 Gemini，未知值省略而不再编造固定容量。目录严格区分缺失 agents 与显式空 allowlist，保留 onlyReasoning、canDisableThinking 和 contextWindow 菜单；未知 reasoning effort 菜单拒绝任意级别，不自动开启或提高 effort。11148 / 11153 返回客户端 400，11140 返回账号受限 403，11133 继续按既有权益证据返回 403；429 保留有界 Retry-After / 明确重置措辞与显式时区的未来 reset，已知终态不触发认证恢复。
+
+WorkBuddy 已作为独立产品接入，见 [WorkBuddy 合同](workbuddy-oauth.md)。CodeBuddy 的 CLI 身份、旧账号和 CB-N4 真实门禁保持；未将新参考 Desktop 身份或模型接受性标成真实通过。
+
+
+### 2026-11-02 既有 Buddy 能力补强
+
+本轮只借鉴 magpie 固定版本及其 WorkBuddy 插件的参数、Schema、错误和套餐处理证据（版本、哈希见 `PROTOCOL_EVIDENCE.md`），不引入新的认证方式、上游协议或模型。产品策略拥有独立 `BuddyClientIdentity`，OAuth、刷新、目录、账单与推理复用同一受审 UA；身份版本、修订、通道、平台和 origin 纳入缓存身份摘要。两个产品仍使用 CLI 2.142.0，WorkBuddy 原生登录与 CLI 推理联合接受性保持 `live_pending`。显式 agents 只采用当前 `cli` 通道；缺失 agents 保持旧 schema 兼容，空通道仍为权威空目录，重复活动通道拒绝，其他 Agent 的模型不会并入。
+
+输出字段 `max_completion_tokens` 归一到 `max_tokens`，保留显式值；两个字段相同则合并、冲突则拒绝，不补默认值或自动增加上限。未知业务码保留实际 HTTP 4xx/5xx；HTTP 200 / SSE 的未知业务错误仍失败关闭。错误文字只有明确英文 reset-at 或中文“将在…重置”且带完整显式偏移与结束标点，才提取重置时间；支持 UTC 正负偏移、`+0800`、`+08:00`、`Z`，保留原有 24 小时等待上限、响应头优先和一次输出前同账号 401 恢复。
+
+现有 function 工具的 Schema 只做等价变换：`true → {}`、`false → {"not":{}}`，无类型的非空 enum 由其原值补充类型。显式 type、空 enum、tuple、联合、引用、required 与额外属性约束保留；只遍历 Schema 位置，数据中的属性名或 enum 对象不被解释为关键字，深度/节点受限，转换增长提前计入请求内存预算。共享 namespace/custom/freeform 桥接与名称映射继续复用。
+
+账单无时区日期按腾讯账单 UTC+8 壁钟解释；显式 RFC3339 偏移和数字秒/毫秒保持其语义。该解析修正与查询窗口分开，Intl 的 UTC 查询窗口、CN 的 UTC+8 查询窗口暂不变更；查询窗口策略仍需独立真实回执。套餐失效时间不会生成 `resets_at`；官方逐请求时间扫描、脱敏和可用性规则保持。
+
+请求准备只解析一次 canonical JSON，图像检查直接借用原对象；工具历史和命名选择转移现有 Value 所有权，保留完整工具轮次与提示词原文。仍保留一份 canonical 对象以支持已有受限恢复；请求内存预算、取消、唯一 DONE + EOF 和输出后的禁止重放继续生效。
