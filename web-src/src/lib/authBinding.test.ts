@@ -1,10 +1,23 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  managedAuthAccountLabel,
   resolveManagedAccountId,
   resolveManagedAccountIdentity,
 } from "./authBinding";
 import type { ProviderMeta } from "@/types";
+
+describe("managed account display labels", () => {
+  it("uses the Server label and supports older responses without displayName", () => {
+    const account = { id: "workbuddy-local-id", login: "workbuddy-local-id", email: null };
+    for (const displayName of ["昵称", "138****0000"]) {
+      expect(managedAuthAccountLabel({ ...account, displayName })).toBe(displayName);
+    }
+    expect(managedAuthAccountLabel({ ...account, email: " owner@example.com " })).toBe("owner@example.com");
+    expect(managedAuthAccountLabel({ ...account, displayName: " " })).toBe(account.id);
+    expect(managedAuthAccountLabel({ ...account, login: " " })).toBe(account.id);
+  });
+});
 
 function metaWithBinding(
   authProvider: string,

@@ -41,6 +41,7 @@ export interface ManagedAuthAccount {
   authIdentityGeneration: number;
   login: string;
   email?: string | null;
+  displayName?: string | null;
   subscriptionLevel?: string | null;
   avatar_url: string | null;
   authenticated_at: number;

@@ -30,17 +30,19 @@ pub(crate) struct BoundAccountIdentity {
 pub(crate) fn bound_account_identity(
     execution: &ProviderExecution,
 ) -> Result<BoundAccountIdentity, ProxyError> {
+    let product = crate::domain::codebuddy::buddy_product_label(execution.stored.provider_type);
     let Some((provider_type, account_id, auth_identity_generation)) =
         execution.managed_account_identity_target()
     else {
-        return Err(ProxyError::bad_request(
-            "CodeBuddy Provider must bind one explicit codebuddy_oauth managed account",
-        ));
+        return Err(ProxyError::bad_request(format!(
+            "{product} Provider must bind one explicit {} managed account",
+            execution.stored.provider_type.as_str()
+        )));
     };
     if !provider_type.is_buddy_oauth() || provider_type != execution.stored.provider_type {
-        return Err(ProxyError::bad_request(
-            "CodeBuddy Provider account type does not match its runtime contract",
-        ));
+        return Err(ProxyError::bad_request(format!(
+            "{product} Provider account type does not match its runtime contract"
+        )));
     }
     Ok(BoundAccountIdentity {
         account_id: account_id.to_string(),
@@ -134,6 +136,7 @@ pub(crate) fn prepare_generation(
     canonical: &CanonicalRequest,
     request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<PreparedGeneration, GenerationPreparationError> {
+    let product = crate::domain::codebuddy::buddy_product_label(prepared_runtime.provider_type);
     // Payload construction clones and normalizes the canonical Chat object.
     // Reserve that transient working set before any request-owned JSON or
     // model strings are allocated.
@@ -151,8 +154,16 @@ pub(crate) fn prepare_generation(
     let model_id = runtime::resolve_codebuddy_model_id(
         prepared_runtime.profile.site,
         &canonical.requested_model,
+        &prepared_runtime.catalog,
+        &canonical.body,
     )
-    .map_err(|error| GenerationPreparationError::Direct(ProxyError::bad_request(error)))?;
+    .map_err(|error| {
+        let error = error.strip_prefix("Buddy ").map_or_else(
+            || error.replace("CodeBuddy", product),
+            |detail| format!("{product} {detail}"),
+        );
+        GenerationPreparationError::Direct(ProxyError::bad_request(error))
+    })?;
     if !prepared_runtime
         .catalog
         .enabled_models
@@ -162,7 +173,7 @@ pub(crate) fn prepare_generation(
         return Err(GenerationPreparationError::RecordFailure(ProxyError {
             status: StatusCode::FORBIDDEN,
             message: format!(
-                "CodeBuddy model {model_id} is not enabled in the bound account's live catalog"
+                "{product} model {model_id} is not enabled in the bound account's live catalog"
             ),
         }));
     }
@@ -172,7 +183,7 @@ pub(crate) fn prepare_generation(
         .get(&model_id)
         .ok_or_else(|| {
             GenerationPreparationError::Direct(ProxyError::bad_gateway(format!(
-                "CodeBuddy live catalog has no capability record for enabled model {model_id}"
+                "{product} live catalog has no capability record for enabled model {model_id}"
             )))
         })?;
     let has_tools = canonical
@@ -183,21 +194,33 @@ pub(crate) fn prepare_generation(
     if has_tools && !capability.supports_tools {
         return Err(GenerationPreparationError::FailBeforeCommit(
             ProxyError::bad_request(format!(
-                "CodeBuddy model {model_id} does not advertise tool support"
+                "{product} model {model_id} does not advertise tool support"
             )),
         ));
     }
-    let requests_reasoning = canonical.body.get("reasoning").is_some()
-        || canonical.body.get("reasoning_effort").is_some();
+    let requests_reasoning = canonical
+        .body
+        .get("reasoning")
+        .is_some_and(|value| !value.is_null())
+        || canonical.body.get("reasoning_effort").is_some_and(|value| {
+            !value.is_null()
+                && !value
+                    .as_str()
+                    .is_some_and(|effort| effort.trim().is_empty())
+        });
     if requests_reasoning && !capability.supports_reasoning {
         return Err(GenerationPreparationError::FailBeforeCommit(
             ProxyError::bad_request(format!(
-                "CodeBuddy model {model_id} does not advertise reasoning support"
+                "{product} model {model_id} does not advertise reasoning support"
             )),
         ));
     }
     let payload = runtime::build_codebuddy_payload(&canonical.body, &model_id, capability)
-        .map_err(|error| GenerationPreparationError::Direct(ProxyError::bad_request(error)))?;
+        .map_err(|error| {
+            GenerationPreparationError::Direct(ProxyError::bad_request(
+                error.replace("CodeBuddy", product),
+            ))
+        })?;
     let prepared = PreparedGeneration {
         model_id,
         payload,
@@ -280,6 +303,7 @@ mod tests {
             .insert_catalog(scope.clone(), fetched, 1_700_000_000_000)
             .await;
         PreparedCodeBuddyRuntime {
+            provider_type: crate::domain::providers::model::ProviderType::CodeBuddyOAuth,
             scope,
             profile: CodeBuddyAccountProfile {
                 site,
@@ -289,6 +313,7 @@ mod tests {
                 name: "Fixture".to_string(),
                 email: String::new(),
                 nickname: String::new(),
+                phone_number: String::new(),
                 account_type: "personal".to_string(),
                 client_version: CODEBUDDY_CLIENT_VERSION.to_string(),
                 product_platform: CODEBUDDY_PLATFORM.to_string(),

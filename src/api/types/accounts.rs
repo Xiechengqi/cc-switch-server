@@ -54,6 +54,8 @@ pub(in crate::api) struct AccountPublicView {
     pub(in crate::api) token_refresh_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) token_type: Option<String>,
     pub(in crate::api) scopes: Vec<String>,
@@ -131,6 +133,7 @@ impl From<&Account> for AccountPublicView {
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
             email: account.email.clone(),
+            display_name: crate::domain::codebuddy::buddy_account_display_name(account),
             token_type: account.token_type.clone(),
             scopes: account.scopes.clone(),
             subscription_level: account_subscription_level_public_view(account),
@@ -1078,6 +1081,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn buddy_public_views_expose_a_safe_label_without_profile_or_raw_phone() {
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            let account: Account = serde_json::from_value(json!({
+                "id":"buddy-display", "providerType":product.as_str(),
+                "accessToken":"secret-access", "refreshToken":"secret-refresh",
+                "profile":{"phoneNumber":"13800000000","nickname":"昵称"}
+            }))
+            .unwrap();
+            let public = serde_json::to_value(AccountPublicView::from(&account)).unwrap();
+            let managed = crate::api::invoke::handlers::map_managed_auth_account(
+                &account,
+                product.as_str(),
+                Some("buddy-display"),
+            );
+            for view in [public, managed] {
+                assert_eq!(view["displayName"], "138****0000");
+                assert!(view.get("email").is_none_or(Value::is_null));
+                for forbidden in [
+                    "13800000000",
+                    "secret-access",
+                    "secret-refresh",
+                    "phoneNumber",
+                    "profile",
+                ] {
+                    assert!(!view.to_string().contains(forbidden), "{view}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn account_public_view_redacts_quota_credentials_and_reflected_secrets() {

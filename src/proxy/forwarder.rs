@@ -19812,7 +19812,11 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 request_memory,
                 runtime_memory,
             }));
-            return await_provider_stream_task(task, "CodeBuddy").await;
+            let mut response = await_provider_stream_task(task, "CodeBuddy").await?;
+            response
+                .extensions_mut()
+                .insert(super::codebuddy_runtime::BuddyResolvedModel(model_id));
+            return Ok(response);
         }
 
         match aggregate_codebuddy_nonstream(
@@ -19852,8 +19856,12 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 };
                 let result = (&mut completion).await;
                 abort_guard.armed = false;
-                return result
-                    .map_err(|_| ProxyError::bad_gateway("CodeBuddy completion task failed"))?;
+                let mut response = result
+                    .map_err(|_| ProxyError::bad_gateway("CodeBuddy completion task failed"))??;
+                response
+                    .extensions_mut()
+                    .insert(super::codebuddy_runtime::BuddyResolvedModel(model_id));
+                return Ok(response);
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure()

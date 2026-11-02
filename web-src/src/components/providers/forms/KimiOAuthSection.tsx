@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { copyText } from "@/lib/clipboard";
+import { managedAuthAccountLabel } from "@/lib/authBinding";
 import type { CodeBuddySite, ManagedAuthProvider } from "@/lib/api";
 import {
   logoutAccountsAndClearSelection,
@@ -111,9 +112,6 @@ export const DeviceCodeManagedAccountSection: React.FC<
   React.useEffect(() => {
     setCallbackUrl("");
   }, [deviceCode?.device_code]);
-
-  const accountLabel = (account: (typeof accounts)[number]) =>
-    account.email || account.login;
 
   const copyUserCode = async () => {
     if (!deviceCode?.user_code) return;
@@ -222,7 +220,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
                 <div className="flex min-w-0 items-center gap-2">
                   <User className="h-5 w-5 shrink-0 text-muted-foreground" />
                   <span className="truncate text-sm font-medium">
-                    {accountLabel(account)}
+                    {managedAuthAccountLabel(account)}
                   </span>
                   {defaultAccountId === account.id ? (
                     <Badge variant="secondary" className="text-xs">
@@ -295,7 +293,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
               ) : null}
               {accounts.map((account) => (
                 <SelectItem key={account.id} value={account.id}>
-                  {accountLabel(account)}
+                  {managedAuthAccountLabel(account)}
                 </SelectItem>
               ))}
             </SelectContent>

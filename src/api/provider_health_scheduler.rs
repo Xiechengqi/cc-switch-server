@@ -1518,8 +1518,11 @@ fn retryable_probe(outcome: ProviderOperationOutcome) -> bool {
 }
 
 fn probe_error_category(status: Option<u16>, stream_completed: Option<bool>) -> Option<String> {
-    if stream_completed == Some(false) {
+    if stream_completed == Some(false) && status.is_some_and(|status| (200..300).contains(&status))
+    {
         Some("streamIncomplete".to_string())
+    } else if matches!(status, Some(401 | 403)) {
+        Some("auth".to_string())
     } else if status == Some(408) {
         Some("timeout".to_string())
     } else if status == Some(429) {
@@ -1927,6 +1930,18 @@ mod tests {
 
     #[test]
     fn failure_categories_distinguish_transient_and_terminal_results() {
+        assert_eq!(
+            probe_error_category(Some(200), Some(false)).as_deref(),
+            Some("streamIncomplete")
+        );
+        assert_eq!(
+            probe_error_category(Some(403), Some(false)).as_deref(),
+            Some("auth")
+        );
+        assert_eq!(
+            probe_error_category(Some(408), Some(false)).as_deref(),
+            Some("timeout")
+        );
         for category in [
             "network",
             "timeout",

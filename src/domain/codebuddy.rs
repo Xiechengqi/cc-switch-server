@@ -26,6 +26,68 @@ pub const CODEBUDDY_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
 pub const CODEBUDDY_SESSION_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const CODEBUDDY_SESSION_REFRESH_JITTER_MS: i64 = 30 * 60 * 1_000;
 
+pub const fn buddy_product_label(provider_type: ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::WorkBuddyOAuth => "WorkBuddy",
+        _ => "CodeBuddy",
+    }
+}
+
+/// Optional display metadata never supplies a principal or a credential.
+/// In particular, encrypted vendor envelopes are not displayable strings.
+pub(crate) fn buddy_display_field(value: &Value, fields: &[&str]) -> String {
+    fields
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|value| {
+            !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub fn buddy_account_display_name(account: &Account) -> Option<String> {
+    if !account.provider_type.is_buddy_oauth() {
+        return None;
+    }
+    let profile = account.profile.as_ref().unwrap_or(&Value::Null);
+    let email = buddy_display_field(profile, &["email"]);
+    let email = if email.is_empty() {
+        account.email.as_deref().unwrap_or_default().trim()
+    } else {
+        &email
+    };
+    if !email.is_empty() && email.len() <= 512 && !email.chars().any(char::is_control) {
+        return Some(email.to_string());
+    }
+    let phone = buddy_display_field(profile, &["phoneNumber", "phone_number", "phone", "mobile"]);
+    if phone.len() <= 64
+        && phone
+            .chars()
+            .all(|c| c.is_ascii_digit() || "+ -()*".contains(c))
+    {
+        let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() >= 8 {
+            return Some(format!(
+                "{}{}{}",
+                &digits[..3],
+                "*".repeat(digits.len() - 7),
+                &digits[digits.len() - 4..]
+            ));
+        }
+    }
+    let name = buddy_display_field(
+        profile,
+        &["nickname", "nickName", "name", "userName", "user_name"],
+    );
+    Some(if name.is_empty() {
+        account.id.clone()
+    } else {
+        name
+    })
+}
+
 /// The active, evidence-gated transport identity. WorkBuddy's native login
 /// does not by itself authorize switching its catalog or inference to Desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +282,8 @@ pub struct CodeBuddyAccountProfile {
     pub email: String,
     #[serde(default)]
     pub nickname: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phone_number: String,
     #[serde(default)]
     pub account_type: String,
     #[serde(default = "default_client_version")]
@@ -242,6 +306,11 @@ impl CodeBuddyAccountProfile {
     }
 
     pub fn parse_for(provider_type: ProviderType, value: Option<&Value>) -> Result<Self, String> {
+        let phone_number = value
+            .map(|value| {
+                buddy_display_field(value, &["phoneNumber", "phone_number", "phone", "mobile"])
+            })
+            .unwrap_or_default();
         let value = value
             .and_then(Value::as_object)
             .ok_or_else(|| "CodeBuddy account profile must be an object".to_string())?;
@@ -274,6 +343,7 @@ impl CodeBuddyAccountProfile {
             name: profile_string(value, &["name", "userName", "user_name"]),
             email: profile_string(value, &["email"]),
             nickname: profile_string(value, &["nickname", "nickName"]),
+            phone_number,
             account_type: profile_string(value, &["accountType", "account_type", "type"]),
             client_version: profile_string(value, &["clientVersion", "client_version"]),
             product_platform: profile_string(
@@ -315,6 +385,7 @@ impl CodeBuddyAccountProfile {
             &self.name,
             &self.email,
             &self.nickname,
+            &self.phone_number,
         ] {
             if value.len() > 512 || value.chars().any(char::is_control) {
                 return Err("Buddy account profile contains an invalid identity field".to_string());
@@ -493,6 +564,57 @@ fn profile_string(value: &serde_json::Map<String, Value>, fields: &[&str]) -> St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn buddy_display_metadata_is_optional_masked_and_not_an_identity() {
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            let mut account: Account = serde_json::from_value(json!({
+                "id":"local-buddy-id", "providerType":product.as_str(),
+                "profile":{"nickname":"旧账号昵称"}
+            }))
+            .unwrap();
+            assert_eq!(
+                buddy_account_display_name(&account).as_deref(),
+                Some("旧账号昵称")
+            );
+            for key in ["phoneNumber", "phone_number", "phone", "mobile"] {
+                account.profile = Some(json!({key:"13800000000", "nickname":"昵称"}));
+                assert_eq!(
+                    buddy_account_display_name(&account).as_deref(),
+                    Some("138****0000")
+                );
+            }
+            account.email = Some("owner@example.com".to_string());
+            assert_eq!(
+                buddy_account_display_name(&account).as_deref(),
+                Some("owner@example.com")
+            );
+            account.profile = Some(json!({"email":"profile@example.com"}));
+            assert_eq!(
+                buddy_account_display_name(&account).as_deref(),
+                Some("profile@example.com")
+            );
+            account.email = None;
+            for invalid in [
+                json!({"$wbEncrypted":"opaque"}),
+                json!("x".repeat(513)),
+                json!("bad\nvalue"),
+                Value::Null,
+            ] {
+                account.profile =
+                    Some(json!({"phoneNumber":invalid,"nickname":invalid,"name":"Fallback"}));
+                assert_eq!(
+                    buddy_account_display_name(&account).as_deref(),
+                    Some("Fallback")
+                );
+            }
+            account.profile = Some(json!({"phoneNumber":"too-short", "nickname":" "}));
+            assert_eq!(
+                buddy_account_display_name(&account).as_deref(),
+                Some("local-buddy-id")
+            );
+        }
+    }
 
     #[test]
     fn account_identity_is_site_and_enterprise_scoped() {

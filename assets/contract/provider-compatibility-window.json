@@ -17,7 +17,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "07af13357075e44ae169704071f37faccc107a0ada1653e845904460b3ad0c5a"
+      "sha256": "1588f096d019375b19cadce1583e59346dbcc78d76b0114628c8f01b01451a36"
     },
     {
       "path": "src/domain/providers/credentials.rs",
@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/runtime.rs",
-      "sha256": "2eca756ad17f2f1d64bfc9c287304166419edb4f149d7a30769b798e0336c77e"
+      "sha256": "f04f58158252775b8810a51f1df77844b51fe30fa1963a9b5102c3075243e0cf"
     },
     {
       "path": "src/domain/providers/store.rs",

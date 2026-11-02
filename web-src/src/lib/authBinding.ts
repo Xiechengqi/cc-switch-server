@@ -1,4 +1,12 @@
 import type { ProviderMeta } from "@/types";
+import type { ManagedAuthAccount } from "@/lib/api/auth";
+
+export function managedAuthAccountLabel(
+  account: Pick<ManagedAuthAccount, "id" | "displayName" | "email" | "login">,
+): string {
+  return account.displayName?.trim() || account.email?.trim() ||
+    account.login?.trim() || account.id;
+}
 
 export interface ManagedAccountIdentity {
   accountId: string;

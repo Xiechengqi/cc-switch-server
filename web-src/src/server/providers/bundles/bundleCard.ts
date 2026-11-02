@@ -1,6 +1,6 @@
 import type { ManagedAuthAccount } from "@/lib/api/auth";
 import type { ProviderBundleView, ProviderResource } from "@/lib/api/providers";
-import { managedAuthProvidersMatch } from "@/lib/authBinding";
+import { managedAuthAccountLabel, managedAuthProvidersMatch } from "@/lib/authBinding";
 import { familyById, profileById } from "@/server/providerRegistry";
 
 const DEFAULT_API_URLS: Partial<Record<string, string>> = {
@@ -78,8 +78,7 @@ export function providerBundleDisplayTarget(
     return {
       kind: "oauth_account",
       value:
-        account?.email?.trim() ||
-        account?.login?.trim() ||
+        (account ? managedAuthAccountLabel(account) : null) ||
         binding?.accountId?.trim() ||
         null,
       subscriptionLevel: account?.subscriptionLevel?.trim() || null,

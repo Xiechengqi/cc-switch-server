@@ -1,5 +1,17 @@
 # Protocol evidence policy
 
+## 2026-11-02 WorkBuddy CN 自动模型与账号展示修复
+
+对同机 Server/Router 的生产故障做只读核查：现有 WorkBuddy CN 账号配置单模型 `auto`，全局健康测试模型为带 reasoning modifier 的 GPT ID。旧路径将它改写为 `auto`，随后硬编码为 `default`，但绑定账号的 CLI 通道没有该 ID，因此生成前 403；流尚未建立却被标记为 streamIncomplete。账号已有昵称，但公开投影与 Web 标签只读取 email/login/ID，正常刷新也未合并显示资料。
+
+使用现有凭据仅执行两次 GET：`https://copilot.tencent.com/v3/config` 与 `https://www.codebuddy.cn/v2/plugin/accounts`，均为 HTTP 200 / business code 0；未刷新、推理或写生产状态。前者总表 33 个模型且包含 `default`，唯一 CLI agent 有 16 个模型却不包含 `default`；与当前 CN reviewed 白名单交集按 CLI 顺序为 `hy3`、`glm-5.2`、`minimax-m2.7`、`kimi-k3-1`、`deepseek-v4-pro`。没有返回默认文本模型字段。后者 accounts 数组的稳定 UID 与绑定账号一致，提供 nickname、phoneNumber，没有 email；本记录不保留账号、手机号、昵称或凭据明文。此项只证明目录/身份读取形态，不能证明任何模型的真实生成接受性。
+
+修复保持受审 CLI 2.142.0、原模型白名单和固定产品/站点/账号绑定。auto 从有效目录选兼容模型，显式模型仍严格校验；单模型探针与推理共用配置，成功检查回显实际模型。显示资料通过正常身份刷新回填，公开仅返回安全 displayName，真实邮箱字段不复用为昵称或手机。实现与回归使用本仓源码和合成回环夹具，不引入新的外部源码依赖，不提升 CB-N4 或 WorkBuddy 双站真实验收状态。
+
+截断回归另确认 Buddy 健康检查原用子串查找成功标记，错误文字中的 `[DONE]` 也会误报完成。现复用有界 SSE 解码器，按三个 App 的真实下游终态判断，显式 error/failed/incomplete 优先拒绝；生成文本或错误正文中的标记不构成成功证据。此项只收紧 Buddy 探针，不改其它供应商的测试路径或 Buddy 转发终态协议。
+
+本轮本地验证：全量 Rust 测试 4,167 项通过、3 项忽略，Buddy 筛选回归 162 项通过，Web 测试 293 项通过；全仓静态检查、包含独立 include 源文件的格式检查、严格 Clippy、前端生产构建及本地启动 smoke 均通过。整体 review 核对模型权益、固定绑定、旋转 receipt 顺序、公开显示资料与真实流终态，未发现遗留阻断项。未部署远程；离线 readiness 仍因真实验收输入和部署验证缺失而 blocked，不能据此标记真实推理或发布验收通过。
+
 ## 2026-11-02 Buddy 既有反代能力增量补强（magpie）
 
 只读参考固定为 `magpie@834c6c7dfe6a6c1dc8c98fb2141105962908377f`，其 `internal/provider/migrate_workbuddy.go` 要求社区 WorkBuddy 插件最低 `0.2.11`。插件源码固定提交 `486a68a54f7300e230023322bb1deb7d952fc310` 的 `packages/workbuddy/index.mjs`，SHA-256 为 `e96bdfb39faac4c975aa1020b1d5340d1265614864a731d58dbfbfc0c721ed96`。外部代码只作本次协议证据，不进入构建、测试或运行依赖；magpie 的 `internal/agent/codebuddy.go` 是下游客户端配置，不是独立 CodeBuddy 订阅上游。

@@ -426,7 +426,7 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "GET /api/accounts",
-      "notes": "Maps server accounts.json into the legacy ManagedAuthStatus shape and returns Codex unconfigured/ready/needs_selection plus the active account id."
+      "notes": "Maps Server accounts into ManagedAuthStatus and returns Codex selection state. Buddy accounts add optional displayName: real email, masked phone, nickname/name, then local id; email retains its meaning and raw phone/profile/credentials never enter this view. Older responses fall back to email/login/id."
     },
     {
       "name": "auth_list_accounts",
@@ -434,7 +434,7 @@
       "implemented": true,
       "feature": "accounts",
       "endpoint": "GET /api/accounts",
-      "notes": "Server-native Web compatibility command."
+      "notes": "Server-native Web compatibility command; Buddy displayName shares the safe auth_get_status projection."
     },
     {
       "name": "auth_logout",

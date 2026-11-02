@@ -1256,6 +1256,9 @@ fn runtime_test_model(
     profiled: bool,
     defaults: &ProviderRuntimeDefaults,
 ) -> Option<String> {
+    if let Some(model) = buddy_fixed_test_model(stored) {
+        return Some(model);
+    }
     let model = non_empty_value(stored.provider.settings_config.get("testModel"))
         .or_else(|| {
             // Bundle overrides belong to the App that originally authored them.
@@ -1298,7 +1301,13 @@ fn runtime_test_model(
                 })
                 .flatten()
         })
-        .unwrap_or_else(|| defaults.test_models.for_app(stored.app).to_string());
+        .unwrap_or_else(|| {
+            if stored.provider_type.is_buddy_oauth() {
+                "auto".to_string()
+            } else {
+                defaults.test_models.for_app(stored.app).to_string()
+            }
+        });
     if stored.app == AppKind::Codex && stored.provider_type == ProviderType::CodexOAuth {
         let model = model.trim();
         if model.contains('@') || model.contains('#') {
@@ -1308,6 +1317,24 @@ fn runtime_test_model(
         }
     } else {
         Some(model)
+    }
+}
+
+/// A single-model Buddy probe follows the same upstream policy as inference.
+/// In particular, an OpenAI-wide default must not inject an unrelated model
+/// name or reasoning modifier into an automatic Buddy probe.
+pub fn buddy_fixed_test_model(stored: &StoredProvider) -> Option<String> {
+    if !stored.provider_type.is_buddy_oauth() {
+        return None;
+    }
+    let profile = stored
+        .resource
+        .profile_id
+        .as_ref()
+        .and_then(|id| profile_by_id(id.as_str()));
+    match runtime_model_policy(stored, profile).ok()? {
+        RuntimeModelPolicy::Single { upstream_model } => Some(upstream_model),
+        RuntimeModelPolicy::Passthrough => None,
     }
 }
 
@@ -2063,6 +2090,57 @@ mod tests {
         let changed = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(first.runtime_fingerprint, changed.runtime_fingerprint);
         assert_ne!(first.health_fingerprint(), changed.health_fingerprint());
+    }
+
+    #[test]
+    fn buddy_probe_models_follow_single_policy_and_use_auto_without_global_modifiers() {
+        let defaults = ProviderRuntimeDefaults::default();
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let mut stored =
+                    provider(&format!("{}.{}", app.as_str(), product.as_str()), product);
+                stored.app = app;
+                stored.provider.settings_config["modelMapping"] =
+                    json!({"mode":"single","upstreamModel":"auto"});
+                stored.provider.settings_config["testModel"] = json!("gpt-5.6-luna@low");
+                stored
+                    .provider
+                    .settings_config
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("modelMapping");
+                assert_eq!(
+                    runtime_test_model(&stored, true, &defaults).as_deref(),
+                    Some("auto")
+                );
+                stored.provider.settings_config["modelMapping"] =
+                    json!({"mode":"single","upstreamModel":"auto"});
+                assert_eq!(
+                    runtime_test_model(&stored, true, &defaults).as_deref(),
+                    Some("auto")
+                );
+                stored.provider.settings_config["modelMapping"]["upstreamModel"] = json!("hy3");
+                assert_eq!(
+                    runtime_test_model(&stored, true, &defaults).as_deref(),
+                    Some("hy3")
+                );
+                stored.provider.settings_config["modelMapping"] = json!({"mode":"passthrough"});
+                assert_eq!(
+                    runtime_test_model(&stored, true, &defaults).as_deref(),
+                    Some("gpt-5.6-luna@low")
+                );
+                stored
+                    .provider
+                    .settings_config
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("testModel");
+                assert_eq!(
+                    runtime_test_model(&stored, true, &defaults).as_deref(),
+                    Some("auto")
+                );
+            }
+        }
     }
 
     #[test]

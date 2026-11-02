@@ -102,6 +102,7 @@ pub struct CodeBuddyAccountProfile {
     pub name: String,
     pub email: String,
     pub nickname: String,        // 【D】accounts 返回 `nickname`
+    pub phone_number: String,    // 可选显示资料；公开视图只返回脱敏后的 displayName
     pub account_type: String,    // 【D】`type` = "personal" | ...
     pub client_version: String,  // 固定 CLI 版本，见 §5.2
     pub product_platform: String,// 【D】auth/state 的 platform = "CLI"
@@ -443,6 +444,7 @@ supportsToolCall, tags[], temperature, top_p, vendor
 
 - 目录按 App、Provider revision/runtime fingerprint、Account、identity generation、token generation、**site**、进程内账号实例及实际请求身份摘要隔离，并 single-flight 获取。摘要覆盖凭据、profile、有效期与测试端点；不会将明文放入缓存键。同代次凭据/UID 改变或同 ID 账号重建不复用旧目录，完全相同作用域的 stale fallback 规则不变。返回目录和发起 generation 前再复核当前绑定及请求身份；分次复核不是跨存储原子事务。
 - **成功空目录是权威结果**，保持为空，不与 Provider 配置、静态 alias 或其他账号目录合并。
+- `agents` 存在时，只取当前产品策略的 CLI 通道与总模型表、reviewed allowlist 的交集；显式空 agents、空 CLI models 或缺少 CLI 均不回退到总表。公开列表维持排序，自动选择另保留 CLI models 原顺序；只有缺少 agents 的兼容格式才使用总表启用项原顺序。
 - 只有 network / 408 / 429 / 5xx 才允许读取**完全相同作用域内**、24 小时硬上限内的 stale cache。
 - 认证错误、超限响应、坏 JSON、未知成功结构、身份 scope 漂移，以及"上游非空但全部模型均不在 reviewed allowlist"，一律 fail closed 并清理当前 scope。
 - `/v3/config` 若出现业务 `code`，必须可解析且为 0；无法解析的字符串、`null`、布尔或对象不能当作缺失后继续接受 `models`。模型 `id` 保留上游原样，只允许与 reviewed allowlist **精确相等**的启用项进入公开目录；首尾空白 ID 失败关闭，大小写不同的 ID 不会被强制转小写后冒充已审核模型。
@@ -459,9 +461,9 @@ supportsToolCall, tags[], temperature, top_p, vendor
 
 **默认别名两站不同名**【A】：国际是 `default-model`、`default-model-lite`、`fast-model`、`balanced-model`、`primary-model`、`deep-model`；国内是 `default`。
 
-这一条直接影响契约：`qoder_cosy` 的 `defaultUpstreamModel` 可以取站点中立的 `"auto"`，**CodeBuddy 不行**。契约里的 `defaultUpstreamModel` 必须要么留空由运行时按 site 解析，要么取一个两站都存在的具体 id（当前不存在这样的 id）。推荐做法：契约写 `defaultUpstreamModel: ""`，由 `qoder_runtime.rs` 同构的 `codebuddy_runtime` 按 site 解析默认别名。
+当前 Registry 使用站点中立的 `defaultUpstreamModel: "auto"`，它是本地选择标记，不能直接发送上游。运行时先尝试当前站点默认 ID（Intl `default-model`、CN `default`），仅当它在绑定账号的有效 CLI 目录内且满足本次工具与 reasoning 要求时采用；否则按 CLI 原顺序选第一个启用、reviewed 且满足请求能力的文本模型。没有候选则在生成前拒绝。显式模型 ID 继续精确校验，不能自动替换或发送另一个模型重试。
 
-alias 表按 site 集中维护，但只有对应 site 下 live-enabled 的 route 才发布公开 alias。上游出现未知 route 时保留 exact id，便于观察新 entitlement，同时不猜测 reasoning、context、图像等能力。
+alias 表按 site 集中维护，只有对应 site 下 live-enabled 且 reviewed 的模型才能公开和调用。未知模型只计入脱敏漂移告警，不自动获得权益或能力。
 
 #### 6.3.1 目录 ≠ 权限（实测，U11）
 
@@ -843,3 +845,11 @@ WorkBuddy 已作为独立产品接入，见 [WorkBuddy 合同](workbuddy-oauth.m
 账单无时区日期按腾讯账单 UTC+8 壁钟解释；显式 RFC3339 偏移和数字秒/毫秒保持其语义。该解析修正与查询窗口分开，Intl 的 UTC 查询窗口、CN 的 UTC+8 查询窗口暂不变更；查询窗口策略仍需独立真实回执。套餐失效时间不会生成 `resets_at`；官方逐请求时间扫描、脱敏和可用性规则保持。
 
 请求准备只解析一次 canonical JSON，图像检查直接借用原对象；工具历史和命名选择转移现有 Value 所有权，保留完整工具轮次与提示词原文。仍保留一份 canonical 对象以支持已有受限恢复；请求内存预算、取消、唯一 DONE + EOF 和输出后的禁止重放继续生效。
+
+## 2026-11-02 自动模型、测试与账号展示
+
+`auto` 的当前目录选择规则见 §6.3；CN 的总模型表包含 `default`，不意味着当前 CLI agent 授权它。自动选择只发生在同一绑定目录内，不新增模型权益、不改变工具/reasoning 要求、不因上游错误尝试其它模型。目录优先顺序计入现有缓存内存所有权，空通道及目录撤销继续失败关闭。
+
+单模型健康检查始终采用该 Surface 配置的 upstreamModel（包含 `auto`），不从全局测试模型注入 GPT ID 或 effort；透传模式保留请求/App/供应商的测试模型覆盖，无覆盖则使用 `auto`。Web 单模型测试框显示并跟随上游模型。成功探针通过内部响应 extension 获取实际 native model，不增加 wire header 或额外目录读取；健康记录使用该模型。生成前目录拒绝归为 invalidConfig，stream completion 为未知；只有收到成功 HTTP 流后缺少终态才归为 streamIncomplete，timeout/auth/quota 等已有分类仍保留。Buddy 探针按有界 SSE 解码后的真实终态判断，error/failed/incomplete 优先拒绝，生成文本或错误说明中的 `[DONE]`、`response.completed` 等子串不能冒充完成。
+
+CodeBuddy 与 WorkBuddy 的 AccountPublicView / ManagedAuthAccount 增加可选 `displayName`。优先真实邮箱、脱敏手机号、nickname/name、内部 ID；手机号不放入 email。旧账号的已存昵称立即可用，后续正常刷新复用已认证 `/accounts` 请求补全显示资料。先落旋转 token receipt，再核对 UID/enterprise，最后合并非空可显示字段；缺失、对象及非法显示值不清除旧资料。显示信息不改变 principal、认证代次、Provider/Share 绑定；完整 profile、原始手机和凭据不进入公开视图。2026-11-02 CN GET 观察只证明字段/目录形态，不能替代推理、OAuth 轮换或双站联合接受性验收。

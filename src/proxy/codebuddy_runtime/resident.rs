@@ -167,6 +167,7 @@ mod tests {
     fn fetched(model: &str) -> FetchedCodeBuddyModelCatalog {
         FetchedCodeBuddyModelCatalog {
             enabled_models: vec![model.to_string()],
+            preferred_models: vec![model.to_string()],
             raw_configs: BTreeMap::from([(model.into(), json!({"id":model}))]),
             capabilities: BTreeMap::new(),
         }
@@ -214,6 +215,7 @@ mod tests {
                 scope(0),
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: Vec::new(),
+                    preferred_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },

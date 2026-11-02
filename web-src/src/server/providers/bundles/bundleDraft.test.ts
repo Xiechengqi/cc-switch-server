@@ -9,6 +9,7 @@ import { customAuthSchemesForProtocol, familyById, profileById, providerRegistry
 import {
   applyCustomRecipeToBundleDraft,
   automaticBundleProbeApp,
+  bundleProbeModel,
   changeModelPolicyScope,
   createProviderBundleDraft,
   customRecipeMatchesBundleDraft,
@@ -31,6 +32,35 @@ import {
   validateProviderBundleDraftIssue,
 } from "./bundleDraft";
 import { createDraftForSelectedFamily } from "./bundleDefaults";
+
+describe("Buddy probe model selection", () => {
+  it("follows single upstream models and keeps passthrough overrides without global GPT defaults", () => {
+    for (const product of ["workbuddy_oauth", "codebuddy_oauth"]) {
+      const draft = createProviderBundleDraft(familyById(`family.${product}`)!);
+      draft.modelPolicy = "single";
+      draft.upstreamModel = "auto";
+      draft.testModel = "gpt-test@low";
+      for (const app of ["claude", "codex", "gemini"] as const) {
+        draft.surfaceTestModels[app] = "other@low";
+        expect(bundleProbeModel(draft, app, "global@low")).toMatchObject({ fixedModel: "auto", effectiveModel: "auto" });
+      }
+      draft.modelPolicyScope = "per_app";
+      draft.surfaces.forEach((surface) => {
+        surface.modelPolicy = "single";
+        surface.upstreamModel = "hy3";
+      });
+      expect(bundleProbeModel(draft, "codex", "global@low").effectiveModel).toBe("hy3");
+      draft.surfaces.find((surface) => surface.app === "codex")!.modelPolicy = "passthrough";
+      expect(bundleProbeModel(draft, "codex", "global@low").effectiveModel).toBe("other@low");
+      draft.surfaceTestModels.codex = "";
+      expect(bundleProbeModel(draft, "codex", "global@low").effectiveModel).toBe("gpt-test@low");
+      draft.testModel = "";
+      expect(bundleProbeModel(draft, "codex", "global@low").effectiveModel).toBe("auto");
+    }
+    const other = createProviderBundleDraft(familyById("family.custom_http")!);
+    expect(bundleProbeModel(other, "codex", "global@low").effectiveModel).toBe("global@low");
+  });
+});
 
 describe("Custom authentication recommendations", () => {
   it("uses protocol defaults for every allowed App/protocol and never recommends query auth", () => {

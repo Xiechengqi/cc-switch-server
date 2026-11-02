@@ -63,6 +63,7 @@ struct CodeBuddyFixtureState {
     replies: Arc<Vec<CodeBuddyGenerationReply>>,
     generation_requests: Arc<AtomicUsize>,
     config_requests: Arc<AtomicUsize>,
+    catalog_override: Arc<Mutex<Option<Value>>>,
     refresh_requests: Arc<AtomicUsize>,
     account_requests: Arc<AtomicUsize>,
     upstream_body_dropped: Arc<AtomicBool>,
@@ -76,6 +77,7 @@ impl CodeBuddyFixtureState {
             replies: Arc::new(replies),
             generation_requests: Default::default(),
             config_requests: Default::default(),
+            catalog_override: Default::default(),
             refresh_requests: Default::default(),
             account_requests: Default::default(),
             upstream_body_dropped: Default::default(),
@@ -132,7 +134,7 @@ async fn codebuddy_config(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            json!({
+            state.catalog_override.lock().unwrap().clone().unwrap_or_else(|| json!({
                 "code": 0,
                 "data": {
                     "enterpriseId": "",
@@ -146,7 +148,7 @@ async fn codebuddy_config(
                         "maxOutputTokens": 8192
                     }]
                 }
-            })
+            }))
             .to_string(),
         ))
         .unwrap()
@@ -1062,6 +1064,160 @@ fn assert_generation_observation(observation: &CodeBuddyRequestObservation, site
     assert_eq!(observation.body["stream_options"]["include_usage"], true);
     assert_eq!(observation.body["messages"][0]["role"], "system");
     assert_eq!(observation.body["tools"][0]["function"]["name"], "lookup");
+}
+
+#[test]
+fn buddy_auto_catalog_selection_reaches_four_surfaces_and_fails_closed_after_revocation() {
+    run_codebuddy_async_test(async {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                for route in [
+                    ProxyRoute::ClaudeMessages,
+                    ProxyRoute::CodexResponses,
+                    ProxyRoute::CodexChatCompletions,
+                    ProxyRoute::Gemini,
+                ] {
+                    for stream in [false, true] {
+                        let (address, fixture, server) =
+                            spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success])
+                                .await;
+                        let catalog = json!({"code":0,"data":{
+                            "enterpriseId":"",
+                            "models":[{"id":site_model(site)},
+                                {"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"defaultEffort":"high","supportedEfforts":["low","medium","high"]}},
+                                {"id":"hy3","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"defaultEffort":"high","supportedEfforts":["low","medium","high"]}},
+                                {"id":"unreviewed-model","supportsToolCall":true}],
+                            "agents":[{"name":"cli","models":["unreviewed-model","hy3","glm-5.2"]}]
+                        }});
+                        *fixture.catalog_override.lock().unwrap() = Some(catalog.clone());
+                        let state = codebuddy_test_state("buddy-auto-cli-surfaces");
+                        let (id, account_id) = install_buddy_provider(
+                            &state,
+                            product,
+                            "auto-cli",
+                            route.app(),
+                            site,
+                            &format!("http://{address}"),
+                        )
+                        .await;
+                        let mut providers = state.providers_snapshot().await;
+                        providers.providers[0].provider.settings_config["modelMapping"] =
+                            json!({"mode":"passthrough"});
+                        providers
+                            .rebuild_runtime_index(&state.accounts_snapshot().await)
+                            .unwrap();
+                        let plan = providers.runtime_plan(route.app(), &id).unwrap();
+                        state.replace_provider_store_for_test(providers).await;
+                        install_codebuddy_share(
+                            &state,
+                            "auto-cli-share",
+                            route.app(),
+                            &id,
+                            "owner@example.com",
+                        )
+                        .await;
+                        let (_, path, body) = surface_request(route.app(), stream);
+                        let body = if route == ProxyRoute::CodexChatCompletions {
+                            Bytes::from(json!({"model":"auto","stream":stream,"messages":[{"role":"user","content":"hi"}]}).to_string())
+                        } else {
+                            body
+                        };
+                        let response = super::forward_for_test_surface(
+                            state.clone(),
+                            route,
+                            id.clone(),
+                            path.clone(),
+                            codebuddy_headers("auto-cli-share", "owner@example.com", "auto-cli"),
+                            body.clone(),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::OK,
+                            "{product:?}/{site:?}/{route:?}/{stream}"
+                        );
+                        assert_eq!(
+                            response
+                                .extensions()
+                                .get::<crate::proxy::codebuddy_runtime::BuddyResolvedModel>()
+                                .unwrap()
+                                .0,
+                            "hy3"
+                        );
+                        assert!(String::from_utf8_lossy(&collect(response).await).contains("ready"));
+                        assert_eq!(fixture.generation_observations()[0].body["model"], "hy3");
+
+                        // An explicit model outside the active channel is never substituted.
+                        let mut explicit: Value = serde_json::from_slice(&body).unwrap();
+                        explicit["model"] = json!(site_model(site));
+                        let explicit_path = (route == ProxyRoute::Gemini).then(|| {
+                            format!(
+                                "models/{}:{}",
+                                site_model(site),
+                                if stream {
+                                    "streamGenerateContent"
+                                } else {
+                                    "generateContent"
+                                }
+                            )
+                        });
+                        let denied = super::forward_for_test_surface(
+                            state.clone(),
+                            route,
+                            id.clone(),
+                            explicit_path,
+                            codebuddy_headers("auto-cli-share", "owner@example.com", "auto-cli"),
+                            Bytes::from(serde_json::to_vec(&explicit).unwrap()),
+                        )
+                        .await
+                        .unwrap_err();
+                        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+                        assert!(denied
+                            .message
+                            .starts_with(crate::domain::codebuddy::buddy_product_label(product)));
+                        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+
+                        // A new authoritative empty catalog cannot revive the prior auto choice.
+                        let prepared = state
+                            .prepare_codebuddy_runtime(
+                                route.app(),
+                                &id,
+                                plan.provider_revision,
+                                &plan.runtime_fingerprint,
+                                &account_id,
+                                1,
+                                std::time::Duration::from_secs(2),
+                            )
+                            .await
+                            .unwrap();
+                        let mut empty = catalog;
+                        empty["data"]["agents"] = json!([]);
+                        *fixture.catalog_override.lock().unwrap() = Some(empty);
+                        state
+                            .invalidate_codebuddy_runtime_scope(&prepared.scope)
+                            .await;
+                        let denied = super::forward_for_test_surface(
+                            state.clone(),
+                            route,
+                            id,
+                            path,
+                            codebuddy_headers("auto-cli-share", "owner@example.com", "auto-cli"),
+                            body,
+                        )
+                        .await
+                        .unwrap_err();
+                        assert_eq!(denied.status, StatusCode::BAD_REQUEST);
+                        assert_eq!(fixture.count(&fixture.generation_requests), 1);
+                        assert_eq!(fixture.count(&fixture.config_requests), 2);
+                        assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+                        assert_eq!(fixture.count(&fixture.account_requests), 0);
+                        server.abort();
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[test]

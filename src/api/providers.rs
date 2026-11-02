@@ -1167,12 +1167,15 @@ pub(in crate::api) async fn test_provider_inner(
             "testPrompt must be non-empty, trimmed, and at most 1000 characters",
         ));
     }
-    let model = query
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string)
+    let model = crate::domain::providers::runtime::buddy_fixed_test_model(stored)
+        .or_else(|| {
+            query
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| execution.plan.test_model.clone())
         .unwrap_or_else(|| provider_test_model(stored.app, stored, None, None));
     let gemini_path = default_gemini_test_path(stored.app, &model, requested_stream);
@@ -1666,7 +1669,9 @@ async fn test_codebuddy_provider_inner(
     let stored = execution.runtime_stored_view();
     let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
         .capability(stored.app, stored.provider_type);
-    let base_response = |ok: bool,
+    let product = crate::domain::codebuddy::buddy_product_label(stored.provider_type);
+    let base_response = |model: &str,
+                         ok: bool,
                          outcome: ProviderOperationOutcome,
                          network_checked: bool,
                          status: Option<u16>,
@@ -1693,22 +1698,26 @@ async fn test_codebuddy_provider_inner(
             "[managed CodeBuddy runtime]"
         }
         .to_string(),
-        model: model.clone(),
+        model: model.to_string(),
         stream: requested_stream,
         header_names: Vec::new(),
         network_checked,
         network_status_code: status,
         network_latency_ms: latency,
         network_stream_completed: stream_completed,
-        network_error,
+        network_error: network_error.map(|message| message.replace("CodeBuddy", product)),
         reconciliation: None,
-        message,
+        message: message.replace("CodeBuddy", product),
     };
     let Some((provider_type, account_id, expected_generation)) =
         execution.managed_account_identity_target()
     else {
-        let message = "CodeBuddy Provider must bind one exact codebuddy_oauth Account".to_string();
+        let message = format!(
+            "{product} Provider must bind one exact {} Account",
+            stored.provider_type.as_str()
+        );
         return Ok(base_response(
+            &model,
             false,
             ProviderOperationOutcome::InvalidConfig,
             false,
@@ -1748,6 +1757,7 @@ async fn test_codebuddy_provider_inner(
         let message =
             "CodeBuddy bound Account is missing, stale, invalid, or requires login".to_string();
         return Ok(base_response(
+            &model,
             false,
             ProviderOperationOutcome::InvalidConfig,
             false,
@@ -1760,6 +1770,7 @@ async fn test_codebuddy_provider_inner(
     }
     if !query.network.unwrap_or(false) {
         return Ok(base_response(
+            &model,
             true,
             ProviderOperationOutcome::Success,
             false,
@@ -1798,12 +1809,13 @@ async fn test_codebuddy_provider_inner(
             let message =
                 "CodeBuddy Provider test timed out before response completion".to_string();
             return Ok(base_response(
+                &model,
                 false,
                 ProviderOperationOutcome::Timeout,
                 true,
                 None,
                 Some(started.elapsed().as_millis()),
-                requested_stream.then_some(false),
+                None,
                 Some(message.clone()),
                 message,
             ));
@@ -1813,32 +1825,46 @@ async fn test_codebuddy_provider_inner(
                 "CodeBuddy Provider test task failed before completion: {error}"
             ));
             return Ok(base_response(
+                &model,
                 false,
                 ProviderOperationOutcome::Protocol,
                 true,
                 None,
                 Some(started.elapsed().as_millis()),
-                requested_stream.then_some(false),
+                None,
                 Some(message.clone()),
                 message,
             ));
         }
         Ok(Ok(Err(error))) => {
             let message = redact_provider_test_error(&error.message);
-            let outcome = provider_test_outcome(true, Some(error.status.as_u16()), Some(&message));
+            let outcome = if message.contains("is not enabled in the bound account's live catalog")
+                || message.contains(
+                    "live catalog has no enabled reviewed text model compatible with this request",
+                ) {
+                ProviderOperationOutcome::InvalidConfig
+            } else {
+                provider_test_outcome(true, Some(error.status.as_u16()), Some(&message))
+            };
             return Ok(base_response(
+                &model,
                 false,
                 outcome,
                 true,
                 Some(error.status.as_u16()),
                 Some(started.elapsed().as_millis()),
-                requested_stream.then_some(false),
+                None,
                 Some(message.clone()),
                 message,
             ));
         }
         Ok(Ok(Ok(response))) => response,
     };
+    let model = response
+        .extensions()
+        .get::<crate::proxy::codebuddy_runtime::BuddyResolvedModel>()
+        .map(|resolved| resolved.0.clone())
+        .unwrap_or(model);
     let status = response.status().as_u16();
     let mut body_task = tokio::spawn(async move {
         axum::body::to_bytes(
@@ -1853,6 +1879,7 @@ async fn test_codebuddy_provider_inner(
             let message =
                 "CodeBuddy Provider test timed out while draining the response".to_string();
             return Ok(base_response(
+                &model,
                 false,
                 ProviderOperationOutcome::Timeout,
                 true,
@@ -1868,6 +1895,7 @@ async fn test_codebuddy_provider_inner(
                 "CodeBuddy Provider test response task failed before completion: {error}"
             ));
             return Ok(base_response(
+                &model,
                 false,
                 ProviderOperationOutcome::Protocol,
                 true,
@@ -1883,6 +1911,7 @@ async fn test_codebuddy_provider_inner(
                 "CodeBuddy Provider test response could not be read: {error}"
             ));
             return Ok(base_response(
+                &model,
                 false,
                 ProviderOperationOutcome::Protocol,
                 true,
@@ -1895,8 +1924,8 @@ async fn test_codebuddy_provider_inner(
         }
         Ok(Ok(Ok(body))) => body,
     };
-    let stream_completed = requested_stream
-        .then(|| provider_test_stream_completed(stored.app, &String::from_utf8_lossy(&body)));
+    let stream_completed =
+        requested_stream.then(|| buddy_probe_stream_completed(stored.app, &body));
     let network_error = if !(200..=299).contains(&status) {
         Some(redact_provider_test_error(&String::from_utf8_lossy(&body)))
     } else if body.is_empty() {
@@ -1916,6 +1945,7 @@ async fn test_codebuddy_provider_inner(
             .to_string()
     });
     Ok(base_response(
+        &model,
         ok,
         outcome,
         true,
@@ -5268,7 +5298,15 @@ pub(in crate::api) fn provider_test_model(
     override_model: Option<&str>,
     defaults: Option<&crate::domain::providers::runtime::ProviderHealthCheckConfig>,
 ) -> String {
-    let defaults = defaults.cloned().unwrap_or_default();
+    let mut defaults = defaults.cloned().unwrap_or_default();
+    if stored.provider_type.is_buddy_oauth() {
+        if let Some(model) = crate::domain::providers::runtime::buddy_fixed_test_model(stored) {
+            return model;
+        }
+        defaults.test_models.claude = "auto".to_string();
+        defaults.test_models.codex = "auto".to_string();
+        defaults.test_models.gemini = "auto".to_string();
+    }
     if crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider) {
         let resolved = override_model
             .map(str::trim)
@@ -5429,6 +5467,66 @@ pub(in crate::api) fn provider_test_stream_completed(app: AppKind, body: &str) -
     }
 }
 
+/// Buddy's bridge emits native downstream terminals. Marker text in an error
+/// or generated content is never evidence that the stream completed.
+fn buddy_probe_stream_completed(app: AppKind, body: &[u8]) -> bool {
+    let mut decoder = proxy::SseEventDecoder::new(PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES);
+    let Ok(events) = decoder.push(body) else {
+        return false;
+    };
+    let Ok(tail) = decoder.finish() else {
+        return false;
+    };
+    let mut completed = false;
+    for event in events.into_iter().chain(tail) {
+        if matches!(
+            event.event.as_deref(),
+            Some("error" | "response.failed" | "response.incomplete")
+        ) {
+            return false;
+        }
+        if !event.has_data || event.data == b"[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&event.data) else {
+            return false;
+        };
+        let event_type = value.get("type").and_then(Value::as_str);
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                event_type,
+                Some("error" | "response.failed" | "response.incomplete")
+            )
+            || matches!(
+                value.pointer("/response/status").and_then(Value::as_str),
+                Some("failed" | "incomplete")
+            )
+        {
+            return false;
+        }
+        completed |= match app {
+            AppKind::Claude => event_type == Some("message_stop"),
+            AppKind::Codex => {
+                event_type == Some("response.completed")
+                    && value.pointer("/response/status").and_then(Value::as_str)
+                        == Some("completed")
+            }
+            AppKind::Gemini => value
+                .get("candidates")
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        candidate
+                            .get("finishReason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| !reason.is_empty())
+                    })
+                }),
+        };
+    }
+    completed
+}
+
 pub(in crate::api) fn redact_provider_test_error(value: &str) -> String {
     let mut redacted = crate::logging::redact_sensitive_text(&redact_urls_in_text(value));
     for marker in ["sk-", "ya29.", "Bearer "] {
@@ -5567,6 +5665,23 @@ mod tests {
         app: AppKind,
         product: ProviderType,
     ) -> proxy::provider_ops::ProviderExecution {
+        install_buddy_execution_for_site(
+            state,
+            base_url,
+            app,
+            product,
+            crate::domain::codebuddy::CodeBuddySite::Intl,
+        )
+        .await
+    }
+
+    async fn install_buddy_execution_for_site(
+        state: &ServerState,
+        base_url: String,
+        app: AppKind,
+        product: ProviderType,
+        site: crate::domain::codebuddy::CodeBuddySite,
+    ) -> proxy::provider_ops::ProviderExecution {
         state
             .mutate_accounts_immediate(move |accounts| {
                 accounts.upsert(
@@ -5578,20 +5693,20 @@ mod tests {
                         "tokenType": "Bearer",
                         "expiresAt": i64::MAX / 2,
                         "profile": {
-                            "site": "intl",
-                            "domain": "www.codebuddy.ai",
+                            "site": site.as_str(),
+                            "domain": site.profile().domain,
                             "uid": "codebuddy-discovery-uid",
                             "enterpriseId": "",
                             "name": "CodeBuddy fixture",
                             "clientVersion": crate::domain::codebuddy::CODEBUDDY_CLIENT_VERSION,
-                            "productPlatform": crate::domain::codebuddy::buddy_product_policy(product,crate::domain::codebuddy::CodeBuddySite::Intl).unwrap().auth_platform
+                            "productPlatform": crate::domain::codebuddy::buddy_product_policy(product,site).unwrap().auth_platform
                         },
                         "raw": {
                             "source": "fixture",
                             "observedAtMs": chrono::Utc::now().timestamp_millis(),
                             "codeBuddyRefreshReceipt": {
-                                "site": "intl",
-                                "domain": "www.codebuddy.ai",
+                                "site": site.as_str(),
+                                "domain": site.profile().domain,
                                 "receivedAtMs": chrono::Utc::now().timestamp_millis()
                             },
                             "testCodeBuddyBaseUrl": base_url,
@@ -5654,6 +5769,18 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        serve_buddy_provider_api_fixture(None, "default-model", true).await
+    }
+
+    async fn serve_buddy_provider_api_fixture(
+        catalog: Option<Value>,
+        generation_model: &'static str,
+        complete: bool,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -5661,6 +5788,7 @@ mod tests {
         let app = axum::Router::new().fallback(axum::routing::any(
             move |headers: HeaderMap, request: axum::extract::Request| {
                 let observations = std::sync::Arc::clone(&route_observations);
+                let catalog = catalog.clone();
                 async move {
                     let path = request.uri().path().to_string();
                     let body = axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024)
@@ -5678,7 +5806,7 @@ mod tests {
                             .status(StatusCode::OK)
                             .header("content-type", "application/json")
                             .body(Body::from(
-                                json!({
+                                catalog.unwrap_or_else(|| json!({
                                     "code": 0,
                                     "data": {
                                         "enterpriseId": "",
@@ -5693,20 +5821,28 @@ mod tests {
                                             "Uin": "must-not-surface"
                                         }]
                                     }
-                                })
+                                }))
                                 .to_string(),
                             ))
                             .unwrap();
                     }
                     if path == crate::domain::codebuddy::CODEBUDDY_CHAT_PATH {
+                        let content = concat!(
+                            "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\",\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                            "data: [DONE]\n\n"
+                        ).replace("default-model", generation_model);
+                        let body = if complete { Body::from(content) } else {
+                            Body::from_stream(async_stream::stream! {
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(content.replace("data: [DONE]\n\n", "")));
+                                // Let semantic output commit before the truncated EOF.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            })
+                        };
                         return Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "text/event-stream")
-                            .body(Body::from(concat!(
-                                "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\",\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
-                                "data: {\"id\":\"cb-provider-test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"default-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
-                                "data: [DONE]\n\n"
-                            )))
+                            .body(body)
                             .unwrap();
                     }
                     Response::builder()
@@ -5855,6 +5991,288 @@ mod tests {
         server.abort();
         drop(state);
         std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn buddy_single_auto_probe_uses_cli_catalog_and_reports_the_selected_model() {
+        use crate::domain::codebuddy::CodeBuddySite;
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                let default_model = if site == CodeBuddySite::Cn {
+                    "default"
+                } else {
+                    "default-model"
+                };
+                for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                    let catalog = json!({"code":0,"data":{
+                        "models":[{"id":default_model},{"id":"glm-5.2"},{"id":"hy3"},{"id":"unreviewed-model"}],
+                        "agents":[{"name":"cli","models":["unreviewed-model","hy3","glm-5.2"]}]
+                    }});
+                    let (origin, observations, server) =
+                        serve_buddy_provider_api_fixture(Some(catalog), "hy3", true).await;
+                    let state = provider_api_test_state("buddy-auto-cli-probe");
+                    let config_dir = state.config_dir.clone();
+                    let execution =
+                        install_buddy_execution_for_site(&state, origin, app, product, site).await;
+                    assert_eq!(execution.plan.test_model.as_deref(), Some("auto"));
+                    for stream in [false, true] {
+                        let response = test_provider_inner(
+                            &state,
+                            execution.clone(),
+                            &TestProviderQuery {
+                                app,
+                                model: Some("gpt-5.6-luna@low".to_string()),
+                                network: Some(true),
+                                stream: Some(stream),
+                                timeout_ms: Some(2_000),
+                                test_prompt: Some("ping".to_string()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            response.ok,
+                            "{product:?}/{site:?}/{app:?}/{stream}: {}",
+                            response.message
+                        );
+                        assert_eq!(response.model, "hy3");
+                        assert_eq!(response.network_stream_completed, stream.then_some(true));
+                        if product == ProviderType::WorkBuddyOAuth {
+                            assert!(!response.message.contains("CodeBuddy"));
+                        }
+                        let result =
+                            crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                                &response,
+                                &Default::default(),
+                            );
+                        assert!(result.success);
+                        assert_eq!(result.model_used, "hy3");
+                    }
+                    let observations = observations.lock().unwrap();
+                    assert_eq!(
+                        observations
+                            .iter()
+                            .filter(|entry| entry["path"]
+                                == crate::domain::codebuddy::CODEBUDDY_CONFIG_PATH)
+                            .count(),
+                        1
+                    );
+                    let generation: Vec<_> = observations
+                        .iter()
+                        .filter(|entry| {
+                            entry["path"] == crate::domain::codebuddy::CODEBUDDY_CHAT_PATH
+                        })
+                        .collect();
+                    assert_eq!(generation.len(), 2);
+                    for entry in generation {
+                        assert_eq!(entry["body"]["model"], "hy3");
+                        assert!(
+                            entry["body"].get("reasoning_effort").is_none(),
+                            "global modifier leaked: {entry}"
+                        );
+                    }
+                    assert_eq!(observations.len(), 3, "no refresh or extra catalog calls");
+                    drop(observations);
+                    server.abort();
+                    drop(state);
+                    std::fs::remove_dir_all(config_dir).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buddy_catalog_probe_rejections_are_configuration_errors_before_streaming() {
+        use crate::domain::codebuddy::CodeBuddySite;
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for (model, agents, status) in [
+                ("default", json!([{"name":"cli","models":["hy3"]}]), 403),
+                ("auto", json!([{"name":"cli","models":[]}]), 400),
+            ] {
+                let (origin, observations, server) = serve_buddy_provider_api_fixture(
+                    Some(json!({"code":0,"data":{
+                        "models":[{"id":"default"},{"id":"hy3"}], "agents":agents
+                    }})),
+                    "hy3",
+                    true,
+                )
+                .await;
+                let state = provider_api_test_state("buddy-catalog-probe-denial");
+                let config_dir = state.config_dir.clone();
+                let mut execution = install_buddy_execution_for_site(
+                    &state,
+                    origin,
+                    AppKind::Codex,
+                    product,
+                    CodeBuddySite::Cn,
+                )
+                .await;
+                let mut stored = execution.stored.clone();
+                stored.provider.settings_config["modelMapping"]["upstreamModel"] = json!(model);
+                let mut providers = ProviderStore {
+                    providers: vec![stored.clone()],
+                    ..Default::default()
+                };
+                providers
+                    .rebuild_runtime_index(&state.accounts_snapshot().await)
+                    .unwrap();
+                execution =
+                    proxy::provider_ops::ProviderExecution::from_store(&providers, stored).unwrap();
+                state.replace_provider_store_for_test(providers).await;
+                let mut response = test_provider_inner(
+                    &state,
+                    execution,
+                    &TestProviderQuery {
+                        app: AppKind::Codex,
+                        model: None,
+                        network: Some(true),
+                        stream: Some(true),
+                        timeout_ms: Some(2_000),
+                        test_prompt: Some("ping".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(!response.ok);
+                assert_eq!(
+                    response.outcome,
+                    ProviderOperationOutcome::InvalidConfig,
+                    "{}",
+                    response.message
+                );
+                assert_eq!(response.network_status_code, Some(status));
+                assert_eq!(response.network_stream_completed, None);
+                assert!(
+                    response
+                        .message
+                        .starts_with(crate::domain::codebuddy::buddy_product_label(product)),
+                    "{}",
+                    response.message
+                );
+                let result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                    &response,
+                    &Default::default(),
+                );
+                assert_eq!(result.error_category.as_deref(), Some("invalidConfig"));
+                for (outcome, status, category) in [
+                    (
+                        ProviderOperationOutcome::InvalidConfig,
+                        Some(403),
+                        "invalidConfig",
+                    ),
+                    (ProviderOperationOutcome::Auth, Some(401), "auth"),
+                    (ProviderOperationOutcome::Quota, Some(402), "quotaExceeded"),
+                    (ProviderOperationOutcome::RateLimit, Some(429), "rateLimit"),
+                    (ProviderOperationOutcome::Timeout, Some(200), "timeout"),
+                    (ProviderOperationOutcome::Network, None, "network"),
+                    (ProviderOperationOutcome::Upstream, Some(502), "upstream"),
+                    (
+                        ProviderOperationOutcome::Upstream,
+                        Some(200),
+                        "streamIncomplete",
+                    ),
+                    (
+                        ProviderOperationOutcome::Protocol,
+                        Some(200),
+                        "streamIncomplete",
+                    ),
+                ] {
+                    response.outcome = outcome;
+                    response.network_status_code = status;
+                    response.network_stream_completed = Some(false);
+                    let result =
+                        crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                            &response,
+                            &Default::default(),
+                        );
+                    assert_eq!(result.error_category.as_deref(), Some(category));
+                }
+                assert_eq!(
+                    observations.lock().unwrap().len(),
+                    1,
+                    "catalog only, no generation or refresh"
+                );
+                server.abort();
+                drop(state);
+                std::fs::remove_dir_all(config_dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buddy_probe_reports_a_committed_truncated_stream_without_hiding_the_model() {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let (origin, observations, server) =
+                    serve_buddy_provider_api_fixture(None, "default-model", false).await;
+                let state = provider_api_test_state("buddy-truncated-probe");
+                let config_dir = state.config_dir.clone();
+                let execution = install_buddy_execution(&state, origin, app, product).await;
+                let response = test_provider_inner(
+                    &state,
+                    execution,
+                    &TestProviderQuery {
+                        app,
+                        network: Some(true),
+                        stream: Some(true),
+                        model: None,
+                        timeout_ms: Some(2_000),
+                        test_prompt: Some("ping".to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(!response.ok);
+                assert_eq!(response.model, "default-model");
+                assert_eq!(response.network_status_code, Some(200));
+                assert_eq!(response.network_stream_completed, Some(false));
+                let result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+                    &response,
+                    &Default::default(),
+                );
+                assert_eq!(result.error_category.as_deref(), Some("streamIncomplete"));
+                assert_eq!(
+                    observations.lock().unwrap().len(),
+                    2,
+                    "one catalog and one generation; no retry"
+                );
+                server.abort();
+                drop(state);
+                std::fs::remove_dir_all(config_dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn buddy_probe_terminals_are_structural_and_failures_override_success_markers() {
+        for (app, terminal) in [
+            (AppKind::Claude, json!({"type":"message_stop"})),
+            (
+                AppKind::Codex,
+                json!({"type":"response.completed","response":{"status":"completed"}}),
+            ),
+            (
+                AppKind::Gemini,
+                json!({"candidates":[{"finishReason":"STOP"}]}),
+            ),
+        ] {
+            let success = format!("data: {terminal}\n\n");
+            assert!(buddy_probe_stream_completed(app, success.as_bytes()));
+            for failure in [
+                json!({"error":{"message":"truncated before [DONE]; missing response.completed / message_stop / finishReason"}}),
+                json!({"type":"response.incomplete","response":{"status":"incomplete"}}),
+            ] {
+                let failed = format!("data: {failure}\n\n{success}data: [DONE]\n\n");
+                assert!(!buddy_probe_stream_completed(app, failed.as_bytes()));
+            }
+            let content = format!(
+                "data: {}\n\n",
+                json!({"delta":{"content":terminal.to_string()}})
+            );
+            assert!(!buddy_probe_stream_completed(app, content.as_bytes()));
+            assert!(!buddy_probe_stream_completed(app, b"data: [DONE]\n\n"));
+            assert!(!buddy_probe_stream_completed(app, b"data: {invalid}\n\n"));
+        }
     }
 
     #[tokio::test]

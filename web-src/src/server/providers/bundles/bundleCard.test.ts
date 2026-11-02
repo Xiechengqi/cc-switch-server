@@ -126,6 +126,20 @@ function account(): ManagedAuthAccount {
 }
 
 describe("Provider Bundle card data", () => {
+  it("shows Buddy display metadata only from the exact product binding", () => {
+    for (const product of ["workbuddy_oauth", "codebuddy_oauth"] as const) {
+      const view = bundle(`family.${product}`, Object.fromEntries(
+        (["claude", "codex", "gemini"] as const).map((app) => [app, resource(app, `${app}.${product}`, {}, {
+          providerType: product,
+          authBinding: { source: "managed_account", authProvider: product, accountId: "account-1" },
+        })]),
+      ));
+      const buddy = { ...account(), provider: product, email: null, login: "account-1", displayName: "138****0000" };
+      expect(providerBundleDisplayTarget(view, [buddy]).value).toBe("138****0000");
+      expect(providerBundleDisplayTarget(view, [{ ...buddy, provider: "codex_oauth" }]).value).toBe("account-1");
+    }
+  });
+
   it("uses the family credential Surface and shows its runtime API URL", () => {
     const view = bundle("family.nvidia", {
       claude: resource(

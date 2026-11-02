@@ -66,7 +66,7 @@ import type {
 } from "@/lib/api/providers";
 import { providersApi } from "@/lib/api/providers";
 import { shareApi, type ShareUserPolicy } from "@/lib/api/share";
-import { normalizeManagedAuthProvider } from "@/lib/authBinding";
+import { managedAuthAccountLabel, normalizeManagedAuthProvider } from "@/lib/authBinding";
 import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { copyText } from "@/lib/clipboard";
 import { stableStringify } from "@/lib/stableStringify";
@@ -122,6 +122,7 @@ import {
 import {
   applyCustomRecipeToBundleDraft,
   automaticBundleProbeApp,
+  bundleProbeModel,
   BUNDLE_TEST_APP_ORDER,
   changeModelPolicyScope,
   customRecipeMatchesBundleDraft,
@@ -1971,7 +1972,7 @@ export function ProviderBundleEditor({
   const connectionSummary =
     [
       credentialProfile?.credentialPolicy.mode === "managed_account"
-        ? (selectedAccount?.email ?? selectedAccount?.login ?? null)
+        ? (selectedAccount ? managedAuthAccountLabel(selectedAccount) : null)
         : null,
       commonEndpointEditable ? draft.endpoint.trim() || null : null,
     ]
@@ -1989,14 +1990,15 @@ export function ProviderBundleEditor({
       .map((surface) => APP_LABELS[surface.app])
       .join(" · ") || t("providerBundle.surfaceOff", { defaultValue: "关" });
   const automaticProbeApp = automaticBundleProbeApp(draft.surfaces);
+  const probeModel = bundleProbeModel(draft, draft.testApp, healthCheckConfig?.testModels[draft.testApp]);
   const diagnosticsSummary = automaticProbeApp ? [
     APP_LABELS[draft.testApp],
-    draft.testModel.trim() || healthCheckConfig?.testModels[draft.testApp],
+    probeModel.effectiveModel,
   ]
     .filter(Boolean)
     .join(" · ") : t("health.unsupported");
   const surfaceTestModelOverrides = enabledTestApps.filter((app) =>
-    draft.surfaceTestModels[app]?.trim(),
+    !bundleProbeModel(draft, app).fixedModel && draft.surfaceTestModels[app]?.trim(),
   ).length;
   const enabledFeatureCount = [
     "codexFastMode",
@@ -2884,9 +2886,9 @@ export function ProviderBundleEditor({
                   </Label>
                   <Input
                     id="provider-bundle-test-model"
-                    disabled={!automaticProbeApp}
-                    value={draft.testModel}
-                    placeholder={healthCheckConfig?.testModels[draft.testApp]}
+                    disabled={!automaticProbeApp || Boolean(probeModel.fixedModel)}
+                    value={probeModel.fixedModel ?? draft.testModel}
+                    placeholder={probeModel.defaultModel}
                     className="focus:placeholder:text-transparent"
                     onChange={(event) =>
                       setDraft((current) => ({
@@ -2897,12 +2899,15 @@ export function ProviderBundleEditor({
                   />
                   {/* An empty field with a grey placeholder is ambiguous — it could be a
                       default or it could be nothing. Spell the fallback out. */}
-                  {!draft.testModel.trim() &&
-                  healthCheckConfig?.testModels[draft.testApp] ? (
+                  {probeModel.fixedModel ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("providerBundle.testModelFollowsUpstreamHint", { model: probeModel.fixedModel })}
+                    </p>
+                  ) : !draft.testModel.trim() && probeModel.defaultModel ? (
                     <p className="text-xs text-muted-foreground">
                       {t("providerBundle.testModelDefaultHint", {
                         defaultValue: "留空则使用 {{model}}",
-                        model: healthCheckConfig.testModels[draft.testApp],
+                        model: probeModel.defaultModel,
                       })}
                     </p>
                   ) : null}
@@ -2940,10 +2945,10 @@ export function ProviderBundleEditor({
                           </Label>
                           <Input
                             id={`provider-bundle-${app}-test-model`}
-                            value={draft.surfaceTestModels[app]}
+                            disabled={Boolean(bundleProbeModel(draft, app).fixedModel)}
+                            value={bundleProbeModel(draft, app).fixedModel ?? draft.surfaceTestModels[app]}
                             placeholder={
-                              draft.testModel.trim() ||
-                              healthCheckConfig?.testModels[app]
+                              bundleProbeModel(draft, app, healthCheckConfig?.testModels[app]).inheritedModel
                             }
                             className="focus:placeholder:text-transparent"
                             onChange={(event) =>

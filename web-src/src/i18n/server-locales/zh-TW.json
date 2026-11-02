@@ -530,6 +530,7 @@
     "automaticProbeHint": "依 OpenAI → Anthropic → Gemini 自動選擇第一個已啟用且支援檢查的介面；檢查失敗不會切換介面。",
     "testModel": "測試模型",
     "testModelDefaultHint": "留空則使用 {{model}}",
+    "testModelFollowsUpstreamHint": "測試使用目前上游模型 {{model}}",
     "timeoutHint": "留空即使用全域預設值",
     "unsaved": "未儲存",
     "validation": {

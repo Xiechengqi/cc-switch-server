@@ -131,7 +131,9 @@ pub fn normalize_buddy_import(
                 "tokenType":"Bearer","expiresAt":expires,
                 "email":field(profile, &["email"]),
                 "profile":{"site":site,"domain":domain,"uid":uid,"enterpriseId":enterprise,
-                    "name":field(profile, &["name", "nickname"]).unwrap_or_default(),
+                    "name":crate::domain::codebuddy::buddy_display_field(profile, &["name", "userName", "user_name"]),
+                    "nickname":crate::domain::codebuddy::buddy_display_field(profile, &["nickname", "nickName"]),
+                    "phoneNumber":crate::domain::codebuddy::buddy_display_field(profile, &["phoneNumber", "phone_number", "phone", "mobile"]),
                     "email":field(profile, &["email"]).unwrap_or_default(),
                     "productPlatform":policy.auth_platform},
                 "raw":{"source":"explicit_buddy_import"}
@@ -148,6 +150,26 @@ pub fn normalize_buddy_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buddy_import_preserves_display_metadata_without_changing_stable_account_id() {
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            let payload = json!({"account":{"uid":"same-user","name":"Name","nickname":"昵称","mobile":"13800000000"},
+                "auth":{"accessToken":"access","refreshToken":"refresh","domain":"www.codebuddy.cn"}});
+            let imported = normalize_buddy_import(product, CodeBuddySite::Cn, &payload).unwrap();
+            assert_eq!(imported[0].profile.as_ref().unwrap()["nickname"], "昵称");
+            assert_eq!(
+                imported[0].profile.as_ref().unwrap()["phoneNumber"],
+                "13800000000"
+            );
+            let mut changed = payload;
+            changed["account"]["nickname"] = json!("Another");
+            changed["account"]["mobile"] = json!({"unsupported":"object"});
+            let reimported = normalize_buddy_import(product, CodeBuddySite::Cn, &changed).unwrap();
+            assert_eq!(imported[0].id, reimported[0].id);
+            assert_eq!(reimported[0].profile.as_ref().unwrap()["phoneNumber"], "");
+        }
+    }
+
     #[test]
     fn codebuddy_workbuddy_imports_require_product_and_site_and_drop_untrusted_fields() {
         for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {

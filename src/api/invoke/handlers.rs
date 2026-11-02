@@ -219,7 +219,17 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
 }
 
 fn provider_test_error_category(response: &TestProviderResponse) -> Option<String> {
-    if response.network_stream_completed == Some(false) {
+    if response.network_stream_completed == Some(false)
+        && response
+            .network_status_code
+            .is_some_and(|status| (200..300).contains(&status))
+        && matches!(
+            response.outcome,
+            ProviderOperationOutcome::Success
+                | ProviderOperationOutcome::Protocol
+                | ProviderOperationOutcome::Upstream
+        )
+    {
         return Some("streamIncomplete".to_string());
     }
     if response.network_status_code == Some(404) {
@@ -2797,6 +2807,7 @@ pub(in crate::api) fn map_managed_auth_account(
         "login": account.email.clone().unwrap_or_else(|| account.id.clone()),
         "email": account.email,
         "subscriptionLevel": crate::api::types::account_subscription_level_public_view(account),
+        "displayName": crate::domain::codebuddy::buddy_account_display_name(account),
         "avatar_url": Value::Null,
         "authenticated_at": account_authenticated_at(account),
         "is_default": default_account_id == Some(account.id.as_str()),

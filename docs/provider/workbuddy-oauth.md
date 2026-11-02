@@ -22,6 +22,10 @@ Account ID 使用独立 `workbuddy-` 命名空间，稳定身份是 product × s
 
 Claude Messages、OpenAI Chat / Responses、Gemini stream/nonstream 使用共同 canonical bridge，文本、工具和推理能力由精确实时目录决定。公开 `/v1/models` 和管理发现复用相同 runtime、空目录语义、128 项 singleflight、8 分钟 fresh / 24 小时 transient-only stale；产品 Profile / Driver 进入 fingerprint，Account providerType 进入身份 digest。认证/协议错误 fail closed。只允许一次业务输出提交前的同账号 401 恢复；错误、取消、DONE+EOF、实际 usage 与内存边界见 [CodeBuddy 合同](codebuddy-oauth.md)。图像、企业和未受审模型保持关闭。
 
+`auto` 使用绑定账号的有效 CLI 目录：站点默认 ID 只有在目录启用且能力相容时优先，否则按 CLI 上游顺序选择满足请求能力的 reviewed 模型；显式 ID 不替换，空目录生成前拒绝。单模型健康检查遵循配置的上游模型，避免全局 GPT 模型/effort 覆盖；透传模式保留显式测试覆盖，未配置则为 `auto`。成功返回的检查结果及健康记录显示实际解析的模型，内部响应元数据不增加上游或下游 wire header。
+
+账号公开视图新增可选 `displayName`：真实邮箱 → 脱敏手机号 → 昵称/名称 → 本地 ID；`email` 保持邮箱语义。已保存昵称的旧账号无需重新登录。登录/显式导入承载可选手机资料，正常旋转刷新在既有 `/accounts` 身份读取中回填；UID/enterprise 校验成功后才合并非空显示字段，缺失或不可显示字段保留旧资料。显示资料不改变账号 ID、产品/站点身份、认证代次和 Provider/Share 绑定；公开接口不返回原始手机号或完整 profile。
+
 官方 credit 用量与本地 token 计量分开。按站点时区扫描近 31 个自然日，pageNum 固定 1，满 3000 条用最大时间推进 inclusive startTime，以归一时间与 requestId 去重；同秒饱和、窗口停滞、坏行和安全上限均不报 complete。套餐成功而官方明细失败时保留套餐并显示 unavailable。原始 prompt、账号私密字段和凭据不能进入日志或回执。
 
 参考固定为 `cli2api@fb2eb35`、`workbuddy-switch@22b318c`、`workbuddy-cliproxy@6528fdc`、`codebuddy2openai@8804ad6`，只作本次协议研究的只读证据。测试与发布不依赖外仓。真实验收需独立双站登录/旋转刷新、目录、四入口 stream/nonstream、工具、reasoning、429、取消和撤销回执；不能复用 CodeBuddy 的历史成功作为 WorkBuddy 成功。

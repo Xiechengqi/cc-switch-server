@@ -17915,6 +17915,7 @@ impl ServerStateInner {
             return Err(CodeBuddyRuntimeError::IdentityChanged);
         }
         Ok(PreparedCodeBuddyRuntime {
+            provider_type: account.provider_type,
             scope,
             profile,
             access_token: Arc::<str>::from(access_token),

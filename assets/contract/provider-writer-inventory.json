@@ -13,7 +13,7 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "07af13357075e44ae169704071f37faccc107a0ada1653e845904460b3ad0c5a"
+      "sha256": "1588f096d019375b19cadce1583e59346dbcc78d76b0114628c8f01b01451a36"
     },
     {
       "path": "src/api/types/providers.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "dec6fc2ad95ac514818f022c7d05d6f3670ab7fc4600cae49e6b23548d8ce03d"
+      "sha256": "ec79d11a924eb59d9f22ef76cf3fb9b222647f663aafb5e53fd1b379d923160f"
     },
     {
       "path": "src/state/provider_bundle.rs",

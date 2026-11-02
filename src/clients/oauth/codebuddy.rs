@@ -664,6 +664,7 @@ pub async fn poll_login(
         "name": identity.name,
         "email": identity.email,
         "nickname": identity.nickname,
+        "phoneNumber": identity.phone_number,
         "accountType": identity.account_type,
         "clientVersion": flow.endpoints.client_identity()?.version(),
         "productPlatform": buddy_product_policy(flow.endpoints.provider_type, flow.endpoints.site).map_err(CodeBuddyClientError::protocol)?.auth_platform,
@@ -1651,6 +1652,22 @@ pub async fn complete_codebuddy_refresh_receipt(
                 .to_string(),
         ));
     }
+    // The existing authenticated identity read also refreshes optional display
+    // metadata, after UID and enterprise closure. Missing/redacted fields do
+    // not erase a previously usable label or affect the bound principal.
+    for (target, value) in [
+        (&mut profile.name, refreshed.name),
+        (&mut profile.email, refreshed.email),
+        (&mut profile.nickname, refreshed.nickname),
+        (&mut profile.phone_number, refreshed.phone_number),
+    ] {
+        if !value.is_empty() {
+            *target = value;
+        }
+    }
+    if !profile.email.is_empty() {
+        update.email = Some(profile.email.clone());
+    }
     update.profile = Some(serde_json::to_value(profile).map_err(|error| {
         AccountRefreshFailure::parse(format!("encode CodeBuddy profile: {error}"))
     })?);
@@ -1661,6 +1678,10 @@ pub async fn complete_codebuddy_refresh_receipt(
 struct CodeBuddyRefreshIdentity {
     uid: String,
     enterprise_id: String,
+    name: String,
+    email: String,
+    nickname: String,
+    phone_number: String,
 }
 
 async fn fetch_current_account_identity(
@@ -1761,7 +1782,18 @@ async fn fetch_current_account_identity(
             "CodeBuddy refresh config response is missing enterpriseId identity closure",
         )
     })?;
-    Ok(CodeBuddyRefreshIdentity { uid, enterprise_id })
+    use crate::domain::codebuddy::buddy_display_field;
+    Ok(CodeBuddyRefreshIdentity {
+        uid,
+        enterprise_id,
+        name: buddy_display_field(identity, &["name", "userName", "user_name"]),
+        email: buddy_display_field(identity, &["email"]),
+        nickname: buddy_display_field(identity, &["nickname", "nickName"]),
+        phone_number: buddy_display_field(
+            identity,
+            &["phoneNumber", "phone_number", "phone", "mobile"],
+        ),
+    })
 }
 
 fn codebuddy_refresh_identity_failure(
@@ -1960,6 +1992,7 @@ struct CodeBuddyLoginIdentity {
     name: String,
     email: String,
     nickname: String,
+    phone_number: String,
     account_type: String,
 }
 
@@ -1999,11 +2032,16 @@ async fn poll_account(
     let uid = string_at(identity, &["/uid", "/userId", "/user_id", "/sub"]).ok_or_else(|| {
         CodeBuddyClientError::protocol("CodeBuddy login account response is missing stable uid")
     })?;
+    use crate::domain::codebuddy::buddy_display_field;
     Ok(Some(CodeBuddyLoginIdentity {
         uid,
-        name: string_at(identity, &["/name", "/userName", "/user_name"]).unwrap_or_default(),
-        email: string_at(identity, &["/email"]).unwrap_or_default(),
-        nickname: string_at(identity, &["/nickname", "/nickName"]).unwrap_or_default(),
+        name: buddy_display_field(identity, &["name", "userName", "user_name"]),
+        email: buddy_display_field(identity, &["email"]),
+        nickname: buddy_display_field(identity, &["nickname", "nickName"]),
+        phone_number: buddy_display_field(
+            identity,
+            &["phoneNumber", "phone_number", "phone", "mobile"],
+        ),
         account_type: string_at(identity, &["/accountType", "/account_type", "/type"])
             .unwrap_or_default(),
     }))
@@ -2438,6 +2476,7 @@ mod tests {
                                         "uid": "uid-1",
                                         "email": "user@example.com",
                                         "nickname": "Fixture",
+                                        "phoneNumber": "13800000000",
                                         "type": "personal"
                                     }
                                 }))
@@ -2537,6 +2576,11 @@ mod tests {
         assert_eq!(input.provider_type, ProviderType::CodeBuddyOAuth);
         assert_eq!(input.profile.as_ref().unwrap()["enterpriseId"], "");
         assert_eq!(input.profile.as_ref().unwrap()["site"], "intl");
+        assert_eq!(input.profile.as_ref().unwrap()["nickname"], "Fixture");
+        assert_eq!(
+            input.profile.as_ref().unwrap()["phoneNumber"],
+            "13800000000"
+        );
         assert_eq!(input.access_token.as_deref(), Some("access-secret"));
         assert_eq!(
             token_polls.load(std::sync::atomic::Ordering::SeqCst),
@@ -2684,17 +2728,35 @@ mod tests {
         Arc<Mutex<Vec<Observation>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        serve_refresh_fixture_with_identity(
+            status,
+            response,
+            json!({"uid":refreshed_uid}),
+            enterprise_id,
+        )
+        .await
+    }
+
+    async fn serve_refresh_fixture_with_identity(
+        status: StatusCode,
+        response: Value,
+        identity: Value,
+        enterprise_id: &str,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Observation>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let observations = Arc::new(Mutex::new(Vec::new()));
         let observations_for_route = Arc::clone(&observations);
-        let refreshed_uid = refreshed_uid.to_string();
         let enterprise_id = enterprise_id.to_string();
         let app = axum::Router::new().fallback(axum::routing::any(
             move |uri: axum::http::Uri, headers: HeaderMap| {
                 let observations = Arc::clone(&observations_for_route);
                 let response = response.clone();
-                let refreshed_uid = refreshed_uid.clone();
+                let identity = identity.clone();
                 let enterprise_id = enterprise_id.clone();
                 async move {
                     observations.lock().unwrap().push(Observation {
@@ -2706,7 +2768,7 @@ mod tests {
                         CODEBUDDY_REFRESH_PATH => (status, response),
                         CODEBUDDY_ACCOUNTS_PATH => (
                             StatusCode::OK,
-                            json!({"code": 0, "data": {"uid": refreshed_uid}}),
+                            json!({"code": 0, "data": identity}),
                         ),
                         CODEBUDDY_CONFIG_PATH => (
                             StatusCode::OK,
@@ -2726,6 +2788,101 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}"), observations, server)
+    }
+
+    #[tokio::test]
+    async fn buddy_refresh_backfills_display_metadata_after_journaling_without_changing_principal()
+    {
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            for missing in [false, true] {
+                let identity = if missing {
+                    json!({"uid":"uid-1","phoneNumber":{"$wbEncrypted":"opaque"},"nickname":"invalid\nvalue"})
+                } else {
+                    json!({"uid":"uid-1","phoneNumber":"13800000000","nickname":"新昵称"})
+                };
+                let (base_url, observations, server) = serve_refresh_fixture_with_identity(
+                    StatusCode::OK,
+                    json!({"accessToken":jwt_for_subject("uid-1"),"refreshToken":"refresh-new"}),
+                    json!({"accounts":[identity]}),
+                    "enterprise-1",
+                )
+                .await;
+                let mut account = refresh_account(&base_url, "uid-1");
+                account.provider_type = product;
+                account.email = None;
+                let profile = account.profile.as_mut().unwrap();
+                profile["productPlatform"] = json!(
+                    buddy_product_policy(product, CodeBuddySite::Intl)
+                        .unwrap()
+                        .auth_platform
+                );
+                profile["email"] = json!("");
+                profile["nickname"] = json!("旧昵称");
+                let journaled = std::cell::Cell::new(false);
+                let mut hook = |receipt: &AccountRefreshUpdate| {
+                    assert_eq!(receipt.refresh_token.as_deref(), Some("refresh-new"));
+                    assert_eq!(
+                        observations.lock().unwrap().len(),
+                        1,
+                        "receipt must precede identity reads"
+                    );
+                    journaled.set(true);
+                    Ok(())
+                };
+                let update =
+                    refresh_codebuddy_account(&reqwest::Client::new(), &account, 1_000, &mut hook)
+                        .await
+                        .unwrap();
+                assert!(journaled.get());
+                assert!(
+                    !crate::domain::accounts::store::account_refresh_replaces_auth_identity(
+                        &account, &update
+                    )
+                );
+                assert_eq!(update.profile.as_ref().unwrap()["uid"], "uid-1");
+                assert_eq!(
+                    update.profile.as_ref().unwrap()["nickname"],
+                    if missing { "旧昵称" } else { "新昵称" }
+                );
+                let mut displayed = account.clone();
+                displayed.profile = update.profile.clone();
+                assert_eq!(
+                    crate::domain::codebuddy::buddy_account_display_name(&displayed).as_deref(),
+                    Some(if missing { "旧昵称" } else { "138****0000" })
+                );
+                assert!(update.email.is_none());
+                let mut store = AccountStore {
+                    accounts: vec![account.clone()],
+                    ..Default::default()
+                };
+                let applied = store.mark_refresh_success(&account.id, update).unwrap();
+                assert_eq!(applied.id, account.id);
+                assert_eq!(applied.provider_type, account.provider_type);
+                assert_eq!(
+                    applied.auth_identity_generation,
+                    account.auth_identity_generation
+                );
+                // A display-only update must not invalidate a binding or a token generation.
+                let generation = applied.token_refresh_generation;
+                let applied = store.mark_refresh_success(&account.id, AccountRefreshUpdate {
+                    profile: Some(json!({"site":"intl","domain":"www.codebuddy.ai","uid":"uid-1","enterpriseId":"enterprise-1",
+                        "productPlatform":buddy_product_policy(product, CodeBuddySite::Intl).unwrap().auth_platform,
+                        "nickname":"Display only"})),
+                    ..Default::default()
+                }).unwrap();
+                assert_eq!(
+                    applied.auth_identity_generation,
+                    account.auth_identity_generation
+                );
+                assert_eq!(applied.token_refresh_generation, generation);
+                assert_eq!(
+                    observations.lock().unwrap().len(),
+                    3,
+                    "no extra display lookup"
+                );
+                server.abort();
+            }
+        }
     }
 
     #[tokio::test]

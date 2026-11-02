@@ -147,6 +147,27 @@ export interface ProviderBundleEditorDraft {
   surfaces: BundleSurfaceEditorDraft[];
 }
 
+export function bundleProbeModel(
+  draft: ProviderBundleEditorDraft,
+  app: CoreProviderApp,
+  globalDefault?: string,
+): { fixedModel?: string; defaultModel?: string; inheritedModel?: string; effectiveModel?: string } {
+  const surface = draft.surfaces.find((item) => item.app === app);
+  const providerType = surface && profileById(surface.profileId)?.compatibilityProviderType;
+  const buddy = providerType === "workbuddy_oauth" || providerType === "codebuddy_oauth";
+  const policy = draft.modelPolicyScope === "per_app" ? surface : draft;
+  const fixedModel = buddy && policy?.modelPolicy === "single"
+    ? policy.upstreamModel.trim() || undefined : undefined;
+  const defaultModel = buddy ? "auto" : globalDefault;
+  const inheritedModel = fixedModel || draft.testModel.trim() || defaultModel;
+  return {
+    fixedModel,
+    defaultModel,
+    inheritedModel,
+    effectiveModel: fixedModel || draft.surfaceTestModels[app]?.trim() || inheritedModel,
+  };
+}
+
 export function resolvePersistedCodexControlTarget(
   bundle: ProviderBundleView | undefined,
   draft: Pick<ProviderBundleEditorDraft, "accountId" | "expectedRevision">,

@@ -530,6 +530,7 @@
     "automaticProbeHint": "Automatically selects the first enabled, testable API: OpenAI → Anthropic → Gemini. A failed check does not switch APIs.",
     "testModel": "Test model",
     "testModelDefaultHint": "Defaults to {{model}} when empty",
+    "testModelFollowsUpstreamHint": "Tests use the configured upstream model {{model}}",
     "timeoutHint": "Leave empty to use the global default",
     "unsaved": "Unsaved",
     "validation": {

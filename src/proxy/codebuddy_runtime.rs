@@ -225,6 +225,17 @@ impl CodeBuddyModelCatalog {
                     )
             });
         enabled_models
+            .saturating_add(
+                self.preferred_models
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.preferred_models
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
             .saturating_add(raw_configs)
             .saturating_add(capabilities)
     }
@@ -233,12 +244,16 @@ impl CodeBuddyModelCatalog {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchedCodeBuddyModelCatalog {
     pub enabled_models: Vec<String>,
+    /// Reviewed, enabled models in the active agent's upstream order. The
+    /// public list remains sorted independently of automatic model selection.
+    pub preferred_models: Vec<String>,
     pub raw_configs: BTreeMap<String, Value>,
     pub capabilities: BTreeMap<String, CodeBuddyModelCapability>,
 }
 
 #[derive(Clone)]
 pub struct PreparedCodeBuddyRuntime {
+    pub provider_type: ProviderType,
     pub scope: CodeBuddyRuntimeScope,
     pub profile: CodeBuddyAccountProfile,
     pub access_token: Arc<str>,
@@ -261,6 +276,7 @@ impl PreparedCodeBuddyRuntime {
             .saturating_add(self.profile.name.capacity())
             .saturating_add(self.profile.email.capacity())
             .saturating_add(self.profile.nickname.capacity())
+            .saturating_add(self.profile.phone_number.capacity())
             .saturating_add(self.profile.account_type.capacity())
             .saturating_add(self.profile.client_version.capacity())
             .saturating_add(self.profile.product_platform.capacity())
@@ -275,6 +291,7 @@ impl std::fmt::Debug for PreparedCodeBuddyRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedCodeBuddyRuntime")
+            .field("provider_type", &self.provider_type)
             .field("scope", &self.scope)
             .field("site", &self.profile.site)
             .field("base_url", &self.base_url)
@@ -341,46 +358,46 @@ pub fn parse_buddy_model_catalog(
     let agent_models = value
         .pointer("/data/agents")
         .or_else(|| value.get("agents"))
-        .map(
-            |agents| -> Result<std::collections::BTreeSet<String>, String> {
-                let agents = agents
-                    .as_array()
-                    .ok_or("CodeBuddy agents must be an array")?;
-                if agents.len() > MAX_MODEL_CATALOG_ENTRIES {
-                    return Err("CodeBuddy agents exceed the limit".to_string());
+        .map(|agents| -> Result<Vec<String>, String> {
+            let agents = agents
+                .as_array()
+                .ok_or("CodeBuddy agents must be an array")?;
+            if agents.len() > MAX_MODEL_CATALOG_ENTRIES {
+                return Err("CodeBuddy agents exceed the limit".to_string());
+            }
+            let mut ids = Vec::new();
+            let mut matched = false;
+            for agent in agents {
+                let name = agent
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("CodeBuddy agent is missing name")?;
+                if !name.eq_ignore_ascii_case(catalog_agent) {
+                    continue;
                 }
-                let mut ids = std::collections::BTreeSet::new();
-                let mut matched = false;
-                for agent in agents {
-                    let name = agent
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .ok_or("CodeBuddy agent is missing name")?;
-                    if !name.eq_ignore_ascii_case(catalog_agent) {
-                        continue;
-                    }
-                    if matched {
-                        return Err("Buddy catalog contains duplicate active agents".to_string());
-                    }
-                    matched = true;
-                    let models = agent
-                        .get("models")
-                        .and_then(Value::as_array)
-                        .ok_or("CodeBuddy CLI agent models must be an array")?;
-                    if models.len() > MAX_MODEL_CATALOG_ENTRIES {
-                        return Err("CodeBuddy CLI agent model list exceeds the limit".to_string());
-                    }
-                    for id in models {
-                        let id = id
-                            .as_str()
-                            .filter(|id| !id.is_empty() && id.len() <= MAX_MODEL_ID_BYTES)
-                            .ok_or("CodeBuddy CLI agent has an invalid model id")?;
-                        ids.insert(id.to_string());
+                if matched {
+                    return Err("Buddy catalog contains duplicate active agents".to_string());
+                }
+                matched = true;
+                let models = agent
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .ok_or("CodeBuddy CLI agent models must be an array")?;
+                if models.len() > MAX_MODEL_CATALOG_ENTRIES {
+                    return Err("CodeBuddy CLI agent model list exceeds the limit".to_string());
+                }
+                for id in models {
+                    let id = id
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= MAX_MODEL_ID_BYTES)
+                        .ok_or("CodeBuddy CLI agent has an invalid model id")?;
+                    if !ids.iter().any(|value| value == id) {
+                        ids.push(id.to_string());
                     }
                 }
-                Ok(ids)
-            },
-        )
+            }
+            Ok(ids)
+        })
         .transpose()?;
     let reviewed = reviewed_models(site);
     let mut seen = BTreeMap::<String, ()>::new();
@@ -455,9 +472,15 @@ pub fn parse_buddy_model_catalog(
             "CodeBuddy live catalog contains enabled models outside the reviewed allowlist"
         );
     }
+    let preferred_models = agent_models
+        .unwrap_or_else(|| enabled_models.clone())
+        .into_iter()
+        .filter(|model| enabled_models.contains(model))
+        .collect();
     enabled_models.sort();
     Ok(FetchedCodeBuddyModelCatalog {
         enabled_models,
+        preferred_models,
         raw_configs,
         capabilities,
     })
@@ -594,7 +617,12 @@ fn json_i64(value: Option<&Value>) -> Option<i64> {
         .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
-pub fn resolve_codebuddy_model_id(site: CodeBuddySite, requested: &str) -> Result<String, String> {
+pub fn resolve_codebuddy_model_id(
+    site: CodeBuddySite,
+    requested: &str,
+    catalog: &FetchedCodeBuddyModelCatalog,
+    request: &Value,
+) -> Result<String, String> {
     let requested = requested
         .trim()
         .strip_prefix("codebuddy/")
@@ -606,11 +634,28 @@ pub fn resolve_codebuddy_model_id(site: CodeBuddySite, requested: &str) -> Resul
         return Err("CodeBuddy request model is empty".to_string());
     }
     if requested == "auto" {
-        return Ok(match site {
+        let default_model = match site {
             CodeBuddySite::Intl => "default-model",
             CodeBuddySite::Cn => "default",
-        }
-        .to_string());
+        };
+        let has_tools = request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        return std::iter::once(default_model)
+            .chain(catalog.preferred_models.iter().map(String::as_str))
+            .find(|id| {
+                catalog.enabled_models.iter().any(|enabled| enabled == id)
+                    && catalog.capabilities.get(*id).is_some_and(|capability| {
+                        (!has_tools || capability.supports_tools)
+                            && codebuddy_reasoning_effort(request, id, capability).is_ok()
+                    })
+            })
+            .map(str::to_string)
+            .ok_or_else(|| {
+                "Buddy live catalog has no enabled reviewed text model compatible with this request"
+                    .to_string()
+            });
     }
     Ok(requested)
 }
@@ -671,23 +716,35 @@ pub fn build_codebuddy_payload(
     request.insert("model".to_string(), Value::String(model_id.to_string()));
     request.insert("stream".to_string(), Value::Bool(true));
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
+    request.remove("reasoning");
+    request.remove("reasoning_effort");
+    if let Some(effort) = codebuddy_reasoning_effort(canonical_chat_request, model_id, capability)?
+    {
+        request.insert("reasoning_effort".to_string(), Value::String(effort));
+    }
+    Ok(Value::Object(request))
+}
+
+fn codebuddy_reasoning_effort(
+    request: &Value,
+    model_id: &str,
+    capability: &CodeBuddyModelCapability,
+) -> Result<Option<String>, String> {
     let explicit_effort = match request.get("reasoning_effort") {
         None | Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim()),
         Some(Value::String(_)) => None,
         Some(_) => {
             return Err("CodeBuddy reasoning_effort must be a string".to_string());
         }
     };
-    let canonical_reasoning = request.remove("reasoning");
+    let canonical_reasoning = request.get("reasoning");
     let (canonical_requested, canonical_effort) = match canonical_reasoning {
         None | Some(Value::Null) => (false, None),
         Some(Value::Object(reasoning)) => {
             let effort = match reasoning.get("effort") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(value)) if !value.trim().is_empty() => {
-                    Some(value.trim().to_string())
-                }
+                Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim()),
                 Some(Value::String(_)) => None,
                 Some(_) => return Err("CodeBuddy reasoning.effort must be a string".to_string()),
             };
@@ -704,7 +761,7 @@ pub fn build_codebuddy_payload(
     }
     let effort = explicit_effort.or(canonical_effort).or_else(|| {
         canonical_requested
-            .then(|| capability.default_reasoning_effort.clone())
+            .then_some(capability.default_reasoning_effort.as_deref())
             .flatten()
     });
     if canonical_requested && effort.is_none() {
@@ -712,8 +769,7 @@ pub fn build_codebuddy_payload(
             "CodeBuddy model {model_id} has no reviewed default reasoning effort"
         ));
     }
-    request.remove("reasoning_effort");
-    if let Some(mut effort) = effort {
+    if let Some(effort) = effort {
         if !capability.supports_reasoning {
             return Err(format!(
                 "CodeBuddy model {model_id} does not advertise reasoning support"
@@ -735,18 +791,23 @@ pub fn build_codebuddy_payload(
             let Some(supported) = capability
                 .reasoning_efforts
                 .iter()
-                .find(|supported| supported.eq_ignore_ascii_case(&effort))
+                .find(|supported| supported.eq_ignore_ascii_case(effort))
             else {
                 return Err(format!(
                     "CodeBuddy model {model_id} does not support reasoning effort {effort:?}"
                 ));
             };
-            effort = supported.clone();
+            return Ok(Some(supported.clone()));
         }
-        request.insert("reasoning_effort".to_string(), Value::String(effort));
+        return Ok(Some("none".to_string()));
     }
-    Ok(Value::Object(request))
+    Ok(None)
 }
+
+/// Internal response metadata for a control-plane probe. It is never emitted
+/// as a wire header and reports the same native model used by the forwarder.
+#[derive(Clone)]
+pub(crate) struct BuddyResolvedModel(pub String);
 
 fn canonicalize_codebuddy_assistant_reasoning(message: &mut Map<String, Value>) {
     if !codebuddy_message_role(message).eq_ignore_ascii_case("assistant") {
@@ -1231,6 +1292,7 @@ mod tests {
                 current.clone(),
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: vec!["default-model".to_string()],
+                    preferred_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },
@@ -1298,6 +1360,7 @@ mod tests {
                 original.clone(),
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: vec!["default-model".to_string()],
+                    preferred_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },
@@ -1338,18 +1401,106 @@ mod tests {
 
     #[test]
     fn model_alias_is_site_bound_and_images_fail_closed() {
-        assert_eq!(
-            resolve_codebuddy_model_id(CodeBuddySite::Intl, "auto").unwrap(),
-            "default-model"
-        );
-        assert_eq!(
-            resolve_codebuddy_model_id(CodeBuddySite::Cn, "auto").unwrap(),
-            "default"
-        );
+        for (site, model) in [
+            (CodeBuddySite::Intl, "default-model"),
+            (CodeBuddySite::Cn, "default"),
+        ] {
+            let catalog =
+                parse_codebuddy_model_catalog(&json!({"models":[{"id":model}]}), site).unwrap();
+            assert_eq!(
+                resolve_codebuddy_model_id(site, "auto", &catalog, &json!({})).unwrap(),
+                model
+            );
+        }
         assert!(build_codebuddy_payload(
             &json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}]}]}),
             "default-model",
             &text_capability(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn buddy_auto_uses_reviewed_cli_order_when_default_is_outside_the_channel() {
+        let value = json!({"data":{
+            "models":[{"id":"default"},{"id":"glm-5.2"},{"id":"hy3"},{"id":"hy4-preview"}],
+            "agents":[{"name":"cli","models":["hy4-preview","hy3","glm-5.2"]}]
+        }});
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            let catalog = parse_buddy_model_catalog(&value, product, CodeBuddySite::Cn).unwrap();
+            assert_eq!(catalog.enabled_models, ["glm-5.2", "hy3"]);
+            assert_eq!(catalog.preferred_models, ["hy3", "glm-5.2"]);
+            assert_eq!(
+                resolve_codebuddy_model_id(
+                    CodeBuddySite::Cn,
+                    "workbuddy/auto",
+                    &catalog,
+                    &json!({})
+                )
+                .unwrap(),
+                "hy3"
+            );
+            // Explicit model requests retain exact entitlement semantics.
+            assert_eq!(
+                resolve_codebuddy_model_id(CodeBuddySite::Cn, "default", &catalog, &json!({}))
+                    .unwrap(),
+                "default"
+            );
+        }
+        for agents in [
+            json!([]),
+            json!([{"name":"cli","models":[]}]),
+            json!([{"name":"desktop","models":["default"]}]),
+        ] {
+            let mut empty = value.clone();
+            empty["data"]["agents"] = agents;
+            let catalog = parse_codebuddy_model_catalog(&empty, CodeBuddySite::Cn).unwrap();
+            assert!(
+                resolve_codebuddy_model_id(CodeBuddySite::Cn, "auto", &catalog, &json!({}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn buddy_auto_preserves_requested_tool_and_reasoning_capabilities() {
+        let catalog = parse_codebuddy_model_catalog(&json!({"data":{
+            "models":[
+                {"id":"default","supportsToolCall":false},
+                {"id":"hy3","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["high"]}},
+                {"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["low","high"]}}
+            ],"agents":[{"name":"cli","models":["default","hy3","glm-5.2"]}]
+        }}), CodeBuddySite::Cn).unwrap();
+        assert_eq!(
+            resolve_codebuddy_model_id(CodeBuddySite::Cn, "auto", &catalog, &json!({})).unwrap(),
+            "default"
+        );
+        let tools = json!([{"type":"function","function":{"name":"read"}}]);
+        assert_eq!(
+            resolve_codebuddy_model_id(
+                CodeBuddySite::Cn,
+                "auto",
+                &catalog,
+                &json!({"tools":tools})
+            )
+            .unwrap(),
+            "hy3"
+        );
+        assert_eq!(
+            resolve_codebuddy_model_id(
+                CodeBuddySite::Cn,
+                "auto",
+                &catalog,
+                &json!({"tools":tools,"reasoning_effort":"low"})
+            )
+            .unwrap(),
+            "glm-5.2"
+        );
+        assert!(resolve_codebuddy_model_id(
+            CodeBuddySite::Cn,
+            "auto",
+            &catalog,
+            &json!({"reasoning_effort":"max"})
         )
         .is_err());
     }

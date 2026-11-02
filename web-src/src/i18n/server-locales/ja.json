@@ -530,6 +530,7 @@
     "automaticProbeHint": "OpenAI → Anthropic → Gemini の順で、有効かつチェック可能な API を自動選択します。チェック失敗時も別の API に切り替えません。",
     "testModel": "テストモデル",
     "testModelDefaultHint": "空欄の場合は {{model}} を使用",
+    "testModelFollowsUpstreamHint": "テストには設定済みの上流モデル {{model}} を使用します",
     "timeoutHint": "空欄ならグローバル既定値を使用",
     "unsaved": "未保存",
     "validation": {
