@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -36,6 +36,7 @@ import type {
   ShareUserPolicy,
   ShareUserUsageEdit,
   ShareUserUsageEditMap,
+  ShareUserValueUsageInitializationMap,
   AccountResetPreview,
 } from "@/lib/api/share";
 import { shareApi } from "@/lib/api/share";
@@ -48,7 +49,7 @@ import {
 import { useShareValuePreview, useShareValueReadiness, useShareValueStatus } from "./shareValueHooks";
 import {
   matchingValueStatus, parseValueLimitInput, valueLimitErrorKey, valueLimitInput, valueLimitLabel, valuePreviewBlocker,
-  valuePreviewNeedsConfirmation, type ValuePreview,
+  valuePreviewNeedsConfirmation, valueUsageInput, valueUsageLabel, valueStateKey, parseValueUsage, parseInitialValueUsage, valueRowKind, type ValuePreview,
 } from "@/lib/share-value-quota";
 
 type PolicyDraft = {
@@ -60,10 +61,13 @@ type PolicyDraft = {
   tokenPeriodAnchor: string;
   expiresAt: string;
   consumedTokens: string;
+  consumedValue: string;
+  valueReason: string;
+  unitDrafts?: Partial<Record<"tokens" | "usdEquivalent", {tokenLimit: string; consumedTokens: string; usageAction: "unchanged" | "set" | "clear"}>>;
   usageAction: "unchanged" | "set" | "clear";
 };
 
-type BatchPolicyDraft = Omit<PolicyDraft, "email"> & {
+type BatchPolicyDraft = Omit<PolicyDraft, "email" | "consumedValue" | "valueReason" | "unitDrafts"> & {
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
   applyConsumedTokens: boolean;
@@ -94,6 +98,9 @@ type ShareUserGrantsEditorProps = {
   protectedEmails?: ReadonlySet<string>;
   usageEdits?: ShareUserUsageEditMap;
   onUsageEditsChange?: (value: ShareUserUsageEditMap) => void;
+  valueUsageInitializations?: ShareUserValueUsageInitializationMap;
+  onValueUsageInitializationsChange?: (value: ShareUserValueUsageInitializationMap) => void;
+  savedGrants?: ShareUserGrantMap;
   disabled?: boolean;
   onChange: (value: ShareUserGrantMap) => void;
 };
@@ -145,6 +152,8 @@ function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
     tokenPeriodAnchor: toUtcDateTime(policy.tokenPeriodAnchorAtMs),
     expiresAt: toLocalDateTime(policy.expiresAt),
     consumedTokens: "",
+    consumedValue: "",
+    valueReason: "",
     usageAction: "unchanged",
   };
 }
@@ -300,6 +309,9 @@ export function ShareUserGrantsEditor({
   protectedEmails,
   usageEdits = {},
   onUsageEditsChange,
+  valueUsageInitializations = {},
+  onValueUsageInitializationsChange,
+  savedGrants = value,
   disabled,
   onChange,
 }: ShareUserGrantsEditorProps) {
@@ -336,6 +348,8 @@ export function ShareUserGrantsEditor({
   const normalizedOwner = ownerEmail.trim().toLowerCase();
   const [editingEmail, setEditingEmail] = useState<string | null>(null);
   const [draft, setDraft] = useState<PolicyDraft | null>(null);
+  const currentDraft = useRef(draft);
+  currentDraft.current = draft;
   const [selecting, setSelecting] = useState(false);
   const [selectedEmails, setSelectedEmails] = useState<Set<string>>(new Set());
   const [batchDraft, setBatchDraft] = useState<BatchPolicyDraft | null>(null);
@@ -405,8 +419,8 @@ export function ShareUserGrantsEditor({
     setApplying(true);
     let preview: ValuePreview | undefined;
     try { preview = await state.fetchNow(); } finally { setApplying(false); }
-    if (!preview || valuePreviewBlocker(preview)) return false;
-    return alreadyShown || !valuePreviewNeedsConfirmation(preview);
+    if (!preview || valuePreviewBlocker(preview)) return undefined;
+    return alreadyShown || !valuePreviewNeedsConfirmation(preview) ? preview : undefined;
   };
   const limitError = (unit: PolicyDraft["quotaUnit"], raw: string) => {
     if (unit !== "usdEquivalent") return undefined;
@@ -439,7 +453,18 @@ export function ShareUserGrantsEditor({
     });
   }, [defaultPolicy, normalizedOwner, onChange, value]);
 
+  const editedEmail = draft?.email.trim().toLowerCase() ?? "";
+  const savedGrant = savedGrants[editedEmail];
+  const editingValueStatus = savedGrant ? matchingValueStatus(valueStatus.items, savedGrant) : undefined;
+  const initialPreviewRow = singlePreview.preview?.rows.find(row => row.email === editedEmail);
+  const canInitializeValue = !disabled && !!onValueUsageInitializationsChange && !savedGrant
+    && singlePreview.preview?.ready === true
+    && singlePreview.preview?.checks?.some(check => check.code === "value_usage_initialization" && check.ready)
+    && initialPreviewRow?.canInitializeUsage === true && !!initialPreviewRow.windowId
+    && valueRowKind(initialPreviewRow) !== "scheduled" && valueRowKind(initialPreviewRow) !== "blocked";
+
   const openAdd = () => {
+    setCorrectionEmail(null);
     setPreviewIntent("");
     setAmountAttempted(false);
     setDraftCycle(accountPreview?.accountQuotaCycle);
@@ -454,6 +479,7 @@ export function ShareUserGrantsEditor({
 
   const openEdit = (grant: ShareUserGrant) => {
     if (protectedEmails?.has(grant.email) || grant.valueQuotaMalformed) return;
+    setCorrectionEmail(null);
     setPreviewIntent("");
     setAmountAttempted(false);
     setDraftCycle(grant.accountQuotaCycle);
@@ -463,6 +489,8 @@ export function ShareUserGrantsEditor({
     setDraft({
       ...policyDraft(grant.email, grant.pendingValueQuota?.policy ?? grant.policy),
       ...usageEditForGrant(grant, usageEdits),
+      consumedValue: valueUsageInput(valueUsageInitializations[grant.email]?.targetPicos),
+      valueReason: valueUsageInitializations[grant.email]?.reason ?? "",
     });
   };
 
@@ -591,7 +619,17 @@ export function ShareUserGrantsEditor({
       policy: previous && !reuseMarketTombstone ? previous.policy : requested,
     };
     const next = stageGrantPolicy(base, requested);
-    if (requested.valueQuota && !await resolveValuePreview(singlePreview)) return;
+    let initialization: ShareUserValueUsageInitializationMap[string] | undefined;
+    if (requested.valueQuota) {
+      const preview = await resolveValuePreview(singlePreview);
+      if (!preview) return;
+      if (currentDraft.current !== draft) return;
+      const parsed = parseInitialValueUsage(preview, email, draft.consumedValue, draft.valueReason, !!savedGrants[email]);
+      if (!parsed.ok || (parsed.initialization && !onValueUsageInitializationsChange)) {
+        setDraftError(t("share.userLimit.valueQuota.initialInvalid")); return;
+      }
+      initialization = parsed.initialization;
+    }
     if (draft.quotaUnit==="tokens" && draft.usageAction === "set" && consumedTokens != null) {
       const previousQuota = previous?.usageQuota;
       const observed = previous ? observedGrantTokens(previous) : 0;
@@ -624,6 +662,12 @@ export function ShareUserGrantsEditor({
     if (editingEmail && editingEmail !== email) delete updated[editingEmail];
     updated[email] = next;
     onChange(updated);
+    if (onValueUsageInitializationsChange) {
+      const next = {...valueUsageInitializations};
+      if (editingEmail && editingEmail !== email) delete next[editingEmail];
+      delete next[email]; if (initialization) next[email] = initialization;
+      onValueUsageInitializationsChange(next);
+    }
     if (onUsageEditsChange) {
       const nextEdits: ShareUserUsageEditMap = { ...usageEdits };
       if (editingEmail && editingEmail !== email) delete nextEdits[editingEmail];
@@ -1012,7 +1056,7 @@ export function ShareUserGrantsEditor({
                     <ShareValueUsageCell status={rowStatus} limitMicros={usdLimit} stale={valueStatus.stale}
                       onReconcile={correctable ? () => setCorrectionEmail(emailKey) : undefined} />
                     {correctable && rowStatus ? <ShareValueUsageCorrection key={grant.email} shareId={shareId!} revision={configRevision!} grant={grant} status={rowStatus}
-                      onSaved={valueStatus.merge} open={correctionEmail === emailKey} onOpenChange={(open) => setCorrectionEmail(open ? emailKey : null)} /> : null}
+                      onSaved={valueStatus.merge} open={!draft && correctionEmail === emailKey} onOpenChange={(open) => setCorrectionEmail(open ? emailKey : null)} /> : null}
                   </> : <div className="whitespace-normal break-all font-mono text-xs">
                     {enforcedPolicy.tokenPeriod === "accountReset" && !stored.usageQuota ? t("share.userLimit.accountReset.pending") : currentGrantTokens(stored, usageEdits).toLocaleString()}
                   </div>}
@@ -1058,6 +1102,9 @@ export function ShareUserGrantsEditor({
                           const updated = { ...value };
                           delete updated[grant.email];
                           onChange(updated);
+                          if (onValueUsageInitializationsChange) {
+                            const next = {...valueUsageInitializations}; delete next[grant.email]; onValueUsageInitializationsChange(next);
+                          }
                           if (onUsageEditsChange) {
                             const nextEdits = { ...usageEdits };
                             delete nextEdits[grant.email];
@@ -1101,7 +1148,14 @@ export function ShareUserGrantsEditor({
               <div className="space-y-2">
                 <Label id="share-user-unit-label">{t("share.userLimit.valueQuota.unit")}</Label>
                 <ShareValueUnitToggle labelledBy="share-user-unit-label" readinessId="share-user-usd-readiness" value={draft.quotaUnit} usdDisabled={readiness.unavailable}
-                  onChange={(unit) => { if (unit === draft.quotaUnit) return; setAmountAttempted(false); setDraft({ ...draft, quotaUnit: unit, tokenLimit: "", usageAction: "unchanged", consumedTokens: "" }); }} />
+                  onChange={(unit) => {
+                    if (unit === draft.quotaUnit) return;
+                    const unitDrafts = {...draft.unitDrafts, [draft.quotaUnit]: {
+                      tokenLimit: draft.tokenLimit, consumedTokens: draft.consumedTokens, usageAction: draft.usageAction,
+                    }};
+                    setAmountAttempted(false); setDraft({...draft, quotaUnit: unit, unitDrafts,
+                      ...(unitDrafts[unit] ?? {tokenLimit: "", usageAction: "unchanged", consumedTokens: ""})});
+                  }} />
                 <ShareValueReadiness state={readiness} id="share-user-usd-readiness" />
               </div>
               <div className="space-y-2 sm:col-span-2">
@@ -1190,6 +1244,27 @@ export function ShareUserGrantsEditor({
                   </p>
                 )}
               </div>
+              {draft.quotaUnit === "usdEquivalent" ? <div className="space-y-2 sm:col-span-2">
+                <span id="share-user-value-label" className="text-sm font-medium">{t("share.userLimit.valueQuota.consumed")}</span>
+                {!savedGrant ? <>
+                  <Input id="share-user-initial-value" inputMode="decimal" autoComplete="off" placeholder="0"
+                    aria-labelledby="share-user-value-label"
+                    disabled={!canInitializeValue} value={draft.consumedValue} onChange={event => setDraft({...draft, consumedValue: event.target.value})} />
+                  <p className="text-xs text-muted-foreground">{t(canInitializeValue ? "share.userLimit.valueQuota.initialHint" : "share.userLimit.valueQuota.initialUnavailable")}</p>
+                  {draft.consumedValue.trim() && parseValueUsage(draft.consumedValue) !== "0" ?
+                    <label className="grid gap-1 text-xs text-muted-foreground">{t("share.userLimit.valueQuota.reason")}
+                      <Input maxLength={1000} value={draft.valueReason} onChange={event => setDraft({...draft, valueReason: event.target.value})} />
+                    </label> : null}
+                </> : <>
+                  <p id="share-user-initial-value" className="font-mono text-sm">{valueUsageLabel(editingValueStatus?.usedPicos)}</p>
+                  <p className="text-xs text-muted-foreground">{t(!editingValueStatus && (savedGrant.pendingValueQuota || (initialPreviewRow && valueRowKind(initialPreviewRow) === "scheduled"))
+                    ? "share.userLimit.valueQuota.scheduledUsage" : valueStatus.stale ? "share.userLimit.valueQuota.stale" : valueStateKey(editingValueStatus))}</p>
+                  {editingValueStatus && editingValueStatus.meteringStatus !== "scheduled" && shareId && configRevision != null && !disabled && !protectedEmails?.has(editedEmail) ?
+                    <ShareValueUsageCorrection key={`${editedEmail}:${configRevision}`} shareId={shareId} revision={configRevision}
+                      grant={savedGrant} status={editingValueStatus} onSaved={valueStatus.merge}
+                      open={correctionEmail === editedEmail} onOpenChange={open => setCorrectionEmail(open ? editedEmail : null)} /> : null}
+                </>}
+              </div> : null}
               <div className="space-y-2">
                 <Label id="share-user-period-label">{t("share.userLimit.period", { defaultValue: "Token 周期" })}</Label>
                 <Select value={draft.tokenPeriod} onValueChange={(tokenPeriod: ShareTokenPeriod) => setDraft({

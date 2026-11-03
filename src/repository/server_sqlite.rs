@@ -922,16 +922,30 @@ fn persist_accounts_with_hook(
 }
 
 pub(crate) fn persist_shares(config_dir: &Path, shares: &ShareStore) -> anyhow::Result<()> {
+    persist_shares_with_value_initializations(config_dir, shares, &[], "", 0)
+}
+
+pub(crate) fn persist_shares_with_value_initializations(
+    config_dir: &Path,
+    shares: &ShareStore,
+    initializations: &[value_quota::Initialization],
+    actor: &str,
+    now: i64,
+) -> anyhow::Result<()> {
     let mut observation = CommitObservation::start("shares");
     assert_committed(config_dir)?;
+    value_quota::ensure_initializations_unfenced(config_dir, initializations)?;
     let bytes = serde_json::to_vec_pretty(shares).context("encode Share SQLite payload")?;
     let root: Value = serde_json::from_slice(&bytes)?;
     let payloads = share_payloads(Some(&root), shares)?;
     let mut connection = open_database(&database_path(config_dir), false)?;
     let transaction = connection
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("begin Share SQLite commit")?;
     validate_share_revision_transition(&transaction, shares)?;
+    if !initializations.is_empty() {
+        value_quota::initialize_in_tx(&transaction, initializations, actor, now)?;
+    }
     transaction.execute("DELETE FROM share_bindings", [])?;
     transaction.execute("DELETE FROM shares", [])?;
     import_share_rows(&transaction, shares, &payloads)?;

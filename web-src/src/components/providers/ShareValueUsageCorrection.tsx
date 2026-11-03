@@ -54,6 +54,7 @@ export function ShareValueUsageCorrection({ shareId, revision, grant, status, on
       {result ? <span role="status" className="text-emerald-600 dark:text-emerald-400">{result}</span> : null}
     </div>
     {open ? <div id={`${id}-panel`} className="space-y-2 rounded-md border border-border-default bg-muted/30 p-2.5">
+      <p className="text-muted-foreground">{t(q + "applyNowHint")}</p>
       <p className="text-muted-foreground">{t(q + "observed")}: {valueUsageLabel(status.observedPicos)} · {t(q + "offset")}: {valueUsageLabel(status.manualOffsetPicos)}</p>
       <label className="block space-y-1" htmlFor={`${id}-target`}><span className="text-muted-foreground">{t(q + "target")}</span>
         <Input id={`${id}-target`} value={amount} onChange={(event) => setAmount(event.target.value)} disabled={working} inputMode="decimal" placeholder={valueUsageLabel(status.observedPicos)} /></label>

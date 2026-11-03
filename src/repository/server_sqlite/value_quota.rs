@@ -1424,6 +1424,93 @@ pub(crate) struct Adjustment<'a> {
     pub grant_revision: u64,
     pub edit: &'a crate::domain::usage::value_pricing::ValueUsageEdit,
 }
+
+/// Owned so the Share snapshot and opening balances can cross a blocking-task
+/// boundary and commit in the same SQLite transaction.
+#[derive(Clone)]
+pub(crate) struct Initialization {
+    pub scope: Scope,
+    pub window: Window,
+    pub grant_revision: u64,
+    pub edit: crate::domain::usage::value_pricing::ValueUsageEdit,
+}
+
+pub(super) fn ensure_initializations_unfenced(
+    config_dir: &Path,
+    inputs: &[Initialization],
+) -> anyhow::Result<()> {
+    if !inputs.is_empty() {
+        let fence = read_restore_fence(config_dir)?;
+        for input in inputs {
+            ensure!(
+                !fence.scopes.contains_key(&input.scope.key()?),
+                "VALUE_QUOTA_NOT_ACTIVE: restored history requires reconcile"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn initialize_in_tx(
+    tx: &Transaction<'_>,
+    inputs: &[Initialization],
+    actor: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    let applied_now = crate::infra::time::now_ms() as i64;
+    for input in inputs {
+        ensure!(
+            input.window.starts_at_ms <= applied_now
+                && input.window.ends_at_ms.is_none_or(|end| applied_now < end),
+            "VALUE_QUOTA_REVISION_CONFLICT: initialization window expired; preview again"
+        );
+        ensure!(
+            !initialization_history_exists_in(tx, &input.scope)?,
+            "VALUE_QUOTA_TARGET_INVALID: usage initialization cannot replace history"
+        );
+        let current = status_in_tx(tx, &input.scope, &input.window)?;
+        ensure!(
+            current.metering_status != "blocked",
+            "VALUE_QUOTA_NOT_ACTIVE: this window needs reconcile"
+        );
+    }
+    let edits = inputs
+        .iter()
+        .map(|input| Adjustment {
+            scope: &input.scope,
+            window: &input.window,
+            grant_revision: input.grant_revision,
+            edit: &input.edit,
+        })
+        .collect::<Vec<_>>();
+    apply_adjustments_in_tx(tx, &edits, actor, now, 0, &[])
+}
+
+fn initialization_history_exists_in(conn: &Connection, scope: &Scope) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM value_quota_attempts WHERE scope=?1)
+         OR EXISTS(SELECT 1 FROM value_quota_adjustments WHERE scope=?1)
+         OR EXISTS(SELECT 1 FROM value_quota_checkpoints WHERE scope=?1)
+         OR EXISTS(SELECT 1 FROM value_quota_gaps WHERE scope=?1)
+         OR EXISTS(SELECT 1 FROM quota_usage_entries WHERE share_id=?2 AND user_email=?3)
+         OR EXISTS(SELECT 1 FROM usage_records WHERE share_id=?2
+                   AND lower(json_extract(payload_json,'$.userEmail'))=?3)",
+        params![scope.key()?, scope.share_id, scope.email],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn can_initialize_usage(config_dir: &Path, scope: &Scope) -> anyhow::Result<bool> {
+    assert_committed(config_dir)?;
+    if read_restore_fence(config_dir)?
+        .scopes
+        .contains_key(&scope.key()?)
+    {
+        return Ok(false);
+    }
+    let conn = open_database(&database_path(config_dir), false)?;
+    Ok(!initialization_history_exists_in(&conn, scope)?)
+}
 /// Owner calibration. `set` is also the reconcile operation for its window:
 /// it resolves stale pending attempts as outcome-unknown, rebuilds the
 /// scope's checkpoints, clears the scope/window block, the legacy global
@@ -2482,6 +2569,44 @@ mod tests {
         input_tokens: 1_000_000,
         output_tokens: 1_000_000,
     };
+
+    #[test]
+    fn opening_usd_usage_rechecks_window_expiry_after_waiting_for_the_database() {
+        use crate::domain::usage::value_pricing::{ValueUsageEdit, ValueUsageEditAction};
+        let (mut conn, scope, window, _, _) = setup();
+        let edit = ValueUsageEdit {
+            action: ValueUsageEditAction::Set,
+            target_picos: Some("1".into()),
+            expected_grant_revision: 1,
+            window_id: window.id.clone(),
+            expected_watermark: 0,
+            operation_id: "expired-opening".into(),
+            reason: "Opening usage".into(),
+        };
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let error = initialize_in_tx(
+            &tx,
+            &[Initialization {
+                scope,
+                window,
+                grant_revision: 1,
+                edit,
+            }],
+            "owner@example.test",
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("REVISION_CONFLICT"), "{error}");
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM value_quota_adjustments", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn value_quota_reported_model_requires_the_same_identity_or_a_declared_exact_alias() {

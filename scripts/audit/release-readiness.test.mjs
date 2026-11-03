@@ -32,6 +32,8 @@ test("release Rust regressions inherit the established 64 MiB test-thread stack"
       `the ${filter} regression must continue to run in the configured job`,
     );
   }
+  assert.ok(validationJob.includes("cargo test --locked opening_usd --lib"),
+    "opening USD usage, rollback, and retry regressions must run in release validation");
   for (const script of [
     "scripts/audit/validate-local.sh",
     "scripts/release-readiness.sh",

@@ -88,6 +88,9 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_value_usage_initializations:
+        Option<BTreeMap<String, ShareUserValueUsageInitialization>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grant_edits: Option<BTreeMap<String, ShareUserGrantEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_context: Option<ShareSettingsEditContext>,
@@ -118,6 +121,17 @@ where
 pub struct ShareSettingsEditContext {
     pub operation_id: String,
     pub expected_config_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+/// One-shot opening balance for a genuinely new ordinary grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserValueUsageInitialization {
+    pub target_picos: String,
+    pub window_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

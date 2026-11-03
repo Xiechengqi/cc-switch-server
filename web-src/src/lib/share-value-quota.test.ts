@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
+import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueUsageInput, parseInitialValueUsage, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
   parseValueLimitInput, valueLimitLabel, valueRowKind, valuePreviewNeedsConfirmation, valuePreviewBlocker, valueErrorMessage, valueRequestError, ValueQuotaResponseError,
   splitValueRows, mergeValueRows, valueStatusReason, VALUE_STATUS_STALE_MS,
   valueFailedChecks, valueCheckBlocker, valueReadinessRoots, valueReadinessSummary, type ValueCheck } from "./share-value-quota";
@@ -10,6 +10,23 @@ import { HttpResponseError } from "./runtime";
 import type { ShareUserGrant } from "./api/share";
 
 describe("Share USD-equivalent quotas", () => {
+  it("initializes only new immediately active USD users and preserves pico precision", () => {
+    const row = {email: "new@example.test", effectiveFromMs: 0, reasonCode: "ready", windowId: "Lifetime:0:0", canInitializeUsage: true};
+    const preview: ValuePreview = {ready: true, checks: [{code: "value_usage_initialization", ready: true}], rows: [row]};
+    const parse = (raw: string, reason = " Reviewed ", existing = false, p = preview) => parseInitialValueUsage(p, row.email, raw, reason, existing);
+    expect(parse("")).toEqual({ok: true});
+    expect(parse("0", "")).toEqual({ok: true});
+    expect(parse("0.000000000001")).toEqual({ok: true, initialization: {targetPicos: "1", windowId: row.windowId, reason: "Reviewed"}});
+    for (const raw of ["-1", "1e3", "0.0000000000001", "1000000001"]) expect(parse(raw)).toEqual({ok: false});
+    expect(parse("1", "")).toEqual({ok: false});
+    expect(parse("1", "x".repeat(1001))).toEqual({ok: false});
+    expect(parse("1", "中".repeat(334))).toEqual({ok: false});
+    expect(parse("1", "reason", true)).toEqual({ok: false});
+    for (const p of [{...preview, checks: []}, {...preview, ready: false}, {...preview, rows: [{...row, canInitializeUsage: false}]},
+      {...preview, rows: [{...row, windowId: undefined}]}, {...preview, rows: [{...row, reasonCode: "scheduled_next_window"}]},
+      {...preview, rows: [{...row, reasonCode: "blocked_needs_reconcile"}]}]) expect(parse("1", "reason", false, p)).toEqual({ok: false});
+    for (const value of ["0", "1", "123456789123", "1000000000000000000000"]) expect(parseValueUsage(valueUsageInput(value))).toBe(value);
+  });
   it("separates infrastructure readiness from policy coverage and fails closed on missing checks",()=>{
     const checks=["router_protocol","sqlite_authority","metering_storage","acknowledged_tariff","text_surface"].map(code=>({code,ready:true}));
     const preview:ValuePreview={ready:false,capabilityReady:true,checks,rows:[]};

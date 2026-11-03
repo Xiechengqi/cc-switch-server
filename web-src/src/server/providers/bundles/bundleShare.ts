@@ -5,6 +5,7 @@ import {
   type ShareUserGrantMap,
   type ShareUserPolicy,
   type ShareUserUsageEditMap,
+  type ShareUserValueUsageInitializationMap,
 } from "@/lib/api/share";
 import {
   buildShareUserGrants,
@@ -37,6 +38,9 @@ export interface ProviderBundleShareDraft {
   expiry: ProviderBundleShareExpiry;
   userGrants: ShareUserGrantMap;
   userUsageEdits: ShareUserUsageEditMap;
+  userValueUsageInitializations: ShareUserValueUsageInitializationMap;
+  valueUsageOperationId: string;
+  valueUsageOperationStartedAtMs: number;
   allowPersonalCredits: boolean;
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: string;
@@ -154,6 +158,9 @@ export function createBundleShareDraft(
         })
       : {},
     userUsageEdits: {},
+    userValueUsageInitializations: {},
+    valueUsageOperationId: crypto.randomUUID(),
+    valueUsageOperationStartedAtMs: Date.now(),
     allowPersonalCredits: share?.allowPersonalCredits ?? false,
     autoConsumeBankedReset: share?.autoConsumeBankedReset ?? false,
     bankedResetExpiryLeadMinutes: String(
@@ -186,11 +193,14 @@ export function bundleShareGrantHandlers(
   onUsageEditsChange: (
     userUsageEdits: ProviderBundleShareDraft["userUsageEdits"],
   ) => void;
+  onValueUsageInitializationsChange: (value: ShareUserValueUsageInitializationMap) => void;
 } {
   return {
     onChange: (userGrants) => update((current) => ({ ...current, userGrants })),
     onUsageEditsChange: (userUsageEdits) =>
       update((current) => ({ ...current, userUsageEdits })),
+    onValueUsageInitializationsChange: (userValueUsageInitializations) =>
+      update((current) => ({ ...current, userValueUsageInitializations })),
   };
 }
 
@@ -210,7 +220,10 @@ function expiresAt(draft: ProviderBundleShareDraft): string {
     (candidate) => candidate.value === draft.expiry,
   );
   if (!preset) throw new Error("Share expiry preset is invalid");
-  return new Date(Date.now() + preset.seconds * 1000).toISOString();
+  // Opening-usage retries must retain the full payload, including an edited
+  // relative expiry, if a previous response was lost after committing.
+  const anchor = Object.keys(draft.userValueUsageInitializations).length ? draft.valueUsageOperationStartedAtMs : Date.now();
+  return new Date(anchor + preset.seconds * 1000).toISOString();
 }
 
 export async function saveBundleShare(
@@ -275,6 +288,8 @@ export async function saveBundleShare(
       }), 400, { code: "cc_switch_share_credential_source_mismatch", details: preflight.details ?? { reason: preflight.reason } });
     }
   }
+  const initializations = Object.fromEntries(Object.entries(draft.userValueUsageInitializations).filter(([email]) =>
+    allowedUsageEmails.has(email) && !!draft.userGrants[email]?.policy.valueQuota));
   return shareApi.saveProviderBundleShare({
     expectedAccountCycle: Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle,
     bundleId,
@@ -295,6 +310,7 @@ export async function saveBundleShare(
     userGrants: draft.baseline ? undefined : userGrants,
     userGrantEdits,
     userUsageEdits,
+    ...(Object.keys(initializations).length ? {userValueUsageInitializations: initializations, valueUsageOperationId: draft.valueUsageOperationId} : {}),
   });
 }
 

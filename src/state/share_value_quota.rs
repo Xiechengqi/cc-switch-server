@@ -27,7 +27,9 @@ pub(crate) const MARKET_TRIAL_VALUE_CHECK: &str = "market_trial_value";
 /// Margin added to the longest provider request timeout before a pending
 /// attempt counts as stuck (sweeper and `set` reconcile share it).
 const STALE_ATTEMPT_MARGIN_MS: i64 = 5 * 60 * 1000;
+mod initialization;
 mod tariff;
+pub(crate) use initialization::{InitializedShareSnapshot, ValueUsageInitializationRequest};
 fn scope(config: &ServerConfig, share_id: &str, email: &str) -> anyhow::Result<ledger::Scope> {
     let identity = config
         .registered_router_identity()
@@ -715,6 +717,7 @@ impl ServerStateInner {
         // Same kind of build capability: one-time Market trials of a USD seat
         // may carry a USD-equivalent budget. Always ready.
         checks.push(serde_json::json!({"code":MARKET_TRIAL_VALUE_CHECK, "ready":true}));
+        checks.push(serde_json::json!({"code":"value_usage_initialization", "ready":true}));
         let capability_ready = checks.iter().all(|check| check["ready"] == true);
         let first_failed = checks
             .iter()
@@ -749,9 +752,12 @@ impl ServerStateInner {
         }
         // The same proof the save path uses (see `activation_rule`); the
         // usage read lock is held only for this computation.
-        let empty_windows: BTreeMap<String, Option<i64>> = {
+        let (empty_windows, no_prior_usage): (
+            BTreeMap<String, Option<i64>>,
+            BTreeMap<String, bool>,
+        ) = {
             let usage = self.usage.read().await;
-            policies
+            let empty_windows = policies
                 .iter()
                 .filter(|(_, policy)| policy.value_quota.is_some())
                 .map(|(email, policy)| {
@@ -767,7 +773,22 @@ impl ServerStateInner {
                     );
                     (email, start)
                 })
-                .collect()
+                .collect();
+            let no_prior_usage = policies
+                .keys()
+                .filter(|email| {
+                    !share
+                        .user_grants
+                        .contains_key(&email.trim().to_ascii_lowercase())
+                })
+                .map(|email| {
+                    let email = email.trim().to_ascii_lowercase();
+                    let empty =
+                        usage.share_user_quota_usage(share_id, &email, 0, i64::MAX) == (0, 0);
+                    (email, empty)
+                })
+                .collect();
+            (empty_windows, no_prior_usage)
         };
         let mut rows = Vec::new();
         let mut first_blocker: Option<&'static str> = None;
@@ -858,7 +879,12 @@ impl ServerStateInner {
                 first_blocker.get_or_insert(code);
             }
             let used = status.as_ref().and_then(|s| s.as_ref().ok());
+            let can_initialize = previous.is_none()
+                && no_prior_usage.get(&email) == Some(&true)
+                && matches!(activation, Activation::Immediate { .. })
+                && ledger::can_initialize_usage(&self.config_dir, &identity).unwrap_or(false);
             rows.push(serde_json::json!({"email":email,"windowId":w.id,"windowStartsAtMs":w.starts_at_ms,"resetsAtMs":w.ends_at_ms,
+                "canInitializeUsage":can_initialize,
                 "meteredFromMs":metered_from,"effectiveFromMs":effective_from,"usedPicos":used.map(|s|s.used_picos.clone()),
                 "usageWatermark":used.map(|s|s.usage_watermark),"ready":row_ready,
                 "reason":if row_ready {reason} else {Some("This user's window is blocked; reconcile it with a usage set before enforcing")},

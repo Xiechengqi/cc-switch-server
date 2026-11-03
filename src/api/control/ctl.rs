@@ -194,11 +194,17 @@ pub(crate) async fn control_apply_share_settings(
     // Control RPC is Router → Client only. Managed Share Market grants must be
     // applied here too; the ordinary dashboard patch helper rejects them.
     let edit_context = input.patch.edit_context.clone();
+    let has_value_initializations = input.patch.user_value_usage_initializations.is_some();
     let share = match state
         .apply_router_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
-        .map_err(ApiError::internal)?
-    {
+        .map_err(|error| {
+            if has_value_initializations {
+                ApiError::value_usage_edit(error)
+            } else {
+                ApiError::internal(error)
+            }
+        })? {
         Ok(share) => share,
         Err(error) => match error {
             crate::domain::sharing::shares::SharePatchError::NotFound => {

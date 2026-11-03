@@ -132,6 +132,28 @@ describe("Provider Bundle sharing", () => {
     expect(sent.userGrantEdits).toEqual({ "a@example.com": { expectedRevision: 3, policy: { parallelLimit: 5 } } });
     expect(sent.userUsageEdits).toEqual({});
   });
+  it("saves opening USD usage with the new grant and reuses its operation ID on retry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-03T00:00:00Z"));
+    const existing = share({codex: "bundle-1"}, 7);
+    const draft = createBundleShareDraft(existing);
+    const opening = {targetPicos: "123456789123", windowId: "Lifetime:0:0", reason: "Opening usage"};
+    draft.userGrants["new@example.test"] = {email: "new@example.test", role: "shareto", active: true,
+      policy: {tokenPeriod: "lifetime", valueQuota: {limitUsdMicros: "1000000", tariffPolicyId: "api-equivalent-v1"}}};
+    draft.userValueUsageInitializations = {"new@example.test": opening, "removed@example.test": opening};
+    draft.expiry = "1h";
+    await saveBundleShare("bundle-1", draft, existing);
+    vi.setSystemTime(new Date("2026-11-03T00:00:10Z"));
+    await saveBundleShare("bundle-1", draft, existing);
+    const sent = shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0];
+    expect(sent.userValueUsageInitializations).toEqual({"new@example.test": opening});
+    expect(sent.userGrantEdits["new@example.test"].expectedRevision).toBe(0);
+    expect(sent.userUsageEdits).toEqual({});
+    expect(sent.valueUsageOperationId).toBe(draft.valueUsageOperationId);
+    expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-2)?.[0].valueUsageOperationId).toBe(sent.valueUsageOperationId);
+    expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-2)?.[0]).toEqual(sent);
+    expect(createBundleShareDraft(existing).userValueUsageInitializations).toEqual({});
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     shareApiMock.preflightProviderBundleShare.mockResolvedValue({ canShare: true });

@@ -12,6 +12,10 @@ use crate::domain::sharing::router_contract::{
     ShareUserGrant, ShareUserUsageEdit, ShareUserUsageEditAction,
 };
 
+#[cfg(test)]
+#[path = "value_initialization_tests.rs"]
+mod value_initialization_tests;
+
 pub(in crate::api) async fn web_provider_health_json(
     state: &ServerState,
     app: AppKind,
@@ -364,10 +368,17 @@ pub(in crate::api) async fn web_patch_share_settings(
     patch: ShareSettingsPatch,
 ) -> Result<Share, ApiError> {
     let share_id = web_arg_share_id(args)?;
+    let has_value_initializations = patch.user_value_usage_initializations.is_some();
     let share = state
         .apply_share_settings_patch_immediate(&share_id, patch)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(|error| {
+            if has_value_initializations {
+                ApiError::value_usage_edit(error)
+            } else {
+                ApiError::internal(error)
+            }
+        })?
         .map_err(map_share_patch_error)?;
     spawn_share_upsert_sync(state.clone(), share.clone());
     emit_share_event(state, "share.changed", &share, "settings_patched");
@@ -1015,7 +1026,7 @@ fn ensure_router_domain_matches(
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveProviderBundleShareCommand {
     #[serde(default)]
@@ -1038,6 +1049,15 @@ struct SaveProviderBundleShareCommand {
     user_grants: Option<BTreeMap<String, ShareUserGrant>>,
     #[serde(default)]
     user_usage_edits: Option<BTreeMap<String, ShareUserUsageEdit>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_value_usage_initializations: Option<
+        BTreeMap<
+            String,
+            crate::domain::sharing::router_contract::ShareUserValueUsageInitialization,
+        >,
+    >,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value_usage_operation_id: Option<String>,
     #[serde(default)]
     user_grant_edits:
         Option<BTreeMap<String, crate::domain::sharing::router_contract::ShareUserGrantEdit>>,
@@ -1361,6 +1381,52 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     reject_retired_share_input_fields(value)?;
     let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
         .map_err(ApiError::bad_request)?;
+    let initialization_operation = if let Some(edits) = &command.user_value_usage_initializations {
+        let id = command
+            .value_usage_operation_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && id.len() <= 80)
+            .ok_or_else(|| {
+                ApiError::bad_request_code(
+                    "quota_target_invalid",
+                    "USD usage initialization requires an operation ID",
+                )
+            })?;
+        if edits.is_empty() || edits.len() > 500 || command.share_id.is_none() {
+            return Err(ApiError::bad_request_code(
+                "quota_target_invalid",
+                "USD usage initialization requires an existing Share and new users",
+            ));
+        }
+        if command
+            .user_usage_edits
+            .as_ref()
+            .is_some_and(|token_edits| {
+                edits.keys().any(|email| {
+                    token_edits
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(email))
+                })
+            })
+        {
+            return Err(ApiError::bad_request_code(
+                "quota_target_invalid",
+                "Do not mix Token and USD usage edits for the same user",
+            ));
+        }
+        use sha2::{Digest, Sha256};
+        let mut payload = serde_json::to_value(&command).map_err(ApiError::internal)?;
+        payload.sort_all_objects();
+        Some((
+            format!("bundle-value:{id}"),
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&payload).map_err(ApiError::internal)?)
+            ),
+        ))
+    } else {
+        None
+    };
     let requests_account_reset = command.user_grants.as_ref().is_some_and(|grants| {
         grants.values().any(|grant| {
             grant.active
@@ -1426,6 +1492,21 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
     let shares = state.shares.read().await.clone();
+    if let Some((operation_id, fingerprint)) = &initialization_operation {
+        if let Some(receipt) = shares.applied_settings_operations.get(operation_id) {
+            if &receipt.patch_fingerprint != fingerprint {
+                return Err(ApiError::conflict_code(
+                    "quota_revision_conflict",
+                    "The initialization operation has a different payload",
+                ));
+            }
+            return shares
+                .get(command.share_id.as_deref().unwrap_or_default())
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| ApiError::not_found("Share not found"));
+        }
+    }
 
     let surfaces = providers
         .providers
@@ -1565,8 +1646,28 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     let owner_email_for_commit = owner_email.clone();
     let providers_for_commit = providers.clone();
     let accounts_for_commit = accounts.clone();
+    let value_initializations = initialization_operation.as_ref().map(|(operation_id, _)| {
+        crate::state::ValueUsageInitializationRequest {
+            share_id: staged_share.id.clone(),
+            operation_id: operation_id.clone(),
+            actor: operator.clone().unwrap_or_else(|| owner_email.clone()),
+            edits: command
+                .user_value_usage_initializations
+                .clone()
+                .unwrap_or_default(),
+        }
+    });
+    let has_value_initializations = value_initializations.is_some();
     let saved = match state
-        .try_mutate_share_quota_immediate(|store, current_usage, applied_at_ms| {
+        .try_mutate_share_quota_with_value_initializations(value_initializations, |store, current_usage, applied_at_ms| {
+            if let Some((operation_id, fingerprint)) = &initialization_operation {
+                if let Some(receipt) = store.applied_settings_operations.get(operation_id) {
+                    if &receipt.patch_fingerprint != fingerprint {
+                        return Err(ApiError::conflict_code("quota_revision_conflict", "The initialization operation has a different payload"));
+                    }
+                    return store.get(&staged_share.id).cloned().ok_or_else(|| ApiError::not_found("Share not found"));
+                }
+            }
             let current = store.clone();
             let saved = stage_provider_bundle_share(
                 store,
@@ -1591,11 +1692,20 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                 store,
             )
             .map_err(map_subscription_binding_error)?;
-            saved.ok_or_else(|| {
+            let saved = saved.ok_or_else(|| {
                 provider_bundle_share_conflict(
                     "Provider Bundle Share disappeared before it could be committed",
                 )
-            })
+            })?;
+            if let Some((operation_id, fingerprint)) = &initialization_operation {
+                if store.applied_settings_operations.len() >= 4096 {
+                    if let Some(id) = store.applied_settings_operations.keys().next().cloned() { store.applied_settings_operations.remove(&id); }
+                }
+                store.applied_settings_operations.insert(operation_id.clone(), crate::domain::sharing::router_contract::ShareSettingsReceipt {
+                    operation_id: operation_id.clone(), patch_fingerprint: fingerprint.clone(), config_revision: saved.config_revision,
+                });
+            }
+            Ok(saved)
         })
         .await
     {
@@ -1628,7 +1738,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                     );
                 }
             }
-            return Err(ApiError::internal(error));
+            return Err(if has_value_initializations { ApiError::value_usage_edit(error) } else { ApiError::internal(error) });
         }
     };
     drop(reference_guard);

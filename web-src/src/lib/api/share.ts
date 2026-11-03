@@ -1,4 +1,5 @@
-import { invokeCommand } from "@/lib/runtime";
+import { invokeCommand, readToken } from "@/lib/runtime";
+import { readRouterAccessToken } from "@/lib/routerAuth";
 import {
   normalizeShareRecord,
   normalizeShareRecords,
@@ -323,8 +324,12 @@ export interface SaveProviderBundleShareParams {
   grokMediaPolicy: GrokMediaPolicy;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
+  userValueUsageInitializations?: ShareUserValueUsageInitializationMap;
+  valueUsageOperationId?: string;
   shareUsageEdit?: ShareTotalUsageEdit;
 }
+
+export type ShareUserValueUsageInitializationMap = Record<string, {targetPicos: string; windowId: string; reason: string}>;
 
 export interface UpdateShareTokenLimitParams {
   shareId: string;
@@ -717,8 +722,12 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 export const shareApi = {
   preflightProviderBundleShare: (bundleId: string) =>
     invokeCommand<BundleSharePreflight>("get_provider_bundle_share_preflight", { bundleId }, { cache: "no-store" }),
-  editValueUsage:(shareId:string,expectedConfigRevision:number,edits:Record<string,import("../share-value-quota").ValueUsageEdit>) =>
-    invokeCommand<{items:import("../share-value-quota").ValueStatus[]}>("edit_share_value_quota_usage",{shareId,expectedConfigRevision,edits}),
+  editValueUsage: async (shareId:string,expectedConfigRevision:number,edits:Record<string,import("../share-value-quota").ValueUsageEdit>) => {
+    const session = readToken(), router = readRouterAccessToken();
+    const result = await invokeCommand<{items:import("../share-value-quota").ValueStatus[]}>("edit_share_value_quota_usage",{shareId,expectedConfigRevision,edits});
+    if (session !== readToken() || router !== readRouterAccessToken()) throw new DOMException("The signed-in user changed", "AbortError");
+    return result;
+  },
   previewValueQuota: (shareId:string,expectedConfigRevision:number,policies?:Record<string,ShareUserPolicy>,signal?:AbortSignal) =>
     invokeCommand<import("../share-value-quota").ValuePreview>("preview_share_value_quota",{shareId,expectedConfigRevision,policies},{signal,cache:"no-store"}),
   valueQuotaStatus: (shareId:string) => invokeCommand<{items:import("../share-value-quota").ValueStatus[];diagnostics?:import("../share-value-quota").ValueDiagnostics}>("get_share_value_quota_status",{shareId}),

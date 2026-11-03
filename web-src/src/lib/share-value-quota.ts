@@ -1,5 +1,5 @@
 // Wire amounts remain integers. Never convert quota limits through Number.
-import type { ShareUserGrant } from "./api/share";
+import type { ShareUserGrant, ShareUserValueUsageInitializationMap } from "./api/share";
 
 const LIMIT_MAX_MICROS = 1000000000000000n;
 export type ValueLimitError = "empty" | "format" | "too_many_decimals" | "too_small" | "too_large";
@@ -62,6 +62,7 @@ export function valueReasonCode(code: unknown): ValueReasonCode | undefined {
   return VALUE_REASON_CODES.find((known) => known === code);
 }
 export type ValuePreviewRow = { email: string; effectiveFromMs: number; meteredFromMs?: number; usedPicos?: string | null;
+  windowId?: string; canInitializeUsage?: boolean;
   reason?: string | null; reasonCode?: string | null; ready?: boolean | null };
 /** A requested policy refused before any timing is worked out (bad amount, period or user). */
 export type ValueInvalidRow = { email: string; reasonCode?: string | null; reason?: string | null };
@@ -262,6 +263,23 @@ export function valueStateKey(status: ValueStatus | undefined, now = Date.now())
   return "share.userLimit.valueQuota.state." + valueStateName(status);
 }
 export type ValueUsageEdit = { action: "set" | "clear"; targetPicos?: string; expectedGrantRevision: number; windowId: string; expectedWatermark: number; operationId: string; reason: string };
+export function valueUsageInput(input: string | undefined): string {
+  if (!input || !/^(0|[1-9]\d{0,21})$/.test(input)) return "";
+  const n = BigInt(input), scale = 1_000_000_000_000n;
+  const fraction = String(n % scale).padStart(12, "0").replace(/0+$/, "");
+  return `${n / scale}${fraction ? `.${fraction}` : ""}`;
+}
+
+export function parseInitialValueUsage(preview: ValuePreview, email: string, raw: string, reason: string, existing: boolean):
+  {ok: true; initialization?: ShareUserValueUsageInitializationMap[string]} | {ok: false} {
+  if (!raw.trim()) return {ok: true};
+  const amount = parseValueUsage(raw), row = preview.rows.find(row => row.email === email);
+  if (existing || amount == null || row?.canInitializeUsage !== true || typeof row.windowId !== "string" || !row.windowId || row.windowId.length > 512
+    || !preview.ready || !preview.checks?.some(check => check.code === "value_usage_initialization" && check.ready)
+    || ["scheduled", "blocked"].includes(valueRowKind(row))
+    || (amount !== "0" && (!reason.trim() || new TextEncoder().encode(reason).length > 1000))) return {ok: false};
+  return {ok: true, ...(amount !== "0" ? {initialization: {targetPicos: amount, windowId: row.windowId, reason: reason.trim()}} : {})};
+}
 export function parseValueUsage(value: string): string | undefined {
   const parts = splitAmount(value, 12);
   if (typeof parts === "string") return undefined;

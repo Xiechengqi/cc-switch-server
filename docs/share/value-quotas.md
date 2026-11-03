@@ -1,6 +1,6 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-02（Share Market USD 席位与美元试用预算，§12；本轮只做编译／静态验证，不运行测试）。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-03（新增用户初始 USD 用量及原子保存，§13；仅本地验证）。
 
 ## 1. 含义与启用条件
 
@@ -200,3 +200,25 @@ Router 托管授权（`manager=routerShareMarket`）的 managed upsert 可携带
 Router 的“本期 API 等值／实际折扣”是 Router 保留日志与窗口末端目录价格的展示估算，不是该账本的权威额度，不改变任何钱包和 Provider 结算。标称折扣按 30 天满额折算，Token／lifetime／免费席位不推算。
 
 本节只做 `cargo check`／格式检查，新增测试未运行。
+
+## 13. 新增授权的初始已用金额（2026-11-03）
+
+Router 用户编辑弹窗和 Server 原生 Bundle 用户编辑器在 USD 模式显示“已消耗额度（美元等值，当前周期）”。已有授权读取权威状态；未同步／待生效显示未知，不伪造零。已有生效授权可展开独立“立即校准”，提示其不随外层保存／取消回滚；市场托管用户保持只读。Token 数量与 USD 输入分开保存草稿，不互相换算，金额编辑保留全部 12 位小数精度。
+
+对于已保存 Share 的真正新增普通用户，可选填初始已用金额，留空／零不补录，非零须审计原因（最多 1000 UTF-8 字节）。预览构建能力 `value_usage_initialization` 必须明确存在，且当前用户行 `canInitializeUsage=true`、有 `windowId`、策略立即生效；仅 v10 或全局 ready 不足以授权初始化。旧 Server 不支持时只关闭初始化，不影响原有额度设置。
+
+- 普通 settings patch 携带 `userValueUsageInitializations={email:{targetPicos,windowId,reason}}`，与新用户 USD 策略和 `editContext` 一起提交。Router 只在初始化时补充真实登录 `actor`，本地 patch 覆盖为本地 Owner，不信任表单身份。
+- 原生 `save_provider_bundle_share` 携带同名 map 与稳定 `valueUsageOperationId`。整个规范化命令指纹进入 `bundle-value:<operationId>` 回执；相同请求可重试，不同 payload 冲突，Share 已删除不能返回假成功。初始化草稿固定相对到期时间的基准，避免响应丢失后重试仅因时间流逝而改变请求。
+- State 域方法沿用 workspace → quota → usage → shares 的锁顺序，准备新授权及金额绑定；SQLite IMMEDIATE 事务中同时写 Share、授权、初始人工偏移、审计、水位和保存回执，提交成功后才发布内存。失败全部回滚这些内容，提交后 checkpoint 异常可根据持久 snapshot 调和，重试不重复补录。绑定准备可能留下安全 coverage 证据，不代表金额／授权部分提交。
+- 检查历史授权（含撤销）、保留用量汇总、原始请求、精确 Token 记录和 USD attempt／checkpoint／gap／adjustment；任何既有历史、恢复 fence、市场托管、非即时策略或变化的窗口均拒绝初始化。不能删除再添加来清零，也不能混合同用户 Token 和 USD 补录。合法历史只能走独立校准。
+- `targetPicos` 为非负规范整数字符串，上限 $1,000,000,000；不经浮点计算、不从旧 Token 推算，也不触碰钱包／市场钱款。批次上限 500，全成或全败；初始化校验／冲突返回 400／409，存储不可用 503，不返回笼统 500。
+
+协议权威仍为 Router `PROTOCOL.md §13.3`。本功能只扩展已验证文本配额管理，不扩大 Provider 支持面、不改变执行费率或真实上游验收状态。两端前端及承载 Share 的 Server 应配套更新；无新增 schema 迁移。
+
+### 13.1 本轮验证与 review
+
+- `cargo test --locked opening_usd --lib`：9/9，通过授权／偏移／回执原子提交、批次及 Share 写失败全回滚、相同请求重试、变更 payload 拒绝、已删除 Share、历史用量／恢复 fence 和保存时跨周期保护。金额账本／转发相关回归 44 通过，显式 opt-in 的十万请求容量测试未运行；Share 授权域回归 78/78 通过。
+- 四个纯 Node 环境前端测试文件共 63/63 通过：金额解析与全精度、初始化能力门槛、Bundle 草稿／稳定重试、四语言词条及本地／Router 会话切换后的迟到校准响应隔离。前端类型检查和生产构建通过，`web-dist` 已同步。
+- Rust `cargo check --locked --tests`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt --check` 与全体独立 Rust 源文件格式检查通过；Provider writer 证据已由官方脚本生成并校验，完整 `scripts/audit/*.test.mjs` 通过。SQLite 权威存储、Provider coverage／UI matrix、文档索引、Web i18n／运行时契约及产物体积审计通过。
+
+整体 review 重点为事务边界、可信 actor、旧 wire 指纹、草稿取消／重试、市场只读和跨周期／跨账号隔离，未发现未解决的阻断项。未截图、未运行浏览器或 UI 自动化、未操作远程系统，也未把本地夹具结果作为真实上游或生产验收；未提交、推送或部署。

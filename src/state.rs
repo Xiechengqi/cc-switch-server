@@ -180,6 +180,7 @@ use grok_media_resident::GrokMediaResidentSnapshot;
 
 pub(crate) use account_reset::QuotaPreviewConflict;
 pub(crate) use share_value_quota::ValueAttemptGuard;
+pub(crate) use share_value_quota::ValueUsageInitializationRequest;
 
 pub use background::{
     report_installation_upgrade_status, spawn_account_quota_refresh, spawn_audit_log_uploader,
@@ -19008,6 +19009,16 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
+        self.try_mutate_shares_with_value_initializations(mutate, None)
+            .await
+    }
+
+    async fn try_mutate_shares_with_value_initializations<R, E>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
+        initializations: Option<share_value_quota::ValueUsageInitializationRequest>,
+    ) -> anyhow::Result<Result<R, E>> {
+        let value_usage_changed = initializations.is_some();
         let value_config = self.config_snapshot().await;
         let value_capable = self.router_supports_value_quotas().await;
         let value_providers = self.providers.read().await.clone();
@@ -19060,14 +19071,41 @@ impl ServerStateInner {
             &value_providers,
             value_usage.as_deref(),
         )?;
+        let prepared_initializations = initializations
+            .as_ref()
+            .map(|request| {
+                request.prepare(
+                    &value_previous,
+                    &candidate,
+                    &value_config,
+                    value_usage.as_deref(),
+                    now_ms_i64(),
+                )
+            })
+            .transpose()?;
         drop(value_usage);
         #[cfg(test)]
         self.shares_persistence.apply_test_persist_delay().await;
-        persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        if let Some(request) = initializations {
+            let now = now_ms_i64();
+            let initializations = prepared_initializations.unwrap_or_default();
+            persist_state_snapshot(
+                &self.config_dir,
+                share_value_quota::InitializedShareSnapshot {
+                    shares: candidate.clone(),
+                    initializations,
+                    actor: request.actor,
+                    now,
+                },
+            )
+            .await?;
+        } else {
+            persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
+        }
         let quota_changed = previous_quota_revision != candidate.quota_cycle_ledger.revision;
         *self.shares.write().await = candidate;
         self.shares_persistence.mark_published();
-        if quota_changed {
+        if quota_changed || value_usage_changed {
             self.router_share_sync_wakeup.notify_one();
         }
         Ok(Ok(result))
@@ -19487,7 +19525,7 @@ impl ServerStateInner {
     pub async fn apply_share_settings_patch_immediate(
         self: &Arc<Self>,
         share_id: &str,
-        patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
+        mut patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         if patch.managed_grant.is_some() {
             return Ok(Err(
@@ -19495,6 +19533,11 @@ impl ServerStateInner {
                     "managed grant operations are reserved for Router Share Market".to_string(),
                 ),
             ));
+        }
+        if patch.user_value_usage_initializations.is_some() {
+            if let Some(context) = &mut patch.edit_context {
+                context.actor = self.config_snapshot().await.owner.email;
+            }
         }
         self.apply_router_share_settings_patch_immediate(share_id, patch)
             .await
@@ -19526,6 +19569,7 @@ impl ServerStateInner {
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         use crate::domain::sharing::router_contract::ShareTokenPeriod;
+        let value_initializations = ValueUsageInitializationRequest::from_patch(share_id, &patch)?;
         let requests_account_reset = patch.user_grants.as_ref().is_some_and(|grants| {
             grants
                 .values()
@@ -19580,9 +19624,17 @@ impl ServerStateInner {
         }
         let Some(support) = patch.support.clone() else {
             return self
-                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
-                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
-                })
+                .try_mutate_share_quota_with_value_initializations(
+                    value_initializations,
+                    |shares, usage, applied_at_ms| {
+                        shares.apply_settings_patch_with_usage(
+                            share_id,
+                            patch,
+                            usage,
+                            applied_at_ms,
+                        )
+                    },
+                )
                 .await;
         };
 
@@ -19593,9 +19645,17 @@ impl ServerStateInner {
         let providers = self.providers.read().await.clone();
         let Some(bundle_id) = share_bundle_id(&providers, &share) else {
             return self
-                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
-                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
-                })
+                .try_mutate_share_quota_with_value_initializations(
+                    value_initializations,
+                    |shares, usage, applied_at_ms| {
+                        shares.apply_settings_patch_with_usage(
+                            share_id,
+                            patch,
+                            usage,
+                            applied_at_ms,
+                        )
+                    },
+                )
                 .await;
         };
 
@@ -19613,9 +19673,17 @@ impl ServerStateInner {
             .collect::<Vec<_>>();
         if family_surfaces.is_empty() {
             return self
-                .try_mutate_share_quota_immediate(|shares, usage, applied_at_ms| {
-                    shares.apply_settings_patch_with_usage(share_id, patch, usage, applied_at_ms)
-                })
+                .try_mutate_share_quota_with_value_initializations(
+                    value_initializations,
+                    |shares, usage, applied_at_ms| {
+                        shares.apply_settings_patch_with_usage(
+                            share_id,
+                            patch,
+                            usage,
+                            applied_at_ms,
+                        )
+                    },
+                )
                 .await;
         }
         let supported = family_surfaces
@@ -19654,20 +19722,32 @@ impl ServerStateInner {
             }
         };
 
-        self.try_mutate_share_quota_immediate(move |shares, usage, applied_at_ms| {
-            shares.apply_settings_patch_with_bindings_and_usage(
-                share_id,
-                patch,
-                &missing_bindings,
-                usage,
-                applied_at_ms,
-            )
-        })
+        self.try_mutate_share_quota_with_value_initializations(
+            value_initializations,
+            move |shares, usage, applied_at_ms| {
+                shares.apply_settings_patch_with_bindings_and_usage(
+                    share_id,
+                    patch,
+                    &missing_bindings,
+                    usage,
+                    applied_at_ms,
+                )
+            },
+        )
         .await
     }
 
     pub async fn try_mutate_share_quota_immediate<R, E>(
         &self,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
+    ) -> anyhow::Result<Result<R, E>> {
+        self.try_mutate_share_quota_with_value_initializations(None, mutate)
+            .await
+    }
+
+    pub(crate) async fn try_mutate_share_quota_with_value_initializations<R, E>(
+        &self,
+        initializations: Option<ValueUsageInitializationRequest>,
         mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
@@ -19676,9 +19756,10 @@ impl ServerStateInner {
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let usage = self.usage.read().await;
         let applied_at_ms = crate::infra::time::now_ms() as i64;
-        self.try_mutate_shares_in_workspace_transaction(|shares| {
-            mutate(shares, &usage, applied_at_ms)
-        })
+        self.try_mutate_shares_with_value_initializations(
+            |shares| mutate(shares, &usage, applied_at_ms),
+            initializations,
+        )
         .await
     }
 
@@ -23419,6 +23500,7 @@ mod tests {
 
     include!("state/buddy_catalog_tests.rs");
     include!("state/share_value_quota/tariff_state_tests.rs");
+    include!("state/share_value_quota/initialization_tests.rs");
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};

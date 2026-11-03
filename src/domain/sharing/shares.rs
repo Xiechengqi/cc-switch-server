@@ -8197,6 +8197,7 @@ mod tests {
             edit_context: Some(ShareSettingsEditContext {
                 operation_id: "expand-1".into(),
                 expected_config_revision: original.config_revision,
+                actor: None,
             }),
             support: Some(ShareSupport {
                 claude: true,
@@ -8247,6 +8248,7 @@ mod tests {
             edit_context: Some(ShareSettingsEditContext {
                 operation_id: "operation-1".into(),
                 expected_config_revision: original.config_revision,
+                actor: None,
             }),
             user_usage_edits: Some(BTreeMap::from([(
                 "a@example.com".into(),

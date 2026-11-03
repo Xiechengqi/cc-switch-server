@@ -1105,6 +1105,7 @@ function BundleShareEditor({
   const {
     onChange: updateUserGrants,
     onUsageEditsChange: updateUserUsageEdits,
+    onValueUsageInitializationsChange: updateValueUsageInitializations,
   } = bundleShareGrantHandlers(onChange);
   const updateDraft = (patch: Partial<ProviderBundleShareDraft>) =>
     onChange((current) => ({ ...current, ...patch }));
@@ -1254,6 +1255,9 @@ function BundleShareEditor({
             defaultPolicy={defaultUserPolicy}
             protectedEmails={protectedGrantEmails}
             usageEdits={draft.userUsageEdits}
+            savedGrants={draft.baseline?.userGrants ?? {}}
+            valueUsageInitializations={draft.userValueUsageInitializations}
+            onValueUsageInitializationsChange={updateValueUsageInitializations}
             onUsageEditsChange={updateUserUsageEdits}
             onChange={updateUserGrants}
           />
