@@ -413,6 +413,21 @@
       "title": "放棄未儲存的變更？"
     }
   },
+  "buddyModels": {
+    "auto": "自動選擇",
+    "choose": "選擇上游模型",
+    "search": "搜尋模型名稱或 ID",
+    "refresh": "重新整理模型目錄",
+    "autoHint": "auto 會依目前帳號目錄和請求能力選擇模型，也可手動輸入模型 ID。",
+    "selectAccount": "請先選擇 OAuth 帳號以取得模型清單。",
+    "loading": "正在取得帳號模型…",
+    "failed": "模型目錄取得失敗：{{message}}。已保留目前值，可重新整理重試。",
+    "stale": "快取目錄取得於 {{time}}，目前即時可用性未確認。",
+    "updated": "帳號目錄更新於 {{time}}。",
+    "empty": "目前帳號沒有可用模型，auto 同樣需要帳號中有可用模型。",
+    "missing": "目前模型不在此帳號的最新目錄中。已保留原值，請於使用前選擇可用模型。",
+    "noMatch": "沒有符合的模型。"
+  },
   "providerBundle": {
     "authAdvanced": "進階相容設定（通常無需修改）",
     "authRecommended": "使用協定建議設定",

@@ -67,6 +67,8 @@ import cursorUrl from "./cursor.png";
 import kiroUrl from "./kiro.png";
 import qoderUrl from "./qoder.png";
 import bailianUrl from "./bailian.png";
+import workbuddyUrl from "./workbuddy.svg?url";
+import codebuddyUrl from "./codebuddy.svg?url";
 
 import { IconMetadata, iconMetadata } from "./metadata";
 
@@ -143,6 +145,8 @@ export const iconUrls: Record<string, string> = {
   kiro: kiroUrl,
   qoder: qoderUrl,
   bailian: bailianUrl,
+  workbuddy: workbuddyUrl,
+  codebuddy: codebuddyUrl,
 };
 
 export const iconList = [...Object.keys(icons), ...Object.keys(iconUrls)].sort();

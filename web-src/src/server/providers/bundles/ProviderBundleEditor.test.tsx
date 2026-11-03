@@ -12,6 +12,7 @@ import { ProviderBundleEditor } from "./ProviderBundleEditor";
 const mocks = vi.hoisted(() => ({
   upsertBundle: vi.fn(), getBundle: vi.fn(), shareSave: vi.fn(), toastError: vi.fn(), onSaved: vi.fn(),
   validateBundleDraft: vi.fn(),
+  fetchBuddyAccountModels: vi.fn(),
   accounts: [] as ManagedAuthAccount[],
 }));
 vi.mock("sonner", () => ({ toast: { error: mocks.toastError, success: vi.fn() } }));
@@ -19,6 +20,7 @@ vi.mock("@/lib/api/providers", () => ({ providersApi: {
   upsertBundle: mocks.upsertBundle,
   getBundle: mocks.getBundle,
   validateBundleDraft: mocks.validateBundleDraft,
+  fetchBuddyAccountModels: mocks.fetchBuddyAccountModels,
   getRequestDefaults: async () => ({ requestTimeoutSeconds: 300, streamFirstByteTimeoutSeconds: 120, streamIdleTimeoutSeconds: 300 }),
   getHealthCheckConfig: async () => ({ timeoutSeconds: 30, maxRetries: 0, degradedThresholdSeconds: 10, testModels: { claude: "test", codex: "test", gemini: "test" } }),
 } }));
@@ -66,6 +68,9 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocks.accounts = [];
   mocks.validateBundleDraft.mockResolvedValue({ requiresRebind: false });
+  mocks.fetchBuddyAccountModels.mockImplementation(async (identity) => ({
+    ...identity, models: [{ id: "hy3", upstreamModel: "hy3" }], source: "fixture", stale: false, fetchedAtMs: 1,
+  }));
 });
 
 describe("Provider Bundle editor save stages", () => {

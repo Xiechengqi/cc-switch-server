@@ -29,6 +29,8 @@ export const iconMetadata: Record<string, IconMetadata> = {
   alibaba: { name: "alibaba", displayName: "Alibaba", defaultColor: "#FF6A00" },
   bailian: { name: "bailian", displayName: "Bailian" },
   qoder: { name: "qoder", displayName: "Qoder" },
+  workbuddy: { name: "workbuddy", displayName: "WorkBuddy" },
+  codebuddy: { name: "codebuddy", displayName: "CodeBuddy" },
   kimi: { name: "kimi", displayName: "Kimi", defaultColor: "#6366F1" },
   nvidia: { name: "nvidia", displayName: "NVIDIA", defaultColor: "#76B900" },
   aws: { name: "aws", displayName: "AWS", defaultColor: "#FF9900" },

@@ -17725,6 +17725,179 @@ impl ServerStateInner {
             })
     }
 
+    /// Read an account catalog for an unsaved management form. This never
+    /// creates a Provider and cannot populate a Provider-bound runtime scope.
+    pub(crate) async fn prepare_buddy_account_catalog(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        account_id: &str,
+        expected_generation: u64,
+        request_timeout: Duration,
+        force_refresh: bool,
+    ) -> Result<crate::proxy::codebuddy_runtime::CodeBuddyModelCatalog, CodeBuddyRuntimeError> {
+        use crate::domain::codebuddy::CodeBuddyAccountProfile;
+        use crate::proxy::codebuddy_runtime::{parse_buddy_model_catalog, CodeBuddyRuntimeScope};
+        if !provider_type.is_buddy_oauth() {
+            return Err(CodeBuddyRuntimeError::InvalidAccount(
+                "Buddy catalog requires a Buddy OAuth account".into(),
+            ));
+        }
+        if self.credential_persistence_degraded() {
+            return Err(CodeBuddyRuntimeError::CredentialPersistenceDegraded);
+        }
+        self.refresh_managed_account_if_needed_for_generation(
+            provider_type,
+            account_id,
+            expected_generation,
+        )
+        .await
+        .map_err(CodeBuddyRuntimeError::Refresh)?;
+        let (account, incarnation) = self
+            .find_account_for_provider_with_incarnation(provider_type, account_id)
+            .await
+            .ok_or(CodeBuddyRuntimeError::NotFound)?;
+        if account.auth_identity_generation != expected_generation {
+            return Err(CodeBuddyRuntimeError::IdentityChanged);
+        }
+        if account.needs_relogin {
+            return Err(CodeBuddyRuntimeError::Upstream {
+                status_code: 401,
+                message: "Buddy account requires login".into(),
+                retryable: false,
+            });
+        }
+        if account
+            .access_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(CodeBuddyRuntimeError::InvalidAccount(
+                "Buddy OAuth account is missing an access token".into(),
+            ));
+        }
+        let profile = CodeBuddyAccountProfile::parse_for(provider_type, account.profile.as_ref())
+            .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
+        let fingerprint = codebuddy_request_identity_fingerprint(&account);
+        let scope = CodeBuddyRuntimeScope::account_preview(
+            provider_type,
+            account_id,
+            profile.site,
+            &profile.domain,
+            expected_generation,
+            account.token_refresh_generation,
+            incarnation,
+            &fingerprint,
+        )
+        .map_err(CodeBuddyRuntimeError::InvalidAccount)?;
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let cached = self.codebuddy_runtime.catalog(&scope, now_ms).await;
+        let catalog = if let Some(cached) = cached.as_ref().filter(|_| !force_refresh) {
+            cached.clone()
+        } else {
+            let _guard = self
+                .codebuddy_runtime
+                .catalog_lock(&scope)
+                .await
+                .ok_or(CodeBuddyRuntimeError::MemoryCapacity)?;
+            if !self
+                .buddy_account_catalog_snapshot_matches(&account, incarnation, &fingerprint)
+                .await
+            {
+                return Err(CodeBuddyRuntimeError::IdentityChanged);
+            }
+            let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            let concurrent = self.codebuddy_runtime.catalog(&scope, now_ms).await;
+            // A concurrent refresh satisfies this request too. Manual refresh
+            // bypasses the old fresh entry without discarding its stale backup.
+            if let Some(catalog) = concurrent.filter(|current| {
+                !force_refresh
+                    || cached
+                        .as_ref()
+                        .is_none_or(|previous| !previous.same_snapshot(current))
+            }) {
+                catalog
+            } else {
+                let fetched = crate::clients::oauth::codebuddy::fetch_model_config(
+                    &self.http_client().await,
+                    &account,
+                    request_timeout,
+                )
+                .await;
+                if !self
+                    .buddy_account_catalog_snapshot_matches(&account, incarnation, &fingerprint)
+                    .await
+                {
+                    return Err(CodeBuddyRuntimeError::IdentityChanged);
+                }
+                match fetched {
+                    Ok((value, _)) => {
+                        let parsed =
+                            match parse_buddy_model_catalog(&value, provider_type, profile.site) {
+                                Ok(parsed) => parsed,
+                                Err(message) => {
+                                    self.invalidate_codebuddy_runtime_scope(&scope).await;
+                                    return Err(CodeBuddyRuntimeError::Upstream {
+                                        status_code: 502,
+                                        message,
+                                        retryable: false,
+                                    });
+                                }
+                            };
+                        let fetched_at = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+                        self.codebuddy_runtime
+                            .insert_catalog(scope.clone(), parsed, fetched_at)
+                            .await
+                    }
+                    Err(error) => {
+                        let transient = error.is_transient();
+                        if !transient {
+                            self.invalidate_codebuddy_runtime_scope(&scope).await;
+                        }
+                        let runtime_error = codebuddy_client_runtime_error(error);
+                        if transient {
+                            self.codebuddy_runtime.mark_catalog_stale(&scope).await;
+                            self.codebuddy_runtime
+                                .stale_catalog(
+                                    &scope,
+                                    crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+                                )
+                                .await
+                                .ok_or(runtime_error)?
+                        } else {
+                            return Err(runtime_error);
+                        }
+                    }
+                }
+            }
+        };
+        if self.credential_persistence_degraded() {
+            return Err(CodeBuddyRuntimeError::CredentialPersistenceDegraded);
+        }
+        if !self
+            .buddy_account_catalog_snapshot_matches(&account, incarnation, &fingerprint)
+            .await
+        {
+            return Err(CodeBuddyRuntimeError::IdentityChanged);
+        }
+        Ok(catalog)
+    }
+
+    async fn buddy_account_catalog_snapshot_matches(
+        &self,
+        expected: &Account,
+        incarnation: u64,
+        fingerprint: &str,
+    ) -> bool {
+        self.find_account_for_provider_with_incarnation(expected.provider_type, &expected.id)
+            .await
+            .is_some_and(|(current, current_incarnation)| {
+                current_incarnation == incarnation
+                    && current.auth_identity_generation == expected.auth_identity_generation
+                    && current.token_refresh_generation == expected.token_refresh_generation
+                    && codebuddy_request_identity_fingerprint(&current) == fingerprint
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare_codebuddy_runtime(
         self: &Arc<Self>,
@@ -23114,6 +23287,7 @@ async fn issue_share_tunnel_lease(
 
 #[cfg(test)]
 mod tests {
+    include!("state/buddy_catalog_tests.rs");
     include!("state/share_value_quota/tariff_state_tests.rs");
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};

@@ -30,6 +30,12 @@ import {
   Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
+import {
+  UpstreamModelInput,
+  useBuddyModelCatalog,
+  type BuddyModelCatalogControl,
+} from "./BuddyModelSelector";
+import { resolveBundleIcon } from "./bundleIcon";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
@@ -383,10 +389,12 @@ function CardGapStatus({ gap }: { gap: BundleGap | null }) {
  * Profile-fixed Surfaces in global scope, so the two read as the same kind of thing.
  */
 function SurfaceModelRow({
+  catalog,
   surface,
   validation,
   onChange,
 }: {
+  catalog?: BuddyModelCatalogControl;
   surface: BundleSurfaceEditorDraft;
   validation: BundleValidationIssue | null;
   onChange: (surface: BundleSurfaceEditorDraft) => void;
@@ -447,7 +455,8 @@ function SurfaceModelRow({
             </TabsList>
           </Tabs>
           {surface.modelPolicy === "single" ? (
-            <Input
+            <UpstreamModelInput
+              catalog={catalog}
               id={bundleValidationFieldId({
                 code: "surfaceUpstreamModelRequired",
                 field: "upstreamModel",
@@ -467,12 +476,12 @@ function SurfaceModelRow({
                 ),
               )}
               value={surface.upstreamModel}
-              onChange={(event) =>
+              onValueChange={(value) =>
                 onChange(
                   updateSurfaceModel(
                     surface,
                     surface.modelPolicy,
-                    event.target.value,
+                    value,
                   ),
                 )
               }
@@ -1482,6 +1491,11 @@ export function ProviderBundleEditor({
     credentialProfile?.credentialPolicy.mode === "managed_account"
       ? credentialProfile.credentialPolicy.accountProviderType
       : undefined;
+  const buddyCatalog = useBuddyModelCatalog(
+    managedProviderType, draft.accountId, draft.accountGeneration,
+    draft.modelPolicyScope === "global" ? draft.modelPolicy === "single"
+      : draft.surfaces.some((surface) => surface.modelPolicy === "single"),
+  );
   const accounts = useMemo(
     () =>
       accountsQuery.data?.filter(
@@ -2160,7 +2174,7 @@ export function ProviderBundleEditor({
                 <div className="space-y-2 md:col-span-2">
                   <div className="flex items-center justify-center">
                     <ProviderIconControl
-                      icon={draft.icon}
+                      icon={resolveBundleIcon(draft.familyId, draft.icon)}
                       iconColor={draft.iconColor}
                       providerName={draft.name}
                       onChange={(icon, iconColor) =>
@@ -2723,7 +2737,8 @@ export function ProviderBundleEditor({
                         </div>
                       )}
                       {draft.modelPolicy === "single" ? (
-                        <Input
+                        <UpstreamModelInput
+                          catalog={buddyCatalog}
                           id={bundleValidationFieldId({
                             code: "upstreamModelRequired",
                             field: "upstreamModel",
@@ -2746,12 +2761,12 @@ export function ProviderBundleEditor({
                             ),
                           )}
                           value={draft.upstreamModel}
-                          onChange={(event) =>
+                          onValueChange={(value) =>
                             setDraft((current) =>
                               updateBundleModel(
                                 current,
                                 current.modelPolicy,
-                                event.target.value,
+                                value,
                               ),
                             )
                           }
@@ -2762,6 +2777,7 @@ export function ProviderBundleEditor({
                       <div className="rounded-md border px-3">
                         {fixedModelSurfaces.map((surface) => (
                           <SurfaceModelRow
+                            catalog={buddyCatalog}
                             key={surface.app}
                             surface={surface}
                             validation={validation}
@@ -2777,6 +2793,7 @@ export function ProviderBundleEditor({
                   <div className="rounded-md border px-3">
                     {draft.surfaces.map((surface) => (
                       <SurfaceModelRow
+                        catalog={buddyCatalog}
                         key={surface.app}
                         surface={surface}
                         validation={validation}

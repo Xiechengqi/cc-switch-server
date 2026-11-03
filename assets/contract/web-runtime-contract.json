@@ -952,6 +952,13 @@
       "notes": "Persisted in ui-settings.json commonConfigSnippets."
     },
     {
+      "name": "fetch_buddy_account_models",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "notes": "Authenticated identity-fenced CodeBuddy/WorkBuddy live account model catalog for saved or unsaved Provider forms; no configuration writes."
+    },
+    {
       "name": "fetch_models_for_config",
       "support": "shim",
       "implemented": true,

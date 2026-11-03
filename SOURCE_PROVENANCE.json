@@ -37,9 +37,43 @@
       "package": "@lobehub/icons-static-svg@1.91.0",
       "license": "MIT",
       "copyright": "Copyright LobeHub",
-      "scope": ["web-src public provider and product icon assets"],
+      "scope": [
+        "web-src public provider and product icon assets"
+      ],
       "technicalInput": false,
       "notice": "THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "id": "buddy-product-icons",
+      "repository": "https://github.com/lobehub/lobe-icons",
+      "license": "MIT",
+      "copyright": "Copyright LobeHub",
+      "referenceRepository": "https://github.com/yetone/magpie.git",
+      "referenceCommit": "834c6c7dfe6a6c1dc8c98fb2141105962908377f",
+      "scope": [
+        "web-src/src/icons/extracted/workbuddy.svg",
+        "web-src/src/icons/extracted/codebuddy.svg"
+      ],
+      "technicalInput": false,
+      "notice": "THIRD_PARTY_NOTICES.md",
+      "assets": [
+        {
+          "path": "web-src/src/icons/extracted/workbuddy.svg",
+          "sourcePath": "internal/gui/assets/icons/workbuddy-color.svg",
+          "sourceCommit": "9687f3d29",
+          "sourceSha256": "ade134028e69e03453bff956059a0e7f23c7341a0295f16994cecd8d03fc2fd4",
+          "modifications": "Added viewBox; local URL rendering.",
+          "upstreamIconVersion": "LobeHub icon; exact package version not established"
+        },
+        {
+          "path": "web-src/src/icons/extracted/codebuddy.svg",
+          "sourcePath": "internal/gui/assets/icons/codebuddy-color.svg",
+          "sourceCommit": "1e271896d",
+          "sourceSha256": "033d5da624460e686046f22b4e242b6b86484ad84ec4877e4efa15a9fb642b97",
+          "modifications": "Local URL rendering.",
+          "upstreamIconVersion": "LobeHub icons 1.95.1 (magpie source attribution)"
+        }
+      ]
     }
   ]
 }

@@ -1,5 +1,17 @@
 # Protocol evidence policy
 
+## 2026-11-03 Buddy 管理目录、产品图标与 Router 输出上限测试
+
+本轮复核现有 `fetch_model_config`、`parse_buddy_model_catalog`、Provider 绑定目录及 Web 表单。新增受认证的 `fetch_buddy_account_models` invoke 为未保存表单读取同一已受审目录，产品/账号/身份世代显式绑定；账号预览有独立缓存命名空间，保留现有 128 项/单飞/内存预算、8 分钟 fresh 与 24 小时 stale 边界。网络前后核验凭据、站点、身份指纹和账号 incarnation；显式刷新临时失败将旧目录标为过期参考，认证/协议错误使预览缓存失效，不能借 stale 成功。预览不创建 Provider，不修改绑定和模型，OAuth 刷新仍走现有持久化域方法。`auto` 继续由请求能力与账号目录解析，不在 UI 改成首个模型；权威空目录、失败、缓存和缺失旧值分别显示。
+
+Router 手动 Responses 测试现在按完整 SSE 事件与实际请求预算判断预期 `response.incomplete`，要求匹配的 type/status/reason 和达到上限的整数 output_tokens，完整读取后错误优先；Server 生产 length 映射保持真实 incomplete。此前段落中的“不改 Router”只描述当时 Server 补丁；本轮补齐 Router 独立入口，不提升 Share Contract 版本。
+
+Logo 研究只读取 magpie 固定提交 `834c6c7dfe6a6c1dc8c98fb2141105962908377f` 的两份图标及来源记录，将 SVG 固定为本仓资产。CodeBuddy 图标新增记录注明 LobeHub 1.95.1；WorkBuddy 包版本未确定，不冒用旧 1.91.0。来源与内容摘要见 SOURCE_PROVENANCE.json。未引入外部 UI 组件、动态资源或构建依赖；旧 Bundle 用稳定 Family 显示回退，不批量写回。
+
+验证使用本仓合成夹具和本地回环。Server 全量 Rust 测试 4,182 项通过、3 项忽略，后端审计 2,111 项及 Web 测试 299 项通过；完整静态检查（含独立 include 源文件格式、严格 Clippy、契约、来源与文档审计）、前端生产构建及最新二进制的 10 步本地启动 smoke 通过。Router 全量 Rust 测试 1,793 项通过，最新探针回归 36 项通过，格式、cargo check、相关前端测试、类型检查、生产构建和模型健康契约审计通过。Router 全仓严格 Clippy 仍被既有告警阻断，已核对本次改动行没有诊断；未移除门禁或顺带修改无关代码。
+
+整体 review 已完成，补齐账号切换晚到结果、并发刷新、失败缓存状态与成功终态后传输断开的回归，未发现本次改动的遗留阻断项。本轮未调用生产凭据、上游服务或执行部署；人工页面验收与真实双站/Router 联合验收仍待执行。离线 readiness 为 failures=0、warnings=2、decision=blocked / blocked_inputs，缺真实输入及部署验证；其 RUN_TESTS=0 的本地测试阶段按脚本如实记为跳过，本轮完整本地测试成绩另行记录，不改写该门禁结果。
+
 ## 2026-11-02 Buddy 单 token 探针的预期输出上限终态
 
 远程 Server `240c6571a9c3` 已包含自动模型和账号展示修复。只读核对发现 WorkBuddy CN 单模型 `auto` 已解析为 `hy3`；同一时段的实际调用记录为 HTTP 200、outputTokens=1、streamStatus=completed，而模型健康检查报告 streamIncomplete。现有公开探针本身设置 `max_output_tokens=1`，不能用“必须自然完成整段回答”判断这种连接检查。

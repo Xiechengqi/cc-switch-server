@@ -7,6 +7,18 @@ export interface ProviderSortUpdate {
   sortIndex: number;
 }
 
+export type BuddyProviderType = "codebuddy_oauth" | "workbuddy_oauth";
+
+export interface BuddyAccountModels {
+  providerType: BuddyProviderType;
+  accountId: string;
+  authIdentityGeneration: number;
+  models: Array<{ id: string; upstreamModel: string; displayName?: string }>;
+  source: string;
+  stale: boolean;
+  fetchedAtMs: number;
+}
+
 export interface ProviderInferenceTestResponse {
   ok: boolean;
   operation: "image_generation" | "image_edit" | "video_generation";
@@ -428,6 +440,20 @@ export type ProviderCredentialPatch =
 export type ProviderCredentialPatches = Record<string, ProviderCredentialPatch>;
 
 export const providersApi = {
+  async fetchBuddyAccountModels(
+    identity: { providerType: BuddyProviderType; accountId: string; authIdentityGeneration: number },
+    forceRefresh = false,
+    signal?: AbortSignal,
+  ): Promise<BuddyAccountModels> {
+    const catalog = await invokeCommand<BuddyAccountModels>(
+      "fetch_buddy_account_models", { ...identity, forceRefresh }, { cache: "no-store", signal },
+    );
+    if (catalog.providerType !== identity.providerType || catalog.accountId !== identity.accountId
+      || catalog.authIdentityGeneration !== identity.authIdentityGeneration) {
+      throw new Error("Account identity changed during model discovery");
+    }
+    return catalog;
+  },
   async testGrokMedia(
     providerId: string,
     operation: ProviderInferenceTestResponse["operation"],

@@ -9,6 +9,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { resolveBundleIcon } from "./bundleIcon";
 import type {
   DraggableAttributes,
   DraggableSyntheticListeners,
@@ -328,7 +329,7 @@ export function ProviderBundleCard({
           ) : null}
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted transition-transform duration-300 group-hover:scale-105">
             <ProviderIcon
-              icon={bundle.icon}
+              icon={resolveBundleIcon(bundle.familyId, bundle.icon)}
               name={bundle.name}
               color={bundle.iconColor}
               size={20}

@@ -251,6 +251,68 @@ fn provider_test_error_category(response: &TestProviderResponse) -> Option<Strin
     Some(category.to_string())
 }
 
+pub(in crate::api) async fn web_fetch_buddy_account_models(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        provider_type: ProviderType,
+        account_id: String,
+        auth_identity_generation: u64,
+        #[serde(default)]
+        force_refresh: bool,
+    }
+    let input: Request = serde_json::from_value(args.clone()).map_err(ApiError::bad_request)?;
+    if !input.provider_type.is_buddy_oauth() || input.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Buddy model discovery requires an explicit Buddy OAuth account",
+        ));
+    }
+    let mut recovery_attempted = false;
+    let catalog = loop {
+        match state
+            .prepare_buddy_account_catalog(
+                input.provider_type,
+                &input.account_id,
+                input.auth_identity_generation,
+                std::time::Duration::from_secs(15),
+                input.force_refresh,
+            )
+            .await
+        {
+            Ok(catalog) => break catalog,
+            Err(error) if error.is_authentication_failure() && !recovery_attempted => {
+                recovery_attempted = true;
+                state
+                    .refresh_managed_account_now_for_generation(
+                        input.provider_type,
+                        &input.account_id,
+                        input.auth_identity_generation,
+                    )
+                    .await
+                    .map_err(map_managed_account_refresh_error)?;
+            }
+            Err(error) => {
+                return Err(providers::codebuddy_runtime_api_error(
+                    error,
+                    input.provider_type,
+                ))
+            }
+        }
+    };
+    Ok(json!({
+        "providerType": input.provider_type,
+        "accountId": input.account_id,
+        "authIdentityGeneration": input.auth_identity_generation,
+        "models": providers::buddy_catalog_models(input.provider_type, &catalog),
+        "source": if input.provider_type == ProviderType::WorkBuddyOAuth { "workbuddy_live_model_catalog" } else { "codebuddy_live_model_catalog" },
+        "stale": catalog.stale,
+        "fetchedAtMs": catalog.fetched_at_ms,
+    }))
+}
+
 pub(in crate::api) async fn web_fetch_models_for_config(
     state: &ServerState,
     args: &Value,

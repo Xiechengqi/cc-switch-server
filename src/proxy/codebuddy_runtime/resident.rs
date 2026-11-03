@@ -124,6 +124,15 @@ impl CodeBuddyRuntimeCache {
         self.catalogs.write().await.remove(scope);
     }
 
+    /// A failed explicit management refresh must not turn its old snapshot
+    /// back into a fresh result on the next read. Retain only its stale backup.
+    pub(crate) async fn mark_catalog_stale(&self, scope: &CodeBuddyRuntimeScope) {
+        if let Some(catalog) = self.catalogs.write().await.get_mut(scope) {
+            catalog.expires_at_ms = i64::MIN;
+            catalog.stale = true;
+        }
+    }
+
     pub(crate) async fn catalog_lock(
         &self,
         scope: &CodeBuddyRuntimeScope,

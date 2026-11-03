@@ -1779,6 +1779,7 @@ async fn web_invoke_dispatch(
             }
             Ok(json!(results))
         }
+        "fetch_buddy_account_models" => web_fetch_buddy_account_models(state, &args).await,
         "fetch_models_for_config" => web_fetch_models_for_config(state, &args).await,
         "get_codex_oauth_models" | "get_antigravity_oauth_models" => Ok(json!([])),
         "get_grok_oauth_models" => Ok(json!(grok_oauth_default_models())),

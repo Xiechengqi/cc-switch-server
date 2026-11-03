@@ -145,6 +145,7 @@ export const serverProviderPresets: Readonly<
     "icon": "qoder"
   },
   "claude.codebuddy_oauth": {
+    "icon": "codebuddy",
     "name": "CodeBuddy OAuth",
     "websiteUrl": "https://www.codebuddy.ai",
     "notes": "",
@@ -160,6 +161,7 @@ export const serverProviderPresets: Readonly<
     "category": "official"
   },
   "claude.workbuddy_oauth": {
+    "icon": "workbuddy",
     "name": "WorkBuddy OAuth",
     "websiteUrl": "https://www.workbuddy.ai",
     "notes": "",
@@ -659,6 +661,7 @@ export const serverProviderPresets: Readonly<
     "icon": "qoder"
   },
   "codex.codebuddy_oauth": {
+    "icon": "codebuddy",
     "name": "CodeBuddy OAuth",
     "websiteUrl": "https://www.codebuddy.ai",
     "notes": "",
@@ -676,6 +679,7 @@ export const serverProviderPresets: Readonly<
     "category": "official"
   },
   "codex.workbuddy_oauth": {
+    "icon": "workbuddy",
     "name": "WorkBuddy OAuth",
     "websiteUrl": "https://www.workbuddy.ai",
     "notes": "",
@@ -1187,6 +1191,7 @@ export const serverProviderPresets: Readonly<
     "icon": "qoder"
   },
   "gemini.codebuddy_oauth": {
+    "icon": "codebuddy",
     "name": "CodeBuddy OAuth",
     "websiteUrl": "https://www.codebuddy.ai",
     "notes": "",
@@ -1202,6 +1207,7 @@ export const serverProviderPresets: Readonly<
     "category": "official"
   },
   "gemini.workbuddy_oauth": {
+    "icon": "workbuddy",
     "name": "WorkBuddy OAuth",
     "websiteUrl": "https://www.workbuddy.ai",
     "notes": "",

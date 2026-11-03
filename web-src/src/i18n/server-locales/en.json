@@ -413,6 +413,21 @@
       "title": "Discard unsaved changes?"
     }
   },
+  "buddyModels": {
+    "auto": "Automatic selection",
+    "choose": "Choose upstream model",
+    "search": "Search model name or ID",
+    "refresh": "Refresh model catalog",
+    "autoHint": "auto selects a model from this account’s catalog according to the request. You can also enter a model ID.",
+    "selectAccount": "Select an OAuth account to load its models.",
+    "loading": "Loading account models…",
+    "failed": "Could not load the model catalog: {{message}}. The current value is preserved; retry with refresh.",
+    "stale": "Cached catalog from {{time}}; live availability could not be confirmed.",
+    "updated": "Account catalog updated {{time}}.",
+    "empty": "This account currently has no available models. auto also requires an available model.",
+    "missing": "The current model is absent from this account’s latest catalog. Its value is preserved; choose an available model before use.",
+    "noMatch": "No matching models."
+  },
   "providerBundle": {
     "authAdvanced": "Advanced compatibility (usually unnecessary)",
     "authRecommended": "Use protocol recommendations",

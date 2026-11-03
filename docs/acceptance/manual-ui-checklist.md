@@ -156,3 +156,13 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 - Offline release readiness remains `blocked_inputs`: real Router/OAuth/Share grant/Client Market credentials and deployment acceptance were not supplied. `RUN_TESTS=0` also records the readiness script's own local-test phase as skipped; the full local suites were run separately and passed.
 - Server-owned zh/zh-TW/en/ja locale coverage remains statically validated. Human reviewers still need to check translated text fit in real viewports.
 - Manual wide and narrow viewport checks remain pending for a human reviewer.
+
+### Buddy 模型与图标
+
+- [ ] CodeBuddy / WorkBuddy 的中国区和国际区账号分别检查：新增、编辑、未保存切换账号时，固定模型目录自动加载；旧目录和晚到响应不出现在新账号下。
+- [ ] 全局与按 Claude/Codex/Gemini 固定模型均能搜索名称/ID、选择真实 ID、保留 auto 和手动输入；获取目录不自动选择或保存。
+- [ ] 未选账号、加载失败、手动刷新、权威空目录、过期缓存、旧模型缺失的提示正确；失败不清空旧模型。
+- [ ] 新增、旧记录、编辑、复制均显示相应产品 Logo；自定义图标优先，反复显示无渐变串色，打开旧记录不因回退图标产生未保存修改。
+- [ ] Router Codex 最小文字测试达到实际请求上限时提示连接成功并保留 response.incomplete；真实错误、截断和取消继续失败，Claude/Gemini 原测试正常。
+
+以上为待执行的人工验收项目，不代表本地单测或真实环境已通过。

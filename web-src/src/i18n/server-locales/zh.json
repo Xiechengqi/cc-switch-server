@@ -413,6 +413,21 @@
       "title": "放弃未保存的更改？"
     }
   },
+  "buddyModels": {
+    "auto": "自动选择",
+    "choose": "选择上游模型",
+    "search": "搜索模型名称或 ID",
+    "refresh": "刷新模型目录",
+    "autoHint": "auto 会根据当前账号目录和请求能力选择模型，也可手动输入模型 ID。",
+    "selectAccount": "请先选择 OAuth 账号以获取模型列表。",
+    "loading": "正在获取账号模型…",
+    "failed": "模型目录获取失败：{{message}}。已保留当前值，可点击刷新重试。",
+    "stale": "缓存目录获取于 {{time}}，当前实时可用性未确认。",
+    "updated": "账号目录更新于 {{time}}。",
+    "empty": "当前账号没有可用模型，auto 同样需要账号中有可用模型。",
+    "missing": "当前模型不在该账号的最新目录中。已保留原值，请在使用前选择可用模型。",
+    "noMatch": "没有匹配的模型。"
+  },
   "providerBundle": {
     "authAdvanced": "高级兼容设置（通常无需修改）",
     "authRecommended": "使用协议推荐配置",

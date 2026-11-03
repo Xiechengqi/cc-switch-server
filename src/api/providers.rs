@@ -4040,44 +4040,10 @@ pub(super) async fn fetch_codebuddy_provider_models(
                     .await
                     .map_err(map_managed_account_refresh_error)?;
             }
-            Err(error) => return Err(codebuddy_runtime_api_error(error)),
+            Err(error) => return Err(codebuddy_runtime_api_error(error, provider_type)),
         }
     };
-    let models = runtime
-        .catalog
-        .enabled_models
-        .iter()
-        .map(|id| {
-            let capability = runtime.catalog.capabilities.get(id);
-            FetchedProviderModel {
-                id: id.clone(),
-                upstream_model: id.clone(),
-                display_name: capability.and_then(|capability| capability.display_name.clone()),
-                raw: capability
-                    .map(|capability| {
-                        json!({
-                            "id": capability.id,
-                            "source": format!("{}_live_model_catalog", if provider_type == ProviderType::WorkBuddyOAuth { "workbuddy" } else { "codebuddy" }),
-                            "stale": runtime.catalog.stale,
-                            "capabilities": {
-                                "stream": true,
-                                "tools": capability.supports_tools,
-                                "images": false,
-                                "reasoning": capability.supports_reasoning,
-                                "reasoningEfforts": capability.reasoning_efforts,
-                                "contextWindow": capability.context_window,
-                                "maxInputTokens": capability.max_input_tokens,
-                                "contextWindowLengths": capability.context_window_lengths,
-                                "onlyReasoning": capability.only_reasoning,
-                                "canDisableThinking": capability.can_disable_thinking,
-                                "maxOutputTokens": capability.max_output_tokens,
-                            }
-                        })
-                    })
-                    .unwrap_or(Value::Null),
-            }
-        })
-        .collect();
+    let models = buddy_catalog_models(provider_type, &runtime.catalog);
     Ok(ProviderModelsFetchResult {
         url: format!(
             "{}{}",
@@ -4098,24 +4064,71 @@ pub(super) async fn fetch_codebuddy_provider_models(
     })
 }
 
-fn codebuddy_runtime_api_error(error: crate::state::CodeBuddyRuntimeError) -> ApiError {
+pub(in crate::api) fn buddy_catalog_models(
+    provider_type: ProviderType,
+    catalog: &crate::proxy::codebuddy_runtime::CodeBuddyModelCatalog,
+) -> Vec<FetchedProviderModel> {
+    catalog.enabled_models
+        .iter()
+        .map(|id| {
+            let capability = catalog.capabilities.get(id);
+            FetchedProviderModel {
+                id: id.clone(),
+                upstream_model: id.clone(),
+                display_name: capability.and_then(|capability| capability.display_name.clone()),
+                raw: capability
+                    .map(|capability| {
+                        json!({
+                            "id": capability.id,
+                            "source": format!("{}_live_model_catalog", if provider_type == ProviderType::WorkBuddyOAuth { "workbuddy" } else { "codebuddy" }),
+                            "stale": catalog.stale,
+                            "capabilities": {
+                                "stream": true,
+                                "tools": capability.supports_tools,
+                                "images": false,
+                                "reasoning": capability.supports_reasoning,
+                                "reasoningEfforts": capability.reasoning_efforts,
+                                "contextWindow": capability.context_window,
+                                "maxInputTokens": capability.max_input_tokens,
+                                "contextWindowLengths": capability.context_window_lengths,
+                                "onlyReasoning": capability.only_reasoning,
+                                "canDisableThinking": capability.can_disable_thinking,
+                                "maxOutputTokens": capability.max_output_tokens,
+                            }
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+            }
+        })
+        .collect()
+}
+
+pub(in crate::api) fn codebuddy_runtime_api_error(
+    error: crate::state::CodeBuddyRuntimeError,
+    provider_type: ProviderType,
+) -> ApiError {
+    let product = crate::domain::codebuddy::buddy_product_label(provider_type);
     match error {
         crate::state::CodeBuddyRuntimeError::NotFound => {
-            ApiError::not_found("CodeBuddy managed Account not found")
+            ApiError::not_found(format!("{product} managed Account not found"))
         }
-        crate::state::CodeBuddyRuntimeError::IdentityChanged => ApiError::conflict(
-            "CodeBuddy Provider or Account identity changed during model discovery",
-        ),
+        crate::state::CodeBuddyRuntimeError::IdentityChanged => ApiError::conflict(format!(
+            "{product} Provider or Account identity changed during model discovery"
+        )),
         crate::state::CodeBuddyRuntimeError::CredentialPersistenceDegraded => {
             ApiError::service_unavailable_code(
                 "codebuddy_credential_persistence_degraded",
-                "CodeBuddy credentials are waiting for durable persistence",
+                format!("{product} credentials are waiting for durable persistence"),
             )
         }
-        crate::state::CodeBuddyRuntimeError::MemoryCapacity => ApiError::service_unavailable_code(
-            "cc_switch_request_memory_exhausted",
-            "CodeBuddy local model discovery capacity is exhausted",
-        ),
+        crate::state::CodeBuddyRuntimeError::MemoryCapacity => {
+            let message = if provider_type == ProviderType::WorkBuddyOAuth {
+                "WorkBuddy local model discovery capacity is exhausted"
+            } else {
+                "CodeBuddy local model discovery capacity is exhausted"
+            };
+            ApiError::service_unavailable_code("cc_switch_request_memory_exhausted", message)
+        }
         crate::state::CodeBuddyRuntimeError::InvalidAccount(message) => {
             ApiError::bad_request(message)
         }
@@ -4134,7 +4147,7 @@ fn codebuddy_runtime_api_error(error: crate::state::CodeBuddyRuntimeError) -> Ap
                 } else {
                     status
                 },
-                "CodeBuddy live model discovery failed for the bound Account",
+                format!("{product} live model discovery failed for the bound Account"),
             )
         }
     }

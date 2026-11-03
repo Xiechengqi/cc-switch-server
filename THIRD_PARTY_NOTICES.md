@@ -37,6 +37,10 @@ SOFTWARE.
 
 Provider and product icons bundled in the Web application include assets from
 `@lobehub/icons-static-svg`, Copyright LobeHub, used under the MIT License.
+CodeBuddy and WorkBuddy SVGs were sourced from the fixed magpie revision recorded
+in `SOURCE_PROVENANCE.json`; CodeBuddy is attributed there to LobeHub 1.95.1.
+The exact WorkBuddy package version is not established. WorkBuddy has an added
+viewBox; neither asset requires a runtime fetch from the reference repository.
 Brand names and logos remain trademarks of their respective owners.
 
 Rust and JavaScript dependencies retain their own licenses. `Cargo.lock`, the

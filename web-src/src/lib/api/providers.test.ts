@@ -53,6 +53,19 @@ beforeEach(() => {
 });
 
 describe("providersApi coding-plan quota", () => {
+  it("discovers unsaved Buddy models through an abortable no-store tunnel command and rejects identity drift", async () => {
+    const identity = { providerType: "workbuddy_oauth" as const, accountId: "account-a", authIdentityGeneration: 3 };
+    const signal = new AbortController().signal;
+    const catalog = { ...identity, models: [], source: "workbuddy_live_model_catalog", stale: false, fetchedAtMs: 1 };
+    runtimeMocks.invokeCommand.mockResolvedValueOnce(catalog);
+    await expect(providersApi.fetchBuddyAccountModels(identity, true, signal)).resolves.toBe(catalog);
+    expect(runtimeMocks.invokeCommand).toHaveBeenLastCalledWith("fetch_buddy_account_models",
+      { ...identity, forceRefresh: true }, { cache: "no-store", signal });
+    for (const change of [{ accountId: "account-b" }, { providerType: "codebuddy_oauth" }, { authIdentityGeneration: 4 }]) {
+      runtimeMocks.invokeCommand.mockResolvedValueOnce({ ...catalog, ...change });
+      await expect(providersApi.fetchBuddyAccountModels(identity)).rejects.toThrow("identity changed");
+    }
+  });
   it("validates an unsaved Bundle through the authenticated no-store tunnel command", async () => {
     const bundle = { id: "custom" } as Parameters<typeof providersApi.upsertBundle>[0];
     await providersApi.validateBundleDraft(bundle, true);

@@ -61,6 +61,49 @@ const CN_REVIEWED_MODELS: &[&str] = &[
 pub struct CodeBuddyRuntimeScope(String);
 
 impl CodeBuddyRuntimeScope {
+    /// Management previews have no Provider binding. Keep them in an explicit
+    /// namespace rather than inventing a Provider ID or weakening runtime scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn account_preview(
+        provider_type: ProviderType,
+        account_id: &str,
+        site: CodeBuddySite,
+        domain: &str,
+        auth_identity_generation: u64,
+        token_refresh_generation: u64,
+        account_incarnation: u64,
+        request_identity_fingerprint: &str,
+    ) -> Result<Self, String> {
+        if !provider_type.is_buddy_oauth()
+            || account_id.trim().is_empty()
+            || request_identity_fingerprint.trim().is_empty()
+        {
+            return Err("Buddy account catalog scope has an invalid identity".into());
+        }
+        let domain = site
+            .canonical_token_domain(domain)
+            .ok_or_else(|| "Buddy account catalog domain is outside its site".to_string())?;
+        let mut digest = Sha256::new();
+        digest.update(b"cc-switch-server:buddy-account-catalog:v1\0");
+        for component in [
+            provider_type.as_str(),
+            account_id,
+            site.as_str(),
+            &domain,
+            &auth_identity_generation.to_string(),
+            &token_refresh_generation.to_string(),
+            &account_incarnation.to_string(),
+            request_identity_fingerprint,
+        ] {
+            digest.update((component.len() as u64).to_be_bytes());
+            digest.update(component.as_bytes());
+        }
+        Ok(Self(format!(
+            "buddy-account-catalog-v1:{:x}",
+            digest.finalize()
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn derive(
         app: &str,
@@ -158,6 +201,10 @@ impl PartialEq for CodeBuddyModelCatalog {
 }
 
 impl CodeBuddyModelCatalog {
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+    }
+
     pub fn exact_config(&self, model_id: &str) -> Option<&Value> {
         self.raw_configs.get(model_id.trim())
     }
@@ -1195,6 +1242,119 @@ mod tests {
             .enabled_models,
             ["default"]
         );
+    }
+
+    #[test]
+    fn buddy_preview_scopes_are_product_site_generation_and_incarnation_isolated() {
+        let preview = |product, id, site, domain, auth, refresh, incarnation, fingerprint| {
+            CodeBuddyRuntimeScope::account_preview(
+                product,
+                id,
+                site,
+                domain,
+                auth,
+                refresh,
+                incarnation,
+                fingerprint,
+            )
+            .unwrap()
+        };
+        let original = preview(
+            ProviderType::CodeBuddyOAuth,
+            "account-a",
+            CodeBuddySite::Intl,
+            "www.codebuddy.ai",
+            7,
+            0,
+            11,
+            "request-a",
+        );
+        assert_ne!(original, scope(CodeBuddySite::Intl, "www.codebuddy.ai", 0));
+        for changed in [
+            preview(
+                ProviderType::WorkBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                7,
+                0,
+                11,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-b",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                7,
+                0,
+                11,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Cn,
+                "www.codebuddy.cn",
+                7,
+                0,
+                11,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                8,
+                0,
+                11,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                7,
+                1,
+                11,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                7,
+                0,
+                12,
+                "request-a",
+            ),
+            preview(
+                ProviderType::CodeBuddyOAuth,
+                "account-a",
+                CodeBuddySite::Intl,
+                "www.codebuddy.ai",
+                7,
+                0,
+                11,
+                "request-b",
+            ),
+        ] {
+            assert_ne!(original, changed);
+        }
+        assert!(CodeBuddyRuntimeScope::account_preview(
+            ProviderType::CodeBuddyOAuth,
+            "a",
+            CodeBuddySite::Cn,
+            "www.codebuddy.ai",
+            1,
+            0,
+            1,
+            "fingerprint"
+        )
+        .is_err());
     }
 
     #[test]
