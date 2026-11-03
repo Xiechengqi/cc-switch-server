@@ -318,6 +318,8 @@ Server-owned capability independently implemented from official Qoder CLI oracle
 
 ### `workbuddy_oauth` (WorkBuddy OAuth)
 
+- Driver revision 3 accepts image input only when the exact reviewed CLI model advertises supportsImages=true; missing evidence is false. auto intersects image/tool/reasoning needs; fixed models reject incompatible images. Native structure validation and bounded canonical image validation preserve data/HTTPS URLs and detail without Server downloads. Public/management discovery and the model selector show the same image capability. Image generation, unreviewed models and independent real-image acceptance stay closed/live_pending; existing request memory, binding and strict terminal rules remain. See docs/provider/workbuddy-oauth.md.
+
 - Bundle management preference buddyLoginSite persists cn/intl for new login/import with revision checks and atomic Surface writes; omitted fields preserve existing values. Legacy defaults derive from the exact bound Account's safe site without dirtying the draft. Login/import lock their start site and exclude each other; actual Account site and runtime identity stay unchanged.
 - Management discovery: authenticated `fetch_buddy_account_models` supports unsaved forms and account switches with exact product/identity fencing and a separate preview scope under existing cache bounds. Fixed-model search preserves auto/current values and explicit empty/error/stale states. Local SVG logos use stable Family display fallbacks; no model allowlist, inference protocol or live acceptance gate is expanded.
 
@@ -330,6 +332,8 @@ Independent WorkBuddy Family, three App Profiles and special.workbuddy_oauth Dri
 - Buddy health probes retain their deliberate one-token output cap. A Responses max_output_tokens terminal counts as probe completion only when the sent request has a positive cap and structured terminal type/status/reason plus usage prove it was reached. Other incomplete/error/truncated streams fail; inference retains response.incomplete without extra budget or retries.
 
 ### `codebuddy_oauth` (CodeBuddy OAuth)
+
+- Driver revision 3 accepts image input only when the exact reviewed CLI model advertises supportsImages=true; missing evidence is false. auto intersects image/tool/reasoning needs; fixed models reject incompatible images. Native structure validation and bounded canonical image validation preserve data/HTTPS URLs and detail without Server downloads. Public/management discovery and the model selector show the same image capability. Image generation, unreviewed models and independent real-image acceptance stay closed/live_pending; existing request memory, binding and strict terminal rules remain. See docs/provider/workbuddy-oauth.md.
 
 - Bundle management preference buddyLoginSite persists cn/intl for new login/import with revision checks and atomic Surface writes; omitted fields preserve existing values. Legacy defaults derive from the exact bound Account's safe site without dirtying the draft. Login/import lock their start site and exclude each other; actual Account site and runtime identity stay unchanged.
 - Management discovery: authenticated `fetch_buddy_account_models` supports unsaved forms and account switches with exact product/identity fencing and a separate preview scope under existing cache bounds. Fixed-model search preserves auto/current values and explicit empty/error/stale states. Local SVG logos use stable Family display fallbacks; no model allowlist, inference protocol or live acceptance gate is expanded.

@@ -1467,7 +1467,15 @@ fn integer_value(value: &Value) -> Option<i64> {
 }
 
 fn sanitize_error_message(value: &str) -> String {
-    crate::logging::redact_sensitive_text(value.trim())
+    static IMAGE_REFERENCES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let references = IMAGE_REFERENCES.get_or_init(|| {
+        regex::Regex::new(r#"(?i)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+|https?://[^\s<>"']+"#)
+            .expect("constant image-reference pattern")
+    });
+    // Vendor error messages can echo a submitted image or signed URL. Redact
+    // before truncating so neither responses nor persisted failure logs carry it.
+    let sanitized = references.replace_all(value.trim(), "[image reference redacted]");
+    crate::logging::redact_sensitive_text(&sanitized)
         .chars()
         .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
         .take(MAX_ERROR_MESSAGE_BYTES)
@@ -1482,6 +1490,21 @@ mod tests {
 
     fn chunk(value: Value) -> Bytes {
         Bytes::from(format!("data: {value}\n\n"))
+    }
+
+    #[test]
+    fn buddy_upstream_image_errors_redact_data_and_signed_urls() {
+        let message = "unsupported image data:image/png;base64,iVBORw0KGgo= at https://images.example.test/private-invoice.png?signature=private-signature";
+        let body = json!({"code":11102,"msg":message});
+        for error in [
+            CodeBuddyUpstreamError::from_status_body(400, body.to_string().as_bytes()),
+            CodeBuddyUpstreamError::from_event(&body).unwrap(),
+        ] {
+            assert!(error.message.contains("unsupported image"));
+            assert!(!error.message.contains("iVBOR"));
+            assert!(!error.message.contains("private"));
+            assert!(!error.message.contains("https://"));
+        }
     }
 
     #[test]

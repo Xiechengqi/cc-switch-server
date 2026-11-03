@@ -5,7 +5,7 @@ async fn buddy_account_catalog_invoke_requires_auth_and_supports_unsaved_forms_w
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let upstream = Router::new().route("/v3/config", get(|| async {
-        Json(json!({"models":[{"id":"hy3","name":"HY3","supportsToolCall":true,"prompt":"private-prompt"},
+        Json(json!({"models":[{"id":"hy3","name":"HY3","supportsImages":true,"supportsToolCall":true,"prompt":"private-prompt"},
             {"id":"fast-model","name":"Fast","supportsToolCall":true,"Uin":"private-identity"}]}))
     }));
     let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
@@ -90,6 +90,10 @@ async fn buddy_account_catalog_invoke_requires_auth_and_supports_unsaved_forms_w
                         }
                     );
                     assert_eq!(body["models"][0]["raw"]["capabilities"]["tools"], true);
+                    assert_eq!(
+                        body["models"][0]["raw"]["capabilities"]["images"],
+                        site == CodeBuddySite::Cn
+                    );
                 }
             }
             assert!(state.providers.read().await.providers.is_empty());
@@ -169,7 +173,7 @@ async fn codebuddy_workbuddy_signed_models_use_live_catalog_and_real_gemini_limi
                     let origin = format!("http://{}", listener.local_addr().unwrap());
                     let upstream = Router::new().route("/v3/config", get(move || async move {
                         Json(json!({"code":0,"data":{"models": if empty { vec![] } else { vec![json!({
-                            "id":model,"supportsToolCall":true,"supportsReasoning":true,
+                            "id":model,"supportsToolCall":true,"supportsReasoning":true,"supportsImages":app_kind != AppKind::Codex,
                             "reasoning":{"supportedEfforts":["low","high"]},
                             "contextWindow":{"defaultLength":64000,"supportedLengths":[64000,128000]},
                             "maxInputTokens":128000,"maxOutputTokens":8192
@@ -220,6 +224,14 @@ async fn codebuddy_workbuddy_signed_models_use_live_catalog_and_real_gemini_limi
                     if !empty {
                         assert_eq!(body["data"][0]["contextWindow"], 64000);
                         assert_eq!(body["data"][0]["maxOutputTokens"], 8192);
+                        assert_eq!(
+                            body["data"][0]["inputModalities"],
+                            if app_kind == AppKind::Codex {
+                                json!(["text"])
+                            } else {
+                                json!(["text", "image"])
+                            }
+                        );
                     }
                     if app_kind == AppKind::Gemini {
                         let response = router

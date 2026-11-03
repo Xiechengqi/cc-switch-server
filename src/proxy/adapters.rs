@@ -1157,6 +1157,16 @@ fn transform_body_for_upstream(
             "request body must be valid json for transform: {error}"
         ))
     })?;
+    if stored.provider_type.is_buddy_oauth() {
+        super::codebuddy_runtime::validate_buddy_source_images(stored.app, &input).map_err(
+            |error| {
+                ProxyError::bad_request(error.replace(
+                    "CodeBuddy",
+                    crate::domain::codebuddy::buddy_product_label(stored.provider_type),
+                ))
+            },
+        )?;
+    }
     if stored.provider_type == ProviderType::QoderCosy
         && stored.app == AppKind::Codex
         && route == Some(ProxyRoute::CodexResponses)

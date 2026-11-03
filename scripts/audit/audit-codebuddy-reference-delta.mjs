@@ -928,7 +928,7 @@ const registry = JSON.parse(
 const truth = contract.registryTruth;
 const driver = registry.drivers.find((item) => item.driverId === truth.driverId);
 assert(driver, "CodeBuddy driver is absent from the registry");
-assert(driver.driverContractRevision === 2, "CodeBuddy driver revision must be 2");
+assert(driver.driverContractRevision === 3, "CodeBuddy image-input driver revision must be 3");
 assert(
   JSON.stringify(driver.operations) === JSON.stringify(truth.operations),
   "CodeBuddy operation support drifted",
@@ -981,7 +981,7 @@ for (const [relativePath, anchors] of [
   [
     "scripts/smoke/codebuddy-real-receipt.mjs",
     [
-      "const HARNESS_REVISION = 2",
+      "const HARNESS_REVISION = 3",
       "codebuddy_live_model_catalog",
       "sameAccountFirst401",
       "const expectedLive = fixtureMode ? \"live_pending\" : \"live_verified\"",
@@ -1061,6 +1061,59 @@ assert(r4.timingInventory?.newMilestoneInstrumentation === false &&
   r4.timingInventory.successfulSocketWriteMeasurement === false && r4.timingInventory.performanceClaim === null &&
   r4.retainedBoundaries?.length === 6 && r4.limitations?.length === 4,
   "CodeBuddy R4 measurement or retained-boundary scope changed");
+
+// This extension advances the live Driver policy without rewriting any frozen
+// observation, historical rejection, R4 record or real-acceptance result above.
+const imageInput = contract.imageInputExtension;
+assert(imageInput?.id === "BUDDY-IMAGE-01" && imageInput.driverContractRevision === 3 &&
+  imageInput.harnessRevision === 3 && imageInput.evidenceState === "fixture_verified" &&
+  imageInput.liveState === "live_pending", "Buddy image-input evidence boundary changed");
+assert(imageInput.scope?.clientIdentity === "CLI/2.142.0" &&
+  imageInput.scope.modelPolicy === "existing_reviewed_active_cli_catalog" &&
+  imageInput.scope.capabilityField === "supportsImages" && imageInput.scope.missingCapability === false &&
+  imageInput.scope.inputOnly === true && imageInput.scope.imageGeneration === false &&
+  imageInput.scope.serverDownloads === false &&
+  JSON.stringify(imageInput.scope.products) === JSON.stringify(["codebuddy_oauth", "workbuddy_oauth"]) &&
+  JSON.stringify(imageInput.scope.sites) === JSON.stringify(["cn", "intl"]),
+  "Buddy images must remain exact-catalog input under the reviewed identity");
+assert(imageInput.limits?.images === 16 && imageInput.limits.inlineImageDecodedBytes === 20971520 &&
+  imageInput.limits.inlineTotalDecodedBytes === 33554432 && imageInput.limits.httpsUrlBytes === 16384 &&
+  imageInput.limits.existingRequestBodyAndMemoryLimitsApply === true,
+  "Buddy image-input limits changed");
+for (const id of ["special.codebuddy_oauth", "special.workbuddy_oauth"]) {
+  const current = registry.drivers.find((item) => item.driverId === id);
+  assert(current?.driverContractRevision === 3 && current.capabilities.images === true,
+    `${id} must declare catalog-gated image-input support`);
+}
+const imageSource = imageInput.source;
+assert(imageSource?.sourceId === "cli2api-head" && commitPattern.test(imageSource.snapshotCommit) &&
+  commitPattern.test(imageSource.snapshotTree) && imageSource.readMode === "read_only_committed_git_objects" &&
+  imageSource.files?.length === 2, "Buddy image-input source snapshot missing");
+for (const file of imageSource.files) {
+  safeRelative(file.path, "Buddy image source path");
+  assert(digestPattern.test(file.sha256) && file.reviewedAnchors?.length > 0,
+    "Buddy image source digest/anchors missing");
+  if (checkSources) {
+    const root = sourceRootById.get(imageSource.sourceId);
+    const content = gitFile(root, imageSource.snapshotCommit, file.path, null);
+    assert(gitTree(root, imageSource.snapshotCommit) === imageSource.snapshotTree &&
+      sha256(content) === file.sha256 && file.reviewedAnchors.every((anchor) => content.toString("utf8").includes(anchor)),
+      `Buddy image-input source evidence changed: ${file.path}`);
+  }
+}
+assert(imageInput.localEvidence?.length === 3 && imageInput.acceptanceBoundary?.includes("No product, site or exact model"),
+  "Buddy image-input validation/acceptance evidence missing");
+for (const evidence of imageInput.localEvidence) {
+  safeRelative(evidence.path, "Buddy image local path");
+  const local = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+  assert(evidence.anchors?.length > 0 && evidence.anchors.every((anchor) => local.includes(anchor)),
+    `Buddy image local evidence missing: ${evidence.path}`);
+}
+const workbuddyImage = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract/workbuddy-protocol.json"), "utf8")).imageInputExtension;
+assert(workbuddyImage?.referenceContract === "assets/contract/codebuddy-reference-delta.json#imageInputExtension" &&
+  workbuddyImage.driverContractRevision === 3 && workbuddyImage.harnessRevision === 3 &&
+  workbuddyImage.evidenceState === "fixture_verified" && workbuddyImage.liveState === "live_pending",
+  "WorkBuddy image-input contract must retain independent live acceptance");
 
 console.log(
   `codebuddy reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} dirty-worktree-excluded snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, ${enhancements.size + contract.incrementalEnhancementExtensions.length} enhancements, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}${

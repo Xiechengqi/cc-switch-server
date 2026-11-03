@@ -40,7 +40,7 @@ const contract = JSON.parse(
     "utf8",
   ),
 );
-const HARNESS_REVISION = 2;
+const HARNESS_REVISION = 3;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 // Match src/proxy/codebuddy_runtime.rs::CODEBUDDY_MODEL_CATALOG_TTL_MS.
 const CATALOG_MAX_AGE_MS = 8 * 60 * 1_000;
@@ -670,7 +670,7 @@ function expectedDecisions() {
     authoritativeEmptyCatalog: "empty_success",
     catalogStale: "same_identity_only",
     enterpriseRuntime: "disabled",
-    multimodalRuntime: "disabled",
+    multimodalRuntime: "image_input_catalog_gated_generation_disabled",
     deepseekV41Runtime: "disabled_without_separate_evidence",
     receiptAutoEnablesCapabilities: "false",
   };
@@ -737,7 +737,7 @@ function validateReceipt(receipt, context) {
     receipt.site !== site ||
     receipt.targetCommit !== context.targetCommit ||
     receipt.harnessRevision !== HARNESS_REVISION ||
-    receipt.harnessRevision !== contract.realAcceptance.harnessRevision ||
+    receipt.harnessRevision !== contract.imageInputExtension.harnessRevision ||
     receipt.model !== model
   ) {
     fail("CodeBuddy receipt identity does not match the selected site and target");

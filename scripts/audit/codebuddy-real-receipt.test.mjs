@@ -185,7 +185,7 @@ function expectedDecisions() {
     authoritativeEmptyCatalog: "empty_success",
     catalogStale: "same_identity_only",
     enterpriseRuntime: "disabled",
-    multimodalRuntime: "disabled",
+    multimodalRuntime: "image_input_catalog_gated_generation_disabled",
     deepseekV41Runtime: "disabled_without_separate_evidence",
     receiptAutoEnablesCapabilities: "false",
   };
@@ -206,7 +206,7 @@ function receipt(value, overrides = {}) {
   const scopeDigest = digest(`cc-switch-server:${product}-real-scope:v2`, {
     site: value.site,
     targetCommit,
-    harnessRevision: 2,
+    harnessRevision: 3,
     model: value.model,
     generations: scopedGenerations,
     catalogs: value.catalogs,
@@ -230,7 +230,7 @@ function receipt(value, overrides = {}) {
     verificationState: "contract_verified",
     liveState: "live_pending",
     targetCommit,
-    harnessRevision: 2,
+    harnessRevision: 3,
     recordedAt: new Date().toISOString(),
     scopeDigest,
     model: value.model,
@@ -902,6 +902,23 @@ test(`${productLabel} fixture mode rejects a receipt that claims live verificati
       assert.doesNotMatch(result.stderr, /live_verified/);
     },
   );
+});
+
+test(`${productLabel} image policy rejects previous harness and obsolete disabled decisions`, async (t) => {
+  for (const site of ["cn", "intl"]) {
+    for (const patch of [
+      { harnessRevision: 2 },
+      { decisions: { ...expectedDecisions(), multimodalRuntime: "disabled" } },
+    ]) {
+      await t.test(`${site}/${patch.harnessRevision ? "harness" : "policy"}`, async () => {
+        await withHarness(site, { receipt: patch }, async ({ result }) => {
+          assert.equal(result.code, 1);
+          assert.equal(result.stdout, "");
+          assert.match(result.stderr, /details redacted/);
+        });
+      });
+    }
+  }
 });
 
 test(product === "codebuddy" ? "CodeBuddy receipt scope binds all six body hashes" : "WorkBuddy receipt scope binds all six body hashes", async () => {

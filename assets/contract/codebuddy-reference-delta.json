@@ -2196,5 +2196,86 @@
         "fixtures_do_not_prove_vendor_new_client_tuple_acceptance_or_deployment_capacity"
       ]
     }
-  ]
+  ],
+  "imageInputExtension": {
+    "id": "BUDDY-IMAGE-01",
+    "capturedAt": "2026-11-03T00:00:00Z",
+    "driverContractRevision": 3,
+    "harnessRevision": 3,
+    "evidenceState": "fixture_verified",
+    "liveState": "live_pending",
+    "scope": {
+      "products": [
+        "codebuddy_oauth",
+        "workbuddy_oauth"
+      ],
+      "sites": [
+        "cn",
+        "intl"
+      ],
+      "clientIdentity": "CLI/2.142.0",
+      "modelPolicy": "existing_reviewed_active_cli_catalog",
+      "capabilityField": "supportsImages",
+      "missingCapability": false,
+      "inputOnly": true,
+      "imageGeneration": false,
+      "serverDownloads": false
+    },
+    "limits": {
+      "images": 16,
+      "inlineImageDecodedBytes": 20971520,
+      "inlineTotalDecodedBytes": 33554432,
+      "httpsUrlBytes": 16384,
+      "existingRequestBodyAndMemoryLimitsApply": true
+    },
+    "source": {
+      "sourceId": "cli2api-head",
+      "snapshotCommit": "fb2eb35b779770b2b3454bbdbe95e0b9ac6cfb70",
+      "snapshotTree": "37c6d3e6fe263d639358939d397cbd5595243f39",
+      "readMode": "read_only_committed_git_objects",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/catalog.go",
+          "sha256": "8ddfa7fd704ed0a53eac4e647804cd845b7b9852366cf78606a5fe4caea10e91",
+          "reviewedAnchors": [
+            "SupportsImages",
+            "Images:             model.SupportsImages"
+          ]
+        },
+        {
+          "path": "internal/providers/workbuddy/client_test.go",
+          "sha256": "c962863c69dd16d26585e712eda15bf0ee3efb2c1ae00419d9c4c0d0bb724383",
+          "reviewedAnchors": [
+            "TestPrepareBodyKeepsImageParts",
+            "data:image/png;base64,BBBB"
+          ]
+        }
+      ]
+    },
+    "localEvidence": [
+      {
+        "path": "src/proxy/codebuddy_runtime/image_tests.rs",
+        "anchors": [
+          "buddy_image_capabilities_are_strict_and_scoped_to_reviewed_cli_models",
+          "buddy_auto_image_selection_intersects_image_tool_and_reasoning_capabilities",
+          "buddy_payload_preserves_image_bytes_urls_details_and_complete_tool_rounds"
+        ]
+      },
+      {
+        "path": "src/proxy/codebuddy_runtime/images.rs",
+        "anchors": [
+          "buddy_images_enforce_decoded_limits_and_count_at_the_boundary",
+          "buddy_images_do_not_interpret_tool_schemas_or_json_text_as_media"
+        ]
+      },
+      {
+        "path": "src/proxy/forwarder/codebuddy_image_tests.rs",
+        "anchors": [
+          "buddy_images_reach_four_surfaces_both_sites_and_products_without_changing_data",
+          "buddy_fixed_text_models_reject_images_without_silent_substitution_or_refresh"
+        ]
+      }
+    ],
+    "acceptanceBoundary": "Catalog-gated image input is implemented and fixture-tested independently of image generation and unreviewed multimodal models. No product, site or exact model has a live image receipt from this change; existing text receipts do not establish image acceptance."
+  }
 }

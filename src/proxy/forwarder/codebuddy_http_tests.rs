@@ -3287,3 +3287,5 @@ fn codebuddy_core03_headers_and_committed_cancel_or_truncation_keep_last_owner_a
         }
     });
 }
+
+include!("codebuddy_image_tests.rs");

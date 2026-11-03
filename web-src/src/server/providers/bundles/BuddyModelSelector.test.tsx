@@ -44,6 +44,26 @@ beforeEach(() => {
 });
 
 describe("Buddy model selection", () => {
+  it.each(["codebuddy_oauth", "workbuddy_oauth"])("shows catalog image capabilities for %s without changing the model", async (product) => {
+    mocks.fetch.mockResolvedValue({ ...fixture("a"), models: [
+      { id: "vision", upstreamModel: "vision", raw: { capabilities: { images: true } } },
+      { id: "text", upstreamModel: "text", raw: { capabilities: { images: false } } },
+      { id: "legacy", upstreamModel: "legacy" },
+    ] });
+    const view = await mount();
+    try {
+      await view.render({ product });
+      await act(async () => view.container.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("buddyModels.choose")}"]`)!.click());
+      const options = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+      for (const [id, label] of [["vision", "imageInput"], ["text", "textInput"], ["legacy", "unknownImageInput"]]) {
+        const option = options.find((option) => option.querySelector(".font-mono")?.textContent === id)!;
+        expect(option.textContent).toContain(i18n.t(`buddyModels.${label}`));
+      }
+      expect(view.container.querySelector<HTMLInputElement>("input")!.value).toBe("auto");
+      expect(view.container.textContent).toContain(i18n.t("buddyModels.autoHint"));
+    } finally { await view.close(); }
+  });
+
   it("loads automatically without changing auto and saves a real ID only when selected", async () => {
     const view = await mount();
     try {

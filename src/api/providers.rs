@@ -1843,7 +1843,7 @@ async fn test_codebuddy_provider_inner(
             let message = redact_provider_test_error(&error.message);
             let outcome = if message.contains("is not enabled in the bound account's live catalog")
                 || message.contains(
-                    "live catalog has no enabled reviewed text model compatible with this request",
+                    "live catalog has no enabled reviewed model compatible with this request",
                 ) {
                 ProviderOperationOutcome::InvalidConfig
             } else {
@@ -4085,7 +4085,7 @@ pub(in crate::api) fn buddy_catalog_models(
                             "capabilities": {
                                 "stream": true,
                                 "tools": capability.supports_tools,
-                                "images": false,
+                                "images": capability.supports_images,
                                 "reasoning": capability.supports_reasoning,
                                 "reasoningEfforts": capability.reasoning_efforts,
                                 "contextWindow": capability.context_window,

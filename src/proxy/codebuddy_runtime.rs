@@ -9,7 +9,10 @@ use crate::domain::codebuddy::{buddy_product_policy, CodeBuddyAccountProfile, Co
 use crate::domain::providers::model::ProviderType;
 use crate::infra::resident_memory::ResidentMemoryBudget;
 
+mod images;
 mod resident;
+
+pub(crate) use images::validate_buddy_source_images;
 
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
@@ -168,6 +171,7 @@ pub struct CodeBuddyModelCapability {
     pub max_input_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
+    pub supports_images: bool,
     pub supports_reasoning: bool,
     pub only_reasoning: bool,
     pub can_disable_thinking: bool,
@@ -492,6 +496,7 @@ pub fn parse_buddy_model_catalog(
             "id": capability.id,
             "name": capability.display_name,
             "supportsToolCall": capability.supports_tools,
+            "supportsImages": capability.supports_images,
             "supportsReasoning": capability.supports_reasoning,
             "reasoning": {"supportedEfforts": capability.reasoning_efforts},
             "maxInputTokens": capability.max_input_tokens,
@@ -631,6 +636,7 @@ fn codebuddy_model_capability(
         max_output_tokens: positive_u64(object.get("maxOutputTokens")),
         // Missing capability evidence cannot authorize a tool-bearing request.
         supports_tools: bool_field(object, "supportsToolCall")?.unwrap_or(false),
+        supports_images: bool_field(object, "supportsImages")?.unwrap_or(false),
         supports_reasoning,
         only_reasoning,
         can_disable_thinking,
@@ -689,18 +695,30 @@ pub fn resolve_codebuddy_model_id(
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty());
+        let has_images = images::has_image_input(request);
+        let has_reasoning = request
+            .get("reasoning")
+            .is_some_and(|value| !value.is_null())
+            || request.get("reasoning_effort").is_some_and(|value| {
+                !value.is_null()
+                    && !value
+                        .as_str()
+                        .is_some_and(|effort| effort.trim().is_empty())
+            });
         return std::iter::once(default_model)
             .chain(catalog.preferred_models.iter().map(String::as_str))
             .find(|id| {
                 catalog.enabled_models.iter().any(|enabled| enabled == id)
                     && catalog.capabilities.get(*id).is_some_and(|capability| {
                         (!has_tools || capability.supports_tools)
+                            && (!has_images || capability.supports_images)
+                            && (!has_reasoning || capability.supports_reasoning)
                             && codebuddy_reasoning_effort(request, id, capability).is_ok()
                     })
             })
             .map(str::to_string)
             .ok_or_else(|| {
-                "Buddy live catalog has no enabled reviewed text model compatible with this request"
+                "Buddy live catalog has no enabled reviewed model compatible with this request"
                     .to_string()
             });
     }
@@ -712,9 +730,12 @@ pub fn build_codebuddy_payload(
     model_id: &str,
     capability: &CodeBuddyModelCapability,
 ) -> Result<Value, String> {
-    if contains_image_content(canonical_chat_request) {
-        return Err("CodeBuddy text rail does not support image input".to_string());
+    if images::has_image_input(canonical_chat_request) && !capability.supports_images {
+        return Err(format!(
+            "CodeBuddy model {model_id} does not advertise image input support in the bound account's live catalog"
+        ));
     }
+    images::validate_image_input(canonical_chat_request)?;
     let mut request = canonical_chat_request
         .as_object()
         .cloned()
@@ -1140,19 +1161,6 @@ fn normalize_codebuddy_tools_and_choice(
     Ok(())
 }
 
-fn contains_image_content(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            matches!(
-                key.as_str(),
-                "image" | "image_url" | "input_image" | "inline_data" | "inlineData"
-            ) || contains_image_content(value)
-        }),
-        Value::Array(values) => values.iter().any(contains_image_content),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,6 +1174,7 @@ mod tests {
             max_input_tokens: Some(200_000),
             max_output_tokens: Some(24_000),
             supports_tools: true,
+            supports_images: false,
             supports_reasoning: true,
             only_reasoning: false,
             can_disable_thinking: false,
@@ -2192,4 +2201,6 @@ mod tests {
         assert_eq!(messages[1]["content"].as_str().unwrap().as_ptr(), pointer);
         assert_eq!(messages.len(), 3);
     }
+
+    include!("codebuddy_runtime/image_tests.rs");
 }

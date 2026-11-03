@@ -968,7 +968,7 @@
       "support": "native",
       "implemented": true,
       "feature": "accounts",
-      "notes": "Authenticated identity-fenced CodeBuddy/WorkBuddy live account model catalog for saved or unsaved Provider forms; no configuration writes."
+      "notes": "Authenticated identity-fenced CodeBuddy/WorkBuddy live account model catalog for saved or unsaved Provider forms, including per-model raw.capabilities.images from reviewed supportsImages; no configuration writes."
     },
     {
       "name": "fetch_models_for_config",

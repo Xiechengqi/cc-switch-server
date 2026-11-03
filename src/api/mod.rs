@@ -1513,7 +1513,11 @@ async fn proxy_models_for_selection(
                             .filter_map(|value| value.as_str().map(str::to_string))
                             .collect()
                     }),
-                    input_modalities: Some(vec!["text".to_string()]),
+                    input_modalities: Some(if capability["images"].as_bool() == Some(true) {
+                        vec!["text".to_string(), "image".to_string()]
+                    } else {
+                        vec!["text".to_string()]
+                    }),
                     context_window: capability["contextWindow"].as_u64(),
                     max_output_tokens: capability["maxOutputTokens"].as_u64(),
                     supports_tools: capability["tools"].as_bool(),

@@ -110,5 +110,12 @@
       "deepseekV41Runtime",
       "receiptAutoEnablesCapabilities"
     ]
+  },
+  "imageInputExtension": {
+    "referenceContract": "assets/contract/codebuddy-reference-delta.json#imageInputExtension",
+    "driverContractRevision": 3,
+    "harnessRevision": 3,
+    "evidenceState": "fixture_verified",
+    "liveState": "live_pending"
   }
 }

@@ -1,5 +1,19 @@
 # Protocol evidence policy
 
+## 2026-11-03 Buddy 图片输入按目录授权
+
+本轮只读核对 `cli2api@fb2eb35b779770b2b3454bbdbe95e0b9ac6cfb70` 已提交的 `internal/providers/workbuddy/catalog.go` 与 `client_test.go`。前者读取上游布尔 `supportsImages`，后者验证用户消息与工具结果的 `image_url` 保留；这只构成字段和桥接行为证据，不能证明本 Server 的任一产品／站点／账号／实际模型已接受图片。源对象摘要固定在 `codebuddy-reference-delta.json.imageInputExtension`，默认审计不读取外部工作区。
+
+此前 Server 在 canonical payload 一律拒绝图片，且未读取该能力字段。现有受审 CLI 模型白名单、2.142.0 身份、产品与站点绑定保持；Driver revision 3 按精确模型目录的图片能力决定是否放行，auto 同时匹配图片、工具和推理。支持原样图片输入，不新增图片生成、图片下载、账户调度或新模型权益。未知/缺失字段为不支持，畸形字段拒绝目录；固定模型不兼容时失败，不静默换模型。
+
+图片原生结构在转换前检查，避免 malformed 图片被共享 bridge 丢弃；Responses detail 与 Claude URL 图片得到完整保留。只检查内容块，工具 Schema/参数与 JSON 文本的同名字段不被当成图片。内嵌图片校验数量、base64、签名/MIME及逐张/总解码大小，复用既有上限与请求内存；远程 HTTPS URL 原样转发且不进入错误或用量正文。
+
+旧不可变 observation、R4 记录与真实验收结果全部保留。append-only 图片扩展声明当前 Driver/harness revision 3；receipt schema 2 的策略决策反映图片输入按目录授权、生成仍关闭。文本回执不证明图片接受性。本轮仅本地合成图片、回环及 jsdom 验证；未调用线上凭据或厂商服务，未部署，真实图片验收均为 live_pending。
+
+最终验证：按仓库标准 `RUST_MIN_STACK=67108864` 运行的 Rust 全量测试 4213 项通过、3 项既有忽略；`cargo check`、`cargo fmt --check`、包含 include! 源文件的 rustfmt、严格 Clippy 和可执行文件构建通过。`scripts/static-checks.sh` 全部通过，包含 Node 审计 2128 项、smoke 单测 13 项、Web 单测 352 项、类型检查、文档、Provider/Writer 与依赖边界审计。Web 生产构建、本地启动冒烟及外部已提交 Git 对象的只读证据核验通过。
+
+整体 review 补齐了 Responses 工具输出中畸形 input_image、Gemini 对象形式 parts 的转换前拒绝，以及上游错误回显图片／签名 URL 的脱敏；修正无兼容模型提示更新后连接探针的错误分类回归，并用生成器刷新 Registry/Writer 摘要。账号／站点／CLI 范围、固定模型、目录撤销、完整工具轮次、请求内存、取消与终态回归均通过，未发现遗留本地阻断项。离线 readiness 的 failures=0，decision=blocked、verificationState=blocked_inputs：该次 gate 指定 RUN_TESTS=0，且真实输入与部署验收未提供；独立通过的本地测试不冒充发布批准或厂商图片接受性。
+
 ## 2026-11-03 Buddy 认证中心入口补齐
 
 本轮仅使用本仓能力声明、账号 API、Web runtime contract 和合成夹具。后端已声明 CodeBuddy / WorkBuddy 的托管账号登录／导入能力，供应商编辑器也有对应组件，但认证中心仍手写入口清单而遗漏两类产品。现由类型化入口注册表统一元数据与 renderer，页面继续以服务端 capability 过滤；无账号也可进入登录。UI 矩阵审计对照 Rust 的托管账号 ownership，新增供应商不得静默遗漏；既有 Trae 入口缺口以 `known_gap` 和原因明确登记，保持本轮范围。

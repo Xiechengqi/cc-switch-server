@@ -68,7 +68,7 @@ export function UpstreamModelInput({ catalog, value, onValueChange, className, .
   const selected = value.trim();
   const needle = search.trim().toLowerCase();
   const options = [
-    { id: "auto", displayName: t("buddyModels.auto") },
+    { id: "auto", displayName: t("buddyModels.auto"), raw: undefined },
     ...models.filter((model) => model.id !== "auto"),
   ].filter((model) => `${model.id} ${model.displayName ?? ""}`.toLowerCase().includes(needle));
   const missing = catalog.data && !catalog.error && !catalog.data.stale && selected
@@ -103,6 +103,10 @@ export function UpstreamModelInput({ catalog, value, onValueChange, className, .
               onClick={() => { onValueChange(model.id); setOpen(false); setSearch(""); }}>
               <span className="block">{model.displayName || model.id}</span>
               <span className="block font-mono text-xs text-muted-foreground">{model.id}</span>
+              {model.id !== "auto" ? <span className="block text-xs text-muted-foreground">
+                {t(model.raw?.capabilities?.images === true ? "buddyModels.imageInput"
+                  : model.raw?.capabilities?.images === false ? "buddyModels.textInput" : "buddyModels.unknownImageInput")}
+              </span> : null}
             </button>)}
             {!options.length ? <p className="p-2 text-xs text-muted-foreground">{t("buddyModels.noMatch")}</p> : null}
           </div>

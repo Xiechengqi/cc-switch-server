@@ -4144,7 +4144,13 @@ fn response_content_part_to_chat_part(role: &str, part: &Value) -> Option<Value>
             .get("image_url")
             .or_else(|| part.get("url"))
             .and_then(Value::as_str)
-            .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
+            .map(|url| {
+                let mut image = json!({"url": url});
+                if let Some(detail) = part.get("detail") {
+                    image["detail"] = detail.clone();
+                }
+                json!({"type": "image_url", "image_url": image})
+            }),
         Some("input_file") => {
             let mut file = Map::new();
             for key in ["file_id", "file_data", "filename"] {
@@ -6416,6 +6422,9 @@ fn anthropic_tool_use_to_openai_response_with_tool_context(
 }
 
 fn anthropic_image_to_openai_chat(block: &Value) -> Value {
+    if block.pointer("/source/type").and_then(Value::as_str) == Some("url") {
+        return json!({"type": "image_url", "image_url": {"url": block.pointer("/source/url").cloned().unwrap_or(Value::Null)}});
+    }
     let media_type = block
         .pointer("/source/media_type")
         .and_then(Value::as_str)

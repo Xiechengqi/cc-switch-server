@@ -14,7 +14,8 @@ export interface BuddyAccountModels {
   providerType: BuddyProviderType;
   accountId: string;
   authIdentityGeneration: number;
-  models: Array<{ id: string; upstreamModel: string; displayName?: string }>;
+  models: Array<{ id: string; upstreamModel: string; displayName?: string;
+    raw?: { capabilities?: { images?: boolean } } }>;
   source: string;
   stale: boolean;
   fetchedAtMs: number;
