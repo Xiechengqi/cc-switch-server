@@ -409,8 +409,21 @@ export function formatCompactTier(
     tier.label?.trim() ||
     COMPACT_TIER_LABELS[tier.name] ||
     (t && TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
-  const utilization = `${Math.round(tier.utilization)}%`;
-  const countdown = countdownStr(tier.resetsAt, nowMs);
+  const buddyPackage = /^codebuddy_package_[1-9]\d*$/.test(tier.name);
+  const utilization = buddyPackage && tier.utilization > 0 && tier.utilization < 0.1
+    ? "<0.1%"
+    : `${buddyPackage ? Math.round(tier.utilization * 10) / 10 : Math.round(tier.utilization)}%`;
+  const deadline = (at: string | null | undefined, key: string, fallback: string) => {
+    if (!at || !Number.isFinite(Date.parse(at))) return "";
+    const time = countdownStr(at, nowMs) || (t ? t("subscription.expired") : "expired");
+    return t ? t(key, { time }) : `${fallback} ${time}`;
+  };
+  const countdown = buddyPackage
+    ? [
+        tier.resetsAt !== tier.expiresAt ? deadline(tier.resetsAt, "provider.buddyPackageCycleEnds", "cycle ends") : "",
+        deadline(tier.expiresAt, "provider.buddyPackageExpires", "expires"),
+      ].filter(Boolean).join(" · ")
+    : countdownStr(tier.resetsAt, nowMs);
   const amount = formatCompactTierAmount(tier);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
@@ -689,8 +702,10 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     appIdForExpiredHint === "antigravity_oauth" ||
     appIdForExpiredHint === "agy_oauth" ||
     appIdForExpiredHint === "grok_oauth";
+  const buddy = appIdForExpiredHint === "workbuddy_oauth" || appIdForExpiredHint === "codebuddy_oauth";
   const tiers = (quota.tiers || []).filter((tier) => {
-    if (!allowUnknownTierNames && !(tier.name in TIER_I18N_KEYS)) return false;
+    if (!allowUnknownTierNames && !(tier.name in TIER_I18N_KEYS)
+      && !(buddy && /^codebuddy_package_[1-9]\d*$/.test(tier.name))) return false;
     if (visibleTierNames && !visibleTierNames.includes(tier.name)) return false;
     return true;
   });
@@ -859,6 +874,9 @@ export const TierBadge: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
 }> = ({ tier, t }) => {
+  if (/^codebuddy_package_[1-9]\d*$/.test(tier.name)) {
+    return <span className="text-xs break-words">{formatCompactTier(tier, t)}</span>;
+  }
   const label =
     tier.label?.trim() ||
     (TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
@@ -894,6 +912,9 @@ const TierBar: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
 }> = ({ tier, t }) => {
+  if (/^codebuddy_package_[1-9]\d*$/.test(tier.name)) {
+    return <div className="text-xs break-words">{formatCompactTier(tier, t)}</div>;
+  }
   const label =
     tier.label?.trim() ||
     (TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);

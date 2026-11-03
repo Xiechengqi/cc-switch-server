@@ -332,7 +332,15 @@
   "provider": {
     "apiKeyAccountDisplay": "API Key 帳號：{{account}}",
     "apiKeyAccountResolving": "API Key 帳號",
-    "codeBuddyUsageSummary": "官方用量：今日 {{today}} · 7 日 {{week}} · 本月 {{month}} credits（{{count}} 次）",
+    "codeBuddyUsageSummary": "官方請求用量（帳號）：今日 {{today}} · 7 日 {{week}} · 本月 {{month}} credits",
+    "buddyPackageHeading": "資源包額度（帳號）",
+    "buddyPackageCollectedAt": "資源包採集：{{time}}",
+    "buddyUsageCollectedAt": "用量採集：{{time}}",
+    "buddyUsageRange": "請求數範圍：{{start}} 至 {{end}} · {{count}} 次 · {{timezone}}",
+    "buddyUsageScope": "資源包按各自週期累計，請求用量按自然日彙總；均為整個帳號的統計，包含其他 share 和用戶端。",
+    "buddyTimeUnknown": "未知",
+    "buddyPackageCycleEnds": "週期結束 {{time}}",
+    "buddyPackageExpires": "到期 {{time}}",
     "codeBuddyUsageUnavailable": "官方逐請求用量暫時無法使用",
     "codingPlanQuota": {
       "fiveHour": "5 小時",

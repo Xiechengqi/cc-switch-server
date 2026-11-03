@@ -1030,11 +1030,11 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             .iter()
             .map(|s| s.id.clone())
             .collect::<Vec<_>>();
-        if let Err(error) = sync_shares_to_router(state, &ids).await {
+        if let Err(error) = sync_shares_to_router_with_policy(state, &ids, true).await {
             state
                 .router_provider_identity_sync_pending
                 .store(true, std::sync::atomic::Ordering::Release);
-            tracing::warn!(%error, "provider identity descriptor backfill remains pending");
+            tracing::warn!(%error, "Router presentation capability backfill remains pending");
         }
     }
     retry_pending_router_share_deletes(state.clone()).await;

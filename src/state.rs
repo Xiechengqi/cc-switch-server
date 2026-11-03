@@ -989,8 +989,15 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool, bool),
+    (bool, bool, bool, bool, bool, bool, bool),
 );
+
+#[derive(Clone, Copy)]
+enum AccountShareMetadataRefresh {
+    SubscriptionExpiry,
+    Runtime,
+    QuotaPresentation,
+}
 
 #[derive(Debug)]
 pub struct ServerStateInner {
@@ -2149,6 +2156,7 @@ fn ollama_cloud_share_projection(
             blocked_reason: None,
             blocked_scope: None,
             banked_reset: None,
+            provider_usage: None,
             tiers,
             unobserved_tiers: Vec::new(),
         },
@@ -13214,14 +13222,31 @@ impl ServerStateInner {
         }) {
             self.emit_oauth_quota_updated_event(account, true);
         }
-        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, true)
-            .await
+        self.refresh_share_subscription_metadata_for_provider_keys(
+            provider_keys,
+            AccountShareMetadataRefresh::SubscriptionExpiry,
+        )
+        .await
     }
 
     pub async fn refresh_account_subscription_metadata(
         self: &Arc<Self>,
         provider_type: ProviderType,
         changed_account_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.refresh_account_share_metadata(
+            provider_type,
+            changed_account_id,
+            AccountShareMetadataRefresh::Runtime,
+        )
+        .await
+    }
+
+    async fn refresh_account_share_metadata(
+        self: &Arc<Self>,
+        provider_type: ProviderType,
+        changed_account_id: Option<&str>,
+        mode: AccountShareMetadataRefresh,
     ) -> anyhow::Result<Vec<String>> {
         let providers = self.providers.read().await.clone();
         let provider_keys = providers
@@ -13237,7 +13262,7 @@ impl ServerStateInner {
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
-        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, false)
+        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, mode)
             .await
     }
 
@@ -13260,14 +13285,17 @@ impl ServerStateInner {
             })
             .map(|provider| (provider.app, provider.provider.id.clone()))
             .collect::<BTreeSet<_>>();
-        self.refresh_share_subscription_metadata_for_provider_keys(provider_keys, false)
-            .await
+        self.refresh_share_subscription_metadata_for_provider_keys(
+            provider_keys,
+            AccountShareMetadataRefresh::Runtime,
+        )
+        .await
     }
 
     async fn refresh_share_subscription_metadata_for_provider_keys(
         self: &Arc<Self>,
         provider_keys: BTreeSet<(AppKind, String)>,
-        only_if_expiry_changed: bool,
+        mode: AccountShareMetadataRefresh,
     ) -> anyhow::Result<Vec<String>> {
         if provider_keys.is_empty() {
             return Ok(Vec::new());
@@ -13277,22 +13305,28 @@ impl ServerStateInner {
         let accounts = self.accounts.read().await.clone();
         let usage = self.usage.read().await.clone();
         let share_ids = self
-            .mutate_shares_immediate(|shares| {
-                if only_if_expiry_changed {
-                    shares.refresh_subscription_expiry_snapshots_for_providers(
+            .mutate_shares_immediate(|shares| match mode {
+                AccountShareMetadataRefresh::SubscriptionExpiry => shares
+                    .refresh_subscription_expiry_snapshots_for_providers(
                         &provider_keys,
                         &providers,
                         Some(&accounts),
                         &usage,
-                    )
-                } else {
-                    shares.refresh_runtime_snapshots_for_providers(
+                    ),
+                AccountShareMetadataRefresh::Runtime => shares
+                    .refresh_runtime_snapshots_for_providers(
                         &provider_keys,
                         &providers,
                         Some(&accounts),
                         &usage,
-                    )
-                }
+                    ),
+                AccountShareMetadataRefresh::QuotaPresentation => shares
+                    .refresh_quota_presentation_snapshots_for_providers(
+                        &provider_keys,
+                        &providers,
+                        Some(&accounts),
+                        &usage,
+                    ),
             })
             .await?;
         if share_ids.is_empty() {
@@ -13300,7 +13334,7 @@ impl ServerStateInner {
         }
 
         self.emit_event(ServerEvent::new("share.changed", "share").message(
-            if only_if_expiry_changed {
+            if matches!(mode, AccountShareMetadataRefresh::SubscriptionExpiry) {
                 "account_subscription_expiry_updated"
             } else {
                 "account_runtime_metadata_updated"
@@ -13314,7 +13348,12 @@ impl ServerStateInner {
             let state = self.clone();
             let pending_ids = share_ids.clone();
             tokio::spawn(async move {
-                if let Err(error) = sync_shares_to_router(&state, &pending_ids).await {
+                let result = if matches!(mode, AccountShareMetadataRefresh::QuotaPresentation) {
+                    sync_shares_to_router_with_policy(&state, &pending_ids, true).await
+                } else {
+                    sync_shares_to_router(&state, &pending_ids).await
+                };
+                if let Err(error) = result {
                     tracing::warn!(
                         share_count = pending_ids.len(),
                         %error,
@@ -13355,13 +13394,24 @@ impl ServerStateInner {
             ) != crate::domain::sharing::router_contract::codex_banked_reset_share_summary(
                 after, now_ms,
             );
-        if !expiry_changed && !usage_block_changed && !quota_visual_changed && !banked_reset_changed
+        let buddy_quota_changed = crate::domain::accounts::buddy_quota::buddy_quota_visual(before)
+            != crate::domain::accounts::buddy_quota::buddy_quota_visual(after);
+        if !expiry_changed
+            && !usage_block_changed
+            && !quota_visual_changed
+            && !banked_reset_changed
+            && !buddy_quota_changed
         {
             return Ok(false);
         }
 
         self.save_accounts().await?;
-        self.refresh_account_subscription_metadata(after.provider_type, Some(&after.id))
+        let mode = if buddy_quota_changed && !expiry_changed && !usage_block_changed {
+            AccountShareMetadataRefresh::QuotaPresentation
+        } else {
+            AccountShareMetadataRefresh::Runtime
+        };
+        self.refresh_account_share_metadata(after.provider_type, Some(&after.id), mode)
             .await?;
         Ok(true)
     }
@@ -19141,13 +19191,19 @@ impl ServerStateInner {
                         capability.cache_creation_ttl(),
                         capability.share_termination(),
                         capability.provider_identity(),
+                        capability.buddy_quota_presentation(),
                     ),
                 )
             });
         let identity_changed = {
             let mut previous = self.router_quota_capability.write().await;
-            let changed = previous.as_ref().map(|(base, id, _, c)| (base, id, c.5))
-                != value.as_ref().map(|(base, id, _, c)| (base, id, c.5));
+            let changed = previous
+                .as_ref()
+                .map(|(base, id, _, c)| (base, id, c.5, c.6))
+                != value.as_ref().map(|(base, id, _, c)| (base, id, c.5, c.6))
+                || previous
+                    .as_ref()
+                    .is_some_and(|(_, _, at, c)| c.6 && at.elapsed() >= Duration::from_secs(300));
             *previous = value;
             changed
         };
@@ -19209,6 +19265,25 @@ impl ServerStateInner {
             descriptor,
             self.router_supports_provider_identity().await,
         );
+        project_buddy_quota_capability(
+            descriptor,
+            self.router_supports_buddy_quota_presentation().await,
+        );
+    }
+
+    pub(crate) async fn router_supports_buddy_quota_presentation(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, c)| {
+                c.6 && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
     }
 
     pub async fn router_supports_market_trials(&self) -> bool {
@@ -21304,6 +21379,38 @@ fn project_provider_identity_capability(descriptor: &mut ShareDescriptor, suppor
     }
 }
 
+fn project_buddy_quota_capability(descriptor: &mut ShareDescriptor, supported: bool) {
+    if supported {
+        return;
+    }
+    let strip = |quota: &mut Option<ShareUpstreamQuota>| {
+        if let Some(quota) = quota {
+            quota.provider_usage = None;
+            for tier in &mut quota.tiers {
+                tier.expires_at = None;
+            }
+        }
+    };
+    for runtime in descriptor
+        .upstream_provider
+        .iter_mut()
+        .chain(descriptor.app_runtimes.claude.iter_mut())
+        .chain(descriptor.app_runtimes.codex.iter_mut())
+        .chain(descriptor.app_runtimes.gemini.iter_mut())
+    {
+        strip(&mut runtime.quota);
+    }
+    for provider in descriptor
+        .app_providers
+        .claude
+        .iter_mut()
+        .chain(&mut descriptor.app_providers.codex)
+        .chain(&mut descriptor.app_providers.gemini)
+    {
+        strip(&mut provider.quota);
+    }
+}
+
 pub(crate) async fn authoritative_share_descriptor(
     state: &ServerState,
     share_id: &str,
@@ -22557,6 +22664,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
         let provider_identity_supported = state.router_supports_provider_identity().await;
+        let buddy_quota_supported = state.router_supports_buddy_quota_presentation().await;
         let termination_archive_since_ms = if state.router_supports_share_termination().await {
             crate::repository::server_sqlite::market_termination::archive_since(&state.config_dir)?
         } else {
@@ -22621,6 +22729,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                 // on explicit authoritative reads. Omit it for old Routers.
                 descriptor.termination_archive_since_ms = termination_archive_since_ms;
                 project_provider_identity_capability(&mut descriptor, provider_identity_supported);
+                project_buddy_quota_capability(&mut descriptor, buddy_quota_supported);
                 let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
                 // v8 read-only capabilities also describe ordinary users, so
                 // a ready source can offer an explicit migration. These
@@ -23427,6 +23536,121 @@ async fn issue_share_tunnel_lease(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn buddy_quota_capability_is_explicit_scoped_expires_and_requests_backfill() {
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "buddy-install").await;
+        let config = state.config_snapshot().await;
+        assert!(!state.router_supports_buddy_quota_presentation().await);
+        for (version, capabilities, supported) in [
+            (10, vec![], false),
+            (6, vec!["buddyQuotaPresentationV1".into()], false),
+            (7, vec!["buddyQuotaPresentationV1".into()], true),
+        ] {
+            state
+                .record_router_quota_capability(
+                    &config,
+                    client::RouterShareCapabilities {
+                        share_contract_version: version,
+                        capabilities,
+                    },
+                )
+                .await;
+            assert_eq!(
+                state.router_supports_buddy_quota_presentation().await,
+                supported
+            );
+        }
+        assert!(state
+            .router_provider_identity_sync_pending
+            .swap(false, AtomicOrdering::AcqRel));
+        state
+            .router_quota_capability
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .2 -= Duration::from_secs(301);
+        assert!(!state.router_supports_buddy_quota_presentation().await);
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 7,
+                    capabilities: vec!["buddyQuotaPresentationV1".into()],
+                },
+            )
+            .await;
+        assert!(state
+            .router_provider_identity_sync_pending
+            .swap(false, AtomicOrdering::AcqRel));
+        state
+            .router_quota_capability
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .2 -= Duration::from_secs(301);
+        state
+            .record_router_quota_capability(
+                &config,
+                client::RouterShareCapabilities {
+                    share_contract_version: 7,
+                    capabilities: vec![],
+                },
+            )
+            .await;
+        assert!(state
+            .router_provider_identity_sync_pending
+            .swap(false, AtomicOrdering::AcqRel));
+        configure_registered_test_router(&state, "http://127.0.0.1:8", "other-install").await;
+        assert!(!state.router_supports_buddy_quota_presentation().await);
+    }
+
+    #[test]
+    fn buddy_quota_capability_strips_all_projections_for_strict_old_peers() {
+        let quota: ShareUpstreamQuota = serde_json::from_str(include_str!(
+            "../tests/fixtures/buddy-quota-presentation-v1.json"
+        ))
+        .unwrap();
+        let runtime = ShareUpstreamProvider {
+            quota: Some(quota.clone()),
+            ..Default::default()
+        };
+        let provider = ShareAppProvider {
+            quota: Some(quota),
+            ..Default::default()
+        };
+        let mut descriptor = ShareDescriptor {
+            upstream_provider: Some(runtime.clone()),
+            app_runtimes: crate::domain::sharing::router_contract::ShareAppRuntimes {
+                claude: Some(runtime.clone()),
+                codex: Some(runtime.clone()),
+                gemini: Some(runtime),
+            },
+            app_providers: crate::domain::sharing::router_contract::ShareAppProviders {
+                claude: vec![provider.clone()],
+                codex: vec![provider.clone()],
+                gemini: vec![provider],
+            },
+            ..Default::default()
+        };
+        let original = serde_json::to_value(&descriptor).unwrap();
+        let static_before =
+            static_descriptor_fingerprint(&descriptor, &ProviderStore::default()).unwrap();
+        project_buddy_quota_capability(&mut descriptor, true);
+        assert_eq!(serde_json::to_value(&descriptor).unwrap(), original);
+        project_buddy_quota_capability(&mut descriptor, false);
+        let wire = serde_json::to_string(&descriptor).unwrap();
+        assert!(!wire.contains("providerUsage"));
+        assert!(!wire.contains("2035-02-01"));
+        assert!(wire.contains("CodeBuddy个人体验版"));
+        assert_eq!(
+            static_descriptor_fingerprint(&descriptor, &ProviderStore::default()).unwrap(),
+            static_before
+        );
+    }
+
     #[tokio::test]
     async fn provider_identity_capability_is_scoped_expires_and_requests_backfill() {
         let state = test_state();
@@ -36563,6 +36787,179 @@ mod tests {
                 .await,
             ClaudeQuotaObservationCommit::StaleIdentity
         );
+    }
+
+    #[tokio::test]
+    async fn buddy_quota_changes_refresh_existing_share_without_changing_configuration() {
+        use crate::domain::accounts::buddy_quota::test_buddy_account;
+        use crate::domain::codebuddy::CodeBuddySite;
+        async fn capture(
+            AxumState(requests): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            let acks = request["ops"].as_array().unwrap().iter().map(|op| {
+                let share = &op["share"];
+                json!({"shareId": share["shareId"], "descriptorGeneration": share["descriptorGeneration"],
+                    "descriptorFingerprint": share["descriptorFingerprint"], "applied": true})
+            }).collect::<Vec<_>>();
+            requests.lock().await.push(request);
+            Json(json!({"ok": true, "acks": acks}))
+        }
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            let state = test_state();
+            let before = test_buddy_account(product, CodeBuddySite::Cn);
+            state
+                .replace_account_store_for_test(AccountStore {
+                    accounts: vec![before.clone()],
+                    ..Default::default()
+                })
+                .await;
+            let mut provider = test_provider("buddy-provider", "Buddy");
+            provider.meta = Some(ProviderMeta {
+                auth_binding: Some(AuthBinding {
+                    source: Some(MANAGED_ACCOUNT_AUTH_BINDING_SOURCE.into()),
+                    auth_provider: Some(product.as_str().into()),
+                    account_id: Some(before.id.clone()),
+                    auth_identity_generation: Some(before.auth_identity_generation),
+                }),
+                ..Default::default()
+            });
+            state
+                .replace_provider_store_for_test(ProviderStore {
+                    providers: vec![StoredProvider {
+                        app: AppKind::Codex,
+                        provider,
+                        provider_type: product,
+                        provider_type_id: product.as_str().into(),
+                        resource: ProviderResourceMetadata::default(),
+                    }],
+                    ..Default::default()
+                })
+                .await;
+            let mut input = router_sync_share_input("buddy-share", "buddy-provider");
+            input.provider_type = product;
+            input.bindings = vec![ShareBinding {
+                app: AppKind::Codex,
+                provider_id: "buddy-provider".into(),
+                provider_type: product,
+            }];
+            state
+                .mutate_shares_immediate(|shares| shares.upsert(input))
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .refresh_account_subscription_metadata(product, Some(&before.id))
+                .await
+                .unwrap();
+            let requests = Arc::new(TokioMutex::new(Vec::<Value>::new()));
+            let app = Router::new()
+                .route("/v1/shares/descriptor-batch-sync", post(capture))
+                .with_state(requests.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            configure_registered_test_router(
+                &state,
+                &format!("http://{address}"),
+                "buddy-quota-install",
+            )
+            .await;
+            let config = state.config_snapshot().await;
+            state
+                .record_router_quota_capability(
+                    &config,
+                    client::RouterShareCapabilities {
+                        share_contract_version: 7,
+                        capabilities: vec![],
+                    },
+                )
+                .await;
+            sync_shares_to_router(&state, &["buddy-share".into()])
+                .await
+                .unwrap();
+            assert!(!requests.lock().await[0]
+                .to_string()
+                .contains("providerUsage"));
+            // An already-ACKed ordinary Share must be backfilled on capability gain.
+            state
+                .record_router_quota_capability(
+                    &config,
+                    client::RouterShareCapabilities {
+                        share_contract_version: 7,
+                        capabilities: vec!["buddyQuotaPresentationV1".into()],
+                    },
+                )
+                .await;
+            run_periodic_share_sync_retry_once(&state).await;
+            assert_eq!(requests.lock().await.len(), 2);
+            assert!(requests.lock().await[1]
+                .to_string()
+                .contains("providerUsage"));
+            let initial = state
+                .shares
+                .read()
+                .await
+                .get("buddy-share")
+                .cloned()
+                .unwrap();
+            assert!(!state
+                .refresh_account_runtime_metadata_if_changed(&before, &before)
+                .await
+                .unwrap());
+            let mut after = before.clone();
+            let quota = after.quota.as_mut().unwrap();
+            quota.tiers[1].used = Some(0.75);
+            quota.tiers[1].utilization = Some(0.0015);
+            quota.extra_usage.as_mut().unwrap()["codeBuddyOfficialUsage"]["usageToday"] =
+                json!(0.6);
+            state
+                .replace_account_store_for_test(AccountStore {
+                    accounts: vec![after.clone()],
+                    ..Default::default()
+                })
+                .await;
+            assert!(state
+                .refresh_account_runtime_metadata_if_changed(&before, &after)
+                .await
+                .unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if requests.lock().await.len() >= 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("dynamic quota update must reach the acknowledged Router Share");
+            let sent = requests.lock().await[2]["ops"][0]["share"].clone();
+            assert_eq!(
+                sent["appRuntimes"]["codex"]["quota"]["providerUsage"]["usageToday"],
+                0.6
+            );
+            assert_eq!(sent["configRevision"], initial.config_revision);
+            assert_eq!(sent["descriptorGeneration"], initial.descriptor_generation);
+            let current = state
+                .shares
+                .read()
+                .await
+                .get("buddy-share")
+                .cloned()
+                .unwrap();
+            assert_eq!(current.config_revision, initial.config_revision);
+            assert_eq!(current.descriptor_generation, initial.descriptor_generation);
+            let snapshot = current.runtime_snapshot.unwrap();
+            assert_eq!(
+                snapshot["appRuntimes"]["codex"]["quota"]["providerUsage"]["usageToday"],
+                0.6
+            );
+            assert_eq!(
+                snapshot["appRuntimes"]["codex"]["quota"]["tiers"][1]["used"],
+                0.75
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]

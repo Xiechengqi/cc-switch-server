@@ -234,7 +234,9 @@ fn subscription_quota_from_parts(
 
     let success = credential_status == "valid" && quota.is_some_and(|quota| quota.success);
     let queried_at = queried_at.or_else(|| {
-        if success || quota.is_some_and(|quota| !quota.tiers.is_empty()) {
+        if !account.provider_type.is_buddy_oauth()
+            && (success || quota.is_some_and(|quota| !quota.tiers.is_empty()))
+        {
             Some(crate::infra::time::now_ms() as i64)
         } else {
             None
@@ -269,7 +271,16 @@ fn subscription_quota_from_parts(
             .map(|quota| quota.tiers.as_slice())
             .unwrap_or_default()
             .iter()
-            .map(subscription_tier_from_account_tier)
+            .map(|tier| {
+                let mut projected = subscription_tier_from_account_tier(tier);
+                if let Some(label) = crate::domain::accounts::buddy_quota::buddy_package_label(account, tier) {
+                    projected["label"] = json!(label);
+                }
+                if let Some(at) = crate::domain::accounts::buddy_quota::buddy_package_expires_at_from_quota(account, quota, tier) {
+                    projected["expiresAt"] = resets_at_for_ui(Some(at));
+                }
+                projected
+            })
             .collect::<Vec<_>>(),
         "unobservedTiers": presentation
             .unobserved_tiers
@@ -277,15 +288,41 @@ fn subscription_quota_from_parts(
             .map(subscription_tier_hint_from_account_tier_hint)
             .collect::<Vec<_>>(),
         "extraUsage": extra_usage_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
-        "providerUsage": quota
-            .and_then(|quota| quota.extra_usage.as_ref())
-            .and_then(|extra| extra.get("codeBuddyOfficialUsage"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        "providerUsage": buddy_official_usage_for_ui(account, quota),
         "bankedReset": banked_reset_for_ui(quota.and_then(|quota| quota.extra_usage.as_ref())),
         "error": error,
         "queriedAt": queried_at,
     })
+}
+
+fn buddy_official_usage_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Value {
+    let Some(summary) =
+        crate::domain::accounts::buddy_quota::buddy_official_usage_summary_from_quota(
+            account, quota,
+        )
+    else {
+        return Value::Null;
+    };
+    let mut usage = serde_json::to_value(summary).expect("Buddy summary is serializable");
+    // Preserve the existing admin-only detail view; Share descriptors use only the summary.
+    if let Some(raw) = quota
+        .and_then(|quota| quota.extra_usage.as_ref())
+        .and_then(|extra| extra.get("codeBuddyOfficialUsage"))
+    {
+        for key in [
+            "requests",
+            "models",
+            "detailTruncated",
+            "reportedTotal",
+            "fetchedCount",
+            "error",
+        ] {
+            if let Some(value) = raw.get(key) {
+                usage[key] = value.clone();
+            }
+        }
+    }
+    usage
 }
 
 fn subscription_for_ui(account: &Account, quota: Option<&AccountQuota>) -> Option<Value> {
@@ -699,36 +736,70 @@ mod tests {
 
     #[test]
     fn subscription_quota_exposes_codebuddy_official_usage_in_a_dedicated_field() {
-        let mut account = sample_account(AccountQuota {
-            success: true,
-            credential_message: Some("CodeBuddy".to_string()),
-            tiers: vec![AccountQuotaTier {
-                name: "codebuddy".to_string(),
-                utilization: Some(0.25),
-                ..Default::default()
-            }],
-            extra_usage: Some(json!({
-                "codeBuddyOfficialUsage": {
-                    "status":"complete",
-                    "usageToday":1.25,
-                    "usage7Days":4.5,
-                    "usageThisMonth":9.75,
-                    "requestCount":3,
-                    "requests":[{"requestId":"safe-id","credit":1.25}]
-                }
-            })),
-        });
-        account.provider_type = ProviderType::CodeBuddyOAuth;
-
+        let mut account = crate::domain::accounts::buddy_quota::test_buddy_account(
+            ProviderType::CodeBuddyOAuth,
+            crate::domain::codebuddy::CodeBuddySite::Cn,
+        );
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .extra_usage
+            .as_mut()
+            .unwrap()["codeBuddyOfficialUsage"]["requests"] =
+            json!([{"requestId":"safe-id","credit":1.25}]);
         let quota = subscription_quota_from_account(&account, "codebuddy_oauth");
         assert_eq!(quota["providerUsage"]["status"], "complete");
-        assert_eq!(quota["providerUsage"]["usageToday"], 1.25);
-        assert_eq!(quota["providerUsage"]["requestCount"], 3);
+        assert_eq!(quota["providerUsage"]["usageToday"], 0.45);
+        assert_eq!(quota["providerUsage"]["requestCount"], 132);
+        assert_eq!(quota["providerUsage"]["scope"], "account");
+        assert_eq!(quota["providerUsage"]["timezone"], "Asia/Shanghai");
         assert_eq!(
             quota["providerUsage"]["requests"][0]["requestId"],
             "safe-id"
         );
         assert_eq!(quota["extraUsage"], Value::Null);
+    }
+
+    #[test]
+    fn buddy_subscription_response_projects_only_the_current_quota_snapshot() {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            let account = crate::domain::accounts::buddy_quota::test_buddy_account(
+                product,
+                crate::domain::codebuddy::CodeBuddySite::Cn,
+            );
+            let mut latest = account.quota.clone().unwrap();
+            let extra = latest.extra_usage.as_mut().unwrap();
+            extra["codeBuddyBilling"]["packages"][0]["expiresAt"] = json!(1893456000000i64);
+            extra["codeBuddyOfficialUsage"]["usageToday"] = json!(0.75);
+            let mut response = AccountQuotaResponse {
+                ok: true,
+                quota: Some(latest),
+                account: None,
+                refreshed: true,
+                message: None,
+                next_refresh_at: None,
+            };
+            let quota = subscription_quota_from_response(&account, &response, product.as_str());
+            assert_eq!(quota["tiers"][0]["expiresAt"], "2030-01-01T00:00:00+00:00");
+            assert_eq!(quota["providerUsage"]["usageToday"], 0.75);
+            let mut unknown_time = account.clone();
+            unknown_time.quota_refreshed_at = None;
+            let unknown = subscription_quota_from_account(&unknown_time, product.as_str());
+            assert!(unknown["queriedAt"].is_null());
+            assert_eq!(unknown["providerUsage"]["collectedAt"], 1793704378549i64);
+            response
+                .quota
+                .as_mut()
+                .unwrap()
+                .extra_usage
+                .as_mut()
+                .unwrap()["codeBuddyOfficialUsage"]["usage7Days"] = Value::Null;
+            let unavailable =
+                subscription_quota_from_response(&account, &response, product.as_str());
+            assert_eq!(unavailable["providerUsage"]["status"], "unavailable");
+            assert!(unavailable["providerUsage"]["usageToday"].is_null());
+        }
     }
 
     #[test]

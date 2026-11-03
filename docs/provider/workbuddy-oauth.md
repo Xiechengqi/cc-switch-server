@@ -34,6 +34,12 @@ Claude Messages、OpenAI Chat / Responses、Gemini stream/nonstream 使用共同
 
 官方 credit 用量与本地 token 计量分开。按站点时区扫描近 31 个自然日，pageNum 固定 1，满 3000 条用最大时间推进 inclusive startTime，以归一时间与 requestId 去重；同秒饱和、窗口停滞、坏行和安全上限均不报 complete。套餐成功而官方明细失败时保留套餐并显示 unavailable。原始 prompt、账号私密字段和凭据不能进入日志或回执。
 
+Server / Router 同时展示资源包额度与官方请求汇总，保留上游官方包名（可含 CodeBuddy）、
+小额使用率、独立采集时间、周期结束与权益到期。两者都是账号账本，计数范围和自然日
+时区明确显示，不与 Share 本地 Token/USD 配额混用，也不强行对齐不同采集时间的金额。
+Router 新字段须显式协商，旧 reader 省略；具体字段、刷新和回填规则见
+[Buddy 展示合同](codebuddy-oauth.md#2026-11-03-资源包与官方请求用量展示)。
+
 参考固定为 `cli2api@fb2eb35`、`workbuddy-switch@22b318c`、`workbuddy-cliproxy@6528fdc`、`codebuddy2openai@8804ad6`，只作本次协议研究的只读证据。测试与发布不依赖外仓。真实验收需独立双站登录/旋转刷新、目录、四入口 stream/nonstream、工具、reasoning、429、取消和撤销回执；不能复用 CodeBuddy 的历史成功作为 WorkBuddy 成功。
 
 

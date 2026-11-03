@@ -6,6 +6,7 @@ export interface QuotaTier {
   label?: string | null;
   utilization: number; // 0-100
   resetsAt: string | null;
+  expiresAt?: string | null;
   used?: number | null;
   limit?: number | null;
   unit?: string | null;
@@ -112,6 +113,12 @@ export interface SubscriptionQuota {
     usageToday?: number;
     usage7Days?: number;
     usageThisMonth?: number;
+    usageTotal?: number;
+    rangeStart?: string;
+    rangeEnd?: string;
+    source?: string;
+    scope?: "account";
+    timezone?: "UTC" | "Asia/Shanghai";
     requestCount?: number;
     detailTruncated?: boolean;
     collectedAt?: number;

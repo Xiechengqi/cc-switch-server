@@ -2,7 +2,7 @@
 
 > 状态：**权威文档（Server 侧）**。线格式、字段定义与 Router 内部行为以 `cc-switch-router/PROTOCOL.md` 为准；本文只描述 Server 实现了什么、在哪里实现、以及 Server 侧的判定规则。
 >
-> 最后核对：2026-10-25。
+> 最后核对：2026-11-03。
 
 ## 1. 实现位置
 
@@ -103,6 +103,24 @@ Router 的 quota 解析拒绝未知字段，因此契约扩展必须先升级 Ro
 catalog 版本。所有出站路径均省略旧 reader 不认识的字段；能力变化自动补发已有分享。
 该内容推进 descriptor ACK，不改变配置 revision、执行指纹或租约快照。
 详见 [供应商展示身份](../provider/presentation.md)。
+
+Buddy 私有账号卡片第二行使用既有 `accountLabel`，值为精确绑定托管账号的内部
+`Account.id`（不是上游 UID、供应商名、昵称或邮箱）。账号缺失或身份代次不匹配时
+省略标签，Router 显示 `-`，不回退产品名或分享者邮箱。此修正不新增协议字段；
+公开 Share Market 的 Buddy `accountHint` 省略，不对外发布内部账号 ID。
+
+独立展示扩展 `buddyQuotaPresentationV1` 要求 reader≥7 且显式能力，不改变普通
+descriptor 或市场最低版本。Server 在 Buddy quota 输出独立的 `providerUsage` 白名单汇总、
+资源包官方名称及可选 `tiers[].expiresAt`；后者与周期结束 `resetsAt` 分开。
+所有出站路径对旧 reader 省略新增字段，能力绑定 URL/installation 并在 300 秒后失效，
+能力变化强制回填已 ACK 的 Share。单纯账单变化仅更新动态快照和完整 descriptor，
+不提升 configRevision/静态 generation/fingerprint；失败沿用既有同步错误与周期重试。
+
+汇总仅含状态、来源、账号口径、时区、采集时间、至多 31 日的日期范围、今日/7日/本月/范围总
+credits 和范围请求数。缺失或畸形数据降为 unavailable，不填零；请求/模型明细、prompt、
+账号标识和原始错误留在 Server 管理边界。资源包与官方明细分别显示采集时间，保留
+官方明细既有 30 分钟成功缓存及手动强刷。两套账号账本与 Share 的 Token/USD 配额分开，
+不要求金额相等，不参与调度、限流或容量评分。详见 [Buddy 展示合同](../provider/codebuddy-oauth.md#2026-11-03-资源包与官方请求用量展示)。
 
 ## 8. 已下线接口
 

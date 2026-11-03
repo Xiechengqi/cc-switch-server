@@ -3434,6 +3434,28 @@ impl ShareStore {
         accounts: Option<&AccountStore>,
         usage: &UsageStore,
     ) -> Vec<String> {
+        self.refresh_provider_snapshots(provider_keys, providers, accounts, usage, true)
+    }
+
+    /// Account billing presentation is dynamic evidence, not a Share configuration edit.
+    pub fn refresh_quota_presentation_snapshots_for_providers(
+        &mut self,
+        provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
+        usage: &UsageStore,
+    ) -> Vec<String> {
+        self.refresh_provider_snapshots(provider_keys, providers, accounts, usage, false)
+    }
+
+    fn refresh_provider_snapshots(
+        &mut self,
+        provider_keys: &BTreeSet<(AppKind, String)>,
+        providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
+        usage: &UsageStore,
+        bump_config_revision: bool,
+    ) -> Vec<String> {
         let mut updated_ids = Vec::new();
         for share in &mut self.shares {
             let uses_provider = if share.bindings.is_empty() {
@@ -3450,7 +3472,9 @@ impl ShareStore {
             share.runtime_snapshot = Some(runtime_snapshot_for_share(
                 share, providers, accounts, usage,
             ));
-            mark_share_config_pending(share);
+            if bump_config_revision {
+                mark_share_config_pending(share);
+            }
             updated_ids.push(share.id.clone());
         }
         updated_ids

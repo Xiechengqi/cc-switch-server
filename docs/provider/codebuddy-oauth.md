@@ -859,3 +859,29 @@ Buddy 连接探针沿用既有 1 token 输出上限。Codex Responses 中，由�
 单模型健康检查始终采用该 Surface 配置的 upstreamModel（包含 `auto`），不从全局测试模型注入 GPT ID 或 effort；透传模式保留请求/App/供应商的测试模型覆盖，无覆盖则使用 `auto`。Web 单模型测试框显示并跟随上游模型。成功探针通过内部响应 extension 获取实际 native model，不增加 wire header 或额外目录读取；健康记录使用该模型。生成前目录拒绝归为 invalidConfig，stream completion 为未知；只有收到成功 HTTP 流后缺少终态才归为 streamIncomplete，timeout/auth/quota 等已有分类仍保留。Buddy 探针按有界 SSE 解码后的真实终态判断，error/failed 及非预期 incomplete 优先拒绝，生成文本或错误说明中的 `[DONE]`、`response.completed` 等子串不能冒充完成。
 
 CodeBuddy 与 WorkBuddy 的 AccountPublicView / ManagedAuthAccount 增加可选 `displayName`。优先真实邮箱、脱敏手机号、nickname/name、内部 ID；手机号不放入 email。旧账号的已存昵称立即可用，后续正常刷新复用已认证 `/accounts` 请求补全显示资料。先落旋转 token receipt，再核对 UID/enterprise，最后合并非空可显示字段；缺失、对象及非法显示值不清除旧资料。显示信息不改变 principal、认证代次、Provider/Share 绑定；完整 profile、原始手机和凭据不进入公开视图。2026-11-02 CN GET 观察只证明字段/目录形态，不能替代推理、OAuth 轮换或双站联合接受性验收。
+
+## 2026-11-03 资源包与官方请求用量展示
+
+CodeBuddy、WorkBuddy 两端同时显示资源包额度和官方请求 credits，均为绑定账号级，
+包含其他 Share/客户端活动。资源包使用上游官方名称（WorkBuddy 账号的官方包名也可能含
+CodeBuddy），小额使用率保留一位，非零且小于 0.1% 显示 `<0.1%`。周期结束和权益到期
+分别显示；旧持久化账号从同一 billing 快照恢复有效期，包名/容量不匹配则不猜测。
+
+官方请求汇总按既有站点时区显示今日/7日/本月 credits，请求数明确对应近 31 自然日的
+采集范围。资源包和官方明细各自显示精确采集时间；资源包刷新不意味着明细缓存也刚采集。
+保留 30 分钟成功缓存，手动刷新沿用 force 绕过。缺值/畸形数据不可用，不伪造零；
+一类账本失败仍可显示另一类可用数据。资源包周期、自然日窗口和上游更新时间独立，
+不能把 0.5 资源包消耗与 0.45 请求 credits 的差额直接归因为本地少计或强行对齐。
+
+Router 的用量扩展仅接收 `buddyQuotaPresentationV1` 协商后的安全汇总和期限，不包含逐请求/模型明细、
+prompt、账号标识或原始错误；管理端已有明细能力保留。普通 Share 仍是 v7，旧 reader
+省略新增字段。能力变化回填已有 Share，单纯账单刷新不改配置版本；展示字段不参与调度、
+限流、容量评分或本地 Token/USD 额度。线格式和严格校验见
+[Router 契约](../architecture/router-contract.md#7-share-契约-v7-兼容与-v8v9v10-协商)。
+
+Router 私有账号卡片第二行复用既有 `accountLabel` 显示绑定托管账号的内部 ID，
+独立于供应商名、昵称和邮箱。该 ID 只从匹配产品、账号及身份代次的绑定读取；
+旧数据缺失时显示 `-`，不回退为产品名称，不进入用量汇总或公开市场身份。
+
+本轮仅使用本地代码、合成夹具和此前只读远程快照结论，未修改上游 host、账号绑定或
+产品/站点身份；未部署，双端真实页面及账单联合验收仍待执行。

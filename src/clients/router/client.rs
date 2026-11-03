@@ -975,6 +975,13 @@ impl RouterShareCapabilities {
     pub fn provider_identity(&self) -> bool {
         self.capabilities.iter().any(|c| c == "providerIdentityV1")
     }
+    pub fn buddy_quota_presentation(&self) -> bool {
+        self.share_contract_version >= 7
+            && self
+                .capabilities
+                .iter()
+                .any(|c| c == "buddyQuotaPresentationV1")
+    }
     pub fn share_termination(&self) -> bool {
         self.capabilities.iter().any(|c| c == "shareTerminationV1")
     }

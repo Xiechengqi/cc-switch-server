@@ -332,7 +332,15 @@
   "provider": {
     "apiKeyAccountDisplay": "API key account: {{account}}",
     "apiKeyAccountResolving": "API key account",
-    "codeBuddyUsageSummary": "Official usage: today {{today}} · 7 days {{week}} · this month {{month}} credits ({{count}} requests)",
+    "codeBuddyUsageSummary": "Official request usage (account): today {{today}} · 7 days {{week}} · this month {{month}} credits",
+    "buddyPackageHeading": "Package quota (account)",
+    "buddyPackageCollectedAt": "Package data collected: {{time}}",
+    "buddyUsageCollectedAt": "Usage data collected: {{time}}",
+    "buddyUsageRange": "Request count: {{start}} – {{end}} · {{count}} requests · {{timezone}}",
+    "buddyUsageScope": "Packages accumulate over their own cycles; request usage uses calendar days. Both cover the account, including other shares and clients.",
+    "buddyTimeUnknown": "unknown",
+    "buddyPackageCycleEnds": "cycle ends in {{time}}",
+    "buddyPackageExpires": "expires in {{time}}",
     "codeBuddyUsageUnavailable": "Official per-request usage is temporarily unavailable",
     "codingPlanQuota": {
       "fiveHour": "5h",

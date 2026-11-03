@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::domain::accounts::buddy_quota::{
+    buddy_official_usage_summary, buddy_package_expires_at, buddy_package_label,
+    BuddyOfficialUsageSummary,
+};
 use crate::domain::accounts::claude_quota::{
     project_account_quota_presentation, projected_quota_queried_at, AccountQuotaTierHint,
 };
@@ -696,6 +700,8 @@ pub struct ShareUpstreamQuotaTier {
     pub relative_weekly_capacity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -743,6 +749,8 @@ pub struct ShareUpstreamQuota {
     pub unobserved_tiers: Vec<ShareUpstreamQuotaTierHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub banked_reset: Option<ShareBankedResetSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage: Option<BuddyOfficialUsageSummary>,
 }
 
 /// Display-only Codex reset-credit evidence. Never use this for quota or scheduling.
@@ -1830,6 +1838,11 @@ fn account_context_for_share(
 }
 
 fn account_display_label(account: &Account) -> Option<String> {
+    // Buddy cards identify the exact managed account, independently of optional
+    // vendor display names, email metadata or the Provider's editable name.
+    if account.provider_type.is_buddy_oauth() {
+        return Some(account.id.clone());
+    }
     account.email.clone().or_else(|| {
         let profile = account.profile.as_ref()?;
         [
@@ -1891,6 +1904,7 @@ fn account_subscription_remaining_ms(account: &Account) -> Option<i64> {
 fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<ShareUpstreamQuota> {
     let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
     let banked_reset = codex_banked_reset_share_summary(account, now_ms);
+    let provider_usage = buddy_official_usage_summary(account);
     let subscription_period_end = account_subscription_expires_at(account);
     let block = current_account_usage_block(account, share);
     let availability = block
@@ -1910,7 +1924,11 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         .map(share_upstream_quota_tier_hint_from_account)
         .collect::<Vec<_>>();
     let Some(quota) = projection.quota else {
-        if subscription_period_end.is_none() && block.is_none() && banked_reset.is_none() {
+        if subscription_period_end.is_none()
+            && block.is_none()
+            && banked_reset.is_none()
+            && provider_usage.is_none()
+        {
             return None;
         }
         return Some(ShareUpstreamQuota {
@@ -1929,6 +1947,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
             tiers: Vec::new(),
             unobserved_tiers,
             banked_reset,
+            provider_usage,
         });
     };
     if quota.tiers.is_empty()
@@ -1937,6 +1956,7 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         && subscription_period_end.is_none()
         && block.is_none()
         && banked_reset.is_none()
+        && provider_usage.is_none()
     {
         return None;
     }
@@ -1967,10 +1987,19 @@ fn upstream_quota_from_account(account: &Account, share: &Share) -> Option<Share
         tiers: quota
             .tiers
             .iter()
-            .map(share_upstream_quota_tier_from_account)
+            .map(|tier| {
+                let mut projected = share_upstream_quota_tier_from_account(tier);
+                if let Some(label) = buddy_package_label(account, tier) {
+                    projected.label = label;
+                }
+                projected.expires_at =
+                    buddy_package_expires_at(account, tier).and_then(unix_ms_to_rfc3339);
+                projected
+            })
             .collect(),
         unobserved_tiers,
         banked_reset,
+        provider_usage,
     })
 }
 
@@ -2002,6 +2031,7 @@ fn share_upstream_quota_tier_from_account(tier: &AccountQuotaTier) -> ShareUpstr
         model_family: tier.model_family.clone(),
         relative_weekly_capacity: tier.relative_weekly_capacity,
         source: tier.source.clone(),
+        expires_at: None,
     }
 }
 
@@ -2450,6 +2480,85 @@ mod tests {
             upstream_provider.subscription_level.as_deref(),
             Some("Cursor Pro+")
         );
+    }
+
+    #[test]
+    fn buddy_descriptor_identifies_only_the_bound_account_in_all_projections() {
+        use crate::domain::accounts::buddy_quota::test_buddy_account;
+        use crate::domain::codebuddy::CodeBuddySite;
+
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            for site in [CodeBuddySite::Cn, CodeBuddySite::Intl] {
+                for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                    let mut account = test_buddy_account(product, site);
+                    account.email = Some("owner@example.com".into());
+                    let profile = account.profile.as_mut().unwrap();
+                    profile["name"] = json!(crate::domain::codebuddy::buddy_product_label(product));
+                    profile["nickname"] = json!("optional-nickname");
+                    let expected_id = account.id.clone();
+                    let mut provider = test_provider(product);
+                    provider.app = app;
+                    provider
+                        .provider
+                        .meta
+                        .as_mut()
+                        .unwrap()
+                        .auth_binding
+                        .as_mut()
+                        .unwrap()
+                        .account_id = Some(expected_id.clone());
+                    let providers = ProviderStore {
+                        providers: vec![provider],
+                        ..Default::default()
+                    };
+                    let mut share = test_share(product, None);
+                    share.app = app;
+                    share.bindings[0].app = app;
+                    let mut accounts = AccountStore {
+                        accounts: vec![account],
+                        ..Default::default()
+                    };
+                    let descriptor = descriptor_for_share_with_accounts_and_usage(
+                        &share,
+                        &providers,
+                        Some(&accounts),
+                        None,
+                    );
+                    for runtime in descriptor
+                        .upstream_provider
+                        .iter()
+                        .chain(descriptor.app_runtimes.claude.iter())
+                        .chain(descriptor.app_runtimes.codex.iter())
+                        .chain(descriptor.app_runtimes.gemini.iter())
+                    {
+                        assert_eq!(runtime.account_label.as_deref(), Some(expected_id.as_str()));
+                        assert_eq!(runtime.account_email.as_deref(), Some("owner@example.com"));
+                    }
+                    let app_providers = descriptor
+                        .app_providers
+                        .claude
+                        .iter()
+                        .chain(&descriptor.app_providers.codex)
+                        .chain(&descriptor.app_providers.gemini)
+                        .collect::<Vec<_>>();
+                    assert_eq!(app_providers.len(), 1);
+                    assert_eq!(
+                        app_providers[0].account_label.as_deref(),
+                        Some(expected_id.as_str())
+                    );
+
+                    // A stale binding must not expose any other account's ID.
+                    accounts.accounts[0].auth_identity_generation += 1;
+                    let stale = descriptor_for_share_with_accounts_and_usage(
+                        &share,
+                        &providers,
+                        Some(&accounts),
+                        None,
+                    );
+                    assert!(stale.upstream_provider.unwrap().account_label.is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -2994,6 +3103,34 @@ mod tests {
 
         assert_eq!(quota.tiers[0].label, "5h");
         assert_eq!(quota.tiers[0].utilization, 1.0);
+    }
+
+    #[test]
+    fn buddy_quota_golden_projection_preserves_packages_and_separate_request_credits() {
+        use crate::domain::accounts::buddy_quota::test_buddy_account;
+        use crate::domain::codebuddy::CodeBuddySite;
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/buddy-quota-presentation-v1.json"
+        ))
+        .unwrap();
+        for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
+            let mut account = test_buddy_account(product, CodeBuddySite::Cn);
+            let share = test_share(product, None);
+            let quota = upstream_quota_from_account(&account, &share).unwrap();
+            assert_eq!(serde_json::to_value(&quota).unwrap(), fixture);
+            // Same frozen wire digest is checked by the independent Router reader.
+            assert_eq!(
+                hex::encode(Sha256::digest(serde_json::to_vec(&quota).unwrap())),
+                "3c15dd018d21c15638a93b134a42c76d23cccda145a1a2b51fe1ee6faefb7ea8"
+            );
+            assert_eq!(quota.tiers[1].used, Some(0.5));
+            assert_eq!(quota.provider_usage.unwrap().usage_today, Some(0.45));
+            account.quota.as_mut().unwrap().success = false;
+            account.quota.as_mut().unwrap().tiers.clear();
+            let failed = upstream_quota_from_account(&account, &share).unwrap();
+            assert_eq!(failed.status, "failed");
+            assert_eq!(failed.provider_usage.unwrap().usage_today, Some(0.45));
+        }
     }
 
     #[test]

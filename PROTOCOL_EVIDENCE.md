@@ -1,5 +1,44 @@
 # Protocol evidence policy
 
+## 2026-11-03 Buddy 资源包与官方用量展示一致性
+
+依据前一轮对同机 Server/Router 的只读快照和本仓投影代码，两个 Share 实际绑定同一个
+WorkBuddy CN 账号。资源包消耗 0.5 / 500 credits，官方请求汇总 0.45 credits / 132 次，
+采集时间相差约 30 分钟。旧 Server 隐藏动态资源包 tier，Router 丢失官方包名并把 0.1%
+取整为 0%，Share 协议也未传官方汇总，形成展示差异；不能仅凭差额证明上游具体计账原因。
+
+本轮在两仓独立实现安全汇总 DTO、显式 `buddyQuotaPresentationV1` 协商、官方名称/期限、
+小额精度及独立采集时间/范围/账号口径说明。缺值降为不可用，保留另一账本的可用证据；
+既有明细成功缓存与手动 force 保持。能力升级回填已 ACK Share，纯账单更新不改配置版本。
+原始请求/模型明细、prompt、账号标识和错误不能进入 Share 汇总，也不参与调度/计量。
+
+补充修复 Buddy 账号卡片第二行：旧 Server 未投影绑定账号 ID，Router 在缺少账号字段时
+回退为供应商名。现复用既有私有 `accountLabel` 传递绑定托管账号内部 ID，双产品／双站／
+三 App 共用相同投影，匹配产品、账号和身份代次；昵称／邮箱不替代 ID，缺值显示 `-`。
+不增加线格式字段，账号 ID 仍不进入用量汇总或公开市场身份。Router 的公开能力投影
+对 Buddy 省略 `accountHint`，市场旧缓存提示也不渲染，避免将私有账号字段带入公开卡片。
+
+实现仅使用本地代码及合成黄金夹具；没有新增外部协议研究、调用生产凭据或修改厂商
+origin。已核对 `docs/provider/coverage.md`，Provider/App 能力矩阵不变。旧 peer 省略新字段，
+普通 v7、reader 上限及市场最低版本均不提高。未部署；真实页面、双站账单联合验收仍待执行。
+
+最终验证：Server 全量 Rust 测试 4,222 项通过、3 项既有忽略，Node 审计 2,128 项、
+smoke 脚本单测 13 项和 Web 测试 364 项通过；包含 include! 源文件的格式检查、严格
+Clippy、类型／边界／Provider／Writer／文档审计、生产构建及 10 步本地启动冒烟通过。
+Router 覆盖受影响入口的 50 项 Rust 定向回归、19 项前端展示测试和 12 项 Node 审计通过，
+补充公开能力隔离的 5 项 Rust 回归及 84 项市场前端回归通过。格式、all-targets 检查、
+普通 Clippy 和类型检查通过。补充账号 ID 修复后的前端常规构建
+受 Google Fonts 网络失败影响；使用缓存的实际 Noto Sans SC 字体完成离线导出构建，
+仅用于本地验证，未修改生产字体配置，不将该次产物作为部署包。Router 商业全量测试
+未跑完；Clippy 保留既有告警，本轮改动行无诊断，不宣称 Router 全量或严格 Clippy 通过。
+
+整体 review 核对双产品／双站隔离、绑定账号 ID 及身份代次保护、安全字段白名单、独立失败与未知值、签名线格式、
+同版本动态落盘／重启恢复、所有出口的旧 peer 兼容及能力 TTL 恢复／撤回后的已 ACK
+Share 回填；新增展示字段不改变调度健康和本地计量，未发现本次改动遗留的本地阻断项。
+离线 readiness 为 failures=0、warnings=2、decision=blocked / blocked_inputs：真实输入
+和部署验收缺失，RUN_TESTS=0 的脚本内本地测试阶段如实记为跳过；上述独立验证成绩
+不作为发布批准。实施验证阶段未部署。
+
 ## 2026-11-03 Buddy 图片输入按目录授权
 
 本轮只读核对 `cli2api@fb2eb35b779770b2b3454bbdbe95e0b9ac6cfb70` 已提交的 `internal/providers/workbuddy/catalog.go` 与 `client_test.go`。前者读取上游布尔 `supportsImages`，后者验证用户消息与工具结果的 `image_url` 保留；这只构成字段和桥接行为证据，不能证明本 Server 的任一产品／站点／账号／实际模型已接受图片。源对象摘要固定在 `codebuddy-reference-delta.json.imageInputExtension`，默认审计不读取外部工作区。
