@@ -88,7 +88,11 @@ pub(crate) async fn share_router_runtime(
     let accounts = state.accounts.read().await.clone();
     let usage = state.usage.read().await.clone();
     let share = resolve_share_for_internal_request(&state, query.share_id.as_deref()).await?;
-    let descriptor = state.share_router_runtime_descriptor(&share, &providers, &accounts, &usage);
+    let mut descriptor =
+        state.share_router_runtime_descriptor(&share, &providers, &accounts, &usage);
+    state
+        .project_router_provider_identity(&mut descriptor)
+        .await;
     Ok(Json(runtime_response_from_descriptor(descriptor)))
 }
 

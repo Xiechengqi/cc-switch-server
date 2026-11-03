@@ -98,6 +98,12 @@ Router 的 quota 解析拒绝未知字段，因此契约扩展必须先升级 Ro
 
 访问模型细节见 [`../share/access-policy.md`](../share/access-policy.md)。
 
+独立展示扩展 `providerIdentityV1` 不提升 Share contractVersion。Router heartbeat 显式
+声明后，Server 才在 `appProviders` 写出真实 Family、单一分类、保存的名称/图标/颜色和
+catalog 版本。所有出站路径均省略旧 reader 不认识的字段；能力变化自动补发已有分享。
+该内容推进 descriptor ACK，不改变配置 revision、执行指纹或租约快照。
+详见 [供应商展示身份](../provider/presentation.md)。
+
 ## 8. 已下线接口
 
 Router 上的独立 Token Market 接口 `/v1/markets*`、`/v1/market/*`、`/_market/proxy/*` 一律返回 `410 Gone`（Router migration 19 归档、21 物理删除）。Server 侧对应的迁移代码保留在 `src/domain/sharing/legacy_token_market_migration.rs`，仅用于一次性历史数据清理，**不是**可用能力。

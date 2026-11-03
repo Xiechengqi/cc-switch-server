@@ -65,6 +65,15 @@ Run the checks manually at:
 
 ## Shares
 
+- [ ] 同一 Bundle 开启 Claude/Codex/Gemini 多个 API 后，Router Client 卡片连接按钮左侧
+  只显示一个供应商 Logo，且与 Server 保存的图标/颜色一致，App 图标独立显示。
+- [ ] 修改名称/Logo/颜色后自动同步；页面刷新、runtime 更新和进程重启不恢复旧值。
+- [ ] MiniMax、智谱、百炼、自定义等多 API 分享在市场只归入真实供应商的一个分类；
+  自定义选择 OpenAI Logo 仍属于自定义，不按协议或名称猜品牌。
+- [ ] 老 Server 缺身份时为未识别；历史多 Bundle 为混合，不归入任一绑定品牌。
+- [ ] 先升级 Router 后升级 Server，已有分享自动补发；已有租约仍有效，额度、健康历史、
+  快照和计费不因展示更新变化。此项须真实环境单独验收，不能由离线测试代替。
+
 - Share status, owner, tunnel/subdomain, provider binding, private/public-free access, authorized users and quotas, Router-managed grants, pending edits, and connect info are visible.
 - One Provider Bundle maps to at most one Share. All enabled Claude, Codex, and Gemini Surface bindings use that same Share record, subdomain, and Share URL; no per-App Share URL is created.
 - The Bundle editor keeps Remote Share outside the Surface tabs and uses the same bottom Save action. The Server derives bindings from enabled Surfaces instead of trusting App/provider binding fields from the browser.

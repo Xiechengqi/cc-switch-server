@@ -65,6 +65,7 @@ for file in "${shell_scripts[@]}"; do
 done
 
 echo "== provider audits =="
+node scripts/generate-provider-presentation.mjs --check
 # Validate generated source fingerprints before the longer receipt fixtures.
 # Otherwise one stale inventory can obscure unrelated negative-case assertions.
 node scripts/audit/audit-provider-phase0-contracts.mjs --check

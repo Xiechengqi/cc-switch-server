@@ -1016,6 +1016,27 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
     if !config.has_registered_router_identity() {
         return;
     }
+    // Startup/reader capability upgrades must backfill already-acknowledged Shares too.
+    // The descriptor ACK outbox handles failed sends without touching configRevision.
+    if state
+        .router_provider_identity_sync_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        let ids = state
+            .shares
+            .read()
+            .await
+            .shares
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = sync_shares_to_router(state, &ids).await {
+            state
+                .router_provider_identity_sync_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            tracing::warn!(%error, "provider identity descriptor backfill remains pending");
+        }
+    }
     retry_pending_router_share_deletes(state.clone()).await;
     if state.router_share_prune_retry_requested() {
         if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {

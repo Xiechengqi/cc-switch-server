@@ -897,6 +897,8 @@ pub struct ShareAppProvider {
     pub app: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_identity: Option<crate::domain::providers::presentation::ProviderIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_apps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1396,7 +1398,9 @@ pub fn descriptor_for_share_with_accounts_and_usage(
 
 /// Hashes only facts owned by the Server's static Share projection. Router-owned
 /// request counters and health observations are deliberately excluded, as are
-/// Provider display names and volatile subscription remaining-time values.
+/// Legacy Provider display names and volatile subscription remaining-time values.
+/// The explicitly negotiated providerIdentity is static display state: it must
+/// advance the descriptor ACK, without entering execution or health fingerprints.
 pub fn static_descriptor_fingerprint(
     descriptor: &ShareDescriptor,
     providers: &ProviderStore,
@@ -1619,6 +1623,7 @@ fn app_provider(input: AppProviderInput<'_>) -> ShareAppProvider {
         app: app.to_string(),
         bundle_id: crate::domain::providers::bundle::bundle_id(&provider.provider)
             .map(str::to_string),
+        provider_identity: crate::domain::providers::presentation::provider_identity(provider),
         supported_apps: crate::domain::providers::bundle::bundle_supported_apps(&provider.provider)
             .unwrap_or_else(|| vec![provider.app])
             .into_iter()

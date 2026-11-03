@@ -101,6 +101,11 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
 | `router/` | `namespace.rs` |
 | `settings/` | `config.rs`、`ui_settings.rs` |
 
+Provider 展示身份由 Registry + 本地 presentation 契约派生，作为协商后的
+`appProviders.*[].providerIdentity` 同步到 Router；与 App 协议、执行/健康指纹及租约
+不可变快照隔离。两产品独立消费版本化的同源图标数据，不共享或复制 UI 组件。
+详见 [供应商展示契约](../provider/presentation.md)。
+
 ### 3.4 clients/
 
 - `oauth/`：Claude / Codex / Gemini / Antigravity / Copilot / Cursor / Grok / Kimi / Kiro / Amazon Q / Qoder / CodeBuddy / Trae 的设备流、JWKS、刷新、模型目录与配额查询（26 个文件）。

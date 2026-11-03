@@ -988,7 +988,7 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool),
+    (bool, bool, bool, bool, bool, bool),
 );
 
 #[derive(Debug)]
@@ -1109,6 +1109,7 @@ pub struct ServerStateInner {
     router_share_runtime_refreshes: Mutex<BTreeSet<String>>,
     router_request_log_sync_wakeup: Notify,
     router_share_sync_wakeup: Notify,
+    router_provider_identity_sync_pending: std::sync::atomic::AtomicBool,
     periodic_backup_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
@@ -7375,6 +7376,7 @@ impl ServerStateInner {
             router_share_runtime_refreshes: Mutex::new(BTreeSet::new()),
             router_request_log_sync_wakeup: Notify::new(),
             router_share_sync_wakeup: Notify::new(),
+            router_provider_identity_sync_pending: std::sync::atomic::AtomicBool::new(false),
             periodic_backup_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
@@ -19100,10 +19102,22 @@ impl ServerStateInner {
                         capability.value_quotas(),
                         capability.cache_creation_ttl(),
                         capability.share_termination(),
+                        capability.provider_identity(),
                     ),
                 )
             });
-        *self.router_quota_capability.write().await = value;
+        let identity_changed = {
+            let mut previous = self.router_quota_capability.write().await;
+            let changed = previous.as_ref().map(|(base, id, _, c)| (base, id, c.5))
+                != value.as_ref().map(|(base, id, _, c)| (base, id, c.5));
+            *previous = value;
+            changed
+        };
+        if identity_changed {
+            self.router_provider_identity_sync_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.router_share_sync_wakeup.notify_one();
+        }
     }
 
     pub async fn router_supports_account_reset(&self) -> bool {
@@ -19134,6 +19148,29 @@ impl ServerStateInner {
                         .registered_router_identity()
                         .is_some_and(|identity| identity.installation_id == *id)
             })
+    }
+
+    pub(crate) async fn router_supports_provider_identity(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, c)| {
+                c.5 && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
+    }
+
+    /// Omit new nested fields for strict old Router readers, including runtime/claim paths.
+    pub(crate) async fn project_router_provider_identity(&self, descriptor: &mut ShareDescriptor) {
+        project_provider_identity_capability(
+            descriptor,
+            self.router_supports_provider_identity().await,
+        );
     }
 
     pub async fn router_supports_market_trials(&self) -> bool {
@@ -21172,6 +21209,20 @@ pub async fn pending_router_log_count(state: &ServerState) -> usize {
         .count()
 }
 
+fn project_provider_identity_capability(descriptor: &mut ShareDescriptor, supported: bool) {
+    if !supported {
+        for provider in descriptor
+            .app_providers
+            .claude
+            .iter_mut()
+            .chain(&mut descriptor.app_providers.codex)
+            .chain(&mut descriptor.app_providers.gemini)
+        {
+            provider.provider_identity = None;
+        }
+    }
+}
+
 pub(crate) async fn authoritative_share_descriptor(
     state: &ServerState,
     share_id: &str,
@@ -21202,6 +21253,9 @@ pub(crate) async fn authoritative_share_descriptor(
         } else {
             None
         };
+        state
+            .project_router_provider_identity(&mut descriptor)
+            .await;
         let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
         let account_reset_supported = state.router_supports_account_reset().await;
         anyhow::ensure!(
@@ -22421,6 +22475,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let account_reset_supported = state.router_supports_account_reset().await;
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
+        let provider_identity_supported = state.router_supports_provider_identity().await;
         let termination_archive_since_ms = if state.router_supports_share_termination().await {
             crate::repository::server_sqlite::market_termination::archive_since(&state.config_dir)?
         } else {
@@ -22484,6 +22539,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                 // Publish the durable archive on normal sync too, not only
                 // on explicit authoritative reads. Omit it for old Routers.
                 descriptor.termination_archive_since_ms = termination_archive_since_ms;
+                project_provider_identity_capability(&mut descriptor, provider_identity_supported);
                 let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
                 // v8 read-only capabilities also describe ordinary users, so
                 // a ready source can offer an explicit migration. These
@@ -23262,6 +23318,9 @@ async fn issue_share_tunnel_lease(
         Some(&usage),
     );
     let mut descriptor = descriptor;
+    state
+        .project_router_provider_identity(&mut descriptor)
+        .await;
     state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
     descriptor.subdomain = client::canonicalize_share_subdomain(&config, &descriptor.subdomain)?;
     let requested_subdomain = descriptor.subdomain.clone();
@@ -23287,6 +23346,77 @@ async fn issue_share_tunnel_lease(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn provider_identity_capability_is_scoped_expires_and_requests_backfill() {
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "identity-install").await;
+        assert!(!state.router_supports_provider_identity().await);
+        let config = state.config_snapshot().await;
+        let caps = || client::RouterShareCapabilities {
+            share_contract_version: 10,
+            capabilities: vec!["providerIdentityV1".into()],
+        };
+        state.record_router_quota_capability(&config, caps()).await;
+        assert!(state.router_supports_provider_identity().await);
+        assert!(state
+            .router_provider_identity_sync_pending
+            .swap(false, AtomicOrdering::AcqRel));
+        state.record_router_quota_capability(&config, caps()).await;
+        assert!(!state
+            .router_provider_identity_sync_pending
+            .load(AtomicOrdering::Acquire));
+        state
+            .router_quota_capability
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .2 -= Duration::from_secs(301);
+        assert!(!state.router_supports_provider_identity().await);
+        state.record_router_quota_capability(&config, caps()).await;
+        configure_registered_test_router(&state, "http://127.0.0.1:8", "different-install").await;
+        assert!(!state.router_supports_provider_identity().await);
+    }
+
+    #[test]
+    fn provider_identity_capability_projection_and_display_ack_are_independent_of_config() {
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../assets/generated/provider-identity-fixtures.json"
+        ))
+        .unwrap();
+        let fixture = fixtures
+            .iter()
+            .find(|f| f["name"] == "family.minimax_cn")
+            .unwrap();
+        let mut descriptor = ShareDescriptor {
+            app_providers: serde_json::from_value(fixture["appProviders"].clone()).unwrap(),
+            config_revision: 42,
+            ..Default::default()
+        };
+        let store = ProviderStore::default();
+        let first = static_descriptor_fingerprint(&descriptor, &store).unwrap();
+        project_provider_identity_capability(&mut descriptor, true);
+        assert_eq!(
+            first,
+            static_descriptor_fingerprint(&descriptor, &store).unwrap()
+        );
+        for p in &mut descriptor.app_providers.codex {
+            let identity = p.provider_identity.as_mut().unwrap();
+            identity.display_name = "Renamed MiniMax".into();
+            identity.icon = Some("openai".into());
+            identity.icon_color = Some("#123456".into());
+        }
+        assert_ne!(
+            first,
+            static_descriptor_fingerprint(&descriptor, &store).unwrap()
+        );
+        assert_eq!(descriptor.config_revision, 42);
+        project_provider_identity_capability(&mut descriptor, false);
+        let json = serde_json::to_string(&descriptor).unwrap();
+        assert!(!json.contains("providerIdentity"));
+        assert!(json.contains("appProviders"));
+    }
+
     include!("state/buddy_catalog_tests.rs");
     include!("state/share_value_quota/tariff_state_tests.rs");
     use std::fs;

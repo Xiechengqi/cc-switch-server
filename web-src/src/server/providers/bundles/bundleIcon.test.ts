@@ -21,9 +21,11 @@ describe("Custom Provider icon", () => {
     }
   });
 
-  it("keeps other family defaults unchanged", () => {
+  it("uses the shared catalog for all family defaults", () => {
     expect(resolveBundleIcon("family.workbuddy_oauth")).toBe("workbuddy");
     expect(resolveBundleIcon("family.codebuddy_oauth")).toBe("codebuddy");
-    expect(resolveBundleIcon("family.openai_oauth")).toBeUndefined();
+    expect(resolveBundleIcon("family.openai_oauth")).toBe("openai");
+    expect(resolveBundleIcon("family.minimax_cn")).toBe("minimax");
+    expect(resolveBundleIcon("family.not_known")).toBeUndefined();
   });
 });

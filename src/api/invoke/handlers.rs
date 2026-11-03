@@ -1527,12 +1527,15 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
 
     let mut remote_subdomain_claimed = false;
     if subdomain_changed && previous.is_some() && config.has_registered_router_identity() {
-        let descriptor = descriptor_for_share_with_accounts_and_usage(
+        let mut descriptor = descriptor_for_share_with_accounts_and_usage(
             &staged_share,
             &providers,
             Some(&accounts),
             Some(&usage),
         );
+        state
+            .project_router_provider_identity(&mut descriptor)
+            .await;
         let http_client = state.http_client().await;
         if let Err(error) =
             crate::clients::router::client::claim_share_subdomain(&http_client, &config, descriptor)
@@ -1791,12 +1794,15 @@ pub(in crate::api) async fn web_save_provider_share(
             let providers = state.providers.read().await.clone();
             let accounts = state.accounts.read().await.clone();
             let usage = state.usage.read().await.clone();
-            let descriptor = descriptor_for_share_with_accounts_and_usage(
+            let mut descriptor = descriptor_for_share_with_accounts_and_usage(
                 &candidate,
                 &providers,
                 Some(&accounts),
                 Some(&usage),
             );
+            state
+                .project_router_provider_identity(&mut descriptor)
+                .await;
             let http_client = state.http_client().await;
             if let Err(error) = crate::clients::router::client::claim_share_subdomain(
                 &http_client,

@@ -1859,8 +1859,18 @@ mod tests {
         stored.provider.settings_config["env"]["OPENAI_API_KEY"] = json!("secret");
         let first = compile_runtime_plan(&stored, &accounts).unwrap();
         stored.provider.name = "Renamed".to_string();
+        stored
+            .provider
+            .extra
+            .insert("icon".into(), json!("minimax"));
+        stored
+            .provider
+            .extra
+            .insert("iconColor".into(), json!("#123456"));
+        stored.resource.revision += 1;
         let second = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(first.runtime_fingerprint, second.runtime_fingerprint);
+        assert_eq!(first.health_fingerprint(), second.health_fingerprint());
     }
 
     #[test]

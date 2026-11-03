@@ -37,6 +37,7 @@
 
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
+| [presentation.md](provider/presentation.md) | 权威 | 真实供应商身份、单一市场分类、同源图标资产与独立能力协商 |
 | [coverage.md](provider/coverage.md) | **生成** | 由 `scripts/audit/audit-provider-coverage.mjs` 生成，源为 `assets/contract/provider-coverage.json` |
 | [regression-matrix.md](provider/regression-matrix.md) | 权威 | Code Agent 回归矩阵的说明与判读口径；矩阵数据本身以同目录 `regression-matrix.json` 为准 |
 | [regression-matrix.json](provider/regression-matrix.json) | 数据 | 矩阵**真值来源**；`MATRIX_PATH` 默认值，被 `scripts/smoke/code-agent-matrix-summary.mjs`、`scripts/smoke/code-agent-regression.sh`、`scripts/static-checks.sh` 与 `scripts/release-readiness.sh` 消费 |

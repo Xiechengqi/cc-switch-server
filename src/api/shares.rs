@@ -842,13 +842,16 @@ pub(in crate::api) async fn update_share_subdomain(
     let expected_config_revision = current.config_revision;
     let mut candidate = current.clone();
     candidate.tunnel_subdomain = Some(subdomain.clone());
-    let descriptor = descriptor_for_share_with_accounts_and_usage(
+    let mut descriptor = descriptor_for_share_with_accounts_and_usage(
         &candidate,
         &providers,
         Some(&accounts),
         Some(&usage),
     );
     let mut remote_claimed = false;
+    state
+        .project_router_provider_identity(&mut descriptor)
+        .await;
     if config.has_registered_router_identity() {
         let http_client = state.http_client().await;
         if let Err(error) =

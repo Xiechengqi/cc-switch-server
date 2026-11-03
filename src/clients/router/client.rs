@@ -972,6 +972,9 @@ pub struct RouterShareCapabilities {
 }
 
 impl RouterShareCapabilities {
+    pub fn provider_identity(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "providerIdentityV1")
+    }
     pub fn share_termination(&self) -> bool {
         self.capabilities.iter().any(|c| c == "shareTerminationV1")
     }

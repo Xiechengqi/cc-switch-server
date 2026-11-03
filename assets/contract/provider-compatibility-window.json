@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/runtime.rs",
-      "sha256": "f04f58158252775b8810a51f1df77844b51fe30fa1963a9b5102c3075243e0cf"
+      "sha256": "29cee5d4a3e64a1a4e9008bfcbc17908cb71506ac8c8765cb916ebdc33d4a247"
     },
     {
       "path": "src/domain/providers/store.rs",
