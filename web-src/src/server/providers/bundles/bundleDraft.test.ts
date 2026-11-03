@@ -7,12 +7,10 @@ import type {
 } from "@/lib/api/providers";
 import { customAuthSchemesForProtocol, familyById, profileById, providerRegistry } from "@/server/providerRegistry";
 import {
-  applyCustomRecipeToBundleDraft,
   automaticBundleProbeApp,
   bundleProbeModel,
   changeModelPolicyScope,
   createProviderBundleDraft,
-  customRecipeMatchesBundleDraft,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
   familyCredentialSlots,
@@ -521,7 +519,7 @@ describe("Provider Bundle drafts", () => {
     });
   });
 
-  it("materializes the Anthropic bearer relay as a Custom HTTP recipe", () => {
+  it("supports manual Anthropic Bearer configuration while retaining the compatibility recipe", () => {
     expect(familyById("family.claude_bearer_relay")).toBeUndefined();
     expect(
       providerRegistry.profiles.some(
@@ -531,18 +529,32 @@ describe("Provider Bundle drafts", () => {
     const recipe = providerRegistry.customRecipes.find(
       (candidate) => candidate.recipeId === "claude.anthropic_bearer_relay",
     )!;
-    const family = familyById("family.custom_http")!;
-    const draft = applyCustomRecipeToBundleDraft(
-      createProviderBundleDraft(family),
-      recipe,
+    expect(recipe).toMatchObject({
+      profileId: "claude.custom_http",
+      compatibilityProviderType: "claude_auth",
+      binding: { upstreamProtocol: "anthropic_messages", authScheme: "bearer" },
+    });
+    const draft = changeModelPolicyScope(
+      createDraftForSelectedFamily(familyById("family.custom_http")!),
+      "global",
     );
+    draft.modelPolicy = "passthrough";
+    for (const surface of draft.surfaces) {
+      surface.enabled = surface.app === "claude";
+      if (surface.enabled) {
+        surface.customBinding = {
+          upstreamProtocol: "anthropic_messages",
+          authScheme: "bearer",
+        };
+        surface.authMode = "manual";
+      }
+    }
 
-    expect(customRecipeMatchesBundleDraft(draft, recipe)).toBe(true);
     expect(draft).toMatchObject({
-      name: "Anthropic Bearer Relay",
+      name: "Custom Provider",
       websiteUrl: "",
-      icon: "anthropic",
-      iconColor: "#D4915D",
+      icon: "custom",
+      iconColor: undefined,
       modelPolicyScope: "global",
       modelPolicy: "passthrough",
     });
@@ -1059,20 +1071,38 @@ describe("Provider Bundle drafts", () => {
     });
   });
 
-  it("applies the first Custom HTTP recipe when creating a selected Family", () => {
-    const draft = createDraftForSelectedFamily(
-      familyById("family.custom_http")!,
+  it("creates Custom with neutral identity and Registry-owned defaults", () => {
+    const family = familyById("family.custom_http")!;
+    const draft = createDraftForSelectedFamily(family);
+    expect(draft).toMatchObject({
+      name: "Custom Provider",
+      icon: "custom",
+      websiteUrl: "",
+      testApp: "codex",
+    });
+    expect(
+      draft.surfaces.map(({ app, profileId, enabled }) => ({
+        app, profileId, enabled,
+      })),
+    ).toEqual(
+      family.surfaces.map(({ app, profileId, defaultEnabled }) => ({
+        app,
+        profileId,
+        enabled: defaultEnabled,
+      })),
     );
     expect(
-      customRecipeMatchesBundleDraft(draft, providerRegistry.customRecipes[0]!),
+      draft.surfaces.every((surface) => surface.authMode === "recommended"),
     ).toBe(true);
     expect(
-      draft.surfaces.find((surface) => surface.app === "claude")?.enabled,
-    ).toBe(true);
-    expect(
-      draft.surfaces
-        .filter((surface) => surface.app !== "claude")
-        .every((surface) => !surface.enabled),
-    ).toBe(true);
+      draft.surfaces.find((surface) => surface.app === "claude")?.customBinding,
+    ).toEqual({
+      upstreamProtocol: "anthropic_messages",
+      authScheme: "api_key",
+    });
+    expect(toProviderBundleWriteDraft(draft)).toMatchObject({
+      name: "Custom Provider",
+      icon: "custom",
+    });
   });
 });

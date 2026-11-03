@@ -150,6 +150,22 @@ describe("Server Provider profile drafts", () => {
     expect(serializedSecrets(draft.settingsConfig)).toEqual([]);
   });
 
+  it("uses neutral Custom Provider identity for all Custom App profiles", () => {
+    const customProfiles = creatable.filter(
+      (profile) => profile.formComposition === "custom",
+    );
+    expect(customProfiles.map((profile) => profile.app).sort()).toEqual([
+      "claude", "codex", "gemini",
+    ]);
+    for (const profile of customProfiles) {
+      expect(createDraftForProfile(profile), profile.profileId).toMatchObject({
+        name: "Custom Provider",
+        websiteUrl: "",
+        icon: "custom",
+      });
+    }
+  });
+
   it("has an icon-selector preset for every non-custom creatable profile", () => {
     for (const profile of creatable.filter(
       (item) => item.formComposition !== "custom",

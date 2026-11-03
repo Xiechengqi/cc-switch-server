@@ -137,6 +137,8 @@ Buddy 的固定模型表单通过受认证的 `fetch_buddy_account_models` Web i
 
 Custom 认证推荐由 Registry 的 `defaultProtocol` / `defaultAuthSchemes` 权威声明，前端仅在新建或明确选择推荐时解析；保存的是具体 `customBinding`，编辑已保存记录时固定保留，不在运行时跟随新默认值切换。高级兼容设置默认折叠，普通密钥输入统一称为 API Key。纯 domain 的 `static_auth_carrier` 同时服务转发、分享同源校验及脱敏诊断，既有 v1 source digest 和容量池算法不变。
 
+Custom 新建显示名默认 `Custom Provider`，使用中性的滑杆图标，新建和编辑页面均不提供“快捷预设”。启用 App 与协议/认证默认值仍以 Registry 为准，接口启用、上游协议、高级认证兼容设置和模型策略通过各自的表单明确配置，不通过连接模板批量覆盖。Registry 中的 Custom recipe 仅保留为兼容声明和覆盖证据，不作为 UI 操作入口；`claude_auth` 等协议能力不受影响。既有名称、图标、绑定、模型策略与凭据不做自动迁移，缺失 Custom 图标仅在展示层使用默认图标。
+
 Web UI 只以本仓库产品需求、Server API 和 `assets/contract/web-runtime-contract.json` 为实现依据；禁止从 cc-switch 或其他外部项目批量复制组件、样式、locale 与页面结构。
 
 ### 4.4 自动模型健康检查

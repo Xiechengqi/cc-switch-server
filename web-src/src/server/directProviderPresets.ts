@@ -1584,7 +1584,8 @@ export const serverProviderPresets: Readonly<
     "iconColor": "#FF6900"
   },
   "claude.custom_http": {
-    "name": "Custom",
+    "name": "Custom Provider",
+    "icon": "custom",
     "websiteUrl": "",
     "notes": "",
     "settingsConfig": {
@@ -1599,7 +1600,8 @@ export const serverProviderPresets: Readonly<
     "category": "custom"
   },
   "codex.custom_http": {
-    "name": "Custom",
+    "name": "Custom Provider",
+    "icon": "custom",
     "websiteUrl": "",
     "notes": "",
     "settingsConfig": {
@@ -1614,7 +1616,8 @@ export const serverProviderPresets: Readonly<
     "category": "custom"
   },
   "gemini.custom_http": {
-    "name": "Custom",
+    "name": "Custom Provider",
+    "icon": "custom",
     "websiteUrl": "",
     "notes": "",
     "settingsConfig": {

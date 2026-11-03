@@ -1,5 +1,6 @@
 import claude from "./claude.svg?raw";
 import anthropic from "./anthropic.svg?raw";
+import custom from "./custom.svg?raw";
 import openai from "./openai.svg?raw";
 import gemini from "./gemini.svg?raw";
 import deepseek from "./deepseek.svg?raw";
@@ -75,6 +76,7 @@ import { IconMetadata, iconMetadata } from "./metadata";
 export const icons: Record<string, string> = {
   claude,
   anthropic,
+  custom,
   openai,
   gemini,
   deepseek,

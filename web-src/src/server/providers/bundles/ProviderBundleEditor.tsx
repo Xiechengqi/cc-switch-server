@@ -86,7 +86,6 @@ import {
 import {
   customPolicyForProfile,
   customAuthSchemesForProtocol,
-  customRecipesForFamily,
   driverForProfile,
   familyById,
   profileById,
@@ -126,12 +125,10 @@ import {
   type ProviderBundleShareDraft,
 } from "./bundleShare";
 import {
-  applyCustomRecipeToBundleDraft,
   automaticBundleProbeApp,
   bundleProbeModel,
   BUNDLE_TEST_APP_ORDER,
   changeModelPolicyScope,
-  customRecipeMatchesBundleDraft,
   defaultUpstreamModelForFamily,
   duplicateProviderBundleDraft,
   editProviderBundleDraft,
@@ -1401,10 +1398,6 @@ export function ProviderBundleEditor({
   const persisted =
     (Boolean(bundle) && !duplicate) || draft.expectedRevision !== undefined;
   const family = familyById(draft.familyId) ?? initialFamily;
-  const customRecipes = customRecipesForFamily(family);
-  const activeCustomRecipe = customRecipes.find((recipe) =>
-    customRecipeMatchesBundleDraft(draft, recipe),
-  );
   const identityEditable = providerBundleIdentityEditable(family);
   const [activeApp, setActiveApp] = useState<CoreProviderApp>(
     draft.surfaces[0]?.app ?? "claude",
@@ -2200,41 +2193,6 @@ export function ProviderBundleEditor({
                     </p>
                   ) : null}
                 </div>
-                {customRecipes.length ? (
-                  <div className="space-y-2 md:col-span-2">
-                    <Label>{t("providerBundle.quickPreset")}</Label>
-                    <Select
-                      value={activeCustomRecipe?.recipeId ?? ""}
-                      onValueChange={(recipeId) => {
-                        const recipe = customRecipes.find(
-                          (candidate) => candidate.recipeId === recipeId,
-                        );
-                        if (!recipe) return;
-                        setDraft((current) =>
-                          applyCustomRecipeToBundleDraft(current, recipe),
-                        );
-                        const recipeProfile = profileById(recipe.profileId);
-                        if (recipeProfile) setActiveApp(recipeProfile.app);
-                      }}
-                    >
-                      <SelectTrigger>
-                        <SelectValue
-                          placeholder={t("providerBundle.manualConfiguration")}
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {customRecipes.map((recipe) => (
-                          <SelectItem
-                            key={recipe.recipeId}
-                            value={recipe.recipeId}
-                          >
-                            {t(recipe.labelKey, { defaultValue: recipe.label })}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ) : null}
                 <div className="space-y-2">
                   <Label>{t("serverProviderForm.basic.name")}</Label>
                   <Input

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ProviderBundleView } from "@/lib/api/providers";
+import type { ProviderBundleView, ProviderBundleWriteDraft } from "@/lib/api/providers";
 import type { ManagedAuthAccount } from "@/lib/api/auth";
 import { familyById } from "@/server/providerRegistry";
 import i18n from "@/i18n";
@@ -74,6 +74,111 @@ beforeEach(() => {
 });
 
 describe("Provider Bundle editor save stages", () => {
+  it("starts Custom creation with neutral identity and no connection preset", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}>
+        <ProviderBundleEditor onSaved={mocks.onSaved} onCancel={() => {}} />
+      </QueryClientProvider>));
+      const familyLogo = Array.from(container.querySelectorAll("[title]"))
+        .find((element) => element.getAttribute("title") === i18n.t("providerBundle.familyCustom"));
+      expect(familyLogo?.querySelectorAll("svg circle").length).toBe(3);
+      const next = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent === i18n.t("common.next"))!;
+      await act(async () => next.click());
+      expect(container.querySelector<HTMLInputElement>("#bundle-field-name")?.value).toBe("Custom Provider");
+      expect(container.querySelector('[title="Custom Provider"]')?.querySelectorAll("svg circle").length).toBe(3);
+      expect(container.querySelector("#provider-bundle-quick-preset")).toBeNull();
+      expect(container.querySelector("#provider-bundle-quick-preset-hint")).toBeNull();
+      expect(container.textContent).not.toContain("Anthropic Bearer Relay");
+      expect(mocks.upsertBundle).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      client.clear();
+      container.remove();
+    }
+  });
+
+  it("edits a legacy Anthropic Bearer relay without a preset or implicit configuration changes", async () => {
+    const bundle = fixture();
+    bundle.name = "Anthropic Bearer Relay";
+    bundle.websiteUrl = "https://relay.example";
+    bundle.icon = "anthropic";
+    bundle.iconColor = "#D4915D";
+    bundle.enabledApps = ["claude"];
+    bundle.testApp = "claude";
+    for (const resource of Object.values(bundle.surfaces)) {
+      if (!resource) continue;
+      const enabled = resource.app === "claude";
+      resource.providerType = enabled ? "claude_auth" : "custom";
+      resource.providerTypeId = resource.providerType;
+      resource.provider.name = bundle.name;
+      resource.provider.settingsConfig = {
+        env: enabled ? { ANTHROPIC_BASE_URL: "https://relay.example/v1" } : {},
+        modelMapping: { mode: "passthrough" },
+      };
+      resource.credentialConfigured = enabled;
+      resource.credentialSlots = enabled ? ["/settingsConfig/apiKey"] : [];
+    }
+    const saved = { ...bundle, notes: "Reviewed relay", revision: 2 };
+    mocks.upsertBundle.mockResolvedValue(saved);
+    mocks.shareSave.mockResolvedValue(undefined);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      await act(async () => root.render(<QueryClientProvider client={client}>
+        <ProviderBundleEditor bundle={bundle} onSaved={mocks.onSaved} onCancel={() => {}} />
+      </QueryClientProvider>));
+      expect(container.querySelector("#provider-bundle-quick-preset")).toBeNull();
+      expect(container.querySelector<HTMLInputElement>("#bundle-field-name")?.value).toBe(bundle.name);
+      expect(mocks.upsertBundle).not.toHaveBeenCalled();
+      const advanced = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent === i18n.t("providerBundle.authAdvanced"))!;
+      await act(async () => advanced.click());
+      expect(container.textContent).toContain("Authorization: Bearer");
+      expect(container.querySelector("#provider-bundle-quick-preset")).toBeNull();
+      await act(async () => {
+        const notes = container.querySelector<HTMLTextAreaElement>("textarea")!;
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(notes, saved.notes);
+        notes.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => saveButton().click());
+      expect(mocks.upsertBundle).toHaveBeenCalledTimes(1);
+      expect(mocks.upsertBundle).toHaveBeenCalledWith(expect.objectContaining({
+        name: bundle.name,
+        websiteUrl: bundle.websiteUrl,
+        icon: bundle.icon,
+        iconColor: bundle.iconColor,
+        notes: saved.notes,
+        modelPolicyScope: "global",
+        modelPolicy: "passthrough",
+        testApp: "claude",
+      }));
+      const write = mocks.upsertBundle.mock.calls[0]![0] as ProviderBundleWriteDraft;
+      expect(write.surfaces.map(({ app, enabled }) => ({ app, enabled })))
+        .toEqual([
+          { app: "claude", enabled: true },
+          { app: "codex", enabled: false },
+          { app: "gemini", enabled: false },
+        ]);
+      expect(write.surfaces[0]).toMatchObject({
+        endpoint: "https://relay.example/v1",
+        customBinding: { upstreamProtocol: "anthropic_messages", authScheme: "bearer" },
+        credentialPatches: { "/settingsConfig/apiKey": { action: "keep" } },
+      });
+      expect(mocks.onSaved).toHaveBeenCalledWith(saved);
+    } finally {
+      await act(async () => root.unmount());
+      client.clear();
+      container.remove();
+    }
+  });
+
   it("shows Buddy account labels and follows the upstream probe model instead of global defaults", async () => {
     for (const product of ["workbuddy_oauth", "codebuddy_oauth"] as const) {
       const family = familyById(`family.${product}`)!;

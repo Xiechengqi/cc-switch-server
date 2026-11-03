@@ -298,22 +298,3 @@ export function recommendedCustomAuth(
     ? scheme
     : undefined;
 }
-
-export function customRecipeById(
-  recipeId: string,
-): ProviderCustomRecipe | undefined {
-  return providerRegistry.customRecipes.find(
-    (recipe) => recipe.recipeId === recipeId,
-  );
-}
-
-export function customRecipesForFamily(
-  family: ProviderFamilySpec,
-): ProviderCustomRecipe[] {
-  const profileIds = new Set(
-    family.surfaces.map((surface) => surface.profileId),
-  );
-  return providerRegistry.customRecipes.filter((recipe) =>
-    profileIds.has(recipe.profileId),
-  );
-}

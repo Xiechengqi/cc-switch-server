@@ -5,6 +5,11 @@ export interface IconMetadata {
 }
 
 export const iconMetadata: Record<string, IconMetadata> = {
+  custom: {
+    name: "custom",
+    displayName: "Custom Provider",
+    defaultColor: "currentColor",
+  },
   claude: { name: "claude", displayName: "Claude", defaultColor: "#D4915D" },
   anthropic: {
     name: "anthropic",
