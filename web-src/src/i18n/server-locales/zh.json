@@ -49,27 +49,33 @@
     "authStatus": "CodeBuddy OAuth 认证",
     "cnSite": "中国站",
     "intlSite": "国际站",
-    "loginSite": "新登录账号站点",
+    "loginSite": "新登录／导入站点",
     "loginWithCodeBuddy": "使用 CodeBuddy 登录",
-    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。",
+    "siteHint": "保存供应商后记住此偏好，仅用于新登录和导入；已有账号保留各自的实际站点。",
+    "authCenterSiteHint": "仅在当前页面保留此选择，用于新登录和导入；已有账号保留各自的实际站点。",
     "importTitle": "导入凭据",
     "importHint": "所选产品和站点适用于每条记录。粘贴含 UID/domain 的双 token，或 account/auth 导出。预览只做本地校验，不请求供应商。",
     "importError": "导入失败，请核对产品、站点、双 token 和 UID。桌面加密导出请改用原生登录。",
     "previewImport": "预览导入",
-    "applyImport": "导入 {{count}} 个账号"
+    "applyImport": "导入 {{count}} 个账号",
+    "boundAccountSite": "当前绑定账号站点：{{site}}",
+    "unknownSite": "未知"
   },
   "workBuddyOauth": {
     "authStatus": "WorkBuddy OAuth 认证",
     "cnSite": "中国站",
     "intlSite": "国际站",
-    "loginSite": "新登录账号站点",
+    "loginSite": "新登录／导入站点",
     "loginWithCodeBuddy": "使用 WorkBuddy 登录",
-    "siteHint": "所选站点会永久绑定到导入账号，反代错误不会触发切站。",
+    "siteHint": "保存供应商后记住此偏好，仅用于新登录和导入；已有账号保留各自的实际站点。",
+    "authCenterSiteHint": "仅在当前页面保留此选择，用于新登录和导入；已有账号保留各自的实际站点。",
     "importTitle": "导入凭据",
     "importHint": "所选产品和站点适用于每条记录。粘贴含 UID/domain 的双 token，或 account/auth 导出。预览只做本地校验，不请求供应商。",
     "importError": "导入失败，请核对产品、站点、双 token 和 UID。桌面加密导出请改用原生登录。",
     "previewImport": "预览导入",
-    "applyImport": "导入 {{count}} 个账号"
+    "applyImport": "导入 {{count}} 个账号",
+    "boundAccountSite": "当前绑定账号站点：{{site}}",
+    "unknownSite": "未知"
   },
   "codexBankedReset": {
     "needsReconcile": "兑换结果待核对，不会自动消费新券；尚未确认共享周主桶重置。",
@@ -771,6 +777,8 @@
       }
     },
     "authCenter": {
+      "codeBuddyOauthDescription": "管理 CodeBuddy 账号，支持中国站和国际站",
+      "workBuddyOauthDescription": "管理 WorkBuddy 账号，支持中国站和国际站",
       "agyOauthDescription": "管理 Agy 订阅账号",
       "agyOauthTitle": "Agy OAuth",
       "antigravityOauthDescription": "管理 Antigravity 订阅账号",

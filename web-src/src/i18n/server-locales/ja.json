@@ -49,27 +49,33 @@
     "authStatus": "CodeBuddy OAuth 認証",
     "cnSite": "中国",
     "intlSite": "国際",
-    "loginSite": "新規ログインのサイト",
+    "loginSite": "新規ログイン／インポートのサイト",
     "loginWithCodeBuddy": "CodeBuddy でログイン",
-    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。",
+    "siteHint": "プロバイダーを保存すると、新規ログインとインポート用の設定が保存されます。既存アカウントのサイトは変わりません。",
+    "authCenterSiteHint": "この選択は現在のページでのみ保持され、新規ログインとインポートに使われます。既存アカウントのサイトは変わりません。",
     "importTitle": "認証情報をインポート",
     "importHint": "選択した製品とサイトは全レコードに適用されます。UID/domain とアクセストークン・更新トークン、または account/auth 形式を貼り付けてください。プレビューはローカル検証のみで、プロバイダーには接続しません。",
     "importError": "インポートできません。製品、サイト、トークンの組、UID を確認してください。暗号化されたデスクトップのエクスポートは通常のログインを使用してください。",
     "previewImport": "インポートをプレビュー",
-    "applyImport": "{{count}} 件のアカウントをインポート"
+    "applyImport": "{{count}} 件のアカウントをインポート",
+    "boundAccountSite": "連携中のアカウントのサイト：{{site}}",
+    "unknownSite": "不明"
   },
   "workBuddyOauth": {
     "authStatus": "WorkBuddy OAuth 認証",
     "cnSite": "中国",
     "intlSite": "国際",
-    "loginSite": "新規ログインのサイト",
+    "loginSite": "新規ログイン／インポートのサイト",
     "loginWithCodeBuddy": "WorkBuddy でログイン",
-    "siteHint": "選択したサイトはインポートしたアカウントに固定され、プロキシエラーによって切り替わることはありません。",
+    "siteHint": "プロバイダーを保存すると、新規ログインとインポート用の設定が保存されます。既存アカウントのサイトは変わりません。",
+    "authCenterSiteHint": "この選択は現在のページでのみ保持され、新規ログインとインポートに使われます。既存アカウントのサイトは変わりません。",
     "importTitle": "認証情報をインポート",
     "importHint": "選択した製品とサイトは全レコードに適用されます。UID/domain とアクセストークン・更新トークン、または account/auth 形式を貼り付けてください。プレビューはローカル検証のみで、プロバイダーには接続しません。",
     "importError": "インポートできません。製品、サイト、トークンの組、UID を確認してください。暗号化されたデスクトップのエクスポートは通常のログインを使用してください。",
     "previewImport": "インポートをプレビュー",
-    "applyImport": "{{count}} 件のアカウントをインポート"
+    "applyImport": "{{count}} 件のアカウントをインポート",
+    "boundAccountSite": "連携中のアカウントのサイト：{{site}}",
+    "unknownSite": "不明"
   },
   "codexBankedReset": {
     "needsReconcile": "交換結果の照合が必要です。新しい券を自動消費せず、共有週次枠のリセットは未確認です。",
@@ -771,6 +777,8 @@
       }
     },
     "authCenter": {
+      "codeBuddyOauthDescription": "中国・国際サイトの CodeBuddy アカウントを管理",
+      "workBuddyOauthDescription": "中国・国際サイトの WorkBuddy アカウントを管理",
       "agyOauthDescription": "Agy サブスクリプションアカウントを管理します",
       "agyOauthTitle": "Agy OAuth",
       "antigravityOauthDescription": "Antigravity サブスクリプションアカウントを管理",

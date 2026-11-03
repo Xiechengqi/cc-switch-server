@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { authListAccounts } from "@/lib/api/auth";
+import { resolveOauthQuotaQueryRoot } from "./oauthQuotaKeys";
 import {
   loadAccountCapabilities,
   type AccountManagerCapability,
@@ -111,16 +112,17 @@ function quotaQueryRoot(providerType: string): string | null {
     case "gemini_cli":
       return "google_gemini_oauth";
     case "ollama_cloud":
-      return "ollama";
     case "claude_oauth":
     case "codex_oauth":
     case "grok_oauth":
     case "kiro_oauth":
     case "amazon_q_oauth":
     case "qoder_cosy":
+    case "codebuddy_oauth":
+    case "workbuddy_oauth":
     case "antigravity_oauth":
     case "agy_oauth":
-      return providerType;
+      return resolveOauthQuotaQueryRoot(providerType);
     default:
       return null;
   }

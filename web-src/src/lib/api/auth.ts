@@ -53,6 +53,7 @@ export interface ManagedAuthAccount {
     site: QoderSite;
     credentialRail: QoderCredentialRail;
   } | null;
+  buddy?: { site: CodeBuddySite } | null;
   subscriptionExpiry: ManagedAuthSubscriptionExpiry;
 }
 

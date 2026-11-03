@@ -1,6 +1,7 @@
 import { invokeCommand, jsonFetch } from "@/lib/runtime";
 import type { Provider } from "@/types";
 import type { CoreProviderApp } from "@/server/providerRegistry";
+import type { CodeBuddySite } from "./auth";
 
 export interface ProviderSortUpdate {
   id: string;
@@ -324,6 +325,7 @@ export interface ProviderBundleView {
   notes?: string;
   icon?: string;
   iconColor?: string;
+  buddyLoginSite?: CodeBuddySite;
   modelPolicyScope: ProviderModelPolicyScope;
   testApp: CoreProviderApp;
   testModel?: string;
@@ -368,6 +370,7 @@ export interface ProviderBundleWriteDraft {
   notes?: string;
   icon?: string;
   iconColor?: string;
+  buddyLoginSite?: CodeBuddySite;
   modelPolicyScope: ProviderModelPolicyScope;
   modelPolicy?: ProviderModelPolicy;
   upstreamModel?: string;

@@ -2,7 +2,9 @@ import React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { authImportBuddyCredentials } from "@/lib/api/auth";
 import { oauthQuotaRootKey } from "@/lib/query/oauthQuotaKeys";
+import { useManagedAccountsQuery } from "@/lib/query/accounts";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslation } from "react-i18next";
 
@@ -19,8 +21,12 @@ import { DeviceCodeManagedAccountSection } from "./KimiOAuthSection";
 
 interface CodeBuddyOAuthSectionProps {
   authProvider?: "codebuddy_oauth" | "workbuddy_oauth";
+  context?: "provider" | "auth-center";
   className?: string;
   selectedAccountId?: string | null;
+  selectedAccountGeneration?: number;
+  loginSite?: CodeBuddySite;
+  onLoginSiteChange?: (site: CodeBuddySite) => void;
   onAccountSelect?: (accountId: string | null) => void;
   showLoggedInAccounts?: boolean;
 }
@@ -28,42 +34,93 @@ interface CodeBuddyOAuthSectionProps {
 export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
   className,
   authProvider = "codebuddy_oauth",
+  context = "provider",
+  selectedAccountGeneration,
+  loginSite,
+  onLoginSiteChange,
   ...props
 }) => {
   const { t } = useTranslation();
   const product = authProvider === "workbuddy_oauth" ? "WorkBuddy" : "CodeBuddy";
   const locale = product === "WorkBuddy" ? "workBuddyOauth" : "codeBuddyOauth";
-  const [site, setSite] = React.useState<CodeBuddySite>("intl");
+  const accountsQuery = useManagedAccountsQuery({
+    enabled: Boolean(props.selectedAccountId),
+  });
+  const account = accountsQuery.data?.find(
+    (account) =>
+      account.provider === authProvider &&
+      account.id === props.selectedAccountId &&
+      (selectedAccountGeneration == null ||
+        account.authIdentityGeneration === selectedAccountGeneration),
+  );
+  const accountSite = account?.buddy?.site;
+  const boundSite =
+    accountSite === "cn" || accountSite === "intl" ? accountSite : undefined;
+  const [localSite, setLocalSite] = React.useState<{
+    product: string;
+    site: CodeBuddySite;
+  }>();
+  const [loginBusy, setLoginBusy] = React.useState(false);
+  const [activeLoginSite, setActiveLoginSite] = React.useState<CodeBuddySite>();
+  const [activeImportSite, setActiveImportSite] = React.useState<CodeBuddySite>();
+  // Legacy records derive their display default without changing the draft.
+  // A late account query must never overwrite an explicit user selection.
+  const site =
+    activeLoginSite ??
+    activeImportSite ??
+    loginSite ??
+    (!onLoginSiteChange && localSite?.product === authProvider
+      ? localSite.site
+      : undefined) ??
+    boundSite ??
+    "intl";
+  const onLoginBusyChange = React.useCallback(
+    (busy: boolean, startedSite?: CodeBuddySite | null) => {
+      setLoginBusy(busy);
+      setActiveLoginSite(busy ? startedSite ?? undefined : undefined);
+    },
+    [],
+  );
 
   const queryClient = useQueryClient();
   const [credentials, setCredentials] = React.useState("");
   const [importBusy, setImportBusy] = React.useState(false);
   const [importError, setImportError] = React.useState<string | null>(null);
   const [previewCount, setPreviewCount] = React.useState<number | null>(null);
-  const importScope = React.useRef(`${authProvider}:${site}`);
-  importScope.current = `${authProvider}:${site}`;
+  const scopeKey = `${authProvider}:${site}`;
+  const importScope = React.useRef({ key: scopeKey });
+  if (importScope.current.key !== scopeKey) {
+    importScope.current = { key: scopeKey };
+  }
   React.useEffect(() => {
-    importScope.current = `${authProvider}:${site}`;
+    const scope = { key: scopeKey };
+    importScope.current = scope;
     setCredentials("");
     setPreviewCount(null);
     setImportError(null);
     setImportBusy(false);
-    return () => { importScope.current = "cancelled"; };
-  }, [authProvider, site]);
+    return () => {
+      if (importScope.current === scope) {
+        importScope.current = { key: "cancelled" };
+      }
+    };
+  }, [scopeKey]);
   const importCredentials = async () => {
+    if (importBusy || loginBusy) return;
     const scope = importScope.current;
+    setActiveImportSite(site);
     setImportBusy(true);
     setImportError(null);
     try {
       const result = await authImportBuddyCredentials(
-        authProvider, site, JSON.parse(credentials), previewCount === null,
+        authProvider,
+        site,
+        JSON.parse(credentials),
+        previewCount === null,
       );
-      if (importScope.current !== scope) return;
-      if (result.preview) {
-        setPreviewCount(result.accounts.length);
-      } else {
-        setCredentials("");
-        setPreviewCount(null);
+      // A successful write must refresh shared views even if its form was
+      // unmounted. Only updates to this form depend on the operation scope.
+      if (!result.preview) {
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ["managed-auth-status", authProvider] }),
           queryClient.invalidateQueries({ queryKey: ["managed-auth-accounts"] }),
@@ -72,7 +129,13 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
           queryClient.invalidateQueries({ queryKey: ["providers"] }),
           queryClient.invalidateQueries({ queryKey: ["share"] }),
         ]);
-        if (importScope.current !== scope) return;
+      }
+      if (importScope.current !== scope) return;
+      if (result.preview) {
+        setPreviewCount(result.accounts.length);
+      } else {
+        setCredentials("");
+        setPreviewCount(null);
         if (result.accounts.length === 1) props.onAccountSelect?.(result.accounts[0].id);
       }
     } catch {
@@ -80,23 +143,38 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
       setPreviewCount(null);
       setImportError(t(`${locale}.importError`, { defaultValue: "Import failed. Check the product, site, token pair and UID; encrypted desktop exports require native login." }));
     } finally {
-      if (importScope.current === scope) setImportBusy(false);
+      if (importScope.current === scope) {
+        setImportBusy(false);
+        setActiveImportSite(undefined);
+      }
     }
   };
 
   return (
     <div className={`space-y-4 ${className || ""}`}>
+      {props.selectedAccountId ? (
+        <p className="text-sm" role="status">
+          {t(`${locale}.boundAccountSite`, {
+            site: t(`${locale}.${boundSite ? `${boundSite}Site` : "unknownSite"}`),
+          })}
+        </p>
+      ) : null}
       <div className="space-y-2">
         <Label htmlFor={`${authProvider}-login-site`}>
           {t(`${locale}.loginSite`, {
-            defaultValue: "Site for new login",
+            defaultValue: "Site for new login / import",
           })}
         </Label>
         <Select
           value={site}
-          disabled={importBusy}
+          disabled={importBusy || loginBusy}
           onValueChange={(value) => {
-            if (value === "intl" || value === "cn") { setSite(value); setPreviewCount(null); }
+            if (importBusy || loginBusy) return;
+            if (value === "intl" || value === "cn") {
+              if (onLoginSiteChange) onLoginSiteChange(value);
+              else setLocalSite({ product: authProvider, site: value });
+              setPreviewCount(null);
+            }
           }}
         >
           <SelectTrigger id={`${authProvider}-login-site`}>
@@ -114,9 +192,11 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
           </SelectContent>
         </Select>
         <p className="text-xs text-muted-foreground">
-          {t(`${locale}.siteHint`, {
+          {t(`${locale}.${context === "auth-center" ? "authCenterSiteHint" : "siteHint"}`, {
             defaultValue:
-              "The selected site is permanently bound to the imported account and is never changed by proxy errors.",
+              context === "auth-center"
+                ? "This selection is kept on this page for new logins and imports only. Existing accounts keep their actual site."
+                : "Save the provider to remember this preference for new logins and imports. Existing accounts keep their actual site.",
           })}
         </p>
       </div>
@@ -124,13 +204,13 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
         <summary className="cursor-pointer text-sm">{t(`${locale}.importTitle`, { defaultValue: "Import credentials" })}</summary>
         <p className="text-xs text-muted-foreground">{t(`${locale}.importHint`, { defaultValue: "The selected product and site apply to every entry. Paste a token pair with UID/domain or an account/auth export. Preview validates locally; it does not contact the provider." })}</p>
         <Textarea
-          value={credentials} disabled={importBusy}
+          value={credentials} disabled={importBusy || loginBusy}
           autoComplete="off" spellCheck={false}
           aria-label={t(`${locale}.importTitle`, { defaultValue: "Import credentials" })}
           onChange={(event) => { setCredentials(event.target.value); setPreviewCount(null); setImportError(null); }}
         />
         {importError && <p role="alert" className="text-sm text-destructive">{importError}</p>}
-        <Button type="button" variant="outline" disabled={importBusy || !credentials.trim()} onClick={() => void importCredentials()}>
+        <Button type="button" variant="outline" disabled={importBusy || loginBusy || !credentials.trim()} onClick={() => void importCredentials()}>
           {previewCount === null
             ? t(`${locale}.previewImport`, { defaultValue: "Preview import" })
             : t(`${locale}.applyImport`, { defaultValue: "Import {{count}} accounts", count: previewCount })}
@@ -146,6 +226,16 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
           defaultValue: `Sign in with ${product}`,
         })}
         loginOptions={{ codeBuddySite: site }}
+        loginDisabled={importBusy}
+        onLoginBusyChange={onLoginBusyChange}
+        renderAccountMetadata={(account) => {
+          const actualSite = account.buddy?.site;
+          return (
+            <Badge variant="outline" className="shrink-0 text-xs">
+              {t(`${locale}.${actualSite === "cn" || actualSite === "intl" ? `${actualSite}Site` : "unknownSite"}`)}
+            </Badge>
+          );
+        }}
       />
     </div>
   );

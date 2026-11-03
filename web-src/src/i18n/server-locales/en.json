@@ -49,27 +49,33 @@
     "authStatus": "CodeBuddy OAuth authentication",
     "cnSite": "China",
     "intlSite": "International",
-    "loginSite": "Site for new login",
+    "loginSite": "Site for new login / import",
     "loginWithCodeBuddy": "Sign in with CodeBuddy",
-    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors.",
+    "siteHint": "Save the provider to remember this preference for new logins and imports. Existing accounts keep their actual site.",
+    "authCenterSiteHint": "This selection is kept on this page for new logins and imports only. Existing accounts keep their actual site.",
     "importTitle": "Import credentials",
     "importHint": "The selected product and site apply to every entry. Paste a token pair with UID/domain or an account/auth export. Preview validates locally; it does not contact the provider.",
     "importError": "Import failed. Check the product, site, token pair and UID; encrypted desktop exports require native login.",
     "previewImport": "Preview import",
-    "applyImport": "Import {{count}} accounts"
+    "applyImport": "Import {{count}} accounts",
+    "boundAccountSite": "Bound account site: {{site}}",
+    "unknownSite": "Unknown"
   },
   "workBuddyOauth": {
     "authStatus": "WorkBuddy OAuth authentication",
     "cnSite": "China",
     "intlSite": "International",
-    "loginSite": "Site for new login",
+    "loginSite": "Site for new login / import",
     "loginWithCodeBuddy": "Sign in with WorkBuddy",
-    "siteHint": "The selected site is permanently bound to the imported account and is never changed by proxy errors.",
+    "siteHint": "Save the provider to remember this preference for new logins and imports. Existing accounts keep their actual site.",
+    "authCenterSiteHint": "This selection is kept on this page for new logins and imports only. Existing accounts keep their actual site.",
     "importTitle": "Import credentials",
     "importHint": "The selected product and site apply to every entry. Paste a token pair with UID/domain or an account/auth export. Preview validates locally; it does not contact the provider.",
     "importError": "Import failed. Check the product, site, token pair and UID; encrypted desktop exports require native login.",
     "previewImport": "Preview import",
-    "applyImport": "Import {{count}} accounts"
+    "applyImport": "Import {{count}} accounts",
+    "boundAccountSite": "Bound account site: {{site}}",
+    "unknownSite": "Unknown"
   },
   "codexBankedReset": {
     "needsReconcile": "The outcome needs reconciliation. No new credit will be consumed automatically; the shared weekly reset has not been confirmed.",
@@ -771,6 +777,8 @@
       }
     },
     "authCenter": {
+      "codeBuddyOauthDescription": "Manage CodeBuddy accounts for China and International sites",
+      "workBuddyOauthDescription": "Manage WorkBuddy accounts for China and International sites",
       "agyOauthDescription": "Manage Agy subscription accounts",
       "agyOauthTitle": "Agy OAuth",
       "antigravityOauthDescription": "Manage Antigravity subscription accounts",

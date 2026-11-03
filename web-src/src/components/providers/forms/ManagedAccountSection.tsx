@@ -1,5 +1,6 @@
 import { AlertTriangle, LoaderCircle, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import type { CodeBuddySite } from "@/lib/api/auth";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -60,12 +61,18 @@ interface ManagedAccountSectionProps {
   providerType: string;
   selectedAccountId: string | null;
   onAccountSelect: (accountId: string | null) => void;
+  selectedAccountGeneration?: number;
+  buddyLoginSite?: CodeBuddySite;
+  onBuddyLoginSiteChange?: (site: CodeBuddySite) => void;
 }
 
 export function ManagedAccountSection({
   providerType,
   selectedAccountId,
   onAccountSelect,
+  selectedAccountGeneration,
+  buddyLoginSite,
+  onBuddyLoginSiteChange,
 }: ManagedAccountSectionProps) {
   const { t } = useTranslation();
   const capabilityQuery = useAccountCapabilitiesQuery();
@@ -163,9 +170,17 @@ export function ManagedAccountSection({
     case "qoder_cosy":
       return <QoderOAuthSection {...common} />;
     case "workbuddy_oauth":
-      return <CodeBuddyOAuthSection {...common} authProvider="workbuddy_oauth" />;
     case "codebuddy_oauth":
-      return <CodeBuddyOAuthSection {...common} />;
+      return (
+        <CodeBuddyOAuthSection
+          key={sectionProviderType}
+          {...common}
+          authProvider={sectionProviderType}
+          selectedAccountGeneration={selectedAccountGeneration}
+          loginSite={buddyLoginSite}
+          onLoginSiteChange={onBuddyLoginSiteChange}
+        />
+      );
     case "trae_solo":
       return <TraeOAuthSection {...common} />;
     case "deepseek_account":

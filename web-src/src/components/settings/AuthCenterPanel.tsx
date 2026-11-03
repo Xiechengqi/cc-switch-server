@@ -3,11 +3,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ChevronDown,
-  Github,
   LoaderCircle,
   RefreshCw,
   ShieldCheck,
-  Sparkles as SparklesIcon,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -26,25 +24,9 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import {
-  ClaudeIcon,
-  CodexIcon,
-  DeepSeekIcon,
-  GeminiIcon,
-} from "@/components/BrandIcons";
-import { CopilotAuthSection } from "@/components/providers/forms/CopilotAuthSection";
-import { AntigravityOAuthSection } from "@/components/providers/forms/AntigravityOAuthSection";
-import { AmazonQOAuthSection } from "@/components/providers/forms/AmazonQOAuthSection";
-import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSection";
-import { ClaudeOAuthSection } from "@/components/providers/forms/ClaudeOAuthSection";
-import { CursorOAuthSection } from "@/components/providers/forms/CursorOAuthSection";
-import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAccountSection";
-import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
-import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
-import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
-import { KimiOAuthSection } from "@/components/providers/forms/KimiOAuthSection";
-import { QoderOAuthSection } from "@/components/providers/forms/QoderOAuthSection";
-import { ProviderIcon } from "@/components/ProviderIcon";
+import type { CodeBuddySite } from "@/lib/api/auth";
+import type { BuddyProviderType } from "@/lib/api/providers";
+import { getAuthCenterProviders } from "./authCenterProviders";
 import { settingsApi } from "@/lib/api";
 import {
   accountCapabilitySupportsAuthCenter,
@@ -112,6 +94,9 @@ export function AuthCenterPanel({
   const { data: settings } = useSettingsQuery();
   const capabilityQuery = useAccountCapabilitiesQuery({ enabled: serverMode });
   const [centerOpen, setCenterOpen] = useState(false);
+  const [buddyLoginSites, setBuddyLoginSites] = useState<
+    Record<BuddyProviderType, CodeBuddySite>
+  >({ codebuddy_oauth: "intl", workbuddy_oauth: "intl" });
   const [savingQuotaSettings, setSavingQuotaSettings] = useState(false);
   const currentRefreshInterval = getOauthQuotaRefreshIntervalMinutes(settings);
   const currentRefreshTimeout = getOauthQuotaRefreshTimeoutSeconds(settings);
@@ -230,6 +215,9 @@ export function AuthCenterPanel({
           "google_gemini_oauth",
           "kiro_oauth",
           "amazon_q_oauth",
+          "qoder_cosy",
+          "codebuddy_oauth",
+          "workbuddy_oauth",
           "antigravity_oauth",
           "agy_oauth",
           "ollama",
@@ -434,173 +422,23 @@ export function AuthCenterPanel({
       ) : null}
 
       <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
-        {canShowAccountProvider("claude_oauth") ? (
-          <AuthProviderAccordionItem
-            value="claude"
-            icon={<ClaudeIcon size={20} />}
-            title="Claude Official"
-            description={t("settings.authCenter.claudeOauthDescription", {
-              defaultValue: "管理 Claude 官方订阅账号",
-            })}
-          >
-            <ClaudeOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("github_copilot") ? (
-          <AuthProviderAccordionItem
-            value="copilot"
-            icon={<Github className="h-5 w-5" />}
-            title="GitHub Copilot"
-            description={t("settings.authCenter.copilotDescription", {
-              defaultValue: "管理 GitHub Copilot 账号",
-            })}
-          >
-            <CopilotAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("codex_oauth") ? (
-          <AuthProviderAccordionItem
-            value="codex"
-            icon={<CodexIcon size={20} />}
-            title="OpenAI OAuth"
-            description={t("settings.authCenter.codexOauthDescription", {
-              defaultValue: "管理 ChatGPT 账号",
-            })}
-          >
-            <CodexOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("grok_oauth") ? (
-          <AuthProviderAccordionItem
-            value="grok"
-            icon={<ProviderIcon icon="grok" name="Grok" size={24} />}
-            title="Grok OAuth"
-            description={t("settings.authCenter.grokOauthDescription", {
-              defaultValue: "管理 Grok/xAI 订阅账号",
-            })}
-          >
-            <GrokOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("kiro_oauth") ? (
-          <AuthProviderAccordionItem
-            value="kiro"
-            icon={<ProviderIcon icon="kiro" name="Kiro" size={24} />}
-            title="Kiro OAuth"
-            description={t("settings.authCenter.kiroOauthDescription", {
-              defaultValue: "管理 Kiro AWS Builder ID 账号",
-            })}
-          >
-            <KiroOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("amazon_q_oauth") ? (
-          <AuthProviderAccordionItem
-            value="amazon-q"
-            icon={<ProviderIcon icon="aws" name="Amazon Q" size={24} />}
-            title={t("amazonQOauth.title")}
-            description={t("amazonQOauth.description")}
-          >
-            <AmazonQOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("kimi_code") ? (
-          <AuthProviderAccordionItem
-            value="kimi-code"
-            icon={<ProviderIcon icon="kimi" name="Kimi OAuth" size={24} />}
-            title="Kimi OAuth"
-            description={t("kimiOauth.description")}
-          >
-            <KimiOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("qoder_cosy") ? (
-          <AuthProviderAccordionItem
-            value="qoder-cosy"
-            icon={<ProviderIcon icon="qoder" name="Qoder OAuth" size={24} />}
-            title="Qoder OAuth"
-            description={t("qoderOauth.description")}
-          >
-            <QoderOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("cursor_oauth") ? (
-          <AuthProviderAccordionItem
-            value="cursor"
-            icon={<ProviderIcon icon="cursor" name="Cursor" size={24} />}
-            title="Cursor OAuth"
-            description={t("settings.authCenter.cursorOauthDescription", {
-              defaultValue: "管理 Cursor 订阅账号",
-            })}
-          >
-            <CursorOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("gemini_cli") ? (
-          <AuthProviderAccordionItem
-            value="gemini"
-            icon={<GeminiIcon size={20} />}
-            title="Google Gemini"
-            description={t("settings.authCenter.geminiOauthDescription", {
-              defaultValue: "管理 Google Gemini 账号",
-            })}
-          >
-            <GeminiOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("antigravity_oauth") ? (
-          <AuthProviderAccordionItem
-            value="antigravity"
-            icon={<SparklesIcon className="h-5 w-5" />}
-            title="Antigravity OAuth"
-            description={t("settings.authCenter.antigravityOauthDescription", {
-              defaultValue: "管理 Antigravity 订阅账号",
-            })}
-          >
-            <AntigravityOAuthSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("agy_oauth") ? (
-          <AuthProviderAccordionItem
-            value="agy"
-            icon={<SparklesIcon className="h-5 w-5" />}
-            title={t("settings.authCenter.agyOauthTitle", {
-              defaultValue: "Agy OAuth",
-            })}
-            description={t("settings.authCenter.agyOauthDescription", {
-              defaultValue: "管理 Agy 订阅账号",
-            })}
-          >
-            <AntigravityOAuthSection
-              showLoggedInAccounts
-              authProvider="agy_oauth"
-            />
-          </AuthProviderAccordionItem>
-        ) : null}
-
-        {canShowAccountProvider("deepseek_account") ? (
-          <AuthProviderAccordionItem
-            value="deepseek"
-            icon={<DeepSeekIcon size={20} />}
-            title="DeepSeek(Account)"
-            description={t("settings.authCenter.deepseekAccountDescription", {
-              defaultValue: "管理 DeepSeek 账号",
-            })}
-          >
-            <DeepSeekAccountSection showLoggedInAccounts />
-          </AuthProviderAccordionItem>
-        ) : null}
+        {getAuthCenterProviders(t, {
+          sites: buddyLoginSites,
+          onSiteChange: (product, site) =>
+            setBuddyLoginSites((current) => ({ ...current, [product]: site })),
+        })
+          .filter((entry) => canShowAccountProvider(entry.providerType))
+          .map((entry) => (
+            <AuthProviderAccordionItem
+              key={entry.providerType}
+              value={entry.value}
+              icon={entry.icon}
+              title={entry.title}
+              description={entry.description}
+            >
+              {entry.content}
+            </AuthProviderAccordionItem>
+          ))}
       </Accordion>
     </motion.div>
   );

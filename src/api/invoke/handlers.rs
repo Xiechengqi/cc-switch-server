@@ -2862,6 +2862,18 @@ pub(in crate::api) fn map_managed_auth_account(
                 "credentialRail": profile.credential_rail,
             })
         });
+    let buddy = account
+        .provider_type
+        .is_buddy_oauth()
+        .then(|| {
+            crate::domain::codebuddy::CodeBuddyAccountProfile::parse_for(
+                account.provider_type,
+                account.profile.as_ref(),
+            )
+            .ok()
+        })
+        .flatten()
+        .map(|profile| json!({ "site": profile.site }));
     json!({
         "id": account.id,
         "provider": provider_label,
@@ -2877,6 +2889,7 @@ pub(in crate::api) fn map_managed_auth_account(
         "workspaces": workspaces,
         "selected_workspace_id": selected_workspace_id,
         "qoder": qoder,
+        "buddy": buddy,
         "subscriptionExpiry": {
             "capability": subscription_expiry.capability,
             "rule": if supports_manual { account.manual_subscription_expiry_rule.as_ref() } else { None },

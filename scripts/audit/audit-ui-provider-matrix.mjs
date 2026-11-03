@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { auditAuthCenterCoverage } from "./auth-center-coverage.mjs";
 import process from "node:process";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const checkMode = process.argv.includes("--check");
 
 const files = {
+  authCenterProviders: path.join(repoRoot, "web-src/src/components/settings/authCenterProviders.tsx"),
+  authCenterPanel: path.join(repoRoot, "web-src/src/components/settings/AuthCenterPanel.tsx"),
+  webRuntimeContract: path.join(repoRoot, "assets/contract/web-runtime-contract.json"),
   adapters: path.join(repoRoot, "src/proxy/adapters.rs"),
   forwarder: path.join(repoRoot, "src/proxy/forwarder.rs"),
   providerMatrix: path.join(repoRoot, "src/domain/providers/matrix.rs"),
@@ -186,6 +190,17 @@ function audit() {
   const uiTypes = new Set(Object.values(providerTypesByApp).flat());
   const registryProviderTypes = new Set();
   const errors = [];
+  const authCenter = auditAuthCenterCoverage({
+    accountManagers,
+    variantToId,
+    registry: read(files.authCenterProviders),
+    knownEntryGaps: JSON.parse(read(files.webRuntimeContract)).authCenter?.knownEntryGaps,
+  });
+  errors.push(...authCenter.errors);
+  const authCenterPanel = read(files.authCenterPanel);
+  for (const marker of ["getAuthCenterProviders(t,", "canShowAccountProvider(entry.providerType)", "{entry.content}"]) {
+    if (!authCenterPanel.includes(marker)) errors.push(`AuthCenter registry is disconnected: ${marker}`);
+  }
 
   for (const [source, marker, label] of [
     [providerMeta, "provider.meta?.providerType === PROVIDER_TYPES.GROK_OAUTH", "managed OAuth recognition"],
@@ -410,6 +425,8 @@ function audit() {
       capabilityApps.length * adapterProviderTypes.length -
       Object.values(providerTypesByApp).reduce((total, types) => total + types.length, 0),
     accountProviderTypes: accountProviderTypes.length,
+    authCenterEntries: authCenter.entryCount,
+    authCenterKnownEntryGaps: authCenter.knownEntryGaps,
     registryFamilies: families.length,
     registryProfiles: profiles.length,
     webSchema: "registry-bundle-ui",
@@ -424,6 +441,7 @@ const message =
   `${summary.uiProviderPairs} UI app/provider pairs, ` +
   `${summary.diagnosticProviderPairs} diagnostic-only pairs, ` +
   `${summary.accountProviderTypes} account provider types, ` +
+  `${summary.authCenterEntries} AuthCenter entries (known gaps: ${summary.authCenterKnownEntryGaps.join(", ") || "none"}), ` +
   `${summary.registryFamilies} Registry families, ` +
   `${summary.registryProfiles} Registry Profiles, ` +
   `web schema ${summary.webSchema}`;

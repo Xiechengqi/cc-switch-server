@@ -1,7 +1,8 @@
 use super::*;
 use crate::domain::providers::bundle::{
-    ProviderBundleBindingChange, ProviderBundleDraftValidation,
+    bundle_buddy_login_site, ProviderBundleBindingChange, ProviderBundleDraftValidation,
     ProviderBundleDraftValidationRequest, ProviderBundleRebindPreview, ProviderBundleRuntimeChange,
+    BUDDY_LOGIN_SITE_FIELD,
 };
 
 impl ServerStateInner {
@@ -342,6 +343,29 @@ fn apply_bundle_candidate(
             code: "cc_switch_provider_bundle_custom_binding_conflict",
             message: format!("{} Custom Bundle binding changes from {:?} to {:?}; preview and apply the Bundle rebind-custom action", change.app.as_str(), change.before, change.after),
         });
+    }
+    // Older clients omit this optional management preference. Preserve it in
+    // the same candidate/commit as the rest of the Bundle, including preflight.
+    if draft.buddy_login_site.is_none() {
+        let previous = existing
+            .iter()
+            .map(|stored| bundle_buddy_login_site(&stored.provider))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(bundle_invalid)?;
+        let site = previous.first().copied().flatten();
+        if previous.iter().any(|previous| *previous != site) {
+            return Err(bundle_invalid(
+                "Provider Bundle login site metadata is inconsistent",
+            ));
+        }
+        if let Some(site) = site {
+            for provider_draft in &mut provider_drafts {
+                provider_draft
+                    .provider
+                    .extra
+                    .insert(BUDDY_LOGIN_SITE_FIELD.to_string(), serde_json::json!(site));
+            }
+        }
     }
     for provider_draft in &mut provider_drafts {
         provider_draft.expected_revision = existing

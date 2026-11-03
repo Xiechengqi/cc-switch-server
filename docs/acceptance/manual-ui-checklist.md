@@ -135,6 +135,10 @@ Run the checks manually at:
 
 - Manual/import-only account templates, refresh plan, quota refresh, Codex banked reset, Copilot/Kiro device flow, and OAuth preview/finish states are visible where supported.
 - In Server mode, AuthCenter and every managed-account Provider editor use `/api/accounts/capabilities` as the authority. Loading or request failure must not expose an unverified binding control; metadata-only, deprecated, missing, or `inferenceBindingSupported=false` account types remain hidden or disabled. Static API Key/AWS credentials stay in the Provider form.
+- CodeBuddy OAuth and WorkBuddy OAuth appear as separate AuthCenter entries with their local product logos, including before any account or Provider exists. Each uses the existing browser login/poll/cancel, credential preview/import, list/default/remove/logout operations and the correct product type.
+- AuthCenter Buddy login/import site choices are independent per product, survive collapsing/reopening within the page, and reset on leaving/reloading the page. They never save a Provider preference or rebind a Provider. Each account row shows its own validated China/International site (unknown remains unknown), alongside the existing safe account label.
+- Buddy login/import pins its starting site and locks competing actions. A completed import refreshes shared account/quota views even after closing its form, while obsolete responses cannot restore old credentials, previews, site choices, or account selection. Referenced-account removal/logout failures remain visible and preserve the account and bindings.
+- Saving AuthCenter quota-refresh settings invalidates both existing Buddy quota roots only when their authoritative capabilities advertise live refresh. AuthCenter coverage auditing reports the pre-existing `trae_solo` entry gap explicitly; it is not treated as implemented or silently excluded.
 - Antigravity OAuth and Agy OAuth appear as separate AuthCenter entries. Add/list/default/remove and quota refresh for `agy_oauth` update only Agy state/query rows and never display or mutate `antigravity_oauth` accounts as Agy.
 - DeepSeek Account shows an optional account label and a required masked access-token field, never an email/phone plus password login. Import creates a real persisted account, selects it when opened from a Provider form, and list/default/remove survive reload; neither the token nor a password field/value is echoed after import.
 - Quota refresh settings appear only when the capability matrix contains at least one `quotaCapability=live_refresh` entry with `supportsLiveQuotaRefresh=true`. Saving invalidates only authoritative live-refresh roots; imported-snapshot and cached-only accounts are not presented as live polling support.
@@ -168,3 +172,12 @@ Record manual findings in the relevant implementation note or PR/commit summary:
 - [ ] Router Codex 最小文字测试达到实际请求上限时提示连接成功并保留 response.incomplete；真实错误、截断和取消继续失败，Claude/Gemini 原测试正常。
 
 以上为待执行的人工验收项目，不代表本地单测或真实环境已通过。
+
+### Buddy 登录与导入站点
+
+- [ ] CodeBuddy / WorkBuddy 分别切换中国站和国际站，仅改站点即可保存；刷新、重新编辑、复制和 Server 重启后保持已保存偏好。保存失败时保留选择，取消编辑后保持原值。
+- [ ] 旧记录优先采用绑定账号实际站点，无可用账号资料时显示国际站；打开页面及异步加载账号均不产生未保存修改，手动选择不被晚到数据覆盖。
+- [ ] 当前绑定账号实际站点与新登录／导入偏好分别显示；切换偏好不会更换已有账号或模型，无效或世代不匹配的账号显示实际站点未知。
+- [ ] 登录启动、轮询和导入请求期间锁定站点，登录与导入互斥；成功、失败、取消后解锁。导入预览随站点／产品切换清除，离开后旧响应不影响新表单。
+
+以上站点交互仍待人工页面验收，本地单测不代替实际视口或真实双站登录验证。

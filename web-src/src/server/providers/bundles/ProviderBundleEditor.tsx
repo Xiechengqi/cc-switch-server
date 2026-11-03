@@ -2275,6 +2275,11 @@ export function ProviderBundleEditor({
                         credentialProfile.credentialPolicy.accountProviderType
                       }
                       selectedAccountId={draft.accountId || null}
+                      selectedAccountGeneration={draft.accountGeneration}
+                      buddyLoginSite={draft.buddyLoginSite}
+                      onBuddyLoginSiteChange={(buddyLoginSite) => {
+                        setDraft((current) => ({ ...current, buddyLoginSite }));
+                      }}
                       onAccountSelect={(accountId) => {
                         const account = accounts.find(
                           (item) => item.id === accountId,

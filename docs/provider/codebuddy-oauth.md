@@ -8,6 +8,10 @@
 
 本文定义 cc-switch-server 的 `codebuddy_oauth` Provider 边界。一个 CodeBuddy Provider 固定绑定一个 CodeBuddy Account；Server 不实现账号池、轮询、权重、按配额/并发选号、自动切站，或跨 Provider fallback。
 
+CodeBuddy / WorkBuddy 的供应商 Bundle 可选 `buddyLoginSite` 只保存新登录／导入的 `cn` / `intl` 偏好，沿用多 Surface 原子保存、revision 校验和旧请求省略保留规则。Web 默认顺序是保存偏好、精确绑定账号实际站点、国际站；派生默认不造成未保存修改。账号实际站点通过经过 profile 校验的 `ManagedAuthAccount.buddy.site` 单独只读显示，未知不猜测。登录／导入固定启动时站点并互斥；偏好不会覆盖已有 Account profile、运行时或模型策略。
+
+认证中心以服务端 capability 为显示门禁，分别提供 CodeBuddy OAuth / WorkBuddy OAuth 入口，复用现有登录、轮询、取消、导入和账号管理接口，无需先创建 Provider。这里的新登录／导入站点仅为页面内按产品隔离的选择，折叠后保留、离页或刷新后重置，不写 `buddyLoginSite` 或更改绑定；账号列表显示各自安全投影的实际站点与显示名称。导入成功即刷新共享视图，过时响应不再更新旧表单。认证中心入口注册表由 UI 审计对照 Rust 托管账号 ownership 检查，既有 Trae 缺口显式登记在 Web runtime contract 中。
+
 当前 `special.codebuddy_oauth` Driver contract revision 为 **2**。revision 2 增加 CodeBuddy 专属的空消息、空 delta 和 tools/tool_choice 线格式规范化；2026-09-18 增量复核又关闭了中断工具轮次、reasoning-only 历史和取消生命周期的离线缺口，2026-09-19 再完成三 Surface、双站恢复共用的请求生命周期内存预算。`assets/contract/codebuddy-reference-delta.json` 现为 append-only schema v2：原 11 个 v1 字段由独立 digest 固定，15 条不可变 observation 将 CB-01 至 CB-04、CB-N1 至 CB-N5、CORE-N1/N2、LIVE-N1 和三条拒绝边界映射到外部只读提交及本仓库 committed target object。
 
 ---

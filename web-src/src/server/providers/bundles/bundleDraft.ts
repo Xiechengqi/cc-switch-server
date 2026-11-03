@@ -8,6 +8,7 @@ import type {
   ProviderResource,
   ProviderRuntimePlan,
 } from "@/lib/api/providers";
+import type { CodeBuddySite } from "@/lib/api/auth";
 import {
   customPolicyForProfile,
   customAuthSchemesForProtocol,
@@ -125,6 +126,7 @@ export interface ProviderBundleEditorDraft {
   notes: string;
   icon?: string;
   iconColor?: string;
+  buddyLoginSite?: CodeBuddySite;
   expectedRevision?: number;
   clientRequestId?: string;
   accountId: string;
@@ -704,6 +706,7 @@ export function editProviderBundleDraft(
     notes: bundle.notes ?? "",
     icon: bundle.icon,
     iconColor: bundle.iconColor,
+    buddyLoginSite: bundle.buddyLoginSite,
     expectedRevision: bundle.revision,
     accountId: binding?.accountId ?? "",
     accountGeneration: binding?.authIdentityGeneration,
@@ -1415,6 +1418,7 @@ export function toProviderBundleWriteDraft(
     notes: draft.notes.trim() || undefined,
     icon: draft.icon,
     iconColor: draft.iconColor,
+    buddyLoginSite: draft.buddyLoginSite,
     modelPolicyScope: draft.modelPolicyScope,
     modelPolicy:
       draft.modelPolicyScope === "global" ? draft.modelPolicy : undefined,

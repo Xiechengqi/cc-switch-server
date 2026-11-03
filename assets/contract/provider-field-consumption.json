@@ -5122,6 +5122,24 @@
       "disposition": "migrate"
     },
     {
+      "locator": "provider.extra.buddyLoginSite",
+      "sourceFormat": "json_pointer",
+      "classification": "operation",
+      "secret": false,
+      "reader": [
+        "src/domain/providers/bundle.rs",
+        "web-src/src/server/providers/bundles/bundleDraft.ts"
+      ],
+      "writer": [
+        "src/state/provider_bundle.rs",
+        "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx"
+      ],
+      "targetOwner": "bundle_management",
+      "migration": "typed_bundle_preference",
+      "retirePhase": "never",
+      "disposition": "migrate"
+    },
+    {
       "locator": "provider.extra.*",
       "sourceFormat": "json_pointer",
       "classification": "unknown_flatten",

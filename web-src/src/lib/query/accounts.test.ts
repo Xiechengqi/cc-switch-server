@@ -152,6 +152,8 @@ describe("account capability selectors", () => {
       capability({ providerType: "gemini_cli" }),
       capability({ providerType: "agy_oauth" }),
       capability({ providerType: "qoder_cosy" }),
+      capability({ providerType: "codebuddy_oauth" }),
+      capability({ providerType: "workbuddy_oauth" }),
       capability({ providerType: "ollama_cloud" }),
       capability({
         providerType: "github_copilot",
@@ -171,6 +173,8 @@ describe("account capability selectors", () => {
       "google_gemini_oauth",
       "agy_oauth",
       "qoder_cosy",
+      "codebuddy_oauth",
+      "workbuddy_oauth",
       "ollama",
     ]);
   });

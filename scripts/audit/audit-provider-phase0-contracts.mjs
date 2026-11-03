@@ -284,6 +284,13 @@ function buildFieldConsumption(inventory) {
     persistedField("provider.extra.notes", "presentation"),
     persistedField("provider.extra.icon", "presentation"),
     persistedField("provider.extra.iconColor", "presentation"),
+    persistedField("provider.extra.buddyLoginSite", "operation", {
+      reader: ["src/domain/providers/bundle.rs", "web-src/src/server/providers/bundles/bundleDraft.ts"],
+      writer: ["src/state/provider_bundle.rs", "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx"],
+      targetOwner: "bundle_management",
+      migration: "typed_bundle_preference",
+      retirePhase: "never",
+    }),
     persistedField("provider.extra.*", "unknown_flatten", {
       targetOwner: "legacy_compat",
       migration: "block_s2_until_classified",

@@ -20,6 +20,10 @@ WorkBuddy 是腾讯办公 Agent 产品，与编程产品 CodeBuddy 分开注册�
 
 管理 REST：`POST /api/accounts/workbuddy/login/start|poll|cancel`；start 请求 `{ "site": "cn" }`，poll/cancel 请求 `{ "flowId": "..." }`。Web 通过现有 `auth_start_login` / `auth_poll` / `auth_cancel` 命令选择 `authProvider=workbuddy_oauth`，共用本仓 ManagedAccount UI。cookie jar、principal 绑定、TTL、poll lease、取消和容量上限沿用公共生命周期；另一产品的 route 不能读取、取消或完成该 flow。
 
+供应商 Bundle 的可选 `buddyLoginSite` 保存新登录／导入的 `cn` / `intl` 偏好，与 CodeBuddy 共用管理合同。保存采用现有原子提交及版本校验，旧请求省略时保留原值。旧记录默认采用精确绑定账号的实际站点，再回退国际站；派生值不写草稿。UI 独立显示实际账号站点，登录／导入期间固定本次站点并互斥锁定控件。此偏好不修改已有 Account 的站点、身份、目录或转发 endpoint。
+
+认证中心独立显示 WorkBuddy OAuth 与 CodeBuddy OAuth，沿用服务端 capability 门禁和已有账号接口。新登录／导入站点按产品保留在当前页面，折叠后保留、离页或刷新后重置，不修改供应商偏好或绑定；列表逐账号显示实际站点与安全显示名称，未知站点不推断。登录、导入及默认／删除／退出操作保持产品隔离和被引用账号保护；导入跨表单卸载成功时仍刷新共享缓存，但不能恢复旧表单状态。该接入只完善既有管理入口，不更改反代协议或账号身份。
+
 Account ID 使用独立 `workbuddy-` 命名空间，稳定身份是 product × site × uid × enterprise。旧 CodeBuddy ID 与绑定保持；domain 同站品牌轮换不触发跨产品合并。相同 refresh token 在两个产品之间只允许一个 owner，避免旋转刷新竞态。导入要求显式 providerType、accessToken、refreshToken、profile.site/domain/uid；`productPlatform` 必须与产品和站点匹配。Server 不能解密桌面 `$wbEncrypted` 导出，应重新原生登录。extraHeaders 和任意 endpoint 覆盖不参与身份。
 
 Claude Messages、OpenAI Chat / Responses、Gemini stream/nonstream 使用共同 canonical bridge，文本、工具和推理能力由精确实时目录决定。公开 `/v1/models` 和管理发现复用相同 runtime、空目录语义、128 项 singleflight、8 分钟 fresh / 24 小时 transient-only stale；产品 Profile / Driver 进入 fingerprint，Account providerType 进入身份 digest。认证/协议错误 fail closed。只允许一次业务输出提交前的同账号 401 恢复；错误、取消、DONE+EOF、实际 usage 与内存边界见 [CodeBuddy 合同](codebuddy-oauth.md)。图像、企业和未受审模型保持关闭。

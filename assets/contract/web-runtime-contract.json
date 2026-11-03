@@ -2,6 +2,18 @@
   "version": 1,
   "product": "cc-switch-server",
   "uiAutomationAllowed": false,
+  "authCenter": {
+    "capabilityEndpoint": "GET /api/accounts/capabilities",
+    "buddyLoginSiteScope": "page",
+    "buddyAccountSiteField": "buddy.site",
+    "knownEntryGaps": [
+      {
+        "providerType": "trae_solo",
+        "status": "known_gap",
+        "reason": "Pre-existing missing AuthCenter entry; the Provider editor is available. Tracked separately from CodeBuddy/WorkBuddy integration."
+      }
+    ]
+  },
   "shareUserTokenPeriods": {
     "wireValues": [
       "lifetime",

@@ -49,27 +49,33 @@
     "authStatus": "CodeBuddy OAuth 驗證",
     "cnSite": "中國站",
     "intlSite": "國際站",
-    "loginSite": "新登入帳號站點",
+    "loginSite": "新登入／匯入站點",
     "loginWithCodeBuddy": "使用 CodeBuddy 登入",
-    "siteHint": "所選站點會永久綁定到匯入帳號，反向代理錯誤不會觸發切站。",
+    "siteHint": "儲存供應商後記住此偏好，僅用於新登入和匯入；既有帳號保留各自的實際站點。",
+    "authCenterSiteHint": "此選擇僅保留於目前頁面，用於新登入和匯入；既有帳號保留各自的實際站點。",
     "importTitle": "匯入憑證",
     "importHint": "所選產品和站點適用於每筆記錄。貼上含 UID/domain 的雙 token，或 account/auth 匯出內容。預覽只做本機驗證，不連線至供應商。",
     "importError": "匯入失敗。請檢查產品、站點、雙 token 和 UID；加密的桌面匯出資料需要重新登入。",
     "previewImport": "預覽匯入",
-    "applyImport": "匯入 {{count}} 個帳號"
+    "applyImport": "匯入 {{count}} 個帳號",
+    "boundAccountSite": "目前綁定帳號站點：{{site}}",
+    "unknownSite": "未知"
   },
   "workBuddyOauth": {
     "authStatus": "WorkBuddy OAuth 驗證",
     "cnSite": "中國站",
     "intlSite": "國際站",
-    "loginSite": "新登入帳號站點",
+    "loginSite": "新登入／匯入站點",
     "loginWithCodeBuddy": "使用 WorkBuddy 登入",
-    "siteHint": "所選站點會永久綁定到匯入帳號，反向代理錯誤不會觸發切站。",
+    "siteHint": "儲存供應商後記住此偏好，僅用於新登入和匯入；既有帳號保留各自的實際站點。",
+    "authCenterSiteHint": "此選擇僅保留於目前頁面，用於新登入和匯入；既有帳號保留各自的實際站點。",
     "importTitle": "匯入憑證",
     "importHint": "所選產品和站點適用於每筆記錄。貼上含 UID/domain 的雙 token，或 account/auth 匯出內容。預覽只做本機驗證，不連線至供應商。",
     "importError": "匯入失敗。請檢查產品、站點、雙 token 和 UID；加密的桌面匯出資料需要重新登入。",
     "previewImport": "預覽匯入",
-    "applyImport": "匯入 {{count}} 個帳號"
+    "applyImport": "匯入 {{count}} 個帳號",
+    "boundAccountSite": "目前綁定帳號站點：{{site}}",
+    "unknownSite": "未知"
   },
   "codexBankedReset": {
     "needsReconcile": "兌換結果待核對，不會自動消耗新券；尚未確認共享週主額度重置。",
@@ -771,6 +777,8 @@
       }
     },
     "authCenter": {
+      "codeBuddyOauthDescription": "管理 CodeBuddy 帳號，支援中國站和國際站",
+      "workBuddyOauthDescription": "管理 WorkBuddy 帳號，支援中國站和國際站",
       "agyOauthDescription": "管理 Agy 訂閱帳號",
       "agyOauthTitle": "Agy OAuth",
       "antigravityOauthDescription": "管理 Antigravity 訂閱帳號",

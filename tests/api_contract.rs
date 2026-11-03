@@ -1,6 +1,8 @@
 // Integration tests for the HTTP API contract.
 // Extracted from src/api/mod.rs as part of R3.6/R3.7.
 
+include!("api_contract/buddy_login_site.rs");
+
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};

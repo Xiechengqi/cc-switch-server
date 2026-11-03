@@ -26,7 +26,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { copyText } from "@/lib/clipboard";
 import { managedAuthAccountLabel } from "@/lib/authBinding";
-import type { CodeBuddySite, ManagedAuthProvider } from "@/lib/api";
+import type { CodeBuddySite, ManagedAuthAccount, ManagedAuthProvider } from "@/lib/api";
 import {
   logoutAccountsAndClearSelection,
   removeAccountAndUpdateSelection,
@@ -46,6 +46,9 @@ interface DeviceCodeManagedAccountSectionProps extends KimiOAuthSectionProps {
   authProvider: ManagedAuthProvider;
   authStatusLabel: string;
   loginLabel: string;
+  renderAccountMetadata?: (account: ManagedAuthAccount) => React.ReactNode;
+  loginDisabled?: boolean;
+  onLoginBusyChange?: (busy: boolean, site?: CodeBuddySite | null) => void;
   userCodeHint?: string;
   loginOptions?: {
     codeBuddySite?: CodeBuddySite | null;
@@ -67,6 +70,9 @@ export const DeviceCodeManagedAccountSection: React.FC<
   authProvider,
   authStatusLabel,
   loginLabel,
+  renderAccountMetadata,
+  loginDisabled = false,
+  onLoginBusyChange,
   userCodeHint,
   loginOptions,
   manualCallback,
@@ -102,6 +108,10 @@ export const DeviceCodeManagedAccountSection: React.FC<
     submitOauthCallback,
     refetchStatus,
   } = useManagedAuth(authProvider);
+  const loginSiteRef = React.useRef<CodeBuddySite | null | undefined>();
+  React.useEffect(() => {
+    onLoginBusyChange?.(isAddingAccount, loginSiteRef.current);
+  }, [isAddingAccount, onLoginBusyChange]);
 
   React.useEffect(() => {
     if (!selectedAccountId && accounts.length === 1) {
@@ -130,6 +140,9 @@ export const DeviceCodeManagedAccountSection: React.FC<
   };
 
   const startLogin = () => {
+    if (isAddingAccount || loginDisabled) return;
+    loginSiteRef.current = loginOptions?.codeBuddySite;
+    onLoginBusyChange?.(true, loginSiteRef.current);
     addAccountWithMode(undefined, loginOptions);
   };
 
@@ -222,6 +235,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
                   <span className="truncate text-sm font-medium">
                     {managedAuthAccountLabel(account)}
                   </span>
+                  {renderAccountMetadata?.(account)}
                   {defaultAccountId === account.id ? (
                     <Badge variant="secondary" className="text-xs">
                       {t("accountAuth.defaultAccount")}
@@ -307,7 +321,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
           variant="outline"
           className="w-full"
           onClick={startLogin}
-          disabled={isAddingAccount}
+          disabled={isAddingAccount || loginDisabled}
         >
           {isAddingAccount ? (
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />

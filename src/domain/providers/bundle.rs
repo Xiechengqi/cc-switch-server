@@ -4,6 +4,8 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::domain::codebuddy::CodeBuddySite;
+
 use super::credentials::{CredentialPatch, ProviderView};
 use super::model::{AppKind, Provider, ProviderMeta};
 use super::model_routing::normalize_and_validate_provider_model_routing;
@@ -22,6 +24,7 @@ const SURFACE_ENABLED_FIELD: &str = "surfaceEnabled";
 const MODEL_POLICY_SCOPE_FIELD: &str = "modelPolicyScope";
 const TEST_APP_FIELD: &str = "testApp";
 const TEST_MODEL_FIELD: &str = "testModel";
+pub(crate) const BUDDY_LOGIN_SITE_FIELD: &str = "buddyLoginSite";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +84,8 @@ pub struct ProviderBundleView {
     pub icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buddy_login_site: Option<CodeBuddySite>,
     pub model_policy_scope: ModelPolicyScope,
     pub test_app: AppKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +169,9 @@ pub struct ProviderBundleWriteDraft {
     pub icon: Option<String>,
     #[serde(default)]
     pub icon_color: Option<String>,
+    /// Management preference for future login/import, never a runtime site override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buddy_login_site: Option<CodeBuddySite>,
     #[serde(default)]
     pub model_policy_scope: ModelPolicyScope,
     #[serde(default)]
@@ -294,6 +302,9 @@ impl ProviderBundleWriteDraft {
         }
         let family = family_by_id(&self.family_id)
             .with_context(|| format!("unknown Provider family {}", self.family_id))?;
+        if self.buddy_login_site.is_some() && !is_buddy_family(&self.family_id) {
+            bail!("buddyLoginSite is only supported by CodeBuddy and WorkBuddy Bundles");
+        }
         if self.surfaces.len() != family.surfaces.len() {
             bail!(
                 "Provider family {} requires exactly {} Surface drafts",
@@ -358,6 +369,9 @@ impl ProviderBundleWriteDraft {
         insert_optional_string(&mut extra, "notes", self.notes.as_deref());
         insert_optional_string(&mut extra, "icon", self.icon.as_deref());
         insert_optional_string(&mut extra, "iconColor", self.icon_color.as_deref());
+        if let Some(site) = self.buddy_login_site {
+            extra.insert(BUDDY_LOGIN_SITE_FIELD.to_string(), json!(site));
+        }
         extra.insert(BUNDLE_ID_FIELD.to_string(), Value::String(self.id.clone()));
         extra.insert(
             FAMILY_ID_FIELD.to_string(),
@@ -990,6 +1004,10 @@ impl ProviderBundleView {
             .context("Provider Bundle Surface has no explicit Bundle identity")?
             .to_string();
         let family_id = family_id_for_view(first)?;
+        let buddy_login_site = bundle_buddy_login_site(&first.provider)?;
+        if buddy_login_site.is_some() && !is_buddy_family(&family_id) {
+            bail!("buddyLoginSite is only supported by CodeBuddy and WorkBuddy Bundles");
+        }
         let name = first.provider.name.clone();
         let model_policy_scope = bundle_model_policy_scope(&first.provider)?
             .context("Provider Bundle Surface has no model policy scope")?;
@@ -1008,6 +1026,7 @@ impl ProviderBundleView {
                 || bundle_model_policy_scope(&view.provider)? != Some(model_policy_scope)
                 || bundle_test_model_override(&view.provider) != test_model.as_deref()
                 || provider_transport_override(&view.provider)? != transport
+                || bundle_buddy_login_site(&view.provider)? != buddy_login_site
             {
                 bail!("Provider Bundle Surface metadata is inconsistent");
             }
@@ -1097,6 +1116,7 @@ impl ProviderBundleView {
             notes: extra_string(provider, "notes"),
             icon: extra_string(provider, "icon"),
             icon_color: extra_string(provider, "iconColor"),
+            buddy_login_site,
             model_policy_scope,
             test_app,
             test_model,
@@ -1117,6 +1137,25 @@ pub fn bundle_id(provider: &Provider) -> Option<&str> {
 
 pub fn bundle_family_id(provider: &Provider) -> Option<&str> {
     extra_string_ref(provider, FAMILY_ID_FIELD)
+}
+
+fn is_buddy_family(family_id: &str) -> bool {
+    matches!(
+        family_id,
+        "family.codebuddy_oauth" | "family.workbuddy_oauth"
+    )
+}
+
+pub(crate) fn bundle_buddy_login_site(
+    provider: &Provider,
+) -> anyhow::Result<Option<CodeBuddySite>> {
+    provider
+        .extra
+        .get(BUDDY_LOGIN_SITE_FIELD)
+        .map(|value| {
+            serde_json::from_value(value.clone()).context("invalid Buddy login site preference")
+        })
+        .transpose()
 }
 
 pub fn bundle_supported_apps(provider: &Provider) -> Option<Vec<AppKind>> {
@@ -1345,6 +1384,7 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
+            buddy_login_site: None,
             model_policy_scope: ModelPolicyScope::Global,
             model_policy: Some(ModelPolicyKind::Single),
             upstream_model: Some("grok-4.6".to_string()),
@@ -1382,6 +1422,7 @@ mod tests {
             notes: None,
             icon: None,
             icon_color: None,
+            buddy_login_site: None,
             model_policy_scope: ModelPolicyScope::PerApp,
             model_policy: None,
             upstream_model: None,

@@ -131,6 +131,10 @@ Cursor 的 live h2 session 与 completed Responses context 是两个独立状态
 
 Buddy 的固定模型表单通过受认证的 `fetch_buddy_account_models` Web invoke 获取当前所选账号目录，支持尚未保存的新增和编辑草稿。预览作用域与 Provider 运行时作用域隔离，复用有界目录缓存和受审解析器；它不创建 Provider，也不保存模型选择。
 
+CodeBuddy / WorkBuddy Bundle 的可选 `buddyLoginSite` 是新登录／导入的管理偏好，只接受 `cn` / `intl`，随现有多 Surface 原子保存和 revision 校验落盘；旧请求省略时保留原值。反代仍使用绑定账号 profile 的实际站点，偏好不参与 runtime fingerprint 或账号身份。Web 依次使用保存偏好、精确匹配产品/账号/身份世代的 `ManagedAuthAccount.buddy.site`、国际站作为默认值，派生默认不写草稿；绑定账号实际站点单独只读显示，未知不猜测。登录与导入互斥，进行中的操作固定启动时站点。
+
+AuthCenter 的入口元数据与组件统一在类型化注册表中维护，并按 `/api/accounts/capabilities` 过滤；UI 矩阵审计对照 Rust 的托管账号 ownership 检查遗漏，既有 `trae_solo` 缺口以 `known_gap` 在 Web runtime contract 中登记，不能伪称已支持。CodeBuddy / WorkBuddy 使用各自入口和同一套已有认证组件；此处的站点选择仅在当前页面按产品隔离保留，账号行读取实际 `buddy.site`，账号管理不直接改写 Provider 绑定。成功导入即刷新共享视图，表单异步结果仍受原操作 scope 约束。
+
 认证的完整草稿预检为 `POST /api/provider-bundles/validate-draft` / `validate_provider_bundle_draft`，要求管理员会话和 Provider 契约，使用与保存相同的候选校验；`shareEnabled` 表示待开启分享的意图，不允许绕过已存在的 Share 引用。该操作没有持久化或上游调用，不验证真实上游接受性，也不代替 apply 的版本/引用锁校验。Provider 修改只重新检查受影响 Share 的 Custom 来源约束，无关历史异常不阻塞其他 Provider。冲突细节使用固定 reason 和 App/Share 标识及无密钥认证描述；前端仅对真正的 revision/preview conflict 提示刷新。
 
 ### 4.3 UI 独立性
